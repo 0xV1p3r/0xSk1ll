@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+sk1ll-core = { path = "crates/sk1ll-core" }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+toml_edit = "0.23"
+sha2 = "0.10"
+walkdir = "2"
+dirs = "6"
+globset = "0.4"
+clap = { version = "4", features = ["derive", "env"] }
+tempfile = "3"
