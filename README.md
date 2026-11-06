@@ -87,13 +87,35 @@ sync reports a conflict instead of overwriting it. Move the edit into
   files listed in a rules directory's `.sk1ll-managed` index.
 - `crates/sk1ll-cli`: thin `clap` front-end.
 
-## Roadmap
+## Direction
 
-- `sk1ll-gui`: Tauri app; each core fn becomes a `#[tauri::command]`, and the
-  plan → confirm → apply flow maps to a diff view.
-- `sk1ll-daemon`: live sync. Watch `personal/`, `instructions/` and targets
-  with `notify`, then re-plan/apply; periodically `git pull --rebase`,
-  autocommit and push personal edits; optionally poll import refs and notify
-  when updates exist.
+The sections above describe the current CLI. The planned fleet model is below.
+Terms are defined in [GLOSSARY.md](GLOSSARY.md), and decisions are recorded in
+[docs/adr/](docs/adr/).
+
+- **The repo holds content only**: skills, fragments, imports. The **hub**, a
+  self-hosted Docker container, hosts the canonical repo, and each machine keeps
+  a full clone with the hub as its only remote ([ADR 0002](docs/adr/0002-hub-is-the-git-remote.md)).
+- **Baseline vs draft**: a draft is a machine's uncommitted changes. It is live
+  in that machine's harnesses and never leaves the machine. Promote and reset
+  work per skill or fragment. After a promote, the hub tells every machine to
+  pull. If a draft clashes with the new baseline, the machine is marked Blocked.
+- **Assignment** (which item is enabled in which harness on which machine) is
+  live hub state, not in `sk1ll.toml`. It is made of explicit toggles plus a
+  per-harness default for new skills, and the hub keeps a log with undo
+  ([ADR 0001](docs/adr/0001-assignment-is-hub-state.md)). `[profiles]` goes
+  away. `[targets]` becomes machine-local harness configuration, detected from
+  presets, which you can override.
+- **`sk1ll-daemon`** runs on every machine. It watches the repo and harnesses,
+  applies draft + assignment, works offline from the last assignment it knew,
+  and is the only process that talks to the hub. Machines join with a
+  single-use join code and get per-machine, revocable tokens.
+- **`sk1ll-gui`** (Tauri) talks to the local daemon. Screens: Fleet (one
+  headline status per machine: Offline > Blocked > Conflict > Behind > Drafting
+  > In sync), Assignment matrix, Draft (diff, promote, reset), Conflicts (adopt
+  or overwrite), Imports (update into draft), Log.
+
+Still open, not yet designed:
+
 - Imported instruction sets (same vendoring + lockfile as skills).
-- Per-target frontmatter transforms (in copy mode) for harness quirks.
+- Per-harness frontmatter transforms (in copy mode) for harness quirks.
