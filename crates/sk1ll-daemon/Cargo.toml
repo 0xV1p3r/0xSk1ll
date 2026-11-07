@@ -1,0 +1,38 @@
+[package]
+name = "sk1ll-daemon"
+description = "Per-machine 0xSk1ll daemon: keeps harnesses in step and talks to the hub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sk1ll-daemon"
+path = "src/main.rs"
+
+[dependencies]
+sk1ll-core.workspace = true
+sk1ll-proto = { path = "../sk1ll-proto" }
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dirs.workspace = true
+clap.workspace = true
+axum = "0.8"
+base64 = "0.22"
+bytes = "1"
+futures-util = "0.3"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+libc = "0.2"
+notify = "8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "signal", "fs", "io-util"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+sk1ll-hub = { path = "../sk1ll-hub" }
+tempfile.workspace = true

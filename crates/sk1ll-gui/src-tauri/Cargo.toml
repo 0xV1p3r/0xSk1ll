@@ -1,0 +1,33 @@
+[package]
+name = "sk1ll-gui"
+description = "0xSk1ll desktop Fleet client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "sk1ll_gui"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[target.'cfg(unix)'.dependencies]
+sk1ll-daemon = { path = "../../sk1ll-daemon" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tauri = { version = "2", features = [] }
+tokio = { version = "1", features = ["time", "macros", "sync"] }
+
+[dev-dependencies]
+axum = "0.8"
+futures-util = "0.3"
+tempfile.workspace = true
+tokio = { version = "1", features = ["test-util", "net", "rt-multi-thread"] }
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+default = ["custom-protocol"]
+
+[target.'cfg(unix)'.dev-dependencies]
+tauri = { version = "2", features = ["test"] }

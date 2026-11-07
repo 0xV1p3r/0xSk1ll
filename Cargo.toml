@@ -1,6 +1,13 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = [
+    "crates/sk1ll-cli",
+    "crates/sk1ll-core",
+    "crates/sk1ll-daemon",
+    "crates/sk1ll-hub",
+    "crates/sk1ll-proto",
+    "crates/sk1ll-gui/src-tauri",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,11 +19,11 @@ sk1ll-core = { path = "crates/sk1ll-core" }
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.9"
 toml_edit = "0.23"
 sha2 = "0.10"
 walkdir = "2"
 dirs = "6"
-globset = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
 tempfile = "3"

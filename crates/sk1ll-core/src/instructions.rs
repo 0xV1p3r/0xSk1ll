@@ -28,6 +28,9 @@ pub const INSTRUCTIONS_DIR: &str = "instructions";
 
 const BEGIN: &str = "<!-- 0xSk1ll:begin";
 const END: &str = "<!-- 0xSk1ll:end -->";
+/// Fragment frontmatter keys restricting which harnesses get it; `targets` is
+/// the deprecated spelling.
+const FRONTMATTER_KEYS: [&str; 2] = ["harnesses", "targets"];
 const NOTE: &str =
     "<!-- Managed by 0xSk1ll: edit instructions/ in your skills repo, then run `sk1ll sync`. -->";
 
@@ -38,17 +41,20 @@ pub struct Fragment {
     pub name: String,
     pub path: PathBuf,
     pub description: Option<String>,
-    /// From frontmatter `targets: [claude, codex]`; `None` means all targets.
-    pub targets: Option<Vec<String>>,
+    /// From frontmatter `harnesses: [claude, codex]` (or the deprecated
+    /// `targets:`); `None` means all harnesses.
+    pub harnesses: Option<Vec<String>>,
     #[serde(skip)]
     pub body: String,
     #[serde(skip)]
-    raw: String,
+    rule_frontmatter: String,
+    #[serde(skip)]
+    routing_source: String,
 }
 
 impl Fragment {
-    pub fn applies_to(&self, target: &str) -> bool {
-        self.targets.as_ref().is_none_or(|t| t.iter().any(|t| t == target))
+    pub fn applies_to(&self, harness: &str) -> bool {
+        self.harnesses.as_ref().is_none_or(|h| h.iter().any(|h| h == harness))
     }
 }
 
@@ -70,23 +76,53 @@ pub fn discover(root: &Path) -> Result<Vec<Fragment>> {
         .map(|path| {
             let text = fs::read_to_string(&path).at(&path)?;
             let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
-            let targets = frontmatter_field(&text, "targets").map(|v| {
-                v.trim_matches(['[', ']'])
-                    .split(',')
-                    .map(|s| s.trim().trim_matches(['"', '\'']).to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            });
+            let harnesses = parse_harnesses(&text, &path)?;
+            // Prepare this while errors can still be returned, before sync writes
+            // any rules. Rendering only uses these validated source slices.
+            let (rule_frontmatter, routing_source) =
+                split_harnesses_key(split_frontmatter(&text).0.unwrap_or_default(), &path)?;
             Ok(Fragment {
                 name,
                 description: frontmatter_field(&text, "description"),
-                targets,
+                harnesses,
                 body: split_frontmatter(&text).1.trim().to_string(),
-                raw: text,
+                rule_frontmatter,
+                routing_source,
                 path,
             })
         })
         .collect()
+}
+
+/// Parses only sk1ll's routing keys; other frontmatter belongs to the harness.
+fn parse_harnesses(text: &str, path: &Path) -> Result<Option<Vec<String>>> {
+    let (frontmatter, _) = split_frontmatter(text);
+    let invalid = || Error::Parse {
+        path: path.to_path_buf(),
+        message: "harnesses/targets must be a string or a sequence of strings".into(),
+    };
+    let Some(frontmatter) = frontmatter else {
+        if text.starts_with("---\n") || text.starts_with("---\r\n") {
+            return Err(invalid());
+        }
+        return Ok(None);
+    };
+    let mapping = frontmatter_mapping(frontmatter, path)?;
+    let mut scopes = BTreeMap::new();
+    for key in FRONTMATTER_KEYS {
+        let Some(value) = mapping.get(serde_yaml_ng::Value::String(key.into())) else {
+            continue;
+        };
+        let names = match value {
+            serde_yaml_ng::Value::String(name) => vec![name.clone()],
+            serde_yaml_ng::Value::Sequence(names) => {
+                names.iter().map(|name| name.as_str().map(str::to_owned).ok_or_else(invalid)).collect::<Result<_>>()?
+            }
+            _ => return Err(invalid()),
+        };
+        scopes.insert(key, names);
+    }
+    Ok(scopes.remove("harnesses").or_else(|| scopes.remove("targets")))
 }
 
 /// Block content for the given fragments, or `None` if there is nothing to write.
@@ -97,28 +133,153 @@ pub fn render(fragments: &[&Fragment]) -> Option<String> {
 
 /// File name and content of a fragment in the `rules` format. Frontmatter is
 /// kept (e.g. Claude's `paths:` for path-scoped rules) minus 0xSk1ll's own
-/// `targets` key.
+/// `harnesses`/`targets` key.
 pub fn render_rule(fragment: &Fragment) -> (String, String) {
     let file_name = format!("{}.md", fragment.name);
-    let (frontmatter, body) = split_frontmatter(&fragment.raw);
-    let mut skipping = false;
-    let kept: Vec<&str> = frontmatter
-        .unwrap_or_default()
-        .lines()
-        .filter(|line| {
-            if !line.starts_with([' ', '\t', '-']) {
-                skipping = line.starts_with("targets:");
-            }
-            !skipping
-        })
-        .collect();
-    let body = body.trim();
-    let content = if kept.iter().all(|l| l.trim().is_empty()) {
-        format!("{body}\n")
-    } else {
-        format!("---\n{}\n---\n\n{body}\n", kept.join("\n"))
-    };
+    let kept = &fragment.rule_frontmatter;
+    let body = fragment.body.trim();
+    let content = if kept.trim().is_empty() { format!("{body}\n") } else { format!("---\n{kept}---\n\n{body}\n") };
     (file_name, content)
+}
+
+fn frontmatter_mapping(text: &str, path: &Path) -> Result<serde_yaml_ng::Mapping> {
+    serde_yaml_ng::from_str::<Option<serde_yaml_ng::Mapping>>(text)
+        .map(Option::unwrap_or_default)
+        .map_err(|e| Error::Parse { path: path.to_path_buf(), message: e.to_string() })
+}
+
+/// Split source ranges, never reserialize unrelated frontmatter. Only implicit
+/// block-mapping keys on one line are supported when routing needs removal.
+///
+/// A possible boundary is accepted only if the YAML parser says the entire
+/// preceding prefix is a complete mapping. Thus apparent keys inside quoted
+/// scalars or flow collections cannot become boundaries. Indentation excludes
+/// nested mappings and block scalar content. Parsing prefixes also handles
+/// escaped quotes, multiline flow lists and indentless block sequences without
+/// maintaining a second, incomplete YAML lexer.
+fn split_harnesses_key(frontmatter: &str, path: &Path) -> Result<(String, String)> {
+    let mapping = frontmatter_mapping(frontmatter, path)?;
+    let mut expected = mapping.clone();
+    let mut routing = serde_yaml_ng::Mapping::new();
+    for key in FRONTMATTER_KEYS {
+        let key = serde_yaml_ng::Value::String(key.into());
+        if let Some(value) = expected.remove(&key) {
+            routing.insert(key, value);
+        }
+    }
+    if routing.is_empty() {
+        return Ok((frontmatter.to_string(), String::new()));
+    }
+    let unsafe_extent = || Error::Parse {
+        path: path.to_path_buf(),
+        message: "cannot safely strip harnesses/targets source ranges; use single-line keys in a block mapping"
+            .into(),
+    };
+    let mut entries = Vec::new();
+    let mut offset = 0;
+    let mut root_indent = None;
+    for line in frontmatter.split_inclusive('\n') {
+        let content = line.trim_end_matches(['\r', '\n']);
+        let indent = content.len() - content.trim_start_matches(' ').len();
+        let content = &content[indent..];
+        if !content.is_empty() && !content.starts_with('#') {
+            let root_indent = *root_indent.get_or_insert(indent);
+            if indent == root_indent
+                && let Some(key) = mapping_key(content)
+                && frontmatter_mapping(&frontmatter[..offset], path).is_ok()
+            {
+                entries.push((offset, key));
+            }
+        }
+        offset += line.len();
+    }
+    // Reject explicit/complex keys, flow mappings, directives and any other
+    // syntax for which we could not identify every top-level entry exactly.
+    if entries.len() != mapping.len() || entries.iter().any(|(_, key)| !mapping.contains_key(key)) {
+        return Err(unsafe_extent());
+    }
+    let mut kept = String::with_capacity(frontmatter.len());
+    let mut removed = String::new();
+    let mut cursor = 0;
+    for (index, (start, key)) in entries.iter().enumerate() {
+        if !routing.contains_key(key) {
+            continue;
+        }
+        let next = entries.get(index + 1).map_or(frontmatter.len(), |(start, _)| *start);
+        let mut end = next;
+        // Standalone comments and blank lines following an entry belong to
+        // the surrounding document. Inline and internal comments stay with it.
+        let through_entry = frontmatter_mapping(&frontmatter[..next], path)?;
+        for line in frontmatter[*start..next].split_inclusive('\n').rev() {
+            let content = line.trim_end_matches(['\r', '\n']);
+            if (content.trim().is_empty() || content.trim_start().starts_with('#'))
+                && frontmatter_mapping(&frontmatter[..end - line.len()], path).ok().as_ref() == Some(&through_entry)
+            {
+                end -= line.len();
+            } else {
+                break;
+            }
+        }
+        kept.push_str(&frontmatter[cursor..*start]);
+        removed.push_str(&frontmatter[*start..end]);
+        cursor = end;
+    }
+    kept.push_str(&frontmatter[cursor..]);
+    // Removing an anchor, for example, could invalidate aliases elsewhere.
+    // Check both YAML validity and the values of every remaining entry.
+    if frontmatter_mapping(&kept, path)? != expected {
+        return Err(unsafe_extent());
+    }
+    // Aliases to retained metadata need a standalone representation when
+    // routing is later restored, potentially ahead of their anchor definitions.
+    if frontmatter_mapping(&removed, path).ok().as_ref() != Some(&routing) {
+        removed = serde_yaml_ng::to_string(&routing)
+            .map_err(|e| Error::Parse { path: path.to_path_buf(), message: e.to_string() })?;
+    }
+    Ok((kept, removed))
+}
+
+/// Decode a simple, implicit YAML mapping key. Parsing the candidate rather
+/// than trimming quotes also handles escapes in quoted routing key names.
+fn mapping_key(line: &str) -> Option<serde_yaml_ng::Value> {
+    if line.starts_with(['?', ':', '{', '[', '&', '!', '*', '%']) {
+        return None;
+    }
+    line.match_indices(':').find_map(|(offset, _)| {
+        if line.as_bytes().get(offset + 1).is_some_and(|b| !b.is_ascii_whitespace()) {
+            return None;
+        }
+        let key = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&line[..offset]).ok()?;
+        (!matches!(key, serde_yaml_ng::Value::Mapping(_) | serde_yaml_ng::Value::Sequence(_))).then_some(key)
+    })
+}
+
+/// A rule file's `text` as fragment source: puts back the `harnesses:` key
+/// that [`render_rule`] stripped from `fragment`, unless `text` has its own.
+pub(crate) fn restore_harnesses(fragment: &Fragment, text: &str) -> String {
+    let key = &fragment.routing_source;
+    let (frontmatter, body) = split_frontmatter(text);
+    if key.is_empty() {
+        return text.to_string();
+    }
+    if let Some(f) = frontmatter {
+        let Ok(mapping) = frontmatter_mapping(f, &fragment.path) else {
+            return text.to_string();
+        };
+        if FRONTMATTER_KEYS.iter().any(|key| mapping.contains_key(serde_yaml_ng::Value::String((*key).into()))) {
+            return text.to_string();
+        }
+    }
+    let restored = match frontmatter {
+        Some(f) => format!("---\n{key}{f}---\n{body}"),
+        None => format!("---\n{key}---\n{text}"),
+    };
+    // Adoption's existing infallible API must not manufacture invalid YAML
+    // when the edited rule uses a different mapping style or invalid input.
+    if frontmatter_mapping(split_frontmatter(&restored).0.unwrap_or_default(), &fragment.path).is_err() {
+        return text.to_string();
+    }
+    restored
 }
 
 /// Hashes of the rule files 0xSk1ll wrote, stored as `<dir>/.sk1ll-managed`.
@@ -252,6 +413,260 @@ mod tests {
         find_block(text, Path::new("test.md")).unwrap()
     }
 
+    fn fragment(raw: &str) -> Fragment {
+        let path = Path::new("r.md");
+        let (rule_frontmatter, routing_source) =
+            split_harnesses_key(split_frontmatter(raw).0.unwrap_or_default(), path).unwrap();
+        Fragment {
+            name: "r".into(),
+            path: path.into(),
+            description: None,
+            harnesses: parse_harnesses(raw, path).unwrap(),
+            body: split_frontmatter(raw).1.trim().into(),
+            rule_frontmatter,
+            routing_source,
+        }
+    }
+
+    fn assert_rule_metadata_and_routing(raw: &str, metadata: &str) {
+        let fragment = fragment(raw);
+        let rendered = render_rule(&fragment).1;
+        let kept = split_frontmatter(&rendered).0.unwrap();
+        assert_eq!(kept.as_bytes(), metadata.as_bytes());
+        let actual: serde_yaml_ng::Value = serde_yaml_ng::from_str(kept).unwrap();
+        let expected: serde_yaml_ng::Value = serde_yaml_ng::from_str(metadata).unwrap();
+        assert_eq!(actual, expected);
+
+        let restored = restore_harnesses(&fragment, &rendered);
+        let original = frontmatter_mapping(split_frontmatter(raw).0.unwrap(), &fragment.path).unwrap();
+        let restored_mapping = frontmatter_mapping(split_frontmatter(&restored).0.unwrap(), &fragment.path).unwrap();
+        assert_eq!(restored_mapping, original);
+        assert_eq!(parse_harnesses(&restored, &fragment.path).unwrap(), fragment.harnesses);
+        assert!(restored.contains(metadata));
+    }
+
+    #[test]
+    fn rule_strips_multiline_flow_routing_without_changing_metadata() {
+        let metadata = "description: Keep café exactly. # comment\npaths: ['src/**']\n";
+        for key in FRONTMATTER_KEYS {
+            let routing = format!("{key}: [claude,\n  codex] # routing\n");
+            for source in [format!("{routing}{metadata}"), format!("{metadata}{routing}")] {
+                assert_rule_metadata_and_routing(&format!("---\n{source}---\nBody.\n"), metadata);
+            }
+        }
+    }
+
+    #[test]
+    fn rule_preserves_unindented_quoted_scalar_continuations() {
+        for metadata in [
+            "description: \"first line\nharnesses: are tools\nend\"\n",
+            "description: 'first line\ntargets: aren''t routing\nend'\n",
+            "metadata: {description: \"first line\nharnesses: are tools\nend\"}\n",
+        ] {
+            for key in FRONTMATTER_KEYS {
+                let routing = format!("{key}: [claude]\n");
+                for source in [format!("{routing}{metadata}"), format!("{metadata}{routing}")] {
+                    assert_rule_metadata_and_routing(&format!("---\n{source}---\nBody.\n"), metadata);
+                }
+            }
+            assert_rule_metadata_and_routing(&format!("---\n{metadata}---\nBody.\n"), metadata);
+        }
+    }
+
+    #[test]
+    fn rule_preserves_comments_and_crlf_around_routing_entries() {
+        for newline in ["\n", "\r\n"] {
+            let metadata = "# header\npaths: ['src/**'] # paths\ndescription: |\n  harnesses: documentation\n  targets: examples\n\n# footer\n"
+                .replace('\n', newline);
+            for key in FRONTMATTER_KEYS {
+                for value in [
+                    "[claude, codex] # routing\n",
+                    "\n- claude # first\n- codex # last\n",
+                    "# routing\n  - claude\n\n# internal\n  - codex # last\n",
+                ] {
+                    let routing = format!("{key}: {value}").replace('\n', newline);
+                    for source in [format!("{routing}{metadata}"), format!("{metadata}{routing}")] {
+                        let raw = format!("---{newline}{source}---{newline}Body.{newline}");
+                        assert_rule_metadata_and_routing(&raw, &metadata);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rule_omits_frontmatter_when_routing_is_only_key() {
+        for newline in ["\n", "\r\n"] {
+            for key in FRONTMATTER_KEYS {
+                for value in ["[claude] # scope\n", "\n- claude # scope\n", "[claude,\n  codex]\n"] {
+                    let raw = format!("---\n{key}: {value}---\nBody.\n").replace('\n', newline);
+                    let fragment = fragment(&raw);
+                    let rendered = render_rule(&fragment).1;
+                    assert_eq!(rendered, "Body.\n");
+                    assert_eq!(
+                        parse_harnesses(&restore_harnesses(&fragment, &rendered), &fragment.path).unwrap(),
+                        fragment.harnesses
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rule_restores_equivalent_routing_values() {
+        for source in [
+            "description: &name claude\nharnesses: *name\n",
+            "description: Keep\n\"harn\\u0065sses\": [claude]\n'targets': [codex]\n",
+            "description: Keep\nharnesses: |+\n  claude\n\n\n",
+            "description: Keep\nharnesses: &tools [claude]\n",
+        ] {
+            let metadata = if source.starts_with("description: &") {
+                "description: &name claude\n"
+            } else {
+                "description: Keep\n"
+            };
+            assert_rule_metadata_and_routing(&format!("---\n{source}---\nBody.\n"), metadata);
+        }
+    }
+
+    #[test]
+    fn rule_preserves_comments_after_routing_and_inside_block_scalars() {
+        for (source, metadata) in [
+            (
+                "harnesses: [claude]\n  # keep this indented comment\n# keep this comment too\n",
+                "  # keep this indented comment\n# keep this comment too\n",
+            ),
+            ("# header\nharnesses: [claude]\n# footer\n", "# header\n# footer\n"),
+            ("harnesses: |\n  claude\n  # part of the routing scalar\n# footer\n", "# footer\n"),
+            (
+                "description: |\n  # keep this scalar content\n\nharnesses: [claude]\n",
+                "description: |\n  # keep this scalar content\n\n",
+            ),
+        ] {
+            assert_rule_metadata_and_routing(&format!("---\n{source}---\nBody.\n"), metadata);
+        }
+    }
+
+    #[test]
+    fn unsafe_routing_source_ranges_are_discovery_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join(INSTRUCTIONS_DIR)).unwrap();
+        let path = tmp.path().join("instructions/scoped.md");
+        for source in [
+            "{harnesses: [claude], description: Keep}\n",
+            "? harnesses\n: [claude]\ndescription: Keep\n",
+            "harnesses: &tools [claude]\nmetadata: *tools\n",
+        ] {
+            let raw = format!("---\n{source}---\nBody.\n");
+            assert!(parse_harnesses(&raw, &path).is_ok(), "invalid fixture: {raw}");
+            fs::write(&path, raw).unwrap();
+            assert!(discover(tmp.path()).is_err(), "accepted unsafe removal: {source}");
+        }
+    }
+
+    #[test]
+    fn multiline_harnesses_and_targets_restrict_fragments() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join(INSTRUCTIONS_DIR)).unwrap();
+        let path = tmp.path().join("instructions/scoped.md");
+        for key in FRONTMATTER_KEYS {
+            for value in [
+                "\n  - only\n  - 'second'",
+                "\n- only\n- second",
+                "[only, second] # scope",
+                "\n  - only # first\n\n# scope\n  - second",
+            ] {
+                fs::write(&path, format!("---\n{key}: {value}\n---\nScoped.\n")).unwrap();
+                let fragments = discover(tmp.path()).unwrap();
+                assert!(fragments[0].applies_to("only"));
+                assert!(fragments[0].applies_to("second"));
+                assert!(!fragments[0].applies_to("other"));
+                assert_eq!(render_rule(&fragments[0]).1, "Scoped.\n");
+            }
+        }
+    }
+
+    #[test]
+    fn routing_ignores_nested_and_embedded_keys_and_preserves_rule_frontmatter() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join(INSTRUCTIONS_DIR)).unwrap();
+        let path = tmp.path().join("instructions/scoped.md");
+        for metadata in [
+            "description: |\n  harnesses: are agent tools\n  targets: are deprecated\n",
+            "description: >\n  harnesses: are agent tools\n  targets: are deprecated\n",
+            "description: \"Some tools\n  harnesses: are agent tools\n  targets: are deprecated\"\n",
+            "metadata:\n  harnesses: {arbitrary: true}\n  targets: 42\n",
+        ] {
+            for key in FRONTMATTER_KEYS {
+                for routing in [String::new(), format!("{key}: [only]\n")] {
+                    for frontmatter in [format!("{routing}{metadata}"), format!("{metadata}{routing}")] {
+                        fs::write(&path, format!("---\n{frontmatter}---\nScoped.\n")).unwrap();
+                        let fragments = discover(tmp.path()).unwrap();
+                        let fragment = &fragments[0];
+                        assert!(fragment.applies_to("only"));
+                        assert_eq!(fragment.applies_to("other"), routing.is_empty());
+                        let rendered = render_rule(fragment).1;
+                        assert_eq!(rendered, format!("---\n{metadata}---\n\nScoped.\n"));
+                        let restored = restore_harnesses(fragment, &rendered);
+                        fs::write(&path, &restored).unwrap();
+                        assert_eq!(discover(tmp.path()).unwrap()[0].harnesses, fragment.harnesses);
+                        assert!(restored.contains(metadata));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn routing_accepts_yaml_strings_and_validates_both_top_level_keys() {
+        let path = Path::new("scoped.md");
+        for key in FRONTMATTER_KEYS {
+            for value in ["only", "'only'", "\"only\"", "\n  only", "[only]", "|\n  only"] {
+                let text = format!("---\n{key}: {value}\n---\nScoped.\n");
+                let expected = if value.starts_with('|') { "only\n" } else { "only" };
+                assert_eq!(parse_harnesses(&text, path).unwrap(), Some(vec![expected.into()]));
+            }
+        }
+        for text in [
+            "harnesses: [only]\ntargets: false",
+            "harnesses: false\ntargets: [only]",
+            "harnesses: [only, 42]",
+            "targets: [only, null]",
+            "harnesses: 42",
+            "targets: true",
+        ] {
+            assert!(parse_harnesses(&format!("---\n{text}\n---\n"), path).is_err(), "accepted {text}");
+        }
+        assert_eq!(
+            parse_harnesses("---\nharnesses: [only]\ntargets: [legacy]\n---\n", path).unwrap(),
+            Some(vec!["only".into()])
+        );
+    }
+
+    #[test]
+    fn invalid_harness_restrictions_are_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join(INSTRUCTIONS_DIR)).unwrap();
+        let path = tmp.path().join("instructions/scoped.md");
+        for key in FRONTMATTER_KEYS {
+            for value in [
+                "",
+                "[only",
+                "[only,,other]",
+                "\n  - [nested]",
+                "null",
+                "{only: true}",
+                "[\"unterminated]",
+                "\n  - only\n    nested: bad",
+            ] {
+                fs::write(&path, format!("---\n{key}: {value}\n---\nScoped.\n")).unwrap();
+                assert!(discover(tmp.path()).is_err(), "accepted {key}: {value}");
+            }
+        }
+        fs::write(&path, "---\nharnesses:\n  - only\n").unwrap();
+        assert!(discover(tmp.path()).is_err());
+    }
+
     #[test]
     fn appends_replaces_and_removes_block() {
         let user = "# Mine\n\nKeep this.\n";
@@ -272,20 +687,23 @@ mod tests {
     }
 
     #[test]
-    fn rule_keeps_frontmatter_except_targets() {
-        let frag = |raw: &str| Fragment {
-            name: "r".into(),
-            path: "r.md".into(),
-            description: None,
-            targets: None,
-            body: split_frontmatter(raw).1.trim().into(),
-            raw: raw.into(),
-        };
+    fn rule_keeps_frontmatter_except_harnesses() {
+        let frag = fragment;
         let (name, text) = render_rule(&frag("---\ntargets:\n  - claude\npaths:\n  - \"src/**\"\n---\nDo X.\n"));
         assert_eq!(name, "r.md");
         assert_eq!(text, "---\npaths:\n  - \"src/**\"\n---\n\nDo X.\n");
         assert_eq!(render_rule(&frag("---\ntargets: [claude]\n---\nDo Y.")).1, "Do Y.\n");
+        assert_eq!(
+            render_rule(&frag("---\nharnesses: [claude]\ndescription: d\n---\nDo Z.")).1,
+            "---\ndescription: d\n---\n\nDo Z.\n"
+        );
         assert_eq!(render_rule(&frag("Plain.")).1, "Plain.\n");
+
+        let f = frag("---\nharnesses:\n  - claude\npaths: [x]\n---\nDo X.\n");
+        let edited = "---\npaths: [x]\n---\n\nDo X better.\n";
+        assert_eq!(restore_harnesses(&f, edited), "---\nharnesses:\n  - claude\npaths: [x]\n---\n\nDo X better.\n");
+        assert_eq!(restore_harnesses(&f, "Plain.\n"), "---\nharnesses:\n  - claude\n---\nPlain.\n");
+        assert_eq!(restore_harnesses(&frag("Plain."), edited), edited);
     }
 
     #[test]
