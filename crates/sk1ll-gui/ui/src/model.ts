@@ -52,3 +52,12 @@ export function mergeAssignments(current: Record<string, AssignmentSnapshot>, in
 export function itemStateLabel(item: Pick<ItemView, 'in_baseline' | 'unpushed'>): string | undefined {
   return item.unpushed ? 'Unpushed' : !item.in_baseline ? 'Draft only' : undefined;
 }
+const relative = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' });
+export function ago(seconds: number | null, now = Date.now() / 1000): string {
+  if (seconds === null) return 'Never';
+  const delta = seconds - now;
+  for (const [unit, size] of [['day', 86400], ['hour', 3600], ['minute', 60]] as const) {
+    if (Math.abs(delta) >= size) return relative.format(Math.round(delta / size), unit);
+  }
+  return Math.abs(delta) < 10 ? 'Just now' : relative.format(Math.round(delta), 'second');
+}

@@ -60,7 +60,7 @@ describe('Draft confirmations', () => {
   it('revalidates Promote content and missing items and keeps the edited message on review', async () => {
     entries.push(entry('fragment:gone'));
     const view = mount();
-    fireEvent.click(await screen.findByRole('button', { name: 'Check all items' }));
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'Check all items' }));
     fireEvent.click(screen.getByRole('button', { name: 'Promote (2)' }));
     const dialog = await screen.findByRole('dialog');
     fireEvent.change(within(dialog).getByRole('textbox'), { target: { value: 'My message' } });
