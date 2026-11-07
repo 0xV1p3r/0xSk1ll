@@ -246,3 +246,33 @@ async fn draft_bridge_adds_fingerprints_and_preserves_daemon_entries() {
     assert_ne!(first[0].fingerprint, second[0].fingerprint);
     assert!(requests.lock().unwrap().iter().all(|(method, _, _)| method == "GET"));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_resolve_and_add_forward_once_with_payloads() {
+    let requests = Recorded::default();
+    let resolved = json!({"source":"github:example/skills", "git_ref":"main", "commit":"abcdef",
+        "candidates":[{"path":"skills/pdf", "default_name":"pdf", "description":"Read PDFs", "taken":false}]});
+    let mut replies = Replies::new();
+    replies.insert("POST /imports/resolve".into(), (StatusCode::OK, resolved.clone()));
+    replies.insert("POST /imports/add".into(),
+        (StatusCode::CONFLICT, json!({"error":"Import name already exists"})));
+    let server = Server::start(Router::new().fallback(respond).with_state((requests.clone(), replies))).await;
+    let bridge = Bridge::new(server.client.clone());
+    let value = bridge.resolve_import(ResolveImportRequest {
+        link: "https://github.com/example/skills/tree/main/skills/pdf".into(), path: "".into(),
+    }).await.unwrap();
+    assert_eq!(serde_json::to_value(value).unwrap(), resolved);
+    let error = bridge.add_import(AddImportRequest {
+        name: "pdf".into(), source: "github:example/skills".into(), path: Some("skills/pdf".into()),
+        git_ref: Some("main".into()), commit: Some("abcdef".into()),
+    }).await.unwrap_err();
+    assert_eq!(error.status, Some(409));
+    assert_eq!(error.message, "Import name already exists");
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].0, "POST");
+    assert_eq!(requests[0].1, "/imports/resolve");
+    assert_eq!(requests[0].2, json!({"link":"https://github.com/example/skills/tree/main/skills/pdf", "path":""}));
+    assert_eq!(requests[1].1, "/imports/add");
+    assert_eq!(requests[1].2, json!({"name":"pdf", "source":"github:example/skills", "path":"skills/pdf", "ref":"main", "commit":"abcdef"}));
+}

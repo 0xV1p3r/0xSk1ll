@@ -9,14 +9,15 @@
 //! its event stream read from it.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::Context;
+use sk1ll_core::imports;
 use sk1ll_core::sync::{self, Action, ActionKind, Item, PlanOptions};
 use sk1ll_core::{
-    EngineLock, HarnessOrigin, Import, ItemRef, MachineConfig, PullOutcome, Repo, default_promote_message,
+    EngineLock, HarnessOrigin, ItemRef, MachineConfig, PullOutcome, Repo, default_promote_message,
     machine_author,
 };
 use sk1ll_proto::{AssignmentSnapshot, ConflictRef, MachineReport, headline};
@@ -25,7 +26,7 @@ use tokio::sync::{Notify, broadcast, watch};
 use crate::client::{
     AddImportRequest, ChangeKind, ConflictTarget, ConflictView, Connection, DiffView, DraftEntry, Event, HarnessView,
     ImportUpdated, ItemView, PromoteMessage, PromoteRequest, PromoteResponse, PullResult, PushResult, ResetRequest,
-    ResetResponse, StatusView, SyncResult, UpdateImportsRequest,
+    ResetResponse, ResolveImportRequest, ResolvedSource, SkillCandidate, StatusView, SyncResult, UpdateImportsRequest,
 };
 use crate::error::{Error, Result};
 use crate::join::{Joined, Registered};
@@ -357,6 +358,7 @@ impl Daemon {
         let harnesses = machine.harnesses();
         let lock = eng.lock.as_ref().ok_or_else(|| Error::Conflict(format!("{} is not locked", root.display())))?;
         sync::recover(lock, &harnesses)?;
+        Self::recover_imports(&root)?;
         let mut errors = Vec::new();
         let mut conflicts: Vec<ConflictRef> = Vec::new();
         if let Some(snap) = &eng.snapshot {
@@ -679,6 +681,9 @@ impl Daemon {
         let mut changed = BTreeMap::<ItemRef, Vec<String>>::new();
         for raw in status.split(|b| *b == 0).filter(|p| p.len() >= 4) {
             let path = String::from_utf8_lossy(&raw[3..]).into_owned();
+            if sk1ll_core::source::is_staging_path(Path::new(&path)) {
+                continue;
+            }
             changed.entry(ItemRef::for_path(Path::new(&path))).or_default().push(path);
         }
         for (item, paths) in changed {
@@ -754,10 +759,21 @@ impl Daemon {
                 "waiting for the hub's assignment; the harnesses are left alone until it arrives".into(),
             ));
         };
+        Self::recover_imports(Self::root(eng))?;
         let repo = Repo::open(Self::root(eng))?;
         let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
         let actions = sync::plan(&repo, &harnesses, &snap.assignment, PlanOptions { force })?;
         Ok((repo, actions))
+    }
+
+    /// Puts back imports an interrupted (or failed, unrolled-back) update
+    /// left set aside, before anything plans a sync: otherwise the sync would
+    /// remove their harness entries. Failing to stops the sync.
+    fn recover_imports(root: &Path) -> Result<()> {
+        for name in sk1ll_core::source::recover_replaced(root)? {
+            tracing::warn!("restored import {name}, which an interrupted update had set aside");
+        }
+        Ok(())
     }
 
     pub(crate) fn recovered(&self) -> Result<Vec<ConflictView>> {
@@ -871,30 +887,90 @@ impl Daemon {
             .collect())
     }
 
+    // Import operations fetch in two or three steps, so a slow or hanging
+    // remote never holds the engine mutex: check what can be checked under
+    // it, fetch into the import cache and stage the checkout without it (core
+    // serializes fetches per cache repo; checkout may run smudge filters that
+    // fetch), then take it again to re-check against the repo as it is now
+    // and install the staged content: a rename, with no git or network.
+
     /// Re-vendors imports into the draft: `name`, or all of them.
-    pub(crate) fn update_imports(&self, eng: &mut Engine, req: UpdateImportsRequest) -> Result<Vec<ImportUpdated>> {
-        self.ensure_managed(eng)?;
-        self.lock_repo(eng)?;
-        let mut repo = Repo::open(Self::root(eng))?;
-        let reports = repo.update(req.name.as_deref(), req.force);
-        self.refresh(eng)?;
-        Ok(reports?.into_iter().map(import_updated).collect())
+    pub(crate) async fn update_imports(self: &Arc<Self>, req: UpdateImportsRequest) -> Result<Vec<ImportUpdated>> {
+        let UpdateImportsRequest { name, force } = req;
+        let (root, todo) = self
+            .blocking(move |d, eng| {
+                d.ensure_managed(eng)?;
+                let todo = Repo::open(Self::root(eng))?.update_targets(name.as_deref(), force)?;
+                Ok((Self::root(eng).to_path_buf(), todo))
+            })
+            .await?;
+        let fetched = unlocked(move || imports::fetch_updates(&root, todo)).await?;
+        self.blocking(move |d, eng| {
+            d.ensure_managed(eng)?;
+            d.lock_repo(eng)?;
+            let reports = Repo::open(Self::root(eng))?.apply_updates(fetched, force);
+            d.refresh(eng)?;
+            Ok(reports?.into_iter().map(import_updated).collect())
+        })
+        .await
     }
 
     /// Re-vendors one import into the draft.
-    pub(crate) fn update_import(&self, eng: &mut Engine, name: &str) -> Result<ImportUpdated> {
-        let req = UpdateImportsRequest { name: Some(name.to_string()), force: false };
-        self.update_imports(eng, req)?.into_iter().next().context("no update report").map_err(Error::Internal)
+    pub(crate) async fn update_import(self: &Arc<Self>, name: String) -> Result<ImportUpdated> {
+        let req = UpdateImportsRequest { name: Some(name), force: false };
+        self.update_imports(req).await?.into_iter().next().context("no update report").map_err(Error::Internal)
     }
 
-    /// Adds an import to the draft.
-    pub(crate) fn add_import(&self, eng: &mut Engine, req: AddImportRequest) -> Result<ImportUpdated> {
+    /// What a link leads to; only the import cache is written.
+    pub(crate) async fn resolve_import(self: &Arc<Self>, req: ResolveImportRequest) -> Result<ResolvedSource> {
+        let root = self.blocking(|d, eng| d.import_root(eng)).await?;
+        let fetched = unlocked(move || imports::fetch_link(&root, &req.link, given(&req.path), None, None)).await?;
+        // `taken` reflects the repo after the fetch, not before it.
+        let r = self
+            .blocking(move |d, eng| {
+                d.ensure_managed(eng)?;
+                Ok(Repo::open(Self::root(eng))?.with_taken(fetched.resolved))
+            })
+            .await?;
+        let candidates = r
+            .candidates
+            .into_iter()
+            .map(|c| SkillCandidate {
+                path: c.path,
+                default_name: c.default_name,
+                description: c.description,
+                taken: c.taken,
+            })
+            .collect();
+        Ok(ResolvedSource { source: r.source, git_ref: r.git_ref, commit: r.commit, candidates })
+    }
+
+    /// Adds an import, from a link or plain source, to the draft.
+    pub(crate) async fn add_import(self: &Arc<Self>, req: AddImportRequest) -> Result<ImportUpdated> {
+        let root = self.blocking(|d, eng| d.import_root(eng)).await?;
+        let AddImportRequest { name, source, path, git_ref, commit } = req;
+        // Staging runs checkout (and any smudge filter) here too, outside the mutex.
+        let fetched = unlocked(move || {
+            let git_ref = git_ref.as_deref().and_then(given);
+            let mut fetched = imports::fetch_link(&root, &source, path.as_deref(), git_ref, commit.as_deref())?;
+            fetched.stage()?;
+            Ok(fetched)
+        })
+        .await?;
+        self.blocking(move |d, eng| {
+            d.ensure_managed(eng)?;
+            d.lock_repo(eng)?;
+            let added = Repo::open(Self::root(eng))?.add_fetched(given(&name), fetched);
+            d.refresh(eng)?;
+            Ok(import_updated(added?))
+        })
+        .await
+    }
+
+    /// The repo an import operation fetches for, if the daemon manages it.
+    fn import_root(&self, eng: &Engine) -> Result<PathBuf> {
         self.ensure_managed(eng)?;
-        self.lock_repo(eng)?;
-        let mut repo = Repo::open(Self::root(eng))?;
-        let added = repo.add_import(&req.name, Import { source: req.source, path: req.path, git_ref: req.git_ref });
-        self.refresh(eng)?;
-        Ok(import_updated(added?))
+        Ok(Self::root(eng).to_path_buf())
     }
 
     /// Removes an import (a draft change).
@@ -1035,6 +1111,18 @@ fn is_rejected_push(e: &sk1ll_core::Error) -> bool {
     let text = e.to_string();
     ["[rejected]", "non-fast-forward", "fetch first", "failed to push some refs"].iter().any(|m| text.contains(m))
         && !text.contains("unable to access")
+}
+
+/// Runs `f` (an import's network phase) on a blocking thread without the
+/// engine mutex.
+async fn unlocked<T: Send + 'static>(f: impl FnOnce() -> sk1ll_core::Result<T> + Send + 'static) -> Result<T> {
+    let out = tokio::task::spawn_blocking(f).await;
+    Ok(out.map_err(|e| Error::Internal(anyhow::anyhow!("import fetch task failed: {e}")))??)
+}
+
+/// An optional request field: empty means not given.
+fn given(s: &str) -> Option<&str> {
+    Some(s).filter(|s| !s.is_empty())
 }
 
 fn import_updated(r: sk1ll_core::UpdateReport) -> ImportUpdated {

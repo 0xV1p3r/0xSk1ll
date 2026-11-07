@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/button';
 import { Card, CardAction, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { api } from './api';
+import { AddImport } from './AddImport';
 import { useResource } from './hooks';
 import { Action, Confirm, Details, ErrorNotice, Loading, Nothing, Notice, When } from './shared';
 import { ago, shortSha, time } from './model';
@@ -74,6 +75,7 @@ export function Imports({ revision, changed, reviewDraft }: { revision: number; 
   const { data, error, loading } = useResource(api.imports, revision);
   const [updated, setUpdated] = useState<string>();
   return <>
+    <div className="flex justify-end"><AddImport changed={changed} reviewDraft={reviewDraft} /></div>
     <InDraft name={updated} reviewDraft={reviewDraft} />
     <ErrorNotice error={error} />{loading && !data && <Loading rows={2} />}
     {data && <><p className="text-xs text-muted-foreground">Last checked {ago(data.checked_at)}</p>

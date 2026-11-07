@@ -482,7 +482,14 @@ impl Repo {
             Ok(out.lines().filter_map(|l| l.split_once(' ')).map(|(h, s)| (h.into(), s.into())).collect())
         };
         let before = list()?;
-        self.git().args(["stash", "push", "--include-untracked", "--quiet", "-m", &message]).envs(committer).run()?;
+        // The whole worktree (`:/`), except imports being staged: those are
+        // left alone whatever the ignore rules say (a `.gitignore` can negate
+        // the exclude sk1ll adds).
+        let keep_stages = format!(":(top,exclude,glob)**/{}*/**", crate::source::STAGE_PREFIX);
+        self.git()
+            .args(["stash", "push", "--include-untracked", "--quiet", "-m", &message, "--", ":/", &keep_stages])
+            .envs(committer)
+            .run()?;
         let after = list()?;
         match after.first() {
             _ if after.len() == before.len() => Ok(None),
@@ -717,8 +724,11 @@ impl Repo {
             .run()?;
         let mut changed = BTreeMap::new();
         let mut add = |raw: &[u8], untracked: bool| {
-            let rel = raw.strip_prefix(prefix).unwrap_or(raw);
-            changed.insert(path_from_bytes(rel), untracked);
+            let rel = path_from_bytes(raw.strip_prefix(prefix).unwrap_or(raw));
+            // An import being staged, whatever `.gitignore` says.
+            if !crate::source::is_staging_path(&rel) {
+                changed.insert(rel, untracked);
+            }
         };
         let mut entries = out.split(|b| *b == 0).filter(|e| !e.is_empty());
         while let Some(entry) = entries.next() {
@@ -1050,6 +1060,39 @@ mod tests {
         assert_eq!(b.pull().unwrap(), PullOutcome::Updated { from: old, to: new });
         assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "v2\n");
         assert_eq!(b.pull().unwrap(), PullOutcome::UpToDate);
+    }
+
+    /// An import being staged while a pull stashes the draft stays where it
+    /// is, even with a `.gitignore` that negates sk1ll's exclude.
+    #[test]
+    fn pull_leaves_imports_being_staged_alone() {
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        write(&f.b.join(".git/info/exclude"), ".sk1ll-stage-*\n");
+        write(&f.b.join(".gitignore"), "!.sk1ll-stage-*/\n");
+        let staged = f.b.join("imported/.sk1ll-stage-1-2-3/tree/SKILL.md");
+        write(&staged, "being staged\n");
+        // A promoted, unpushed commit: the pull rebases, stashing the draft.
+        write(&f.b.join("instructions/style.md"), "b promoted\n");
+        b.promote(&[item("fragment:style")], "style from b", None).unwrap();
+        write(&f.b.join("instructions/git.md"), "b draft\n");
+        let draft = b.draft().unwrap();
+        assert!(draft.iter().all(|d| !d.item.to_string().contains(".sk1ll-stage-")), "{draft:?}");
+        // An old mtime: anything that sweeps the file away and puts it back
+        // (a stash and unstash) gives it a new one.
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        fs::File::options().write(true).open(&staged).unwrap().set_modified(old).unwrap();
+        let mtime = || fs::metadata(&staged).unwrap().modified().unwrap();
+
+        write(&f.a.join("personal/pdf/SKILL.md"), "v2\n");
+        a.promote(&[item("skill:pdf")], "v2", None).unwrap();
+        a.push().unwrap();
+        assert!(matches!(b.pull().unwrap(), PullOutcome::Updated { .. }));
+        assert_eq!(read(&staged), "being staged\n");
+        assert_eq!(mtime(), old, "never swept away and put back");
+        assert_eq!(b.draft().unwrap(), draft);
+        let stashed = git(&f.b, &["stash", "list"]);
+        assert_eq!(stashed, "", "the pull's stash is gone, with nothing of the stage in it");
     }
 
     #[test]

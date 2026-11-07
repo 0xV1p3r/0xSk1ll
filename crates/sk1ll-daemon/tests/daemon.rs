@@ -11,7 +11,10 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use sk1ll_daemon::DaemonState;
-use sk1ll_daemon::client::{Client, Connection, Event, PromoteRequest, PromoteResponse, ResetRequest, StatusView};
+use sk1ll_daemon::client::{
+    AddImportRequest, Client, Connection, Event, PromoteRequest, PromoteResponse, ResetRequest, ResolveImportRequest,
+    StatusView,
+};
 use sk1ll_proto::{
     Assignment, AssignmentChanges, AssignmentSnapshot, DaemonMessage, FleetView, HarnessAssignment, HubMessage,
     ItemRef, LogCause, LogEntry, MachineStatus, ToggleChange, ToggleKind,
@@ -1199,4 +1202,117 @@ async fn displaced_conflicts_report_to_hub_and_resolve() {
     m.client.discard_displaced("discard-me").await.unwrap();
     assert!(m.client.conflicts().await.unwrap().is_empty());
     assert!(m.status().await.report.conflicts.is_empty());
+}
+
+/// A pasted link is resolved without touching the repo, then one of its
+/// skills is added into the draft.
+#[tokio::test(flavor = "multi_thread")]
+async fn imports_resolve_links_and_add_one_skill() {
+    let hub = FakeHub::new().await;
+    let mut m = solo("solo", &hub.url(), Some(snapshot(1, &["x"])));
+    let source = m.home.path().join("source");
+    write(&source.join("skills/pdf"), "SKILL.md", "---\ndescription: Work with PDFs\n---\n");
+    write(&source.join("skills/x"), "SKILL.md", "---\ndescription: Clashes with personal x\n---\n");
+    git(&source, &["init", "--quiet", "-b", "main"]);
+    git(&source, &["add", "-A"]);
+    git(&source, &["commit", "--quiet", "-m", "skills"]);
+    let link = source.to_string_lossy().into_owned();
+    m.start().await;
+
+    let req = ResolveImportRequest { link: link.clone(), path: String::new() };
+    let r = m.client.resolve_import(&req).await.unwrap();
+    assert_eq!((r.source.as_str(), r.git_ref.as_str()), (link.as_str(), "HEAD"));
+    let found: Vec<_> = r.candidates.iter().map(|c| (c.path.as_str(), c.default_name.as_str(), c.taken)).collect();
+    assert_eq!(found, [("skills/pdf", "pdf", false), ("skills/x", "x", true)]);
+    assert_eq!(r.candidates[0].description.as_deref(), Some("Work with PDFs"));
+    assert!(m.client.draft().await.unwrap().is_empty(), "resolving leaves the repo alone");
+
+    let add = |path: Option<&str>| AddImportRequest {
+        name: String::new(), source: link.clone(), path: path.map(Into::into), git_ref: None, commit: None,
+    };
+    let err = m.client.add_import(&add(None)).await.unwrap_err();
+    assert_eq!(err.status, Some(400));
+    assert!(err.message.contains("skills/pdf, skills/x"), "{}", err.message);
+    // Upstream moves on after the preview; the previewed commit is what's added.
+    write(&source.join("skills/pdf"), "SKILL.md", "---\ndescription: v2\n---\n");
+    git(&source, &["commit", "--quiet", "-am", "v2"]);
+    let added = m.client.add_import(&AddImportRequest { commit: Some(r.commit.clone()), ..add(Some("skills/pdf")) })
+        .await.unwrap();
+    assert_eq!((added.name.as_str(), added.new_commit.as_str()), ("pdf", r.commit.as_str()));
+    let vendored = std::fs::read_to_string(m.repo().join("imported/pdf/SKILL.md")).unwrap();
+    assert!(vendored.contains("Work with PDFs"), "{vendored}");
+    let draft = eventually(|| async {
+        let d = m.client.draft().await.unwrap();
+        (!d.is_empty()).then_some(d)
+    }).await;
+    assert!(draft.iter().any(|d| d.item == ItemRef::Skill("pdf".into())), "{draft:?}");
+}
+
+/// A GitHub folder link with an explicit `ref` and an explicit root `path`
+/// (`""`, as the GUI sends it): both override the link. GitHub is a local
+/// repo here (`url.<dir>.insteadOf`).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_explicit_root_path_overrides_a_folder_link() {
+    let hub = FakeHub::new().await;
+    let gh = tempfile::tempdir().unwrap();
+    let source = gh.path().join("o/r.git");
+    write(&source, "SKILL.md", "---\ndescription: The root skill\n---\n");
+    write(&source.join("sub/pdf"), "SKILL.md", "---\ndescription: PDFs\n---\n");
+    git(&source, &["init", "--quiet", "-b", "main"]);
+    git(&source, &["add", "-A"]);
+    git(&source, &["commit", "--quiet", "-m", "skills"]);
+    let base = format!("file://{}/", gh.path().display());
+    let mut m = solo("solo", &hub.url(), Some(snapshot(1, &["x"])))
+        .with_env("GIT_CONFIG_COUNT", "1")
+        .with_env("GIT_CONFIG_KEY_0", &format!("url.{base}.insteadOf"))
+        .with_env("GIT_CONFIG_VALUE_0", "https://github.com/");
+    m.start().await;
+
+    let link = "https://github.com/o/r/tree/main/sub/pdf";
+    let r = m.client.resolve_import(&ResolveImportRequest { link: link.into(), path: String::new() }).await.unwrap();
+    assert_eq!((r.source.as_str(), r.git_ref.as_str()), ("github:o/r", "main"));
+    assert_eq!(r.candidates.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(), ["sub/pdf"]);
+
+    let req: AddImportRequest = serde_json::from_value(serde_json::json!({
+        "name": "", "source": link, "path": "", "ref": "HEAD",
+    })).unwrap();
+    let added = m.client.add_import(&req).await.unwrap();
+    assert_eq!((added.name.as_str(), added.new_commit.as_str()), ("r", r.commit.as_str()));
+    let vendored = std::fs::read_to_string(m.repo().join("imported/r/SKILL.md")).unwrap();
+    assert!(vendored.contains("The root skill"), "{vendored}");
+    let manifest = std::fs::read_to_string(m.repo().join("sk1ll.toml")).unwrap();
+    assert!(manifest.contains("[import.r]\nsource = \"github:o/r\"\nref = \"HEAD\""), "{manifest}");
+}
+
+/// A resolve stuck fetching (an ssh that never answers) holds up no other
+/// call, including ones that need the engine mutex, and ends at the git
+/// deadline.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hanging_fetch_blocks_no_other_call() {
+    let hub = FakeHub::new().await;
+    let probe = tempfile::tempdir().unwrap();
+    let pidfile = probe.path().join("ssh.pid");
+    let ssh = format!("sleep 30 & echo $! > '{}'; wait; :", pidfile.display());
+    let mut m = solo("solo", &hub.url(), Some(snapshot(1, &["x"])))
+        .with_env("GIT_SSH_COMMAND", &ssh)
+        .with_env("GIT_SSH_VARIANT", "simple")
+        .with_env("SK1LL_GIT_TIMEOUT", "4s");
+    m.start().await;
+
+    let client = m.client.clone();
+    let req = ResolveImportRequest { link: "ssh://sk1ll.invalid/slow.git".into(), path: String::new() };
+    let stuck = tokio::spawn(async move { client.resolve_import(&req).await });
+    eventually(|| async { pidfile.exists().then_some(()) }).await;
+
+    let started = std::time::Instant::now();
+    m.client.status().await.unwrap();
+    m.client.items().await.unwrap();
+    m.client.draft().await.unwrap();
+    m.client.sync(&Default::default()).await.unwrap();
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_secs(2), "other calls waited {elapsed:?} for the fetch");
+    assert!(!stuck.is_finished(), "the fetch was still hanging");
+
+    let err = stuck.await.unwrap().unwrap_err();
+    assert!(err.message.contains("timed out"), "{}", err.message);
 }

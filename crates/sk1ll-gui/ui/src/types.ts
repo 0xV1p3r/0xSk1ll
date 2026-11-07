@@ -69,3 +69,8 @@ export type DaemonEvent = { type: 'status' | 'draft' | 'fleet' } | { type: 'assi
 export interface ItemView {
   item: ItemRef; in_baseline: boolean; draft: DraftEntry['change'] | null; unpushed: boolean; description: string | null;
 }
+
+export interface SkillCandidate { path: string; default_name: string; description: string | null; taken: boolean }
+export interface ResolvedSource { source: string; git_ref: string; commit: string; candidates: SkillCandidate[] }
+export interface ResolveRequest { link: string; path?: string }
+export interface AddImportRequest { name: string; source: string; path: string; ref: string; commit?: string }

@@ -809,7 +809,7 @@ fn place(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 /// `rename`, failing with `AlreadyExists` instead of replacing; see [`place`].
-fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     {
         use std::os::unix::ffi::OsStrExt;

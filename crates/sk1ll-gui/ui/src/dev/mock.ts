@@ -106,6 +106,22 @@ export function installMock(scenario: string) {
       case 'recovered': return delay(recovered);
       case 'harnesses': return delay(harnesses);
       case 'imports': return delay(imports);
+      // A tree/blob link resolves one Skill; a repository link resolves several.
+      case 'resolve_import': {
+        const request = a.request as T.ResolveRequest;
+        const single = /\/(tree|blob)\//.test(request.link);
+        return delay({ source: 'github:example/skills', git_ref: 'main', commit: 'c0ffee1234567890',
+          candidates: (single ? ['pdf'] : ['pdf', 'writing']).map(name => ({ path: `skills/${name}`,
+            default_name: name, description: `Tools for ${name}.`, taken: items.some(i => i.item === `skill:${name}`) })) });
+      }
+      case 'add_import': {
+        const request = a.request as T.AddImportRequest;
+        if (items.some(i => i.item === `skill:${request.name}`))
+          return Promise.reject({ message: 'Import name already exists', status: 409, unreachable: false });
+        items.push({ item: `skill:${request.name}`, in_baseline: false, draft: 'added', unpushed: false, description: null });
+        draft.push({ item: `skill:${request.name}`, change: 'added', paths: [`imported/${request.name}/SKILL.md`], fingerprint: 'new' });
+        return delay({ name: request.name, old_commit: null, new_commit: 'c0ffee1234567890', changed: true });
+      }
       case 'log': return delay(log);
       case 'join_code': return delay({ code: 'sk1ll-join-7Q2M-XK9P-44RD-ZT8W' });
       case 'connection_info': return delay('/run/user/1000/sk1ll/daemon.sock', 10);
