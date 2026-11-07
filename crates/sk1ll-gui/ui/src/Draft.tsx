@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 import { Badge } from '@/components/ui/badge';
+import { ArrowUpFromLine, ChevronRight } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Field, FieldLabel, FieldSet, FieldLegend } from '@/components/ui/field';
 import { Textarea } from '@/components/ui/textarea';
@@ -9,28 +11,39 @@ import { api } from './api';
 import { useMutation, useResource } from './hooks';
 import { Action, ErrorNotice, Loading, Nothing, Notice, Pending } from './shared';
 import { captureReview, confirmReview, loadDraft, reconcileReview, type DraftReview } from './draftReview';
-import type { PromoteResponse, PullResult, StatusView } from './types';
+import type { DraftEntry, PromoteResponse, PullResult, StatusView } from './types';
 
 function Diff({ item, diff }: { item: string; diff: string }) {
-  return <pre className="diff" aria-label={`Unified diff for ${item}`}>
+  return <pre tabIndex={0} className="diff mt-2 max-h-[32rem] overflow-auto rounded-md border bg-muted/40 p-3 font-mono text-xs leading-relaxed outline-none [tab-size:4] focus-visible:ring-3 focus-visible:ring-ring/50"
+    aria-label={`Unified diff for ${item}`}>
     {diff ? diff.split('\n').map((line, i) => <span key={i}
       data-kind={line.startsWith('+') ? 'add' : line.startsWith('-') ? 'delete' : line.startsWith('@@') ? 'hunk' : undefined}>
-      {line}{'\n'}</span>) : 'No textual diff.'}</pre>;
+      {line}{'\n'}</span>) : <span className="text-muted-foreground">No textual diff.</span>}</pre>;
 }
+const changeTone = { added: 'success', modified: 'info', deleted: 'destructive' } as const;
 function DraftItem({ item, change, paths, diff, checked, toggle, disabled }: {
-  item: string; change: string; paths: string[]; diff: string; checked: boolean; toggle: () => void; disabled: boolean;
+  item: string; change: DraftEntry['change']; paths: string[]; diff: string; checked: boolean; toggle: () => void; disabled: boolean;
 }) {
-  return <div className="draft-item"><div className="row"><Checkbox aria-label={`Select ${item}`} checked={checked}
-    onCheckedChange={toggle} disabled={disabled} /><code>{item}</code><Badge variant="outline">{change}</Badge></div>
-    <details><summary>Diff <span className="meta">{paths.join(', ')}</span></summary><Diff item={item} diff={diff} /></details></div>;
+  return <Collapsible className="px-4 py-3">
+    <div className="flex flex-wrap items-center gap-3">
+      <Checkbox aria-label={`Select ${item}`} checked={checked} onCheckedChange={toggle} disabled={disabled} />
+      <code className="font-mono text-sm font-medium">{item}</code><Badge variant={changeTone[change]}>{change}</Badge>
+      <span className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground" title={paths.join(', ')}>{paths.join(', ')}</span>
+      <CollapsibleTrigger render={<Button variant="ghost" size="sm" className="group/diff" aria-label={`Diff for ${item}`} />}>
+        <ChevronRight className="transition-transform group-data-panel-open/diff:rotate-90" />Diff</CollapsibleTrigger>
+    </div>
+    <CollapsibleContent><Diff item={item} diff={diff} /></CollapsibleContent>
+  </Collapsible>;
 }
 function ReviewNotice({ review, disabled, accept }: { review: DraftReview; disabled: boolean; accept: () => void }) {
-  return <>{review.changes.length > 0 && <Notice title="Draft changed. Review required">
-    <ul>{review.changes.map(change => <li key={change}>{change}</li>)}</ul>
+  return <>{review.changes.length > 0 && <Notice title="Draft changed. Review required" tone="destructive">
+    <ul className="list-disc pl-4">{review.changes.map(change => <li key={change}>{change}</li>)}</ul>
     <p>Review the updated items below. Newly added items are excluded from this action.</p>
-    <Button variant="outline" disabled={disabled} onClick={accept}>Review updated Draft</Button>
+    <div><Button variant="outline" size="sm" className="mt-1" disabled={disabled} onClick={accept}>Review updated Draft</Button></div>
   </Notice>}{review.snapshot.filter(entry => review.items.includes(entry.item)).map(entry =>
-    <details key={entry.item}><summary>{entry.item}</summary><Diff item={entry.item} diff={entry.diff} /></details>)}</>;
+    <Collapsible key={entry.item}><CollapsibleTrigger render={<Button variant="ghost" size="sm" className="group/diff -ml-2" />}>
+      <ChevronRight className="transition-transform group-data-panel-open/diff:rotate-90" /><code className="font-mono">{entry.item}</code>
+    </CollapsibleTrigger><CollapsibleContent><Diff item={entry.item} diff={entry.diff} /></CollapsibleContent></Collapsible>)}</>;
 }
 export function Draft({ revision, status, changed }: { revision: number; status: StatusView; changed: () => void }) {
   const { data, error, loading } = useResource(loadDraft, revision);
@@ -51,41 +64,48 @@ export function Draft({ revision, status, changed }: { revision: number; status:
   const resetReview = reset && data && reconcileReview(reset.review, data);
   const reviewDisabled = loading || !!error || mutation.pending;
   const items = selected.filter(item => data?.some(d => d.item === item));
-  return <><p className="description">This Machine's Draft is live in its Harnesses. Promote sends selected items to the Fleet Baseline.</p>
-    {(status.report.blocked || status.report.clashes.length > 0) && <Notice title="Blocked">
+  const all = !!data?.length && items.length === data.length;
+  return <>
+    {(status.report.blocked || status.report.clashes.length > 0) && <Notice title="Blocked" tone="destructive">
       The new Baseline clashes with this Draft. Promote or Reset the clashing items, then Pull.
-      <p>{status.report.clashes.join(', ')}</p></Notice>}
-    <div className="toolbar"><Button disabled={!items.length || prefill.pending || reviewDisabled}
-      onClick={() => {
-        if (!data) return;
-        const review = captureReview(data, items);
-        void prefill.run(() => api.promoteMessage(review.items), value => setPromote({ review, message: value.message }));
-      }}>
-      <Pending pending={prefill.pending}>Promote {items.length > 0 ? `(${items.length})` : ''}</Pending></Button>
-      <Button variant="destructive" size="sm" disabled={!items.length || reviewDisabled}
+      <p className="font-mono text-xs">{status.report.clashes.join(', ')}</p></Notice>}
+    <div className="flex flex-wrap items-center gap-2">
+      <Button disabled={!items.length || prefill.pending || reviewDisabled}
+        onClick={() => {
+          if (!data) return;
+          const review = captureReview(data, items);
+          void prefill.run(() => api.promoteMessage(review.items), value => setPromote({ review, message: value.message }));
+        }}>
+        <Pending pending={prefill.pending}><ArrowUpFromLine data-icon="inline-start" />Promote {items.length > 0 ? `(${items.length})` : ''}</Pending></Button>
+      <Button variant="destructive" disabled={!items.length || reviewDisabled}
         onClick={() => data && setReset({ review: captureReview(data, items), all: false })}>Reset selected</Button>
-      <Button variant="destructive" size="sm" disabled={!data?.length || reviewDisabled}
+      <Button variant="ghost" className="text-destructive hover:text-destructive" disabled={!data?.length || reviewDisabled}
         onClick={() => data && setReset({ review: captureReview(data, data.map(entry => entry.item), true), all: true })}>Reset all</Button>
-      <Action label="Pull" action={async () => { const value = await api.pull(); setPull(value); }} onDone={changed} />
+      <div className="ml-auto"><Action label="Pull Baseline" action={async () => { const value = await api.pull(); setPull(value); }} onDone={changed} /></div>
     </div><ErrorNotice error={error} /><ErrorNotice error={prefill.error} />
-    {pull && <Notice title={pull.state === 'blocked' ? 'Blocked' : 'Pull complete'}>
+    {pull && <Notice title={pull.state === 'blocked' ? 'Blocked' : 'Pull complete'} tone={pull.state === 'blocked' ? 'destructive' : 'default'}>
       {pull.state === 'blocked' ? `Clashes: ${pull.items.join(', ')}` : pull.state === 'updated' ? `Baseline ${pull.to}` : 'Already on the latest Baseline.'}
     </Notice>}
-    {result && <Notice title="Promote complete"><code>{result.sha}</code>
+    {result && <Notice title="Promote complete"><code className="font-mono text-xs">{result.sha}</code>
       <p>{result.pushed ? 'Pushed to the Hub.' : 'Unpushed. The Daemon queued this Promote until it can reach the Hub.'}</p>
       {result.push_error && <p>{result.push_error}</p>}</Notice>}
-    {loading && !data && <Loading />}{data?.length === 0 && <Nothing>This Machine has no Draft changes.</Nothing>}
-    {!!data?.length && <FieldSet><FieldLegend>Draft items</FieldLegend>
-      <div className="toolbar"><Button variant="ghost" size="sm" disabled={mutation.pending}
-        onClick={() => setSelected(items.length === data.length ? [] : data.map(d => d.item))}>
-        {items.length === data.length ? 'Clear checkboxes' : 'Check all items'}</Button></div>
-      {data.map(entry => <DraftItem key={entry.item} {...entry} checked={items.includes(entry.item)}
-        disabled={mutation.pending} toggle={() => setSelected(previous => previous.includes(entry.item)
-          ? previous.filter(i => i !== entry.item) : [...previous, entry.item])} />)}
+    {loading && !data && <Loading />}{data?.length === 0 && <Nothing title="Draft is clean">This Machine has no Draft changes.</Nothing>}
+    {!!data?.length && <FieldSet className="gap-0"><FieldLegend className="sr-only">Draft items</FieldLegend>
+      <div className="divide-y overflow-hidden rounded-lg border">
+        <div className="flex items-center gap-3 bg-muted/50 px-4 py-2 text-sm">
+          <Checkbox aria-label={all ? 'Clear checkboxes' : 'Check all items'} checked={all}
+            indeterminate={items.length > 0 && !all} disabled={mutation.pending}
+            onCheckedChange={() => setSelected(all ? [] : data.map(d => d.item))} />
+          <span className="text-muted-foreground">{items.length ? `${items.length} of ${data.length} selected` : `${data.length} Draft items`}</span>
+        </div>
+        {data.map(entry => <DraftItem key={entry.item} {...entry} checked={items.includes(entry.item)}
+          disabled={mutation.pending} toggle={() => setSelected(previous => previous.includes(entry.item)
+            ? previous.filter(i => i !== entry.item) : [...previous, entry.item])} />)}
+      </div>
     </FieldSet>}
     <Dialog open={!!promote} onOpenChange={open => { if (!open && !mutation.pending) setPromote(undefined); }}>
       <DialogContent showCloseButton={!mutation.pending}><DialogHeader><DialogTitle>Promote to Baseline</DialogTitle>
-        <DialogDescription>{promoteReview?.items.join(', ') || 'No selected items remain in Draft.'}</DialogDescription></DialogHeader>
+        <DialogDescription>{promoteReview?.items.length ? `${promoteReview.items.length} Draft ${promoteReview.items.length === 1 ? 'item' : 'items'} selected. Expand an item to review its diff.` : 'No selected items remain in Draft.'}</DialogDescription></DialogHeader>
         {promoteReview && <ReviewNotice review={promoteReview} disabled={reviewDisabled}
           accept={() => setPromote(value => value && { ...value, review: confirmReview(promoteReview) })} />}
         <ErrorNotice error={error} />

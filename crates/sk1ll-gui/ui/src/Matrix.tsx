@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { RotateCcw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Checkbox } from '@/components/ui/checkbox';
@@ -7,6 +8,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { api, errorMessage } from './api';
 import { applyToggle, cellState, emptyHarness, itemStateLabel, mergeAssignments, splitItem } from './model';
 import { useResource } from './hooks';
+import { cn } from '@/lib/utils';
 import { ErrorNotice, Loading, Nothing, Pending } from './shared';
 import type { CachedAssignmentSnapshot as AssignmentSnapshot, ItemView, StatusView, ToggleChange } from './types';
 
@@ -71,40 +73,68 @@ export function Matrix({ revision, status }: { revision: number; status: StatusV
   const cell = (item: ItemView, machine: string, harness: string) => {
     const state = cellState(assignment(machine), harness, item.item);
     const localOnly = !item.in_baseline && machine !== status.machine_id;
+    const { kind, name } = splitItem(item.item);
     const reason = localOnly ? `${itemStateLabel(item)}. This item can only be assigned on this Machine until it reaches the Baseline.`
-      : `${state.explicit ? 'Explicit Assignment' : 'Inherited from the default'}. Toggle to set an explicit Assignment.`;
-    return <TableCell key={`${machine}/${harness}`}><Tooltip><TooltipTrigger render={<span className="cell" tabIndex={localOnly ? 0 : undefined} />}>
-      <Checkbox checked={state.enabled} disabled={localOnly || pending[machine]}
-        aria-label={`${item.item} in ${machine} / ${harness}, ${state.explicit ? 'explicit' : 'inherited'}`}
-        onCheckedChange={enabled => void write(machine, { harness, kind: splitItem(item.item).kind as 'skill' | 'fragment',
-          name: splitItem(item.item).name, enabled })} />
-      <span className="cell-origin">{state.explicit ? 'Explicit' : 'Default'}</span>
-      {state.explicit && !localOnly && <Button size="xs" variant="ghost" disabled={pending[machine]}
+      : state.explicit ? 'Explicit Assignment. Use the reset button to inherit the Harness default.'
+        : 'Inherited from the Harness default. Toggle to set an explicit Assignment.';
+    return <TableCell key={`${machine}/${harness}`} className="border-l"><div className="flex h-7 items-center gap-1.5">
+      <Tooltip><TooltipTrigger render={<span className="inline-flex items-center gap-1.5 rounded-sm focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+        tabIndex={localOnly ? 0 : undefined} role={localOnly ? 'group' : undefined}
+        aria-label={localOnly ? `${item.item} in ${machine} / ${harness}, unavailable` : undefined} aria-description={localOnly ? reason : undefined} />}>
+        <Checkbox checked={state.enabled} disabled={localOnly || pending[machine]}
+          aria-label={`${item.item} in ${machine} / ${harness}, ${state.explicit ? 'explicit' : 'inherited'}`}
+          aria-description={localOnly ? reason : undefined}
+          onCheckedChange={enabled => void write(machine, { harness, kind: kind as 'skill' | 'fragment', name, enabled })} />
+        <span className={cn('text-xs', state.explicit ? 'font-medium text-foreground' : 'text-muted-foreground')}>
+          {state.explicit ? 'Explicit' : 'Default'}</span>
+      </TooltipTrigger><TooltipContent className="max-w-64">{reason}</TooltipContent></Tooltip>
+      {state.explicit && !localOnly && <Tooltip><TooltipTrigger render={<Button size="icon-xs" variant="ghost" disabled={pending[machine]}
         aria-label={`Use default for ${item.item} in ${machine} / ${harness}`}
-        onClick={() => void write(machine, { harness, kind: splitItem(item.item).kind as 'skill' | 'fragment',
-          name: splitItem(item.item).name, enabled: null })}>Inherit</Button>}
-    </TooltipTrigger><TooltipContent>{reason}</TooltipContent></Tooltip></TableCell>;
+        onClick={() => void write(machine, { harness, kind: kind as 'skill' | 'fragment', name, enabled: null })} />}>
+        <RotateCcw /></TooltipTrigger><TooltipContent>Inherit the Harness default</TooltipContent></Tooltip>}
+    </div></TableCell>;
   };
-  return <><p className="description">Assignment takes effect immediately. Explicit toggles override a Harness default.</p>
+  const saving = Object.entries(pending).filter(([, value]) => value).map(([id]) => id);
+  return <>
     <ErrorNotice error={resource.error} />{Object.entries(errors).filter(([, value]) => value).map(([id, error]) =>
       <ErrorNotice key={id} error={`${id}: ${error}`} />)}
-    {Object.entries(pending).filter(([, value]) => value).map(([id]) => <p key={id} role="status"><Pending pending>Saving Assignment for {id}…</Pending></p>)}
-    <Table className="matrix"><TableHeader><TableRow><TableHead rowSpan={2}>Skill / Fragment</TableHead>
-      {groups.filter(g => g.harnesses.length).map(g => <TableHead key={g.machine.id} colSpan={g.harnesses.length}>
-        {g.machine.id}{g.machine.id === status.machine_id && ' (this Machine)'}</TableHead>)}</TableRow><TableRow>
-      {columns.map(c => <TableHead key={`${c.machine}/${c.harness}`}>{c.harness}</TableHead>)}
-    </TableRow></TableHeader><TableBody>
-      {(['skill', 'fragment'] as const).map(kind => <TableRow key={kind}><TableCell>Default for new {kind === 'skill' ? 'Skills' : 'Fragments'}</TableCell>
-        {columns.map(c => <TableCell key={`${c.machine}/${c.harness}`}><Checkbox
-          checked={(assignment(c.machine).harnesses[c.harness] ?? emptyHarness())[kind === 'skill' ? 'new_skills_default' : 'new_fragments_default']}
-          disabled={pending[c.machine]} aria-label={`Default for new ${kind}s in ${c.machine} / ${c.harness}`}
-          onCheckedChange={enabled => void write(c.machine, { harness: c.harness,
-            kind: kind === 'skill' ? 'new_skills_default' : 'new_fragments_default', enabled })} /></TableCell>)}</TableRow>)}
-      {items.map(item => <TableRow key={item.item}><TableCell><div className="item-label"><code>{item.item}</code>
-        {itemStateLabel(item) && <Badge variant="outline">{itemStateLabel(item)}</Badge>}</div>
-        {item.description && <p className="meta item-description">{item.description}</p>}</TableCell>
-        {columns.map(c => cell(item, c.machine, c.harness))}</TableRow>)}
-    </TableBody></Table>{!items.length && <Nothing>Add a Skill or Fragment to this Machine's Draft to get started.</Nothing>}
-    {!columns.length && <Nothing>No Harnesses reported. Check the Machine configuration in Settings.</Nothing>}
+    <div className="flex min-h-5 flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
+      <span className="font-medium text-foreground">Default</span><span>inherits the Harness default</span>
+      <span className="font-medium text-foreground">Explicit</span><span>overrides it for one Harness</span>
+      <span id="default-hint" className="basis-full">Changing a default for new Skills or Fragments applies to items added later.
+        Existing items keep their current value as an explicit Assignment.</span>
+      {saving.length > 0 && <span role="status" className="ml-auto inline-flex items-center gap-1.5 text-foreground">
+        <Pending pending>Saving Assignment for {saving.join(', ')}…</Pending></span>}
+    </div>
+    {columns.length > 0 && <div className="overflow-hidden rounded-lg border"><Table aria-label="Assignment matrix" className="[&_tr:hover_th[scope=row]]:bg-muted/50">
+      <TableHeader><TableRow className="bg-muted hover:bg-muted">
+        <TableHead rowSpan={2} scope="col" className="sticky left-0 z-10 min-w-48 bg-muted align-bottom md:min-w-64">Skill / Fragment</TableHead>
+        {groups.filter(g => g.harnesses.length).map(g => <TableHead key={g.machine.id} scope="colgroup" colSpan={g.harnesses.length} className="border-l">
+          {g.machine.id}{g.machine.id === status.machine_id && <Badge variant="outline" className="ml-2 bg-background">This Machine</Badge>}</TableHead>)}
+      </TableRow><TableRow className="bg-muted hover:bg-muted">
+        {columns.map(c => <TableHead key={`${c.machine}/${c.harness}`} scope="col" className="h-8 min-w-32 border-l text-xs font-normal text-muted-foreground">{c.harness}</TableHead>)}
+      </TableRow></TableHeader>
+      <TableBody>
+        {(['skill', 'fragment'] as const).map(kind => <TableRow key={kind}>
+          <TableHead scope="row" className="sticky left-0 z-10 h-auto bg-background py-3 whitespace-normal">
+            <span className="font-medium">Default for new {kind === 'skill' ? 'Skills' : 'Fragments'}</span></TableHead>
+          {columns.map(c => <TableCell key={`${c.machine}/${c.harness}`} className="border-l"><div className="flex h-7 items-center"><Checkbox
+            checked={(assignment(c.machine).harnesses[c.harness] ?? emptyHarness())[kind === 'skill' ? 'new_skills_default' : 'new_fragments_default']}
+            disabled={pending[c.machine]} aria-label={`Default for new ${kind}s in ${c.machine} / ${c.harness}`} aria-describedby="default-hint"
+            onCheckedChange={enabled => void write(c.machine, { harness: c.harness,
+              kind: kind === 'skill' ? 'new_skills_default' : 'new_fragments_default', enabled })} /></div></TableCell>)}
+        </TableRow>)}
+        {items.map(item => <TableRow key={item.item}>
+          <TableHead scope="row" className="sticky left-0 z-10 h-auto max-w-80 bg-background py-2 font-normal whitespace-normal">
+            <div className="flex flex-wrap items-center gap-2"><code className="font-mono text-xs font-medium">{item.item}</code>
+              {itemStateLabel(item) && <Badge variant="outline">{itemStateLabel(item)}</Badge>}</div>
+            {item.description && <p className="mt-1 text-xs text-muted-foreground">{item.description}</p>}
+          </TableHead>
+          {columns.map(c => cell(item, c.machine, c.harness))}
+        </TableRow>)}
+      </TableBody>
+    </Table></div>}
+    {!items.length && <Nothing title="No Skills or Fragments">Add a Skill or Fragment to this Machine's Draft to get started.</Nothing>}
+    {!columns.length && <Nothing title="No Harnesses">No Harnesses reported. Check the Machine configuration in Settings.</Nothing>}
   </>;
 }

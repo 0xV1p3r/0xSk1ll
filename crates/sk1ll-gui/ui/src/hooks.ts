@@ -6,13 +6,14 @@ export function useResource<T>(load: () => Promise<T>, revision: number, merge =
   const [data, setData] = useState<T>();
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
+  const [updatedAt, setUpdatedAt] = useState<number>();
   const generation = useRef(0);
   const refresh = useCallback(async () => {
     const current = ++generation.current;
     setLoading(true);
     try {
       const value = await load();
-      if (current === generation.current) { setData(previous => merge(previous, value)); setError(''); }
+      if (current === generation.current) { setData(previous => merge(previous, value)); setError(''); setUpdatedAt(Date.now() / 1000); }
     } catch (e) { if (current === generation.current) setError(errorMessage(e)); }
     finally { if (current === generation.current) setLoading(false); }
   }, [load, merge]);
@@ -21,7 +22,7 @@ export function useResource<T>(load: () => Promise<T>, revision: number, merge =
     void refresh();
     return () => { counter.current++; };
   }, [refresh, revision]);
-  return { data, setData, error, loading, refresh };
+  return { data, setData, error, loading, refresh, updatedAt };
 }
 export function useMutation(onSuccess?: () => void) {
   const [pending, setPending] = useState(false);

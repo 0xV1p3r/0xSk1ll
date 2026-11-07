@@ -4,10 +4,15 @@ import * as React from "react"
 import { cn } from "@/lib/utils"
 
 function Table({ className, ...props }: React.ComponentProps<"table">) {
+  // A labelled table gets a focusable scroll region for keyboard scrolling.
+  const label = props["aria-label"]
   return (
     <div
       data-slot="table-container"
-      className="relative w-full overflow-x-auto"
+      role={label ? "region" : undefined}
+      aria-label={label}
+      tabIndex={label ? 0 : undefined}
+      className="relative w-full overflow-x-auto outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
     >
       <table
         data-slot="table"
