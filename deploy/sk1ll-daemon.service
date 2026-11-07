@@ -1,0 +1,36 @@
+# systemd user unit for the 0xSk1ll daemon.
+#
+#   sk1ll join https://hub.example <join-code>
+#   cp deploy/sk1ll-daemon.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now sk1ll-daemon
+#   loginctl enable-linger "$USER"   # optional: keep running while logged out
+#
+# Logs: journalctl --user -u sk1ll-daemon (RUST_LOG=debug for more).
+#
+# While it runs, the daemon holds the repo's engine lock: `sk1ll` commands
+# that change the repo go through it, and it refuses to start while another
+# sk1ll process holds the lock (Restart= below retries). `sk1ll join` after a
+# removal also goes through it; the daemon then restarts itself in place
+# (same PID) with the new credentials, so no `systemctl restart` is needed.
+# The machine token lives only in ~/.config/sk1ll/daemon.json (mode 0600).
+[Unit]
+Description=0xSk1ll daemon: keeps this machine's harnesses in step with the fleet
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# Adjust if sk1ll isn't installed with `cargo install`.
+ExecStart=%h/.cargo/bin/sk1ll daemon
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+# Files it creates (state, snapshot, outbox, socket) are private to the user.
+UMask=0077
+# The local API socket goes to $XDG_RUNTIME_DIR/sk1ll/daemon.sock; that
+# directory must belong to the user and be mode 0700, or the daemon refuses
+# to start.
+
+[Install]
+WantedBy=default.target

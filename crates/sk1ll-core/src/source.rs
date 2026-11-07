@@ -1,12 +1,11 @@
-//! Fetching imports from git. Shells out to the `git` binary so auth (SSH
-//! agent, credential helpers) behaves exactly like the user's own git.
+//! Fetching imports from git (via the `git` binary, see [`crate::git`]).
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
+use crate::git::Git;
 use crate::hash::hex;
 use crate::manifest::Import;
 use crate::{Error, IoExt, Result};
@@ -92,18 +91,5 @@ fn cache_dir_for(url: &str) -> PathBuf {
 }
 
 fn git(dir: &Path, args: &[&str], env: &[(&str, &Path)]) -> Result<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .envs(env.iter().copied())
-        .output()
-        .map_err(|e| Error::Git { args: args.join(" "), stderr: e.to_string() })?;
-    if !out.status.success() {
-        return Err(Error::Git {
-            args: args.join(" "),
-            stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
-        });
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    env.iter().fold(Git::new(dir).args(args), |g, (k, v)| g.env(k, v)).text()
 }

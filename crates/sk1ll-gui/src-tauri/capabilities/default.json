@@ -1,0 +1,6 @@
+{
+  "identifier": "desktop",
+  "description": "Local desktop window event subscriptions. No filesystem, shell or network plugins.",
+  "windows": ["main"],
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
+}

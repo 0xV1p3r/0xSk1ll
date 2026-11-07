@@ -1,0 +1,71 @@
+// Daemon serde contract: sk1ll-daemon/src/client.rs and sk1ll-proto/src/lib.rs.
+// ItemRef and PathBuf serialize as strings; timestamps are Unix seconds.
+export type ItemRef = string;
+export type MachineStatus = 'offline' | 'blocked' | 'conflict' | 'behind' | 'drafting' | 'in_sync';
+export type Connection = 'connecting' | 'connected' | 'offline' | 'auth_rejected' | 'revoked';
+export interface MachineReport {
+  baseline: string | null; drafts: ItemRef[]; unpushed: ItemRef[];
+  conflicts: { item: ItemRef; harness: string }[]; harnesses: string[];
+  blocked: boolean; clashes: ItemRef[]; behind: boolean;
+}
+export interface StatusView {
+  machine_id: string; hub_url: string; repo: string; headline: MachineStatus; connection: Connection;
+  last_error: string | null; revoked: boolean; hub_baseline: string | null; assignment_revision: number;
+  awaiting_assignment: boolean; auth_rejected_since: number | null; pending_discards: number; report: MachineReport;
+}
+export interface MachineRow {
+  id: string; status: MachineStatus; connected: boolean; joined_at: number; last_seen: number | null;
+  report: MachineReport | null;
+}
+export interface FleetView { baseline: string | null; machines: MachineRow[] }
+export interface HarnessAssignment {
+  new_skills_default: boolean; new_fragments_default: boolean;
+  skills: Record<string, boolean>; fragments: Record<string, boolean>;
+}
+export interface Assignment { harnesses: Record<string, HarnessAssignment> }
+export type ToggleKind = 'skill' | 'fragment' | 'new_skills_default' | 'new_fragments_default';
+export interface ToggleChange { harness: string; kind: ToggleKind; name?: string; enabled: boolean | null }
+export interface AssignmentChanges { changes: ToggleChange[] }
+export interface AssignmentSnapshot extends Assignment { revision: number }
+export interface CachedAssignmentSnapshot { assignment: Assignment; revision: number }
+export interface AssignmentUpdate extends CachedAssignmentSnapshot { entries: LogEntry[] }
+export type LogCause = { type: 'change' | 'item_removed' | 'default_materialized' | 'machine_removed' | 'harness_added' }
+  | { type: 'undo'; entry: number };
+export interface LogEntry {
+  id: number; at: number; author: string; machine: string; harness: string; kind: ToggleKind;
+  name: string | null; before: boolean | null; after: boolean | null; cause: LogCause;
+}
+export interface LogQuery { machine?: string; before?: number; limit?: number }
+// The GUI bridge adds a byte fingerprint to the Daemon's Draft entry.
+export interface DraftEntry { item: ItemRef; change: 'added' | 'modified' | 'deleted'; paths: string[]; fingerprint: string }
+export interface DiffView { item: ItemRef; diff: string }
+export interface PromoteMessage { items: ItemRef[]; message: string }
+export interface PromoteRequest { items: string[]; message?: string; author?: string }
+export interface PromoteResponse { sha: string; items: ItemRef[]; message: string; pushed: boolean; push_error: string | null }
+export interface ResetRequest { items: string[]; all: boolean }
+export interface ResetResponse { discarded: ItemRef[] }
+export type PullResult = { state: 'up_to_date' } | { state: 'updated'; from: string | null; to: string }
+  | { state: 'blocked'; baseline: string; items: ItemRef[] };
+export interface ConflictView {
+  kind?: string; id?: string; item?: ItemRef; path?: string; displaced_at?: number;
+  harness: string; name: string; items: ItemRef[]; dest: string; reason: string | null; adoptable: boolean;
+}
+export interface ConflictTarget { harness: string; name: string }
+export interface HarnessView {
+  name: string; origin: string;
+  harness: { skills: string | null; instructions: string | null; instructions_format: 'block' | 'rules'; mode: 'symlink' | 'copy' };
+}
+export interface ImportUpdate { name: string; source: string; ref: string; locked: string; upstream: string }
+export interface ImportsView { checked_at: number | null; updates: ImportUpdate[]; errors: { name: string; message: string }[] }
+export interface ImportUpdated { name: string; old_commit: string | null; new_commit: string; changed: boolean }
+export interface JoinApiRequest { hub_url: string; code: string; machine_id?: string; copy_from?: string; repo?: string }
+export interface Joined { machine_id: string; repo: string; setup: 'cloned' | 'initialized' | 'adopted'; harnesses: string[]; revision: number }
+export interface JoinCode { code: string }
+export interface CommandError { message: string; status: number | null; unreachable: boolean }
+export interface DaemonConnection { reachable: boolean; message: string | null; retry_in_ms: number }
+export type DaemonEvent = { type: 'status' | 'draft' | 'fleet' } | { type: 'assignment'; revision: number }
+  | { type: 'imports'; updates: ImportUpdate[] };
+
+export interface ItemView {
+  item: ItemRef; in_baseline: boolean; draft: DraftEntry['change'] | null; unpushed: boolean; description: string | null;
+}
