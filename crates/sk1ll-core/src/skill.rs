@@ -36,6 +36,9 @@ pub fn discover(root: &Path) -> Result<Vec<Skill>> {
         }
         for entry in fs::read_dir(&dir).at(&dir)? {
             let path = entry.at(&dir)?.path();
+            if path.file_name().is_some_and(|n| crate::source::is_staging_path(Path::new(n))) {
+                continue;
+            }
             let skill_md = path.join("SKILL.md");
             if !skill_md.is_file() {
                 continue;

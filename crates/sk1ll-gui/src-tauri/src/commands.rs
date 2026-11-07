@@ -66,6 +66,8 @@ command!(overwrite(target: ConflictTarget) -> (), overwrite(&target));
 command!(adopt_displaced(id: String) -> (), adopt_displaced(&id));
 command!(discard_displaced(id: String) -> (), discard_displaced(&id));
 command!(harnesses() -> Vec<HarnessView>, harnesses());
+command!(resolve_import(request: ResolveImportRequest) -> ResolvedSource, resolve_import(&request));
+command!(add_import(request: AddImportRequest) -> ImportUpdated, add_import(&request));
 command!(imports() -> ImportsView, imports());
 command!(update_import(name: String) -> ImportUpdated, update_import(&name));
 command!(assignment(machine: String) -> AssignmentSnapshot, assignment(&machine));

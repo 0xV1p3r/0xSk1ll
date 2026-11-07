@@ -80,6 +80,10 @@ fn targets(roots: &[WatchRoot]) -> Vec<Target> {
 
 /// Whether a change at `path` matters, given the repo's `.git` directory.
 fn relevant(path: &Path, git_dir: &Path) -> bool {
+    // Imports being staged and installed (see `sk1ll_core::source::STAGE_PREFIX`).
+    if sk1ll_core::source::is_staging_path(path) {
+        return false;
+    }
     let Ok(rel) = path.strip_prefix(git_dir) else {
         return true;
     };
@@ -235,6 +239,9 @@ mod tests {
         assert!(!relevant(Path::new("/r/.git/objects/ab/cdef"), git));
         assert!(!relevant(Path::new("/r/.git/refs/remotes/origin/main"), git));
         assert!(!relevant(Path::new("/r/.git/FETCH_HEAD"), git));
+        assert!(!relevant(Path::new("/r/imported/.sk1ll-stage-1-2-3/tree/SKILL.md"), git));
+        assert!(!relevant(Path::new("/r/imported/.sk1ll-stage-1-2-3-old"), git));
+        assert!(relevant(Path::new("/r/imported/pdf/SKILL.md"), git));
     }
 
     #[test]

@@ -11,7 +11,7 @@ use sk1ll_daemon::client::{
 use sk1ll_daemon::{Config, DaemonState};
 use sk1ll_proto::{AssignmentChanges, ToggleChange, ToggleKind};
 
-use crate::{Cli, Cmd, Kind, assign_target, check_exists, confirm, default_name, names, print_update, short};
+use crate::{Cli, Cmd, Kind, assign_target, check_exists, confirm, fetch_hint, names, print_update, short};
 
 /// Sets up this process's environment, before any thread starts: the
 /// daemon's (`sk1ll daemon`), or for direct mode the machine's git
@@ -355,9 +355,10 @@ impl Daemon {
                 self.block(c.adopt(&ConflictTarget { harness: harness.clone(), name: name.clone() }))?;
                 println!("adopted {name} from {harness} into the draft; review with `sk1ll diff {name}`");
             }
-            Cmd::Add { source, path, git_ref, name } => {
-                let name = name.unwrap_or_else(|| default_name(&source, &path));
-                let r = self.block(c.add_import(&AddImportRequest { name, source, path, git_ref }))?;
+            Cmd::Add { source, path, git_ref, name, list: false } => {
+                // An empty name is the skill's default name, decided by the daemon.
+                let req = AddImportRequest { name: name.unwrap_or_default(), source, path, git_ref, commit: None };
+                let r = self.block(c.add_import(&req)).map_err(fetch_hint)?;
                 println!("added {} @ {}", r.name, short(&r.new_commit));
             }
             Cmd::Update { name, force } => {

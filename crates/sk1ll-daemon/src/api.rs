@@ -21,7 +21,8 @@ use tokio::sync::broadcast::error::RecvError;
 use crate::client::{
     AddImportRequest, ConflictTarget, ConflictView, DiffView, DraftEntry, Event, HarnessView, ImportName,
     ImportUpdated, ItemView, JoinApiRequest, PromoteMessage, PromoteRequest, PromoteResponse, PullResult, PushResult,
-    ResetRequest, ResetResponse, StatusView, SyncRequest, SyncResult, UpdateImportsRequest,
+    ResetRequest, ResetResponse, ResolveImportRequest, ResolvedSource, StatusView, SyncRequest, SyncResult,
+    UpdateImportsRequest,
 };
 use crate::daemon::Daemon;
 use crate::error::{Error, Result};
@@ -49,6 +50,7 @@ pub(crate) fn router(d: Arc<Daemon>) -> Router {
         .route("/harnesses", get(harnesses))
         .route("/imports", get(pass))
         .route("/imports/{name}/update", post(update_import))
+        .route("/imports/resolve", post(resolve_import))
         .route("/imports/add", post(add_import))
         .route("/imports/update", post(update_imports))
         .route("/imports/remove", post(remove_import))
@@ -220,15 +222,19 @@ async fn harnesses(State(d): St) -> Result<Json<Vec<HarnessView>>> {
 }
 
 async fn update_import(State(d): St, UrlPath(name): UrlPath<String>) -> Result<Json<ImportUpdated>> {
-    Ok(Json(d.blocking(move |d, eng| d.update_import(eng, &name)).await?))
+    Ok(Json(d.update_import(name).await?))
+}
+
+async fn resolve_import(State(d): St, Json(req): Json<ResolveImportRequest>) -> Result<Json<ResolvedSource>> {
+    Ok(Json(d.resolve_import(req).await?))
 }
 
 async fn add_import(State(d): St, Json(req): Json<AddImportRequest>) -> Result<Json<ImportUpdated>> {
-    Ok(Json(d.blocking(move |d, eng| d.add_import(eng, req)).await?))
+    Ok(Json(d.add_import(req).await?))
 }
 
 async fn update_imports(State(d): St, Json(req): Json<UpdateImportsRequest>) -> Result<Json<Vec<ImportUpdated>>> {
-    Ok(Json(d.blocking(move |d, eng| d.update_imports(eng, req)).await?))
+    Ok(Json(d.update_imports(req).await?))
 }
 
 async fn remove_import(State(d): St, Json(req): Json<ImportName>) -> Result<StatusCode> {

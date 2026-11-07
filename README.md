@@ -15,9 +15,20 @@ into every harness on every machine.
 
 The CLI command is `sk1ll`; the Rust crates use the `sk1ll-` prefix.
 
+`sk1ll add` takes a GitHub repo, folder (`/tree/<ref>/<path>`) or file
+(`/blob/<ref>/<path>/SKILL.md`) link, `github:owner/repo`, or any git URL or
+local path. The Import records `github:owner/repo`, the link's ref (`HEAD` if
+none) and path; `--path` and `--ref` override them (a `--ref` that differs
+from the link's needs `--path` too). A ref with slashes is told
+apart from the path by the remote's branches, tags and commits. A link to a
+repo or folder with several skills needs `--path`; `--list` shows them.
+[skills/sk1ll](skills/sk1ll/SKILL.md) teaches agents to do this for you.
+
 ```sh
 sk1ll init
-sk1ll add github:owner/repo --path skills/pdf --ref main
+sk1ll add https://github.com/owner/repo/tree/main/skills/pdf   # or a repo, blob or github:owner/repo
+sk1ll add --list https://github.com/owner/repo                 # the skills a link offers; adds nothing
+sk1ll add github:owner/repo --path skills/pdf --ref main [--name pdf]
 sk1ll update [name] [--force]   # refuses to clobber local edits unless forced
 sk1ll fork <name>               # imported -> personal, to edit freely
 sk1ll list                      # skills + instruction fragments
@@ -195,8 +206,8 @@ Draft includes item checkboxes, unified diffs, an editable prefilled Promote
 message, push results, confirmed Reset and Pull for Blocked clashes. Reset and
 Promote capture their item lists, compare byte fingerprints on refresh, and
 require review again when selected content changes. Conflicts
-supports Adopt/Overwrite and displaced recovery Adopt/Discard. Imports updates
-into Draft; Log pages newest first with per-entry Undo. Settings lists Harnesses,
+supports Adopt/Overwrite and displaced recovery Adopt/Discard. Imports adds Skills from a pasted link
+(previewing every Skill a repo holds) and updates Imports, both into Draft; Log pages newest first with per-entry Undo. Settings lists Harnesses,
 joins/rejoins, creates one-time join codes, removes Machines with typed
 confirmation and shows connection info. Mutations show pending states and are
 never retried by the GUI.

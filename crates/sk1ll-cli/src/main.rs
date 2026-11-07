@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use sk1ll_core::{
-    Action, ActionKind, Assignment, Change, EngineLock, HarnessOrigin, Import, ImportState, InstructionsFormat, Item,
+    Action, ActionKind, Assignment, Change, EngineLock, HarnessOrigin, ImportState, InstructionsFormat, Item,
     ItemRef, LinkMode, MachineConfig, Origin, PlanOptions, PullOutcome, Repo, default_promote_message, machine_author,
     sync,
 };
@@ -101,18 +101,26 @@ enum Cmd {
     Init { path: Option<PathBuf> },
     /// List skills and instruction fragments in the repo
     List,
-    /// Import a skill from a git repo (URL, local path, or github:owner/repo)
+    /// Import a skill from a link (GitHub repo, folder or file), github:owner/repo, git URL or local path
+    #[command(after_help = "Examples:\n  sk1ll add https://github.com/owner/repo/tree/main/skills/pdf\n  \
+                            sk1ll add --list https://github.com/owner/repo\n  \
+                            sk1ll add github:owner/repo --path skills/pdf --ref v1.2")]
     Add {
+        #[arg(value_name = "LINK")]
         source: String,
-        /// Subdirectory containing SKILL.md
-        #[arg(long, default_value = "")]
-        path: String,
-        /// Branch, tag or commit
-        #[arg(long = "ref", default_value = "HEAD")]
-        git_ref: String,
+        /// Subdirectory containing SKILL.md (default: the link's)
+        #[arg(long)]
+        path: Option<String>,
+        /// Branch, tag or commit (default: the link's, else HEAD). If the link names a ref, they must agree
+        /// unless --path is given too
+        #[arg(long = "ref")]
+        git_ref: Option<String>,
         /// Local name (default: last path segment or repo name)
         #[arg(long)]
         name: Option<String>,
+        /// List the skills the link leads to, without adding any
+        #[arg(long, conflicts_with = "name")]
+        list: bool,
     },
     /// Re-fetch imports and update the lockfile
     Update {
@@ -233,7 +241,7 @@ impl Cmd {
     /// engine lock while they run.
     fn mutates(&self) -> bool {
         match self {
-            Self::Recover { .. } | Self::Conflicts | Self::Add { .. }
+            Self::Recover { .. } | Self::Conflicts
             | Self::Update { .. }
             | Self::Remove { .. }
             | Self::Fork { .. }
@@ -244,6 +252,7 @@ impl Cmd {
             | Self::Adopt { .. }
             | Self::Assign { .. } => true,
             Self::Sync { dry_run, .. } => !dry_run,
+            Self::Add { list, .. } => !list,
             Self::Init { .. }
             | Self::List
             | Self::Status
@@ -281,7 +290,17 @@ impl Switch {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    // A relative local source means the user's cwd, which the daemon doesn't
+    // share. Links and invalid sources are left for `parse_link` to handle.
+    if let Cmd::Add { source, .. } = &mut cli.cmd
+        && let Ok(link) = sk1ll_core::source::parse_link(source)
+        && sk1ll_core::source::is_local_path(&link.source)
+        && Path::new(&link.source).is_relative()
+    {
+        let path = std::fs::canonicalize(&link.source).or_else(|_| std::path::absolute(&link.source))?;
+        *source = path.to_string_lossy().into_owned();
+    }
     // Single-threaded here, before any runtime starts: the only safe place to
     // change the environment (git's credentials for the hub, see `fleet`).
     fleet::prepare(&cli)?;
@@ -307,6 +326,7 @@ fn run(cli: Cli) -> Result<()> {
         std::fs::create_dir_all(&root)?;
         let repo = Repo::init(&root)?;
         println!("initialized skills repo at {}", repo.root().display());
+        println!("To let agents add skills: sk1ll add https://github.com/0xV1p3r/0xSk1ll/tree/main/skills/sk1ll");
         return Ok(());
     }
 
@@ -388,9 +408,22 @@ fn run(cli: Cli) -> Result<()> {
                 println!("{:<24} {:<10} {scope}{}", f.name, "instr", f.description.unwrap_or_default());
             }
         }
-        Cmd::Add { source, path, git_ref, name } => {
-            let name = name.unwrap_or_else(|| default_name(&source, &path));
-            let r = repo.add_import(&name, Import { source, path, git_ref })?;
+        Cmd::Add { source, path, git_ref, list: true, .. } => {
+            let r = repo.resolve_source(&source, path.as_deref(), git_ref.as_deref()).map_err(fetch_hint)?;
+            println!("{} @ {} ({})", r.source, r.git_ref, short(&r.commit));
+            if r.candidates.is_empty() {
+                println!("no SKILL.md found");
+            }
+            for c in r.candidates {
+                let path = if c.path.is_empty() { "." } else { &c.path };
+                let taken = if c.taken { "taken" } else { "" };
+                println!("{path:<32} {:<24} {taken:<5} {}", c.default_name, c.description.unwrap_or_default());
+            }
+        }
+        Cmd::Add { source, path, git_ref, name, list: false } => {
+            let r = repo
+                .add_link(name.as_deref(), &source, path.as_deref(), git_ref.as_deref(), None)
+                .map_err(fetch_hint)?;
             println!("added {} @ {}", r.name, short(&r.new_commit));
         }
         Cmd::Update { name, force } => {
@@ -423,6 +456,13 @@ fn run(cli: Cli) -> Result<()> {
             // Recovery moves and deletes; only a real sync, holding the lock, may run it.
             if !dry_run && let Some(lock) = &lock {
                 sync::recover(lock, &harnesses)?;
+            }
+            // An import an interrupted update set aside is put back first, so
+            // the sync doesn't remove it from the harnesses.
+            if !dry_run {
+                for name in repo.recover_imports()? {
+                    eprintln!("restored import {name}, which an interrupted update had set aside");
+                }
             }
             let actions = sync::plan(&repo, &harnesses, &assignment()?, PlanOptions { force })?;
             print_plan(&actions);
@@ -676,10 +716,15 @@ fn label(a: &Action) -> String {
     }
 }
 
-fn default_name(source: &str, path: &str) -> String {
-    let base = path.trim_matches('/').rsplit('/').next().filter(|s| !s.is_empty());
-    let base = base.unwrap_or_else(|| source.trim_end_matches('/').rsplit(['/', ':']).next().unwrap_or(source));
-    base.trim_end_matches(".git").to_string()
+/// Fetching a source failed: keep git's message and say what to check.
+fn fetch_hint(e: impl Into<anyhow::Error>) -> anyhow::Error {
+    const HINT: &str = "Check the repository URL and your git credentials (SSH agent / credential helper).";
+    let e = e.into();
+    let msg = e.to_string();
+    if (msg.contains("`git clone ") || msg.contains("`git fetch ")) && !msg.contains(HINT) {
+        return anyhow::anyhow!("{msg}\n{HINT}");
+    }
+    e
 }
 
 fn short(sha: &str) -> &str {
@@ -893,6 +938,17 @@ mod tests {
         assert!(!skills.join("pdf").exists());
     }
 
+    /// The daemon's message may already carry the hint; it's added once.
+    #[test]
+    fn fetch_hint_is_added_once_and_only_to_fetch_failures() {
+        let failed = "`git clone --quiet -- https://x.invalid/r.git /c` failed: could not resolve host";
+        let once = fetch_hint(anyhow::anyhow!("{failed}")).to_string();
+        assert!(once.starts_with(failed) && once.ends_with("(SSH agent / credential helper)."), "{once}");
+        assert_eq!(fetch_hint(anyhow::anyhow!("{once}")).to_string(), once);
+        let other = "import `pdf` already exists";
+        assert_eq!(fetch_hint(anyhow::anyhow!("{other}")).to_string(), other);
+    }
+
     #[test]
     fn init_takes_the_existing_repos_engine_lock_before_writing() {
         let repo = TestRepo::new();
@@ -1015,8 +1071,16 @@ mod tests {
         server.join().unwrap();
 
         // The listener is gone but its socket file stays: connection refused.
+        // Other tests spawn git meanwhile, and a child forked before its exec
+        // briefly holds a copy of the listening socket (CLOEXEC only closes it
+        // at exec); a connect in that window is accepted, then reset. So try
+        // again, for a bounded time, until no such copy is left.
         assert!(sock.exists());
-        repo.run_on(&sock, &assign).unwrap();
+        let gave_up = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while let Err(e) = repo.run_on(&sock, &assign) {
+            assert!(std::time::Instant::now() < gave_up, "{e}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         assert!(repo.0.join("assignment.json").exists());
 
         fs::remove_file(&sock).unwrap();

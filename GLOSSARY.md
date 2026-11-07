@@ -7,6 +7,10 @@ Manages agent skills and instructions in one git repo and keeps every harness on
 **Skill**:
 A `SKILL.md` folder, either personal or imported.
 
+**Import**:
+A skill vendored from an external git source and pinned to a commit; updated from its source rather than edited (fork it to edit).
+_Avoid_: Dependency, package, remote skill
+
 **Fragment**:
 One instruction file ("for X do Y") that is rendered into a harness's global instructions.
 _Avoid_: Rule, instruction (when meaning a single file)

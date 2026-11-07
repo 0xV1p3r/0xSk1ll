@@ -24,7 +24,10 @@ use std::path::{Path, PathBuf};
 pub use assignment::{Assignment, HarnessAssignment};
 pub use draft::{Change, DraftItem, FLEET_BRANCH, ItemRef, PullOutcome, default_promote_message, machine_author};
 pub use engine::EngineLock;
-pub use imports::{ImportState, ImportStatus, UpdateReport};
+pub use imports::{
+    FetchedLink, FetchedUpdates, ImportState, ImportStatus, ResolvedSource, SkillCandidate, UpdateReport,
+    UpdateTargets,
+};
 pub use instructions::Fragment;
 pub use lock::{LockEntry, Lockfile};
 pub use machine::{

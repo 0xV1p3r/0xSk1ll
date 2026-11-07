@@ -18,6 +18,7 @@
 //! | POST | `/conflicts/adopt`, `/conflicts/overwrite` | [`ConflictTarget`] → 204 |
 //! | GET | `/harnesses` | → `Vec<`[`HarnessView`]`>` |
 //! | POST | `/imports/{name}/update` | → [`ImportUpdated`] |
+//! | POST | `/imports/resolve` | [`ResolveImportRequest`] → [`ResolvedSource`] |
 //! | POST | `/imports/add` | [`AddImportRequest`] → [`ImportUpdated`] |
 //! | POST | `/imports/update` | [`UpdateImportsRequest`] → `Vec<`[`ImportUpdated`]`>` |
 //! | POST | `/imports/remove`, `/imports/fork` | [`ImportName`] → 204 |
@@ -246,15 +247,63 @@ pub struct ImportUpdated {
     pub changed: bool,
 }
 
-/// `POST /imports/add`.
+/// `POST /imports/resolve`: what a pasted link leads to. Fetches it into the
+/// import cache; the repo is not changed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AddImportRequest {
-    pub name: String,
-    pub source: String,
+pub struct ResolveImportRequest {
+    /// A GitHub repo, folder (`/tree/<ref>/<path>`) or file (`/blob/...`)
+    /// link, `github:owner/repo`, or any git URL or local path.
+    pub link: String,
+    /// Overrides the link's path when non-empty (`""` keeps the link's,
+    /// since a resolve lists every skill under it anyway).
     #[serde(default)]
     pub path: String,
-    #[serde(rename = "ref")]
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedSource {
+    /// What an import from it records: `github:owner/repo`, or the URL/path.
+    pub source: String,
+    /// The link's ref, `HEAD` if it names none.
     pub git_ref: String,
+    pub commit: String,
+    /// One entry when the link points at a skill directory; otherwise every
+    /// directory with a `SKILL.md` under it, sorted by path.
+    pub candidates: Vec<SkillCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillCandidate {
+    /// Repo-relative directory; `""` for the repo root. Pass it as
+    /// [`AddImportRequest::path`].
+    pub path: String,
+    pub default_name: String,
+    pub description: Option<String>,
+    /// An import or personal skill already has `default_name`.
+    pub taken: bool,
+}
+
+/// `POST /imports/add`. `source` may be any link [`ResolveImportRequest`]
+/// takes, and must lead to exactly one skill. A given `path` or `ref`
+/// overrides what the link names; a `ref` must equal the link's own ref
+/// unless `path` is given too. To add a previewed candidate, send
+/// [`ResolvedSource::git_ref`], [`SkillCandidate::path`] and
+/// [`ResolvedSource::commit`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddImportRequest {
+    /// Empty: the skill's default name.
+    pub name: String,
+    pub source: String,
+    /// Absent: the link's path. `""` is the repo root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Absent (or empty): the link's ref, else `HEAD`.
+    #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
+    /// Vendor exactly this commit (it must be in the fetched source), e.g.
+    /// the one a resolve previewed; the manifest still records `ref`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
 }
 
 /// `POST /imports/update`: one import (`name`) or all.
@@ -509,6 +558,10 @@ impl Client {
         self.post(&format!("/imports/{}/update", encode(name)), &()).await
     }
 
+    pub async fn resolve_import(&self, req: &ResolveImportRequest) -> Result<ResolvedSource> {
+        self.post("/imports/resolve", req).await
+    }
+
     pub async fn add_import(&self, req: &AddImportRequest) -> Result<ImportUpdated> {
         self.post("/imports/add", req).await
     }
@@ -656,5 +709,43 @@ mod tests {
         let v = serde_json::to_value(&p).unwrap();
         assert_eq!(v["state"], "blocked");
         assert_eq!(serde_json::from_value::<PullResult>(v).unwrap(), p);
+    }
+
+    /// The GUI's contract: serde's default field names.
+    #[test]
+    fn resolved_sources_use_plain_field_names() {
+        let req: ResolveImportRequest = serde_json::from_value(serde_json::json!({"link": "github:o/r"})).unwrap();
+        assert_eq!(req.path, "");
+        let r = ResolvedSource {
+            source: "github:o/r".into(),
+            git_ref: "main".into(),
+            commit: "c".into(),
+            candidates: vec![SkillCandidate {
+                path: "".into(),
+                default_name: "r".into(),
+                description: None,
+                taken: true,
+            }],
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"source": "github:o/r", "git_ref": "main", "commit": "c", "candidates": [
+                {"path": "", "default_name": "r", "description": null, "taken": true}]})
+        );
+        assert_eq!(serde_json::from_value::<ResolvedSource>(v).unwrap(), r);
+    }
+
+    /// Absent and empty are different for `path`: `""` is the repo root.
+    #[test]
+    fn add_requests_tell_an_absent_path_from_the_root() {
+        let json = serde_json::json!({"name": "", "source": "s", "path": "", "ref": "main", "commit": "abcd"});
+        let req: AddImportRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.path.as_deref(), Some(""));
+        assert_eq!((req.git_ref.as_deref(), req.commit.as_deref()), (Some("main"), Some("abcd")));
+        let req: AddImportRequest = serde_json::from_value(serde_json::json!({"name": "", "source": "s"})).unwrap();
+        assert_eq!((req.path, req.git_ref, req.commit), (None, None, None));
+        let none = AddImportRequest { name: "n".into(), source: "s".into(), path: None, git_ref: None, commit: None };
+        assert_eq!(serde_json::to_value(&none).unwrap(), serde_json::json!({"name": "n", "source": "s"}));
     }
 }
