@@ -45,3 +45,11 @@ lost.
 
 The cap is a cleanup target, not a strict ceiling. It is checked before a
 new copy is added, so recovery can sit above the cap until the next prune.
+
+## Content browsing outside Unix
+
+On Unix, Skills file reads and tree listings pin directories and open each path
+component relative to its directory descriptor, refusing symlinks. On non-Unix
+platforms containment uses best-effort canonical-path checks. A concurrent
+ancestor-directory symlink replacement can redirect a read or listing after
+that check. Avoid browsing content being changed by an untrusted process there.

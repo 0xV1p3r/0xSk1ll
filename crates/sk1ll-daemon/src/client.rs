@@ -6,6 +6,10 @@
 //! |---|---|---|
 //! | GET | `/status` | → [`StatusView`] |
 //! | GET | `/items` | → `Vec<`[`ItemView`]`>` |
+//! | GET | `/skills` | → `Vec<ContentEntry>` |
+//! | GET | `/skills/tree?item=skill:pdf` | → `Vec<FileEntry>` |
+//! | GET | `/skills/file?item=skill:pdf&path=SKILL.md` | → `FileContent` |
+//! | POST | `/skills/adopt` | `ConflictTarget` → 204; unmanaged Adopt needs a Hub connection |
 //! | GET | `/draft` | → `Vec<`[`DraftEntry`]`>` |
 //! | GET | `/draft/diff?item=` | → [`DiffView`] |
 //! | GET | `/promote/message?items=a,b` | → [`PromoteMessage`] |
@@ -50,6 +54,8 @@ use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+
+pub use sk1ll_core::content::{ContentEntry, ContentQuery, ContentType, FileContent, FileEntry, FileQuery};
 pub use sk1ll_proto::{
     Assignment, AssignmentChanges, AssignmentSnapshot, AssignmentUpdate, ErrorBody, FleetView, ImportUpdate, ImportsView, ItemRef,
     JoinCode, LogEntry, LogQuery, MachineReport, MachineStatus,
@@ -502,6 +508,28 @@ impl Client {
         self.get("/items").await
     }
 
+    pub async fn skills(&self) -> Result<Vec<ContentEntry>> {
+        self.get("/skills").await
+    }
+
+    pub async fn skill_tree(&self, query: &ContentQuery) -> Result<Vec<FileEntry>> {
+        self.get(&format!("/skills/tree?{}", content_query(query)))
+            .await
+    }
+
+    pub async fn skill_file(&self, query: &FileQuery) -> Result<FileContent> {
+        self.get(&format!(
+            "/skills/file?{}&path={}",
+            content_query(&query.content),
+            encode(&query.path)
+        ))
+        .await
+    }
+
+    pub async fn adopt_unmanaged(&self, target: &ConflictTarget) -> Result<()> {
+        self.post_empty("/skills/adopt", target).await
+    }
+
     pub async fn draft(&self) -> Result<Vec<DraftEntry>> {
         self.get("/draft").await
     }
@@ -677,6 +705,17 @@ impl EventStream {
 }
 
 /// Percent-encodes a path segment or query value.
+fn content_query(q: &ContentQuery) -> String {
+    let mut query = format!("item={}", encode(&q.item));
+    if let Some(hash) = &q.hash {
+        query.push_str(&format!("&hash={}", encode(hash)));
+    }
+    if let Some(harness) = &q.harness {
+        query.push_str(&format!("&harness={}", encode(harness)));
+    }
+    query
+}
+
 fn encode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {

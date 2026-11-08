@@ -276,3 +276,280 @@ async fn import_resolve_and_add_forward_once_with_payloads() {
     assert_eq!(requests[1].1, "/imports/add");
     assert_eq!(requests[1].2, json!({"name":"pdf", "source":"github:example/skills", "path":"skills/pdf", "ref":"main", "commit":"abcdef"}));
 }
+
+#[test]
+fn editor_detection_and_terminal_arguments() {
+    use crate::editors::*;
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let executable = |name: &str| {
+        let path = bin.join(name);
+        std::fs::write(&path, "not executed").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    executable("nvim");
+    let discovery = Discovery { path: vec![bin.clone()], data: vec![temp.path().into()], apps: vec![], terminal: None };
+    assert_eq!(discovery.detect().len(), if cfg!(target_os = "macos") { 3 } else { 2 });
+    executable("kitty");
+    executable("zeditor");
+    let found = discovery.detect();
+    assert_eq!(found.iter().map(|e| e.view.id.as_str()).collect::<Vec<_>>(), ["zed", "nvim", "file-manager", "default-app"]);
+    let terminal = found.iter().find(|e| e.view.id == "nvim").unwrap();
+    assert_eq!(terminal.args, [std::ffi::OsString::from("--"), bin.join("nvim").into_os_string()]);
+    for (name, args) in [("wezterm", vec!["start", "--"]), ("gnome-terminal", vec!["--"]), ("konsole", vec!["-e"]), ("ghostty", vec!["-e"]), ("alacritty", vec!["-e"]), ("xterm", vec!["-e"])] {
+        assert_eq!(terminal_prefix(name), args.into_iter().map(std::ffi::OsString::from).collect::<Vec<_>>());
+    }
+    let desktop_bin = temp.path().join("code");
+    std::fs::write(&desktop_bin, "never run").unwrap();
+    std::fs::set_permissions(&desktop_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::create_dir(temp.path().join("applications")).unwrap();
+    std::fs::write(temp.path().join("applications/code.desktop"), format!("[Desktop Entry]\nExec=\"{}\" --new-window %F\n", desktop_bin.display())).unwrap();
+    let found = discovery.detect();
+    assert_eq!(found[0].view.id, "code");
+    assert_eq!(found[0].args, ["--new-window"]);
+}
+
+#[test]
+fn editor_targets_reject_escapes_and_imports() {
+    use crate::editors::*;
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path();
+    let skill = repo.join("personal/pdf");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(skill.join("SKILL.md"), "pdf").unwrap();
+    let target = validate_target(repo, &skill, false).unwrap();
+    let discovery = Discovery { path: vec![], data: vec![], apps: vec![], terminal: None };
+    let mut editor = discovery.detect().remove(0);
+    assert_eq!(target_path(&editor, &target), target.folder);
+    editor.view.id = "default-app".into();
+    assert_eq!(target_path(&editor, &target), target.file);
+    editor.view.id = "code".into(); editor.view.kind = EditorKind::Gui;
+    assert_eq!(target_path(&editor, &target), target.folder);
+    editor.view.kind = EditorKind::Terminal;
+    assert_eq!(target_path(&editor, &target), target.file);
+    std::fs::create_dir(repo.join("instructions")).unwrap();
+    let fragment = repo.join("instructions/git.md");
+    std::fs::write(&fragment, "git").unwrap();
+    let target = validate_target(repo, &fragment, true).unwrap();
+    editor.view.kind = EditorKind::Gui;
+    assert_eq!(target_path(&editor, &target), fragment.canonicalize().unwrap());
+    assert!(validate_target(repo, std::path::Path::new("relative"), false).is_err());
+    assert!(validate_target(repo, &repo.join("missing"), false).is_err());
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), repo.join("escape")).unwrap();
+    assert!(validate_target(repo, &repo.join("escape"), false).is_err());
+    std::fs::create_dir(repo.join("imported")).unwrap();
+    std::os::unix::fs::symlink(&skill, repo.join("imported/pdf")).unwrap();
+    assert!(validate_target(repo, &repo.join("imported/pdf"), false).is_err());
+    std::fs::remove_file(skill.join("SKILL.md")).unwrap();
+    std::os::unix::fs::symlink(outside.path().join("file"), skill.join("SKILL.md")).unwrap();
+    std::fs::write(outside.path().join("file"), "outside").unwrap();
+    assert!(validate_target(repo, &skill, false).is_err());
+}
+
+#[tokio::test]
+async fn editor_resolution_uses_daemon_repo_and_rejects_item_paths() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(directory.path().join("personal/pdf")).unwrap();
+    std::fs::write(directory.path().join("personal/pdf/SKILL.md"), "pdf").unwrap();
+    let mut replies = Replies::new();
+    replies.insert("GET /status".into(), (StatusCode::OK, json!({
+        "machine_id":"alpha", "hub_url":"http://hub", "repo":directory.path(),
+        "headline":"drafting", "connection":"connected", "last_error":null,
+        "revoked":false, "hub_baseline":null, "assignment_revision":1, "report":{},
+    })));
+    replies.insert("GET /skills".into(), (StatusCode::OK, json!([
+        {"name":"pdf", "item":"skill:pdf", "type":"personal", "description":null,
+         "draft":null, "in_baseline":true, "path":directory.path().join("personal/pdf"),
+         "enabled_harnesses":[], "clashes_with_repo":false, "variants":[]}
+    ])));
+    let server = Server::start(Router::new().fallback(respond).with_state((Recorded::default(), replies))).await;
+    let bridge = Bridge::new(server.client.clone());
+    assert_eq!(bridge.editor_target("skill:pdf").await.unwrap().file, directory.path().join("personal/pdf/SKILL.md").canonicalize().unwrap());
+    for item in ["skill:../pdf", "skill:/tmp/pdf", "skill:..", "unmanaged:pdf", "pdf"] {
+        assert!(bridge.editor_target(item).await.is_err());
+    }
+}
+
+#[test]
+fn editor_bundle_detection_and_json_contract() {
+    use crate::editors::*;
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("Cursor.app")).unwrap();
+    let discovery = Discovery { path: vec![], data: vec![], apps: vec![temp.path().into()], terminal: None };
+    let found = discovery.detect();
+    assert_eq!(found[0].program, std::path::Path::new("/usr/bin/open"));
+    assert_eq!(found[0].args, [std::ffi::OsString::from("-a"), temp.path().join("Cursor.app").into_os_string()]);
+    let view = EditorsView { editors: found.into_iter().map(|e| e.view).collect(), preferred_editor: "cursor".into() };
+    let value = serde_json::to_value(view).unwrap();
+    assert_eq!(value["editors"][0], json!({"id":"cursor", "name":"Cursor", "kind":"gui"}));
+    assert_eq!(value["preferred_editor"], "cursor");
+    let preference = Preferences { preferred_editor: Some("cursor".into()) };
+    let stored = serde_json::to_vec(&preference).unwrap();
+    assert_eq!(serde_json::from_slice::<Preferences>(&stored).unwrap().preferred_editor.as_deref(), Some("cursor"));
+}
+
+#[tokio::test]
+async fn skill_commands_preserve_queries_payloads_and_errors() {
+    let requests = Recorded::default();
+    let inventory = json!([{"name":"pdf", "item":null, "type":"unmanaged", "description":"PDF",
+        "draft":null, "in_baseline":false, "path":null, "enabled_harnesses":[], "clashes_with_repo":false,
+        "variants":[{"hash":"sha256:one", "description":"PDF", "locations":[{"harness":"claude", "path":"/tmp/pdf"}]}]}]);
+    let tree = json!([{"path":"SKILL.md", "kind":"file", "size":12}]);
+    let file = json!({"path":"docs/a b.md", "text":"# PDF", "binary":false, "too_large":false, "size":5});
+    let mut replies = Replies::new();
+    for (route, value) in [
+        ("GET /skills", inventory.clone()),
+        ("GET /skills/tree?item=unmanaged%3Apdf&hash=sha256%3Aone&harness=claude", tree.clone()),
+        ("GET /skills/file?item=unmanaged%3Apdf&hash=sha256%3Aone&harness=claude&path=docs%2Fa%20b.md", file.clone()),
+    ] { replies.insert(route.into(), (StatusCode::OK, value)); }
+    replies.insert("POST /skills/adopt".into(), (StatusCode::NO_CONTENT, Value::Null));
+    replies.insert("POST /imports/fork".into(), (StatusCode::CONFLICT, json!({"error":"Skill changed"})));
+    let server = Server::start(Router::new().fallback(respond).with_state((requests.clone(), replies))).await;
+    let bridge = Bridge::new(server.client.clone());
+    assert_eq!(serde_json::to_value(bridge.skills().await.unwrap()).unwrap(), inventory);
+    let query = ContentQuery { item: "unmanaged:pdf".into(), hash: Some("sha256:one".into()), harness: Some("claude".into()) };
+    assert_eq!(serde_json::to_value(bridge.skill_tree(query.clone()).await.unwrap()).unwrap(), tree);
+    assert_eq!(serde_json::to_value(bridge.skill_file(FileQuery { content: query, path: "docs/a b.md".into() }).await.unwrap()).unwrap(), file);
+    bridge.adopt_unmanaged(ConflictTarget { harness: "claude".into(), name: "pdf".into() }).await.unwrap();
+    let error = bridge.fork("pdf".into()).await.unwrap_err();
+    assert_eq!(error.status, Some(409));
+    assert_eq!(error.message, "Skill changed");
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 5, "mutations are never retried");
+    assert_eq!(requests[3].2, json!({"harness":"claude", "name":"pdf"}));
+    assert_eq!(requests[4].2, json!({"name":"pdf"}));
+}
+
+#[test]
+fn mac_terminal_argv_preserves_shell_metacharacters_as_arguments() {
+    use crate::editors::terminal_prefix;
+    use std::ffi::OsString;
+    let mut args = terminal_prefix("Terminal.app");
+    args.extend([OsString::from("/Applications/My editor's/bin/nvim"), OsString::from("/repo/a'; $(touch unexpected) \" b/SKILL.md")]);
+    assert_eq!(args[0], "-e");
+    assert!(args[1].to_str().unwrap().contains("quoted form of (argument as text)"));
+    assert!(args[1].to_str().unwrap().contains("tell application \"Terminal\""));
+    assert_eq!(args[2], "--");
+    assert_eq!(args[3], "/Applications/My editor's/bin/nvim");
+    assert_eq!(args[4], "/repo/a'; $(touch unexpected) \" b/SKILL.md");
+    assert!(!args[1].to_str().unwrap().contains("unexpected"));
+}
+
+#[tokio::test]
+async fn editor_resolution_uses_inventory_path_and_refuses_inventory_imports_and_missing_items() {
+    let directory = tempfile::tempdir().unwrap();
+    let repo = directory.path();
+    let path = repo.join("custom/pdf");
+    std::fs::create_dir_all(&path).unwrap();
+    std::fs::write(path.join("SKILL.md"), "pdf").unwrap();
+    let mut replies = Replies::new();
+    replies.insert("GET /status".into(), (StatusCode::OK, json!({
+        "machine_id":"alpha", "hub_url":"http://hub", "repo":repo, "headline":"in_sync",
+        "connection":"connected", "last_error":null, "revoked":false, "hub_baseline":null,
+        "assignment_revision":1, "report":{}
+    })));
+    let make = |name: &str, kind: &str, path: &std::path::Path| json!({
+        "name":name, "item":format!("skill:{name}"), "type":kind, "description":null,
+        "draft":null, "in_baseline":true, "path":path, "enabled_harnesses":[],
+        "clashes_with_repo":false, "variants":[]
+    });
+    replies.insert("GET /skills".into(), (StatusCode::OK, json!([
+        make("pdf", "personal", &path), make("remote", "import", &path),
+        make("gone", "personal", &repo.join("missing")), make("escape", "personal", std::path::Path::new("/tmp")),
+        make("unmanaged", "unmanaged", &path),
+    ])));
+    let server = Server::start(Router::new().fallback(respond).with_state((Recorded::default(), replies))).await;
+    let bridge = Bridge::new(server.client.clone());
+    assert_eq!(bridge.editor_target("skill:pdf").await.unwrap().folder, path.canonicalize().unwrap());
+    assert!(bridge.editor_target("skill:remote").await.err().unwrap().message.contains("Fork"));
+    for name in ["gone", "escape", "unknown", "unmanaged"] {
+        assert!(bridge.editor_target(&format!("skill:{name}")).await.is_err());
+    }
+}
+
+#[tokio::test]
+async fn editor_inventory_accepts_literal_unusual_names() {
+    let directory = tempfile::tempdir().unwrap();
+    let names = ["my notes", "résumé", "a'\"b", "semi;colon", "$(touch nope)", "line\nbreak", "a\\b"];
+    let entries: Vec<_> = names.iter().map(|name| {
+        let path = directory.path().join("personal").join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("SKILL.md"), "skill").unwrap();
+        json!({"name":name, "item":format!("skill:{name}"), "type":"personal",
+            "description":null, "draft":null, "in_baseline":true, "path":path,
+            "enabled_harnesses":[], "clashes_with_repo":false, "variants":[]})
+    }).collect();
+    let mut replies = Replies::new();
+    replies.insert("GET /skills".into(), (StatusCode::OK, json!(entries)));
+    replies.insert("GET /status".into(), (StatusCode::OK, json!({
+        "machine_id":"a", "hub_url":"http://hub", "repo":directory.path(),
+        "headline":"drafting", "connection":"connected", "last_error":null,
+        "revoked":false, "hub_baseline":null, "assignment_revision":1, "report":{}
+    })));
+    let server = Server::start(Router::new().fallback(respond).with_state((Recorded::default(), replies))).await;
+    let bridge = Bridge::new(server.client.clone());
+    for name in names {
+        let target = bridge.editor_target(&format!("skill:{name}")).await.unwrap();
+        assert_eq!(target.folder.file_name().unwrap(), name);
+    }
+    for name in [".", "..", "a/b", "nul\0"] {
+        assert!(bridge.editor_target(&format!("skill:{name}")).await.is_err());
+    }
+}
+
+#[test]
+fn every_editor_launch_keeps_unusual_paths_in_one_argument() {
+    use crate::editors::*;
+    use std::{ffi::OsString, path::PathBuf, process::Stdio};
+    let directory = tempfile::tempdir().unwrap();
+    let stub = directory.path().join("capture");
+    std::fs::write(&stub, "#!/bin/sh\nprintf '%s\\0' \"$@\"\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for name in ["my notes", "résumé", "a'\"b", "semi;colon", "$(touch nope)", "line\nbreak", "a\\b"] {
+        let folder = directory.path().join(name);
+        let target = Target { file: folder.join("SKILL.md"), folder, fragment: false };
+        for kind in ["Terminal.app", "wezterm", "gnome-terminal", "kitty", "konsole", "ghostty", "alacritty", "xterm", "open", "xdg-open"] {
+            let args = if matches!(kind, "open" | "xdg-open") { vec![] } else {
+                let mut args = terminal_prefix(kind);
+                args.push(OsString::from("/Applications/My editor's/bin/nvim"));
+                args
+            };
+            let editor = Editor {
+                view: EditorView { id: "default-app".into(), name: kind.into(), kind: EditorKind::System },
+                program: stub.clone(), args: args.clone(),
+            };
+            let output = launch_command(&editor, &target).stdout(Stdio::piped()).output().unwrap();
+            assert!(output.status.success());
+            let mut expected: Vec<_> = args.iter().map(|s| s.as_encoded_bytes().to_vec()).collect();
+            expected.push(target.file.as_os_str().as_encoded_bytes().to_vec());
+            let mut expected = expected.join(&0);
+            expected.push(0);
+            assert_eq!(output.stdout, expected, "{kind} {name:?}");
+            if kind == "Terminal.app" {
+                assert!(!args[1].to_str().unwrap().contains(name));
+                assert!(args[1].to_str().unwrap().contains("quoted form of (argument as text)"));
+            }
+        }
+    }
+    // Absolute paths also prevent open/xdg-open option interpretation.
+    assert!(PathBuf::from("/repo/-option/SKILL.md").is_absolute());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn mac_terminal_script_shell_quoting_round_trips_unusual_paths() {
+    use std::process::Command;
+    let script = crate::editors::terminal_prefix("Terminal.app")[1].to_str().unwrap()
+        .replace("    tell application \"Terminal\"\n        activate\n        do script shellCommand\n    end tell", "    return shellCommand");
+    for path in ["my notes", "résumé", "a'\"b", "semi;colon", "$(touch nope)", "line\nbreak", "a\\b"] {
+        let result = Command::new("/usr/bin/osascript").args(["-e", &script, "--", "/usr/bin/printf", "%s", path]).output().unwrap();
+        assert!(result.status.success());
+        let shell = String::from_utf8(result.stdout).unwrap();
+        let output = Command::new("/bin/sh").args(["-c", shell.trim_end()]).output().unwrap();
+        assert_eq!(output.stdout, path.as_bytes());
+    }
+}

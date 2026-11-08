@@ -47,6 +47,10 @@ mod fleet {
         Ok(false)
     }
 
+    pub(crate) fn require_standalone_adoption(_state: Option<&Path>, _repo: &sk1ll_core::Repo) -> Result<()> {
+        Ok(())
+    }
+
     pub(crate) fn connect(cli: &Cli, _repo: &Path) -> Result<Option<Daemon>> {
         let _ = &cli.daemon_socket;
         Ok(None)
@@ -100,7 +104,13 @@ enum Cmd {
     /// Create a new skills repo
     Init { path: Option<PathBuf> },
     /// List skills and instruction fragments in the repo
-    List,
+    List {
+        /// List unmanaged skills in this machine's harnesses
+        #[arg(long)]
+        unmanaged: bool,
+    },
+    /// Open a personal Skill or Fragment in $VISUAL or $EDITOR
+    Edit { name: String },
     /// Import a skill from a link (GitHub repo, folder or file), github:owner/repo, git URL or local path
     #[command(after_help = "Examples:\n  sk1ll add https://github.com/owner/repo/tree/main/skills/pdf\n  \
                             sk1ll add --list https://github.com/owner/repo\n  \
@@ -254,7 +264,8 @@ impl Cmd {
             Self::Sync { dry_run, .. } => !dry_run,
             Self::Add { list, .. } => !list,
             Self::Init { .. }
-            | Self::List
+            | Self::List { .. }
+            | Self::Edit { .. }
             | Self::Status
             | Self::Draft
             | Self::Diff { .. }
@@ -394,7 +405,48 @@ fn run(cli: Cli) -> Result<()> {
             print_recovered(sync::displaced::changed()?);
         }
         Cmd::Init { .. } | Cmd::Join { .. } | Cmd::Daemon | Cmd::Fleet => unreachable!(),
-        Cmd::List => {
+        Cmd::List { unmanaged: true } => {
+            for skill in sync::unmanaged::discover(&repo, &machine()?.harnesses())? {
+                let harnesses: std::collections::BTreeSet<_> = skill
+                    .variants
+                    .iter()
+                    .flat_map(|v| v.locations.iter().map(|l| l.harness.as_str()))
+                    .collect();
+                println!(
+                    "{:<24} {:<24} {}",
+                    skill.name,
+                    harnesses.into_iter().collect::<Vec<_>>().join(", "),
+                    if skill.variants.len() > 1 {
+                        "differs"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        }
+        Cmd::Edit { name } => {
+            let path = sk1ll_core::content::editable_path(&repo, &machine()?.harnesses(), &name)?;
+            let editor = std::env::var("VISUAL")
+                .ok()
+                .filter(|e| !e.trim().is_empty())
+                .or_else(|| {
+                    std::env::var("EDITOR")
+                        .ok()
+                        .filter(|e| !e.trim().is_empty())
+                })
+                .context("set $VISUAL or $EDITOR to edit a Skill or Fragment")?;
+            #[cfg(unix)]
+            let status = std::process::Command::new("sh")
+                .args(["-c", &format!("{editor} \"$1\""), "sk1ll-edit"])
+                .arg(&path)
+                .status()?;
+            #[cfg(not(unix))]
+            let status = std::process::Command::new(&editor).arg(&path).status()?;
+            if !status.success() {
+                bail!("editor exited with {status}");
+            }
+        }
+        Cmd::List { unmanaged: false } => {
             for s in repo.skills()? {
                 let origin = match s.origin {
                     Origin::Personal if s.shadows_import => "personal*",
@@ -568,6 +620,38 @@ fn run(cli: Cli) -> Result<()> {
             let harnesses = machine()?.harnesses();
             if !harnesses.contains_key(&harness) {
                 bail!("unknown harness `{harness}` on this machine (see `sk1ll harnesses`)");
+            }
+            let unmanaged = sync::unmanaged::discover(&repo, &harnesses)?
+                .iter()
+                .any(|s| {
+                    s.name == name
+                        && s.variants
+                            .iter()
+                            .any(|v| v.locations.iter().any(|l| l.harness == harness))
+                });
+            let adopted = if unmanaged { None } else { sync::unmanaged::adopted(&repo, &harnesses, &harness, &name)? };
+            if unmanaged || adopted.is_some() {
+                fleet::require_standalone_adoption(daemon_state.as_deref(), &repo)?;
+                let adoption = match adopted {
+                    Some(adoption) => adoption,
+                    None => sync::unmanaged::select(&repo, &harnesses, &harness, &name)?,
+                };
+                sync::unmanaged::publish(&repo, &adoption)?;
+                let mut assignments = assignment()?;
+                for location in &adoption.locations {
+                    assignments.set_skill(&location.harness, &name, true);
+                }
+                assignments.save(&assignment_path)?;
+                sync::unmanaged::complete(&repo, &harnesses, &adoption)?;
+                for action in
+                    sync::plan(&repo, &harnesses, &assignments, PlanOptions::default())?
+                {
+                    sync::apply(&repo, &action)?;
+                }
+                println!(
+                    "adopted {name} from {harness} into the draft; review with `sk1ll diff {name}`"
+                );
+                return Ok(());
             }
             let actions = sync::plan(&repo, &harnesses, &assignment()?, PlanOptions::default())?;
             let file = format!("{name}.md");

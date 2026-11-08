@@ -835,6 +835,57 @@ impl Daemon {
     pub(crate) fn adopt(&self, eng: &mut Engine, t: ConflictTarget) -> Result<()> {
         self.ensure_managed(eng)?;
         self.lock_repo(eng)?;
+        let repo = Repo::open(Self::root(eng))?;
+        let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
+        let unmanaged = sync::unmanaged::discover(&repo, &harnesses)?.iter().any(|s| {
+            s.name == t.name && s.variants.iter().any(|v| v.locations.iter().any(|l| l.harness == t.harness))
+        });
+        let adopted = if unmanaged { None } else { sync::unmanaged::adopted(&repo, &harnesses, &t.harness, &t.name)? };
+        if unmanaged || adopted.is_some() {
+            if !self.is_connected() {
+                return Err(Error::Unavailable("Adopt needs a connection to the Hub".into()));
+            }
+            let adoption = match adopted {
+                Some(adoption) => adoption,
+                None => sync::unmanaged::select(&repo, &harnesses, &t.harness, &t.name)?,
+            };
+            let created = repo.personal_dir().join(&adoption.name).symlink_metadata().is_err();
+            // The Hub rejects unknown items, so publish and report the draft
+            // before enabling it. A crash leaves the original harness copies
+            // untouched and an identical draft that Adopt can retry. Only a
+            // newly created, unchanged repo copy may be rolled back on failure;
+            // retry destinations and user edits must survive. Displacement runs
+            // only after the synchronous, naturally idempotent explicit enable.
+            sync::unmanaged::publish(&repo, &adoption)?;
+            let result = (|| {
+                self.refresh(eng)?;
+                tokio::runtime::Handle::current().block_on(crate::hub::assign_adoption(self, &adoption))
+                    .map_err(Error::Internal)
+            })();
+            let update = match result {
+                Ok(update) => update,
+                Err(error) => {
+                    if created && sync::unmanaged::rollback(&repo, &adoption)? {
+                        self.queue_discarded(vec![ItemRef::Skill(adoption.name.clone())]);
+                    }
+                    self.refresh(eng)?;
+                    self.event(Event::Draft);
+                    return Err(error);
+                }
+            };
+            self.apply_assignment(eng, AssignmentSnapshot {
+                revision: update.revision, assignment: update.assignment,
+            })?;
+            let mut adoption = adoption;
+            adoption.locations.retain(|l| eng.snapshot.as_ref().is_some_and(|s| {
+                s.assignment.skill_enabled(&l.harness, &adoption.name)
+            }));
+            sync::unmanaged::complete(&repo, &harnesses, &adoption)?;
+            self.refresh(eng)?;
+            self.event(Event::Draft);
+            self.event(Event::Fleet);
+            return Ok(());
+        }
         let (repo, actions) = self.plan(eng, false)?;
         sync::adopt(&repo, Self::find_conflict(&actions, &t)?)?;
         tracing::info!("adopted {} from {} into the draft", t.name, t.harness);
@@ -843,6 +894,49 @@ impl Daemon {
             let _ = self.pull(eng);
         }
         Ok(())
+    }
+
+    pub(crate) fn skills(&self, eng: &Engine) -> Result<Vec<sk1ll_core::content::ContentEntry>> {
+        let repo = Repo::open(Self::root(eng))?;
+        let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
+        let baseline = gitx::baseline(repo.root())?;
+        let assignment = eng
+            .snapshot
+            .as_ref()
+            .map(|s| s.assignment.clone())
+            .unwrap_or_default();
+        let mut entries =
+            sk1ll_core::content::list(&repo, &harnesses, &assignment, baseline.as_deref())?;
+        if eng.snapshot.is_none() {
+            for entry in &mut entries {
+                entry.enabled_harnesses.clear();
+            }
+        }
+        Ok(entries)
+    }
+
+    pub(crate) fn skill_tree(
+        &self,
+        eng: &Engine,
+        q: sk1ll_core::content::ContentQuery,
+    ) -> Result<Vec<sk1ll_core::content::FileEntry>> {
+        Ok(sk1ll_core::content::tree(
+            &Repo::open(Self::root(eng))?,
+            &MachineConfig::load(&self.cfg.machine_config)?.harnesses(),
+            &q,
+        )?)
+    }
+
+    pub(crate) fn skill_file(
+        &self,
+        eng: &Engine,
+        q: sk1ll_core::content::FileQuery,
+    ) -> Result<sk1ll_core::content::FileContent> {
+        Ok(sk1ll_core::content::file(
+            &Repo::open(Self::root(eng))?,
+            &MachineConfig::load(&self.cfg.machine_config)?.harnesses(),
+            &q,
+        )?)
     }
 
     /// Replaces the harness's content with what the draft says: a forced plan,
@@ -1281,4 +1375,78 @@ mod tests {
         assert!(!is_rejected_push(&git("fatal: unable to access 'http://h/git/repo.git/': Failed to connect")));
         assert!(!is_rejected_push(&git("fatal: the remote end hung up unexpectedly")));
     }
+    #[tokio::test]
+    async fn refused_adoption_rolls_back_only_its_own_unchanged_copy_and_can_retry() {
+        use axum::{Json, Router, http::StatusCode, routing::{get, put}};
+        use sk1ll_proto::{AssignmentChanges, AssignmentUpdate};
+        for scenario in ["new", "retry", "edit_repo", "edit_source"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("repo");
+            let repo = Repo::init(&root).unwrap();
+            let source = dir.path().join("h/pdf");
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::write(source.join("SKILL.md"), "original").unwrap();
+            let destination = repo.personal_dir().join("pdf");
+            if scenario == "retry" {
+                std::fs::create_dir_all(&destination).unwrap();
+                std::fs::write(destination.join("SKILL.md"), "original").unwrap();
+            }
+            let accept = Arc::new(AtomicBool::new(false));
+            let app = Router::new().route("/api/fleet", get(|| async { Json(sk1ll_proto::FleetView {
+                baseline: None, machines: vec![sk1ll_proto::MachineRow {
+                    id: "a".into(), status: sk1ll_proto::MachineStatus::Drafting, connected: true,
+                    joined_at: 0, last_seen: None,
+                    report: Some(MachineReport { drafts: vec![ItemRef::Skill("pdf".into())], ..Default::default() }),
+                }],
+            }) })).route("/api/machines/a/assignment", put({
+                let accept = accept.clone();
+                let (destination, source) = (destination.clone(), source.clone());
+                move |Json(body): Json<AssignmentChanges>| {
+                    let (accept, destination, source) = (accept.clone(), destination.clone(), source.clone());
+                    async move {
+                        assert_eq!(body.changes.len(), 1);
+                        assert_eq!(body.changes[0].enabled, Some(true));
+                        assert_eq!(body.changes[0].name.as_deref(), Some("pdf"));
+                        if !accept.load(Ordering::SeqCst) {
+                            if scenario == "edit_repo" { std::fs::write(destination.join("SKILL.md"), "later edit").unwrap(); }
+                            if scenario == "edit_source" { std::fs::write(source.join("SKILL.md"), "later edit").unwrap(); }
+                            return (StatusCode::UNPROCESSABLE_ENTITY, "Hub rejected assignment".to_string());
+                        }
+                        let mut assignment = sk1ll_proto::Assignment::default();
+                        assignment.set_skill("h", "pdf", true);
+                        (StatusCode::OK, serde_json::to_string(&AssignmentUpdate { assignment, revision: 2, entries: vec![] }).unwrap())
+                    }
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let mut cfg = Config::new().unwrap();
+            cfg.state = dir.path().join("state/daemon.json");
+            cfg.assignment = dir.path().join("assignment.json");
+            cfg.machine_config = dir.path().join("machine.toml");
+            std::fs::write(&cfg.machine_config, format!("[harnesses.h]\nskills = {:?}\nmode = \"copy\"\n", dir.path().join("h"))).unwrap();
+            let mut snap = AssignmentSnapshot { revision: 1, ..Default::default() };
+            snap.assignment.set_new_skills_default("h", false);
+            state::save_snapshot(&cfg.snapshot_path(), &snap).unwrap();
+            let d = Daemon::new(cfg, DaemonState {
+                machine_id: "a".into(), token: "t".into(), hub_url: format!("http://{address}"), repo: root, revoked: false,
+            }).unwrap();
+            d.set_connection(Connection::Connected);
+            let error = d.blocking(|d, eng| d.adopt(eng, ConflictTarget { harness: "h".into(), name: "pdf".into() })).await.unwrap_err();
+            assert!(error.to_string().contains("Hub refused"), "{error}");
+            assert_eq!(std::fs::read_to_string(source.join("SKILL.md")).unwrap(), if scenario == "edit_source" { "later edit" } else { "original" });
+            assert!(!source.join(".sk1ll-managed").exists());
+            if scenario == "new" {
+                assert!(!destination.exists());
+                accept.store(true, Ordering::SeqCst);
+                d.blocking(|d, eng| d.adopt(eng, ConflictTarget { harness: "h".into(), name: "pdf".into() })).await.unwrap();
+                assert!(source.join(".sk1ll-managed").is_file());
+            } else {
+                assert_eq!(std::fs::read_to_string(destination.join("SKILL.md")).unwrap(), if scenario == "edit_repo" { "later edit" } else { "original" });
+            }
+            server.abort();
+        }
+    }
+
 }

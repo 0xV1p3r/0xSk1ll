@@ -122,6 +122,19 @@ pub(crate) fn queue_discarded(
     Ok(())
 }
 
+pub(crate) fn require_standalone_adoption(state: Option<&Path>, repo: &sk1ll_core::Repo) -> Result<()> {
+    let mut cfg = Config::from_env()?;
+    if let Some(p) = state { cfg.state = p.to_path_buf(); }
+    if let Some(state) = DaemonState::load(&cfg.state)?.filter(|s| !s.revoked) {
+        let joined = state.repo.canonicalize()?;
+        anyhow::ensure!(repo.root() == joined,
+            "selected repo {} differs from the joined repo {}; select the joined repo to change fleet content",
+            repo.root().display(), joined.display());
+        bail!("Adopt needs a connection to the Hub; start the daemon with `sk1ll daemon` and wait for it to connect");
+    }
+    Ok(())
+}
+
 fn client(cli: &Cli) -> Result<Client> {
     Ok(match &cli.daemon_socket {
         Some(p) => Client::new(p),

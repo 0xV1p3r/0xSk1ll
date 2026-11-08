@@ -97,6 +97,8 @@ enum Existing {
     Unmanaged(String),
 }
 
+pub mod unmanaged;
+
 /// Repo content, resolved once per plan and filtered per harness by assignment.
 struct Selection {
     skills: Vec<Skill>,
@@ -176,7 +178,7 @@ pub fn render_instructions(
 pub fn apply(repo: &Repo, action: &Action) -> Result<()> {
     match &action.item {
         Item::Skill { name, mode, source, expected } => {
-            apply_skill(repo, action, name, *mode, source.as_deref(), expected.as_deref())
+            apply_skill(repo, action, name, *mode, source.as_deref(), expected.as_deref(), false)
         }
         Item::Instructions { content, expected, .. } => {
             apply_instructions(action, content.as_deref(), expected.as_deref())
@@ -440,6 +442,7 @@ fn apply_skill(
     mode: LinkMode,
     source: Option<&Path>,
     expected: Option<&str>,
+    adopted: bool,
 ) -> Result<()> {
     if action.kind == ActionKind::Conflict {
         return Ok(());
@@ -455,6 +458,7 @@ fn apply_skill(
     let managed = match &existing {
         Existing::Missing => false,
         Existing::ManagedLink(_) | Existing::ManagedCopy(_) => true,
+        Existing::Unmanaged(_) if adopted => true,
         Existing::Unmanaged(why) => {
             return Err(Error::Invalid(format!("refusing to touch {}: {why}", dest.display())));
         }
@@ -1012,6 +1016,19 @@ pub fn adopt(repo: &Repo, action: &Action) -> Result<()> {
 }
 
 fn adopt_skill(repo: &Repo, src: &Path, name: &str) -> Result<()> {
+    let source = repo
+        .skills()?
+        .into_iter()
+        .find(|s| s.name == name)
+        .map(|s| s.path);
+    if matches!(
+        classify(repo.root(), src, source.as_deref())?,
+        Existing::Unmanaged(_)
+    ) {
+        return Err(Error::Invalid(format!(
+            "`{name}` is an unmanaged skill and cannot replace an existing repo skill"
+        )));
+    }
     copy_into_repo(repo, src, name)?;
     let marker = src.join(MARKER);
     fs::write(&marker, hash_dir(src)?).at(&marker)

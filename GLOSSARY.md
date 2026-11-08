@@ -11,6 +11,10 @@ A `SKILL.md` folder, either personal or imported.
 A skill vendored from an external git source and pinned to a commit; updated from its source rather than edited (fork it to edit).
 _Avoid_: Dependency, package, remote skill
 
+**Unmanaged skill**:
+A skill in a harness's skills directory that sk1ll did not put there and does not track; it is not in the repo.
+_Avoid_: Installed skill, stray, foreign skill
+
 **Fragment**:
 One instruction file ("for X do Y") that is rendered into a harness's global instructions.
 _Avoid_: Rule, instruction (when meaning a single file)
@@ -57,6 +61,10 @@ _Avoid_: Revert, discard
 **Conflict**:
 Content in a harness that differs from what the machine's draft says it should be, and that sk1ll won't overwrite on its own.
 _Avoid_: Drift
+
+**Adopt**:
+To copy content from a harness into the machine's draft: either a hand edit made to managed content in the harness, or an unmanaged skill, which becomes a personal skill.
+_Avoid_: Import (reserved for external git sources), take in
 
 **Daemon**:
 The background process on each machine that keeps its harnesses matching its draft and assignment, and talks to the hub for it.
