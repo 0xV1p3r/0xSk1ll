@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
-import { ArrowDownToLine, FilePen, History, LayoutGrid, LoaderCircle, RefreshCw, Server, Settings as SettingsIcon, TriangleAlert } from 'lucide-react';
+import { ArrowDownToLine, BookOpen, FilePen, History, LayoutGrid, LoaderCircle, RefreshCw, Server, Settings as SettingsIcon, TriangleAlert } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -16,6 +16,8 @@ import { Fleet } from './Fleet';
 import { Matrix } from './Matrix';
 import { Draft } from './Draft';
 import { Conflicts, Imports, Log } from './Activity';
+import { Skills } from './Skills';
+import { useResource } from './hooks';
 import { Settings } from './Settings';
 import { ErrorNotice, Loading, Notice, StatusBadge } from './shared';
 import type { CommandError, DaemonConnection, StatusView } from './types';
@@ -24,6 +26,7 @@ const screens = {
   Fleet: { icon: Server, group: 'Fleet', description: 'Machines sharing this Baseline. Reports refresh live and every 15 seconds.' },
   'Assignment matrix': { icon: LayoutGrid, group: 'Fleet', description: 'Assignment takes effect immediately. Explicit toggles override a Harness default.' },
   Log: { icon: History, group: 'Fleet', description: 'Assignment log, newest first. Undo restores an entry\'s previous value and adds a new log entry.' },
+  Skills: { icon: BookOpen, group: 'This Machine', description: 'Browse Personal Skills, Imports, Fragments, and Unmanaged skills on this Machine.' },
   Draft: { icon: FilePen, group: 'This Machine', description: 'This Machine\'s Draft is live in its Harnesses. Promote sends selected items to the Fleet Baseline.' },
   Conflicts: { icon: TriangleAlert, group: 'This Machine', description: 'A Conflict is a Harness edit that differs from this Machine\'s Draft.' },
   Imports: { icon: ArrowDownToLine, group: 'This Machine', description: 'Available upstream updates. Review each update in the Draft before Promote.' },
@@ -52,15 +55,15 @@ function ConnectionPage({ socket, error }: { socket: string; error: string }) {
   </main>;
 }
 
-function AppSidebar({ screen, setScreen, status }: { screen: Screen; setScreen: (screen: Screen) => void; status: StatusView }) {
+export function AppSidebar({ screen, setScreen, status, unmanagedCount }: { screen: Screen; setScreen: (screen: Screen) => void; status: StatusView; unmanagedCount: number }) {
   const { isMobile, setOpenMobile } = useSidebar();
-  const counts: Partial<Record<Screen, number>> = { Draft: status.report.drafts.length, Conflicts: status.report.conflicts.length };
+  const counts: Partial<Record<Screen, number>> = { Skills: unmanagedCount, Draft: status.report.drafts.length, Conflicts: status.report.conflicts.length };
   const item = (name: Screen) => {
     const Icon = screens[name].icon;
     return <SidebarMenuItem key={name}>
       <SidebarMenuButton isActive={screen === name} tooltip={name} aria-current={screen === name ? 'page' : undefined}
         onClick={() => { if (isMobile) setOpenMobile(false); setScreen(name); }}><Icon /><span>{name}</span></SidebarMenuButton>
-      {!!counts[name] && <SidebarMenuBadge>{counts[name]}</SidebarMenuBadge>}
+      {!!counts[name] && <SidebarMenuBadge aria-label={name === 'Skills' ? `${counts[name]} Unmanaged skills` : undefined}>{counts[name]}</SidebarMenuBadge>}
     </SidebarMenuItem>;
   };
   const group = (label: string) => (Object.keys(screens) as Screen[]).filter(name => screens[name].group === label);
@@ -88,6 +91,7 @@ export function App() {
   const [socket, setSocket] = useState('Default Daemon socket');
   const [revision, setRevision] = useState(0);
   const changed = useCallback(() => setRevision(value => value + 1), []);
+  const skills = useResource(api.skills, revision);
   const heading = useRef<HTMLHeadingElement>(null);
   const navigated = useRef(false);
   const navigate = useCallback((next: Screen) => { navigated.current = true; setScreen(next); }, []);
@@ -154,7 +158,7 @@ export function App() {
   const hubConnected = status.connection === 'connected';
   return <TooltipProvider><SidebarProvider>
     <a href="#main" className="sr-only z-50 rounded-md bg-background px-3 py-2 text-sm shadow focus:not-sr-only focus:fixed focus:top-2 focus:left-2">Skip to content</a>
-    <AppSidebar screen={screen} setScreen={navigate} status={status} />
+    <AppSidebar screen={screen} setScreen={navigate} status={status} unmanagedCount={skills.data?.filter(entry => entry.type === 'unmanaged').length ?? 0} />
     <SidebarInset className="min-w-0">
       <header className="sticky top-0 z-10 flex h-14 shrink-0 items-center gap-2 border-b bg-background/95 px-4 backdrop-blur">
         <SidebarTrigger className="-ml-1" />
@@ -182,6 +186,7 @@ export function App() {
           <p>If this Machine was removed or its credential rotated, create a join code on another Machine and rejoin.</p>
           <div><Button variant="outline" size="sm" className="mt-2" onClick={() => navigate('Settings')}>Rejoin in Settings</Button></div></Notice>}
         <ErrorNotice error={error} />
+        {screen === 'Skills' && <><ErrorNotice error={skills.error} />{skills.loading && !skills.data ? <Loading /> : <Skills connection={status.connection} entries={skills.data ?? []} revision={revision} changed={changed} reviewDraft={() => navigate('Draft')} assignment={() => navigate('Assignment matrix')} />}</>}
         {screen === 'Fleet' && <Fleet revision={revision} machineId={status.machine_id} navigate={navigate} changed={changed} live={status.connection === 'connected'} />}
         {screen === 'Assignment matrix' && <Matrix revision={revision} status={status} />}
         {screen === 'Draft' && <Draft revision={revision} status={status} changed={changed} />}

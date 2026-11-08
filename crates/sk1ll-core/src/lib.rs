@@ -5,6 +5,7 @@
 //! IPC boundary (e.g. Tauri commands) unchanged.
 
 pub mod assignment;
+pub mod content;
 pub mod draft;
 pub mod engine;
 pub mod git;

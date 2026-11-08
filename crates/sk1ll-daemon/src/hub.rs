@@ -113,13 +113,31 @@ async fn flush_outbox(d: &Arc<Daemon>, sink: &mut Sink, sent: &mut MachineReport
     loop {
         // Capture the entry and the state used to filter it under the same
         // engine mutex, so a concurrent Reset cannot queue against an older report.
-        let (report, entry) = d.blocking(|d, eng| {
+        // Adoption holds the engine mutex while waiting for its published
+        // draft to reach the Hub. Keep sending fresh reports even if an outbox
+        // refresh is waiting for that mutex.
+        let mut view = d.subscribe_view();
+        let refresh = d.blocking(|d, eng| {
             d.refresh(eng)?;
             Ok((d.view().report, d.outbox_front()))
-        }).await.map_err(|e| {
-            d.set_error(format!("refreshing before replaying discards: {e}"));
-            e
-        })?;
+        });
+        tokio::pin!(refresh);
+        let (report, entry) = loop {
+            tokio::select! {
+                result = &mut refresh => break result.map_err(|e| {
+                    d.set_error(format!("refreshing before replaying discards: {e}"));
+                    e
+                })?,
+                changed = view.changed() => {
+                    changed?;
+                    let report = view.borrow_and_update().report.clone();
+                    if report != *sent {
+                        send(sink, &DaemonMessage::Status(report.clone())).await?;
+                        *sent = report;
+                    }
+                }
+            }
+        };
         if report != *sent {
             send(sink, &DaemonMessage::Status(report.clone())).await?;
             *sent = report.clone();
@@ -267,8 +285,17 @@ pub async fn set_assignment_direct(
 ) -> anyhow::Result<AssignmentUpdate> {
     use anyhow::Context;
     let state = DaemonState::load(&cfg.state)?.context("this machine hasn't joined a fleet")?;
+    let update = change_assignment(&reqwest::Client::new(), &state, changes).await?;
+    let snap = AssignmentSnapshot { revision: update.revision, assignment: update.assignment.clone() };
+    crate::state::save_snapshot(&cfg.snapshot_path(), &snap)
+        .context("Hub accepted the assignment, but saving its authoritative snapshot failed")?;
+    Ok(update)
+}
+
+async fn change_assignment(http: &reqwest::Client, state: &DaemonState, changes: &AssignmentChanges) -> anyhow::Result<AssignmentUpdate> {
+    use anyhow::Context;
     let path = format!("/machines/{}/assignment", state.machine_id);
-    let resp = request(&reqwest::Client::new(), &state, Method::PUT, &path, serde_json::to_vec(changes)?.into()).await?;
+    let resp = request(http, state, Method::PUT, &path, serde_json::to_vec(changes)?.into()).await?;
     let status = resp.status();
     let body = resp.bytes().await.context("reading the Hub's assignment response")?;
     if !status.is_success() {
@@ -277,8 +304,32 @@ pub async fn set_assignment_direct(
         anyhow::bail!("Hub refused the assignment (HTTP {status}): {}", redact(&message));
     }
     let update: AssignmentUpdate = serde_json::from_slice(&body).context("parsing the Hub's assignment response")?;
-    let snap = AssignmentSnapshot { revision: update.revision, assignment: update.assignment.clone() };
-    crate::state::save_snapshot(&cfg.snapshot_path(), &snap)
-        .context("Hub accepted the assignment, but saving its authoritative snapshot failed")?;
     Ok(update)
+}
+
+/// Wait for the existing status protocol to report this local draft before PUT.
+/// HTTP and WebSocket requests have no ordering guarantee across transports.
+pub(crate) async fn assign_adoption(d: &Daemon, adoption: &sk1ll_core::sync::unmanaged::Adoption) -> anyhow::Result<AssignmentUpdate> {
+    let item = sk1ll_proto::ItemRef::Skill(adoption.name.clone());
+    tokio::time::timeout(SEND_TIMEOUT, async {
+        loop {
+            anyhow::ensure!(d.is_connected(), "Adopt needs a connection to the Hub");
+            let report = d.view().report;
+            if !report.drafts.contains(&item) && !report.unpushed.contains(&item) {
+                break; // An unchanged baseline item needs no new draft report.
+            }
+            let fleet: sk1ll_proto::FleetView = request(&d.http, &d.ident, Method::GET, "/fleet", Bytes::new())
+                .await?.error_for_status()?.json().await?;
+            if fleet.machines.iter().any(|m| m.id == d.ident.machine_id && m.report.as_ref().is_some_and(|r| {
+                r.drafts.contains(&item) || r.unpushed.contains(&item)
+            })) { break; }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    }).await.map_err(|_| anyhow::anyhow!("Adopt timed out waiting for the Hub to receive the draft; retry Adopt"))??;
+    let changes = AssignmentChanges { changes: adoption.locations.iter().map(|l| sk1ll_proto::ToggleChange {
+        harness: l.harness.clone(), kind: sk1ll_proto::ToggleKind::Skill,
+        name: Some(adoption.name.clone()), enabled: Some(true),
+    }).collect() };
+    change_assignment(&d.http, &d.ident, &changes).await
 }

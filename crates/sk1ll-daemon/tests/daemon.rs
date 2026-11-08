@@ -1316,3 +1316,223 @@ async fn a_hanging_fetch_blocks_no_other_call() {
     let err = stuck.await.unwrap().unwrap_err();
     assert!(err.message.contains("timed out"), "{}", err.message);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn skills_api_browses_content_and_adopts_only_while_connected() {
+    use sk1ll_daemon::client::{ConflictTarget, ContentQuery, ContentType, FileQuery};
+    let mut hub = Hub::start().await;
+    let mut m = Machine::new("skills");
+    // Identical copies in two Harnesses, a differing third, and an empty
+    // fourth whose new-skills default remains off.
+    let config = m.home.path().join(".config/sk1ll/machine.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    for h in ["second", "different", "empty"] {
+        text.push_str(&format!(
+            "\n[harnesses.{h}]\nskills = {:?}\nmode = \"copy\"\n",
+            m.home.path().join(h).to_str().unwrap()
+        ));
+    }
+    std::fs::write(config, text).unwrap();
+    m.join(&hub).await;
+    m.start_connected().await;
+    m.write(
+        "personal/baseline/SKILL.md",
+        "---\ndescription: baseline\n---\nold",
+    );
+    m.write(
+        "instructions/git.md",
+        "---\ndescription: Git\n---\nfragment baseline",
+    );
+    assert!(m.promote_all().await.pushed);
+    m.write(
+        "personal/baseline/SKILL.md",
+        "---\ndescription: draft\n---\nnew",
+    );
+    std::fs::remove_file(m.repo().join("instructions/git.md")).unwrap();
+    let items = m.client.skills().await.unwrap();
+    let baseline = items.iter().find(|s| s.name == "baseline").unwrap();
+    assert!(baseline.in_baseline);
+    assert_eq!(baseline.description.as_deref(), Some("draft"));
+    assert_eq!(baseline.draft, Some(sk1ll_core::Change::Modified));
+    let fragment = items.iter().find(|s| s.name == "git").unwrap();
+    assert_eq!(fragment.kind, ContentType::Fragment);
+    assert_eq!(fragment.draft, Some(sk1ll_core::Change::Deleted));
+    let q = |item: &str| ContentQuery {
+        item: item.into(),
+        hash: None,
+        harness: None,
+    };
+    let file = |item: &str, path: &str| FileQuery {
+        content: q(item),
+        path: path.into(),
+    };
+    assert!(
+        m.client
+            .skill_file(&file("skill:baseline", "SKILL.md"))
+            .await
+            .unwrap()
+            .text
+            .unwrap()
+            .ends_with("new")
+    );
+    assert!(
+        m.client
+            .skill_file(&file("fragment:git", "git.md"))
+            .await
+            .unwrap()
+            .text
+            .unwrap()
+            .ends_with("fragment baseline")
+    );
+    assert_eq!(
+        m.client.skill_tree(&q("fragment:git")).await.unwrap()[0].path,
+        "git.md"
+    );
+    assert!(
+        m.client
+            .skill_file(&file("skill:baseline", "../sk1ll.toml"))
+            .await
+            .is_err()
+    );
+    std::fs::write(m.repo().join("personal/baseline/binary"), b"\x00\xff").unwrap();
+    assert!(
+        m.client
+            .skill_file(&file("skill:baseline", "binary"))
+            .await
+            .unwrap()
+            .binary
+    );
+    for path in [m.skills(), m.home.path().join("second")] {
+        write(
+            &path.join("pdf"),
+            "SKILL.md",
+            "---\ndescription: PDFs\n---\nsame",
+        );
+    }
+    write(
+        &m.home.path().join("different/pdf"),
+        "SKILL.md",
+        "different",
+    );
+    let skills = m.client.skills().await.unwrap();
+    let unmanaged = skills
+        .iter()
+        .find(|s| s.kind == ContentType::Unmanaged && s.name == "pdf")
+        .unwrap();
+    assert_eq!(unmanaged.variants.len(), 2);
+    assert!(!unmanaged.clashes_with_repo);
+    let variant = unmanaged
+        .variants
+        .iter()
+        .find(|v| v.locations.len() == 2)
+        .unwrap();
+    let selected = ContentQuery {
+        hash: Some(variant.hash.clone()),
+        ..q("unmanaged:pdf")
+    };
+    assert_eq!(
+        m.client.skill_tree(&selected).await.unwrap()[0].path,
+        "SKILL.md"
+    );
+    assert!(
+        m.client
+            .skill_file(&FileQuery {
+                content: selected,
+                path: "SKILL.md".into()
+            })
+            .await
+            .unwrap()
+            .text
+            .unwrap()
+            .ends_with("same")
+    );
+    assert!(m.client.skill_tree(&q("unmanaged:pdf")).await.is_err());
+    hub.stop();
+    eventually(|| async { (m.status().await.connection == Connection::Offline).then_some(()) })
+        .await;
+    let target = ConflictTarget { harness: HARNESS.into(), name: "pdf".into() };
+    for result in [m.client.adopt_unmanaged(&target).await, m.client.adopt(&target).await] {
+        assert!(result.unwrap_err().message.contains("Adopt needs a connection to the Hub"));
+    }
+    assert!(!m.repo().join("personal/pdf").exists());
+    assert!(!m.outbox_path().exists());
+    assert!(!m.skills().join("pdf/.sk1ll-managed").exists());
+    assert!(m.harness_skill("pdf").unwrap().ends_with("same"));
+    hub.launch().await;
+    eventually(|| async { (m.status().await.connection == Connection::Connected).then_some(()) }).await;
+    m.client.adopt_unmanaged(&target).await.unwrap();
+    assert!(m.repo().join("personal/pdf/SKILL.md").is_file());
+    assert!(!m.outbox_path().exists());
+    assert!(m.skills().join("pdf/.sk1ll-managed").is_file());
+    assert!(m.home.path().join("second/pdf/.sk1ll-managed").is_file());
+    // The entire operation may have completed before the local response was
+    // lost. Repeating it must still succeed and keep its explicit Assignment.
+    m.client.adopt_unmanaged(&target).await.unwrap();
+
+    let snap = m.snapshot().unwrap();
+    assert!(!snap.assignment.skill_enabled("different", "pdf"));
+    assert!(!snap.assignment.skill_enabled("empty", "pdf"));
+    assert!(!m.home.path().join("empty/pdf").exists());
+    assert_eq!(
+        std::fs::read_to_string(m.home.path().join("different/pdf/SKILL.md")).unwrap(),
+        "different"
+    );
+    assert!(m.skills().join(".sk1ll-tmp/displaced").is_dir());
+    let recovered = m.client.recovered().await.unwrap();
+    let originals = recovered.iter().filter(|entry| entry.name == "pdf" && entry.path.as_ref().is_some_and(|path| {
+        std::fs::read_to_string(path.join("SKILL.md")).is_ok_and(|text| text.ends_with("same"))
+    })).count();
+    assert_eq!(originals, 2);
+
+    let skills = m.client.skills().await.unwrap();
+    let adopted = skills
+        .iter()
+        .find(|s| s.name == "pdf" && s.kind == ContentType::Personal)
+        .unwrap();
+    assert_eq!(adopted.enabled_harnesses, [HARNESS, "second"]);
+    assert_eq!(adopted.draft, Some(sk1ll_core::Change::Added));
+    let unmanaged = skills
+        .iter()
+        .find(|s| s.kind == ContentType::Unmanaged && s.name == "pdf")
+        .unwrap();
+    assert!(unmanaged.clashes_with_repo);
+    assert!(
+        m.client
+            .adopt_unmanaged(&ConflictTarget {
+                harness: "different".into(),
+                name: "pdf".into()
+            })
+            .await
+            .unwrap_err()
+            .message
+            .contains("already exists")
+    );
+    let log: Vec<LogEntry> = hub.get("/log").await;
+    assert!(log.iter().any(|e| e.kind == ToggleKind::Skill
+        && e.name.as_deref() == Some("pdf")
+        && e.after == Some(true)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unmanaged_adoption_retries_after_crash_between_publication_and_assignment() {
+    use sk1ll_daemon::client::ConflictTarget;
+    let hub = Hub::start().await;
+    let mut m = Machine::new("adopt-retry");
+    m.join(&hub).await;
+    m.start_connected().await;
+    m.stop();
+    write(&m.skills().join("pdf"), "SKILL.md", "original user content");
+    let repo = sk1ll_core::Repo::open(m.repo()).unwrap();
+    let hs = sk1ll_core::MachineConfig::load(&m.home.path().join(".config/sk1ll/machine.toml")).unwrap().harnesses();
+    // Simulate a process dying just after atomic draft publication. There is
+    // no intent or startup reconciliation; the original is still unmanaged.
+    sk1ll_core::sync::unmanaged::prepare(&repo, &hs, HARNESS, "pdf").unwrap();
+    m.start_connected().await;
+    assert!(!m.skills().join("pdf/.sk1ll-managed").exists());
+    let target = ConflictTarget { harness: HARNESS.into(), name: "pdf".into() };
+    m.client.adopt(&target).await.unwrap();
+    let snap: AssignmentSnapshot = hub.get(&format!("/machines/{}/assignment", m.id)).await;
+    assert!(snap.assignment.skill_enabled(HARNESS, "pdf"));
+    assert!(m.skills().join("pdf/.sk1ll-managed").is_file());
+    assert_eq!(m.harness_skill("pdf").unwrap(), "original user content");
+}

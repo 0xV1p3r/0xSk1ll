@@ -344,7 +344,7 @@ pub(crate) fn stage(cache: &Path, commit: &str, import: &Import, root: &Path, in
 }
 
 /// A fresh staging path in `dir` (nothing is created).
-fn unique(dir: &Path) -> PathBuf {
+pub(crate) fn unique(dir: &Path) -> PathBuf {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     let n = NEXT.fetch_add(1, Ordering::Relaxed);

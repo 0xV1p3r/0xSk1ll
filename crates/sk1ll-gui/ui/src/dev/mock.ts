@@ -37,6 +37,22 @@ export function installMock(scenario: string) {
     { item: 'fragment:style', in_baseline: true, draft: 'modified', unpushed: false, description: 'House code style rules shared by every Harness.' },
     { item: 'fragment:security', in_baseline: true, draft: null, unpushed: false, description: null },
   ];
+  const content: T.ContentEntry[] = empty ? [] : [
+    ...items.map((item): T.ContentEntry => {
+      const [kind, name] = item.item.split(':');
+      return { name, item: item.item, type: kind === 'fragment' ? 'fragment' : 'personal', description: item.description,
+        draft: item.draft, in_baseline: item.in_baseline, path: `${status.repo}/${kind === 'fragment' ? `instructions/${name}.md` : `personal/${name}`}`,
+        enabled_harnesses: ['claude', 'codex'], clashes_with_repo: false, variants: [] };
+    }),
+    { name: 'pdf', item: 'skill:pdf', type: 'import', description: 'Work with PDFs.', draft: null, in_baseline: true,
+      path: `${status.repo}/imported/pdf`, enabled_harnesses: ['claude'], clashes_with_repo: false, variants: [] },
+    { name: 'notes', item: null, type: 'unmanaged', description: 'Collect notes.', draft: null, in_baseline: false,
+      path: null, enabled_harnesses: [], clashes_with_repo: false, variants: [
+        { hash: 'sha256:one', description: 'Collect notes.', locations: [{ harness: 'claude', path: '/home/dev/.claude/skills/notes' }] },
+        { hash: 'sha256:two', description: 'Collect detailed notes.', locations: [{ harness: 'codex', path: '/home/dev/.codex/skills/notes' }] },
+      ] },
+  ];
+  let preferredEditor = 'code';
   const assignments: Record<string, T.AssignmentSnapshot> = {
     workstation: { revision: 42, harnesses: { claude: harness({ deploy: false }, { style: true }), codex: harness({}, { security: true }) } },
     laptop: { revision: 17, harnesses: { claude: harness({ 'code-review': true }) } },
@@ -82,6 +98,31 @@ export function installMock(scenario: string) {
       case 'status': return delay(status, 60);
       case 'fleet': return delay({ baseline: '9f3c2a17d4e1', machines: empty ? machines.slice(0, 1) : machines });
       case 'items': return delay(items);
+      case 'skills': return delay(structuredClone(content));
+      case 'skill_tree': {
+        const query = a.query as T.ContentQuery;
+        return delay(query.item.startsWith('fragment:') ? [{ path: `${query.item.slice(9)}.md`, kind: 'file', size: 120 }]
+          : [{ path: 'SKILL.md', kind: 'file', size: 120 }, { path: 'references', kind: 'directory', size: 0 }, { path: 'references/example.md', kind: 'file', size: 50 }]);
+      }
+      case 'skill_file': {
+        const query = a.query as T.ContentQuery & { path: string };
+        return delay({ path: query.path, text: `---\nname: ${query.item.split(':')[1]}\ndescription: ${query.hash === 'sha256:two' ? 'Collect detailed notes.' : 'Work with this Skill.'}\n---\n# Instructions\n\nUse **careful review** before making changes.\n\n- Read the files.\n- Check the result.`, binary: false, too_large: false, size: 120 });
+      }
+      case 'editors': return delay({ preferred_editor: preferredEditor, editors: [
+        { id: 'code', name: 'VS Code', kind: 'gui' }, { id: 'nvim', name: 'Neovim', kind: 'terminal' }, { id: 'file-manager', name: 'File manager', kind: 'system' },
+      ] });
+      case 'open_in_editor': preferredEditor = a.editorId as string; return delay(undefined);
+      case 'fork': case 'adopt_unmanaged': {
+        const name = cmd === 'fork' ? a.name as string : (a.target as T.ConflictTarget).name;
+        const entry = content.find(value => value.name === name && value.type === (cmd === 'fork' ? 'import' : 'unmanaged'));
+        if (!entry) return Promise.reject({ message: 'Skill no longer exists' });
+        entry.type = 'personal'; entry.item = `skill:${name}`; entry.draft = cmd === 'fork' ? 'modified' : 'added';
+        entry.path = `${status.repo}/personal/${name}`; entry.variants = []; entry.enabled_harnesses = ['claude'];
+        if (!items.some(item => item.item === entry.item)) items.push({ item: entry.item, in_baseline: false, draft: entry.draft, unpushed: false, description: entry.description });
+        draft.push({ item: entry.item, change: entry.draft, paths: [`personal/${name}/SKILL.md`], fingerprint: 'converted' });
+        local.drafts.push(entry.item);
+        return delay(undefined);
+      }
       case 'assignment': return delay(assignments[a.machine as string] ?? { revision: 0, harnesses: {} });
       case 'set_assignment': {
         const snapshot = assignments[a.machine as string];
@@ -118,6 +159,7 @@ export function installMock(scenario: string) {
         const request = a.request as T.AddImportRequest;
         if (items.some(i => i.item === `skill:${request.name}`))
           return Promise.reject({ message: 'Import name already exists', status: 409, unreachable: false });
+        content.push({ name: request.name, item: `skill:${request.name}`, type: 'import', description: null, draft: 'added', in_baseline: false, path: `${status.repo}/imported/${request.name}`, enabled_harnesses: [], clashes_with_repo: false, variants: [] });
         items.push({ item: `skill:${request.name}`, in_baseline: false, draft: 'added', unpushed: false, description: null });
         draft.push({ item: `skill:${request.name}`, change: 'added', paths: [`imported/${request.name}/SKILL.md`], fingerprint: 'new' });
         return delay({ name: request.name, old_commit: null, new_commit: 'c0ffee1234567890', changed: true });

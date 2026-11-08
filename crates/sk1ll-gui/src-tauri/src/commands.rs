@@ -54,6 +54,11 @@ macro_rules! command {
 command!(status() -> StatusView, status());
 command!(fleet() -> FleetView, fleet());
 command!(items() -> Vec<ItemView>, items());
+command!(skills() -> Vec<ContentEntry>, skills());
+command!(skill_tree(query: ContentQuery) -> Vec<FileEntry>, skill_tree(&query));
+command!(skill_file(query: FileQuery) -> FileContent, skill_file(&query));
+command!(adopt_unmanaged(target: ConflictTarget) -> (), adopt_unmanaged(&target));
+command!(fork(name: String) -> (), fork(&name));
 command!(diff(item: String) -> DiffView, diff(&item));
 command!(promote_message(items: Vec<String>) -> PromoteMessage, promote_message(&items));
 command!(promote(request: PromoteRequest) -> PromoteResponse, promote(&request));
@@ -141,4 +146,61 @@ pub async fn draft(bridge: State<'_, Bridge>) -> Result<Vec<ReviewDraftEntry>> {
 #[tauri::command]
 pub fn connection_info(bridge: State<'_, Bridge>) -> String {
     bridge.client.socket().display().to_string()
+}
+
+fn editor_error(message: impl Into<String>) -> CommandError {
+    CommandError { message: message.into(), status: None, unreachable: false }
+}
+
+impl Bridge {
+    /// Resolve the editor destination from the same inventory used by Skills.
+    pub(crate) async fn editor_target(&self, item: &str) -> Result<crate::editors::Target> {
+        let (kind, name) = item.split_once(':').ok_or_else(|| editor_error("Expected skill:<name> or fragment:<name>"))?;
+        if name.is_empty() || name.contains(['/', '\0']) || (cfg!(windows) && name.contains('\\')) || matches!(name, "." | "..") {
+            return Err(editor_error("Invalid item name"));
+        }
+        if !matches!(kind, "skill" | "fragment") { return Err(editor_error("Adopt this Unmanaged skill before opening it")); }
+        let entry = self.client.skills().await?.into_iter()
+            .find(|entry| entry.item.as_ref().is_some_and(|reference| reference.to_string() == item))
+            .ok_or_else(|| editor_error("Item is no longer in Skills"))?;
+        match entry.kind {
+            ContentType::Import => return Err(editor_error("Fork this Import before opening it in an editor")),
+            ContentType::Unmanaged => return Err(editor_error("Adopt this Unmanaged skill before opening it")),
+            _ => {}
+        }
+        let path = entry.path.ok_or_else(|| editor_error("Item has no repo path"))?;
+        let repo = self.client.status().await?.repo;
+        crate::editors::validate_target(&repo, &path, entry.kind == ContentType::Fragment).map_err(editor_error)
+    }
+}
+
+fn preference_path<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<PathBuf> {
+    use tauri::Manager;
+    Ok(app.path().app_config_dir().map_err(|e| editor_error(e.to_string()))?.join("editors.json"))
+}
+
+#[tauri::command]
+pub fn editors(app: tauri::AppHandle, cache: State<'_, crate::editors::EditorCache>, refresh: Option<bool>) -> Result<crate::editors::EditorsView> {
+    let mut guard = cache.0.lock().map_err(|_| editor_error("Editor cache unavailable"))?;
+    if refresh.unwrap_or(false) || guard.is_none() { *guard = Some(crate::editors::Discovery::environment().detect()); }
+    let editors = guard.as_ref().unwrap();
+    let preference = std::fs::read(preference_path(&app)?).ok().and_then(|b| serde_json::from_slice::<crate::editors::Preferences>(&b).ok()).and_then(|p| p.preferred_editor);
+    let preferred_editor = preference.filter(|id| editors.iter().any(|e| &e.view.id == id)).unwrap_or_else(|| editors[0].view.id.clone());
+    Ok(crate::editors::EditorsView { editors: editors.iter().map(|e| e.view.clone()).collect(), preferred_editor })
+}
+
+#[tauri::command]
+pub async fn open_in_editor(app: tauri::AppHandle, bridge: State<'_, Bridge>, cache: State<'_, crate::editors::EditorCache>, editor_id: String, item: String) -> Result<()> {
+    let editor = {
+        let mut guard = cache.0.lock().map_err(|_| editor_error("Editor cache unavailable"))?;
+        let editors = guard.get_or_insert_with(|| crate::editors::Discovery::environment().detect());
+        editors.iter().find(|e| e.view.id == editor_id).cloned().ok_or_else(|| editor_error("Editor is not available; refresh the editor list"))?
+    };
+    let target = bridge.editor_target(&item).await?;
+    let path = preference_path(&app)?;
+    std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| editor_error(e.to_string()))?;
+    crate::editors::launch(&editor, &target).map_err(editor_error)?;
+    let bytes = serde_json::to_vec(&crate::editors::Preferences { preferred_editor: Some(editor_id) }).map_err(|e| editor_error(e.to_string()))?;
+    std::fs::write(path, bytes).map_err(|e| editor_error(format!("Editor opened, but preference could not be saved: {e}")))?;
+    Ok(())
 }

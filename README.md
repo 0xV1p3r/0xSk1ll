@@ -32,13 +32,15 @@ sk1ll add github:owner/repo --path skills/pdf --ref main [--name pdf]
 sk1ll update [name] [--force]   # refuses to clobber local edits unless forced
 sk1ll fork <name>               # imported -> personal, to edit freely
 sk1ll list                      # skills + instruction fragments
+sk1ll list --unmanaged          # unmanaged skills, grouped across harnesses
+sk1ll edit <name>               # open a personal Skill or Fragment in $VISUAL / $EDITOR
 sk1ll status                    # import drift + pending sync actions
 sk1ll harnesses                 # this machine's harnesses (detected + machine.toml)
 sk1ll assign claude skill pdf off       # per-harness toggles on this machine
 sk1ll assign codex --default-skills off # default for skills added later
 sk1ll render <harness>          # preview a harness's instruction files
 sk1ll sync [--dry-run] [--force]
-sk1ll adopt <harness> <name>    # take a harness's hand edits into the draft
+sk1ll adopt <harness> <name>    # adopt hand edits or an unmanaged skill into the draft
 ```
 
 ## Baseline and draft
@@ -145,6 +147,20 @@ directly in the harness, sync reports a conflict instead of overwriting it.
 repo as a draft change (a rule file's `harnesses:` key is restored); `sync
 --force` overwrites the edit instead. A `block` can't be adopted, since it mixes
 fragments: move the edit into `instructions/` by hand.
+
+Adopt also copies an unmanaged Skill into `personal/<name>/` as a Draft,
+refusing a name already in the repo unless an identical personal copy lets an
+interrupted Adopt retry. Identical copies in other Harnesses are
+adopted together and explicitly enabled there; differing copies stay unmanaged.
+Sync keeps the original copies in recovery. Other Harnesses follow their
+new-Skills defaults. A joined Machine needs a running Daemon connected to the
+Hub. Adopt publishes the Draft, synchronously enables its Assignment through the Hub, then replaces
+the Harness copies. A rejected Assignment rolls back only a new, unchanged repo
+copy; originals stay in place. Start `sk1ll daemon` before adopting on a joined
+repo. Standalone repos use local Assignment. `edit` opens a personal Skill's
+`SKILL.md` or a Fragment in `$VISUAL`, falling back to `$EDITOR`; fork an Import
+or adopt an unmanaged Skill before editing. The Daemon's content endpoints are
+documented in [Skills API](docs/skills-api.md).
 
 ## Layout
 

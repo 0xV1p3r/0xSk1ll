@@ -74,3 +74,18 @@ export interface SkillCandidate { path: string; default_name: string; descriptio
 export interface ResolvedSource { source: string; git_ref: string; commit: string; candidates: SkillCandidate[] }
 export interface ResolveRequest { link: string; path?: string }
 export interface AddImportRequest { name: string; source: string; path: string; ref: string; commit?: string }
+
+export type ContentType = 'personal' | 'import' | 'fragment' | 'unmanaged';
+export interface ContentVariant {
+  hash: string; description: string | null; locations: { harness: string; path: string }[];
+}
+export interface ContentEntry {
+  name: string; item: ItemRef | null; type: ContentType; description: string | null;
+  draft: DraftEntry['change'] | null; in_baseline: boolean; path: string | null;
+  enabled_harnesses: string[]; clashes_with_repo: boolean; variants: ContentVariant[];
+}
+export interface ContentQuery { item: string; hash?: string; harness?: string }
+export interface FileEntry { path: string; kind: 'file' | 'directory' | 'symlink'; size: number }
+export interface FileContent { path: string; text: string | null; binary: boolean; too_large: boolean; size: number }
+export interface Editor { id: string; name: string; kind: 'gui' | 'terminal' | 'system' }
+export interface EditorsView { editors: Editor[]; preferred_editor: string }

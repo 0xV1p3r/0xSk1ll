@@ -20,3 +20,6 @@ sk1ll-daemon = { path = "../sk1ll-daemon" }
 sk1ll-proto = { path = "../sk1ll-proto" }
 dirs.workspace = true
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time"] }
+
+[dev-dependencies]
+tempfile.workspace = true

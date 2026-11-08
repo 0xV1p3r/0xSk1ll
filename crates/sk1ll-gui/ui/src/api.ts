@@ -2,6 +2,13 @@ import { invoke } from '@tauri-apps/api/core';
 import type * as T from './types';
 
 export const api = {
+  skills: () => invoke<T.ContentEntry[]>('skills'),
+  skillTree: (query: T.ContentQuery) => invoke<T.FileEntry[]>('skill_tree', { query }),
+  skillFile: (query: T.ContentQuery & { path: string }) => invoke<T.FileContent>('skill_file', { query }),
+  adoptUnmanaged: (target: T.ConflictTarget) => invoke<void>('adopt_unmanaged', { target }),
+  fork: (name: string) => invoke<void>('fork', { name }),
+  editors: (refresh = false) => invoke<T.EditorsView>('editors', { refresh }),
+  openInEditor: (editorId: string, item: string) => invoke<void>('open_in_editor', { editorId, item }),
   status: () => invoke<T.StatusView>('status'),
   fleet: () => invoke<T.FleetView>('fleet'),
   items: () => invoke<T.ItemView[]>('items'),

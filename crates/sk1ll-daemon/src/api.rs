@@ -35,6 +35,10 @@ pub(crate) fn router(d: Arc<Daemon>) -> Router {
     Router::new()
         .route("/status", get(status))
         .route("/items", get(items))
+        .route("/skills", get(skills))
+        .route("/skills/tree", get(skill_tree))
+        .route("/skills/file", get(skill_file))
+        .route("/skills/adopt", post(adopt))
         .route("/draft", get(draft))
         .route("/draft/diff", get(diff))
         .route("/promote", post(promote))
@@ -156,6 +160,24 @@ async fn items(State(d): St) -> Result<Json<Vec<ItemView>>> {
 
 async fn draft(State(d): St) -> Result<Json<Vec<DraftEntry>>> {
     Ok(Json(d.blocking(|d, eng| d.draft(eng)).await?))
+}
+
+async fn skills(State(d): St) -> Result<Json<Vec<sk1ll_core::content::ContentEntry>>> {
+    Ok(Json(d.blocking(|d, eng| d.skills(eng)).await?))
+}
+
+async fn skill_tree(
+    State(d): St,
+    Query(q): Query<sk1ll_core::content::ContentQuery>,
+) -> Result<Json<Vec<sk1ll_core::content::FileEntry>>> {
+    Ok(Json(d.blocking(move |d, eng| d.skill_tree(eng, q)).await?))
+}
+
+async fn skill_file(
+    State(d): St,
+    Query(q): Query<sk1ll_core::content::FileQuery>,
+) -> Result<Json<sk1ll_core::content::FileContent>> {
+    Ok(Json(d.blocking(move |d, eng| d.skill_file(eng, q)).await?))
 }
 
 #[derive(Deserialize)]
