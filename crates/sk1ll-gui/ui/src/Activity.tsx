@@ -1,4 +1,4 @@
-import { useCallback, useState, type ReactNode } from 'react';
+import { useCallback, useRef, useState, type ReactNode } from 'react';
 import { ArrowRight, ChevronLeft, ChevronRight } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -37,9 +37,9 @@ function Conflict({ entry, displaced, changed, adopted }: {
           this item in this Machine's Draft. Any existing Draft changes to {entry.items.length ? entry.items.join(', ') : entry.name} are overwritten.</>}
         action={() => displaced ? api.adoptDisplaced(entry.id!) : api.adopt(target)} onDone={() => { adopted(entry.name); changed(); }} />
       <Confirm label={displaced ? 'Discard' : 'Overwrite'}
-        ariaLabel={`${displaced ? 'Discard' : 'Overwrite'} ${entry.name} in ${entry.harness}`} title={displaced ? 'Discard this recovery entry?' : 'Overwrite this Harness Conflict?'}
-        description={displaced ? 'Permanently remove the recovered content. The Draft is unchanged.'
-          : 'Replace this Harness edit with the content in this Machine’s Draft and Baseline.'}
+        ariaLabel={`${displaced ? 'Discard' : 'Overwrite'} ${entry.name} in ${entry.harness}`} title={`${displaced ? 'Discard' : 'Overwrite'} ${entry.name} in ${entry.harness}?`}
+        description={displaced ? <>Permanently remove recovered content for {entry.name} from {entry.harness} at <code className="font-mono break-all">{entry.path ?? entry.dest}</code>. The Draft is unchanged.</>
+          : <>Replace {entry.name} in {entry.harness} at <code className="font-mono break-all">{entry.dest}</code> with the content in this Machine's Draft and Baseline.</>}
         action={() => displaced ? api.discardDisplaced(entry.id!) : api.overwrite(target)} onDone={changed}
         disabled={displaced && !entry.id} />
     </CardFooter>
@@ -71,14 +71,14 @@ export function Conflicts({ revision, changed, reviewDraft }: { revision: number
     </Section>
   </>;
 }
-export function Imports({ revision, changed, reviewDraft }: { revision: number; changed: () => void; reviewDraft: () => void }) {
+export function Imports({ revision, changed, reviewDraft, openAdd = false }: { revision: number; changed: () => void; reviewDraft: () => void; openAdd?: boolean }) {
   const { data, error, loading } = useResource(api.imports, revision);
   const [updated, setUpdated] = useState<string>();
   return <>
-    <div className="flex justify-end"><AddImport changed={changed} reviewDraft={reviewDraft} /></div>
+    <div className="flex flex-wrap items-center justify-between gap-3">{data && <p className="text-xs text-muted-foreground">Last checked {ago(data.checked_at)}</p>}<div className="ml-auto"><AddImport initiallyOpen={openAdd} changed={changed} reviewDraft={reviewDraft} /></div></div>
     <InDraft name={updated} reviewDraft={reviewDraft} />
     <ErrorNotice error={error} />{loading && !data && <Loading rows={2} />}
-    {data && <><p className="text-xs text-muted-foreground">Last checked {ago(data.checked_at)}</p>
+    {data && <>
       {data.errors.map(e => <ErrorNotice key={e.name} title={`Could not check ${e.name}`}
         error={`${e.message}. Check this import's repository URL and access credentials.`} />)}
       {!data.updates.length && !data.errors.length && <Nothing title="Up to date">No available import updates.</Nothing>}
@@ -96,13 +96,20 @@ export function Imports({ revision, changed, reviewDraft }: { revision: number; 
 }
 const toggleLabel = (value: boolean | null) => value === null ? 'Default' : value ? 'On' : 'Off';
 export function Log({ revision, changed }: { revision: number; changed: () => void }) {
+  const [restored, setRestored] = useState<{ id: number; message: string }>();
+  const log = useRef<HTMLDivElement>(null);
   const [before, setBefore] = useState<number>();
   const [pages, setPages] = useState<(number | undefined)[]>([]);
   const load = useCallback(() => api.log({ before, limit: 50 }), [before]);
   const { data, error, loading } = useResource(load, revision);
   return <>
     <ErrorNotice error={error} />{loading && !data && <Loading />}
-    {data?.length === 0 ? <Nothing title="No log entries">No Assignment log entries on this page.</Nothing> : data && <div className="overflow-hidden rounded-lg border"><Table aria-label="Assignment log">
+    <div className="flex min-h-8 items-center justify-between gap-3 text-sm"><p role="status" aria-live="polite" aria-atomic="true">{restored?.message}</p>
+      {restored && <Button variant="ghost" size="sm" aria-label="Dismiss Restore status" onClick={() => {
+        (log.current?.querySelector<HTMLElement>(`[data-log-id="${restored.id}"] button`) ?? log.current?.querySelector<HTMLElement>('[role="region"]') ?? log.current)?.focus();
+        setRestored(undefined);
+      }}>Dismiss</Button>}</div>
+    <div ref={log} tabIndex={-1} role={!data?.length ? 'region' : undefined} aria-label={!data?.length ? 'Assignment log' : undefined} className="outline-none">{data?.length === 0 ? <Nothing title="No log entries">No Assignment log entries on this page.</Nothing> : data && <div className="overflow-hidden rounded-lg border"><Table aria-label="Assignment log">
       <TableHeader><TableRow className="bg-muted/50 hover:bg-muted/50">{['Time', 'Assignment', 'Change', 'Cause', 'Author'].map(label =>
         <TableHead key={label}>{label}</TableHead>)}<TableHead><span className="sr-only">Actions</span></TableHead></TableRow></TableHeader>
       <TableBody>{data.map(entry => <TableRow key={entry.id}>
@@ -112,9 +119,11 @@ export function Log({ revision, changed }: { revision: number; changed: () => vo
         <TableCell className="whitespace-nowrap">{toggleLabel(entry.before)} <span className="text-muted-foreground">→</span> {toggleLabel(entry.after)}</TableCell>
         <TableCell><Badge variant="secondary">{entry.cause.type.replaceAll('_', ' ')}{'entry' in entry.cause ? ` #${entry.cause.entry}` : ''}</Badge></TableCell>
         <TableCell className="text-muted-foreground">{entry.author}</TableCell>
-        <TableCell className="text-right"><Action label="Undo" doneLabel="Undone" variant="ghost"
-          ariaLabel={`Undo log entry ${entry.id}: ${entry.name === null ? entry.kind.replaceAll('_', ' ') : `${entry.kind}:${entry.name}`} on ${entry.machine} / ${entry.harness}`} action={() => api.undo(entry.id)} onDone={changed} /></TableCell>
-      </TableRow>)}</TableBody></Table></div>}
+        <TableCell data-log-id={entry.id} className="w-24 min-w-24 max-w-24 whitespace-normal xl:w-36 xl:min-w-36 xl:max-w-36"><Action announceDone={false} className="h-10 w-full whitespace-normal xl:whitespace-nowrap" label={`Restore ${toggleLabel(entry.before)}`} doneLabel="Restored" variant="ghost"
+          ariaLabel={`Restore ${toggleLabel(entry.before)} for log entry ${entry.id}: ${entry.name === null ? entry.kind.replaceAll('_', ' ') : `${entry.kind}:${entry.name}`} on ${entry.machine} / ${entry.harness}`} action={() => { setRestored(undefined); return api.undo(entry.id); }} onDone={() => {
+            setRestored({ id: entry.id, message: `Restored Assignment ${entry.name === null ? entry.kind.replaceAll('_', ' ') : `${entry.kind}:${entry.name}`} on ${entry.machine} / ${entry.harness} to ${toggleLabel(entry.before)}.` }); changed();
+          }} /></TableCell>
+      </TableRow>)}</TableBody></Table></div>}</div>
     <div className="flex items-center justify-end gap-2">
       {before !== undefined && <Button variant="ghost" size="sm" onClick={() => { setBefore(undefined); setPages([]); }}>Latest</Button>}
       <Button variant="outline" size="sm" disabled={!pages.length || loading} onClick={() => {

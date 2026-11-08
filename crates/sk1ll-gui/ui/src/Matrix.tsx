@@ -22,7 +22,10 @@ type MatrixData = Awaited<ReturnType<typeof loadMatrix>>;
 const mergeMatrix = (previous: MatrixData | undefined, next: MatrixData): MatrixData => ({
   ...next, assignments: mergeAssignments(previous?.assignments ?? {}, next.assignments),
 });
-export function Matrix({ revision, status }: { revision: number; status: StatusView }) {
+export function Matrix({ revision, status, target }: { revision: number; status: StatusView; target?: { item: string; harness: string } }) {
+  const destination = useRef<HTMLButtonElement>(null);
+  const visited = useRef<typeof target>(undefined);
+  const [highlighted, setHighlighted] = useState(false);
   const locks = useRef(new Set<string>());
   const [pending, setPending] = useState<Record<string, boolean>>({});
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -35,6 +38,18 @@ export function Matrix({ revision, status }: { revision: number; status: StatusV
     setOverrides(old => Object.fromEntries(Object.entries(old).filter(([machine, override]) =>
       override.saving || !accepted[machine] || accepted[machine].revision < override.revision)));
   }, [resource.data]);
+  useEffect(() => {
+    if (!target || visited.current === target || !destination.current) return;
+    visited.current = target;
+    destination.current.scrollIntoView?.({ block: 'center', inline: 'nearest' });
+    destination.current.focus();
+    setHighlighted(true);
+  }, [target, resource.data]);
+  useEffect(() => {
+    if (!highlighted) return;
+    const timer = setTimeout(() => setHighlighted(false), 2500);
+    return () => clearTimeout(timer);
+  }, [highlighted]);
   const write = async (machine: string, change: ToggleChange) => {
     if (!resource.data || locks.current.has(machine)) return;
     locks.current.add(machine);
@@ -77,15 +92,16 @@ export function Matrix({ revision, status }: { revision: number; status: StatusV
     const reason = localOnly ? `${itemStateLabel(item)}. This item can only be assigned on this Machine until it reaches the Baseline.`
       : state.explicit ? 'Explicit Assignment. Use the reset button to inherit the Harness default.'
         : 'Inherited from the Harness default. Toggle to set an explicit Assignment.';
-    return <TableCell key={`${machine}/${harness}`} className="border-l"><div className="flex h-7 items-center gap-1.5">
-      <Tooltip><TooltipTrigger render={<span className="inline-flex items-center gap-1.5 rounded-sm focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+    const focused = target?.item === item.item && target.harness === harness && machine === status.machine_id;
+    return <TableCell key={`${machine}/${harness}`} data-highlighted={focused && highlighted || undefined} className={cn('border-l', focused && highlighted && 'bg-info/15 ring-2 ring-info ring-inset')}><div className="flex min-h-8 items-center gap-1.5">
+      <Tooltip><TooltipTrigger render={<label className="inline-flex min-h-8 cursor-pointer items-center gap-1.5 rounded-sm focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
         tabIndex={localOnly ? 0 : undefined} role={localOnly ? 'group' : undefined}
         aria-label={localOnly ? `${item.item} in ${machine} / ${harness}, unavailable` : undefined} aria-description={localOnly ? reason : undefined} />}>
-        <Checkbox checked={state.enabled} disabled={localOnly || pending[machine]}
+        <Checkbox ref={focused ? destination : undefined} checked={state.enabled} disabled={localOnly || pending[machine]}
           aria-label={`${item.item} in ${machine} / ${harness}, ${state.explicit ? 'explicit' : 'inherited'}`}
           aria-description={localOnly ? reason : undefined}
           onCheckedChange={enabled => void write(machine, { harness, kind: kind as 'skill' | 'fragment', name, enabled })} />
-        <span className={cn('text-xs', state.explicit ? 'font-medium text-foreground' : 'text-muted-foreground')}>
+        <span className={cn('text-xs', state.explicit ? 'font-medium text-foreground' : focused && highlighted ? 'text-foreground' : 'text-muted-foreground')}>
           {state.explicit ? 'Explicit' : 'Default'}</span>
       </TooltipTrigger><TooltipContent className="max-w-64">{reason}</TooltipContent></Tooltip>
       {state.explicit && !localOnly && <Tooltip><TooltipTrigger render={<Button size="icon-xs" variant="ghost" disabled={pending[machine]}
@@ -99,14 +115,14 @@ export function Matrix({ revision, status }: { revision: number; status: StatusV
     <ErrorNotice error={resource.error} />{Object.entries(errors).filter(([, value]) => value).map(([id, error]) =>
       <ErrorNotice key={id} error={`${id}: ${error}`} />)}
     <div className="flex min-h-5 flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
-      <span className="font-medium text-foreground">Default</span><span>inherits the Harness default</span>
-      <span className="font-medium text-foreground">Explicit</span><span>overrides it for one Harness</span>
+      <span><span className="font-medium text-foreground">Default</span> inherits the Harness default</span>
+      <span><span className="font-medium text-foreground">Explicit</span> overrides it for one Harness</span>
       <span id="default-hint" className="basis-full">Changing a default for new Skills or Fragments applies to items added later.
         Existing items keep their current value as an explicit Assignment.</span>
       {saving.length > 0 && <span role="status" className="ml-auto inline-flex items-center gap-1.5 text-foreground">
         <Pending pending>Saving Assignment for {saving.join(', ')}…</Pending></span>}
     </div>
-    {columns.length > 0 && <div className="overflow-hidden rounded-lg border"><Table aria-label="Assignment matrix" className="[&_tr:hover_th[scope=row]]:bg-muted/50">
+    {columns.length > 0 && <div className="overflow-hidden rounded-lg border"><Table aria-label="Assignment matrix" stickyFirstColumn>
       <TableHeader><TableRow className="bg-muted hover:bg-muted">
         <TableHead rowSpan={2} scope="col" className="sticky left-0 z-10 min-w-48 bg-muted align-bottom md:min-w-64">Skill / Fragment</TableHead>
         {groups.filter(g => g.harnesses.length).map(g => <TableHead key={g.machine.id} scope="colgroup" colSpan={g.harnesses.length} className="border-l">
@@ -118,11 +134,11 @@ export function Matrix({ revision, status }: { revision: number; status: StatusV
         {(['skill', 'fragment'] as const).map(kind => <TableRow key={kind}>
           <TableHead scope="row" className="sticky left-0 z-10 h-auto bg-background py-3 whitespace-normal">
             <span className="font-medium">Default for new {kind === 'skill' ? 'Skills' : 'Fragments'}</span></TableHead>
-          {columns.map(c => <TableCell key={`${c.machine}/${c.harness}`} className="border-l"><div className="flex h-7 items-center"><Checkbox
+          {columns.map(c => <TableCell key={`${c.machine}/${c.harness}`} className="border-l"><label className="inline-flex min-h-8 min-w-8 cursor-pointer items-center gap-1.5"><Checkbox
             checked={(assignment(c.machine).harnesses[c.harness] ?? emptyHarness())[kind === 'skill' ? 'new_skills_default' : 'new_fragments_default']}
             disabled={pending[c.machine]} aria-label={`Default for new ${kind}s in ${c.machine} / ${c.harness}`} aria-describedby="default-hint"
             onCheckedChange={enabled => void write(c.machine, { harness: c.harness,
-              kind: kind === 'skill' ? 'new_skills_default' : 'new_fragments_default', enabled })} /></div></TableCell>)}
+              kind: kind === 'skill' ? 'new_skills_default' : 'new_fragments_default', enabled })} /><span className="text-xs text-muted-foreground">Default</span></label></TableCell>)}
         </TableRow>)}
         {items.map(item => <TableRow key={item.item}>
           <TableHead scope="row" className="sticky left-0 z-10 h-auto max-w-80 bg-background py-2 font-normal whitespace-normal">

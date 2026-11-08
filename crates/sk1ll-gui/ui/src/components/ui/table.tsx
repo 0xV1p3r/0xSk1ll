@@ -3,22 +3,51 @@
 import * as React from "react"
 import { cn } from "@/lib/utils"
 
-function Table({ className, ...props }: React.ComponentProps<"table">) {
-  // A labelled table gets a focusable scroll region for keyboard scrolling.
+function Table({ className, stickyFirstColumn = false, ...props }: React.ComponentProps<"table"> & { stickyFirstColumn?: boolean }) {
+  const frame = React.useRef<HTMLDivElement>(null)
+  const scroll = React.useRef<HTMLDivElement>(null)
   const label = props["aria-label"]
+  const update = React.useCallback(() => {
+    const container = scroll.current, outer = frame.current
+    if (!container || !outer) return
+    outer.dataset.overflowStart = String(container.scrollLeft > 1)
+    outer.dataset.overflowEnd = String(container.scrollLeft + container.clientWidth < container.scrollWidth - 1)
+    const width = stickyFirstColumn ? container.querySelector("th")?.getBoundingClientRect().width ?? 0 : 0
+    outer.style.setProperty("--sticky-column-width", `${width}px`)
+  }, [stickyFirstColumn])
+  React.useEffect(() => {
+    update()
+    if (typeof ResizeObserver === "undefined") return
+    const observer = new ResizeObserver(update)
+    if (scroll.current) observer.observe(scroll.current)
+    const table = scroll.current?.querySelector("table")
+    if (table) observer.observe(table)
+    const first = table?.querySelector("th")
+    if (stickyFirstColumn && first) observer.observe(first)
+    return () => observer.disconnect()
+  }, [update, stickyFirstColumn, props.children])
   return (
-    <div
-      data-slot="table-container"
-      role={label ? "region" : undefined}
-      aria-label={label}
-      tabIndex={label ? 0 : undefined}
-      className="relative w-full overflow-x-auto outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
-    >
-      <table
-        data-slot="table"
-        className={cn("w-full caption-bottom text-sm", className)}
-        {...props}
-      />
+    <div ref={frame} data-slot="table-frame" data-sticky-first={stickyFirstColumn || undefined} className="relative min-w-0">
+      <div
+        ref={scroll}
+        data-slot="table-container"
+        role={label ? "region" : undefined}
+        aria-label={label}
+        tabIndex={label ? 0 : undefined}
+        onScroll={update}
+        onFocusCapture={event => {
+          const container = scroll.current, target = event.target as HTMLElement
+          if (!stickyFirstColumn || !container || target === container || target.closest<HTMLTableCellElement>("td, th")?.cellIndex === 0) return
+          const bounds = container.getBoundingClientRect()
+          const left = bounds.left + Number.parseFloat(frame.current?.style.getPropertyValue("--sticky-column-width") || "0") + 8
+          const focused = target.getBoundingClientRect()
+          if (focused.left < left) container.scrollLeft -= left - focused.left
+          else if (focused.right > bounds.right - 8) container.scrollLeft += focused.right - bounds.right + 8
+        }}
+        className={cn("relative w-full overflow-x-auto outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset", stickyFirstColumn && "[scroll-padding-inline-start:var(--sticky-column-width)]")}
+      >
+        <table data-slot="table" className={cn("w-full caption-bottom text-sm", className)} {...props} />
+      </div>
     </div>
   )
 }

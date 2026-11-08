@@ -25,7 +25,7 @@ import type { CommandError, DaemonConnection, StatusView } from './types';
 const screens = {
   Fleet: { icon: Server, group: 'Fleet', description: 'Machines sharing this Baseline. Reports refresh live and every 15 seconds.' },
   'Assignment matrix': { icon: LayoutGrid, group: 'Fleet', description: 'Assignment takes effect immediately. Explicit toggles override a Harness default.' },
-  Log: { icon: History, group: 'Fleet', description: 'Assignment log, newest first. Undo restores an entry\'s previous value and adds a new log entry.' },
+  Log: { icon: History, group: 'Fleet', description: 'Assignment log, newest first. Restore applies an entry\'s previous value and adds a new log entry.' },
   Skills: { icon: BookOpen, group: 'This Machine', description: 'Browse Personal Skills, Imports, Fragments, and Unmanaged skills on this Machine.' },
   Draft: { icon: FilePen, group: 'This Machine', description: 'This Machine\'s Draft is live in its Harnesses. Promote sends selected items to the Fleet Baseline.' },
   Conflicts: { icon: TriangleAlert, group: 'This Machine', description: 'A Conflict is a Harness edit that differs from this Machine\'s Draft.' },
@@ -85,6 +85,8 @@ export function AppSidebar({ screen, setScreen, status, unmanagedCount }: { scre
 
 export function App() {
   const [screen, setScreen] = useState<Screen>('Fleet');
+  const [openAdd, setOpenAdd] = useState(false);
+  const [matrixTarget, setMatrixTarget] = useState<{ item: string; harness: string }>();
   const [status, setStatus] = useState<StatusView>();
   const [reachable, setReachable] = useState<boolean>();
   const [error, setError] = useState('');
@@ -94,7 +96,7 @@ export function App() {
   const skills = useResource(api.skills, revision);
   const heading = useRef<HTMLHeadingElement>(null);
   const navigated = useRef(false);
-  const navigate = useCallback((next: Screen) => { navigated.current = true; setScreen(next); }, []);
+  const navigate = useCallback((next: Screen) => { navigated.current = true; setMatrixTarget(undefined); setOpenAdd(false); setScreen(next); }, []);
   useEffect(() => {
     // Move keyboard and screen-reader focus to the new screen after navigation.
     if (navigated.current) { navigated.current = false; heading.current?.focus(); }
@@ -177,7 +179,7 @@ export function App() {
       </header>
       <main id="main" className="mx-auto flex w-full max-w-6xl min-w-0 flex-col gap-6 p-4 md:p-6">
         <div className="flex flex-col gap-1"><h1 ref={heading} tabIndex={-1} className="rounded-sm text-2xl font-semibold tracking-tight outline-none focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-ring">{screen}</h1>
-          <p className="text-sm text-muted-foreground">{screens[screen].description}</p></div>
+          <p className="text-sm text-muted-foreground">{screen === 'Draft' && status.revoked ? "This Machine's Draft is private. The Daemon has stopped managing its Harnesses until this Machine rejoins." : screen === 'Draft' && status.awaiting_assignment ? "This Machine's Draft is private. Harnesses stay unchanged until the Hub sends an Assignment." : screens[screen].description}</p></div>
         {status.revoked && <Notice title="Machine revoked" tone="destructive">This Machine was removed from the Fleet. The Daemon has stopped managing its Harnesses.
           <div><Button variant="outline" size="sm" className="mt-2" onClick={() => navigate('Settings')}>Rejoin in Settings</Button></div></Notice>}
         {status.awaiting_assignment && <Notice title="Awaiting Assignment">The Daemon has no Assignment snapshot. Harnesses are left alone until the Hub sends one.</Notice>}
@@ -186,12 +188,12 @@ export function App() {
           <p>If this Machine was removed or its credential rotated, create a join code on another Machine and rejoin.</p>
           <div><Button variant="outline" size="sm" className="mt-2" onClick={() => navigate('Settings')}>Rejoin in Settings</Button></div></Notice>}
         <ErrorNotice error={error} />
-        {screen === 'Skills' && <><ErrorNotice error={skills.error} />{skills.loading && !skills.data ? <Loading /> : <Skills connection={status.connection} entries={skills.data ?? []} revision={revision} changed={changed} reviewDraft={() => navigate('Draft')} assignment={() => navigate('Assignment matrix')} />}</>}
+        {screen === 'Skills' && <><ErrorNotice error={skills.error} />{skills.loading && !skills.data ? <Loading /> : <Skills connection={status.connection} entries={skills.data ?? []} revision={revision} changed={changed} reviewDraft={() => navigate('Draft')} assignment={(item, harness) => { navigate('Assignment matrix'); setMatrixTarget({ item, harness }); }} addImport={() => { navigate('Imports'); setOpenAdd(true); }} />}</>}
         {screen === 'Fleet' && <Fleet revision={revision} machineId={status.machine_id} navigate={navigate} changed={changed} live={status.connection === 'connected'} />}
-        {screen === 'Assignment matrix' && <Matrix revision={revision} status={status} />}
+        {screen === 'Assignment matrix' && <Matrix revision={revision} status={status} target={matrixTarget} />}
         {screen === 'Draft' && <Draft revision={revision} status={status} changed={changed} />}
         {screen === 'Conflicts' && <Conflicts revision={revision} changed={changed} reviewDraft={() => navigate('Draft')} />}
-        {screen === 'Imports' && <Imports revision={revision} changed={changed} reviewDraft={() => navigate('Draft')} />}
+        {screen === 'Imports' && <Imports openAdd={openAdd} revision={revision} changed={changed} reviewDraft={() => navigate('Draft')} />}
         {screen === 'Log' && <Log revision={revision} changed={changed} />}
         {screen === 'Settings' && <Settings revision={revision} status={status} socket={socket} changed={changed} />}
       </main>

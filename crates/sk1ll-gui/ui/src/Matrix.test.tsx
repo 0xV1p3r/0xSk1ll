@@ -129,3 +129,33 @@ describe('Assignment response cache', () => {
     expect(screen.queryByText(/not promoted/i)).toBeNull();
   });
 });
+
+it('toggles an Assignment and a Harness default from their state labels', async () => {
+  await mount();
+  const label = cell('a').closest('label')!;
+  expect(label.className).toContain('min-h-8');
+  fireEvent.click(within(label).getByText('Explicit'));
+  await waitFor(() => expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: true }] }));
+  await waitFor(() => expect(cell('a').hasAttribute('data-disabled')).toBe(false));
+  const defaultLabel = screen.getByRole('checkbox', { name: 'Default for new skills in a / claude' }).closest('label')!;
+  fireEvent.click(within(defaultLabel).getByText('Default'));
+  await waitFor(() => expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'new_skills_default', enabled: true }] }));
+});
+
+it('focuses and highlights the requested local cell after loading without changing its Assignment', async () => {
+  const scroll = vi.fn();
+  const previous = HTMLElement.prototype.scrollIntoView;
+  HTMLElement.prototype.scrollIntoView = scroll;
+  try {
+    const target = { item: 'skill:pdf', harness: 'claude' };
+    const view = render(<Matrix revision={0} status={status} target={target} />);
+    await waitFor(() => expect(document.activeElement).toBe(cell('a')));
+    expect(cell('a').closest('td')?.getAttribute('data-highlighted')).toBe('true');
+    expect(scroll).toHaveBeenCalledWith({ block: 'center', inline: 'nearest' });
+    expect(api.setAssignment).not.toHaveBeenCalled();
+    cell('b').focus();
+    view.rerender(<Matrix revision={1} status={status} target={target} />);
+    await waitFor(() => expect(api.assignment).toHaveBeenCalledTimes(4));
+    expect(document.activeElement).toBe(cell('b'));
+  } finally { HTMLElement.prototype.scrollIntoView = previous; }
+});
