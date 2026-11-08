@@ -9,8 +9,8 @@ use sk1ll_proto::{Assignment, AssignmentSnapshot, HarnessAssignment, ItemRef, Lo
 use crate::db;
 use crate::error::{ApiError, Result};
 
-/// Author of changes the hub makes on its own.
-pub const HUB_AUTHOR: &str = "hub";
+/// Author of changes the server makes on its own.
+pub const SERVER_AUTHOR: &str = "server";
 
 /// One toggle to set; `after: None` removes an item's explicit toggle.
 #[derive(Debug, Clone)]
@@ -24,7 +24,7 @@ pub struct Change {
 
 /// A harness that starts with nothing enabled.
 pub fn all_off() -> HarnessAssignment {
-    HarnessAssignment { new_skills_default: false, new_fragments_default: false, ..Default::default() }
+    HarnessAssignment { new_skills_default: false, new_rules_default: false, ..Default::default() }
 }
 
 /// Current value of a toggle. Defaults are always `Some` (a harness without
@@ -33,9 +33,9 @@ pub fn get(a: &Assignment, harness: &str, kind: ToggleKind, name: Option<&str>) 
     let h = a.harnesses.get(harness);
     match kind {
         ToggleKind::Skill => h.and_then(|h| h.skills.get(name?).copied()),
-        ToggleKind::Fragment => h.and_then(|h| h.fragments.get(name?).copied()),
+        ToggleKind::Rule => h.and_then(|h| h.rules.get(name?).copied()),
         ToggleKind::NewSkillsDefault => Some(a.harness(harness).new_skills_default),
-        ToggleKind::NewFragmentsDefault => Some(a.harness(harness).new_fragments_default),
+        ToggleKind::NewRulesDefault => Some(a.harness(harness).new_rules_default),
     }
 }
 
@@ -43,21 +43,21 @@ fn set(a: &mut Assignment, harness: &str, kind: ToggleKind, name: Option<&str>, 
     let name = name.unwrap_or_default();
     match (kind, value) {
         (ToggleKind::Skill, Some(v)) => a.set_skill(harness, name, v),
-        (ToggleKind::Fragment, Some(v)) => a.set_fragment(harness, name, v),
+        (ToggleKind::Rule, Some(v)) => a.set_rule(harness, name, v),
         (ToggleKind::Skill, None) => {
             if let Some(h) = a.harnesses.get_mut(harness) {
                 h.skills.remove(name);
             }
         }
-        (ToggleKind::Fragment, None) => {
+        (ToggleKind::Rule, None) => {
             if let Some(h) = a.harnesses.get_mut(harness) {
-                h.fragments.remove(name);
+                h.rules.remove(name);
             }
         }
         (ToggleKind::NewSkillsDefault, Some(v)) => a.set_new_skills_default(harness, v),
-        (ToggleKind::NewFragmentsDefault, Some(v)) => a.set_new_fragments_default(harness, v),
+        (ToggleKind::NewRulesDefault, Some(v)) => a.set_new_rules_default(harness, v),
         // Defaults can't be unset; `validate` rejects it.
-        (ToggleKind::NewSkillsDefault | ToggleKind::NewFragmentsDefault, None) => {}
+        (ToggleKind::NewSkillsDefault | ToggleKind::NewRulesDefault, None) => {}
     }
 }
 
@@ -67,7 +67,7 @@ pub fn validate(c: &Change) -> Result<()> {
     match (c.kind.has_name(), &c.name) {
         (true, Some(n)) => crate::check_name("item name", n)?,
         (true, None) => {
-            return Err(ApiError::BadRequest("skill and fragment toggles need a `name`".into()));
+            return Err(ApiError::BadRequest("skill and rule toggles need a `name`".into()));
         }
         (false, Some(_)) => return Err(ApiError::BadRequest("defaults take no `name`".into())),
         (false, None) if c.after.is_none() => {
@@ -82,13 +82,13 @@ pub fn validate(c: &Change) -> Result<()> {
 fn item(kind: ToggleKind, name: &str) -> Option<ItemRef> {
     match kind {
         ToggleKind::Skill => Some(ItemRef::Skill(name.to_string())),
-        ToggleKind::Fragment => Some(ItemRef::Fragment(name.to_string())),
-        ToggleKind::NewSkillsDefault | ToggleKind::NewFragmentsDefault => None,
+        ToggleKind::Rule => Some(ItemRef::Rule(name.to_string())),
+        ToggleKind::NewSkillsDefault | ToggleKind::NewRulesDefault => None,
     }
 }
 
 /// Checks that every toggle that turns an item on names one the machine can
-/// have: in the baseline, its reported draft, or its unpushed promotes. Turning an
+/// have: in the baseline, its reported draft, or its unpushed commits. Turning an
 /// item off or removing its toggle is allowed for any item, so stale state
 /// can always be cleaned up.
 pub fn check_items(
@@ -106,7 +106,7 @@ pub fn check_items(
         };
         if !baseline.contains(&item) && !drafts.contains(&item) && !unpushed.contains(&item) {
             return Err(ApiError::Unprocessable(format!(
-                "`{item}` is absent from the baseline, this machine's draft and its unpushed promotes"
+                "`{item}` is absent from the baseline, this machine's draft and its unpushed commits"
             )));
         }
     }
@@ -131,7 +131,7 @@ impl Applied {
 /// new-items default first gives every existing item of that kind without a
 /// toggle an explicit one with its current value, so the new default only
 /// affects items that appear later. Existing items include the destination's
-/// latest reported drafts and unpushed promotes, even when another machine writes.
+/// latest reported drafts and unpushed commits, even when another machine writes.
 pub fn apply(
     tx: &Connection,
     machine: &str,
@@ -187,13 +187,13 @@ fn materialize_changes(a: &Assignment, harness: &str, kind: ToggleKind, existing
     let h = a.harness(harness);
     let (item_kind, current, toggles) = match kind {
         ToggleKind::NewSkillsDefault => (ToggleKind::Skill, h.new_skills_default, &h.skills),
-        ToggleKind::NewFragmentsDefault => (ToggleKind::Fragment, h.new_fragments_default, &h.fragments),
-        ToggleKind::Skill | ToggleKind::Fragment => return Vec::new(),
+        ToggleKind::NewRulesDefault => (ToggleKind::Rule, h.new_rules_default, &h.rules),
+        ToggleKind::Skill | ToggleKind::Rule => return Vec::new(),
     };
     existing
         .iter()
         .filter_map(|i| match (item_kind, i) {
-            (ToggleKind::Skill, ItemRef::Skill(n)) | (ToggleKind::Fragment, ItemRef::Fragment(n)) => Some(n),
+            (ToggleKind::Skill, ItemRef::Skill(n)) | (ToggleKind::Rule, ItemRef::Rule(n)) => Some(n),
             _ => None,
         })
         .filter(|n| !toggles.contains_key(*n) && crate::check_name("item name", n).is_ok())
@@ -227,7 +227,7 @@ pub fn new_harness_changes(a: &Assignment, reported: &[String]) -> Vec<Change> {
         .iter()
         .filter(|h| !a.harnesses.contains_key(*h) && crate::check_name("harness", h).is_ok())
         .flat_map(|h| {
-            [ToggleKind::NewSkillsDefault, ToggleKind::NewFragmentsDefault].map(|kind| Change {
+            [ToggleKind::NewSkillsDefault, ToggleKind::NewRulesDefault].map(|kind| Change {
                 harness: h.clone(),
                 kind,
                 name: None,
@@ -239,7 +239,7 @@ pub fn new_harness_changes(a: &Assignment, reported: &[String]) -> Vec<Change> {
 }
 
 /// Removes every toggle for an item that is in neither the baseline nor the
-/// machine's own reported draft or unpushed promotes (where it can still be assigned).
+/// machine's own reported draft or unpushed commits (where it can still be assigned).
 pub fn sweep_changes(
     a: &Assignment,
     baseline: &BTreeSet<ItemRef>,
@@ -248,7 +248,7 @@ pub fn sweep_changes(
 ) -> Vec<Change> {
     let mut changes = Vec::new();
     for (harness, h) in &a.harnesses {
-        for (toggles, kind) in [(&h.skills, ToggleKind::Skill), (&h.fragments, ToggleKind::Fragment)] {
+        for (toggles, kind) in [(&h.skills, ToggleKind::Skill), (&h.rules, ToggleKind::Rule)] {
             for name in toggles.keys() {
                 let item = item(kind, name).expect("item toggle");
                 if !baseline.contains(&item) && !drafts.contains(&item) && !unpushed.contains(&item) {
@@ -267,13 +267,13 @@ pub fn sweep_changes(
 }
 
 /// Drops `machine`'s toggles for items it can no longer have (see
-/// [`sweep_changes`]), as the hub, inside the caller's transaction. Idempotent;
+/// [`sweep_changes`]), as the server, inside the caller's transaction. Idempotent;
 /// `None` if the machine is gone or nothing changed.
-/// With `discarded`, only those explicitly Reset items are considered.
+/// With `discarded`, only those explicitly Restore items are considered.
 /// A push keeps toggles for items in the machine's latest drafts or unpushed report.
 /// Once they leave baseline, drafts and unpushed, an explicit `DraftDiscarded` or
 /// a later push's sweep clears those exempt toggles. Status snapshots
-/// never sweep: a stash during a pull or an unpushed promote can hide drafts.
+/// never sweep: a stash during a pull or an unpushed commit can hide drafts.
 pub fn sweep(
     tx: &Connection,
     machine: &str,
@@ -295,7 +295,7 @@ pub fn sweep(
     if changes.is_empty() {
         return Ok(None);
     }
-    let applied = apply(tx, machine, HUB_AUTHOR, changes, now, None)?;
+    let applied = apply(tx, machine, SERVER_AUTHOR, changes, now, None)?;
     for e in &applied.entries {
         if let Some(item) = e.name.as_deref().and_then(|n| item(e.kind, n)) {
             tracing::info!("dropped the `{item}` toggle on {machine}/{} (item_removed)", e.harness);
@@ -312,13 +312,13 @@ pub fn remove_machine(conn: &mut Connection, machine: &str, author: &str, now: i
     for (harness, h) in &a.harnesses {
         let defaults = [
             (ToggleKind::NewSkillsDefault, None, h.new_skills_default),
-            (ToggleKind::NewFragmentsDefault, None, h.new_fragments_default),
+            (ToggleKind::NewRulesDefault, None, h.new_rules_default),
         ];
         let items = h
             .skills
             .iter()
             .map(|(n, v)| (ToggleKind::Skill, Some(n.clone()), *v))
-            .chain(h.fragments.iter().map(|(n, v)| (ToggleKind::Fragment, Some(n.clone()), *v)));
+            .chain(h.rules.iter().map(|(n, v)| (ToggleKind::Rule, Some(n.clone()), *v)));
         for (kind, name, value) in defaults.into_iter().chain(items) {
             let mut entry = LogEntry {
                 id: 0,

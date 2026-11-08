@@ -4,7 +4,7 @@
 //! thread with the engine mutex held ([`Daemon::blocking`]), so they never
 //! interleave; across processes, the daemon holds core's [`EngineLock`] on
 //! the repo for its whole lifetime, so direct CLI mutations are refused.
-//! What the outside sees ([`StatusView`]) lives in a `watch` channel: the hub
+//! What the outside sees ([`StatusView`]) lives in a `watch` channel: the server
 //! session sends a status whenever its report changes, and the local API and
 //! its event stream read from it.
 
@@ -17,7 +17,7 @@ use anyhow::Context;
 use sk1ll_core::imports;
 use sk1ll_core::sync::{self, Action, ActionKind, Item, PlanOptions};
 use sk1ll_core::{
-    EngineLock, HarnessOrigin, ItemRef, MachineConfig, PullOutcome, Repo, default_promote_message,
+    EngineLock, HarnessOrigin, ItemRef, MachineConfig, PullOutcome, Repo, default_commit_message,
     machine_author,
 };
 use sk1ll_proto::{AssignmentSnapshot, ConflictRef, MachineReport, headline};
@@ -25,8 +25,8 @@ use tokio::sync::{Notify, broadcast, watch};
 
 use crate::client::{
     AddImportRequest, ChangeKind, ConflictTarget, ConflictView, Connection, DiffView, DraftEntry, Event, HarnessView,
-    ImportUpdated, ItemView, PromoteMessage, PromoteRequest, PromoteResponse, PullResult, PushResult, ResetRequest,
-    ResetResponse, ResolveImportRequest, ResolvedSource, SkillCandidate, StatusView, SyncResult, UpdateImportsRequest,
+    ImportUpdated, ItemView, CommitMessage, CommitRequest, CommitResponse, PullResult, PushResult, RestoreRequest,
+    RestoreResponse, ResolveImportRequest, ResolvedSource, SkillCandidate, StatusView, SyncResult, UpdateImportsRequest,
 };
 use crate::error::{Error, Result};
 use crate::join::{Joined, Registered};
@@ -40,7 +40,7 @@ const BLOCK_NAME: &str = "instructions";
 
 pub(crate) struct Daemon {
     pub(crate) cfg: Config,
-    /// Fixed for the life of the process: machine id, hub URL and token. A
+    /// Fixed for the life of the process: machine id, server URL and token. A
     /// rejoin restarts the process (see [`Daemon::rejoin`]).
     pub(crate) ident: DaemonState,
     engine: Mutex<Engine>,
@@ -48,11 +48,11 @@ pub(crate) struct Daemon {
     events: broadcast::Sender<Event>,
     /// `draft_discarded` messages not yet delivered, persisted.
     outbox: Mutex<Outbox>,
-    /// Signals the hub session that the outbox has something new.
+    /// Signals the server session that the outbox has something new.
     pub(crate) outbox_ready: Notify,
     connected: AtomicBool,
     revoked: AtomicBool,
-    /// Since when (Unix seconds) the hub has been rejecting the token.
+    /// Since when (Unix seconds) the server has been rejecting the token.
     auth_rejected: Mutex<Option<i64>>,
     pub(crate) roots: watch::Sender<Vec<WatchRoot>>,
     pub(crate) http: reqwest::Client,
@@ -62,12 +62,12 @@ pub(crate) struct Daemon {
 pub(crate) struct Engine {
     state: DaemonState,
     /// The applied assignment. `None` when it was lost (or never stored):
-    /// harnesses are left alone until the hub sends one.
+    /// harnesses are left alone until the server sends one.
     snapshot: Option<AssignmentSnapshot>,
-    /// Draft items clashing with the hub's newer baseline (Blocked).
+    /// Draft items clashing with the server's newer baseline (Blocked).
     blocked: Option<Vec<ItemRef>>,
-    /// The hub's baseline as last announced or fetched.
-    hub_baseline: Option<String>,
+    /// The server's baseline as last announced or fetched.
+    server_baseline: Option<String>,
     /// Core's engine lock on the repo, held from startup (or from the clone).
     lock: Option<EngineLock>,
     /// Joined again and about to restart: do nothing more.
@@ -79,24 +79,24 @@ impl Daemon {
         let snapshot = match state::load_snapshot(&cfg.snapshot_path()) {
             Ok(Some(s)) => Some(s),
             Ok(None) => {
-                tracing::warn!("no stored assignment: leaving the harnesses alone until the hub sends one");
+                tracing::warn!("no stored assignment: leaving the harnesses alone until the server sends one");
                 None
             }
             Err(e) => {
-                tracing::warn!("{e:#}; leaving the harnesses alone until the hub sends an assignment");
+                tracing::warn!("{e:#}; leaving the harnesses alone until the server sends an assignment");
                 None
             }
         };
         let outbox = Outbox::load(cfg.outbox_path());
         let view = StatusView {
             machine_id: state.machine_id.clone(),
-            hub_url: state.hub_url.clone(),
+            server_url: state.server_url.clone(),
             repo: state.repo.clone(),
             headline: sk1ll_proto::MachineStatus::Offline,
             connection: if state.revoked { Connection::Revoked } else { Connection::Connecting },
             last_error: None,
             revoked: state.revoked,
-            hub_baseline: None,
+            server_baseline: None,
             assignment_revision: snapshot.as_ref().map_or(0, |s| s.revision),
             awaiting_assignment: snapshot.is_none(),
             auth_rejected_since: None,
@@ -111,7 +111,7 @@ impl Daemon {
                 state,
                 snapshot,
                 blocked: None,
-                hub_baseline: None,
+                server_baseline: None,
                 lock: None,
                 frozen: false,
             }),
@@ -173,7 +173,7 @@ impl Daemon {
             let before = v.clone();
             f(v);
             let offline = v.connection != Connection::Connected;
-            v.headline = headline(offline, Some(&v.report), v.hub_baseline.as_deref());
+            v.headline = headline(offline, Some(&v.report), v.server_baseline.as_deref());
             draft_changed = before.report.drafts != v.report.drafts;
             *v != before
         });
@@ -206,10 +206,10 @@ impl Daemon {
         }
     }
 
-    /// The hub answered 401 to the token. That can be a proxy or a hub
+    /// The server answered 401 to the token. That can be a proxy or a server
     /// misconfiguration as well as a removal while the daemon was away, so the
     /// machine keeps being managed and the connection is retried; only the
-    /// hub's `revoked` message revokes it. After `auth_warn_after`, the status
+    /// server's `revoked` message revokes it. After `auth_warn_after`, the status
     /// says the machine was probably removed.
     pub(crate) fn set_auth_rejected(&self) {
         if self.is_revoked() {
@@ -220,13 +220,13 @@ impl Daemon {
         let since = *lock(&self.auth_rejected).get_or_insert(now);
         let message = if now - since >= self.cfg.auth_warn_after.as_secs() as i64 {
             format!(
-                "the hub has rejected this machine's token since {}h ago; it was probably removed from the fleet: \
-                 join again with `sk1ll join <hub-url> <join-code>` (still managing the harnesses meanwhile)",
+                "the server has rejected this machine's token since {}h ago; it was probably removed from the fleet: \
+                 join again with `sk1ll join <server-url> <join-code>` (still managing the harnesses meanwhile)",
                 (now - since) / 3600
             )
         } else {
-            "the hub rejected this machine's token (HTTP 401); retrying. If it was removed from the fleet, \
-             join again with `sk1ll join <hub-url> <join-code>`"
+            "the server rejected this machine's token (HTTP 401); retrying. If it was removed from the fleet, \
+             join again with `sk1ll join <server-url> <join-code>`"
                 .to_string()
         };
         if self.view().last_error.as_deref() != Some(message.as_str()) {
@@ -251,7 +251,7 @@ impl Daemon {
     // -----------------------------------------------------------------------
     // Outbox
 
-    /// Queues a `draft_discarded` durably and wakes the hub session.
+    /// Queues a `draft_discarded` durably and wakes the server session.
     fn queue_discarded(&self, items: Vec<ItemRef>) {
         let pending = {
             let mut o = lock(&self.outbox);
@@ -268,7 +268,7 @@ impl Daemon {
         lock(&self.outbox).front()
     }
 
-    /// `id` reached the hub.
+    /// `id` reached the server.
     pub(crate) fn outbox_delivered(&self, id: u64) {
         let pending = {
             let mut o = lock(&self.outbox);
@@ -351,7 +351,7 @@ impl Daemon {
         }
         let root = eng.state.repo.clone();
         if !root.join(".git").exists() {
-            return Err(Error::Conflict(format!("{} is not set up yet (the hub was unreachable)", root.display())));
+            return Err(Error::Conflict(format!("{} is not set up yet (the server was unreachable)", root.display())));
         }
         self.lock_repo(eng)?;
         let machine = MachineConfig::load(&self.cfg.machine_config)?;
@@ -399,7 +399,7 @@ impl Daemon {
         let unpushed = gitx::unpushed_items(&root)?;
         let clashes = eng.blocked.clone().unwrap_or_default();
         let blocked = eng.blocked.is_some();
-        let behind = blocked || eng.hub_baseline.as_ref().is_some_and(|h| baseline.as_ref() != Some(h));
+        let behind = blocked || eng.server_baseline.as_ref().is_some_and(|h| baseline.as_ref() != Some(h));
         let report = MachineReport {
             baseline,
             drafts,
@@ -410,11 +410,11 @@ impl Daemon {
             clashes,
             behind,
         };
-        let hub_baseline = eng.hub_baseline.clone();
+        let server_baseline = eng.server_baseline.clone();
         let awaiting = eng.snapshot.is_none();
         self.update(|v| {
             v.report = report;
-            v.hub_baseline = hub_baseline;
+            v.server_baseline = server_baseline;
             v.awaiting_assignment = awaiting;
             if let Some(e) = errors.first() {
                 v.last_error = Some(crate::auth::redact(e));
@@ -457,8 +457,8 @@ impl Daemon {
         Ok(())
     }
 
-    /// Fetches the hub's baseline and moves onto it (draft carried along),
-    /// pushes queued promotes, and syncs.
+    /// Fetches the server's baseline and moves onto it (draft carried along),
+    /// pushes queued commits, and syncs.
     pub(crate) fn pull(&self, eng: &mut Engine) -> Result<PullResult> {
         self.ensure_managed(eng)?;
         let root = eng.state.repo.clone();
@@ -513,12 +513,12 @@ impl Daemon {
             }
         };
         if let Some(remote) = gitx::remote_head(&root)? {
-            eng.hub_baseline = Some(remote);
+            eng.server_baseline = Some(remote);
         }
         Ok(result)
     }
 
-    /// Pushes promoted commits the hub doesn't have. A push the hub rejected
+    /// Pushes committed commits the server doesn't have. A push the server rejected
     /// as not fast-forward is retried once after rebasing onto its baseline;
     /// any other failure (unreachable, timed out) is returned right away.
     fn push_pending(&self, eng: &mut Engine) -> Result<bool> {
@@ -535,18 +535,18 @@ impl Daemon {
             if let PullResult::Blocked { items, .. } = self.pull_inner(eng)? {
                 let names: Vec<String> = items.iter().map(ToString::to_string).collect();
                 return Err(Error::Conflict(format!(
-                    "can't push: the hub's baseline clashes with {}; promote or reset them",
+                    "can't push: the server's baseline clashes with {}; commit or restore them",
                     names.join(", ")
                 )));
             }
             repo.push()?;
         }
-        tracing::info!("pushed to the hub");
-        eng.hub_baseline = gitx::remote_head(&root)?;
+        tracing::info!("pushed to the server");
+        eng.server_baseline = gitx::remote_head(&root)?;
         Ok(true)
     }
 
-    /// `POST /push`: pushes promoted commits now.
+    /// `POST /push`: pushes committed commits now.
     pub(crate) fn push(&self, eng: &mut Engine) -> Result<PushResult> {
         self.ensure_managed(eng)?;
         self.lock_repo(eng)?;
@@ -569,15 +569,15 @@ impl Daemon {
         self.pull(eng).map(drop)
     }
 
-    pub(crate) fn promote_message(&self, eng: &Engine, items: &[String]) -> Result<PromoteMessage> {
+    pub(crate) fn commit_message(&self, eng: &Engine, items: &[String]) -> Result<CommitMessage> {
         let repo = Repo::open_git_only(Self::root(eng))?;
         let draft = repo.draft()?;
         let items = items.iter().map(|i| ItemRef::resolve(i, &draft)).collect::<Result<Vec<_>, _>>()?;
-        let message = default_promote_message(&items, &eng.state.machine_id);
-        Ok(PromoteMessage { items, message })
+        let message = default_commit_message(&items, &eng.state.machine_id);
+        Ok(CommitMessage { items, message })
     }
 
-    pub(crate) fn promote(&self, eng: &mut Engine, req: PromoteRequest) -> Result<PromoteResponse> {
+    pub(crate) fn commit(&self, eng: &mut Engine, req: CommitRequest) -> Result<CommitResponse> {
         self.ensure_managed(eng)?;
         self.lock_repo(eng)?;
         let root = eng.state.repo.clone();
@@ -585,25 +585,25 @@ impl Daemon {
         let draft = repo.draft()?;
         let items = req.items.iter().map(|i| ItemRef::resolve(i, &draft)).collect::<Result<Vec<_>, _>>()?;
         if items.is_empty() {
-            return Err(Error::BadRequest("name the draft items to promote".into()));
+            return Err(Error::BadRequest("name the draft items to commit".into()));
         }
         let id = eng.state.machine_id.clone();
         let message =
-            req.message.filter(|m| !m.trim().is_empty()).unwrap_or_else(|| default_promote_message(&items, &id));
+            req.message.filter(|m| !m.trim().is_empty()).unwrap_or_else(|| default_commit_message(&items, &id));
         let author = match req.author {
             Some(a) => Some(a),
             None if !repo.has_git_identity()? => Some(machine_author(&id)),
             None => None,
         };
-        let sha = repo.promote(&items, &message, author.as_deref())?;
-        tracing::info!("promoted {} as {sha}", items.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "));
+        let sha = repo.commit(&items, &message, author.as_deref())?;
+        tracing::info!("committed {} as {sha}", items.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "));
         let (pushed, push_error) = if self.is_connected() {
             match self.push_pending(eng) {
                 Ok(_) => (true, None),
                 Err(e) => (false, Some(crate::auth::redact(&e.to_string()))),
             }
         } else {
-            (false, Some("offline: queued until the hub is reachable".to_string()))
+            (false, Some("offline: queued until the server is reachable".to_string()))
         };
         self.refresh(eng)?;
         if let Some(e) = &push_error {
@@ -612,28 +612,28 @@ impl Daemon {
         if eng.blocked.is_some() && self.is_connected() {
             let _ = self.pull(eng);
         }
-        Ok(PromoteResponse { sha, items, message, pushed, push_error })
+        Ok(CommitResponse { sha, items, message, pushed, push_error })
     }
 
-    /// Resets draft items, then queues `draft_discarded` durably. The hub
+    /// Restores draft items, then queues `draft_discarded` durably. The server
     /// session sends the updated status before it.
-    pub(crate) fn reset(&self, eng: &mut Engine, req: ResetRequest) -> Result<ResetResponse> {
+    pub(crate) fn restore(&self, eng: &mut Engine, req: RestoreRequest) -> Result<RestoreResponse> {
         self.ensure_managed(eng)?;
         self.lock_repo(eng)?;
         let repo = Repo::open_git_only(Self::root(eng))?;
         let draft = repo.draft()?;
         let before: BTreeSet<ItemRef> = draft.iter().map(|d| d.item.clone()).collect();
         match (req.all, req.items.is_empty()) {
-            (true, true) => repo.reset_all()?,
+            (true, true) => repo.restore_all()?,
             (false, false) => {
                 let items = req.items.iter().map(|i| ItemRef::resolve(i, &draft)).collect::<Result<Vec<_>, _>>()?;
-                repo.reset(&items)?;
+                repo.restore(&items)?;
             }
             (true, false) => {
                 return Err(Error::BadRequest("pass either items or all, not both".into()));
             }
             (false, true) => {
-                return Err(Error::BadRequest("name the draft items to reset, or pass all".into()));
+                return Err(Error::BadRequest("name the draft items to restore, or pass all".into()));
             }
         }
         let after: BTreeSet<ItemRef> = repo.draft()?.into_iter().map(|d| d.item).collect();
@@ -646,7 +646,7 @@ impl Daemon {
         if eng.blocked.is_some() && self.is_connected() {
             let _ = self.pull(eng);
         }
-        Ok(ResetResponse { discarded })
+        Ok(RestoreResponse { discarded })
     }
 
     /// A read-only inventory. GIT_OPTIONAL_LOCKS=0 prevents status from refreshing
@@ -672,7 +672,7 @@ impl Daemon {
         };
         for path in &baseline_paths {
             let item = ItemRef::for_path(Path::new(path));
-            if matches!(item, ItemRef::Skill(_) | ItemRef::Fragment(_)) {
+            if matches!(item, ItemRef::Skill(_) | ItemRef::Rule(_)) {
                 inventory.entry(item.clone()).or_insert_with(|| entry(item)).in_baseline = true;
             }
         }
@@ -756,7 +756,7 @@ impl Daemon {
     fn plan(&self, eng: &Engine, force: bool) -> Result<(Repo, Vec<Action>)> {
         let Some(snap) = &eng.snapshot else {
             return Err(Error::Conflict(
-                "waiting for the hub's assignment; the harnesses are left alone until it arrives".into(),
+                "waiting for the server's assignment; the harnesses are left alone until it arrives".into(),
             ));
         };
         Self::recover_imports(Self::root(eng))?;
@@ -843,14 +843,14 @@ impl Daemon {
         let adopted = if unmanaged { None } else { sync::unmanaged::adopted(&repo, &harnesses, &t.harness, &t.name)? };
         if unmanaged || adopted.is_some() {
             if !self.is_connected() {
-                return Err(Error::Unavailable("Adopt needs a connection to the Hub".into()));
+                return Err(Error::Unavailable("Adopt needs a connection to the Server".into()));
             }
             let adoption = match adopted {
                 Some(adoption) => adoption,
                 None => sync::unmanaged::select(&repo, &harnesses, &t.harness, &t.name)?,
             };
             let created = repo.personal_dir().join(&adoption.name).symlink_metadata().is_err();
-            // The Hub rejects unknown items, so publish and report the draft
+            // The Server rejects unknown items, so publish and report the draft
             // before enabling it. A crash leaves the original harness copies
             // untouched and an identical draft that Adopt can retry. Only a
             // newly created, unchanged repo copy may be rolled back on failure;
@@ -859,7 +859,7 @@ impl Daemon {
             sync::unmanaged::publish(&repo, &adoption)?;
             let result = (|| {
                 self.refresh(eng)?;
-                tokio::runtime::Handle::current().block_on(crate::hub::assign_adoption(self, &adoption))
+                tokio::runtime::Handle::current().block_on(crate::server::assign_adoption(self, &adoption))
                     .map_err(Error::Internal)
             })();
             let update = match result {
@@ -1117,13 +1117,13 @@ impl Daemon {
         Ok(true)
     }
 
-    /// The hub's baseline is now `baseline`: pull unless already on it.
+    /// The server's baseline is now `baseline`: pull unless already on it.
     pub(crate) fn nudge(&self, eng: &mut Engine, baseline: String) -> Result<()> {
         if Self::idle(eng) {
             return Ok(());
         }
-        eng.hub_baseline = Some(baseline.clone());
-        self.update(|v| v.hub_baseline = Some(baseline.clone()));
+        eng.server_baseline = Some(baseline.clone());
+        self.update(|v| v.server_baseline = Some(baseline.clone()));
         self.event(Event::Fleet);
         let current = gitx::baseline(Self::root(eng)).unwrap_or(None);
         if current.as_deref() != Some(baseline.as_str()) || eng.blocked.is_some() {
@@ -1154,7 +1154,7 @@ impl Daemon {
     }
 
     /// Whether `POST /join` may join again: the machine was removed, or the
-    /// hub rejects its token.
+    /// server rejects its token.
     pub(crate) fn can_rejoin(&self) -> bool {
         self.is_revoked() || self.view().connection == Connection::AuthRejected
     }
@@ -1194,13 +1194,13 @@ impl Daemon {
 }
 
 /// Whether a snapshot at `incoming` replaces one at `applied`. Revision 0
-/// (unknown, from an older hub) is only taken while nothing newer was seen.
+/// (unknown, from an older server) is only taken while nothing newer was seen.
 pub(crate) fn newer(applied: u64, incoming: u64) -> bool {
     incoming > applied || (incoming == 0 && applied == 0)
 }
 
-/// Whether a push failed because the hub has commits we don't (worth a pull
-/// and one retry), as opposed to the hub being unreachable.
+/// Whether a push failed because the server has commits we don't (worth a pull
+/// and one retry), as opposed to the server being unreachable.
 fn is_rejected_push(e: &sk1ll_core::Error) -> bool {
     let text = e.to_string();
     ["[rejected]", "non-fast-forward", "fetch first", "failed to push some refs"].iter().any(|m| text.contains(m))
@@ -1240,9 +1240,9 @@ fn unix_now() -> i64 {
 fn conflict_items(a: &Action) -> Vec<ItemRef> {
     match &a.item {
         Item::Skill { name, .. } => vec![ItemRef::Skill(name.clone())],
-        Item::Rule { file, .. } => vec![ItemRef::Fragment(file.strip_suffix(".md").unwrap_or(file).to_string())],
-        Item::Instructions { fragments, .. } if !fragments.is_empty() => {
-            fragments.iter().map(|f| ItemRef::Fragment(f.clone())).collect()
+        Item::Rule { file, .. } => vec![ItemRef::Rule(file.strip_suffix(".md").unwrap_or(file).to_string())],
+        Item::Instructions { rules, .. } if !rules.is_empty() => {
+            rules.iter().map(|f| ItemRef::Rule(f.clone())).collect()
         }
         Item::Instructions { .. } => vec![ItemRef::Other(a.dest.display().to_string())],
     }
@@ -1262,7 +1262,7 @@ fn displaced_item(entry: &sync::displaced::Entry) -> ItemRef {
     let name = entry.dest.file_name().unwrap_or_default().to_string_lossy();
     match entry.kind {
         sync::displaced::Kind::Skill => ItemRef::Skill(name.into_owned()),
-        sync::displaced::Kind::Rule => ItemRef::Fragment(name.strip_suffix(".md").unwrap_or(&name).to_string()),
+        sync::displaced::Kind::Rule => ItemRef::Rule(name.strip_suffix(".md").unwrap_or(&name).to_string()),
         sync::displaced::Kind::Instructions => ItemRef::Other(entry.dest.display().to_string()),
     }
 }
@@ -1289,7 +1289,7 @@ fn matches_target(a: &Action, t: &ConflictTarget) -> bool {
         && match &a.item {
             Item::Skill { name, .. } => *name == t.name,
             Item::Rule { file, .. } => *file == t.name || *file == format!("{}.md", t.name),
-            Item::Instructions { fragments, .. } => t.name == BLOCK_NAME || fragments.contains(&t.name),
+            Item::Instructions { rules, .. } => t.name == BLOCK_NAME || rules.contains(&t.name),
         }
 }
 
@@ -1318,7 +1318,7 @@ mod tests {
         git(&["config", "user.name", "test"]);
         git(&["config", "user.email", "test@example.invalid"]);
         write("personal/base/SKILL.md", "---\ndescription: Baseline description\n---\nbase\n");
-        write("instructions/git.md", "baseline fragment\n");
+        write("instructions/git.md", "baseline rule\n");
         git(&["add", "."]);
         git(&["commit", "-qm", "baseline"]);
         let baseline = String::from_utf8(git(&["rev-parse", "HEAD"])).unwrap();
@@ -1336,8 +1336,8 @@ mod tests {
         assert!(find("skill:base").in_baseline);
         assert_eq!(find("skill:base").draft, Some(ChangeKind::Modified));
         assert_eq!(find("skill:base").description.as_deref(), Some("Draft description"));
-        assert!(find("fragment:git").in_baseline, "deleted Draft item still comes from the git tree");
-        assert_eq!(find("fragment:git").draft, Some(ChangeKind::Deleted));
+        assert!(find("rule:git").in_baseline, "deleted Draft item still comes from the git tree");
+        assert_eq!(find("rule:git").draft, Some(ChangeKind::Deleted));
         assert!(!find("skill:queued").in_baseline);
         assert!(find("skill:queued").unpushed);
         assert!(!find("skill:local").in_baseline);
@@ -1347,14 +1347,14 @@ mod tests {
 
         // A fetched but clashing Baseline has not been applied locally.
         git(&["checkout", "-qb", "remote", baseline.trim()]);
-        write("instructions/remote.md", "remote fragment\n");
+        write("instructions/remote.md", "remote rule\n");
         git(&["add", "instructions/remote.md"]);
         git(&["commit", "-qm", "remote"]);
         let remote = String::from_utf8(git(&["rev-parse", "HEAD"])).unwrap();
         git(&["update-ref", "refs/remotes/origin/main", remote.trim()]);
         git(&["checkout", "-q", "main"]);
         let items = Daemon::items(root).unwrap();
-        assert!(!items.iter().any(|entry| entry.item.to_string() == "fragment:remote"));
+        assert!(!items.iter().any(|entry| entry.item.to_string() == "rule:remote"));
         assert!(items.iter().find(|entry| entry.item.to_string() == "skill:base").unwrap().in_baseline);
     }
 
@@ -1410,7 +1410,7 @@ mod tests {
                         if !accept.load(Ordering::SeqCst) {
                             if scenario == "edit_repo" { std::fs::write(destination.join("SKILL.md"), "later edit").unwrap(); }
                             if scenario == "edit_source" { std::fs::write(source.join("SKILL.md"), "later edit").unwrap(); }
-                            return (StatusCode::UNPROCESSABLE_ENTITY, "Hub rejected assignment".to_string());
+                            return (StatusCode::UNPROCESSABLE_ENTITY, "Server rejected assignment".to_string());
                         }
                         let mut assignment = sk1ll_proto::Assignment::default();
                         assignment.set_skill("h", "pdf", true);
@@ -1430,11 +1430,11 @@ mod tests {
             snap.assignment.set_new_skills_default("h", false);
             state::save_snapshot(&cfg.snapshot_path(), &snap).unwrap();
             let d = Daemon::new(cfg, DaemonState {
-                machine_id: "a".into(), token: "t".into(), hub_url: format!("http://{address}"), repo: root, revoked: false,
+                machine_id: "a".into(), token: "t".into(), server_url: format!("http://{address}"), repo: root, revoked: false,
             }).unwrap();
             d.set_connection(Connection::Connected);
             let error = d.blocking(|d, eng| d.adopt(eng, ConflictTarget { harness: "h".into(), name: "pdf".into() })).await.unwrap_err();
-            assert!(error.to_string().contains("Hub refused"), "{error}");
+            assert!(error.to_string().contains("Server refused"), "{error}");
             assert_eq!(std::fs::read_to_string(source.join("SKILL.md")).unwrap(), if scenario == "edit_source" { "later edit" } else { "original" });
             assert!(!source.join(".sk1ll-managed").exists());
             if scenario == "new" {

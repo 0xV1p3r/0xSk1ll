@@ -6,7 +6,7 @@ use sk1ll_proto::ErrorBody;
 /// An operation's failure, as the local API reports it.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The request can't be done as asked (unknown item, nothing to promote...).
+    /// The request can't be done as asked (unknown item, nothing to commit...).
     #[error("{0}")]
     BadRequest(String),
     #[error("{0}")]
@@ -14,7 +14,7 @@ pub enum Error {
     /// The machine's state forbids it (e.g. it was removed from the fleet).
     #[error("{0}")]
     Conflict(String),
-    /// The hub is unreachable.
+    /// The server is unreachable.
     #[error("{0}")]
     Unavailable(String),
     #[error(transparent)]

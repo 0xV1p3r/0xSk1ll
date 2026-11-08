@@ -11,14 +11,14 @@ import type { ContentEntry, ContentType, StatusView } from './types';
 vi.mock('./api', () => ({ api: { skills: vi.fn(), skillTree: vi.fn(), skillFile: vi.fn(), editors: vi.fn(),
   fork: vi.fn(), adoptUnmanaged: vi.fn(), openInEditor: vi.fn() }, errorMessage: (error: unknown) => String(error) }));
 const entry = (name: string, type: ContentType, extra: Partial<ContentEntry> = {}): ContentEntry => ({
-  name, item: type === 'unmanaged' ? null : `${type === 'fragment' ? 'fragment' : 'skill'}:${name}`, type,
+  name, item: type === 'unmanaged' ? null : `${type === 'rule' ? 'rule' : 'skill'}:${name}`, type,
   description: `About ${name}`, draft: null, in_baseline: type !== 'unmanaged', path: null,
   enabled_harnesses: ['claude'], clashes_with_repo: false, variants: type === 'unmanaged' ? [
     { hash: 'sha256:one', description: 'First variant', locations: [{ harness: 'claude', path: '/claude/notes' }] },
     { hash: 'sha256:two', description: 'Second variant', locations: [{ harness: 'codex', path: '/codex/notes' }] },
   ] : [], ...extra,
 });
-const entries = [entry('writing', 'personal'), entry('pdf', 'import'), entry('style', 'fragment'), entry('notes', 'unmanaged')];
+const entries = [entry('writing', 'personal'), entry('pdf', 'import'), entry('style', 'rule'), entry('notes', 'unmanaged')];
 const changed = vi.fn(), reviewDraft = vi.fn(), assignment = vi.fn(), addImport = vi.fn();
 const props = { connection: 'connected' as const, entries, revision: 0, changed, reviewDraft, assignment, addImport };
 const markdown = '---\nname: pdf\ndescription: Read PDFs\nharnesses: [claude, codex]\n---\n# Guide\n\nUse **bold** text.\n\n<script>alert(1)</script>';
@@ -52,7 +52,7 @@ it('sorts Name and Type and opens rows using the keyboard', async () => {
   mount(); fireEvent.click(screen.getByRole('button', { name: 'Name' }));
   expect(screen.getAllByRole('row')[1].textContent).toContain('writing');
   fireEvent.click(screen.getByRole('button', { name: 'Type' }));
-  expect(screen.getAllByRole('row')[1].textContent).toContain('style');
+  expect(screen.getAllByRole('row')[1].textContent).toContain('pdf');
   fireEvent.keyDown(screen.getByRole('row', { name: 'View Import pdf' }), { key: 'Enter' });
   expect(await screen.findByRole('button', { name: 'Fork to edit' })).toBeTruthy();
 });
@@ -112,11 +112,11 @@ it('shows frontmatter separately and toggles Rendered and Raw without raw HTML',
   expect(screen.getByRole('region', { name: 'Frontmatter' })).toBeTruthy(); fireEvent.click(screen.getByRole('button', { name: 'Rendered' }));
   expect(screen.getByRole('heading', { name: 'Guide' })).toBeTruthy();
 });
-it('browses a Fragment single file and keeps deleted items read-only', async () => {
+it('browses a Rule single file and keeps deleted items read-only', async () => {
   vi.mocked(api.skillTree).mockResolvedValue([{ path: 'style.md', kind: 'file', size: 100 }]);
   vi.mocked(api.skillFile).mockResolvedValue({ path: 'style.md', text: '# Style', binary: false, too_large: false, size: 100 });
-  mount([entry('style', 'fragment', { draft: 'deleted' })]); fireEvent.click(screen.getByRole('row', { name: 'View Fragment style' }));
-  expect(await screen.findByRole('heading', { name: 'Style' })).toBeTruthy(); expect(api.skillFile).toHaveBeenCalledWith({ item: 'fragment:style', path: 'style.md' });
+  mount([entry('style', 'rule', { draft: 'deleted' })]); fireEvent.click(screen.getByRole('row', { name: 'View Rule style' }));
+  expect(await screen.findByRole('heading', { name: 'Style' })).toBeTruthy(); expect(api.skillFile).toHaveBeenCalledWith({ item: 'rule:style', path: 'style.md' });
   expect(screen.queryByRole('button', { name: 'Choose editor' })).toBeNull(); fireEvent.click(screen.getByRole('button', { name: 'Review in Draft' })); expect(reviewDraft).toHaveBeenCalledOnce();
 });
 it('shows binary and size notices and reloads on revision changes', async () => {
@@ -176,10 +176,10 @@ it.each(['offline', 'connecting', 'auth_rejected', 'revoked'] as const)('disable
   fireEvent.pointerEnter(trigger, { pointerType: 'mouse' });
   fireEvent.mouseMove(trigger);
   fireEvent.mouseEnter(trigger);
-  expect(await screen.findByText('Needs a connection to the Hub')).toBeTruthy();
+  expect(await screen.findByText('Needs a connection to the Server')).toBeTruthy();
   expect(api.adoptUnmanaged).not.toHaveBeenCalled();
 });
-it('disables a pending adoption confirmation when the Hub disconnects', async () => {
+it('disables a pending adoption confirmation when the Server disconnects', async () => {
   const view = render(<TooltipProvider><Skills {...props} /></TooltipProvider>);
   await select('notes', 'Unmanaged');
   fireEvent.click(screen.getByRole('button', { name: 'Adopt' }));

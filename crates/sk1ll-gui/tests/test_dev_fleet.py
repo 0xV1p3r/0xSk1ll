@@ -53,7 +53,7 @@ class DevelopmentFleet(unittest.TestCase):
                     env = Path(f"/proc/{row[0]}/environ").read_bytes().split(b"\0")
                 except (FileNotFoundError, PermissionError, ProcessLookupError):
                     continue
-                if any(value in env for value in [f"HOME={fleet / name}".encode() for name in ("hub", "alpha", "beta")]):
+                if any(value in env for value in [f"HOME={fleet / name}".encode() for name in ("server", "alpha", "beta")]):
                     sessions.add(int(row[3]))
             if stop is not None:
                 self.assertEqual(len(sessions), 3, output)
@@ -68,7 +68,7 @@ class DevelopmentFleet(unittest.TestCase):
                     str(fleet / "alpha/run/sk1ll/daemon.sock"), "--request", "POST",
                     "--header", "Content-Type: application/json",
                     "--data", json.dumps({"items": ["skill:local-only"], "message": "Slow hook cleanup test"}),
-                    "http://localhost/promote",
+                    "http://localhost/commit",
                 ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 deadline = time.monotonic() + 15
                 while not marker.exists():
@@ -134,7 +134,7 @@ class Workspace(unittest.TestCase):
         ], cwd=ROOT, text=True))
         packages = {p["name"]: p for p in metadata["packages"] if p["id"] in metadata["workspace_members"]}
         self.assertEqual(set(packages), {
-            "sk1ll-cli", "sk1ll-core", "sk1ll-daemon", "sk1ll-hub", "sk1ll-proto", "sk1ll-gui",
+            "sk1ll-cli", "sk1ll-core", "sk1ll-daemon", "sk1ll-server", "sk1ll-proto", "sk1ll-gui",
         })
         self.assertEqual(Path(packages["sk1ll-gui"]["manifest_path"]), ROOT / "crates/sk1ll-gui/src-tauri/Cargo.toml")
         self.assertFalse((ROOT / "crates/sk1ll-gui/Cargo.toml").exists())

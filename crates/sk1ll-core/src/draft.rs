@@ -1,7 +1,7 @@
 //! Baseline and draft: the repo's committed `HEAD` (pushed to [`REMOTE`]) is
 //! the baseline; uncommitted changes in the working tree, untracked files
 //! included, are this machine's draft. A draft is split into items (a skill,
-//! a fragment, the manifest) so that promote and reset work per item.
+//! a rule, the manifest) so that commit and restore work per item.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -19,26 +19,26 @@ use crate::manifest::MANIFEST_FILE;
 use crate::skill::{IMPORTED_DIR, PERSONAL_DIR};
 use crate::{Error, IoExt, Repo, Result, machine};
 
-/// The only remote: the hub (see ADR 0002).
+/// The only remote: the server (see ADR 0002).
 pub const REMOTE: &str = "origin";
 
-/// The one branch the fleet's baseline lives on, locally and on the hub.
+/// The one branch the fleet's baseline lives on, locally and on the server.
 /// Pull and push always use it, never "whatever branch is checked out": a
 /// clone on another branch would otherwise find nothing to pull and push a
 /// separate branch the fleet never sees.
 pub const FLEET_BRANCH: &str = "main";
 
-/// One unit of repo content, as promoted or reset. String form: `skill:pdf`,
-/// `fragment:git`, `manifest`, `other:<path>`.
+/// One unit of repo content, as committed or restored. String form: `skill:pdf`,
+/// `rule:git`, `manifest`, `other:<path>`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ItemRef {
     /// `personal/<name>/` and/or `imported/<name>/`.
     Skill(String),
     /// `instructions/<name>.md`.
-    Fragment(String),
+    Rule(String),
     /// `sk1ll.toml` and `sk1ll.lock` together.
     Manifest,
-    /// Any other path; only promoted or reset when named explicitly.
+    /// Any other path; only committed or restored when named explicitly.
     Other(String),
 }
 
@@ -56,7 +56,7 @@ impl ItemRef {
         match parts.as_slice() {
             [dir, name, _, ..] if *dir == PERSONAL_DIR || *dir == IMPORTED_DIR => Self::Skill(name.to_string()),
             [dir, file] if *dir == INSTRUCTIONS_DIR => match file.strip_suffix(".md") {
-                Some(name) if !name.is_empty() && !name.starts_with('.') => Self::Fragment(name.to_string()),
+                Some(name) if !name.is_empty() && !name.starts_with('.') => Self::Rule(name.to_string()),
                 _ => Self::other(s),
             },
             [file] if *file == MANIFEST_FILE || *file == LOCK_FILE => Self::Manifest,
@@ -79,10 +79,10 @@ impl ItemRef {
         Some(path_from_bytes(&unquote_path(name)?))
     }
 
-    /// Short name for messages: the skill or fragment name, `manifest`, or the path.
+    /// Short name for messages: the skill or rule name, `manifest`, or the path.
     pub fn name(&self) -> &str {
         match self {
-            Self::Skill(n) | Self::Fragment(n) | Self::Other(n) => n,
+            Self::Skill(n) | Self::Rule(n) | Self::Other(n) => n,
             Self::Manifest => "manifest",
         }
     }
@@ -106,7 +106,7 @@ impl fmt::Display for ItemRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Skill(n) => write!(f, "skill:{n}"),
-            Self::Fragment(n) => write!(f, "fragment:{n}"),
+            Self::Rule(n) => write!(f, "rule:{n}"),
             Self::Manifest => f.write_str("manifest"),
             Self::Other(p) => write!(f, "other:{p}"),
         }
@@ -120,11 +120,11 @@ impl FromStr for ItemRef {
         let item = match s.split_once(':') {
             None if s == "manifest" => Self::Manifest,
             Some(("skill", n)) if !n.is_empty() => Self::Skill(n.into()),
-            Some(("fragment", n)) if !n.is_empty() => Self::Fragment(n.into()),
+            Some(("rule", n)) if !n.is_empty() => Self::Rule(n.into()),
             Some(("other", p)) if !p.is_empty() => Self::Other(p.into()),
             _ => {
                 return Err(Error::Invalid(format!(
-                    "invalid item `{s}` (expected skill:<name>, fragment:<name>, manifest or other:<path>)"
+                    "invalid item `{s}` (expected skill:<name>, rule:<name>, manifest or other:<path>)"
                 )));
             }
         };
@@ -166,7 +166,7 @@ pub enum PullOutcome {
     UpToDate,
     /// `HEAD` moved; the draft was carried on top.
     Updated { from: String, to: String },
-    /// The new baseline clashes with the draft (or with promoted, unpushed
+    /// The new baseline clashes with the draft (or with committed, unpushed
     /// commits, or with local files the draft leaves out, such as ignored
     /// ones). Nothing was changed; `baseline` is the remote commit.
     Blocked { baseline: String, items: Vec<ItemRef> },
@@ -179,10 +179,10 @@ pub fn machine_author(machine_id: &str) -> String {
     format!("{machine_id} <sk1ll@{slug}>")
 }
 
-/// E.g. `promote pdf, git-flow from laptop`.
-pub fn default_promote_message(items: &[ItemRef], machine_id: &str) -> String {
+/// E.g. `commit pdf, git-flow from laptop`.
+pub fn default_commit_message(items: &[ItemRef], machine_id: &str) -> String {
     let names: Vec<&str> = items.iter().map(ItemRef::name).collect();
-    format!("promote {} from {machine_id}", names.join(", "))
+    format!("commit {} from {machine_id}", names.join(", "))
 }
 
 /// Makes index entries match the working tree for the paths on stdin (adds,
@@ -239,18 +239,18 @@ impl Repo {
     /// items stay as they were, in the working tree and the index. `author`
     /// (`"Name <email>"`) overrides git's identity; with neither, the commit
     /// is made as [`machine_author`] of the hostname.
-    pub fn promote(&self, items: &[ItemRef], message: &str, author: Option<&str>) -> Result<String> {
+    pub fn commit(&self, items: &[ItemRef], message: &str, author: Option<&str>) -> Result<String> {
         if message.trim().is_empty() {
-            return Err(Error::Invalid("promote needs a message".into()));
+            return Err(Error::Invalid("commit needs a message".into()));
         }
-        // A promote is only useful if it can be pushed, and that needs the fleet branch.
+        // A commit is only useful if it can be pushed, and that needs the fleet branch.
         self.on_fleet_branch()?;
-        let (selected, st) = self.select(items, "promoted")?;
+        let (selected, st) = self.select(items, "committed")?;
         let paths: Vec<&PathBuf> = selected.iter().flat_map(|d| &d.paths).collect();
 
         // Build the commit in a throwaway index so the real one is untouched.
         let index = PathBuf::from(
-            self.git().args(["rev-parse", "--path-format=absolute", "--git-path", "sk1ll-promote.index"]).text()?,
+            self.git().args(["rev-parse", "--path-format=absolute", "--git-path", "sk1ll-commit.index"]).text()?,
         );
         let _ = fs::remove_file(&index);
         let tree = (|| {
@@ -267,7 +267,7 @@ impl Repo {
         if let Some(h) = &st.head
             && self.git().args(["rev-parse", &format!("{h}^{{tree}}")]).text()? == tree
         {
-            return Err(Error::Invalid("nothing to promote: those items already match the baseline".into()));
+            return Err(Error::Invalid("nothing to commit: those items already match the baseline".into()));
         }
 
         let mut commit = self.git().args(["commit-tree", &tree]);
@@ -275,12 +275,12 @@ impl Repo {
             commit = commit.args(["-p", h]);
         }
         let sha = commit.args(["-m", message]).envs(&self.identity_env(author)?).text()?;
-        let mut update = self.git().args(["update-ref", "-m", "sk1ll: promote", "HEAD", &sha]);
+        let mut update = self.git().args(["update-ref", "-m", "sk1ll: commit", "HEAD", &sha]);
         if let Some(h) = &st.head {
             update = update.arg(h);
         }
         update.run()?;
-        // The promoted paths now match HEAD; bring the real index in line for them only.
+        // The committed paths now match HEAD; bring the real index in line for them only.
         self.git().args(UPDATE_INDEX).stdin(nul_list(&paths)).run()?;
         Ok(sha)
     }
@@ -295,23 +295,23 @@ impl Repo {
 
     /// Returns `items` to the baseline: tracked paths are checked out from
     /// `HEAD`, paths the baseline doesn't have are deleted. The manifest can't
-    /// be reset while the baseline has none, since that would delete it, and
-    /// nothing is reset that would delete or replace an ignored file.
-    pub fn reset(&self, items: &[ItemRef]) -> Result<()> {
-        let (selected, st) = self.select(items, "reset")?;
+    /// be restored while the baseline has none, since that would delete it, and
+    /// nothing is restored that would delete or replace an ignored file.
+    pub fn restore(&self, items: &[ItemRef]) -> Result<()> {
+        let (selected, st) = self.select(items, "restored")?;
         if selected.iter().any(|d| d.item == ItemRef::Manifest) && !st.head_paths.contains(Path::new(MANIFEST_FILE)) {
             return Err(Error::Invalid(format!(
-                "there is no baseline to restore the manifest to; promote it first (it would delete {MANIFEST_FILE})"
+                "there is no baseline to restore the manifest to; commit it first (it would delete {MANIFEST_FILE})"
             )));
         }
         // Ignored files aren't in the draft, but git would delete or overwrite
-        // one that sits at, under or above a path being reset.
+        // one that sits at, under or above a path being restored.
         let ignored = self.ignored_paths()?;
         for d in &selected {
             let clash = d.paths.iter().find_map(|p| ignored.iter().find(|i| i.starts_with(p) || p.starts_with(i)));
             if let Some(i) = clash {
                 return Err(Error::Invalid(format!(
-                    "`{}` can't be reset: that would delete or replace the ignored `{}`; move it out of the way first",
+                    "`{}` can't be restored: that would delete or replace the ignored `{}`; move it out of the way first",
                     d.item,
                     i.display()
                 )));
@@ -340,18 +340,18 @@ impl Repo {
         Ok(())
     }
 
-    /// Resets the whole draft, including `other:` items, except a manifest
-    /// the baseline doesn't have yet (see [`reset`](Self::reset)).
-    pub fn reset_all(&self) -> Result<()> {
+    /// Restores the whole draft, including `other:` items, except a manifest
+    /// the baseline doesn't have yet (see [`restore`](Self::restore)).
+    pub fn restore_all(&self) -> Result<()> {
         let (draft, st) = self.draft_with_status()?;
         let keep_manifest = !st.head_paths.contains(Path::new(MANIFEST_FILE));
         let items: Vec<ItemRef> =
             draft.into_iter().map(|d| d.item).filter(|i| !(keep_manifest && *i == ItemRef::Manifest)).collect();
-        if items.is_empty() { Ok(()) } else { self.reset(&items) }
+        if items.is_empty() { Ok(()) } else { self.restore(&items) }
     }
 
     /// Fetches [`REMOTE`] and moves to its baseline, carrying the draft on
-    /// top. Promoted but unpushed commits are rebased onto it. If the new
+    /// top. Committed but unpushed commits are rebased onto it. If the new
     /// baseline touches an item the draft also changes (or the rebase
     /// conflicts), nothing changes and the outcome is
     /// [`PullOutcome::Blocked`]. A baseline with no commit in common with
@@ -360,7 +360,7 @@ impl Repo {
     ///
     /// The baseline is [`REMOTE`]'s [`FLEET_BRANCH`], which must also be
     /// checked out here. A remote without that branch is an error too, unless
-    /// it has no branches at all (an empty hub, which only older hubs start
+    /// it has no branches at all (an empty server, which only older servers start
     /// as): then there is nothing to pull yet, and the first push creates it.
     pub fn pull(&self) -> Result<PullOutcome> {
         let branch = self.on_fleet_branch()?;
@@ -670,7 +670,7 @@ impl Repo {
         Ok((items, st))
     }
 
-    /// The draft entries for `items`, to be `verb` (promoted, reset) as a
+    /// The draft entries for `items`, to be `verb` (committed, restored) as a
     /// whole: no other draft item may share a path with them (a file that
     /// became a directory, or the reverse), since git would change it too.
     fn select(&self, items: &[ItemRef], verb: &str) -> Result<(Vec<DraftItem>, Status)> {
@@ -701,7 +701,7 @@ impl Repo {
         let exists = |rel: &str| fs::symlink_metadata(root.join(rel)).is_ok();
         match item {
             ItemRef::Skill(name) => [PERSONAL_DIR, IMPORTED_DIR].iter().any(|d| has_files(&root.join(d).join(name))),
-            ItemRef::Fragment(name) => exists(&format!("{INSTRUCTIONS_DIR}/{name}.md")),
+            ItemRef::Rule(name) => exists(&format!("{INSTRUCTIONS_DIR}/{name}.md")),
             ItemRef::Manifest => exists(MANIFEST_FILE) || exists(LOCK_FILE),
             // The name may be quoted (non-UTF-8); `paths` is exact.
             ItemRef::Other(_) => paths.iter().any(|p| fs::symlink_metadata(root.join(p)).is_ok()),
@@ -750,16 +750,16 @@ impl Repo {
 
 /// The draft entries for `items`; every one must be in the draft.
 /// Why a pull can't move onto a baseline that shares no commit with `HEAD`
-/// (say, two machines that each made a root commit on an empty hub). This is
-/// an error rather than [`PullOutcome::Blocked`]: Blocked means "promote or
-/// reset these items, then pull again", which can never resolve this.
+/// (say, two machines that each made a root commit on an empty server). This is
+/// an error rather than [`PullOutcome::Blocked`]: Blocked means "commit or
+/// restore these items, then pull again", which can never resolve this.
 fn unrelated_histories(root: &Path, branch: &str, head: &str, remote: &str) -> Error {
     let short = |s: &str| s.chars().take(12).collect::<String>();
     Error::Invalid(format!(
-        "can't pull: this machine's `{branch}` ({}) and the hub's baseline ({}) have unrelated histories (no \
+        "can't pull: this machine's `{branch}` ({}) and the server's baseline ({}) have unrelated histories (no \
          common commit), so local commits can't be carried onto it. Nothing was changed. To keep this machine's \
          commits, stash the draft and run `git -C {} rebase --root --onto {REMOTE}/{branch}`; or move the repo \
-         aside and clone it again from the hub",
+         aside and clone it again from the server",
         short(head),
         short(remote),
         root.display(),
@@ -940,7 +940,7 @@ mod tests {
 
     #[test]
     fn item_refs_round_trip() {
-        for s in ["skill:pdf", "fragment:10-git", "manifest", "other:notes/a.txt"] {
+        for s in ["skill:pdf", "rule:10-git", "manifest", "other:notes/a.txt"] {
             assert_eq!(item(s).to_string(), s);
             assert_eq!(serde_json::to_string(&item(s)).unwrap(), format!("\"{s}\""));
         }
@@ -948,12 +948,12 @@ mod tests {
         let for_path = |p: &str| ItemRef::for_path(Path::new(p)).to_string();
         assert_eq!(for_path("imported/web/sub/x.md"), "skill:web");
         assert_eq!(for_path("personal/.gitkeep"), "other:personal/.gitkeep");
-        assert_eq!(for_path("instructions/git.md"), "fragment:git");
+        assert_eq!(for_path("instructions/git.md"), "rule:git");
         assert_eq!(for_path("instructions/.gitkeep"), "other:instructions/.gitkeep");
         assert_eq!(for_path("sk1ll.lock"), "manifest");
         assert_eq!(
-            default_promote_message(&[item("skill:pdf"), item("fragment:git-flow")], "laptop"),
-            "promote pdf, git-flow from laptop"
+            default_commit_message(&[item("skill:pdf"), item("rule:git-flow")], "laptop"),
+            "commit pdf, git-flow from laptop"
         );
     }
 
@@ -977,9 +977,9 @@ mod tests {
             ("skill:new", Added),
             ("skill:pdf", Modified),
             ("skill:web", Deleted),
-            ("fragment:git", Modified),
-            ("fragment:style", Deleted),
-            ("fragment:tone", Added),
+            ("rule:git", Modified),
+            ("rule:style", Deleted),
+            ("rule:tone", Added),
             ("manifest", Modified),
             ("other:notes.txt", Added),
         ];
@@ -992,35 +992,35 @@ mod tests {
         assert!(diff.contains("+++ b/personal/new/SKILL.md") && diff.contains("+new"), "{diff}");
         let diff = r.diff(&item("skill:pdf")).unwrap();
         assert!(diff.contains("-PDFs.") && diff.contains("+changed"), "{diff}");
-        assert!(r.diff(&item("fragment:tone")).unwrap().contains("+Be terse."));
+        assert!(r.diff(&item("rule:tone")).unwrap().contains("+Be terse."));
         assert!(matches!(r.diff(&item("skill:nope")), Err(Error::Invalid(_))));
         assert_eq!(ItemRef::resolve("pdf", &draft).unwrap(), item("skill:pdf"));
         assert!(ItemRef::resolve("nope", &draft).is_err());
     }
 
     #[test]
-    fn partial_promote_leaves_the_rest_in_draft() {
+    fn partial_commit_leaves_the_rest_in_draft() {
         let f = Fleet::new();
         let r = repo(&f.b); // b has no git identity
         assert!(!r.has_git_identity().unwrap());
-        write(&f.b.join("personal/pdf/SKILL.md"), "promoted\n");
+        write(&f.b.join("personal/pdf/SKILL.md"), "committed\n");
         fs::remove_dir_all(f.b.join("imported/web")).unwrap();
         write(&f.b.join("instructions/git.md"), "draft only\n");
         write(&f.b.join("notes.txt"), "staged\n");
         git(&f.b, &["add", "notes.txt"]);
 
-        assert!(matches!(r.promote(&[item("skill:nope")], "m", None), Err(Error::Invalid(_))));
-        let sha = r.promote(&[item("skill:pdf"), item("skill:web")], "promote pdf, web from b", None).unwrap();
+        assert!(matches!(r.commit(&[item("skill:nope")], "m", None), Err(Error::Invalid(_))));
+        let sha = r.commit(&[item("skill:pdf"), item("skill:web")], "commit pdf, web from b", None).unwrap();
         assert_eq!(git(&f.b, &["rev-parse", "HEAD"]), sha);
         let files = git(&f.b, &["show", "--name-only", "--format=", "HEAD"]);
         assert_eq!(files.lines().collect::<Vec<_>>(), ["imported/web/SKILL.md", "personal/pdf/SKILL.md"]);
-        let expected = format!("{}|promote pdf, web from b", machine::hostname());
+        let expected = format!("{}|commit pdf, web from b", machine::hostname());
         assert_eq!(git(&f.b, &["log", "-1", "--format=%an|%s"]), expected);
-        assert_eq!(items(&r), [("fragment:git".into(), Change::Modified), ("other:notes.txt".into(), Change::Added)]);
+        assert_eq!(items(&r), [("rule:git".into(), Change::Modified), ("other:notes.txt".into(), Change::Added)]);
         assert_eq!(git(&f.b, &["diff", "--cached", "--name-only"]), "notes.txt");
         assert_eq!(read(&f.b.join("instructions/git.md")), "draft only\n");
 
-        let sha = r.promote(&[item("fragment:git")], "git", Some("laptop <sk1ll@laptop>")).unwrap();
+        let sha = r.commit(&[item("rule:git")], "git", Some("laptop <sk1ll@laptop>")).unwrap();
         assert_eq!(git(&f.b, &["log", "-1", "--format=%an <%ae>"]), "laptop <sk1ll@laptop>");
         r.push().unwrap();
         assert_eq!(git(&f.b, &["rev-parse", "origin/main"]), sha);
@@ -1028,7 +1028,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_restores_baseline() {
+    fn restore_restores_baseline() {
         let f = Fleet::new();
         let r = repo(&f.a);
         let before = snapshot(&f.a);
@@ -1039,11 +1039,11 @@ mod tests {
         fs::remove_dir_all(f.a.join("imported/web")).unwrap();
         write(&f.a.join("notes.txt"), "n\n");
 
-        r.reset(&[item("skill:pdf"), item("skill:new"), item("fragment:new"), item("skill:web")]).unwrap();
+        r.restore(&[item("skill:pdf"), item("skill:new"), item("rule:new"), item("skill:web")]).unwrap();
         assert_eq!(items(&r), [("other:notes.txt".into(), Change::Added)]);
         assert!(!f.a.join("personal/new").exists());
         assert!(f.a.join("personal").is_dir());
-        r.reset_all().unwrap();
+        r.restore_all().unwrap();
         assert!(r.draft().unwrap().is_empty());
         assert_eq!(snapshot(&f.a), before);
     }
@@ -1055,7 +1055,7 @@ mod tests {
         assert_eq!(b.pull().unwrap(), PullOutcome::UpToDate);
         let old = git(&f.b, &["rev-parse", "HEAD"]);
         write(&f.a.join("personal/pdf/SKILL.md"), "v2\n");
-        let new = a.promote(&[item("skill:pdf")], "v2", None).unwrap();
+        let new = a.commit(&[item("skill:pdf")], "v2", None).unwrap();
         a.push().unwrap();
         assert_eq!(b.pull().unwrap(), PullOutcome::Updated { from: old, to: new });
         assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "v2\n");
@@ -1072,9 +1072,9 @@ mod tests {
         write(&f.b.join(".gitignore"), "!.sk1ll-stage-*/\n");
         let staged = f.b.join("imported/.sk1ll-stage-1-2-3/tree/SKILL.md");
         write(&staged, "being staged\n");
-        // A promoted, unpushed commit: the pull rebases, stashing the draft.
-        write(&f.b.join("instructions/style.md"), "b promoted\n");
-        b.promote(&[item("fragment:style")], "style from b", None).unwrap();
+        // A committed, unpushed commit: the pull rebases, stashing the draft.
+        write(&f.b.join("instructions/style.md"), "b committed\n");
+        b.commit(&[item("rule:style")], "style from b", None).unwrap();
         write(&f.b.join("instructions/git.md"), "b draft\n");
         let draft = b.draft().unwrap();
         assert!(draft.iter().all(|d| !d.item.to_string().contains(".sk1ll-stage-")), "{draft:?}");
@@ -1085,7 +1085,7 @@ mod tests {
         let mtime = || fs::metadata(&staged).unwrap().modified().unwrap();
 
         write(&f.a.join("personal/pdf/SKILL.md"), "v2\n");
-        a.promote(&[item("skill:pdf")], "v2", None).unwrap();
+        a.commit(&[item("skill:pdf")], "v2", None).unwrap();
         a.push().unwrap();
         assert!(matches!(b.pull().unwrap(), PullOutcome::Updated { .. }));
         assert_eq!(read(&staged), "being staged\n");
@@ -1106,7 +1106,7 @@ mod tests {
         let draft = b.draft().unwrap();
 
         write(&f.a.join("personal/pdf/SKILL.md"), "v2\n");
-        let v2 = a.promote(&[item("skill:pdf")], "v2", None).unwrap();
+        let v2 = a.commit(&[item("skill:pdf")], "v2", None).unwrap();
         a.push().unwrap();
         assert!(matches!(b.pull().unwrap(), PullOutcome::Updated { to, .. } if to == v2));
         assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "v2\n");
@@ -1114,17 +1114,17 @@ mod tests {
         assert_eq!(read(&f.b.join("instructions/git.md")), "b draft\n");
         assert_eq!(git(&f.b, &["diff", "--cached", "--name-only"]), "notes.txt");
 
-        // Promoted but unpushed commits are rebased onto the new baseline.
-        write(&f.b.join("instructions/style.md"), "b promoted\n");
-        b.promote(&[item("fragment:style")], "style from b", None).unwrap();
+        // Committed but unpushed commits are rebased onto the new baseline.
+        write(&f.b.join("instructions/style.md"), "b committed\n");
+        b.commit(&[item("rule:style")], "style from b", None).unwrap();
         write(&f.a.join("imported/web/SKILL.md"), "web v2\n");
-        let web = a.promote(&[item("skill:web")], "web v2", None).unwrap();
+        let web = a.commit(&[item("skill:web")], "web v2", None).unwrap();
         a.push().unwrap();
         assert!(matches!(b.pull().unwrap(), PullOutcome::Updated { .. }));
         assert_eq!(git(&f.b, &["rev-parse", "HEAD~1"]), web);
         assert_eq!(git(&f.b, &["log", "-1", "--format=%s"]), "style from b");
         assert_eq!(read(&f.b.join("imported/web/SKILL.md")), "web v2\n");
-        assert_eq!(read(&f.b.join("instructions/style.md")), "b promoted\n");
+        assert_eq!(read(&f.b.join("instructions/style.md")), "b committed\n");
         assert_eq!(b.draft().unwrap(), draft);
         assert_eq!(git(&f.b, &["diff", "--cached", "--name-only"]), "notes.txt");
         assert_eq!(git(&f.b, &["stash", "list"]), "");
@@ -1137,7 +1137,7 @@ mod tests {
         write(&f.b.join("personal/pdf/ref.md"), "b's edit\n");
         write(&f.b.join("personal/new/SKILL.md"), "b new\n");
         write(&f.a.join("personal/pdf/SKILL.md"), "a's edit\n");
-        let remote = a.promote(&[item("skill:pdf")], "a", None).unwrap();
+        let remote = a.commit(&[item("skill:pdf")], "a", None).unwrap();
         a.push().unwrap();
 
         let before = snapshot(&f.b);
@@ -1145,17 +1145,17 @@ mod tests {
         assert_eq!(outcome, PullOutcome::Blocked { baseline: remote.clone(), items: vec![item("skill:pdf")] });
         assert_eq!(snapshot(&f.b), before);
 
-        // An unpushed promote that conflicts with the new baseline backs out too.
-        b.reset(&[item("skill:pdf")]).unwrap();
-        write(&f.b.join("personal/pdf/SKILL.md"), "b's promoted edit\n");
-        b.promote(&[item("skill:pdf")], "b", None).unwrap();
+        // An unpushed commit that conflicts with the new baseline backs out too.
+        b.restore(&[item("skill:pdf")]).unwrap();
+        write(&f.b.join("personal/pdf/SKILL.md"), "b's committed edit\n");
+        b.commit(&[item("skill:pdf")], "b", None).unwrap();
         write(&f.b.join("personal/pdf/ref.md"), "unrelated?\n");
         let before = snapshot(&f.b);
         // The draft touches pdf too, so this is caught before anything moves.
         assert!(matches!(b.pull().unwrap(), PullOutcome::Blocked { .. }));
         assert_eq!(snapshot(&f.b), before);
 
-        b.reset(&[item("skill:pdf")]).unwrap();
+        b.restore(&[item("skill:pdf")]).unwrap();
         let before = snapshot(&f.b);
         let outcome = b.pull().unwrap();
         assert_eq!(outcome, PullOutcome::Blocked { baseline: remote, items: vec![item("skill:pdf")] });
@@ -1176,7 +1176,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_and_promote_refuse_to_cross_item_boundaries() {
+    fn restore_and_commit_refuse_to_cross_item_boundaries() {
         let f = Fleet::new();
         let r = repo(&f.a);
         write(&f.a.join("notes"), "baseline file\n");
@@ -1192,17 +1192,17 @@ mod tests {
         assert_eq!(names, ["other:docs", "other:docs/private", "other:notes", "other:notes/private.txt"]);
 
         let before = snapshot(&f.a);
-        assert!(invalid(r.reset(&[item("other:notes")])).contains("other:notes/private.txt"));
-        assert!(invalid(r.reset(&[item("other:notes/private.txt")])).contains("other:notes"));
-        assert!(invalid(r.promote(&[item("other:docs")], "m", None)).contains("other:docs/private"));
-        assert!(invalid(r.promote(&[item("other:docs/private")], "m", None)).contains("other:docs"));
+        assert!(invalid(r.restore(&[item("other:notes")])).contains("other:notes/private.txt"));
+        assert!(invalid(r.restore(&[item("other:notes/private.txt")])).contains("other:notes"));
+        assert!(invalid(r.commit(&[item("other:docs")], "m", None)).contains("other:docs/private"));
+        assert!(invalid(r.commit(&[item("other:docs/private")], "m", None)).contains("other:docs"));
         assert_eq!(snapshot(&f.a), before);
         assert_eq!(git(&f.a, &["rev-parse", "HEAD"]), head);
 
         // Together they're fine.
-        r.reset(&[item("other:notes"), item("other:notes/private.txt")]).unwrap();
+        r.restore(&[item("other:notes"), item("other:notes/private.txt")]).unwrap();
         assert_eq!(read(&f.a.join("notes")), "baseline file\n");
-        r.promote(&[item("other:docs"), item("other:docs/private")], "docs", None).unwrap();
+        r.commit(&[item("other:docs"), item("other:docs/private")], "docs", None).unwrap();
         assert_eq!(git(&f.a, &["show", "HEAD:docs"]), "now a file");
         assert!(r.draft().unwrap().is_empty());
     }
@@ -1217,7 +1217,7 @@ mod tests {
         assert!(b.draft().unwrap().is_empty());
         write(&f.a.join("secret.txt"), "upstream\n");
         write(&f.a.join("build/out.txt"), "upstream\n");
-        let remote = a.promote(&[item("other:secret.txt"), item("other:build/out.txt")], "secret", None).unwrap();
+        let remote = a.commit(&[item("other:secret.txt"), item("other:build/out.txt")], "secret", None).unwrap();
         a.push().unwrap();
 
         // Fast-forward path.
@@ -1230,8 +1230,8 @@ mod tests {
         assert_eq!(snapshot(&f.b), before);
 
         // Rebase path.
-        write(&f.b.join("instructions/style.md"), "b promoted\n");
-        b.promote(&[item("fragment:style")], "style", None).unwrap();
+        write(&f.b.join("instructions/style.md"), "b committed\n");
+        b.commit(&[item("rule:style")], "style", None).unwrap();
         let before = snapshot(&f.b);
         assert_eq!(b.pull().unwrap(), blocked);
         assert_eq!(snapshot(&f.b), before);
@@ -1247,12 +1247,12 @@ mod tests {
         // The user's own stash must survive untouched.
         write(&f.b.join("personal/pdf/ref.md"), "user stash\n");
         git(&f.b, &["stash", "push", "--quiet", "-m", "user's own"]);
-        write(&f.b.join("instructions/style.md"), "b promoted\n");
-        b.promote(&[item("fragment:style")], "style", None).unwrap();
+        write(&f.b.join("instructions/style.md"), "b committed\n");
+        b.commit(&[item("rule:style")], "style", None).unwrap();
         write(&f.b.join("instructions/git.md"), "b draft\n");
         write(&f.b.join("notes.txt"), "untracked\n");
         write(&f.a.join("imported/web/SKILL.md"), "web v2\n");
-        a.promote(&[item("skill:web")], "web v2", None).unwrap();
+        a.commit(&[item("skill:web")], "web v2", None).unwrap();
         a.push().unwrap();
         let hook = f.b.join(".git/hooks/pre-rebase");
         write(&hook, "#!/bin/sh\nexit 1\n");
@@ -1284,24 +1284,24 @@ mod tests {
         assert_eq!(draft[0].paths, [PathBuf::from(bad)]);
         assert_eq!(ItemRef::resolve("\"bad\\377.txt\"", &draft).unwrap(), draft[0].item);
 
-        r.reset(&[item("other:notes\\b")]).unwrap();
+        r.restore(&[item("other:notes\\b")]).unwrap();
         assert_eq!(git(&f.a, &["ls-files", "notes"]), "notes/b");
         assert_eq!(read(&f.a.join("notes/b")), "tracked\n");
         assert!(!f.a.join("notes\\b").exists());
-        r.reset(&[draft[0].item.clone()]).unwrap();
+        r.restore(&[draft[0].item.clone()]).unwrap();
         assert!(!f.a.join(bad).exists());
         assert!(r.draft().unwrap().is_empty());
     }
 
     #[test]
-    fn reset_keeps_a_manifest_that_was_never_promoted() {
+    fn restore_keeps_a_manifest_that_was_never_committed() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("repo");
         let r = Repo::init(&root).unwrap();
-        r.reset_all().unwrap();
+        r.restore_all().unwrap();
         assert!(root.join(MANIFEST_FILE).is_file());
         assert_eq!(items(&r), [("manifest".into(), Change::Added)]);
-        assert!(invalid(r.reset(&[ItemRef::Manifest])).contains("promote it first"));
+        assert!(invalid(r.restore(&[ItemRef::Manifest])).contains("commit it first"));
 
         // A baseline without the manifest is no better.
         git(&root, &["config", "user.name", "T"]);
@@ -1310,28 +1310,28 @@ mod tests {
         git(&root, &["add", "notes.txt"]);
         git(&root, &["commit", "--quiet", "-m", "notes"]);
         write(&root.join("instructions/x.md"), "x\n");
-        r.reset_all().unwrap();
+        r.restore_all().unwrap();
         assert!(root.join(MANIFEST_FILE).is_file());
         assert_eq!(items(&r), [("manifest".into(), Change::Added)]);
         write(&root.join("instructions/x.md"), "x\n");
-        assert!(invalid(r.reset(&[ItemRef::Manifest, item("fragment:x")])).contains("promote it first"));
+        assert!(invalid(r.restore(&[ItemRef::Manifest, item("rule:x")])).contains("commit it first"));
         assert!(root.join("instructions/x.md").is_file());
     }
 
     #[test]
-    fn promote_refuses_a_detached_head() {
+    fn commit_refuses_a_detached_head() {
         let f = Fleet::new();
         let r = repo(&f.a);
         git(&f.a, &["checkout", "--quiet", "--detach"]);
         write(&f.a.join("personal/pdf/SKILL.md"), "changed\n");
         let before = snapshot(&f.a);
-        assert!(invalid(r.promote(&[item("skill:pdf")], "m", None)).contains("detached"));
+        assert!(invalid(r.commit(&[item("skill:pdf")], "m", None)).contains("detached"));
         assert!(invalid(r.push()).contains("detached"));
         assert_eq!(snapshot(&f.a), before);
     }
 
     #[test]
-    fn reset_refuses_to_delete_ignored_content() {
+    fn restore_refuses_to_delete_ignored_content() {
         let f = Fleet::new();
         let r = repo(&f.a);
         write(&f.a.join("notes"), "baseline file\n");
@@ -1348,17 +1348,17 @@ mod tests {
         assert_eq!(names, ["other:docs/private", "other:notes"]);
 
         let before = snapshot(&f.a);
-        assert!(invalid(r.reset(&[item("other:notes")])).contains("`notes/private.txt`"));
-        assert!(invalid(r.reset(&[item("other:docs/private")])).contains("`docs`"));
-        assert!(invalid(r.reset_all()).contains("ignored"));
+        assert!(invalid(r.restore(&[item("other:notes")])).contains("`notes/private.txt`"));
+        assert!(invalid(r.restore(&[item("other:docs/private")])).contains("`docs`"));
+        assert!(invalid(r.restore_all()).contains("ignored"));
         assert_eq!(snapshot(&f.a), before);
 
-        // Promote doesn't touch the working tree, so the ignored files are safe.
-        r.promote(&[item("other:notes")], "drop notes", None).unwrap();
+        // Commit doesn't touch the working tree, so the ignored files are safe.
+        r.commit(&[item("other:notes")], "drop notes", None).unwrap();
         assert_eq!(read(&f.a.join("notes/private.txt")), "secret\n");
-        // Once the ignored file is moved away, reset goes ahead.
+        // Once the ignored file is moved away, restore goes ahead.
         fs::remove_file(f.a.join("docs")).unwrap();
-        r.reset(&[item("other:docs/private")]).unwrap();
+        r.restore(&[item("other:docs/private")]).unwrap();
         assert_eq!(read(&f.a.join("docs/private")), "baseline\n");
     }
 
@@ -1431,10 +1431,10 @@ mod tests {
         let (bad_item, literal_item) = (of(Path::new(bad)), of(Path::new(literal)));
         assert_ne!(bad_item, literal_item);
 
-        r.reset(&[bad_item]).unwrap();
+        r.restore(&[bad_item]).unwrap();
         assert!(!f.a.join(bad).exists());
         assert_eq!(read(&f.a.join(literal)), "y\n");
-        r.reset(&[ItemRef::resolve(&literal_item.to_string(), &r.draft().unwrap()).unwrap()]).unwrap();
+        r.restore(&[ItemRef::resolve(&literal_item.to_string(), &r.draft().unwrap()).unwrap()]).unwrap();
         assert!(r.draft().unwrap().is_empty());
     }
 
@@ -1444,11 +1444,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let f = Fleet::new();
         let (a, b) = (repo(&f.a), repo(&f.b));
-        // a: an unpushed promote, so the pull rebases; b moves the baseline.
-        write(&f.a.join("instructions/style.md"), "a promoted\n");
-        a.promote(&[item("fragment:style")], "style", None).unwrap();
+        // a: an unpushed commit, so the pull rebases; b moves the baseline.
+        write(&f.a.join("instructions/style.md"), "a committed\n");
+        a.commit(&[item("rule:style")], "style", None).unwrap();
         write(&f.b.join("imported/web/SKILL.md"), "web v2\n");
-        b.promote(&[item("skill:web")], "web v2", None).unwrap();
+        b.commit(&[item("skill:web")], "web v2", None).unwrap();
         b.push().unwrap();
         write(&f.a.join("instructions/git.md"), "a draft\n");
         write(&f.a.join("notes.txt"), "untracked\n");
@@ -1471,7 +1471,7 @@ mod tests {
 
     #[test]
     fn pull_refuses_unrelated_histories_without_touching_anything() {
-        // Two machines joined an empty hub and each made its own root commit.
+        // Two machines joined an empty server and each made its own root commit.
         let f = Fleet::new();
         let origin = f._tmp.path().join("origin.git");
         let c = f._tmp.path().join("c");
@@ -1490,7 +1490,7 @@ mod tests {
             assert!(message.contains("unrelated histories"), "{message}");
             assert_eq!(snapshot(&c), before);
         }
-        assert_eq!(items(&r), [("fragment:git".to_string(), Change::Added)]);
+        assert_eq!(items(&r), [("rule:git".to_string(), Change::Added)]);
     }
 
     /// A repo started on its own (not cloned) on `c`'s branch, with the fleet's origin.
@@ -1519,7 +1519,7 @@ mod tests {
         let r = repo(&c);
         write(&c.join("personal/pdf/SKILL.md"), "c's pdf\n");
         let before = snapshot(&c);
-        for message in [invalid(r.pull()), invalid(r.push()), invalid(r.promote(&[item("skill:pdf")], "m", None))] {
+        for message in [invalid(r.pull()), invalid(r.push()), invalid(r.commit(&[item("skill:pdf")], "m", None))] {
             assert!(message.contains("`master`") && message.contains("`main`"), "{message}");
             assert!(message.contains("branch -m master main"), "{message}");
         }
@@ -1541,7 +1541,7 @@ mod tests {
         assert!(message.contains("no `main` branch") && message.contains("trunk"), "{message}");
         assert_eq!(snapshot(&c), before);
 
-        // An empty origin (an older hub): nothing to pull, and the first push creates `main`.
+        // An empty origin (an older server): nothing to pull, and the first push creates `main`.
         let empty = f._tmp.path().join("empty.git");
         git(f._tmp.path(), &["init", "--quiet", "--bare", "-b", "main", empty.to_str().unwrap()]);
         git(&c, &["remote", "set-url", REMOTE, empty.to_str().unwrap()]);

@@ -1,4 +1,4 @@
-//! The hub: a self-hosted server that hosts the fleet's canonical bare repo
+//! The server: a self-hosted server that hosts the fleet's canonical bare repo
 //! (git smart HTTP under `/git/`), holds each machine's assignment and its
 //! log, collects status from daemons over WebSockets, and nudges them to pull
 //! after every push (ADR 0001, ADR 0002).
@@ -24,23 +24,23 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
-use sk1ll_proto::{AssignmentSnapshot, HubMessage, ImportsView, ItemRef};
+use sk1ll_proto::{AssignmentSnapshot, ServerMessage, ImportsView, ItemRef};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 
 pub use config::Config;
 use error::{ApiError, Result};
 
-/// Shared hub state.
-pub struct Hub {
+/// Shared server state.
+pub struct Server {
     config: Config,
-    /// Only ever locked on a blocking thread, through [`Hub::db`].
+    /// Only ever locked on a blocking thread, through [`Server::db`].
     db: Arc<Mutex<Connection>>,
     /// Live daemon sessions by machine id; a newer one replaces (and cancels)
     /// an older. Locked briefly, never across an `.await` or the DB lock.
     conns: Mutex<HashMap<String, ws::Handle>>,
     next_conn: AtomicU64,
-    /// Last baseline the hub acted on.
+    /// Last baseline the server acted on.
     baseline: Mutex<Option<Baseline>>,
     /// Held across a whole push: receive-pack and the pass after it.
     push_lock: Arc<tokio::sync::Mutex<()>>,
@@ -52,7 +52,7 @@ pub struct Hub {
     imports_due: Notify,
 }
 
-/// A baseline commit and the skills and fragments in its tree.
+/// A baseline commit and the skills and rules in its tree.
 #[derive(Clone)]
 struct Baseline {
     commit: String,
@@ -62,7 +62,7 @@ struct Baseline {
 /// Who made an authenticated request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Caller {
-    /// The bootstrap token (`SK1LL_HUB_ADMIN_TOKEN`).
+    /// The bootstrap token (`SK1LL_SERVER_ADMIN_TOKEN`).
     Admin,
     Machine(String),
 }
@@ -77,7 +77,7 @@ impl Caller {
     }
 }
 
-impl Hub {
+impl Server {
     /// Creates the data dir, bare repo and database as needed.
     pub async fn open(config: Config) -> anyhow::Result<Arc<Self>> {
         let (data_dir, repo, db_path) = (config.data_dir.clone(), config.repo_dir(), config.db_path());
@@ -95,7 +95,7 @@ impl Hub {
             None => None,
         };
         if config.admin_token.is_none() {
-            tracing::warn!("SK1LL_HUB_ADMIN_TOKEN is not set: only joined machines can create join codes");
+            tracing::warn!("SK1LL_SERVER_ADMIN_TOKEN is not set: only joined machines can create join codes");
         }
         Ok(Arc::new(Self {
             config,
@@ -191,7 +191,7 @@ impl Hub {
         }
     }
 
-    fn broadcast(&self, msg: &HubMessage) {
+    fn broadcast(&self, msg: &ServerMessage) {
         for (machine, c) in lock(&self.conns).iter() {
             c.send(machine, msg.clone());
         }
@@ -226,7 +226,7 @@ impl Hub {
         };
         *lock(&self.baseline) = Some(Baseline { commit: new.clone(), items: items.clone() });
         tracing::info!("baseline is now {new}");
-        self.broadcast(&HubMessage::Nudge { baseline: new });
+        self.broadcast(&ServerMessage::Nudge { baseline: new });
         if let Err(e) = self.sweep_all(items).await {
             tracing::error!("dropping toggles for removed items: {e:#}");
         }
@@ -256,8 +256,8 @@ impl Hub {
     }
 }
 
-async fn healthz(State(hub): State<Arc<Hub>>) -> Response {
-    let degraded = hub.push_degraded.load(Ordering::SeqCst);
+async fn healthz(State(server): State<Arc<Server>>) -> Response {
+    let degraded = server.push_degraded.load(Ordering::SeqCst);
     let status = if degraded { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::OK };
     (
         status,
@@ -277,10 +277,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
 /// Serves on `listener` (tests pass an ephemeral one).
 pub async fn serve(config: Config, listener: TcpListener) -> anyhow::Result<()> {
-    let hub = Hub::open(config).await?;
-    tokio::spawn(imports::poll(hub.clone()));
+    let server = Server::open(config).await?;
+    tokio::spawn(imports::poll(server.clone()));
     tracing::info!("listening on {}", listener.local_addr()?);
-    axum::serve(listener, hub.router()).with_graceful_shutdown(shutdown()).await?;
+    axum::serve(listener, server.router()).with_graceful_shutdown(shutdown()).await?;
     Ok(())
 }
 
@@ -340,8 +340,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn database_work_runs_off_the_async_workers() {
         let dir = tempfile::tempdir().unwrap();
-        let hub = Hub::open(Config::new(dir.path().join("data"))).await.unwrap();
-        let held = hub.db.clone();
+        let server = Server::open(Config::new(dir.path().join("data"))).await.unwrap();
+        let held = server.db.clone();
         let (locked_tx, locked_rx) = std::sync::mpsc::channel();
         let holder = std::thread::spawn(move || {
             let _guard = lock(&held);
@@ -351,8 +351,8 @@ mod tests {
         locked_rx.recv().unwrap();
         let start = std::time::Instant::now();
         let query = tokio::spawn({
-            let hub = hub.clone();
-            async move { hub.authenticate("some-token").await.is_err() }
+            let server = server.clone();
+            async move { server.authenticate("some-token").await.is_err() }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(start.elapsed() < Duration::from_millis(300), "the runtime was blocked for {:?}", start.elapsed());

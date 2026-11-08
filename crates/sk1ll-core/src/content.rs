@@ -1,4 +1,4 @@
-//! Skill and Fragment details and bounded, read-only content browsing.
+//! Skill and Rule details and bounded, read-only content browsing.
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
@@ -30,7 +30,7 @@ pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
 pub enum ContentType {
     Personal,
     Import,
-    Fragment,
+    Rule,
     Unmanaged,
 }
 
@@ -43,7 +43,7 @@ pub struct ContentEntry {
     pub description: Option<String>,
     pub draft: Option<Change>,
     pub in_baseline: bool,
-    /// Absolute repo folder, or the Fragment file. Null for unmanaged skills.
+    /// Absolute repo folder, or the Rule file. Null for unmanaged skills.
     pub path: Option<PathBuf>,
     pub enabled_harnesses: Vec<String>,
     pub clashes_with_repo: bool,
@@ -52,7 +52,7 @@ pub struct ContentEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContentQuery {
-    /// skill:<name>, fragment:<name>, or unmanaged:<name>.
+    /// skill:<name>, rule:<name>, or unmanaged:<name>.
     pub item: String,
     /// Required for an unmanaged name with differing variants.
     pub hash: Option<String>,
@@ -114,7 +114,7 @@ fn tracked(root: &Path, revision: &str) -> Result<Vec<(String, String, String)>>
         .collect()
 }
 
-/// Every repo Skill and Fragment, including draft-deleted items, then unmanaged
+/// Every repo Skill and Rule, including draft-deleted items, then unmanaged
 /// skills. `baseline` is the applied fleet revision, not an unpushed HEAD.
 pub fn list(
     repo: &Repo,
@@ -134,7 +134,7 @@ pub fn list(
         .map(|(p, _, _)| ItemRef::for_path(Path::new(p)))
         .collect();
     let drafts: BTreeMap<_, _> = repo.draft()?.into_iter().map(|d| (d.item, d.change)).collect();
-    let fragments = repo.fragments()?;
+    let rules = repo.rules()?;
     let mut entries = BTreeMap::new();
     let mut insert = |name: String, item: ItemRef, kind, path: PathBuf, description| {
         entries.insert(
@@ -166,11 +166,11 @@ pub fn list(
             s.description,
         );
     }
-    for f in &fragments {
+    for f in &rules {
         insert(
             f.name.clone(),
-            ItemRef::Fragment(f.name.clone()),
-            ContentType::Fragment,
+            ItemRef::Rule(f.name.clone()),
+            ContentType::Rule,
             f.path.clone(),
             f.description.clone(),
         );
@@ -188,7 +188,7 @@ pub fn list(
         } else if path.starts_with("imported/") {
             ContentType::Import
         } else {
-            ContentType::Fragment
+            ContentType::Rule
         };
         let content = git(repo.root())
             .args(["cat-file", "-s", oid])
@@ -206,7 +206,7 @@ pub fn list(
             None
         };
         let absolute = repo.root().join(path);
-        let absolute = if kind == ContentType::Fragment {
+        let absolute = if kind == ContentType::Rule {
             absolute
         } else {
             absolute.parent().unwrap().to_path_buf()
@@ -233,10 +233,10 @@ pub fn list(
             .iter()
             .filter(|(h, config)| match &entry.item {
                 Some(ItemRef::Skill(n)) => config.skills_dir().is_some() && assignment.skill_enabled(h, n),
-                Some(ItemRef::Fragment(n)) => {
+                Some(ItemRef::Rule(n)) => {
                     config.instructions_file().is_some()
-                        && assignment.fragment_enabled(h, n)
-                        && fragments.iter().find(|f| f.name == *n).is_none_or(|f| f.applies_to(h))
+                        && assignment.rule_enabled(h, n)
+                        && rules.iter().find(|f| f.name == *n).is_none_or(|f| f.applies_to(h))
                 }
                 _ => false,
             })
@@ -263,7 +263,7 @@ pub fn list(
 fn is_item(path: &str) -> bool {
     match ItemRef::for_path(Path::new(path)) {
         ItemRef::Skill(_) => path.split('/').count() == 3 && path.ends_with("/SKILL.md"),
-        ItemRef::Fragment(_) => true,
+        ItemRef::Rule(_) => true,
         _ => false,
     }
 }
@@ -297,10 +297,10 @@ fn source(repo: &Repo, harnesses: &BTreeMap<String, Harness>, query: &ContentQue
     let item: ItemRef = query.item.parse()?;
     let path = match &item {
         ItemRef::Skill(name) => repo.skills()?.into_iter().find(|s| s.name == *name).map(|s| s.path),
-        ItemRef::Fragment(name) => repo.fragments()?.into_iter().find(|f| f.name == *name).map(|f| f.path),
+        ItemRef::Rule(name) => repo.rules()?.into_iter().find(|f| f.name == *name).map(|f| f.path),
         _ => {
             return Err(Error::Invalid(
-                "only Skills and Fragments have browsable content".into(),
+                "only Skills and Rules have browsable content".into(),
             ));
         }
     };
@@ -334,7 +334,7 @@ fn source(repo: &Repo, harnesses: &BTreeMap<String, Harness>, query: &ContentQue
             return Ok(Source::Disk(canonical));
         }
     }
-    Ok(Source::Head(if matches!(item, ItemRef::Fragment(_)) {
+    Ok(Source::Head(if matches!(item, ItemRef::Rule(_)) {
         PathBuf::from(path)
     } else {
         Path::new(path).parent().unwrap().to_path_buf()
@@ -345,7 +345,7 @@ pub fn tree(repo: &Repo, harnesses: &BTreeMap<String, Harness>, query: &ContentQ
     match source(repo, harnesses, query)? {
         #[cfg(unix)]
         Source::Disk(root) => {
-            let pinned = pinned::Item::open(&root, query.item.starts_with("fragment:"))?;
+            let pinned = pinned::Item::open(&root, query.item.starts_with("rule:"))?;
             #[cfg(test)]
             before_access();
             pinned.tree()
@@ -384,7 +384,7 @@ pub fn tree(repo: &Repo, harnesses: &BTreeMap<String, Harness>, query: &ContentQ
             Ok(files)
         }
         Source::Head(root) => {
-            let base = if query.item.starts_with("fragment:") {
+            let base = if query.item.starts_with("rule:") {
                 root.parent().unwrap()
             } else {
                 &root
@@ -435,7 +435,7 @@ pub fn file(repo: &Repo, harnesses: &BTreeMap<String, Harness>, query: &FileQuer
     let (bytes, size) = match source(repo, harnesses, &query.content)? {
         #[cfg(unix)]
         Source::Disk(root) => {
-            let pinned = pinned::Item::open(&root, query.content.item.starts_with("fragment:"))?;
+            let pinned = pinned::Item::open(&root, query.content.item.starts_with("rule:"))?;
             #[cfg(test)]
             before_access();
             let file = pinned.file(rel)?;
@@ -481,9 +481,9 @@ pub fn file(repo: &Repo, harnesses: &BTreeMap<String, Harness>, query: &FileQuer
             (bytes, size)
         }
         Source::Head(root) => {
-            let path = if query.content.item.starts_with("fragment:") {
+            let path = if query.content.item.starts_with("rule:") {
                 if root.file_name() != rel.file_name() || rel.components().count() != 1 {
-                    return Err(Error::Invalid("file path escapes the Fragment".into()));
+                    return Err(Error::Invalid("file path escapes the Rule".into()));
                 }
                 root
             } else {
@@ -528,7 +528,7 @@ pub fn file(repo: &Repo, harnesses: &BTreeMap<String, Harness>, query: &FileQuer
     })
 }
 
-/// The editor destination for a personal Skill or Fragment. Imports must be
+/// The editor destination for a personal Skill or Rule. Imports must be
 /// forked, and unmanaged skills adopted, before editing repo content.
 pub fn editable_path(repo: &Repo, harnesses: &BTreeMap<String, Harness>, input: &str) -> Result<PathBuf> {
     let requested = if input.contains(':') {
@@ -545,16 +545,16 @@ pub fn editable_path(repo: &Repo, harnesses: &BTreeMap<String, Harness>, input: 
             matches.push((skill.path.join("SKILL.md"), Some((skill.name, skill.origin))));
         }
     }
-    for fragment in repo.fragments()? {
-        if requested.as_ref().map_or(fragment.name == input, |r| {
-            *r == ItemRef::Fragment(fragment.name.clone())
+    for rule in repo.rules()? {
+        if requested.as_ref().map_or(rule.name == input, |r| {
+            *r == ItemRef::Rule(rule.name.clone())
         }) {
-            matches.push((fragment.path, None));
+            matches.push((rule.path, None));
         }
     }
     if matches.len() > 1 {
         return Err(Error::Invalid(format!(
-            "`{input}` is ambiguous; use skill:<name> or fragment:<name>"
+            "`{input}` is ambiguous; use skill:<name> or rule:<name>"
         )));
     }
     if let Some((path, origin)) = matches.pop() {
@@ -570,7 +570,7 @@ pub fn editable_path(repo: &Repo, harnesses: &BTreeMap<String, Harness>, input: 
         return Ok(canonical);
     }
     let name = requested.as_ref().map_or(input, ItemRef::name);
-    if !matches!(requested, Some(ItemRef::Fragment(_)))
+    if !matches!(requested, Some(ItemRef::Rule(_)))
         && let Some(skill) = unmanaged::discover(repo, harnesses)?
             .into_iter()
             .find(|s| s.name == name)
@@ -580,7 +580,7 @@ pub fn editable_path(repo: &Repo, harnesses: &BTreeMap<String, Harness>, input: 
             "`{name}` is an unmanaged skill; run `sk1ll adopt {harness} {name}` before editing"
         )));
     }
-    Err(Error::Invalid(format!("no Skill or Fragment `{input}`")))
+    Err(Error::Invalid(format!("no Skill or Rule `{input}`")))
 }
 
 #[cfg(test)]
@@ -634,7 +634,7 @@ mod tests {
         write(&repo.imported_dir().join("remote/SKILL.md"), "import");
         write(
             &repo.root().join("instructions/git.md"),
-            "---\ndescription: Git conventions\n---\nold fragment",
+            "---\ndescription: Git conventions\n---\nold rule",
         );
         commit(&repo);
         write(
@@ -651,9 +651,9 @@ mod tests {
         let new = items.iter().find(|s| s.name == "new").unwrap();
         assert_eq!(new.draft, Some(Change::Added));
         assert!(!new.in_baseline);
-        let fragment = items.iter().find(|s| s.name == "git").unwrap();
-        assert_eq!(fragment.draft, Some(Change::Deleted));
-        assert_eq!(fragment.description.as_deref(), Some("Git conventions"));
+        let rule = items.iter().find(|s| s.name == "git").unwrap();
+        assert_eq!(rule.draft, Some(Change::Deleted));
+        assert_eq!(rule.description.as_deref(), Some("Git conventions"));
         assert!(
             read(&repo, "skill:pdf", "SKILL.md")
                 .unwrap()
@@ -662,11 +662,11 @@ mod tests {
                 .ends_with("new")
         );
         assert!(
-            read(&repo, "fragment:git", "git.md")
+            read(&repo, "rule:git", "git.md")
                 .unwrap()
                 .text
                 .unwrap()
-                .ends_with("old fragment")
+                .ends_with("old rule")
         );
         fs::remove_dir_all(repo.personal_dir().join("pdf")).unwrap();
         assert!(

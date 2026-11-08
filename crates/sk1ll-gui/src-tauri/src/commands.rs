@@ -60,9 +60,9 @@ command!(skill_file(query: FileQuery) -> FileContent, skill_file(&query));
 command!(adopt_unmanaged(target: ConflictTarget) -> (), adopt_unmanaged(&target));
 command!(fork(name: String) -> (), fork(&name));
 command!(diff(item: String) -> DiffView, diff(&item));
-command!(promote_message(items: Vec<String>) -> PromoteMessage, promote_message(&items));
-command!(promote(request: PromoteRequest) -> PromoteResponse, promote(&request));
-command!(reset(request: ResetRequest) -> ResetResponse, reset(&request));
+command!(commit_message(items: Vec<String>) -> CommitMessage, commit_message(&items));
+command!(commit(request: CommitRequest) -> CommitResponse, commit(&request));
+command!(restore(request: RestoreRequest) -> RestoreResponse, restore(&request));
 command!(pull() -> PullResult, pull());
 command!(conflicts() -> Vec<ConflictView>, conflicts());
 command!(recovered() -> Vec<ConflictView>, recovered());
@@ -155,11 +155,11 @@ fn editor_error(message: impl Into<String>) -> CommandError {
 impl Bridge {
     /// Resolve the editor destination from the same inventory used by Skills.
     pub(crate) async fn editor_target(&self, item: &str) -> Result<crate::editors::Target> {
-        let (kind, name) = item.split_once(':').ok_or_else(|| editor_error("Expected skill:<name> or fragment:<name>"))?;
+        let (kind, name) = item.split_once(':').ok_or_else(|| editor_error("Expected skill:<name> or rule:<name>"))?;
         if name.is_empty() || name.contains(['/', '\0']) || (cfg!(windows) && name.contains('\\')) || matches!(name, "." | "..") {
             return Err(editor_error("Invalid item name"));
         }
-        if !matches!(kind, "skill" | "fragment") { return Err(editor_error("Adopt this Unmanaged skill before opening it")); }
+        if !matches!(kind, "skill" | "rule") { return Err(editor_error("Adopt this Unmanaged skill before opening it")); }
         let entry = self.client.skills().await?.into_iter()
             .find(|entry| entry.item.as_ref().is_some_and(|reference| reference.to_string() == item))
             .ok_or_else(|| editor_error("Item is no longer in Skills"))?;
@@ -170,7 +170,7 @@ impl Bridge {
         }
         let path = entry.path.ok_or_else(|| editor_error("Item has no repo path"))?;
         let repo = self.client.status().await?.repo;
-        crate::editors::validate_target(&repo, &path, entry.kind == ContentType::Fragment).map_err(editor_error)
+        crate::editors::validate_target(&repo, &path, entry.kind == ContentType::Rule).map_err(editor_error)
     }
 }
 

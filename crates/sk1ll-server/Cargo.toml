@@ -1,12 +1,12 @@
 [package]
-name = "sk1ll-hub"
-description = "Self-hosted hub for a 0xSk1ll fleet: git remote, assignment, status"
+name = "sk1ll-server"
+description = "Self-hosted server for a 0xSk1ll fleet: git remote, assignment, status"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "sk1ll-hub"
+name = "sk1ll-server"
 path = "src/main.rs"
 
 [dependencies]

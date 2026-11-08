@@ -14,8 +14,8 @@ use crate::state::{self, DaemonState};
 
 #[derive(Clone)]
 pub struct JoinOptions {
-    /// The hub's base URL, e.g. `https://hub.example`.
-    pub hub_url: String,
+    /// The server's base URL, e.g. `https://server.example`.
+    pub server_url: String,
     pub code: String,
     /// Default: `machine.toml`'s `id`, else the hostname.
     pub machine_id: Option<String>,
@@ -28,7 +28,7 @@ pub struct JoinOptions {
 impl std::fmt::Debug for JoinOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("JoinOptions")
-            .field("hub_url", &crate::auth::redact(&self.hub_url))
+            .field("server_url", &crate::auth::redact(&self.server_url))
             .field("code", &"<redacted>")
             .field("machine_id", &self.machine_id)
             .field("copy_from", &self.copy_from)
@@ -46,16 +46,16 @@ pub struct Joined {
     pub revision: u64,
 }
 
-/// What the hub granted, not yet stored.
+/// What the server granted, not yet stored.
 pub(crate) struct Registered {
     state: DaemonState,
     snapshot: AssignmentSnapshot,
     harnesses: Vec<String>,
 }
 
-/// Joins the fleet: registers this machine and its harnesses with the hub,
+/// Joins the fleet: registers this machine and its harnesses with the server,
 /// stores the token (0600) and the assignment snapshot, and clones the
-/// hub's repo (or adopts an existing clone of it). The repo path is checked
+/// server's repo (or adopts an existing clone of it). The repo path is checked
 /// before the code is spent.
 pub async fn join(cfg: &Config, opts: JoinOptions) -> anyhow::Result<Joined> {
     let reg = register(cfg, &opts, false).await?;
@@ -73,7 +73,7 @@ pub async fn join_or_rejoin(cfg: &Config, mut opts: JoinOptions) -> anyhow::Resu
     match client.status().await {
         Ok(_) => {
             let req = JoinApiRequest {
-                hub_url: opts.hub_url,
+                server_url: opts.server_url,
                 code: opts.code,
                 machine_id: opts.machine_id,
                 copy_from: opts.copy_from,
@@ -94,12 +94,12 @@ fn absolute(p: &Path) -> anyhow::Result<PathBuf> {
 /// Checks the request and spends the join code. `replace` allows replacing
 /// a state that isn't revoked (the daemon decided the token is dead).
 pub(crate) async fn register(cfg: &Config, opts: &JoinOptions, replace: bool) -> anyhow::Result<Registered> {
-    let hub_url = opts.hub_url.trim().trim_end_matches('/').to_string();
-    if !(hub_url.starts_with("http://") || hub_url.starts_with("https://")) {
-        bail!("the hub URL must start with http:// or https:// (got `{}`)", crate::auth::redact(&hub_url));
+    let server_url = opts.server_url.trim().trim_end_matches('/').to_string();
+    if !(server_url.starts_with("http://") || server_url.starts_with("https://")) {
+        bail!("the server URL must start with http:// or https:// (got `{}`)", crate::auth::redact(&server_url));
     }
-    if crate::state::has_credentials(&hub_url) {
-        bail!("the hub URL must not contain credentials");
+    if crate::state::has_credentials(&server_url) {
+        bail!("the server URL must not contain credentials");
     }
     if let Some(s) = DaemonState::load(&cfg.state)?
         && !s.revoked
@@ -107,13 +107,13 @@ pub(crate) async fn register(cfg: &Config, opts: &JoinOptions, replace: bool) ->
     {
         bail!(
             "this machine already joined {} as `{}`; remove {} to join again",
-            s.hub_url,
+            s.server_url,
             s.machine_id,
             cfg.state.display()
         );
     }
     let repo = absolute(&opts.repo)?;
-    let remote = format!("{hub_url}{REPO_PATH}");
+    let remote = format!("{server_url}{REPO_PATH}");
     gitx::check_repo_path(&repo, &remote)?;
 
     let machine = MachineConfig::load(&cfg.machine_config)?;
@@ -126,24 +126,24 @@ pub(crate) async fn register(cfg: &Config, opts: &JoinOptions, replace: bool) ->
         copy_from: opts.copy_from.clone(),
     };
     let resp = reqwest::Client::new()
-        .post(format!("{hub_url}/api/join"))
+        .post(format!("{server_url}/api/join"))
         .json(&req)
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("cannot reach the hub at {hub_url}: {}", crate::auth::redact(&e.to_string())))?;
+        .map_err(|e| anyhow::anyhow!("cannot reach the server at {server_url}: {}", crate::auth::redact(&e.to_string())))?;
     if !resp.status().is_success() {
         let status = resp.status();
         let msg = resp.json::<ErrorBody>().await.map(|e| e.error).unwrap_or_else(|_| status.to_string());
-        bail!("the hub refused to join: {msg}");
+        bail!("the server refused to join: {msg}");
     }
-    let joined: JoinResponse = resp.json().await.context("reading the hub's join response")?;
+    let joined: JoinResponse = resp.json().await.context("reading the server's join response")?;
     if joined.repo_path != REPO_PATH {
-        tracing::warn!("the hub serves its repo at {}, not {REPO_PATH}", joined.repo_path);
+        tracing::warn!("the server serves its repo at {}, not {REPO_PATH}", joined.repo_path);
     }
     Ok(Registered {
         state: DaemonState {
             machine_id: joined.machine_id,
-            hub_url,
+            server_url,
             token: joined.token,
             repo,
             revoked: false,
@@ -177,8 +177,8 @@ impl Registered {
         let setup = gitx::ensure_clone(repo, &self.state.repo_url(), &env).with_context(|| {
             format!("joined, but setting up {} failed; the daemon retries at startup", repo.display())
         })?;
-        // An existing clone must continue the hub's history (its branch was
-        // checked before the code was spent; its history needs the hub).
+        // An existing clone must continue the server's history (its branch was
+        // checked before the code was spent; its history needs the server).
         if setup == Setup::Adopted {
             gitx::check_shares_history(repo, &env)
                 .with_context(|| format!("joined, but the existing clone at {} can't be used", repo.display()))?;

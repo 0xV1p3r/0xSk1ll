@@ -1,9 +1,9 @@
 //! The daemon's persisted state: who this machine is in the fleet and how to
-//! reach the hub. Holds the machine token, so it is written with mode 0600;
+//! reach the server. Holds the machine token, so it is written with mode 0600;
 //! the token is never written anywhere else (git gets it from the
 //! environment, see [`crate::auth`]).
 //!
-//! Next to it, also private: the last assignment snapshot the hub sent
+//! Next to it, also private: the last assignment snapshot the server sent
 //! (revision and content together, so they can't disagree) and the outbox
 //! of `draft_discarded` messages not yet delivered.
 
@@ -18,8 +18,8 @@ use sk1ll_proto::AssignmentSnapshot;
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonState {
     pub machine_id: String,
-    /// Base URL, e.g. `https://hub.example`, without a trailing slash.
-    pub hub_url: String,
+    /// Base URL, e.g. `https://server.example`, without a trailing slash.
+    pub server_url: String,
     /// Machine token: API bearer token and git password. Shown once at join.
     pub token: String,
     /// The local clone.
@@ -33,7 +33,7 @@ impl std::fmt::Debug for DaemonState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DaemonState")
             .field("machine_id", &self.machine_id)
-            .field("hub_url", &crate::auth::redact(&self.hub_url))
+            .field("server_url", &crate::auth::redact(&self.server_url))
             .field("token", &"<redacted>")
             .field("repo", &self.repo)
             .field("revoked", &self.revoked)
@@ -58,12 +58,12 @@ impl DaemonState {
 
     /// The repo's `origin`: `http://host/git/repo.git`, without credentials.
     pub fn repo_url(&self) -> String {
-        format!("{}{}", self.hub_url, sk1ll_proto::REPO_PATH)
+        format!("{}{}", self.server_url, sk1ll_proto::REPO_PATH)
     }
 
     /// `ws(s)://host/api/ws`.
     pub fn ws_url(&self) -> String {
-        let url = &self.hub_url;
+        let url = &self.server_url;
         let ws = if let Some(rest) = url.strip_prefix("https://") {
             format!("wss://{rest}")
         } else if let Some(rest) = url.strip_prefix("http://") {
@@ -97,14 +97,14 @@ pub fn load_assignment(cfg: &crate::Config) -> anyhow::Result<sk1ll_proto::Assig
     if DaemonState::load(&cfg.state)?.is_some_and(|s| !s.revoked) {
         return load_snapshot(&cfg.snapshot_path())?
             .map(|s| s.assignment)
-            .context("no authoritative assignment is stored; start the daemon and connect to the hub \
+            .context("no authoritative assignment is stored; start the daemon and connect to the server \
                       before changing harnesses");
     }
     Ok(sk1ll_proto::Assignment::load(&cfg.assignment)?)
 }
 
-/// Persists direct-mode reset notifications for the daemon's next connection.
-/// The caller must hold the joined repo's engine lock while resetting and
+/// Persists direct-mode restore notifications for the daemon's next connection.
+/// The caller must hold the joined repo's engine lock while restoring and
 /// appending, so the daemon cannot load the outbox between those operations.
 pub fn queue_discards(
     cfg: &crate::Config, _lock: &sk1ll_core::EngineLock, items: Vec<sk1ll_proto::ItemRef>,
@@ -163,7 +163,7 @@ mod tests {
     fn state() -> DaemonState {
         DaemonState {
             machine_id: "ws".into(),
-            hub_url: "https://hub.example:8443".into(),
+            server_url: "https://server.example:8443".into(),
             token: "t0k".into(),
             repo: "/r".into(),
             revoked: false,
@@ -173,12 +173,12 @@ mod tests {
     #[test]
     fn urls() {
         let s = state();
-        assert_eq!(s.repo_url(), "https://hub.example:8443/git/repo.git");
-        assert_eq!(s.ws_url(), "wss://hub.example:8443/api/ws");
-        assert_eq!(without_credentials("https://ws:t0k@hub.example:8443/git/repo.git"), s.repo_url());
+        assert_eq!(s.repo_url(), "https://server.example:8443/git/repo.git");
+        assert_eq!(s.ws_url(), "wss://server.example:8443/api/ws");
+        assert_eq!(without_credentials("https://ws:t0k@server.example:8443/git/repo.git"), s.repo_url());
         assert_eq!(without_credentials("http://h/git/repo.git/"), "http://h/git/repo.git");
-        assert!(has_credentials("https://ws:t0k@hub.example/git/repo.git"));
-        assert!(!has_credentials("https://hub.example/git/a@b"));
+        assert!(has_credentials("https://ws:t0k@server.example/git/repo.git"));
+        assert!(!has_credentials("https://server.example/git/a@b"));
     }
 
     #[test]
@@ -198,7 +198,7 @@ mod tests {
         assert_eq!(DaemonState::load(&path).unwrap(), Some(s));
         assert_eq!(DaemonState::load(&dir.path().join("none")).unwrap(), None);
         // Older state files carried the assignment revision; it is ignored now.
-        fs::write(&path, r#"{"machine_id":"m","hub_url":"http://h","token":"t","repo":"/r","revision":4}"#).unwrap();
+        fs::write(&path, r#"{"machine_id":"m","server_url":"http://h","token":"t","repo":"/r","revision":4}"#).unwrap();
         assert!(DaemonState::load(&path).unwrap().is_some());
     }
 

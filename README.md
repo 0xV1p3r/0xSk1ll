@@ -10,7 +10,7 @@ into every harness on every machine.
   sk1ll.lock        # pinned commit + content hash per import
   personal/<name>/SKILL.md
   imported/<name>/...        # vendored, reviewed via git diff
-  instructions/<name>.md     # instruction fragments, rendered in file-name order
+  instructions/<name>.md     # instruction rules, rendered in file-name order
 ```
 
 The CLI command is `sk1ll`; the Rust crates use the `sk1ll-` prefix.
@@ -31,9 +31,9 @@ sk1ll add --list https://github.com/owner/repo                 # the skills a li
 sk1ll add github:owner/repo --path skills/pdf --ref main [--name pdf]
 sk1ll update [name] [--force]   # refuses to clobber local edits unless forced
 sk1ll fork <name>               # imported -> personal, to edit freely
-sk1ll list                      # skills + instruction fragments
+sk1ll list                      # skills + instruction rules
 sk1ll list --unmanaged          # unmanaged skills, grouped across harnesses
-sk1ll edit <name>               # open a personal Skill or Fragment in $VISUAL / $EDITOR
+sk1ll edit <name>               # open a personal Skill or Rule in $VISUAL / $EDITOR
 sk1ll status                    # import drift + pending sync actions
 sk1ll harnesses                 # this machine's harnesses (detected + machine.toml)
 sk1ll assign claude skill pdf off       # per-harness toggles on this machine
@@ -48,28 +48,28 @@ sk1ll adopt <harness> <name>    # adopt hand edits or an unmanaged skill into th
 The repo's committed `HEAD`, pushed to `origin`, is the **baseline**. Uncommitted
 changes (untracked files included) are this machine's **draft**, and sync
 applies it to the harnesses right away. The draft is split into items:
-`skill:<name>` (`personal/<name>/`, `imported/<name>/`), `fragment:<name>`
+`skill:<name>` (`personal/<name>/`, `imported/<name>/`), `rule:<name>`
 (`instructions/<name>.md`), `manifest` (`sk1ll.toml` + `sk1ll.lock`), and
-`other:<path>` for anything else. Commands take a bare skill or fragment name,
+`other:<path>` for anything else. Commands take a bare skill or rule name,
 or the `kind:name` form.
 
 ```sh
 sk1ll draft                         # draft items: A(dded), M(odified), D(eleted)
 sk1ll diff pdf                      # an item against the baseline
-sk1ll promote pdf git-flow [-m msg] [--push]   # commit just these items
-sk1ll push                          # push promoted commits to origin
-sk1ll reset pdf                     # discard an item's draft
-sk1ll reset --all [--yes]           # discard the whole draft (asks first)
+sk1ll commit pdf git-flow [-m msg] [--push]   # commit just these items
+sk1ll push                          # push committed commits to origin
+sk1ll restore pdf                     # discard an item's draft
+sk1ll restore --all [--yes]           # discard the whole draft (asks first)
 sk1ll pull                          # fetch the new baseline, keep the draft on top
 ```
 
-`promote` commits exactly the named items and leaves the rest of the draft (and
-the index) alone. Without `-m`, the message is `promote <items> from <machine>`;
+`commit` commits exactly the named items and leaves the rest of the draft (and
+the index) alone. Without `-m`, the message is `commit <items> from <machine>`;
 the author is your git identity, or the machine id if git has none. `pull`
-fast-forwards (rebasing promoted, unpushed commits), and carries the draft
+fast-forwards (rebasing committed, unpushed commits), and carries the draft
 across. If the new baseline changes an item that is also in the draft, or a
 rebase conflicts, `pull` changes nothing and reports the machine as Blocked;
-promote or reset those items and pull again. Then run `sk1ll sync` (e.g. in a
+commit or restore those items and pull again. Then run `sk1ll sync` (e.g. in a
 `post-merge` hook).
 
 ## Harnesses
@@ -106,16 +106,16 @@ instructions = ""    # empty clears a preset's path
 
 ## Assignment
 
-Which skills and fragments each harness on this machine gets. Initially,
+Which skills and rules each harness on this machine gets. Initially,
 every item is enabled. Each harness has a default for newly appearing
-items (`--default-skills`, `--default-fragments`). Changing a default records
+items (`--default-skills`, `--default-rules`). Changing a default records
 existing items' current values as explicit toggles, so their assignment stays
 the same. Assignment lives in a local cache, `~/.cache/sk1ll/assignment.json`
-(`--assignment` / `SK1LL_ASSIGNMENT`), until the hub holds it (see Direction).
+(`--assignment` / `SK1LL_ASSIGNMENT`), until the server holds it (see Direction).
 
 ## Instructions
 
-Each `instructions/*.md` file is one fragment. Optional frontmatter:
+Each `instructions/*.md` file is one rule. Optional frontmatter:
 
 ```markdown
 ---
@@ -131,12 +131,12 @@ so each harness has an `instructions_format`:
 | Format | Writes | Use for |
 |---|---|---|
 | `block` (default) | A marked block inside one file; the rest of the file is left alone. Writes follow symlinks, so dotfile-linked files work. | `~/.codex/AGENTS.md`, `~/.config/opencode/AGENTS.md`, `~/.gemini/GEMINI.md` |
-| `rules` | One copied file per fragment, tracked in a hidden `.sk1ll-managed` index | Claude Code's `~/.claude/rules/`, which loads every `.md` file in it for all projects |
+| `rules` | One copied file per rule, tracked in a hidden `.sk1ll-managed` index | Claude Code's `~/.claude/rules/`, which loads every `.md` file in it for all projects |
 
-A fragment's `harnesses:` restricts it further on top of assignment; `targets:`
+A rule's `harnesses:` restricts it further on top of assignment; `targets:`
 is still accepted as a deprecated alias.
 
-`rules` keeps fragment frontmatter except `harnesses`, so Claude's `paths:` works for
+`rules` keeps rule frontmatter except `harnesses`, so Claude's `paths:` works for
 path-scoped rules. It copies rather than symlinks because Claude Code skips
 symlinked rule files in some sessions (Cowork). Rule files you wrote yourself are
 never touched; a name clash is reported as a conflict.
@@ -146,7 +146,7 @@ directly in the harness, sync reports a conflict instead of overwriting it.
 `sk1ll adopt <harness> <name>` copies a copied skill or a rule file back into the
 repo as a draft change (a rule file's `harnesses:` key is restored); `sync
 --force` overwrites the edit instead. A `block` can't be adopted, since it mixes
-fragments: move the edit into `instructions/` by hand.
+rules: move the edit into `instructions/` by hand.
 
 Adopt also copies an unmanaged Skill into `personal/<name>/` as a Draft,
 refusing a name already in the repo unless an identical personal copy lets an
@@ -154,11 +154,11 @@ interrupted Adopt retry. Identical copies in other Harnesses are
 adopted together and explicitly enabled there; differing copies stay unmanaged.
 Sync keeps the original copies in recovery. Other Harnesses follow their
 new-Skills defaults. A joined Machine needs a running Daemon connected to the
-Hub. Adopt publishes the Draft, synchronously enables its Assignment through the Hub, then replaces
+Server. Adopt publishes the Draft, synchronously enables its Assignment through the Server, then replaces
 the Harness copies. A rejected Assignment rolls back only a new, unchanged repo
 copy; originals stay in place. Start `sk1ll daemon` before adopting on a joined
 repo. Standalone repos use local Assignment. `edit` opens a personal Skill's
-`SKILL.md` or a Fragment in `$VISUAL`, falling back to `$EDITOR`; fork an Import
+`SKILL.md` or a Rule in `$VISUAL`, falling back to `$EDITOR`; fork an Import
 or adopt an unmanaged Skill before editing. The Daemon's content endpoints are
 documented in [Skills API](docs/skills-api.md).
 
@@ -177,24 +177,24 @@ documented in [Skills API](docs/skills-api.md).
 
 The sections above describe the current CLI: harnesses are already
 machine-local and profiles are gone, but assignment is still a local file and
-there is no hub, daemon or GUI yet. The planned fleet model is below.
+there is no server, daemon or GUI yet. The planned fleet model is below.
 Terms are defined in [GLOSSARY.md](GLOSSARY.md), and decisions are recorded in
 [docs/adr/](docs/adr/).
 
-- **The repo holds content only**: skills, fragments, imports. The **hub**, a
+- **The repo holds content only**: skills, rules, imports. The **server**, a
   self-hosted Docker container, hosts the canonical repo, and each machine keeps
-  a full clone with the hub as its only remote ([ADR 0002](docs/adr/0002-hub-is-the-git-remote.md)).
+  a full clone with the server as its only remote ([ADR 0002](docs/adr/0002-server-is-the-git-remote.md)).
 - **Baseline vs draft**: a draft is a machine's uncommitted changes. It is live
-  in that machine's harnesses and never leaves the machine. Promote and reset
-  work per skill or fragment. After a promote, the hub tells every machine to
+  in that machine's harnesses and never leaves the machine. Commit and restore
+  work per skill or rule. After a commit, the server tells every machine to
   pull. If a draft clashes with the new baseline, the machine is marked Blocked.
 - **Assignment** (which item is enabled in which harness on which machine) is
-  live hub state, not in `sk1ll.toml`. It is made of explicit toggles plus a
-  per-harness default for new skills, and the hub keeps a log with undo
-  ([ADR 0001](docs/adr/0001-assignment-is-hub-state.md)).
+  live server state, not in `sk1ll.toml`. It is made of explicit toggles plus a
+  per-harness default for new skills, and the server keeps a log with undo
+  ([ADR 0001](docs/adr/0001-assignment-is-server-state.md)).
 - **`sk1ll-daemon`** runs on every machine. It watches the repo and harnesses,
   applies draft + assignment, works offline from the last assignment it knew,
-  and is the only process that talks to the hub. Machines join with a
+  and is the only process that talks to the server. Machines join with a
   single-use join code and get per-machine, revocable tokens.
 - **`sk1ll-gui`** (Tauri v2) talks only to the local Daemon over its Unix
   socket. See [Desktop GUI](#desktop-gui) below.
@@ -204,12 +204,12 @@ Terms are defined in [GLOSSARY.md](GLOSSARY.md), and decisions are recorded in
 The Unix desktop app includes Fleet, Assignment matrix, Draft, Conflicts,
 Imports, Log and Settings. It supports light, dark and system appearance.
 Fleet reports refresh on Daemon events and every 15 seconds. The header shows
-this Machine's id, headline status and Daemon/Hub connections. A stopped
+this Machine's id, headline status and Daemon/Server connections. A stopped
 Daemon gets a reconnecting screen with start instructions; revoked and
 awaiting-assignment Machines get banners.
 
 The matrix groups Harness columns by Machine, shows explicit vs inherited
-Assignment and controls the defaults for new Skills and Fragments. Items
+Assignment and controls the defaults for new Skills and Rules. Items
 absent from the applied Baseline carry an `Unpushed` or `Draft only` badge
 and can only be assigned to this Machine. Writes are optimistic, roll back on errors and show
 the Daemon's message. Successful responses merge by Machine and revision, so
@@ -218,9 +218,9 @@ Assignment changes, which return a revision without modifying or logging state.
 The read-only `GET /items` inventory reads the applied
 origin/main tree from git and includes Draft and unpushed items.
 
-Draft includes item checkboxes, unified diffs, an editable prefilled Promote
-message, push results, confirmed Reset and Pull for Blocked clashes. Reset and
-Promote capture their item lists, compare byte fingerprints on refresh, and
+Draft includes item checkboxes, unified diffs, an editable prefilled Commit
+message, push results, confirmed Restore and Pull for Blocked clashes. Restore and
+Commit capture their item lists, compare byte fingerprints on refresh, and
 require review again when selected content changes. Conflicts
 supports Adopt/Overwrite and displaced recovery Adopt/Discard. Imports adds Skills from a pasted link
 (previewing every Skill a repo holds) and updates Imports, both into Draft; Log pages newest first with per-entry Undo. Settings lists Harnesses,
@@ -249,7 +249,7 @@ pnpm tauri dev
 SK1LL_DAEMON_SOCKET=/absolute/path/to/daemon.sock pnpm tauri dev
 ```
 
-For an isolated real Fleet with a Hub, two Machines, sample Skills, a Fragment
+For an isolated real Fleet with a Server, two Machines, sample Skills, a Rule
 and a local-only Draft:
 
 ```sh
@@ -257,13 +257,13 @@ scripts/dev-fleet.sh           # prints the GUI command for its temporary socket
 scripts/dev-fleet.sh --gui     # also launches pnpm tauri dev
 ```
 
-The script builds Hub/Daemon binaries, isolates their HOME/XDG and git config,
+The script builds Server/Daemon binaries, isolates their HOME/XDG and git config,
 and uses a temporary admin token to create join codes. Its Harness paths are
 inside the temporary directory. Ctrl-C stops every process in the service
 sessions, including git hooks, with a five-second grace period before SIGKILL,
 and removes the Fleet. It never reads or writes the real skills or Harness directories.
 Requires bash, curl, python3, git, setsid, ps and pkill. `SK1LL_DEV_PORT` optionally pins
-the Hub port. `SK1LL_GUI_TRACE=1` logs command names and outcomes without payloads.
+the Server port. `SK1LL_GUI_TRACE=1` logs command names and outcomes without payloads.
 
 Build and check:
 

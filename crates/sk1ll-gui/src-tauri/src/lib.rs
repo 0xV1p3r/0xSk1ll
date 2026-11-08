@@ -23,8 +23,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::skills, commands::skill_tree, commands::skill_file, commands::adopt_unmanaged, commands::fork,
-            commands::status, commands::fleet, commands::items, commands::draft, commands::diff, commands::promote_message,
-            commands::promote, commands::reset, commands::pull, commands::conflicts, commands::recovered,
+            commands::status, commands::fleet, commands::items, commands::draft, commands::diff, commands::commit_message,
+            commands::commit, commands::restore, commands::pull, commands::conflicts, commands::recovered,
             commands::adopt, commands::overwrite, commands::adopt_displaced, commands::discard_displaced,
             commands::harnesses, commands::imports, commands::resolve_import, commands::add_import, commands::update_import, commands::assignment,
             commands::set_assignment, commands::log, commands::undo, commands::join, commands::join_code,

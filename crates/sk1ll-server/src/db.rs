@@ -79,7 +79,7 @@ pub struct MachineRecord {
 }
 
 fn json<T: serde::de::DeserializeOwned>(text: &str, what: &str) -> Result<T> {
-    Ok(serde_json::from_str(text).with_context(|| format!("corrupt {what} in hub.db"))?)
+    Ok(serde_json::from_str(text).with_context(|| format!("corrupt {what} in server.db"))?)
 }
 
 fn to_json<T: serde::Serialize>(value: &T) -> String {
@@ -130,7 +130,7 @@ pub fn insert_machine(conn: &Connection, id: &str, token_hash: &str, now: i64, a
     Ok(revision)
 }
 
-/// The next value of the hub-wide assignment revision sequence. Hub-wide
+/// The next value of the server-wide assignment revision sequence. Server-wide
 /// rather than per machine so that a re-joined machine never goes back.
 fn next_revision(conn: &Connection) -> Result<u64> {
     let v: i64 =
@@ -201,14 +201,14 @@ pub fn consume_join_code(conn: &Connection, code_hash: &str, machine: &str, now:
 fn kind_str(kind: ToggleKind) -> &'static str {
     match kind {
         ToggleKind::Skill => "skill",
-        ToggleKind::Fragment => "fragment",
+        ToggleKind::Rule => "rule",
         ToggleKind::NewSkillsDefault => "new_skills_default",
-        ToggleKind::NewFragmentsDefault => "new_fragments_default",
+        ToggleKind::NewRulesDefault => "new_rules_default",
     }
 }
 
 fn parse_kind(s: &str) -> Result<ToggleKind> {
-    Ok(serde_json::from_value(serde_json::Value::String(s.into())).context("corrupt log kind in hub.db")?)
+    Ok(serde_json::from_value(serde_json::Value::String(s.into())).context("corrupt log kind in server.db")?)
 }
 
 /// Appends `entry` (its `id` is ignored) and sets its new id.
@@ -279,7 +279,7 @@ mod tests {
     #[test]
     fn migrates_once_and_round_trips_log() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("hub.db");
+        let path = dir.path().join("server.db");
         drop(open(&path).unwrap());
         let conn = open(&path).unwrap();
         let v: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
@@ -306,7 +306,7 @@ mod tests {
     #[test]
     fn revisions_grow_across_machines_and_rejoins() {
         let dir = tempfile::tempdir().unwrap();
-        let conn = open(&dir.path().join("hub.db")).unwrap();
+        let conn = open(&dir.path().join("server.db")).unwrap();
         let a = Assignment::default();
         let r1 = insert_machine(&conn, "m", "t1", 0, &a).unwrap();
         let r2 = save_assignment(&conn, "m", &a).unwrap();

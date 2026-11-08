@@ -16,11 +16,11 @@ use sk1ll_proto::{
 
 use crate::assign::{self, Change};
 use crate::error::{ApiError, Result};
-use crate::{Caller, Hub, check_name, db, hash, lock, now, random_bytes};
+use crate::{Caller, Server, check_name, db, hash, lock, now, random_bytes};
 
-type HubState = State<Arc<Hub>>;
+type ServerState = State<Arc<Server>>;
 
-pub fn routes() -> Router<Arc<Hub>> {
+pub fn routes() -> Router<Arc<Server>> {
     Router::new()
         .route("/join", post(join))
         .route("/join-codes", post(create_join_code))
@@ -39,11 +39,11 @@ pub fn bearer(parts: &Parts) -> Option<&str> {
     v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")).map(str::trim)
 }
 
-impl FromRequestParts<Arc<Hub>> for Caller {
+impl FromRequestParts<Arc<Server>> for Caller {
     type Rejection = ApiError;
 
-    async fn from_request_parts(parts: &mut Parts, hub: &Arc<Hub>) -> Result<Self> {
-        hub.authenticate(bearer(parts).ok_or(ApiError::Unauthorized)?).await
+    async fn from_request_parts(parts: &mut Parts, server: &Arc<Server>) -> Result<Self> {
+        server.authenticate(bearer(parts).ok_or(ApiError::Unauthorized)?).await
     }
 }
 
@@ -68,17 +68,17 @@ fn normalize_code(code: &str) -> String {
     code.chars().filter(|c| c.is_ascii_alphanumeric()).map(|c| c.to_ascii_uppercase()).collect()
 }
 
-async fn create_join_code(State(hub): HubState, caller: Caller) -> Result<(StatusCode, Json<JoinCode>)> {
+async fn create_join_code(State(server): ServerState, caller: Caller) -> Result<(StatusCode, Json<JoinCode>)> {
     let code = new_join_code();
     let (code_hash, author, now) = (hash(&normalize_code(&code)), caller.author().to_string(), now());
-    hub.db(move |conn| db::insert_join_code(conn, &code_hash, &author, now)).await?;
+    server.db(move |conn| db::insert_join_code(conn, &code_hash, &author, now)).await?;
     tracing::info!("{} created a join code", caller.author());
     Ok((StatusCode::CREATED, Json(JoinCode { code })))
 }
 
-async fn join(State(hub): HubState, Json(req): Json<JoinRequest>) -> Result<(StatusCode, Json<JoinResponse>)> {
+async fn join(State(server): ServerState, Json(req): Json<JoinRequest>) -> Result<(StatusCode, Json<JoinResponse>)> {
     check_name("machine id", &req.machine_id)?;
-    if req.machine_id == assign::HUB_AUTHOR || req.machine_id == "admin" {
+    if req.machine_id == assign::SERVER_AUTHOR || req.machine_id == "admin" {
         return Err(ApiError::BadRequest(format!("`{}` is reserved", req.machine_id)));
     }
     for h in &req.harnesses {
@@ -87,7 +87,7 @@ async fn join(State(hub): HubState, Json(req): Json<JoinRequest>) -> Result<(Sta
     let token = crate::hex(&random_bytes::<32>());
     let token_hash = hash(&token);
     let req2 = req.clone();
-    let (assignment, revision) = hub
+    let (assignment, revision) = server
         .db(move |conn| {
             let req = req2;
             let tx = conn.transaction()?;
@@ -118,15 +118,15 @@ async fn join(State(hub): HubState, Json(req): Json<JoinRequest>) -> Result<(Sta
     ))
 }
 
-async fn fleet(State(hub): HubState, _: Caller) -> Result<Json<FleetView>> {
-    let baseline = hub.head();
-    let records = hub.db(|conn| db::machines(conn)).await?;
+async fn fleet(State(server): ServerState, _: Caller) -> Result<Json<FleetView>> {
+    let baseline = server.head();
+    let records = server.db(|conn| db::machines(conn)).await?;
     let now = now();
-    let offline_after = hub.config.offline_after.as_secs() as i64;
+    let offline_after = server.config.offline_after.as_secs() as i64;
     let machines = records
         .into_iter()
         .map(|m| {
-            let connected = hub.is_connected(&m.id);
+            let connected = server.is_connected(&m.id);
             // By age alone: a registered but silent connection is Offline too.
             let offline = m.last_seen.is_none_or(|t| now - t > offline_after);
             MachineRow {
@@ -142,16 +142,16 @@ async fn fleet(State(hub): HubState, _: Caller) -> Result<Json<FleetView>> {
     Ok(Json(FleetView { baseline, machines }))
 }
 
-async fn get_assignment(State(hub): HubState, _: Caller, Path(id): Path<String>) -> Result<Json<AssignmentSnapshot>> {
+async fn get_assignment(State(server): ServerState, _: Caller, Path(id): Path<String>) -> Result<Json<AssignmentSnapshot>> {
     let machine = id.clone();
-    hub.db(move |conn| db::snapshot(conn, &machine))
+    server.db(move |conn| db::snapshot(conn, &machine))
         .await?
         .map(Json)
         .ok_or_else(|| ApiError::NotFound(format!("no machine `{id}`")))
 }
 
 async fn put_assignment(
-    State(hub): HubState,
+    State(server): ServerState,
     caller: Caller,
     Path(id): Path<String>,
     Json(body): Json<AssignmentChanges>,
@@ -162,8 +162,8 @@ async fn put_assignment(
         .map(|c| Change { harness: c.harness, kind: c.kind, name: c.name, after: c.enabled, cause: LogCause::Change })
         .collect();
     changes.iter().try_for_each(assign::validate)?;
-    let (machine, author, now, items) = (id.clone(), caller.author().to_string(), now(), hub.baseline_items());
-    let applied = hub
+    let (machine, author, now, items) = (id.clone(), caller.author().to_string(), now(), server.baseline_items());
+    let applied = server
         .db(move |conn| {
             let tx = conn.transaction()?;
             let m = db::machine(&tx, &machine)?.ok_or_else(|| ApiError::NotFound(format!("no machine `{machine}`")))?;
@@ -174,26 +174,26 @@ async fn put_assignment(
             Ok(applied)
         })
         .await?;
-    Ok(Json(published(&hub, &id, applied)))
+    Ok(Json(published(&server, &id, applied)))
 }
 
 /// Hands a changed assignment to the machine's session and builds the response.
-fn published(hub: &Hub, machine: &str, applied: assign::Applied) -> AssignmentUpdate {
+fn published(server: &Server, machine: &str, applied: assign::Applied) -> AssignmentUpdate {
     if !applied.entries.is_empty() {
-        hub.publish_assignment(machine, applied.snapshot());
+        server.publish_assignment(machine, applied.snapshot());
     }
     AssignmentUpdate { assignment: applied.assignment, revision: applied.revision, entries: applied.entries }
 }
 
-async fn log(State(hub): HubState, _: Caller, Query(q): Query<LogQuery>) -> Result<Json<Vec<LogEntry>>> {
-    Ok(Json(hub.db(move |conn| db::log_entries(conn, &q)).await?))
+async fn log(State(server): ServerState, _: Caller, Query(q): Query<LogQuery>) -> Result<Json<Vec<LogEntry>>> {
+    Ok(Json(server.db(move |conn| db::log_entries(conn, &q)).await?))
 }
 
 /// Restores an entry's `before` as a new entry. A no-op (empty `entries`) if
 /// the toggle already has that value.
-async fn undo(State(hub): HubState, caller: Caller, Path(id): Path<i64>) -> Result<Json<AssignmentUpdate>> {
-    let (author, now, items) = (caller.author().to_string(), now(), hub.baseline_items());
-    let (machine, applied) = hub
+async fn undo(State(server): ServerState, caller: Caller, Path(id): Path<i64>) -> Result<Json<AssignmentUpdate>> {
+    let (author, now, items) = (caller.author().to_string(), now(), server.baseline_items());
+    let (machine, applied) = server
         .db(move |conn| {
             let tx = conn.transaction()?;
             let (machine, change) = assign::undo_change(&tx, id)?;
@@ -207,21 +207,21 @@ async fn undo(State(hub): HubState, caller: Caller, Path(id): Path<i64>) -> Resu
             Ok((machine, applied))
         })
         .await?;
-    Ok(Json(published(&hub, &machine, applied)))
+    Ok(Json(published(&server, &machine, applied)))
 }
 
 /// Revokes the machine's token and deletes its assignment (logged). Its files
 /// are untouched; its daemon stops managing them when told `Revoked`.
-async fn remove_machine(State(hub): HubState, caller: Caller, Path(id): Path<String>) -> Result<StatusCode> {
+async fn remove_machine(State(server): ServerState, caller: Caller, Path(id): Path<String>) -> Result<StatusCode> {
     let (machine, author, now) = (id.clone(), caller.author().to_string(), now());
-    hub.db(move |conn| assign::remove_machine(conn, &machine, &author, now)).await?;
-    hub.revoke(&id);
+    server.db(move |conn| assign::remove_machine(conn, &machine, &author, now)).await?;
+    server.revoke(&id);
     tracing::info!("{} removed machine {id}", caller.author());
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn imports(State(hub): HubState, _: Caller) -> Json<ImportsView> {
-    Json(lock(&hub.imports).clone())
+async fn imports(State(server): ServerState, _: Caller) -> Json<ImportsView> {
+    Json(lock(&server.imports).clone())
 }
 
 #[cfg(test)]

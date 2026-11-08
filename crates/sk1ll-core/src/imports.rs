@@ -994,7 +994,7 @@ mod tests {
         let backup = repo.imported_dir().join(".sk1ll-stage-old-pdf");
         let recorded = repo.imported_dir().join("recorded");
         copy_dir(&dest, &recorded);
-        let reset = |at_dest: &dyn Fn(&Path)| {
+        let restore = |at_dest: &dyn Fn(&Path)| {
             let _ = fs::remove_dir_all(&dest).or_else(|_| fs::remove_file(&dest));
             let _ = fs::remove_dir_all(&backup);
             copy_dir(&recorded, &backup);
@@ -1019,7 +1019,7 @@ mod tests {
         let cases: [(&str, Make); 5] =
             [("empty", &empty), ("user", &user), ("file", &file), ("partial", &partial), ("unrecorded", &unrecorded)];
         for (case, at_dest) in cases {
-            reset(at_dest);
+            restore(at_dest);
             let err = repo.recover_imports().unwrap_err().to_string();
             assert!(err.contains(&backup.display().to_string()) && err.contains(&dest.display().to_string()), "{err}");
             assert!(err.contains("is the recorded version") && err.contains("sync again"), "{case}: {err}");
@@ -1032,20 +1032,20 @@ mod tests {
         }
 
         // Neither matches the lock: still both kept.
-        reset(&user);
+        restore(&user);
         fs::write(backup.join("SKILL.md"), "edited").unwrap();
         let err = repo.recover_imports().unwrap_err().to_string();
         assert!(err.contains("is not what sk1ll.lock records") && backup.is_dir(), "{err}");
 
         // The replacement completed and was recorded: only then does the
         // backup go.
-        reset(&|d: &Path| copy_dir(&recorded, d));
+        restore(&|d: &Path| copy_dir(&recorded, d));
         fs::write(backup.join("SKILL.md"), "the old version").unwrap();
         assert!(repo.recover_imports().unwrap().is_empty());
         assert!(!backup.exists() && dest.join("SKILL.md").is_file());
 
         // Nothing installed: the backup is put back.
-        reset(&|_: &Path| {});
+        restore(&|_: &Path| {});
         assert_eq!(repo.recover_imports().unwrap(), ["pdf"]);
         assert_eq!(crate::hash::hash_dir(&dest).unwrap(), repo.lock.skills["pdf"].hash);
     }

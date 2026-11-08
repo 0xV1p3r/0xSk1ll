@@ -13,7 +13,7 @@ sk1ll-core.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 
-# The daemon, the hub client and fleet commands are Unix-only; direct mode
+# The daemon, the server client and fleet commands are Unix-only; direct mode
 # builds everywhere.
 [target.'cfg(unix)'.dependencies]
 sk1ll-daemon = { path = "../sk1ll-daemon" }

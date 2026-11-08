@@ -11,7 +11,7 @@ const DIRECTORY: OFlags = OFlags::RDONLY.union(OFlags::DIRECTORY)
 
 pub(super) struct Item {
     directory: OwnedFd,
-    fragment: Option<OsString>,
+    rule: Option<OsString>,
     path: PathBuf,
 }
 
@@ -20,8 +20,8 @@ fn open_at(dir: &OwnedFd, name: &std::ffi::OsStr, flags: OFlags, path: &Path) ->
 }
 
 impl Item {
-    pub(super) fn open(path: &Path, fragment: bool) -> Result<Self> {
-        let base = if fragment { path.parent().unwrap() } else { path };
+    pub(super) fn open(path: &Path, rule: bool) -> Result<Self> {
+        let base = if rule { path.parent().unwrap() } else { path };
         let mut directory = fd::open("/", DIRECTORY, Mode::empty())
             .map_err(std::io::Error::from).at(path)?;
         for component in base.components() {
@@ -31,14 +31,14 @@ impl Item {
                 _ => return Err(Error::Invalid("item path must be absolute and normalized".into())),
             }
         }
-        Ok(Self { directory, fragment: fragment.then(|| path.file_name().unwrap().to_owned()), path: path.into() })
+        Ok(Self { directory, rule: rule.then(|| path.file_name().unwrap().to_owned()), path: path.into() })
     }
 
     pub(super) fn file(&self, relative: &Path) -> Result<fs::File> {
-        if let Some(name) = &self.fragment
+        if let Some(name) = &self.rule
             && relative != Path::new(name)
         {
-            return Err(Error::Invalid("file path escapes the Fragment".into()));
+            return Err(Error::Invalid("file path escapes the Rule".into()));
         }
         let mut directory = open_at(&self.directory, std::ffi::OsStr::new("."), DIRECTORY, &self.path)?;
         let mut components = relative.components().peekable();
@@ -55,7 +55,7 @@ impl Item {
 
     pub(super) fn tree(&self) -> Result<Vec<FileEntry>> {
         let mut result = Vec::new();
-        if let Some(name) = &self.fragment {
+        if let Some(name) = &self.rule {
             self.entry(&self.directory, name, Path::new(name), &mut result)?;
         } else {
             self.walk(&self.directory, Path::new(""), &mut result)?;

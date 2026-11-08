@@ -345,9 +345,9 @@ pub(crate) fn terminal_prefix(kind: &str) -> Vec<OsString> {
 pub(crate) struct Target {
     pub folder: PathBuf,
     pub file: PathBuf,
-    pub fragment: bool,
+    pub rule: bool,
 }
-pub(crate) fn validate_target(repo: &Path, path: &Path, fragment: bool) -> Result<Target, String> {
+pub(crate) fn validate_target(repo: &Path, path: &Path, rule: bool) -> Result<Target, String> {
     let repo = repo.canonicalize().map_err(|e| e.to_string())?;
     if !path.is_absolute() {
         return Err("Item path must be absolute".into());
@@ -361,12 +361,12 @@ pub(crate) fn validate_target(repo: &Path, path: &Path, fragment: bool) -> Resul
     if !path.starts_with(&repo) || path.starts_with(repo.join("imported")) {
         return Err("Item must be inside the repo and cannot be an Import".into());
     }
-    let folder = if fragment {
-        path.parent().ok_or("Fragment has no parent")?.to_owned()
+    let folder = if rule {
+        path.parent().ok_or("Rule has no parent")?.to_owned()
     } else {
         path.clone()
     };
-    let file = if fragment {
+    let file = if rule {
         path
     } else {
         folder.join("SKILL.md")
@@ -383,14 +383,14 @@ pub(crate) fn validate_target(repo: &Path, path: &Path, fragment: bool) -> Resul
     Ok(Target {
         folder,
         file,
-        fragment,
+        rule,
     })
 }
 pub(crate) fn target_path<'a>(editor: &Editor, target: &'a Target) -> &'a Path {
     match editor.view.id.as_str() {
         "file-manager" => &target.folder,
         "default-app" => &target.file,
-        _ if editor.view.kind == EditorKind::Gui && !target.fragment => &target.folder,
+        _ if editor.view.kind == EditorKind::Gui && !target.rule => &target.folder,
         _ => &target.file,
     }
 }

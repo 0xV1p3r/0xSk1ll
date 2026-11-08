@@ -26,10 +26,10 @@ const screens = {
   Fleet: { icon: Server, group: 'Fleet', description: 'Machines sharing this Baseline. Reports refresh live and every 15 seconds.' },
   'Assignment matrix': { icon: LayoutGrid, group: 'Fleet', description: 'Assignment takes effect immediately. Explicit toggles override a Harness default.' },
   Log: { icon: History, group: 'Fleet', description: 'Assignment log, newest first. Restore applies an entry\'s previous value and adds a new log entry.' },
-  Skills: { icon: BookOpen, group: 'This Machine', description: 'Browse Personal Skills, Imports, Fragments, and Unmanaged skills on this Machine.' },
-  Draft: { icon: FilePen, group: 'This Machine', description: 'This Machine\'s Draft is live in its Harnesses. Promote sends selected items to the Fleet Baseline.' },
+  Skills: { icon: BookOpen, group: 'This Machine', description: 'Browse Personal Skills, Imports, Rules, and Unmanaged skills on this Machine.' },
+  Draft: { icon: FilePen, group: 'This Machine', description: 'This Machine\'s Draft is live in its Harnesses. Commit sends selected items to the Fleet Baseline.' },
   Conflicts: { icon: TriangleAlert, group: 'This Machine', description: 'A Conflict is a Harness edit that differs from this Machine\'s Draft.' },
-  Imports: { icon: ArrowDownToLine, group: 'This Machine', description: 'Available upstream updates. Review each update in the Draft before Promote.' },
+  Imports: { icon: ArrowDownToLine, group: 'This Machine', description: 'Available upstream updates. Review each update in the Draft before Commit.' },
   Settings: { icon: SettingsIcon, group: 'Settings', description: 'Harnesses, Fleet membership, and the Daemon connection for this Machine.' },
 } as const;
 type Screen = keyof typeof screens;
@@ -157,7 +157,7 @@ export function App() {
   if (reachable === false) return <TooltipProvider><ConnectionPage socket={socket} error={error} /></TooltipProvider>;
   if (!status) return <main className="grid min-h-svh place-items-center p-6"><div className="flex w-full max-w-sm flex-col gap-3">
     <p className="text-sm text-muted-foreground" role="status">Connecting to the Daemon…</p><Loading /><ErrorNotice error={error} /></div></main>;
-  const hubConnected = status.connection === 'connected';
+  const serverConnected = status.connection === 'connected';
   return <TooltipProvider><SidebarProvider>
     <a href="#main" className="sr-only z-50 rounded-md bg-background px-3 py-2 text-sm shadow focus:not-sr-only focus:fixed focus:top-2 focus:left-2">Skip to content</a>
     <AppSidebar screen={screen} setScreen={navigate} status={status} unmanagedCount={skills.data?.filter(entry => entry.type === 'unmanaged').length ?? 0} />
@@ -169,8 +169,8 @@ export function App() {
         <StatusBadge status={status.headline} />
         <div className="ml-auto flex items-center gap-2">
           <Badge variant="outline" className="hidden sm:inline-flex">
-            <span className={hubConnected ? 'size-1.5 rounded-full bg-success' : 'size-1.5 rounded-full bg-warning'} aria-hidden />
-            Hub {connectionLabel(status.connection)}
+            <span className={serverConnected ? 'size-1.5 rounded-full bg-success' : 'size-1.5 rounded-full bg-warning'} aria-hidden />
+            Server {connectionLabel(status.connection)}
           </Badge>
           <Tooltip><TooltipTrigger render={<Button variant="ghost" size="icon" aria-label="Refresh" onClick={changed} />}>
             <RefreshCw /></TooltipTrigger><TooltipContent>Refresh</TooltipContent></Tooltip>
@@ -179,11 +179,11 @@ export function App() {
       </header>
       <main id="main" className="mx-auto flex w-full max-w-6xl min-w-0 flex-col gap-6 p-4 md:p-6">
         <div className="flex flex-col gap-1"><h1 ref={heading} tabIndex={-1} className="rounded-sm text-2xl font-semibold tracking-tight outline-none focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-ring">{screen}</h1>
-          <p className="text-sm text-muted-foreground">{screen === 'Draft' && status.revoked ? "This Machine's Draft is private. The Daemon has stopped managing its Harnesses until this Machine rejoins." : screen === 'Draft' && status.awaiting_assignment ? "This Machine's Draft is private. Harnesses stay unchanged until the Hub sends an Assignment." : screens[screen].description}</p></div>
+          <p className="text-sm text-muted-foreground">{screen === 'Draft' && status.revoked ? "This Machine's Draft is private. The Daemon has stopped managing its Harnesses until this Machine rejoins." : screen === 'Draft' && status.awaiting_assignment ? "This Machine's Draft is private. Harnesses stay unchanged until the Server sends an Assignment." : screens[screen].description}</p></div>
         {status.revoked && <Notice title="Machine revoked" tone="destructive">This Machine was removed from the Fleet. The Daemon has stopped managing its Harnesses.
           <div><Button variant="outline" size="sm" className="mt-2" onClick={() => navigate('Settings')}>Rejoin in Settings</Button></div></Notice>}
-        {status.awaiting_assignment && <Notice title="Awaiting Assignment">The Daemon has no Assignment snapshot. Harnesses are left alone until the Hub sends one.</Notice>}
-        {status.connection === 'auth_rejected' && <Notice title="Hub authentication rejected" tone="destructive">The Daemon is using its cached Assignment and keeps reconnecting.
+        {status.awaiting_assignment && <Notice title="Awaiting Assignment">The Daemon has no Assignment snapshot. Harnesses are left alone until the Server sends one.</Notice>}
+        {status.connection === 'auth_rejected' && <Notice title="Server authentication rejected" tone="destructive">The Daemon is using its cached Assignment and keeps reconnecting.
           {status.last_error && <p className="font-mono text-xs">{status.last_error}</p>}
           <p>If this Machine was removed or its credential rotated, create a join code on another Machine and rejoin.</p>
           <div><Button variant="outline" size="sm" className="mt-2" onClick={() => navigate('Settings')}>Rejoin in Settings</Button></div></Notice>}

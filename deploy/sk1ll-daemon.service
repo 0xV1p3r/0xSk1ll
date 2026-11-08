@@ -1,6 +1,6 @@
 # systemd user unit for the 0xSk1ll daemon.
 #
-#   sk1ll join https://hub.example <join-code>
+#   sk1ll join https://server.example <join-code>
 #   cp deploy/sk1ll-daemon.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now sk1ll-daemon

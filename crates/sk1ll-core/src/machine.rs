@@ -27,10 +27,10 @@ pub enum LinkMode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum InstructionsFormat {
-    /// All fragments in one marked block inside a single file.
+    /// All rules in one marked block inside a single file.
     #[default]
     Block,
-    /// One copied file per fragment in a directory.
+    /// One copied file per rule in a directory.
     Rules,
 }
 

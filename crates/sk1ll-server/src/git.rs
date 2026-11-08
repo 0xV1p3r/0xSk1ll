@@ -24,7 +24,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio_util::io::ReaderStream;
 
-use crate::Hub;
+use crate::Server;
 
 /// Creates the bare repo (default branch `main`, pushes over HTTP allowed)
 /// unless it exists.
@@ -56,15 +56,15 @@ fn setup_git() -> std::process::Command {
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_AUTHOR_NAME", "hub")
-        .env("GIT_AUTHOR_EMAIL", "sk1ll@hub")
-        .env("GIT_COMMITTER_NAME", "hub")
-        .env("GIT_COMMITTER_EMAIL", "sk1ll@hub")
+        .env("GIT_AUTHOR_NAME", "server")
+        .env("GIT_AUTHOR_EMAIL", "sk1ll@server")
+        .env("GIT_COMMITTER_NAME", "server")
+        .env("GIT_COMMITTER_EMAIL", "sk1ll@server")
         .stdin(Stdio::null());
     cmd
 }
 
-/// Gives a fresh or previously empty hub one shared root commit. Repositories
+/// Gives a fresh or previously empty server one shared root commit. Repositories
 /// with any refs (even without main), or a detached HEAD, are left untouched.
 pub fn init_baseline(repo: &Path) -> anyhow::Result<()> {
     let run = |dir: &Path, args: &[&str]| -> anyhow::Result<String> {
@@ -117,7 +117,7 @@ pub async fn show(repo: &Path, commit: &str, path: &str) -> anyhow::Result<Optio
     git(repo, &["show", &format!("{commit}:{path}")]).await
 }
 
-/// Skills (`personal/<n>/SKILL.md`, `imported/<n>/SKILL.md`) and fragments
+/// Skills (`personal/<n>/SKILL.md`, `imported/<n>/SKILL.md`) and rules
 /// (`instructions/<n>.md`) at `commit`.
 pub async fn items_at(repo: &Path, commit: &str) -> anyhow::Result<BTreeSet<ItemRef>> {
     let args = ["ls-tree", "-r", "-z", "--name-only", commit, "--", PERSONAL_DIR, IMPORTED_DIR, INSTRUCTIONS_DIR];
@@ -125,7 +125,7 @@ pub async fn items_at(repo: &Path, commit: &str) -> anyhow::Result<BTreeSet<Item
     Ok(out.split('\0').filter_map(item_for_path).collect())
 }
 
-/// The skill or fragment a tree path makes exist. Stricter than core's
+/// The skill or rule a tree path makes exist. Stricter than core's
 /// [`ItemRef::for_path`], which maps any file under a skill dir: a skill is
 /// in the baseline only with its `SKILL.md`.
 fn item_for_path(path: &str) -> Option<ItemRef> {
@@ -137,7 +137,7 @@ fn item_for_path(path: &str) -> Option<ItemRef> {
         [dir, file] if *dir == INSTRUCTIONS_DIR => file
             .strip_suffix(".md")
             .filter(|n| !n.is_empty() && !n.starts_with('.'))
-            .map(|n| ItemRef::Fragment(n.to_string())),
+            .map(|n| ItemRef::Rule(n.to_string())),
         _ => None,
     }
 }
@@ -175,9 +175,9 @@ fn resolve_ref(listing: &str, git_ref: &str) -> Option<String> {
 
 /// `/git/*`: git smart HTTP for `repo.git`, authenticated with HTTP Basic
 /// where the password is a machine (or admin) token.
-pub async fn http(State(hub): State<Arc<Hub>>, req: Request) -> Response {
+pub async fn http(State(server): State<Arc<Server>>, req: Request) -> Response {
     let caller = match basic_password(req.headers()) {
-        Some(token) => hub.authenticate(&token).await.ok(),
+        Some(token) => server.authenticate(&token).await.ok(),
         None => None,
     };
     let Some(caller) = caller else {
@@ -188,7 +188,7 @@ pub async fn http(State(hub): State<Arc<Hub>>, req: Request) -> Response {
     if !path_info.starts_with("/repo.git/") {
         return (StatusCode::NOT_FOUND, "only /git/repo.git is served\n").into_response();
     }
-    match cgi(hub, caller.author().to_string(), path_info, req).await {
+    match cgi(server, caller.author().to_string(), path_info, req).await {
         Ok(resp) => resp,
         Err(e) => {
             tracing::error!("git http-backend: {e:#}");
@@ -205,23 +205,23 @@ fn basic_password(headers: &HeaderMap) -> Option<String> {
     Some(text.split_once(':')?.1.to_string())
 }
 
-async fn cgi(hub: Arc<Hub>, user: String, path_info: String, req: Request) -> anyhow::Result<Response> {
+async fn cgi(server: Arc<Server>, user: String, path_info: String, req: Request) -> anyhow::Result<Response> {
     let is_push = req.method() == "POST" && path_info.ends_with("/git-receive-pack");
     let receive_pack = is_push
         || (path_info.ends_with("/info/refs")
             && req.uri().query().is_some_and(|q| q.split('&').any(|p| p == "service=git-receive-pack")));
-    if receive_pack && hub.push_degraded.load(Ordering::SeqCst) {
+    if receive_pack && server.push_degraded.load(Ordering::SeqCst) {
         return Ok(degraded_response());
     }
     // A push holds the lock from before receive-pack until its follow-up is
     // done, so each push is diffed and announced on its own, in order.
     let push = if is_push {
-        let guard = hub.push_lock.clone().lock_owned().await;
+        let guard = server.push_lock.clone().lock_owned().await;
         // Cleanup may have failed while this request was queued.
-        if hub.push_degraded.load(Ordering::SeqCst) {
+        if server.push_degraded.load(Ordering::SeqCst) {
             return Ok(degraded_response());
         }
-        Some((guard, head(&hub.config.repo_dir()).await?))
+        Some((guard, head(&server.config.repo_dir()).await?))
     } else {
         None
     };
@@ -239,8 +239,8 @@ async fn cgi(hub: Arc<Hub>, user: String, path_info: String, req: Request) -> an
     cmd.arg("http-backend")
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", &hub.config.data_dir)
-        .env("GIT_PROJECT_ROOT", &hub.config.data_dir)
+        .env("HOME", &server.config.data_dir)
+        .env("GIT_PROJECT_ROOT", &server.config.data_dir)
         .env("GIT_HTTP_EXPORT_ALL", "1")
         .env("GATEWAY_INTERFACE", "CGI/1.1")
         .env("SERVER_PROTOCOL", "HTTP/1.1")
@@ -261,8 +261,8 @@ async fn cgi(hub: Arc<Hub>, user: String, path_info: String, req: Request) -> an
     #[cfg(unix)]
     let pgid = child.id().expect("newly spawned child has a pid") as libc::pid_t;
 
-    let idle = hub.config.push_idle;
-    let max = hub.config.push_max;
+    let idle = server.config.push_idle;
+    let max = server.config.push_max;
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
     // This task owns the child and push guard even if the HTTP caller leaves.
     // Every exit after spawning the backend must run the push follow-up.
@@ -359,7 +359,7 @@ async fn cgi(hub: Arc<Hub>, user: String, path_info: String, req: Request) -> an
             // backend or changing process-wide state in parallel tests.
             #[cfg(test)]
             let stopped = stopped.and_then(|()| {
-                if hub.fail_cleanup_confirmation.load(Ordering::SeqCst) {
+                if server.fail_cleanup_confirmation.load(Ordering::SeqCst) {
                     bail!("forced cleanup confirmation failure");
                 }
                 Ok(())
@@ -370,7 +370,7 @@ async fn cgi(hub: Arc<Hub>, user: String, path_info: String, req: Request) -> an
                 if let Some((_guard, _)) = push {
                     // Set the flag before releasing the guard. Queued and new
                     // pushes must fail closed while a writer may survive.
-                    hub.push_degraded.store(true, Ordering::SeqCst);
+                    server.push_degraded.store(true, Ordering::SeqCst);
                     tracing::error!("{DEGRADED_MESSAGE}");
                 }
                 return;
@@ -378,13 +378,13 @@ async fn cgi(hub: Arc<Hub>, user: String, path_info: String, req: Request) -> an
         }
         errors.abort();
         if let Some((_guard, before)) = push {
-            hub.after_push(before).await;
+            server.after_push(before).await;
         }
     });
     response_rx.await.context("git backend ended before a response")
 }
 
-const DEGRADED_MESSAGE: &str = "hub push path is degraded after an unconfirmed backend cleanup; restart the hub";
+const DEGRADED_MESSAGE: &str = "server push path is degraded after an unconfirmed backend cleanup; restart the server";
 
 fn degraded_response() -> Response {
     tracing::error!("{DEGRADED_MESSAGE}");
@@ -457,26 +457,26 @@ mod tests {
         let mut config = crate::Config::new(dir.path().join("data"));
         config.admin_token = Some("test".into());
         config.push_idle = Duration::from_millis(200);
-        let hub = Hub::open(config).await.unwrap();
-        hub.fail_cleanup_confirmation.store(true, Ordering::SeqCst);
+        let server = Server::open(config).await.unwrap();
+        server.fail_cleanup_confirmation.store(true, Ordering::SeqCst);
         let push_path = "/repo.git/git-receive-pack";
         let stalled = tokio::spawn({
-            let hub = hub.clone();
+            let server = server.clone();
             async move {
                 let body = Body::from_stream(futures_util::stream::pending::<std::io::Result<Bytes>>());
-                cgi(hub, "admin".into(), push_path.into(), request("/git/repo.git/git-receive-pack", "POST", body))
+                cgi(server, "admin".into(), push_path.into(), request("/git/repo.git/git-receive-pack", "POST", body))
                     .await
             }
         });
         tokio::time::timeout(Duration::from_secs(2), async {
-            while hub.push_lock.try_lock().is_ok() {
+            while server.push_lock.try_lock().is_ok() {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .expect("stalled push never acquired the lock");
         let mut queued = Box::pin(cgi(
-            hub.clone(),
+            server.clone(),
             "admin".into(),
             push_path.into(),
             request("/git/repo.git/git-receive-pack", "POST", Body::empty()),
@@ -491,13 +491,13 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(body, DEGRADED_MESSAGE);
-        assert!(hub.push_lock.try_lock().is_ok(), "degraded state must not leak the push guard");
+        assert!(server.push_lock.try_lock().is_ok(), "degraded state must not leak the push guard");
         for (uri, method) in
             [("/git/repo.git/git-receive-pack", "POST"), ("/git/repo.git/info/refs?service=git-receive-pack", "GET")]
         {
             let response = tokio::time::timeout(
                 Duration::from_secs(1),
-                http(State(hub.clone()), request(uri, method, Body::empty())),
+                http(State(server.clone()), request(uri, method, Body::empty())),
             )
             .await
             .expect("degraded receive-pack request hung");
@@ -505,7 +505,7 @@ mod tests {
             let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
             assert_eq!(body, DEGRADED_MESSAGE);
         }
-        let health = crate::healthz(State(hub.clone())).await;
+        let health = crate::healthz(State(server.clone())).await;
         assert_eq!(health.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = axum::body::to_bytes(health.into_body(), usize::MAX).await.unwrap();
         assert_eq!(
@@ -517,8 +517,8 @@ mod tests {
         // A real clone exercises both upload-pack discovery and its POST.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let router = hub.router();
-        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let router = server.router();
+        let serve_task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let clone = dir.path().join("clone");
         let out = tokio::time::timeout(
             Duration::from_secs(5),
@@ -534,11 +534,11 @@ mod tests {
         .await
         .expect("fetch hung while pushes were degraded")
         .unwrap();
-        server.abort();
+        serve_task.abort();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         assert!(clone.join("sk1ll.toml").is_file());
         // The degraded state lasts only for this process, not across restart.
-        let restarted = Hub::open(hub.config.clone()).await.unwrap();
+        let restarted = Server::open(server.config.clone()).await.unwrap();
         assert!(!restarted.push_degraded.load(Ordering::SeqCst));
     }
 
@@ -573,7 +573,7 @@ mod tests {
     fn maps_paths_to_items() {
         assert_eq!(item_for_path("personal/pdf/SKILL.md"), Some(ItemRef::Skill("pdf".into())));
         assert_eq!(item_for_path("imported/x/SKILL.md"), Some(ItemRef::Skill("x".into())));
-        assert_eq!(item_for_path("instructions/10-git.md"), Some(ItemRef::Fragment("10-git".into())));
+        assert_eq!(item_for_path("instructions/10-git.md"), Some(ItemRef::Rule("10-git".into())));
         assert_eq!(item_for_path("personal/pdf/ref/SKILL.md"), None);
         assert_eq!(item_for_path("instructions/notes.txt"), None);
         assert_eq!(item_for_path("instructions/sub/a.md"), None);

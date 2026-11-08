@@ -27,7 +27,7 @@ describe('Assignment cells', () => {
     expect(cellState(assignment, 'claude', 'skill:pdf')).toEqual({ enabled: true, explicit: true });
     expect(cellState(assignment, 'claude', 'skill:git')).toEqual({ enabled: false, explicit: true });
     expect(cellState(assignment, 'claude', 'skill:new')).toEqual({ enabled: false, explicit: false });
-    expect(cellState(assignment, 'claude', 'fragment:git')).toEqual({ enabled: true, explicit: false });
+    expect(cellState(assignment, 'claude', 'rule:git')).toEqual({ enabled: true, explicit: false });
     expect(cellState(assignment, 'codex', 'skill:new')).toEqual({ enabled: true, explicit: false });
   });
   it('removes explicit toggles when following the default again', () => {
@@ -35,7 +35,7 @@ describe('Assignment cells', () => {
     expect(cellState(next, 'claude', 'skill:pdf')).toEqual({ enabled: false, explicit: false });
     expect(assignment.harnesses.claude.skills.pdf).toBe(true);
   });
-  it('leaves default materialization to the Hub', () => {
+  it('leaves default materialization to the Server', () => {
     const next = applyToggle(assignment, { harness: 'claude', kind: 'new_skills_default', enabled: true });
     expect(next).toEqual(assignment);
   });

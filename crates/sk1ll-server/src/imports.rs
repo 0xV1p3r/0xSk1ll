@@ -6,35 +6,35 @@ use sk1ll_core::lock::LOCK_FILE;
 use sk1ll_core::manifest::MANIFEST_FILE;
 use sk1ll_core::source::resolve_url;
 use sk1ll_core::{Lockfile, Manifest};
-use sk1ll_proto::{HubMessage, ImportError, ImportUpdate, ImportsView};
+use sk1ll_proto::{ServerMessage, ImportError, ImportUpdate, ImportsView};
 
-use crate::{Hub, git, lock, now};
+use crate::{Server, git, lock, now};
 
 /// Checks now, then every `import_poll` and after each push.
-pub async fn poll(hub: Arc<Hub>) {
+pub async fn poll(server: Arc<Server>) {
     loop {
-        let view = check(&hub).await;
+        let view = check(&server).await;
         let changed = {
-            let mut current = lock(&hub.imports);
+            let mut current = lock(&server.imports);
             let changed = current.updates != view.updates;
             *current = view.clone();
             changed
         };
         if changed {
             tracing::info!("{} import(s) have upstream updates", view.updates.len());
-            hub.broadcast(&HubMessage::ImportsChanged { updates: view.updates });
+            server.broadcast(&ServerMessage::ImportsChanged { updates: view.updates });
         }
         tokio::select! {
-            () = tokio::time::sleep(hub.config.import_poll) => {}
-            () = hub.imports_due.notified() => {}
+            () = tokio::time::sleep(server.config.import_poll) => {}
+            () = server.imports_due.notified() => {}
         }
     }
 }
 
-async fn check(hub: &Hub) -> ImportsView {
+async fn check(server: &Server) -> ImportsView {
     let mut view = ImportsView::default();
-    if let Some(head) = hub.head()
-        && let Err(e) = check_at(hub, &head, &mut view).await
+    if let Some(head) = server.head()
+        && let Err(e) = check_at(server, &head, &mut view).await
     {
         view.errors.push(ImportError { name: MANIFEST_FILE.into(), message: format!("{e:#}") });
     }
@@ -43,8 +43,8 @@ async fn check(hub: &Hub) -> ImportsView {
     view
 }
 
-async fn check_at(hub: &Hub, head: &str, view: &mut ImportsView) -> anyhow::Result<()> {
-    let repo = hub.config.repo_dir();
+async fn check_at(server: &Server, head: &str, view: &mut ImportsView) -> anyhow::Result<()> {
+    let repo = server.config.repo_dir();
     let Some(manifest) = git::show(&repo, head, MANIFEST_FILE).await? else {
         return Ok(());
     };

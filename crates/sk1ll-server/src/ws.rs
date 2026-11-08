@@ -1,5 +1,5 @@
-//! `GET /api/ws`: one daemon session per machine. Hub messages go out as JSON
-//! text frames. The hub pings every `ping_every`, refreshes `last_seen` on
+//! `GET /api/ws`: one daemon session per machine. Server messages go out as JSON
+//! text frames. The server pings every `ping_every`, refreshes `last_seen` on
 //! every inbound frame, and closes a session that has been silent for
 //! [`Config::idle_limit`](crate::Config::idle_limit).
 //!
@@ -23,12 +23,12 @@ use futures_util::stream::SplitStream;
 use futures_util::{Sink, SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::Value;
-use sk1ll_proto::{AssignmentSnapshot, DaemonMessage, HubMessage, ItemRef, MachineReport};
+use sk1ll_proto::{AssignmentSnapshot, DaemonMessage, ServerMessage, ItemRef, MachineReport};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{ApiError, Result};
-use crate::{Caller, Hub, assign, db, hash, now};
+use crate::{Caller, Server, assign, db, hash, now};
 
 /// Non-assignment messages a session may have waiting; a daemon that falls
 /// this far behind is disconnected.
@@ -42,14 +42,14 @@ pub struct TokenQuery {
 /// An authenticated daemon: its machine id and the hash of its token.
 pub struct WsCaller(String, String);
 
-impl FromRequestParts<Arc<Hub>> for WsCaller {
+impl FromRequestParts<Arc<Server>> for WsCaller {
     type Rejection = ApiError;
 
     /// Token from `Authorization: Bearer` or `?token=`; machine tokens only.
-    async fn from_request_parts(parts: &mut Parts, hub: &Arc<Hub>) -> Result<Self> {
+    async fn from_request_parts(parts: &mut Parts, server: &Arc<Server>) -> Result<Self> {
         let query = Query::<TokenQuery>::try_from_uri(&parts.uri).ok().and_then(|q| q.0.token);
         let token = crate::api::bearer(parts).map(str::to_string).or(query).ok_or(ApiError::Unauthorized)?;
-        match hub.authenticate(&token).await? {
+        match server.authenticate(&token).await? {
             Caller::Machine(id) => Ok(Self(id, hash(&token))),
             Caller::Admin => Err(ApiError::Forbidden("the WebSocket is for machine daemons".into())),
         }
@@ -62,7 +62,7 @@ pub struct Handle {
     cancel: CancellationToken,
     revoked: Arc<AtomicBool>,
     assignment: Arc<watch::Sender<Option<AssignmentSnapshot>>>,
-    queue: mpsc::Sender<HubMessage>,
+    queue: mpsc::Sender<ServerMessage>,
 }
 
 impl Handle {
@@ -76,7 +76,7 @@ impl Handle {
     }
 
     /// Queues `msg`; a daemon whose queue is full is disconnected.
-    pub fn send(&self, machine: &str, msg: HubMessage) {
+    pub fn send(&self, machine: &str, msg: ServerMessage) {
         if let Err(mpsc::error::TrySendError::Full(_)) = self.queue.try_send(msg) {
             tracing::warn!("{machine}: not reading its messages; disconnecting");
             self.cancel.cancel();
@@ -100,30 +100,30 @@ fn publish(tx: &watch::Sender<Option<AssignmentSnapshot>>, snapshot: AssignmentS
 }
 
 pub async fn upgrade(
-    State(hub): State<Arc<Hub>>,
+    State(server): State<Arc<Server>>,
     WsCaller(machine, token_hash): WsCaller,
     ws: WebSocketUpgrade,
 ) -> Response {
-    ws.on_upgrade(move |socket| session(hub, machine, token_hash, socket))
+    ws.on_upgrade(move |socket| session(server, machine, token_hash, socket))
 }
 
-async fn session(hub: Arc<Hub>, machine: String, token_hash: String, socket: WebSocket) {
+async fn session(server: Arc<Server>, machine: String, token_hash: String, socket: WebSocket) {
     let (sink, stream) = socket.split();
     let cancel = CancellationToken::new();
     let revoked = Arc::new(AtomicBool::new(false));
     let (atx, arx) = watch::channel(None);
     let atx = Arc::new(atx);
     let (qtx, qrx) = mpsc::channel(QUEUE);
-    let id = hub.next_conn.fetch_add(1, Ordering::Relaxed);
+    let id = server.next_conn.fetch_add(1, Ordering::Relaxed);
     let handle =
         Handle { id, cancel: cancel.clone(), revoked: revoked.clone(), assignment: atx.clone(), queue: qtx.clone() };
-    hub.connect(&machine, handle);
+    server.connect(&machine, handle);
     tracing::info!("{machine} connected (session {id})");
 
-    let writer = tokio::spawn(write_loop(sink, qrx, arx, cancel.clone(), revoked, hub.config.clone()));
+    let writer = tokio::spawn(write_loop(sink, qrx, arx, cancel.clone(), revoked, server.config.clone()));
     // Registered first, so no change committed after this read can be missed.
     let (m, t) = (machine.clone(), token_hash.clone());
-    match hub
+    match server
         .db(move |conn| {
             if db::machine_for_token(conn, &t)?.as_deref() != Some(m.as_str()) {
                 return Ok(None);
@@ -136,27 +136,27 @@ async fn session(hub: Arc<Hub>, machine: String, token_hash: String, socket: Web
         Ok(None) => cancel.cancel(),
         Err(e) => tracing::error!("{machine}: loading assignment: {e}"),
     }
-    if let Some(baseline) = hub.head() {
-        let _ = qtx.try_send(HubMessage::Nudge { baseline });
+    if let Some(baseline) = server.head() {
+        let _ = qtx.try_send(ServerMessage::Nudge { baseline });
     }
     drop((atx, qtx));
 
-    read_loop(&hub, &machine, id, &token_hash, stream, &cancel).await;
+    read_loop(&server, &machine, id, &token_hash, stream, &cancel).await;
     cancel.cancel();
     let _ = writer.await;
-    hub.disconnect(&machine, id);
+    server.disconnect(&machine, id);
     tracing::info!("{machine} disconnected (session {id})");
 }
 
 async fn read_loop(
-    hub: &Arc<Hub>,
+    server: &Arc<Server>,
     machine: &str,
     id: u64,
     token_hash: &str,
     mut stream: SplitStream<WebSocket>,
     cancel: &CancellationToken,
 ) {
-    let idle = hub.config.idle_limit();
+    let idle = server.config.idle_limit();
     loop {
         let next = tokio::select! {
             biased;
@@ -168,7 +168,7 @@ async fn read_loop(
         };
         let Some(Ok(msg)) = msg else { return };
         let (m, t, now) = (machine.to_string(), token_hash.to_string(), now());
-        let _ = hub.db(move |conn| db::touch(conn, &m, &t, now)).await;
+        let _ = server.db(move |conn| db::touch(conn, &m, &t, now)).await;
         match msg {
             Message::Text(text) => {
                 match serde_json::from_str::<Value>(&text).map_err(|e| e.to_string()).and_then(parse) {
@@ -177,12 +177,12 @@ async fn read_loop(
                     }
                     Ok(DaemonMessage::Hello { .. }) => {}
                     Ok(DaemonMessage::Status(report)) => {
-                        if let Err(e) = on_status(hub, machine, id, token_hash, report, cancel).await {
+                        if let Err(e) = on_status(server, machine, id, token_hash, report, cancel).await {
                             tracing::error!("{machine}: storing status: {e}");
                         }
                     }
                     Ok(DaemonMessage::DraftDiscarded { items }) => {
-                        if let Err(e) = on_draft_discarded(hub, machine, id, token_hash, items, cancel).await {
+                        if let Err(e) = on_draft_discarded(server, machine, id, token_hash, items, cancel).await {
                             tracing::error!("{machine}: discarding draft toggles: {e}");
                         }
                     }
@@ -199,7 +199,7 @@ async fn read_loop(
 /// Every frame has a deadline; a stuck send ends with the session.
 async fn write_loop<S: Sink<Message> + Unpin>(
     mut sink: S,
-    mut queue: mpsc::Receiver<HubMessage>,
+    mut queue: mpsc::Receiver<ServerMessage>,
     mut assignment: watch::Receiver<Option<AssignmentSnapshot>>,
     cancel: CancellationToken,
     revoked: Arc<AtomicBool>,
@@ -218,7 +218,7 @@ async fn write_loop<S: Sink<Message> + Unpin>(
                     break;
                 }
                 let Some(snapshot) = assignment.borrow_and_update().clone() else { continue };
-                text(&HubMessage::Assignment(snapshot))
+                text(&ServerMessage::Assignment(snapshot))
             }
             msg = queue.recv() => match msg {
                 Some(msg) => text(&msg),
@@ -247,12 +247,12 @@ async fn write_loop<S: Sink<Message> + Unpin>(
         }
     }
     if revoked.load(Ordering::SeqCst) {
-        let _ = tokio::time::timeout(deadline, sink.send(text(&HubMessage::Revoked))).await;
+        let _ = tokio::time::timeout(deadline, sink.send(text(&ServerMessage::Revoked))).await;
     }
     let _ = tokio::time::timeout(deadline, sink.send(Message::Close(None))).await;
 }
 
-fn text(msg: &HubMessage) -> Message {
+fn text(msg: &ServerMessage) -> Message {
     Message::Text(serde_json::to_string(msg).expect("serializing plain data").into())
 }
 
@@ -284,7 +284,7 @@ fn parse(mut v: Value) -> std::result::Result<DaemonMessage, String> {
 /// Stores the report if the session is still current and its token still
 /// valid; adds harnesses the machine has no assignment for (all off).
 async fn on_status(
-    hub: &Arc<Hub>,
+    server: &Arc<Server>,
     machine: &str,
     id: u64,
     token_hash: &str,
@@ -294,8 +294,8 @@ async fn on_status(
     if cancel.is_cancelled() {
         return Ok(());
     }
-    let (h, m, t, now) = (hub.clone(), machine.to_string(), token_hash.to_string(), now());
-    let updated = hub
+    let (h, m, t, now) = (server.clone(), machine.to_string(), token_hash.to_string(), now());
+    let updated = server
         .db(move |conn| {
             // Checked under the DB lock, so a removal can't slip in between.
             if !h.is_current(&m, id) || db::machine_for_token(conn, &t)?.as_deref() != Some(m.as_str()) {
@@ -310,22 +310,22 @@ async fn on_status(
             let added = assign::new_harness_changes(&a, &report.harnesses);
             let mut latest = None;
             if !added.is_empty() {
-                latest = Some(assign::apply(&tx, &m, assign::HUB_AUTHOR, added, now, None)?.snapshot());
+                latest = Some(assign::apply(&tx, &m, assign::SERVER_AUTHOR, added, now, None)?.snapshot());
             }
             tx.commit()?;
             Ok(latest)
         })
         .await?;
     if let Some(snapshot) = updated {
-        hub.publish_assignment(machine, snapshot);
+        server.publish_assignment(machine, snapshot);
     }
     Ok(())
 }
 
-/// An explicit Reset, scoped to this machine and the named items. A status
+/// An explicit Restore, scoped to this machine and the named items. A status
 /// snapshot alone never proves that an absent draft item was discarded.
 async fn on_draft_discarded(
-    hub: &Arc<Hub>,
+    server: &Arc<Server>,
     machine: &str,
     id: u64,
     token_hash: &str,
@@ -335,11 +335,11 @@ async fn on_draft_discarded(
     if cancel.is_cancelled() {
         return Ok(());
     }
-    // Serialize with pushes so a Reset can't sweep against an old baseline.
-    let _push = hub.push_lock.lock().await;
-    let items = hub.baseline_items();
-    let (h, m, t, now) = (hub.clone(), machine.to_string(), token_hash.to_string(), now());
-    let updated = hub
+    // Serialize with pushes so a Restore can't sweep against an old baseline.
+    let _push = server.push_lock.lock().await;
+    let items = server.baseline_items();
+    let (h, m, t, now) = (server.clone(), machine.to_string(), token_hash.to_string(), now());
+    let updated = server
         .db(move |conn| {
             if !h.is_current(&m, id) || db::machine_for_token(conn, &t)?.as_deref() != Some(m.as_str()) {
                 return Ok(None);
@@ -351,7 +351,7 @@ async fn on_draft_discarded(
         })
         .await?;
     if let Some(snapshot) = updated {
-        hub.publish_assignment(machine, snapshot);
+        server.publish_assignment(machine, snapshot);
     }
     Ok(())
 }
@@ -367,7 +367,7 @@ mod tests {
         let v = serde_json::json!({
             "type": "status",
             "drafts": ["skill:pdf", "bogus", "manifest", 3],
-            "conflicts": [{"item": "fragment:git", "harness": "codex"}, {"item": "nope"}],
+            "conflicts": [{"item": "rule:git", "harness": "codex"}, {"item": "nope"}],
             "harnesses": ["claude"],
         });
         let DaemonMessage::Status(r) = parse(v).unwrap() else { panic!("expected status") };
@@ -381,7 +381,7 @@ mod tests {
         let v = serde_json::json!({
             "type": "status",
             "baseline": "abc",
-            "unpushed": ["skill:wip", "bogus", "fragment:git", 3, "manifest", "other:notes.txt"],
+            "unpushed": ["skill:wip", "bogus", "rule:git", 3, "manifest", "other:notes.txt"],
             "harnesses": ["claude"],
         });
         let DaemonMessage::Status(r) = parse(v).unwrap() else { panic!("expected status") };
@@ -389,7 +389,7 @@ mod tests {
             r.unpushed,
             [
                 ItemRef::Skill("wip".into()),
-                ItemRef::Fragment("git".into()),
+                ItemRef::Rule("git".into()),
                 ItemRef::Manifest,
                 ItemRef::Other("notes.txt".into()),
             ]
@@ -462,11 +462,11 @@ mod tests {
         };
         let (queue_tx, queue_rx) = mpsc::channel(1);
         let (_assignment_tx, assignment_rx) = watch::channel(None);
-        queue_tx.send(HubMessage::Nudge { baseline: "abc".into() }).await.unwrap();
+        queue_tx.send(ServerMessage::Nudge { baseline: "abc".into() }).await.unwrap();
         write_loop(sink, queue_rx, assignment_rx, cancel, revoked, crate::Config::new("/unused")).await;
         let frames = frames.lock().unwrap();
         assert!(frames.iter().any(|frame| matches!(frame, Message::Text(text)
-            if serde_json::from_str::<HubMessage>(text).ok() == Some(HubMessage::Revoked))), "{frames:?}");
+            if serde_json::from_str::<ServerMessage>(text).ok() == Some(ServerMessage::Revoked))), "{frames:?}");
         assert!(matches!(frames.last(), Some(Message::Close(_))), "{frames:?}");
     }
 

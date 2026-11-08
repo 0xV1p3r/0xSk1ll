@@ -1,6 +1,6 @@
 [package]
 name = "sk1ll-proto"
-description = "Wire types shared by the 0xSk1ll hub, daemon and GUI"
+description = "Wire types shared by the 0xSk1ll server, daemon and GUI"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

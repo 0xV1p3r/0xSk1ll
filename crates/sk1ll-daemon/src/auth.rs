@@ -1,8 +1,8 @@
-//! How git authenticates to the hub without the token ever being written to a
+//! How git authenticates to the server without the token ever being written to a
 //! remote URL or `.git/config`: the token stays in the 0600 state file, and
 //! each git process gets it from environment-scoped config
 //! (`GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n`) as an
-//! `http.<hub-url>/.extraHeader` carrying `Authorization: Basic`.
+//! `http.<server-url>/.extraHeader` carrying `Authorization: Basic`.
 //!
 //! The daemon puts this in its own process environment once, before any
 //! thread starts ([`crate::prepare_process`]), so every git it or core runs
@@ -12,16 +12,16 @@ use base64::Engine as _;
 
 use crate::state::DaemonState;
 
-/// Environment that lets git authenticate to `state`'s hub, merged with any
+/// Environment that lets git authenticate to `state`'s server, merged with any
 /// `GIT_CONFIG_*` entries already in this process's environment (they are
 /// kept; an earlier entry for the same key is replaced). Apply it to a
 /// `Command` with `envs`, or to the process before any thread starts.
 pub fn git_credentials_env(state: &DaemonState) -> Vec<(String, String)> {
-    merge_config_env(|k| std::env::var(k).ok(), &header_key(&state.hub_url), &header_value(state))
+    merge_config_env(|k| std::env::var(k).ok(), &header_key(&state.server_url), &header_value(state))
 }
 
-fn header_key(hub_url: &str) -> String {
-    format!("http.{}/.extraHeader", hub_url.trim_end_matches('/'))
+fn header_key(server_url: &str) -> String {
+    format!("http.{}/.extraHeader", server_url.trim_end_matches('/'))
 }
 
 fn header_value(state: &DaemonState) -> String {
@@ -97,7 +97,7 @@ mod tests {
     fn state() -> DaemonState {
         DaemonState {
             machine_id: "ws".into(),
-            hub_url: "http://127.0.0.1:9".into(),
+            server_url: "http://127.0.0.1:9".into(),
             token: "s3cret".into(),
             repo: "/r".into(),
             revoked: false,
@@ -105,9 +105,9 @@ mod tests {
     }
 
     #[test]
-    fn credentials_are_an_extra_header_for_the_hub() {
+    fn credentials_are_an_extra_header_for_the_server() {
         let s = state();
-        let env = merge_config_env(|_| None, &header_key(&s.hub_url), &header_value(&s));
+        let env = merge_config_env(|_| None, &header_key(&s.server_url), &header_value(&s));
         let expected = base64::engine::general_purpose::STANDARD.encode("ws:s3cret");
         assert_eq!(
             env,
@@ -122,7 +122,7 @@ mod tests {
     #[test]
     fn existing_env_config_is_kept() {
         let s = state();
-        let key = header_key(&s.hub_url);
+        let key = header_key(&s.server_url);
         let user: HashMap<&str, &str> =
             [("GIT_CONFIG_COUNT", "1"), ("GIT_CONFIG_KEY_0", "core.pager"), ("GIT_CONFIG_VALUE_0", "cat")].into();
         let env = merge_config_env(|k| user.get(k).map(|v| v.to_string()), &key, "v");

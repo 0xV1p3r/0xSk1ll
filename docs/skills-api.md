@@ -22,17 +22,17 @@ These endpoints use the Daemon's local Unix socket. Shared Rust types are in
 }
 ```
 
-`type` is `personal`, `import`, `fragment`, or `unmanaged`. `item` is
-`skill:<name>` or `fragment:<name>`, and is null for unmanaged Skills.
+`type` is `personal`, `import`, `rule`, or `unmanaged`. `item` is
+`skill:<name>` or `rule:<name>`, and is null for unmanaged Skills.
 `description` is a string or null. `draft` is `added`, `modified`, `deleted`,
 or null. `in_baseline` refers to the applied fleet Baseline, so an unpushed
-promote can still have `in_baseline: false` and `draft: null`.
+commit can still have `in_baseline: false` and `draft: null`.
 
-`path` is the absolute Skill directory or Fragment file in the repo. It can
+`path` is the absolute Skill directory or Rule file in the repo. It can
 name a missing path for a deleted Draft item. Unmanaged entries have a null
 `path`; each location supplies its own absolute path instead.
 `enabled_harnesses` uses this Machine's current Assignment and the Harness's
-supported content types. A Fragment's frontmatter restricts it further. It is
+supported content types. A Rule's frontmatter restricts it further. It is
 empty while the authoritative Assignment is unavailable and for unmanaged
 entries.
 
@@ -95,14 +95,14 @@ size zero. Tree browsing does not follow directory symlinks. Sk1ll markers and
 }
 ```
 
-Both endpoints require `item`. Use `fragment:git` to browse a Fragment, whose
+Both endpoints require `item`. Use `rule:git` to browse a Rule, whose
 single file is named `git.md`. For unmanaged Skills use `unmanaged:pdf`, with
 `hash=sha256:...` to choose a variant. Hash is required when variants differ.
 Optional `harness=claude` chooses a location within that variant; otherwise its
 first location is used. URL-encode query values.
 
 `path` is required for file reads and is relative to the Skill folder. A
-Fragment accepts only its own filename. Absolute paths, parent components and
+Rule accepts only its own filename. Absolute paths, parent components and
 symlinks are refused on Unix. Other platforms use best-effort containment checks. Invalid UTF-8 or NUL bytes set
 `binary: true` and `text: null`. Files larger than 1 MiB set `too_large: true`
 and `text: null`; their binary status is not inspected.
@@ -122,8 +122,8 @@ remaining Draft files. Unmanaged reads use the selected Harness location.
 Success is HTTP 204 with no body. The existing `POST /conflicts/adopt` accepts
 the same body and also supports unmanaged Skills.
 
-Unmanaged Adopt requires a running Daemon connected to the Hub. Otherwise it
-returns HTTP 503 with `"Adopt needs a connection to the Hub"`, without changing
+Unmanaged Adopt requires a running Daemon connected to the Server. Otherwise it
+returns HTTP 503 with `"Adopt needs a connection to the Server"`, without changing
 the repo or Harnesses. The GUI disables Adopt and Adopt to edit while disconnected.
 On a joined repo, the CLI also requires the connected Daemon and suggests
 `sk1ll daemon` when it is stopped. Standalone repos use local Assignment.
@@ -133,8 +133,8 @@ It refuses an existing repo Skill with different content or an Import with the
 same name. An identical personal copy is accepted so an interrupted Adopt can
 be retried. Differing Harness copies stay unmanaged.
 
-The Hub rejects toggles for unknown items, so Adopt first copies the selected
-content into `personal/<name>/` and reports the Draft. It waits for the Hub to
+The Server rejects toggles for unknown items, so Adopt first copies the selected
+content into `personal/<name>/` and reports the Draft. It waits for the Server to
 see it, then synchronously sets explicit `enabled: true` Assignment toggles in
 each Harness where that variant was found. A rejected Assignment rolls back
 only the repo copy this request created, and only while it still matches a
@@ -142,7 +142,7 @@ source. Existing copies and concurrent edits are preserved. A crash between
 publication and Assignment leaves the original Harness copies untouched;
 retrying Adopt finishes the Assignment. Explicit enable toggles are idempotent.
 
-After the Hub accepts Assignment, sync replaces the selected Harness copies
+After the Server accepts Assignment, sync replaces the selected Harness copies
 through normal displacement, retaining originals in recovery. Other Harnesses
 follow their new-Skills defaults. Success is returned after these steps finish.
 There is no offline adoption queue or background adoption replay.

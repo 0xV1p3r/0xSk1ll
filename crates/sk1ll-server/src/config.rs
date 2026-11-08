@@ -4,34 +4,34 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 
-/// Hub settings, from `SK1LL_HUB_*` environment variables.
+/// Server settings, from `SK1LL_SERVER_*` environment variables.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Holds `repo.git` and `hub.db` (`SK1LL_HUB_DATA`, default `/data`).
+    /// Holds `repo.git` and `server.db` (`SK1LL_SERVER_DATA`, default `/data`).
     pub data_dir: PathBuf,
-    /// `SK1LL_HUB_BIND`, default `0.0.0.0:7878`.
+    /// `SK1LL_SERVER_BIND`, default `0.0.0.0:7878`.
     pub bind: SocketAddr,
     /// Bootstrap token that may create join codes and manage the fleet
-    /// (`SK1LL_HUB_ADMIN_TOKEN`).
+    /// (`SK1LL_SERVER_ADMIN_TOKEN`).
     pub admin_token: Option<String>,
     /// A machine without a live connection is Offline once it hasn't been
-    /// seen for this long (`SK1LL_HUB_OFFLINE_AFTER`, default `2m`).
+    /// seen for this long (`SK1LL_SERVER_OFFLINE_AFTER`, default `2m`).
     pub offline_after: Duration,
     /// How often to check imports for newer upstream commits
-    /// (`SK1LL_HUB_IMPORT_POLL`, default `1h`).
+    /// (`SK1LL_SERVER_IMPORT_POLL`, default `1h`).
     pub import_poll: Duration,
-    /// How often the hub pings each daemon (`SK1LL_HUB_PING`, default `30s`).
+    /// How often the server pings each daemon (`SK1LL_SERVER_PING`, default `30s`).
     /// A connection that sends nothing, pongs included, for
     /// [`Config::idle_limit`] is closed.
     pub ping_every: Duration,
     /// How long one frame to a daemon may take to send before the daemon is
-    /// disconnected as too slow (`SK1LL_HUB_SEND_TIMEOUT`, default `10s`).
+    /// disconnected as too slow (`SK1LL_SERVER_SEND_TIMEOUT`, default `10s`).
     pub send_timeout: Duration,
     /// Maximum inactivity while reading a Git request body or forwarding its
-    /// response (`SK1LL_HUB_PUSH_IDLE`, default `30s`).
+    /// response (`SK1LL_SERVER_PUSH_IDLE`, default `30s`).
     pub push_idle: Duration,
     /// Deadline for the whole Git backend exchange, including upload and
-    /// response forwarding (`SK1LL_HUB_PUSH_MAX`, default `10m`).
+    /// response forwarding (`SK1LL_SERVER_PUSH_MAX`, default `10m`).
     pub push_max: Duration,
 }
 
@@ -53,28 +53,28 @@ impl Config {
 
     pub fn from_env() -> anyhow::Result<Self> {
         let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
-        let mut cfg = Self::new(var("SK1LL_HUB_DATA").unwrap_or_else(|| "/data".into()));
-        if let Some(bind) = var("SK1LL_HUB_BIND") {
-            cfg.bind = bind.parse().with_context(|| format!("SK1LL_HUB_BIND: invalid address `{bind}`"))?;
+        let mut cfg = Self::new(var("SK1LL_SERVER_DATA").unwrap_or_else(|| "/data".into()));
+        if let Some(bind) = var("SK1LL_SERVER_BIND") {
+            cfg.bind = bind.parse().with_context(|| format!("SK1LL_SERVER_BIND: invalid address `{bind}`"))?;
         }
-        cfg.admin_token = var("SK1LL_HUB_ADMIN_TOKEN");
-        if let Some(v) = var("SK1LL_HUB_OFFLINE_AFTER") {
-            cfg.offline_after = parse_duration(&v).with_context(|| format!("SK1LL_HUB_OFFLINE_AFTER: `{v}`"))?;
+        cfg.admin_token = var("SK1LL_SERVER_ADMIN_TOKEN");
+        if let Some(v) = var("SK1LL_SERVER_OFFLINE_AFTER") {
+            cfg.offline_after = parse_duration(&v).with_context(|| format!("SK1LL_SERVER_OFFLINE_AFTER: `{v}`"))?;
         }
-        if let Some(v) = var("SK1LL_HUB_IMPORT_POLL") {
-            cfg.import_poll = parse_duration(&v).with_context(|| format!("SK1LL_HUB_IMPORT_POLL: `{v}`"))?;
+        if let Some(v) = var("SK1LL_SERVER_IMPORT_POLL") {
+            cfg.import_poll = parse_duration(&v).with_context(|| format!("SK1LL_SERVER_IMPORT_POLL: `{v}`"))?;
         }
-        if let Some(v) = var("SK1LL_HUB_PING") {
-            cfg.ping_every = parse_duration(&v).with_context(|| format!("SK1LL_HUB_PING: `{v}`"))?;
+        if let Some(v) = var("SK1LL_SERVER_PING") {
+            cfg.ping_every = parse_duration(&v).with_context(|| format!("SK1LL_SERVER_PING: `{v}`"))?;
         }
-        if let Some(v) = var("SK1LL_HUB_SEND_TIMEOUT") {
-            cfg.send_timeout = parse_duration(&v).with_context(|| format!("SK1LL_HUB_SEND_TIMEOUT: `{v}`"))?;
+        if let Some(v) = var("SK1LL_SERVER_SEND_TIMEOUT") {
+            cfg.send_timeout = parse_duration(&v).with_context(|| format!("SK1LL_SERVER_SEND_TIMEOUT: `{v}`"))?;
         }
-        if let Some(v) = var("SK1LL_HUB_PUSH_IDLE") {
-            cfg.push_idle = parse_duration(&v).with_context(|| format!("SK1LL_HUB_PUSH_IDLE: `{v}`"))?;
+        if let Some(v) = var("SK1LL_SERVER_PUSH_IDLE") {
+            cfg.push_idle = parse_duration(&v).with_context(|| format!("SK1LL_SERVER_PUSH_IDLE: `{v}`"))?;
         }
-        if let Some(v) = var("SK1LL_HUB_PUSH_MAX") {
-            cfg.push_max = parse_duration(&v).with_context(|| format!("SK1LL_HUB_PUSH_MAX: `{v}`"))?;
+        if let Some(v) = var("SK1LL_SERVER_PUSH_MAX") {
+            cfg.push_max = parse_duration(&v).with_context(|| format!("SK1LL_SERVER_PUSH_MAX: `{v}`"))?;
         }
         Ok(cfg)
     }
@@ -89,7 +89,7 @@ impl Config {
     }
 
     pub fn db_path(&self) -> PathBuf {
-        self.data_dir.join("hub.db")
+        self.data_dir.join("server.db")
     }
 }
 

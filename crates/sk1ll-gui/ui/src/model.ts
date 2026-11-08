@@ -15,7 +15,7 @@ export function headline(offline: boolean, report: MachineReport | null, baselin
   return report?.drafts.length ? 'drafting' : 'in_sync';
 }
 export function emptyHarness(): HarnessAssignment {
-  return { new_skills_default: true, new_fragments_default: true, skills: {}, fragments: {} };
+  return { new_skills_default: true, new_rules_default: true, skills: {}, rules: {} };
 }
 export function splitItem(item: ItemRef): { kind: string; name: string } {
   const at = item.indexOf(':');
@@ -24,16 +24,16 @@ export function splitItem(item: ItemRef): { kind: string; name: string } {
 export function cellState(assignment: Assignment, harness: string, item: ItemRef) {
   const h = assignment.harnesses[harness] ?? emptyHarness();
   const { kind, name } = splitItem(item);
-  const items = kind === 'skill' ? h.skills : h.fragments;
+  const items = kind === 'skill' ? h.skills : h.rules;
   const explicit = Object.hasOwn(items, name);
-  return { explicit, enabled: explicit ? items[name] : kind === 'skill' ? h.new_skills_default : h.new_fragments_default };
+  return { explicit, enabled: explicit ? items[name] : kind === 'skill' ? h.new_skills_default : h.new_rules_default };
 }
 export function applyToggle(assignment: Assignment, change: ToggleChange): Assignment {
   const next = structuredClone(assignment);
   const h = next.harnesses[change.harness] ??= emptyHarness();
-  // Default changes are rendered only after the Hub materializes existing items.
-  if ((change.kind === 'skill' || change.kind === 'fragment') && change.name !== undefined) {
-    const map = change.kind === 'skill' ? h.skills : h.fragments;
+  // Default changes are rendered only after the Server materializes existing items.
+  if ((change.kind === 'skill' || change.kind === 'rule') && change.name !== undefined) {
+    const map = change.kind === 'skill' ? h.skills : h.rules;
     if (change.enabled === null) delete map[change.name];
     else map[change.name] = change.enabled;
   }

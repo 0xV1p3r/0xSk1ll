@@ -20,14 +20,14 @@ use tokio::sync::broadcast::error::RecvError;
 
 use crate::client::{
     AddImportRequest, ConflictTarget, ConflictView, DiffView, DraftEntry, Event, HarnessView, ImportName,
-    ImportUpdated, ItemView, JoinApiRequest, PromoteMessage, PromoteRequest, PromoteResponse, PullResult, PushResult,
-    ResetRequest, ResetResponse, ResolveImportRequest, ResolvedSource, StatusView, SyncRequest, SyncResult,
+    ImportUpdated, ItemView, JoinApiRequest, CommitMessage, CommitRequest, CommitResponse, PullResult, PushResult,
+    RestoreRequest, RestoreResponse, ResolveImportRequest, ResolvedSource, StatusView, SyncRequest, SyncResult,
     UpdateImportsRequest,
 };
 use crate::daemon::Daemon;
 use crate::error::{Error, Result};
 use crate::join::{self, JoinOptions, Joined};
-use crate::hub;
+use crate::server;
 
 type St = State<Arc<Daemon>>;
 
@@ -41,9 +41,9 @@ pub(crate) fn router(d: Arc<Daemon>) -> Router {
         .route("/skills/adopt", post(adopt))
         .route("/draft", get(draft))
         .route("/draft/diff", get(diff))
-        .route("/promote", post(promote))
-        .route("/promote/message", get(promote_message))
-        .route("/reset", post(reset))
+        .route("/commit", post(commit))
+        .route("/commit/message", get(commit_message))
+        .route("/restore", post(restore))
         .route("/pull", post(pull))
         .route("/conflicts", get(conflicts))
         .route("/conflicts/displaced", get(recovered))
@@ -194,17 +194,17 @@ struct ItemsQuery {
     items: String,
 }
 
-async fn promote_message(State(d): St, Query(q): Query<ItemsQuery>) -> Result<Json<PromoteMessage>> {
+async fn commit_message(State(d): St, Query(q): Query<ItemsQuery>) -> Result<Json<CommitMessage>> {
     let items: Vec<String> = q.items.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
-    Ok(Json(d.blocking(move |d, eng| d.promote_message(eng, &items)).await?))
+    Ok(Json(d.blocking(move |d, eng| d.commit_message(eng, &items)).await?))
 }
 
-async fn promote(State(d): St, Json(req): Json<PromoteRequest>) -> Result<Json<PromoteResponse>> {
-    Ok(Json(d.blocking(move |d, eng| d.promote(eng, req)).await?))
+async fn commit(State(d): St, Json(req): Json<CommitRequest>) -> Result<Json<CommitResponse>> {
+    Ok(Json(d.blocking(move |d, eng| d.commit(eng, req)).await?))
 }
 
-async fn reset(State(d): St, Json(req): Json<ResetRequest>) -> Result<Json<ResetResponse>> {
-    Ok(Json(d.blocking(move |d, eng| d.reset(eng, req)).await?))
+async fn restore(State(d): St, Json(req): Json<RestoreRequest>) -> Result<Json<RestoreResponse>> {
+    Ok(Json(d.blocking(move |d, eng| d.restore(eng, req)).await?))
 }
 
 async fn pull(State(d): St) -> Result<Json<PullResult>> {
@@ -277,7 +277,7 @@ async fn push(State(d): St) -> Result<Json<PushResult>> {
     Ok(Json(d.blocking(|d, eng| d.push(eng)).await?))
 }
 
-/// Joins again (after a removal, or while the hub rejects the token), then
+/// Joins again (after a removal, or while the server rejects the token), then
 /// restarts the daemon in place so the new credentials take effect.
 async fn join(State(d): St, Json(req): Json<JoinApiRequest>) -> Result<Json<Joined>> {
     if !d.can_rejoin() {
@@ -287,7 +287,7 @@ async fn join(State(d): St, Json(req): Json<JoinApiRequest>) -> Result<Json<Join
         )));
     }
     let opts = JoinOptions {
-        hub_url: req.hub_url,
+        server_url: req.server_url,
         code: req.code,
         machine_id: req.machine_id,
         copy_from: req.copy_from,
@@ -305,11 +305,11 @@ async fn join(State(d): St, Json(req): Json<JoinApiRequest>) -> Result<Json<Join
     Ok(Json(joined?))
 }
 
-/// Hub pass-through: same path and query under the hub's `/api`.
+/// Server pass-through: same path and query under the server's `/api`.
 /// Assignment GETs preserve the flattened assignment snapshot, including its revision.
 async fn pass(State(d): St, method: Method, OriginalUri(uri): OriginalUri, body: Bytes) -> Result<Response> {
     let path = uri.path_and_query().map_or(uri.path(), |p| p.as_str());
-    hub::proxy(&d, method, path, body).await
+    server::proxy(&d, method, path, body).await
 }
 
 async fn events(State(d): St) -> impl IntoResponse {
