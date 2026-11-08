@@ -129,3 +129,33 @@ describe('Draft confirmations', () => {
     expect(action).not.toHaveBeenCalled();
   });
 });
+
+it.each(['Reset all', 'Reset selected'])('returns focus to %s after Cancel and Escape', async label => {
+  mount();
+  fireEvent.click(await screen.findByRole('checkbox', { name: 'Select skill:reviewed' }));
+  const trigger = screen.getByRole('button', { name: label });
+  for (const close of ['Cancel', 'Escape']) {
+    trigger.focus(); fireEvent.click(trigger);
+    const dialog = await screen.findByRole('dialog');
+    if (close === 'Cancel') fireEvent.click(button(dialog, 'Cancel'));
+    else fireEvent.keyDown(dialog, { key: 'Escape' });
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+  }
+});
+
+it('returns focus to Promote after Cancel and Escape and to its completion notice after success', async () => {
+  mount();
+  fireEvent.click(await screen.findByRole('checkbox', { name: 'Select skill:reviewed' }));
+  const trigger = screen.getByRole('button', { name: 'Promote (1)' });
+  for (const close of ['Cancel', 'Escape', 'Promote']) {
+    trigger.focus(); fireEvent.click(trigger);
+    const dialog = await screen.findByRole('dialog');
+    if (close === 'Escape') fireEvent.keyDown(dialog, { key: 'Escape' });
+    else fireEvent.click(button(dialog, close));
+    if (close === 'Promote') {
+      await screen.findByText('Promote complete');
+      await waitFor(() => expect(document.activeElement?.textContent).toContain('Promote complete'));
+      expect(trigger.hasAttribute('disabled')).toBe(true);
+    } else await waitFor(() => expect(document.activeElement).toBe(trigger));
+  }
+});

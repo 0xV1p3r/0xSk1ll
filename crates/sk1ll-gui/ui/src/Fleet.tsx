@@ -74,9 +74,8 @@ export function Fleet({ revision, machineId, navigate, changed, live }: {
       </div>
       <div className="flex items-center justify-between gap-4"><h2 className="text-base font-semibold">Machines</h2>
         <JoinCodeButton label="Add Machine" /></div>
-      {machines.length > 0 ? <div className="overflow-hidden rounded-lg border"><Table aria-label="Machines">
-        <TableHeader><TableRow className="bg-muted/50 hover:bg-muted/50">
-          <TableHead className="w-10"><span className="sr-only">Details</span></TableHead>
+      {machines.length > 0 ? <div className="overflow-hidden rounded-lg border"><Table aria-label="Machines" stickyFirstColumn>
+        <TableHeader><TableRow className="bg-muted hover:bg-muted">
           {['Machine', 'Status', 'Baseline', 'Draft items', 'Conflicts', 'Last seen'].map(label =>
             <TableHead key={label} className={cn(['Draft items', 'Conflicts'].includes(label) && 'text-right')}>{label}</TableHead>)}
         </TableRow></TableHeader>
@@ -84,10 +83,9 @@ export function Fleet({ revision, machineId, navigate, changed, live }: {
           const expanded = open.includes(machine.id);
           return <Fragment key={machine.id}>
             <TableRow data-state={expanded ? 'selected' : undefined} className="cursor-pointer" onClick={() => toggle(machine.id)}>
-              <TableCell><Button variant="ghost" size="icon-xs" aria-expanded={expanded} aria-controls={`machine-${machine.id}`}
+              <TableCell className="font-medium"><Button variant="ghost" size="icon-xs" aria-expanded={expanded} aria-controls={`machine-${machine.id}`}
                 aria-label={`${expanded ? 'Hide' : 'Show'} details for ${machine.id}`} onClick={event => { event.stopPropagation(); toggle(machine.id); }}>
-                <ChevronRight className={cn('transition-transform', expanded && 'rotate-90')} /></Button></TableCell>
-              <TableCell className="font-medium">{machine.id}{machine.id === machineId && <Badge variant="secondary" className="ml-2">This Machine</Badge>}</TableCell>
+                <ChevronRight className={cn('transition-transform', expanded && 'rotate-90')} /></Button><span className="ml-2">{machine.id}</span>{machine.id === machineId && <Badge variant="secondary" className="ml-2">This Machine</Badge>}</TableCell>
               <TableCell><StatusBadge status={machine.status} /></TableCell>
               <TableCell><code className="font-mono text-xs">{shortSha(machine.report?.baseline)}</code></TableCell>
               <TableCell className="text-right tabular-nums">{machine.report?.drafts.length ?? '—'}</TableCell>
@@ -95,7 +93,7 @@ export function Fleet({ revision, machineId, navigate, changed, live }: {
               <TableCell className="text-muted-foreground" onClick={event => event.stopPropagation()}><When seconds={machine.last_seen} /></TableCell>
             </TableRow>
             {expanded && <TableRow id={`machine-${machine.id}`} className="bg-muted/30 hover:bg-muted/30">
-              <TableCell /><TableCell colSpan={6} className="whitespace-normal"><div className="flex flex-col gap-3 py-2"><MachineDetails machine={machine} />
+              <TableCell colSpan={6} className="whitespace-normal"><div className="flex flex-col gap-3 py-2"><MachineDetails machine={machine} />
                 <NextStep machine={machine} local={machine.id === machineId} navigate={navigate} changed={changed} /></div></TableCell>
             </TableRow>}
           </Fragment>;

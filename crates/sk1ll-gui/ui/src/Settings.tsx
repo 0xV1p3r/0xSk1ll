@@ -1,8 +1,8 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
-import { Field, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui/field';
+import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
@@ -15,11 +15,12 @@ import type { StatusView } from './types';
 export function JoinCodeButton({ label, variant = 'outline' }: { label: string; variant?: 'outline' | 'default' }) {
   const [joinCode, setJoinCode] = useState<string>();
   const createCode = useMutation();
+  const trigger = useRef<HTMLButtonElement>(null);
   return <div className="flex flex-col items-start gap-3">
-    <Button variant={variant} disabled={createCode.pending} onClick={() => void createCode.run(api.joinCode, value => setJoinCode(value.code))}>
+    <Button ref={trigger} variant={variant} disabled={createCode.pending} onClick={() => void createCode.run(api.joinCode, value => setJoinCode(value.code))}>
       <Pending pending={createCode.pending}>{label}</Pending></Button><ErrorNotice error={createCode.error} />
     <Dialog open={joinCode !== undefined} onOpenChange={open => { if (!open) setJoinCode(undefined); }}>
-      <DialogContent><DialogHeader><DialogTitle>Join code</DialogTitle>
+      <DialogContent finalFocus={trigger}><DialogHeader><DialogTitle>Join code</DialogTitle>
         <DialogDescription>Copy this code now. It cannot be shown again. On the new Machine, enter it under Settings → Join / rejoin this Machine,
           or run <code className="font-mono">sk1ll join</code>.</DialogDescription></DialogHeader>
         <code className="rounded-md border bg-muted px-3 py-2 font-mono text-base break-all select-all">{joinCode}</code>
@@ -55,20 +56,20 @@ export function Settings({ status, socket, revision, changed }: {
         </TableRow>)}</TableBody></Table></div>}
       </CardContent></Card>
 
-    <div className="grid gap-6 lg:grid-cols-2">
+    <div className="grid items-start gap-6 xl:grid-cols-2">
       <Card><CardHeader><CardTitle>Join / rejoin this Machine</CardTitle>
         <CardDescription>Join uses a single-use join code. Rejoin replaces this Machine's credentials and restarts its Daemon.</CardDescription></CardHeader>
         <CardContent><form onSubmit={e => { e.preventDefault(); setConfirming(true); }}><FieldGroup>
-          <Field><FieldLabel htmlFor="hub-url">Hub URL</FieldLabel><Input id="hub-url" type="url" required value={hub} disabled={join.pending}
+          <Field><FieldLabel htmlFor="hub-url">Hub URL</FieldLabel><Input id="hub-url" type="url" required aria-describedby={join.error ? 'join-error' : undefined} value={hub} disabled={join.pending}
             onChange={e => setHub(e.target.value)} placeholder="https://skills.example.com" /></Field>
-          <Field><FieldLabel htmlFor="join-code">Join code</FieldLabel><Input id="join-code" autoComplete="off" type="password" required value={code}
+          <Field><FieldLabel htmlFor="join-code">Join code</FieldLabel><Input id="join-code" autoComplete="off" type="password" required aria-describedby={join.error ? 'join-error' : undefined} value={code}
             disabled={join.pending} onChange={e => setCode(e.target.value)} /></Field>
           <Field><FieldLabel htmlFor="machine-id">Machine id</FieldLabel><Input id="machine-id" value={id} disabled={join.pending}
-            onChange={e => setId(e.target.value)} aria-describedby="machine-id-hint" /><FieldDescription id="machine-id-hint">Optional. Defaults to the id in machine.toml, else the hostname.</FieldDescription></Field>
+            onChange={e => setId(e.target.value)} aria-describedby={join.error ? 'machine-id-hint join-error' : 'machine-id-hint'} /><FieldDescription id="machine-id-hint">Optional. Defaults to the id in machine.toml, else the hostname.</FieldDescription></Field>
           <Field><FieldLabel htmlFor="copy-from">Copy Assignment from Machine</FieldLabel><Input id="copy-from" value={copyFrom}
-            disabled={join.pending} onChange={e => setCopyFrom(e.target.value)} placeholder="laptop" aria-describedby="copy-from-hint" />
+            disabled={join.pending} onChange={e => setCopyFrom(e.target.value)} placeholder="laptop" aria-describedby={join.error ? 'copy-from-hint join-error' : 'copy-from-hint'} />
             <FieldDescription id="copy-from-hint">Optional. Starts with another Machine's Assignment.</FieldDescription></Field>
-          <ErrorNotice error={join.error} />{joined && <Notice title="Join complete">{joined}</Notice>}
+          <FieldError id="join-error">{join.error}</FieldError>{joined && <Notice title="Join complete">{joined}</Notice>}
           <div><Button type="submit" disabled={join.pending}><Pending pending={join.pending}>Join / rejoin</Pending></Button></div>
         </FieldGroup></form>
         <Dialog open={confirming} onOpenChange={open => { if (!join.pending) setConfirming(open); }}>
@@ -90,8 +91,8 @@ export function Settings({ status, socket, revision, changed }: {
           <CardDescription>Create a single-use code for another Machine. The code is shown once.</CardDescription></CardHeader>
           <CardContent><JoinCodeButton label="Create join code" /></CardContent></Card>
 
-        <Card><CardHeader><CardTitle>Daemon connection</CardTitle></CardHeader>
-          <CardContent><Details className="grid-cols-1 gap-y-1 sm:grid-cols-[minmax(0,10rem)_minmax(0,1fr)] sm:gap-y-2" rows={[
+        <Card className="@container"><CardHeader><CardTitle>Daemon connection</CardTitle></CardHeader>
+          <CardContent><Details className="grid-cols-1 gap-y-1 [&_dd]:mb-3 @min-[28rem]:grid-cols-[minmax(0,10rem)_minmax(0,1fr)] @min-[28rem]:gap-y-2 @min-[28rem]:[&_dd]:mb-0" rows={[
             ['Socket', <code className="font-mono text-xs break-all">{socket}</code>],
             ['Machine', status.machine_id], ['Hub', status.hub_url], ['Hub connection', <span className="capitalize">{connection}</span>],
             ['Repo', <code className="font-mono text-xs break-all">{status.repo}</code>], ['Assignment revision', status.assignment_revision],

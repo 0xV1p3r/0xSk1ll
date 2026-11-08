@@ -19,8 +19,8 @@ const entry = (name: string, type: ContentType, extra: Partial<ContentEntry> = {
   ] : [], ...extra,
 });
 const entries = [entry('writing', 'personal'), entry('pdf', 'import'), entry('style', 'fragment'), entry('notes', 'unmanaged')];
-const changed = vi.fn(), reviewDraft = vi.fn(), assignment = vi.fn();
-const props = { connection: 'connected' as const, entries, revision: 0, changed, reviewDraft, assignment };
+const changed = vi.fn(), reviewDraft = vi.fn(), assignment = vi.fn(), addImport = vi.fn();
+const props = { connection: 'connected' as const, entries, revision: 0, changed, reviewDraft, assignment, addImport };
 const markdown = '---\nname: pdf\ndescription: Read PDFs\nharnesses: [claude, codex]\n---\n# Guide\n\nUse **bold** text.\n\n<script>alert(1)</script>';
 beforeEach(() => {
   vi.resetAllMocks();
@@ -139,7 +139,7 @@ it('stops after failed Adopt and blocks clashing names', async () => {
   expect((screen.getByRole('button', { name: 'Adopt to edit' }) as HTMLButtonElement).disabled).toBe(true);
 });
 it('Harness chips navigate to the Assignment matrix', () => {
-  mount(); fireEvent.click(screen.getByRole('button', { name: 'Assignment for writing in claude' })); expect(assignment).toHaveBeenCalledOnce(); expect(screen.queryByRole('dialog')).toBeNull();
+  mount(); fireEvent.click(screen.getByRole('button', { name: 'Assignment for writing in claude' })); expect(assignment).toHaveBeenCalledWith('skill:writing', 'claude'); expect(screen.queryByRole('dialog')).toBeNull();
 });
 
 it('refreshes the selected item Type and closes a removed item', async () => {
@@ -185,4 +185,36 @@ it('disables a pending adoption confirmation when the Hub disconnects', async ()
   fireEvent.click(screen.getByRole('button', { name: 'Adopt' }));
   view.rerender(<TooltipProvider><Skills {...props} connection="offline" /></TooltipProvider>);
   expect(screen.getByRole('button', { name: 'Adopt into Draft' }).hasAttribute('disabled')).toBe(true);
+});
+
+it('opens an Unmanaged Harness chip at its selected variant without navigating to Assignment', async () => {
+  mount(); fireEvent.click(screen.getByRole('button', { name: 'View notes in codex' }));
+  expect(await screen.findByRole('dialog')).toBeTruthy();
+  expect((screen.getByLabelText('Harness location and variant') as HTMLSelectElement).value).toBe('sha256:two:codex');
+  await waitFor(() => expect(api.skillTree).toHaveBeenLastCalledWith({ item: 'unmanaged:notes', hash: 'sha256:two', harness: 'codex' }));
+  expect(api.skillFile).toHaveBeenLastCalledWith({ item: 'unmanaged:notes', hash: 'sha256:two', harness: 'codex', path: 'SKILL.md' });
+  expect(assignment).not.toHaveBeenCalled();
+});
+it('offers Add Import for an empty inventory and keeps filtered empty results distinct', () => {
+  const view = mount([]);
+  expect(screen.getByText('No Skills yet')).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: 'Add Import' })); expect(addImport).toHaveBeenCalledOnce();
+  view.rerender(<TooltipProvider><Skills {...props} /></TooltipProvider>);
+  fireEvent.change(screen.getByLabelText('Search by name'), { target: { value: 'missing' } });
+  expect(screen.getByText('No matching Skills')).toBeTruthy();
+  expect(screen.queryByRole('button', { name: 'Add Import' })).toBeNull();
+});
+
+it('keeps confirmation focus inside the sheet on Cancel and Escape and focuses Review after Adopt', async () => {
+  mount(); await select('notes', 'Unmanaged');
+  const trigger = screen.getByRole('button', { name: 'Adopt' });
+  for (const close of ['Cancel', 'Escape', 'Adopt into Draft']) {
+    trigger.focus(); fireEvent.click(trigger);
+    const dialog = await screen.findByRole('dialog', { name: 'Adopt notes?' });
+    if (close === 'Escape') fireEvent.keyDown(dialog, { key: 'Escape' });
+    else fireEvent.click(within(dialog).getByRole('button', { name: close }));
+    const target = close === 'Adopt into Draft' ? await screen.findByRole('button', { name: 'Review in Draft' }) : trigger;
+    await waitFor(() => expect(document.activeElement).toBe(target));
+    expect(screen.getByRole('dialog', { name: 'notes' }).contains(document.activeElement)).toBe(true);
+  }
 });

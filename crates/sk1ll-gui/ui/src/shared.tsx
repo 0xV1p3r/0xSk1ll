@@ -3,7 +3,7 @@ import { Check, CircleAlert, Info, Inbox, LoaderCircle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
-import { Empty, EmptyHeader, EmptyMedia, EmptyTitle, EmptyDescription } from '@/components/ui/empty';
+import { Empty, EmptyContent, EmptyHeader, EmptyMedia, EmptyTitle, EmptyDescription } from '@/components/ui/empty';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter, DialogTrigger } from '@/components/ui/dialog';
 import { Field, FieldLabel } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
@@ -14,6 +14,11 @@ import { useMutation } from './hooks';
 import { ago, statusLabels, statusTone, time } from './model';
 import type { MachineStatus } from './types';
 
+const changeTone = { added: 'success', modified: 'info', deleted: 'destructive' } as const;
+const changeLabels = { added: 'Added', modified: 'Modified', deleted: 'Deleted' };
+export function ChangeBadge({ change }: { change: keyof typeof changeTone }) {
+  return <Badge variant={changeTone[change]}>{changeLabels[change]}</Badge>;
+}
 export function StatusBadge({ status }: { status: MachineStatus }) {
   return <Badge variant={statusTone[status]}>{statusLabels[status]}</Badge>;
 }
@@ -25,9 +30,9 @@ export function Notice({ title, children, tone = 'default' }: { title: string; c
   return <Alert variant={tone} role={tone === 'destructive' ? 'alert' : 'status'}>{tone === 'destructive' ? <CircleAlert /> : <Info />}
     <AlertTitle>{title}</AlertTitle><AlertDescription>{children}</AlertDescription></Alert>;
 }
-export function Nothing({ title = 'Nothing here', children, className }: { title?: string; children: ReactNode; className?: string }) {
+export function Nothing({ title = 'Nothing here', children, className, action }: { title?: string; children: ReactNode; className?: string; action?: ReactNode }) {
   return <Empty className={cn('border border-dashed', className)}><EmptyHeader><EmptyMedia variant="icon"><Inbox /></EmptyMedia>
-    <EmptyTitle>{title}</EmptyTitle><EmptyDescription>{children}</EmptyDescription></EmptyHeader></Empty>;
+    <EmptyTitle>{title}</EmptyTitle><EmptyDescription>{children}</EmptyDescription></EmptyHeader>{action && <EmptyContent>{action}</EmptyContent>}</Empty>;
 }
 export function Loading({ rows = 3 }: { rows?: number }) {
   return <div className="flex flex-col gap-2" role="status" aria-label="Loading">
@@ -49,9 +54,9 @@ export function When({ seconds }: { seconds: number | null }) {
     className="rounded-sm underline decoration-dotted underline-offset-4 outline-none focus-visible:ring-2 focus-visible:ring-ring" />}>
     {ago(seconds)}<span className="sr-only"> ({time(seconds)})</span></TooltipTrigger><TooltipContent>{time(seconds)}</TooltipContent></Tooltip>;
 }
-export function Action({ label, action, onDone, disabled = false, variant = 'outline', ariaLabel, doneLabel }: {
+export function Action({ label, action, onDone, disabled = false, variant = 'outline', ariaLabel, doneLabel, className, announceDone = true }: {
   label: string; action: () => Promise<unknown>; onDone?: () => void; disabled?: boolean;
-  variant?: 'outline' | 'default' | 'ghost' | 'secondary'; ariaLabel?: string; doneLabel?: string;
+  variant?: 'outline' | 'default' | 'ghost' | 'secondary'; ariaLabel?: string; doneLabel?: string; className?: string; announceDone?: boolean;
 }) {
   const mutation = useMutation(onDone);
   const [done, setDone] = useState(false);
@@ -60,11 +65,11 @@ export function Action({ label, action, onDone, disabled = false, variant = 'out
     const timer = setTimeout(() => setDone(false), 2500);
     return () => clearTimeout(timer);
   }, [done]);
-  return <div className="flex flex-col items-start gap-2">
-    <Button variant={variant} size="sm" aria-label={ariaLabel} disabled={disabled || mutation.pending}
-      onClick={() => void mutation.run(action, () => setDone(!!doneLabel))}>
+  return <div className="flex min-w-0 flex-col items-start gap-2">
+    <Button variant={variant} size="sm" className={className} aria-label={ariaLabel} disabled={disabled} aria-disabled={disabled || mutation.pending}
+      onClick={() => { if (!disabled && !mutation.pending) void mutation.run(action, () => setDone(!!doneLabel)); }}>
       {done ? <><Check data-icon="inline-start" />{doneLabel}</> : <Pending pending={mutation.pending}>{label}</Pending>}</Button>
-    <span role="status" className="sr-only">{done ? doneLabel : ''}</span>
+    {announceDone && <span role="status" className="sr-only">{done ? doneLabel : ''}</span>}
     <ErrorNotice error={mutation.error} /></div>;
 }
 export function Confirm({ label, title, description, action, onDone, disabled = false, typed, ariaLabel, confirmLabel = label, variant = 'destructive' }: {
