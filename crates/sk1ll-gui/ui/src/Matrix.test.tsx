@@ -104,7 +104,7 @@ describe('Assignment response cache', () => {
     fireEvent.click(cell('a'));
     await waitFor(() => expect(vi.mocked(api.setAssignment).mock.calls.filter(([, r]) => r.changes.length)).toHaveLength(2));
   });
-  it('sends only the default change and renders materialized values from the Hub response', async () => {
+  it('sends only the default change and renders materialized values from the Server response', async () => {
     const save = deferred<AssignmentUpdate>();
     vi.mocked(api.setAssignment).mockReturnValue(save.promise);
     await mount();
@@ -116,7 +116,7 @@ describe('Assignment response cache', () => {
     expect(screen.getByRole('checkbox', { name: 'Default for new skills in a / claude' }).getAttribute('aria-checked')).toBe('true');
     expect(enabled('a')).toBe(false);
   });
-  it('labels unpushed Promotes and Draft-only additions consistently', async () => {
+  it('labels unpushed Commits and Draft-only additions consistently', async () => {
     vi.mocked(api.items).mockResolvedValue([
       { item: 'skill:queued', in_baseline: false, draft: null, unpushed: true, description: null },
       { item: 'skill:local', in_baseline: false, draft: 'added', unpushed: false, description: null },
@@ -126,7 +126,7 @@ describe('Assignment response cache', () => {
     const local = screen.getByText('skill:local').closest('tr')!;
     expect(within(queued).getByText('Unpushed')).toBeTruthy();
     expect(within(local).getByText('Draft only')).toBeTruthy();
-    expect(screen.queryByText(/not promoted/i)).toBeNull();
+    expect(screen.queryByText(/not committed/i)).toBeNull();
   });
 });
 

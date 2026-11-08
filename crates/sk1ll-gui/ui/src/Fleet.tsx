@@ -18,7 +18,7 @@ function NextStep({ machine, local, navigate, changed }: {
 }) {
   const report = machine.report;
   if (!local) {
-    const hint = { offline: 'Start its Daemon, or check its network path to the Hub.', blocked: `Promote or Reset the clashing items on ${machine.id}, then Pull.`,
+    const hint = { offline: 'Start its Daemon, or check its network path to the Server.', blocked: `Commit or Restore the clashing items on ${machine.id}, then Pull.`,
       conflict: `Resolve its Conflicts in the GUI on ${machine.id}.`, behind: `${machine.id} Pulls the new Baseline once its Draft allows it.` } as Record<string, string>;
     return hint[machine.status] ? <p className="text-xs text-muted-foreground">{hint[machine.status]}</p> : null;
   }
@@ -32,7 +32,7 @@ function MachineDetails({ machine }: { machine: MachineRow }) {
   const report = machine.report;
   if (!report) return <Details className="py-1" rows={[
     ['Connection', machine.connected ? 'Connected' : 'Disconnected'], ['Joined', time(machine.joined_at)],
-    ['Last seen', time(machine.last_seen)], ['Report', 'Not reported. This Machine has not sent a report to the Hub yet.'],
+    ['Last seen', time(machine.last_seen)], ['Report', 'Not reported. This Machine has not sent a report to the Server yet.'],
   ]} />;
   return <Details className="py-1 md:grid-cols-[max-content_minmax(0,1fr)_max-content_minmax(0,1fr)]" rows={[
     ['Connection', machine.connected ? 'Connected' : 'Disconnected'],
@@ -64,7 +64,7 @@ export function Fleet({ revision, machineId, navigate, changed, live }: {
   return <>
     <ErrorNotice error={error} />{loading && !data && <Loading />}
     {data && <>
-      {(!!error || !live) && <Notice title="Showing last available Fleet data">Hub updates are unavailable, so Machine reports may be out of date.
+      {(!!error || !live) && <Notice title="Showing last available Fleet data">Server updates are unavailable, so Machine reports may be out of date.
         Read from the Daemon {ago(updatedAt ?? null).toLowerCase()}.</Notice>}
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
         <Stat label="Machines" value={machines.length} />

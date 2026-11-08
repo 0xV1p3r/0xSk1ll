@@ -16,7 +16,7 @@ import { ChangeBadge, ErrorNotice, Loading, Nothing, Notice, Pending } from './s
 import { SkillFile } from './SkillFile';
 import type { ContentEntry, ContentQuery, ContentType, StatusView } from './types';
 
-const typeLabels: Record<ContentType, string> = { personal: 'Personal', import: 'Import', fragment: 'Fragment', unmanaged: 'Unmanaged' };
+const typeLabels: Record<ContentType, string> = { personal: 'Personal', import: 'Import', rule: 'Rule', unmanaged: 'Unmanaged' };
 const loadEditors = () => api.editors(true);
 const keyFor = (entry: ContentEntry) => entry.item ?? `unmanaged:${entry.name}`;
 function DraftBadge({ entry }: { entry: ContentEntry }) {
@@ -42,7 +42,7 @@ export function Skills({ entries, revision, changed, reviewDraft, assignment, ad
         {Object.entries(typeLabels).map(([type, label]) => <NativeSelectOption key={type} value={type}>{label}</NativeSelectOption>)}
       </NativeSelect></Field>
       <Field className="min-w-40 flex-1 sm:max-w-xs"><FieldLabel htmlFor="skill-search">Search by name</FieldLabel>
-        <Input id="skill-search" value={search} onChange={event => setSearch(event.target.value)} placeholder="Find a Skill or Fragment…" /></Field>
+        <Input id="skill-search" value={search} onChange={event => setSearch(event.target.value)} placeholder="Find a Skill or Rule…" /></Field>
     </div>
     {visible.length ? <div className="overflow-hidden rounded-lg border"><Table aria-label="Skills" stickyFirstColumn>
       <TableHeader><TableRow className="bg-muted hover:bg-muted">{(['name', 'type'] as const).map(column => <TableHead key={column}
@@ -65,10 +65,10 @@ export function Skills({ entries, revision, changed, reviewDraft, assignment, ad
           </div></TableCell>
         </TableRow>;
       })}</TableBody>
-    </Table></div> : <Nothing title={entries.length ? 'No matching Skills' : 'No Skills yet'} action={!entries.length && <Button onClick={addImport}>Add Import</Button>}>{entries.length ? 'Choose another Type or name.' : 'Personal Skills, Imports, Fragments, and Unmanaged skills will appear here.'}</Nothing>}
+    </Table></div> : <Nothing title={entries.length ? 'No matching Skills' : 'No Skills yet'} action={!entries.length && <Button onClick={addImport}>Add Import</Button>}>{entries.length ? 'Choose another Type or name.' : 'Personal Skills, Imports, Rules, and Unmanaged skills will appear here.'}</Nothing>}
     <Sheet open={!!entry} onOpenChange={open => { if (!open) setSelected(undefined); }}>
       <SheetContent className="overflow-y-auto data-[side=right]:w-full data-[side=right]:sm:max-w-3xl">
-        {entry && <SkillDetail key={`${entry.type === 'fragment' ? 'fragment' : 'skill'}:${entry.name}`} entry={entry} initialHarness={selected?.harness} connection={connection} revision={revision} changed={changed} reviewDraft={() => { setSelected(undefined); reviewDraft(); }}
+        {entry && <SkillDetail key={`${entry.type === 'rule' ? 'rule' : 'skill'}:${entry.name}`} entry={entry} initialHarness={selected?.harness} connection={connection} revision={revision} changed={changed} reviewDraft={() => { setSelected(undefined); reviewDraft(); }}
           converted={next => setSelected({ key: keyFor(next), optimistic: { entry: next, inventory: entries } })} />}
       </SheetContent>
     </Sheet>
@@ -100,9 +100,9 @@ function SkillBrowser({ query, revision }: { query: () => ContentQuery; revision
   </>;
 }
 
-function HubRequired({ needed, children }: { needed: boolean; children: ReactNode }) {
+function ServerRequired({ needed, children }: { needed: boolean; children: ReactNode }) {
   return needed ? <Tooltip><TooltipTrigger render={<span tabIndex={0} className="inline-flex" />}>{children}</TooltipTrigger>
-    <TooltipContent>Needs a connection to the Hub</TooltipContent></Tooltip> : children;
+    <TooltipContent>Needs a connection to the Server</TooltipContent></Tooltip> : children;
 }
 
 function SkillDetail({ entry, initialHarness, revision, changed, reviewDraft, converted, connection }: {
@@ -125,13 +125,13 @@ function SkillDetail({ entry, initialHarness, revision, changed, reviewDraft, co
   const editorTrigger = useRef<HTMLButtonElement>(null);
   const preferred = editors.data?.editors.find(editor => editor.id === editors.data?.preferred_editor);
   const needsConversion = entry.type === 'import' || entry.type === 'unmanaged';
-  const needsHub = entry.type === 'unmanaged' && connection !== 'connected';
-  const canAdopt = !needsHub && !entry.clashes_with_repo && !!choice;
+  const needsServer = entry.type === 'unmanaged' && connection !== 'connected';
+  const canAdopt = !needsServer && !entry.clashes_with_repo && !!choice;
   const execute = (editorId?: string) => void mutation.run(async () => {
     let destination = entry.item;
     if (entry.type === 'import') { await api.fork(entry.name); destination = `skill:${entry.name}`; }
     if (entry.type === 'unmanaged') {
-      if (needsHub) throw new Error('Adopt needs a connection to the Hub');
+      if (needsServer) throw new Error('Adopt needs a connection to the Server');
       if (!choice || entry.clashes_with_repo) throw new Error('Choose a Harness variant with an available name before Adopt.');
       await api.adoptUnmanaged({ name: entry.name, harness: choice.harness }); destination = `skill:${entry.name}`;
     }
@@ -149,7 +149,7 @@ function SkillDetail({ entry, initialHarness, revision, changed, reviewDraft, co
   const edit = (editorId: string) => { if (needsConversion) setConfirmation({ editorId }); else execute(editorId); };
   return <>
     <SheetHeader className="pr-12"><SheetTitle>{entry.name}</SheetTitle>
-      <SheetDescription>{choice?.description ?? entry.description ?? `${typeLabels[entry.type]} ${entry.type === 'fragment' ? '' : 'Skill'}`}</SheetDescription>
+      <SheetDescription>{choice?.description ?? entry.description ?? `${typeLabels[entry.type]} ${entry.type === 'rule' ? '' : 'Skill'}`}</SheetDescription>
       <div className="mt-2 flex flex-wrap gap-2"><Badge variant="secondary">{typeLabels[entry.type]}</Badge><DraftBadge entry={entry} />
         {entry.variants.length > 1 && <Badge variant="warning">Differs</Badge>}{entry.clashes_with_repo && <Badge variant="warning">Clashes with repo</Badge>}</div>
     </SheetHeader>
@@ -157,7 +157,7 @@ function SkillDetail({ entry, initialHarness, revision, changed, reviewDraft, co
       <div className="flex flex-wrap gap-2">
         {entry.draft && <Button ref={reviewButton} variant="outline" size="sm" onClick={reviewDraft}>Review in Draft</Button>}
         {entry.draft !== 'deleted' && <>
-          <HubRequired needed={needsHub}><div className="flex" role="group" aria-label="Edit Skill">
+          <ServerRequired needed={needsServer}><div className="flex" role="group" aria-label="Edit Skill">
             <Button size="sm" className="rounded-r-none" disabled={!preferred || mutation.pending || (entry.type === 'unmanaged' && !canAdopt)}
               onClick={event => { confirmationTrigger.current = event.currentTarget; if (preferred) edit(preferred.id); }}><Pending pending={mutation.pending}>
                 {entry.type === 'import' ? 'Fork to edit' : entry.type === 'unmanaged' ? 'Adopt to edit' : `Open in ${preferred?.name ?? 'editor'}`}
@@ -170,8 +170,8 @@ function SkillDetail({ entry, initialHarness, revision, changed, reviewDraft, co
                 </DropdownMenuGroup>;
               })}<DropdownMenuGroup><DropdownMenuItem onClick={() => void editors.refresh()}>Refresh editors</DropdownMenuItem></DropdownMenuGroup></DropdownMenuContent>
             </DropdownMenu>
-          </div></HubRequired>
-          {entry.type === 'unmanaged' && <HubRequired needed={needsHub}><Button variant="outline" size="sm" disabled={mutation.pending || !canAdopt} onClick={event => { confirmationTrigger.current = event.currentTarget; setConfirmation({}); }}>Adopt</Button></HubRequired>}
+          </div></ServerRequired>
+          {entry.type === 'unmanaged' && <ServerRequired needed={needsServer}><Button variant="outline" size="sm" disabled={mutation.pending || !canAdopt} onClick={event => { confirmationTrigger.current = event.currentTarget; setConfirmation({}); }}>Adopt</Button></ServerRequired>}
         </>}
       </div>
       <ErrorNotice error={editors.error || mutation.error} />
@@ -190,8 +190,8 @@ function SkillDetail({ entry, initialHarness, revision, changed, reviewDraft, co
           : `Adopt copies this Unmanaged skill into the Draft as a Personal Skill, enabled in the Harnesses where this variant was found. The original is kept in recovery when sync replaces it.${entry.variants.length > 1 ? ` Adopt uses the selected variant from ${choice?.harness}. Other variants stay unmanaged.` : ''}`}</DialogDescription>
       </DialogHeader><ErrorNotice error={mutation.error} /><DialogFooter>
         <Button variant="outline" disabled={mutation.pending} onClick={() => setConfirmation(undefined)}>Cancel</Button>
-        <HubRequired needed={needsHub}><Button disabled={mutation.pending || needsHub} onClick={() => execute(confirmation?.editorId)}><Pending pending={mutation.pending}>
-          {entry.type === 'import' ? 'Fork' : 'Adopt'}{confirmation?.editorId ? ' and open' : ' into Draft'}</Pending></Button></HubRequired>
+        <ServerRequired needed={needsServer}><Button disabled={mutation.pending || needsServer} onClick={() => execute(confirmation?.editorId)}><Pending pending={mutation.pending}>
+          {entry.type === 'import' ? 'Fork' : 'Adopt'}{confirmation?.editorId ? ' and open' : ' into Draft'}</Pending></Button></ServerRequired>
       </DialogFooter></DialogContent>
     </Dialog>
   </>;

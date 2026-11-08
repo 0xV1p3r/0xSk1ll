@@ -32,7 +32,7 @@ sk1ll add <link> --name <name>    # add it under another name
 ## Look and update
 
 ```sh
-sk1ll list                # skills and instruction fragments
+sk1ll list                # skills and instruction rules
 sk1ll status              # import state and pending sync actions
 sk1ll update <name>       # re-fetch an import from its source into the Draft
 ```
@@ -43,5 +43,5 @@ sk1ll update <name>       # re-fetch an import from its source into the Draft
 
 - Only use a link or `owner/repo` the user gave you. Never search the web
   for skills to install.
-- Never run `promote`, `push`, `reset`, `remove`, `fork` or `sync --force`.
+- Never run `commit`, `push`, `restore`, `remove`, `fork` or `sync --force`.
   Those are the user's decisions; tell them the command if they want it.

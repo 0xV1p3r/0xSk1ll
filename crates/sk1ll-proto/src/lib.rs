@@ -1,4 +1,4 @@
-//! Wire types shared by the hub, the daemon and the GUI: WebSocket messages,
+//! Wire types shared by the server, the daemon and the GUI: WebSocket messages,
 //! REST bodies, machine status and the assignment log. Only serde types and
 //! pure functions live here, no I/O or async runtime.
 //!
@@ -8,21 +8,21 @@ use serde::{Deserialize, Serialize};
 
 pub use sk1ll_core::assignment::{Assignment, HarnessAssignment};
 
-/// Path of the fleet repo under the hub's base URL.
+/// Path of the fleet repo under the server's base URL.
 pub const REPO_PATH: &str = "/git/repo.git";
 
 // ---------------------------------------------------------------------------
 // Items
 
-/// A skill, fragment, the manifest or another repo path, as core names it in
-/// drafts. On the wire it is a string: `skill:pdf`, `fragment:10-git`,
+/// A skill, rule, the manifest or another repo path, as core names it in
+/// drafts. On the wire it is a string: `skill:pdf`, `rule:10-git`,
 /// `manifest` or `other:<path>`; it never carries content.
 pub use sk1ll_core::draft::ItemRef;
 
 // ---------------------------------------------------------------------------
 // WebSocket (`GET /api/ws`), JSON text frames tagged by `type`.
 
-/// Daemon → hub.
+/// Daemon → server.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonMessage {
@@ -30,21 +30,21 @@ pub enum DaemonMessage {
     Hello { machine_id: String },
     /// The machine's current state; send on connect and whenever it changes.
     Status(MachineReport),
-    /// The user Reset these draft items. Send after the updated status so
-    /// the hub can drop toggles for items absent from both baseline and draft.
+    /// The user Restore these draft items. Send after the updated status so
+    /// the server can drop toggles for items absent from both baseline and draft.
     DraftDiscarded { items: Vec<ItemRef> },
 }
 
-/// Hub → daemon.
+/// Server → daemon.
 ///
-/// Liveness: the hub pings at a configurable interval and closes a connection
+/// Liveness: the server pings at a configurable interval and closes a connection
 /// it has received nothing from (no frame of any kind, pongs included) for
 /// max(2 × ping interval, offline-after). Daemons must keep reading so that
 /// pongs go out, and should reconnect when closed. A daemon that doesn't
 /// read its frames in time is disconnected too.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum HubMessage {
+pub enum ServerMessage {
     /// This machine's full assignment. Sent on connect and after every change;
     /// snapshots that were superseded before they could be sent are skipped,
     /// so only the latest is guaranteed to arrive. Apply one only if its
@@ -53,7 +53,7 @@ pub enum HubMessage {
     /// The baseline is now `baseline`; pull. Sent on connect and after every push.
     Nudge { baseline: String },
     /// The machine was removed from the fleet; its token no longer works. The
-    /// hub closes the connection right after.
+    /// server closes the connection right after.
     Revoked,
     /// The set of imports with a newer upstream commit changed.
     ImportsChanged { updates: Vec<ImportUpdate> },
@@ -64,7 +64,7 @@ pub enum HubMessage {
 /// "harnesses": {...}}`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssignmentSnapshot {
-    /// Grows with every change. It comes from one hub-wide sequence, so it
+    /// Grows with every change. It comes from one server-wide sequence, so it
     /// also grows across removing and re-joining a machine. 0 means unknown.
     #[serde(default)]
     pub revision: u64,
@@ -78,11 +78,11 @@ pub struct MachineReport {
     /// Commit the machine's harnesses are built from; `None` before the first pull.
     #[serde(default)]
     pub baseline: Option<String>,
-    /// Items with uncommitted changes in the machine's repo. The hub skips
+    /// Items with uncommitted changes in the machine's repo. The server skips
     /// (and logs) entries it can't parse instead of dropping the report.
     #[serde(default)]
     pub drafts: Vec<ItemRef>,
-    /// Items in commits the machine has promoted but not yet pushed to the hub.
+    /// Items in commits the machine has committed but not yet pushed to the server.
     #[serde(default)]
     pub unpushed: Vec<ItemRef>,
     #[serde(default)]
@@ -122,12 +122,12 @@ pub enum MachineStatus {
     InSync,
 }
 
-/// The most severe status that applies. `offline` is decided by the hub (not
+/// The most severe status that applies. `offline` is decided by the server (not
 /// seen recently: `last_seen` older than its offline-after, whether or not a
-/// connection is registered); `hub_baseline` is the hub repo's
+/// connection is registered); `server_baseline` is the server repo's
 /// HEAD (`None` while it is empty). A machine that never reported is Behind
-/// once the hub has a baseline.
-pub fn headline(offline: bool, report: Option<&MachineReport>, hub_baseline: Option<&str>) -> MachineStatus {
+/// once the server has a baseline.
+pub fn headline(offline: bool, report: Option<&MachineReport>, server_baseline: Option<&str>) -> MachineStatus {
     if offline {
         return MachineStatus::Offline;
     }
@@ -137,7 +137,7 @@ pub fn headline(offline: bool, report: Option<&MachineReport>, hub_baseline: Opt
         MachineStatus::Blocked
     } else if !r.conflicts.is_empty() {
         MachineStatus::Conflict
-    } else if r.behind || hub_baseline.is_some_and(|h| r.baseline.as_deref() != Some(h)) {
+    } else if r.behind || server_baseline.is_some_and(|h| r.baseline.as_deref() != Some(h)) {
         MachineStatus::Behind
     } else if !r.drafts.is_empty() {
         MachineStatus::Drafting
@@ -149,7 +149,7 @@ pub fn headline(offline: bool, report: Option<&MachineReport>, hub_baseline: Opt
 /// `GET /api/fleet`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetView {
-    /// The hub repo's HEAD; `None` until the first push.
+    /// The server repo's HEAD; `None` until the first push.
     pub baseline: Option<String>,
     pub machines: Vec<MachineRow>,
 }
@@ -175,15 +175,15 @@ pub struct MachineRow {
 #[serde(rename_all = "snake_case")]
 pub enum ToggleKind {
     Skill,
-    Fragment,
+    Rule,
     NewSkillsDefault,
-    NewFragmentsDefault,
+    NewRulesDefault,
 }
 
 impl ToggleKind {
     /// Whether `name` is required (item toggles) or must be absent (defaults).
     pub fn has_name(self) -> bool {
-        matches!(self, Self::Skill | Self::Fragment)
+        matches!(self, Self::Skill | Self::Rule)
     }
 }
 
@@ -223,7 +223,7 @@ pub struct LogEntry {
     pub id: i64,
     pub at: i64,
     /// Machine id that made the change, `admin` for the bootstrap token, or
-    /// `hub` for changes the hub made itself.
+    /// `server` for changes the server made itself.
     pub author: String,
     /// The machine whose assignment changed.
     pub machine: String,
@@ -284,7 +284,7 @@ pub struct JoinResponse {
     pub machine_id: String,
     /// Bearer token for the API and password for git over HTTP. Shown once.
     pub token: String,
-    /// Path of the fleet repo, relative to the hub's base URL.
+    /// Path of the fleet repo, relative to the server's base URL.
     pub repo_path: String,
     pub assignment: Assignment,
     /// The assignment's revision (see [`AssignmentSnapshot`]).
@@ -342,21 +342,21 @@ mod tests {
     fn item_refs_are_strings() {
         let r: ItemRef = "skill:pdf".parse().unwrap();
         assert_eq!(r, ItemRef::Skill("pdf".into()));
-        assert_eq!(serde_json::to_string(&ItemRef::Fragment("10-git".into())).unwrap(), "\"fragment:10-git\"");
+        assert_eq!(serde_json::to_string(&ItemRef::Rule("10-git".into())).unwrap(), "\"rule:10-git\"");
         assert!("pdf".parse::<ItemRef>().is_err());
-        assert!("rule:x".parse::<ItemRef>().is_err());
+        assert!("fragment:x".parse::<ItemRef>().is_err());
         assert!("skill:".parse::<ItemRef>().is_err());
     }
 
     #[test]
     fn reports_accept_every_draft_item() {
-        let text = r#"{"type":"status","drafts":["skill:pdf","fragment:git","manifest","other:README.md"]}"#;
+        let text = r#"{"type":"status","drafts":["skill:pdf","rule:git","manifest","other:README.md"]}"#;
         let DaemonMessage::Status(r) = serde_json::from_str(text).unwrap() else { panic!("expected status") };
         assert_eq!(
             r.drafts,
             [
                 ItemRef::Skill("pdf".into()),
-                ItemRef::Fragment("git".into()),
+                ItemRef::Rule("git".into()),
                 ItemRef::Manifest,
                 ItemRef::Other("README.md".into())
             ]
@@ -367,7 +367,7 @@ mod tests {
 
     #[test]
     fn draft_discarded_wire_format() {
-        let value = serde_json::json!({"type": "draft_discarded", "items": ["skill:wip", "fragment:git", "manifest", "other:notes.txt"]});
+        let value = serde_json::json!({"type": "draft_discarded", "items": ["skill:wip", "rule:git", "manifest", "other:notes.txt"]});
         let message: DaemonMessage = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(serde_json::to_value(message).unwrap(), value);
     }
@@ -376,15 +376,15 @@ mod tests {
     fn assignment_snapshots_carry_a_revision() {
         let mut a = Assignment::default();
         a.set_skill("claude", "pdf", true);
-        let m = HubMessage::Assignment(AssignmentSnapshot { revision: 7, assignment: a.clone() });
+        let m = ServerMessage::Assignment(AssignmentSnapshot { revision: 7, assignment: a.clone() });
         let v = serde_json::to_value(&m).unwrap();
         assert_eq!(v["type"], "assignment");
         assert_eq!(v["revision"], 7);
         assert_eq!(v["harnesses"]["claude"]["skills"]["pdf"], true);
-        assert_eq!(serde_json::from_value::<HubMessage>(v).unwrap(), m);
-        // Without a revision (an older hub) it reads as 0.
-        let old: HubMessage = serde_json::from_str(r#"{"type":"assignment","harnesses":{}}"#).unwrap();
-        assert_eq!(old, HubMessage::Assignment(AssignmentSnapshot::default()));
+        assert_eq!(serde_json::from_value::<ServerMessage>(v).unwrap(), m);
+        // Without a revision (an older server) it reads as 0.
+        let old: ServerMessage = serde_json::from_str(r#"{"type":"assignment","harnesses":{}}"#).unwrap();
+        assert_eq!(old, ServerMessage::Assignment(AssignmentSnapshot::default()));
     }
 
     #[test]
@@ -399,11 +399,11 @@ mod tests {
         let mut a = Assignment::default();
         a.set_skill("claude", "pdf", false);
         let snapshot = AssignmentSnapshot { revision: 1, assignment: a };
-        for m in [HubMessage::Assignment(snapshot), HubMessage::Nudge { baseline: "abc".into() }, HubMessage::Revoked] {
+        for m in [ServerMessage::Assignment(snapshot), ServerMessage::Nudge { baseline: "abc".into() }, ServerMessage::Revoked] {
             let text = serde_json::to_string(&m).unwrap();
-            assert_eq!(serde_json::from_str::<HubMessage>(&text).unwrap(), m);
+            assert_eq!(serde_json::from_str::<ServerMessage>(&text).unwrap(), m);
         }
-        assert_eq!(serde_json::to_string(&HubMessage::Revoked).unwrap(), r#"{"type":"revoked"}"#);
+        assert_eq!(serde_json::to_string(&ServerMessage::Revoked).unwrap(), r#"{"type":"revoked"}"#);
     }
 
     #[test]
@@ -423,7 +423,7 @@ mod tests {
         assert_eq!(headline(false, Some(&self_reported), head), Behind);
 
         let conflict = MachineReport {
-            conflicts: vec![ConflictRef { item: ItemRef::Fragment("git".into()), harness: "codex".into() }],
+            conflicts: vec![ConflictRef { item: ItemRef::Rule("git".into()), harness: "codex".into() }],
             ..behind.clone()
         };
         assert_eq!(headline(false, Some(&conflict), head), Conflict);

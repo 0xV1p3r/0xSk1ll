@@ -5,5 +5,5 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
-    sk1ll_hub::run(sk1ll_hub::Config::from_env()?).await
+    sk1ll_server::run(sk1ll_server::Config::from_env()?).await
 }

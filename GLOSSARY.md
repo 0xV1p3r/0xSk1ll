@@ -15,9 +15,9 @@ _Avoid_: Dependency, package, remote skill
 A skill in a harness's skills directory that sk1ll did not put there and does not track; it is not in the repo.
 _Avoid_: Installed skill, stray, foreign skill
 
-**Fragment**:
-One instruction file ("for X do Y") that is rendered into a harness's global instructions.
-_Avoid_: Rule, instruction (when meaning a single file)
+**Rule**:
+One instruction file ("for X do Y"), kept in `rules/`. A harness's **instructions** are all its enabled rules rendered together (into a block or as rule files).
+_Avoid_: Fragment, instruction (when meaning a single file)
 
 ## Where content goes
 
@@ -33,12 +33,12 @@ _Avoid_: Target
 All machines that share one repo.
 
 **Assignment**:
-Which skills and fragments are enabled in which harness on which machine. It is live fleet state held by the hub, not part of the repo, so it has no draft.
+Which skills and rules are enabled in which harness on which machine. It is live fleet state held by the server, not part of the repo, so it has no draft.
 _Avoid_: Profile, selection, enablement
 
-**Hub**:
-The self-hosted server that holds the fleet's assignments and status and moves content between machines.
-_Avoid_: Relay, server
+**Server**:
+The self-hosted fleet server: the fleet's git remote, which also holds its assignments and machine status and tells machines when to pull. Always means this one; the daemon's endpoint is its **local API**.
+_Avoid_: Hub, relay, coordinator
 
 ## State
 
@@ -50,13 +50,19 @@ _Avoid_: Git state, main
 Uncommitted changes to the repo on one machine; private to that machine and live in its harnesses.
 _Avoid_: System state, local state, working copy
 
-**Promote**:
-To turn (part of) a draft into baseline, so that it reaches the whole fleet.
-_Avoid_: Commit, publish
+**Commit**:
+To record selected draft items as a new commit on the fleet branch. It reaches the fleet once it is pushed.
+_Avoid_: Promote, publish
 
-**Reset**:
-To discard (part of) a draft and return to baseline.
-_Avoid_: Revert, discard
+**Push**:
+To send commits to the server, making them the new baseline.
+
+**Pull**:
+To fetch the latest baseline and carry the draft on top; it never merges, it stops as **Blocked** instead.
+
+**Restore**:
+To discard (part of) a draft and return it to baseline.
+_Avoid_: Reset, revert, discard
 
 **Conflict**:
 Content in a harness that differs from what the machine's draft says it should be, and that sk1ll won't overwrite on its own.
@@ -67,7 +73,7 @@ To copy content from a harness into the machine's draft: either a hand edit made
 _Avoid_: Import (reserved for external git sources), take in
 
 **Daemon**:
-The background process on each machine that keeps its harnesses matching its draft and assignment, and talks to the hub for it.
+The background process on each machine that keeps its harnesses matching its draft and assignment, and talks to the server for it.
 _Avoid_: Agent (reserved for the AI tools that harnesses run)
 
 **Join code**:
@@ -79,7 +85,7 @@ _Avoid_: Invite, fleet token
 A machine has one headline status: the most severe that applies, in the order Offline, Blocked, Conflict, Behind, Drafting, In sync. **Conflict** is defined above.
 
 **Offline**:
-The hub can't reach the machine; it shows a last-seen time.
+The server can't reach the machine; it shows a last-seen time.
 
 **Blocked**:
 A new baseline clashes with the machine's draft, so the machine stays on its old baseline.

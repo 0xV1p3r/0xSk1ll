@@ -93,7 +93,7 @@ fn unmanaged_list_and_adopt_preserve_differing_variants_and_assignment() {
 fn edit_uses_visual_then_editor_and_refuses_imports_and_unmanaged_skills() {
     let fixture = Fixture::new();
     fixture.write("repo/personal/pdf/SKILL.md", "skill");
-    fixture.write("repo/instructions/git.md", "fragment");
+    fixture.write("repo/instructions/git.md", "rule");
     fixture.write("repo/imported/remote/SKILL.md", "import");
     fixture.write("a/local/SKILL.md", "unmanaged");
     fixture.write("editor script", "printf '%s' \"$2\" > \"$1\"\n");
@@ -146,7 +146,7 @@ fn direct_adoption_rejects_a_repo_other_than_the_joined_repo() {
     // A different process may own the joined repo's lock. --repo must not bypass it.
     let _joined_lock = sk1ll_core::EngineLock::acquire(joined.root()).unwrap();
     sk1ll_daemon::DaemonState {
-        machine_id: "a".into(), token: "token".into(), hub_url: "http://unused".into(),
+        machine_id: "a".into(), token: "token".into(), server_url: "http://unused".into(),
         repo: joined.root().to_path_buf(), revoked: false,
     }.save(&root.join("absent.json")).unwrap();
     fixture.write("a/second/SKILL.md", "unmanaged user content");
@@ -165,12 +165,12 @@ fn joined_adoption_requires_a_running_connected_daemon() {
     let fixture = Fixture::new();
     let root = fixture.0.path();
     sk1ll_daemon::DaemonState {
-        machine_id: "a".into(), token: "token".into(), hub_url: "http://unused".into(),
+        machine_id: "a".into(), token: "token".into(), server_url: "http://unused".into(),
         repo: root.join("repo"), revoked: false,
     }.save(&root.join("absent.json")).unwrap();
     fixture.write("a/pdf/SKILL.md", "unmanaged user content");
     let message = error(fixture.command(&["adopt", "a", "pdf"]).output().unwrap());
-    assert!(message.contains("Adopt needs a connection to the Hub") && message.contains("sk1ll daemon"), "{message}");
+    assert!(message.contains("Adopt needs a connection to the Server") && message.contains("sk1ll daemon"), "{message}");
     assert!(!root.join("repo/personal/pdf").exists());
     assert!(!root.join("assignment.json").exists());
     assert!(!root.join("daemon-outbox.json").exists());

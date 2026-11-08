@@ -71,7 +71,7 @@ it('adds sequentially and stops at the first error without retrying', async () =
   expect(changed).toHaveBeenCalledOnce();
 });
 it('refreshes even when the first add fails, since its outcome is unknown', async () => {
-  vi.mocked(api.addImport).mockRejectedValueOnce('connection reset');
+  vi.mocked(api.addImport).mockRejectedValueOnce('connection restore');
   await resolve([candidate('pdf')]);
   fireEvent.click(confirm());
   await screen.findByText('pdf may not have been added; check the Draft.');
@@ -167,7 +167,7 @@ it('describes join errors from the submitted fields without losing existing hint
   vi.mocked(api.harnesses).mockResolvedValue([]);
   vi.mocked(api.fleet).mockResolvedValue({ baseline: 'abc', machines: [] });
   vi.mocked(api.join).mockRejectedValue('Join code expired');
-  const status = { hub_url: 'https://skills.example.com', machine_id: 'laptop', connection: 'connected', auth_rejected_since: null } as StatusView;
+  const status = { server_url: 'https://skills.example.com', machine_id: 'laptop', connection: 'connected', auth_rejected_since: null } as StatusView;
   render(<Settings revision={0} status={status} socket="/daemon.sock" changed={changed} />);
   const code = screen.getByLabelText('Join code');
   fireEvent.change(code, { target: { value: 'expired' } });

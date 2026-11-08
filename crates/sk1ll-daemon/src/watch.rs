@@ -2,14 +2,14 @@
 //! instructions paths, and re-syncs once changes settle.
 //!
 //! Inside `.git` only `HEAD`, `packed-refs` and `refs/heads/` count, so
-//! commits, resets and checkouts are noticed but git's own bookkeeping (and
+//! commits, restores and checkouts are noticed but git's own bookkeeping (and
 //! our fetches) isn't. Reads never count, so a sync that changes nothing
 //! doesn't trigger another one; one that does write converges after one
 //! more pass.
 //!
 //! Events only set a coalesced dirty flag. A sync runs after a quiet period
 //! (`debounce`), but a steady stream of events postpones it at most
-//! `debounce_max`. Independently of events and of the hub connection, a
+//! `debounce_max`. Independently of events and of the server connection, a
 //! periodic reconciliation (`reconcile_every`) re-syncs too.
 
 use std::path::{Path, PathBuf};

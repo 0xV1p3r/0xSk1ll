@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::instructions::{self, Fragment, INSTRUCTIONS_DIR};
+use crate::instructions::{self, Rule, INSTRUCTIONS_DIR};
 use crate::lock::Lockfile;
 use crate::manifest::{MANIFEST_FILE, Manifest};
 use crate::skill::{self, IMPORTED_DIR, PERSONAL_DIR, Skill};
@@ -15,7 +15,7 @@ const MANIFEST_TEMPLATE: &str = r#"# 0xSk1ll manifest. The repo holds content on
 #
 # Harnesses are configured per machine, not here: built-in presets are
 # detected, and you can adjust them in machine.toml (see `sk1ll harnesses`).
-# Which skills and fragments each harness gets is assignment (`sk1ll assign`).
+# Which skills and rules each harness gets is assignment (`sk1ll assign`).
 
 # [import.pdf]
 # source = "github:owner/repo"
@@ -118,7 +118,7 @@ impl Repo {
             fs::write(&ignore, ".sk1ll-stage-*\n").at(&ignore)?;
         }
         if !root.join(".git").exists() {
-            // Always on the fleet's branch (promote and the daemon need it),
+            // Always on the fleet's branch (commit and the daemon need it),
             // whatever git defaults to (`master` without `init.defaultBranch`).
             // `symbolic-ref` on the unborn HEAD works where `init -b` doesn't (git < 2.28).
             let git = || crate::git::Git::new(root);
@@ -145,7 +145,7 @@ impl Repo {
         skill::discover(&self.root)
     }
 
-    pub fn fragments(&self) -> Result<Vec<Fragment>> {
+    pub fn rules(&self) -> Result<Vec<Rule>> {
         instructions::discover(&self.root)
     }
 }
@@ -167,7 +167,7 @@ mod tests {
         dirs::home_dir().map(|h| h.join("skills"))
     }
 
-    /// Promote and the daemon only work on the fleet's branch, so a fresh
+    /// Commit and the daemon only work on the fleet's branch, so a fresh
     /// repo starts on it even where git's own default is still `master`
     /// (unit tests run git without the developer's config).
     #[test]

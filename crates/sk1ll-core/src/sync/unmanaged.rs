@@ -397,7 +397,7 @@ mod tests {
         let adoption = prepare(&repo, &hs, "a", "pdf").unwrap();
         complete(&repo, &hs, &adoption).unwrap();
         assert!(adopted(&repo, &hs, "a", "pdf").unwrap().is_some());
-        repo.promote(&[crate::ItemRef::Skill("pdf".into())], "promote pdf", Some("t <t@example.com>")).unwrap();
+        repo.commit(&[crate::ItemRef::Skill("pdf".into())], "commit pdf", Some("t <t@example.com>")).unwrap();
         assert!(adopted(&repo, &hs, "a", "pdf").unwrap().is_none());
     }
 

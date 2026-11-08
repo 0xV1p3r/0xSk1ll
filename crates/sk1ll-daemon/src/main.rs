@@ -18,7 +18,7 @@ enum Cmd {
     Run,
     /// Join a fleet (same as `sk1ll join`)
     Join {
-        hub_url: String,
+        server_url: String,
         code: String,
         #[arg(long)]
         id: Option<String>,
@@ -41,12 +41,12 @@ fn main() -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     match cli.cmd.unwrap_or(Cmd::Run) {
         Cmd::Run => rt.block_on(sk1ll_daemon::run(cfg)),
-        Cmd::Join { hub_url, code, id, copy_from, repo } => {
+        Cmd::Join { server_url, code, id, copy_from, repo } => {
             let repo = match repo {
                 Some(r) => r,
                 None => dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?.join("skills"),
             };
-            let opts = JoinOptions { hub_url, code, machine_id: id, copy_from, repo };
+            let opts = JoinOptions { server_url, code, machine_id: id, copy_from, repo };
             let (joined, via_daemon) = rt.block_on(sk1ll_daemon::join_or_rejoin(&cfg, opts))?;
             println!("joined as {} with repo {}", joined.machine_id, joined.repo.display());
             if via_daemon {

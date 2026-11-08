@@ -18,13 +18,13 @@ use tokio::time::timeout;
 
 use crate::commands::Bridge;
 
-struct Server {
+struct FakeDaemon {
     _directory: tempfile::TempDir,
     client: Client,
     task: tokio::task::JoinHandle<()>,
 }
 
-impl Server {
+impl FakeDaemon {
     async fn start(router: Router) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("daemon.sock");
@@ -34,7 +34,7 @@ impl Server {
     }
 }
 
-impl Drop for Server {
+impl Drop for FakeDaemon {
     fn drop(&mut self) {
         self.task.abort();
     }
@@ -62,17 +62,17 @@ async fn commands_use_the_unix_client_and_preserve_payloads_and_errors() {
     let items = json!([{"item":"skill:pdf", "in_baseline":true, "draft":null, "unpushed":false,
         "description":"Read PDF files"}]);
     let assignment = json!({"revision":7, "harnesses": {"claude": {"new_skills_default":false,
-        "new_fragments_default":true, "skills":{"pdf":true}, "fragments":{}}}});
-    let promoted = json!({"sha":"abc", "items":["skill:pdf"], "message":"Ship PDF", "pushed":false,
-        "push_error":"Hub offline"});
+        "new_rules_default":true, "skills":{"pdf":true}, "rules":{}}}});
+    let committed = json!({"sha":"abc", "items":["skill:pdf"], "message":"Ship PDF", "pushed":false,
+        "push_error":"Server offline"});
     let mut replies = Replies::new();
     for (path, value) in [
         ("GET /fleet", fleet.clone()), ("GET /items", items.clone()),
         ("GET /machines/alpha/assignment", assignment.clone()),
         ("GET /draft/diff?item=skill%3Apdf", json!({"item":"skill:pdf", "diff":"+new\n"})),
-        ("GET /promote/message?items=skill%3Apdf%2Cfragment%3Agit",
-            json!({"items":["skill:pdf","fragment:git"],"message":"prefilled"})),
-        ("POST /promote", promoted.clone()), ("POST /reset", json!({"discarded":["skill:pdf"]})),
+        ("GET /commit/message?items=skill%3Apdf%2Crule%3Agit",
+            json!({"items":["skill:pdf","rule:git"],"message":"prefilled"})),
+        ("POST /commit", committed.clone()), ("POST /restore", json!({"discarded":["skill:pdf"]})),
         ("POST /pull", json!({"state":"blocked","baseline":"abc","items":["skill:pdf"]})),
         ("GET /log?before=42&limit=10", json!([])),
         ("POST /join-codes", json!({"code":"ONCE"})),
@@ -86,22 +86,22 @@ async fn commands_use_the_unix_client_and_preserve_payloads_and_errors() {
     }
     replies.insert("PUT /machines/alpha/assignment".into(),
         (StatusCode::UNPROCESSABLE_ENTITY, json!({"error":"skill:local is not in the Baseline"})));
-    let server = Server::start(Router::new().fallback(respond).with_state((requests.clone(), replies))).await;
-    let bridge = Bridge::new(server.client.clone());
+    let daemon = FakeDaemon::start(Router::new().fallback(respond).with_state((requests.clone(), replies))).await;
+    let bridge = Bridge::new(daemon.client.clone());
     assert_eq!(serde_json::to_value(bridge.fleet().await.unwrap()).unwrap(), fleet);
     assert_eq!(serde_json::to_value(bridge.items().await.unwrap()).unwrap(), items);
     assert_eq!(serde_json::to_value(bridge.assignment("alpha".into()).await.unwrap()).unwrap(), assignment);
     assert_eq!(bridge.diff("skill:pdf".into()).await.unwrap().diff, "+new\n");
-    assert_eq!(bridge.promote_message(vec!["skill:pdf".into(), "fragment:git".into()]).await.unwrap().message,
+    assert_eq!(bridge.commit_message(vec!["skill:pdf".into(), "rule:git".into()]).await.unwrap().message,
         "prefilled");
-    let request = PromoteRequest { items: vec!["skill:pdf".into()], message: Some("Ship PDF".into()), author: None };
-    assert_eq!(serde_json::to_value(bridge.promote(request).await.unwrap()).unwrap(), promoted);
-    let reset = bridge.reset(ResetRequest { items: vec!["skill:pdf".into()], all: false }).await.unwrap();
-    assert_eq!(reset.discarded.len(), 1);
+    let request = CommitRequest { items: vec!["skill:pdf".into()], message: Some("Ship PDF".into()), author: None };
+    assert_eq!(serde_json::to_value(bridge.commit(request).await.unwrap()).unwrap(), committed);
+    let restore = bridge.restore(RestoreRequest { items: vec!["skill:pdf".into()], all: false }).await.unwrap();
+    assert_eq!(restore.discarded.len(), 1);
     assert!(matches!(bridge.pull().await.unwrap(), PullResult::Blocked { .. }));
     assert!(bridge.log(LogQuery { before: Some(42), limit: Some(10), ..Default::default() }).await.unwrap().is_empty());
     assert_eq!(bridge.join_code().await.unwrap().code, "ONCE");
-    let joined = bridge.join(JoinApiRequest { hub_url: "http://hub".into(), code: "CODE".into(),
+    let joined = bridge.join(JoinApiRequest { server_url: "http://server".into(), code: "CODE".into(),
         machine_id: Some("alpha".into()), copy_from: Some("beta".into()), repo: None }).await.unwrap();
     assert_eq!(joined.revision, 7);
     bridge.adopt(ConflictTarget { harness: "claude".into(), name: "pdf".into() }).await.unwrap();
@@ -118,7 +118,7 @@ async fn commands_use_the_unix_client_and_preserve_payloads_and_errors() {
     {
         let requests = requests.lock().unwrap();
         assert_eq!(requests.iter().filter(|(method, _, _)| method == "PUT").count(), 1, "no mutation retry");
-        let body = &requests.iter().find(|(_, uri, _)| uri == "/promote").unwrap().2;
+        let body = &requests.iter().find(|(_, uri, _)| uri == "/commit").unwrap().2;
         assert_eq!(body, &json!({"items":["skill:pdf"],"message":"Ship PDF","author":null}));
         let body = &requests.iter().find(|(_, uri, _)| uri == "/join").unwrap().2;
         assert_eq!(body["copy_from"], "beta");
@@ -161,9 +161,9 @@ async fn event_task_reconnects_after_failure_and_eof_and_forwards_unchanged_even
         Response::builder().header(header::CONTENT_TYPE, "text/event-stream").body(Body::from_stream(stream)).unwrap()
     }
     let attempts = Arc::new(AtomicUsize::new(0));
-    let server = Server::start(Router::new().route("/events", get(events)).with_state(attempts.clone())).await;
+    let daemon = FakeDaemon::start(Router::new().route("/events", get(events)).with_state(attempts.clone())).await;
     let (sender, mut receiver) = mpsc::unbounded_channel();
-    let task = tokio::spawn(crate::events::forward(server.client.clone(), move |name, value| {
+    let task = tokio::spawn(crate::events::forward(daemon.client.clone(), move |name, value| {
         sender.send((name.to_string(), value)).unwrap();
     }));
     let mut seen = Vec::new();
@@ -177,7 +177,7 @@ async fn event_task_reconnects_after_failure_and_eof_and_forwards_unchanged_even
     assert_eq!(seen[1].1["reachable"], true);
     assert_eq!(seen[2], ("assignment".into(), json!({"type":"assignment","revision":9})));
     assert_eq!(seen[3], ("draft".into(), json!({"type":"draft"})));
-    assert_eq!(seen[4].1["retry_in_ms"], 500, "a valid event resets backoff");
+    assert_eq!(seen[4].1["retry_in_ms"], 500, "a valid event restores backoff");
     assert_eq!(seen[5].1["retry_in_ms"], 1000);
     assert_eq!(seen[6].1["retry_in_ms"], 2000);
     assert_eq!(attempts.load(Ordering::SeqCst), 4);
@@ -225,16 +225,16 @@ async fn draft_bridge_adds_fingerprints_and_preserves_daemon_entries() {
     std::fs::write(directory.path().join("draft.bin"), [0, 1, 2]).unwrap();
     let mut replies = Replies::new();
     replies.insert("GET /status".into(), (StatusCode::OK, json!({
-        "machine_id":"alpha", "hub_url":"http://hub", "repo":directory.path(),
+        "machine_id":"alpha", "server_url":"http://server", "repo":directory.path(),
         "headline":"drafting", "connection":"connected", "last_error":null,
-        "revoked":false, "hub_baseline":null, "assignment_revision":1, "report":{},
+        "revoked":false, "server_baseline":null, "assignment_revision":1, "report":{},
     })));
     replies.insert("GET /draft".into(), (StatusCode::OK, json!([
         {"item":"skill:binary", "change":"added", "paths":["draft.bin"]}
     ])));
     let requests = Recorded::default();
-    let server = Server::start(Router::new().fallback(respond).with_state((requests.clone(), replies))).await;
-    let bridge = Bridge::new(server.client.clone());
+    let daemon = FakeDaemon::start(Router::new().fallback(respond).with_state((requests.clone(), replies))).await;
+    let bridge = Bridge::new(daemon.client.clone());
     let first = bridge.draft().await.unwrap();
     let value = serde_json::to_value(&first).unwrap();
     assert_eq!(value[0]["item"], "skill:binary");
@@ -256,8 +256,8 @@ async fn import_resolve_and_add_forward_once_with_payloads() {
     replies.insert("POST /imports/resolve".into(), (StatusCode::OK, resolved.clone()));
     replies.insert("POST /imports/add".into(),
         (StatusCode::CONFLICT, json!({"error":"Import name already exists"})));
-    let server = Server::start(Router::new().fallback(respond).with_state((requests.clone(), replies))).await;
-    let bridge = Bridge::new(server.client.clone());
+    let daemon = FakeDaemon::start(Router::new().fallback(respond).with_state((requests.clone(), replies))).await;
+    let bridge = Bridge::new(daemon.client.clone());
     let value = bridge.resolve_import(ResolveImportRequest {
         link: "https://github.com/example/skills/tree/main/skills/pdf".into(), path: "".into(),
     }).await.unwrap();
@@ -330,11 +330,11 @@ fn editor_targets_reject_escapes_and_imports() {
     editor.view.kind = EditorKind::Terminal;
     assert_eq!(target_path(&editor, &target), target.file);
     std::fs::create_dir(repo.join("instructions")).unwrap();
-    let fragment = repo.join("instructions/git.md");
-    std::fs::write(&fragment, "git").unwrap();
-    let target = validate_target(repo, &fragment, true).unwrap();
+    let rule = repo.join("instructions/git.md");
+    std::fs::write(&rule, "git").unwrap();
+    let target = validate_target(repo, &rule, true).unwrap();
     editor.view.kind = EditorKind::Gui;
-    assert_eq!(target_path(&editor, &target), fragment.canonicalize().unwrap());
+    assert_eq!(target_path(&editor, &target), rule.canonicalize().unwrap());
     assert!(validate_target(repo, std::path::Path::new("relative"), false).is_err());
     assert!(validate_target(repo, &repo.join("missing"), false).is_err());
     let outside = tempfile::tempdir().unwrap();
@@ -356,17 +356,17 @@ async fn editor_resolution_uses_daemon_repo_and_rejects_item_paths() {
     std::fs::write(directory.path().join("personal/pdf/SKILL.md"), "pdf").unwrap();
     let mut replies = Replies::new();
     replies.insert("GET /status".into(), (StatusCode::OK, json!({
-        "machine_id":"alpha", "hub_url":"http://hub", "repo":directory.path(),
+        "machine_id":"alpha", "server_url":"http://server", "repo":directory.path(),
         "headline":"drafting", "connection":"connected", "last_error":null,
-        "revoked":false, "hub_baseline":null, "assignment_revision":1, "report":{},
+        "revoked":false, "server_baseline":null, "assignment_revision":1, "report":{},
     })));
     replies.insert("GET /skills".into(), (StatusCode::OK, json!([
         {"name":"pdf", "item":"skill:pdf", "type":"personal", "description":null,
          "draft":null, "in_baseline":true, "path":directory.path().join("personal/pdf"),
          "enabled_harnesses":[], "clashes_with_repo":false, "variants":[]}
     ])));
-    let server = Server::start(Router::new().fallback(respond).with_state((Recorded::default(), replies))).await;
-    let bridge = Bridge::new(server.client.clone());
+    let daemon = FakeDaemon::start(Router::new().fallback(respond).with_state((Recorded::default(), replies))).await;
+    let bridge = Bridge::new(daemon.client.clone());
     assert_eq!(bridge.editor_target("skill:pdf").await.unwrap().file, directory.path().join("personal/pdf/SKILL.md").canonicalize().unwrap());
     for item in ["skill:../pdf", "skill:/tmp/pdf", "skill:..", "unmanaged:pdf", "pdf"] {
         assert!(bridge.editor_target(item).await.is_err());
@@ -407,8 +407,8 @@ async fn skill_commands_preserve_queries_payloads_and_errors() {
     ] { replies.insert(route.into(), (StatusCode::OK, value)); }
     replies.insert("POST /skills/adopt".into(), (StatusCode::NO_CONTENT, Value::Null));
     replies.insert("POST /imports/fork".into(), (StatusCode::CONFLICT, json!({"error":"Skill changed"})));
-    let server = Server::start(Router::new().fallback(respond).with_state((requests.clone(), replies))).await;
-    let bridge = Bridge::new(server.client.clone());
+    let daemon = FakeDaemon::start(Router::new().fallback(respond).with_state((requests.clone(), replies))).await;
+    let bridge = Bridge::new(daemon.client.clone());
     assert_eq!(serde_json::to_value(bridge.skills().await.unwrap()).unwrap(), inventory);
     let query = ContentQuery { item: "unmanaged:pdf".into(), hash: Some("sha256:one".into()), harness: Some("claude".into()) };
     assert_eq!(serde_json::to_value(bridge.skill_tree(query.clone()).await.unwrap()).unwrap(), tree);
@@ -447,8 +447,8 @@ async fn editor_resolution_uses_inventory_path_and_refuses_inventory_imports_and
     std::fs::write(path.join("SKILL.md"), "pdf").unwrap();
     let mut replies = Replies::new();
     replies.insert("GET /status".into(), (StatusCode::OK, json!({
-        "machine_id":"alpha", "hub_url":"http://hub", "repo":repo, "headline":"in_sync",
-        "connection":"connected", "last_error":null, "revoked":false, "hub_baseline":null,
+        "machine_id":"alpha", "server_url":"http://server", "repo":repo, "headline":"in_sync",
+        "connection":"connected", "last_error":null, "revoked":false, "server_baseline":null,
         "assignment_revision":1, "report":{}
     })));
     let make = |name: &str, kind: &str, path: &std::path::Path| json!({
@@ -461,8 +461,8 @@ async fn editor_resolution_uses_inventory_path_and_refuses_inventory_imports_and
         make("gone", "personal", &repo.join("missing")), make("escape", "personal", std::path::Path::new("/tmp")),
         make("unmanaged", "unmanaged", &path),
     ])));
-    let server = Server::start(Router::new().fallback(respond).with_state((Recorded::default(), replies))).await;
-    let bridge = Bridge::new(server.client.clone());
+    let daemon = FakeDaemon::start(Router::new().fallback(respond).with_state((Recorded::default(), replies))).await;
+    let bridge = Bridge::new(daemon.client.clone());
     assert_eq!(bridge.editor_target("skill:pdf").await.unwrap().folder, path.canonicalize().unwrap());
     assert!(bridge.editor_target("skill:remote").await.err().unwrap().message.contains("Fork"));
     for name in ["gone", "escape", "unknown", "unmanaged"] {
@@ -485,12 +485,12 @@ async fn editor_inventory_accepts_literal_unusual_names() {
     let mut replies = Replies::new();
     replies.insert("GET /skills".into(), (StatusCode::OK, json!(entries)));
     replies.insert("GET /status".into(), (StatusCode::OK, json!({
-        "machine_id":"a", "hub_url":"http://hub", "repo":directory.path(),
+        "machine_id":"a", "server_url":"http://server", "repo":directory.path(),
         "headline":"drafting", "connection":"connected", "last_error":null,
-        "revoked":false, "hub_baseline":null, "assignment_revision":1, "report":{}
+        "revoked":false, "server_baseline":null, "assignment_revision":1, "report":{}
     })));
-    let server = Server::start(Router::new().fallback(respond).with_state((Recorded::default(), replies))).await;
-    let bridge = Bridge::new(server.client.clone());
+    let daemon = FakeDaemon::start(Router::new().fallback(respond).with_state((Recorded::default(), replies))).await;
+    let bridge = Bridge::new(daemon.client.clone());
     for name in names {
         let target = bridge.editor_target(&format!("skill:{name}")).await.unwrap();
         assert_eq!(target.folder.file_name().unwrap(), name);
@@ -511,7 +511,7 @@ fn every_editor_launch_keeps_unusual_paths_in_one_argument() {
     std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
     for name in ["my notes", "résumé", "a'\"b", "semi;colon", "$(touch nope)", "line\nbreak", "a\\b"] {
         let folder = directory.path().join(name);
-        let target = Target { file: folder.join("SKILL.md"), folder, fragment: false };
+        let target = Target { file: folder.join("SKILL.md"), folder, rule: false };
         for kind in ["Terminal.app", "wezterm", "gnome-terminal", "kitty", "konsole", "ghostty", "alacritty", "xterm", "open", "xdg-open"] {
             let args = if matches!(kind, "open" | "xdg-open") { vec![] } else {
                 let mut args = terminal_prefix(kind);

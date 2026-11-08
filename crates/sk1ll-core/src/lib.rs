@@ -23,13 +23,13 @@ pub mod sync;
 use std::path::{Path, PathBuf};
 
 pub use assignment::{Assignment, HarnessAssignment};
-pub use draft::{Change, DraftItem, FLEET_BRANCH, ItemRef, PullOutcome, default_promote_message, machine_author};
+pub use draft::{Change, DraftItem, FLEET_BRANCH, ItemRef, PullOutcome, default_commit_message, machine_author};
 pub use engine::EngineLock;
 pub use imports::{
     FetchedLink, FetchedUpdates, ImportState, ImportStatus, ResolvedSource, SkillCandidate, UpdateReport,
     UpdateTargets,
 };
-pub use instructions::Fragment;
+pub use instructions::Rule;
 pub use lock::{LockEntry, Lockfile};
 pub use machine::{
     EffectiveHarness, Harness, HarnessEntry, HarnessOrigin, InstructionsFormat, LinkMode, MachineConfig,

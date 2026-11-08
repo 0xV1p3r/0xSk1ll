@@ -9,12 +9,12 @@
 //! | GET | `/skills` | → `Vec<ContentEntry>` |
 //! | GET | `/skills/tree?item=skill:pdf` | → `Vec<FileEntry>` |
 //! | GET | `/skills/file?item=skill:pdf&path=SKILL.md` | → `FileContent` |
-//! | POST | `/skills/adopt` | `ConflictTarget` → 204; unmanaged Adopt needs a Hub connection |
+//! | POST | `/skills/adopt` | `ConflictTarget` → 204; unmanaged Adopt needs a Server connection |
 //! | GET | `/draft` | → `Vec<`[`DraftEntry`]`>` |
 //! | GET | `/draft/diff?item=` | → [`DiffView`] |
-//! | GET | `/promote/message?items=a,b` | → [`PromoteMessage`] |
-//! | POST | `/promote` | [`PromoteRequest`] → [`PromoteResponse`] |
-//! | POST | `/reset` | [`ResetRequest`] → [`ResetResponse`] |
+//! | GET | `/commit/message?items=a,b` | → [`CommitMessage`] |
+//! | POST | `/commit` | [`CommitRequest`] → [`CommitResponse`] |
+//! | POST | `/restore` | [`RestoreRequest`] → [`RestoreResponse`] |
 //! | POST | `/pull` | → [`PullResult`] |
 //! | GET | `/conflicts` | → `Vec<`[`ConflictView`]`>` |
 //! | GET | `/conflicts/displaced` | → all recovered entries |
@@ -31,17 +31,17 @@
 //! | POST | `/join` | [`JoinApiRequest`] → [`Joined`](crate::Joined) |
 //! | GET | `/events` | → SSE stream of [`Event`] |
 //!
-//! `POST /join` is for a machine that was removed (or whose token the hub
+//! `POST /join` is for a machine that was removed (or whose token the server
 //! rejects): the daemon joins again and then restarts itself in place with
 //! the new credentials, so the socket goes away for a moment.
 //!
 //! The socket's directory must be ours and mode 0700, and connections from
 //! other users are refused.
 //!
-//! Hub pass-throughs (the daemon adds its machine token; 503 while the hub
+//! Server pass-throughs (the daemon adds its machine token; 503 while the server
 //! is unreachable): `GET /fleet`, `GET|PUT /machines/{id}/assignment`,
 //! `DELETE /machines/{id}`, `GET /log`, `POST /log/{id}/undo`,
-//! `GET /imports`, `POST /join-codes`. Bodies are the hub's (`sk1ll-proto`).
+//! `GET /imports`, `POST /join-codes`. Bodies are the server's (`sk1ll-proto`).
 //!
 //! Errors are [`ErrorBody`] with a 4xx/5xx status.
 
@@ -65,17 +65,17 @@ use tokio::net::UnixStream;
 // ---------------------------------------------------------------------------
 // Types
 
-/// The daemon's connection to the hub.
+/// The daemon's connection to the server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Connection {
     Connecting,
     Connected,
-    /// The hub is unreachable; the machine keeps working from its cache.
+    /// The server is unreachable; the machine keeps working from its cache.
     Offline,
-    /// The hub (or something in front of it) answers 401 to the machine's
+    /// The server (or something in front of it) answers 401 to the machine's
     /// token. Like Offline, the machine keeps working and keeps retrying;
-    /// only the hub's explicit `revoked` message removes it.
+    /// only the server's explicit `revoked` message removes it.
     AuthRejected,
     /// The machine was removed from the fleet; the daemon no longer manages it.
     Revoked,
@@ -85,28 +85,28 @@ pub enum Connection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusView {
     pub machine_id: String,
-    pub hub_url: String,
+    pub server_url: String,
     pub repo: PathBuf,
-    /// Computed locally: Offline while not connected to the hub.
+    /// Computed locally: Offline while not connected to the server.
     pub headline: MachineStatus,
     pub connection: Connection,
     pub last_error: Option<String>,
     pub revoked: bool,
-    /// The hub's baseline as last announced (nudge or our own push).
-    pub hub_baseline: Option<String>,
+    /// The server's baseline as last announced (nudge or our own push).
+    pub server_baseline: Option<String>,
     /// Revision of the applied assignment snapshot.
     pub assignment_revision: u64,
     /// No assignment snapshot is stored (lost or never received): harnesses
-    /// are left alone until the hub sends one.
+    /// are left alone until the server sends one.
     #[serde(default)]
     pub awaiting_assignment: bool,
-    /// Since when (Unix seconds) the hub has been rejecting the token.
+    /// Since when (Unix seconds) the server has been rejecting the token.
     #[serde(default)]
     pub auth_rejected_since: Option<i64>,
-    /// `draft_discarded` messages waiting to be delivered to the hub.
+    /// `draft_discarded` messages waiting to be delivered to the server.
     #[serde(default)]
     pub pending_discards: usize,
-    /// What the daemon reports to the hub.
+    /// What the daemon reports to the server.
     pub report: MachineReport,
 }
 
@@ -145,18 +145,18 @@ pub struct DiffView {
     pub diff: String,
 }
 
-/// `GET /promote/message`: the message a promote of `items` gets by default.
+/// `GET /commit/message`: the message a commit of `items` gets by default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PromoteMessage {
+pub struct CommitMessage {
     pub items: Vec<ItemRef>,
     pub message: String,
 }
 
-/// Items are `kind:name` or a bare skill/fragment name that is in the draft.
+/// Items are `kind:name` or a bare skill/rule name that is in the draft.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PromoteRequest {
+pub struct CommitRequest {
     pub items: Vec<String>,
-    /// Default: `promote <items> from <machine>`.
+    /// Default: `commit <items> from <machine>`.
     #[serde(default)]
     pub message: Option<String>,
     /// `"Name <email>"`. Default: git's identity, else the machine id.
@@ -165,27 +165,27 @@ pub struct PromoteRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PromoteResponse {
+pub struct CommitResponse {
     pub sha: String,
     pub items: Vec<ItemRef>,
     pub message: String,
-    /// Pushed to the hub; otherwise queued until the daemon reconnects.
+    /// Pushed to the server; otherwise queued until the daemon reconnects.
     pub pushed: bool,
     pub push_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResetRequest {
+pub struct RestoreRequest {
     #[serde(default)]
     pub items: Vec<String>,
-    /// Reset the whole draft (`items` must be empty).
+    /// Restore the whole draft (`items` must be empty).
     #[serde(default)]
     pub all: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResetResponse {
-    /// Items that left the draft (reported to the hub as `draft_discarded`).
+pub struct RestoreResponse {
+    /// Items that left the draft (reported to the server as `draft_discarded`).
     pub discarded: Vec<ItemRef>,
 }
 
@@ -220,7 +220,7 @@ pub struct ConflictView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub displaced_at: Option<u64>,
     pub harness: String,
-    /// What to pass to adopt/overwrite: a skill name, or a rule's fragment name.
+    /// What to pass to adopt/overwrite: a skill name, or a rule's rule name.
     pub name: String,
     pub items: Vec<ItemRef>,
     pub dest: PathBuf,
@@ -353,7 +353,7 @@ pub struct PushResult {
 /// `POST /join`: like `sk1ll join`, done by the running daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinApiRequest {
-    pub hub_url: String,
+    pub server_url: String,
     pub code: String,
     #[serde(default)]
     pub machine_id: Option<String>,
@@ -370,13 +370,13 @@ pub struct JoinApiRequest {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
     /// `GET /status` changed. Also invalidates `/items` when a pull or
-    /// promote changes the applied Baseline or unpushed commits.
+    /// commit changes the applied Baseline or unpushed commits.
     Status,
     /// The draft's item list changed.
     Draft,
     /// A new assignment was applied.
     Assignment { revision: u64 },
-    /// The hub's set of imports with upstream updates changed.
+    /// The server's set of imports with upstream updates changed.
     Imports { updates: Vec<ImportUpdate> },
     /// The fleet view may have changed (connection, baseline, removals).
     Fleet,
@@ -538,16 +538,16 @@ impl Client {
         self.get(&format!("/draft/diff?item={}", encode(item))).await
     }
 
-    pub async fn promote_message(&self, items: &[String]) -> Result<PromoteMessage> {
-        self.get(&format!("/promote/message?items={}", encode(&items.join(",")))).await
+    pub async fn commit_message(&self, items: &[String]) -> Result<CommitMessage> {
+        self.get(&format!("/commit/message?items={}", encode(&items.join(",")))).await
     }
 
-    pub async fn promote(&self, req: &PromoteRequest) -> Result<PromoteResponse> {
-        self.post("/promote", req).await
+    pub async fn commit(&self, req: &CommitRequest) -> Result<CommitResponse> {
+        self.post("/commit", req).await
     }
 
-    pub async fn reset(&self, req: &ResetRequest) -> Result<ResetResponse> {
-        self.post("/reset", req).await
+    pub async fn restore(&self, req: &RestoreRequest) -> Result<RestoreResponse> {
+        self.post("/restore", req).await
     }
 
     pub async fn pull(&self) -> Result<PullResult> {
@@ -623,7 +623,7 @@ impl Client {
         self.get("/fleet").await
     }
 
-    /// The Hub's current assignment and revision, read together.
+    /// The Server's current assignment and revision, read together.
     pub async fn assignment(&self, machine: &str) -> Result<AssignmentSnapshot> {
         self.get(&format!("/machines/{}/assignment", encode(machine))).await
     }

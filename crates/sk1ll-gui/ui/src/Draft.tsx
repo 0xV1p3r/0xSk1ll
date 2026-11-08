@@ -10,7 +10,7 @@ import { api } from './api';
 import { useMutation, useResource } from './hooks';
 import { Action, ChangeBadge, ErrorNotice, Loading, Nothing, Notice, Pending } from './shared';
 import { captureReview, confirmReview, loadDraft, reconcileReview, type DraftReview } from './draftReview';
-import type { DraftEntry, PromoteResponse, PullResult, StatusView } from './types';
+import type { DraftEntry, CommitResponse, PullResult, StatusView } from './types';
 
 function Diff({ item, diff }: { item: string; diff: string }) {
   return <pre tabIndex={0} className="diff mt-2 min-w-0 max-w-full max-h-[32rem] overflow-auto rounded-md border bg-muted/40 p-3 font-mono text-xs leading-relaxed outline-none [tab-size:4] focus-visible:ring-3 focus-visible:ring-ring"
@@ -46,50 +46,50 @@ function ReviewNotice({ review, disabled, accept }: { review: DraftReview; disab
 export function Draft({ revision, status, changed }: { revision: number; status: StatusView; changed: () => void }) {
   const { data, error, loading } = useResource(loadDraft, revision);
   const [selected, setSelected] = useState<string[]>([]);
-  const [promote, setPromote] = useState<{ review: DraftReview; message: string }>();
-  const resetTrigger = useRef<HTMLButtonElement>(null);
-  const promoteTrigger = useRef<HTMLButtonElement>(null);
+  const [commit, setCommit] = useState<{ review: DraftReview; message: string }>();
+  const restoreTrigger = useRef<HTMLButtonElement>(null);
+  const commitTrigger = useRef<HTMLButtonElement>(null);
   const completion = useRef<HTMLDivElement>(null);
-  const [reset, setReset] = useState<{ review: DraftReview; all: boolean }>();
-  const [result, setResult] = useState<PromoteResponse>();
+  const [restore, setRestore] = useState<{ review: DraftReview; all: boolean }>();
+  const [result, setResult] = useState<CommitResponse>();
   const [pull, setPull] = useState<PullResult>();
   const mutation = useMutation(changed);
   const prefill = useMutation();
   // Latch changes across refreshes, even if an item later returns to its reviewed content.
   useEffect(() => {
     if (!data) return;
-    setPromote(value => value && { ...value, review: reconcileReview(value.review, data) });
-    setReset(value => value && { ...value, review: reconcileReview(value.review, data) });
+    setCommit(value => value && { ...value, review: reconcileReview(value.review, data) });
+    setRestore(value => value && { ...value, review: reconcileReview(value.review, data) });
   }, [data]);
-  const promoteReview = promote && data && reconcileReview(promote.review, data);
-  const resetReview = reset && data && reconcileReview(reset.review, data);
+  const commitReview = commit && data && reconcileReview(commit.review, data);
+  const restoreReview = restore && data && reconcileReview(restore.review, data);
   const reviewDisabled = loading || !!error || mutation.pending;
   const items = selected.filter(item => data?.some(d => d.item === item));
   const all = !!data?.length && items.length === data.length;
   return <>
     {(status.report.blocked || status.report.clashes.length > 0) && <Notice title="Blocked" tone="destructive">
-      The new Baseline clashes with this Draft. Promote or Reset the clashing items, then Pull.
+      The new Baseline clashes with this Draft. Commit or Restore the clashing items, then Pull.
       <p className="font-mono text-xs">{status.report.clashes.join(', ')}</p></Notice>}
     <div className="flex flex-wrap items-center gap-2">
-      <Button ref={promoteTrigger} disabled={!items.length || prefill.pending || reviewDisabled}
+      <Button ref={commitTrigger} disabled={!items.length || prefill.pending || reviewDisabled}
         onClick={() => {
           if (!data) return;
           setResult(undefined);
           const review = captureReview(data, items);
-          void prefill.run(() => api.promoteMessage(review.items), value => setPromote({ review, message: value.message }));
+          void prefill.run(() => api.commitMessage(review.items), value => setCommit({ review, message: value.message }));
         }}>
-        <Pending pending={prefill.pending}><ArrowUpFromLine data-icon="inline-start" />Promote {items.length > 0 ? `(${items.length})` : ''}</Pending></Button>
+        <Pending pending={prefill.pending}><ArrowUpFromLine data-icon="inline-start" />Commit {items.length > 0 ? `(${items.length})` : ''}</Pending></Button>
       <Button variant="destructive" disabled={!items.length || reviewDisabled}
-        onClick={event => { if (data) { resetTrigger.current = event.currentTarget; setReset({ review: captureReview(data, items), all: false }); } }}>Reset selected</Button>
+        onClick={event => { if (data) { restoreTrigger.current = event.currentTarget; setRestore({ review: captureReview(data, items), all: false }); } }}>Restore selected</Button>
       <Button variant="ghost" className="text-destructive-foreground hover:text-destructive-foreground" disabled={!data?.length || reviewDisabled}
-        onClick={event => { if (data) { resetTrigger.current = event.currentTarget; setReset({ review: captureReview(data, data.map(entry => entry.item), true), all: true }); } }}>Reset all</Button>
+        onClick={event => { if (data) { restoreTrigger.current = event.currentTarget; setRestore({ review: captureReview(data, data.map(entry => entry.item), true), all: true }); } }}>Restore all</Button>
       <div className="ml-auto"><Action label="Pull Baseline" action={async () => { const value = await api.pull(); setPull(value); }} onDone={changed} /></div>
     </div><ErrorNotice error={error} /><ErrorNotice error={prefill.error} />
     {pull && <Notice title={pull.state === 'blocked' ? 'Blocked' : 'Pull complete'} tone={pull.state === 'blocked' ? 'destructive' : 'default'}>
       {pull.state === 'blocked' ? `Clashes: ${pull.items.join(', ')}` : pull.state === 'updated' ? `Baseline ${pull.to}` : 'Already on the latest Baseline.'}
     </Notice>}
-    {result && <div ref={completion} tabIndex={-1} className="outline-none"><Notice title="Promote complete"><code className="font-mono text-xs">{result.sha}</code>
-      <p>{result.pushed ? 'Pushed to the Hub.' : 'Unpushed. The Daemon queued this Promote until it can reach the Hub.'}</p>
+    {result && <div ref={completion} tabIndex={-1} className="outline-none"><Notice title="Commit complete"><code className="font-mono text-xs">{result.sha}</code>
+      <p>{result.pushed ? 'Pushed to the Server.' : 'Unpushed. The Daemon queued this Commit until it can reach the Server.'}</p>
       {result.push_error && <p>{result.push_error}</p>}</Notice></div>}
     {loading && !data && <Loading />}{data?.length === 0 && <Nothing title="Draft is clean">This Machine has no Draft changes.</Nothing>}
     {!!data?.length && <FieldSet className="min-w-0 w-full max-w-full gap-0"><FieldLegend className="sr-only">Draft items</FieldLegend>
@@ -105,38 +105,38 @@ export function Draft({ revision, status, changed }: { revision: number; status:
             ? previous.filter(i => i !== entry.item) : [...previous, entry.item])} />)}
       </div>
     </FieldSet>}
-    <Dialog open={!!promote} onOpenChange={open => { if (!open && !mutation.pending) setPromote(undefined); }}>
-      <DialogContent finalFocus={() => completion.current ?? promoteTrigger.current} showCloseButton={!mutation.pending}><DialogHeader><DialogTitle>Promote to Baseline</DialogTitle>
-        <DialogDescription>{promoteReview?.items.length ? `${promoteReview.items.length} Draft ${promoteReview.items.length === 1 ? 'item' : 'items'} selected. Expand an item to review its diff.` : 'No selected items remain in Draft.'}</DialogDescription></DialogHeader>
-        {promoteReview && <ReviewNotice review={promoteReview} disabled={reviewDisabled}
-          accept={() => setPromote(value => value && { ...value, review: confirmReview(promoteReview) })} />}
+    <Dialog open={!!commit} onOpenChange={open => { if (!open && !mutation.pending) setCommit(undefined); }}>
+      <DialogContent finalFocus={() => completion.current ?? commitTrigger.current} showCloseButton={!mutation.pending}><DialogHeader><DialogTitle>Commit to Baseline</DialogTitle>
+        <DialogDescription>{commitReview?.items.length ? `${commitReview.items.length} Draft ${commitReview.items.length === 1 ? 'item' : 'items'} selected. Expand an item to review its diff.` : 'No selected items remain in Draft.'}</DialogDescription></DialogHeader>
+        {commitReview && <ReviewNotice review={commitReview} disabled={reviewDisabled}
+          accept={() => setCommit(value => value && { ...value, review: confirmReview(commitReview) })} />}
         <ErrorNotice error={error} />
-        <Field><FieldLabel htmlFor="promote-message">Message</FieldLabel><Textarea id="promote-message"
-          value={promote?.message ?? ''} disabled={mutation.pending}
-          onChange={e => setPromote(value => value && { ...value, message: e.target.value })} /></Field>
+        <Field><FieldLabel htmlFor="commit-message">Message</FieldLabel><Textarea id="commit-message"
+          value={commit?.message ?? ''} disabled={mutation.pending}
+          onChange={e => setCommit(value => value && { ...value, message: e.target.value })} /></Field>
         <ErrorNotice error={mutation.error} /><DialogFooter>
-          <Button variant="outline" disabled={mutation.pending} onClick={() => setPromote(undefined)}>Cancel</Button>
-          <Button disabled={!promote?.message.trim() || !promoteReview?.items.length || !!promoteReview.changes.length || reviewDisabled} onClick={() => {
-            if (promote && promoteReview && !promoteReview.changes.length && !reviewDisabled) void mutation.run(
-              () => api.promote({ items: promoteReview.items, message: promote.message }), value => {
-              setResult(value); setSelected([]); setPromote(undefined);
+          <Button variant="outline" disabled={mutation.pending} onClick={() => setCommit(undefined)}>Cancel</Button>
+          <Button disabled={!commit?.message.trim() || !commitReview?.items.length || !!commitReview.changes.length || reviewDisabled} onClick={() => {
+            if (commit && commitReview && !commitReview.changes.length && !reviewDisabled) void mutation.run(
+              () => api.commit({ items: commitReview.items, message: commit.message }), value => {
+              setResult(value); setSelected([]); setCommit(undefined);
             });
-          }}><Pending pending={mutation.pending}>Promote</Pending></Button>
+          }}><Pending pending={mutation.pending}>Commit</Pending></Button>
         </DialogFooter></DialogContent></Dialog>
-    <Dialog open={!!reset} onOpenChange={open => { if (!open && !mutation.pending) setReset(undefined); }}>
-      <DialogContent finalFocus={resetTrigger} showCloseButton={!mutation.pending}><DialogHeader>
-        <DialogTitle>Reset {reset?.all ? 'reviewed Draft' : 'selected Draft items'}?</DialogTitle>
-        <DialogDescription>Return {resetReview?.items.join(', ') || 'no items'} to Baseline. Their Draft changes will be lost.</DialogDescription>
+    <Dialog open={!!restore} onOpenChange={open => { if (!open && !mutation.pending) setRestore(undefined); }}>
+      <DialogContent finalFocus={restoreTrigger} showCloseButton={!mutation.pending}><DialogHeader>
+        <DialogTitle>Restore {restore?.all ? 'reviewed Draft' : 'selected Draft items'}?</DialogTitle>
+        <DialogDescription>Return {restoreReview?.items.join(', ') || 'no items'} to Baseline. Their Draft changes will be lost.</DialogDescription>
       </DialogHeader>
-        {resetReview && <ReviewNotice review={resetReview} disabled={reviewDisabled}
-          accept={() => setReset(value => value && { ...value, review: confirmReview(resetReview) })} />}
+        {restoreReview && <ReviewNotice review={restoreReview} disabled={reviewDisabled}
+          accept={() => setRestore(value => value && { ...value, review: confirmReview(restoreReview) })} />}
         <ErrorNotice error={error} /><ErrorNotice error={mutation.error} /><DialogFooter>
-          <Button variant="outline" disabled={mutation.pending} onClick={() => setReset(undefined)}>Cancel</Button>
-          <Button variant="destructive" disabled={!resetReview?.items.length || !!resetReview.changes.length || reviewDisabled}
+          <Button variant="outline" disabled={mutation.pending} onClick={() => setRestore(undefined)}>Cancel</Button>
+          <Button variant="destructive" disabled={!restoreReview?.items.length || !!restoreReview.changes.length || reviewDisabled}
             onClick={() => {
-              if (resetReview && !resetReview.changes.length && !reviewDisabled) void mutation.run(
-                () => api.reset({ items: resetReview.items, all: false }), () => { setReset(undefined); setSelected([]); });
-            }}><Pending pending={mutation.pending}>{reset?.all ? 'Reset all' : 'Reset selected'}</Pending></Button>
+              if (restoreReview && !restoreReview.changes.length && !reviewDisabled) void mutation.run(
+                () => api.restore({ items: restoreReview.items, all: false }), () => { setRestore(undefined); setSelected([]); });
+            }}><Pending pending={mutation.pending}>{restore?.all ? 'Restore all' : 'Restore selected'}</Pending></Button>
         </DialogFooter></DialogContent>
     </Dialog>
   </>;

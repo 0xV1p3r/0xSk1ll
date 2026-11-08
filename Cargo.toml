@@ -4,7 +4,7 @@ members = [
     "crates/sk1ll-cli",
     "crates/sk1ll-core",
     "crates/sk1ll-daemon",
-    "crates/sk1ll-hub",
+    "crates/sk1ll-server",
     "crates/sk1ll-proto",
     "crates/sk1ll-gui/src-tauri",
 ]

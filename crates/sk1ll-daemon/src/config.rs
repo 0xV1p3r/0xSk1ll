@@ -7,7 +7,7 @@ use sk1ll_core::{Assignment, MachineConfig};
 /// Daemon settings: where its files live and how often it does things.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Machine id, hub URL, token and repo path (`SK1LL_DAEMON_STATE`,
+    /// Machine id, server URL, token and repo path (`SK1LL_DAEMON_STATE`,
     /// default `~/.config/sk1ll/daemon.json`). Mode 0600.
     pub state: PathBuf,
     /// Harness config (`SK1LL_MACHINE_CONFIG`, default `~/.config/sk1ll/machine.toml`).
@@ -27,10 +27,10 @@ pub struct Config {
     /// Longest a stream of file changes can postpone a sync
     /// (`SK1LL_DEBOUNCE_MAX`, default `2s`, at least `debounce`).
     pub debounce_max: Duration,
-    /// Local re-sync of the harnesses, whether or not the hub is reachable
+    /// Local re-sync of the harnesses, whether or not the server is reachable
     /// (`SK1LL_RECONCILE_INTERVAL`, default `60s`).
     pub reconcile_every: Duration,
-    /// After the hub has rejected the token this long, `/status` says the
+    /// After the server has rejected the token this long, `/status` says the
     /// machine was probably removed (`SK1LL_AUTH_WARN_AFTER`, default `24h`).
     /// It is never revoked automatically.
     pub auth_warn_after: Duration,

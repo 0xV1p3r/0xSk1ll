@@ -1,19 +1,19 @@
-//! The daemon's side of the hub protocol (`sk1ll-proto`): one WebSocket
+//! The daemon's side of the server protocol (`sk1ll-proto`): one WebSocket
 //! session at a time, reconnected with jittered exponential backoff, plus
 //! authenticated pass-through of REST calls for the local API.
 //!
 //! On connect: `hello`; then the local state is recomputed (with the engine
 //! mutex) and sent as the first status; then the outbox of `draft_discarded`
-//! is delivered, each entry removed only once sent; then promotes queued
+//! is delivered, each entry removed only once sent; then commits queued
 //! while offline are pushed and the baseline is pulled. Afterwards a status
 //! goes out whenever the report changes, always before newly queued
 //! `draft_discarded`. The socket is read continuously so pings are answered;
-//! hub messages are handled in order by a separate worker so slow work (a
+//! server messages are handled in order by a separate worker so slow work (a
 //! pull) never stalls reading.
 //!
 //! An HTTP 401 on connecting is not a revocation (a proxy may send it too):
 //! the machine is marked auth-rejected, keeps being managed, and the
-//! connection is retried. Only the hub's `revoked` message revokes it.
+//! connection is retried. Only the server's `revoked` message revokes it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,7 +23,7 @@ use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::Response;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use sk1ll_proto::{AssignmentChanges, AssignmentSnapshot, AssignmentUpdate, DaemonMessage, HubMessage, MachineReport};
+use sk1ll_proto::{AssignmentChanges, AssignmentSnapshot, AssignmentUpdate, DaemonMessage, ServerMessage, MachineReport};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::{self, Message, client::IntoClientRequest};
 
@@ -41,7 +41,7 @@ type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<t
 type Sink = futures_util::stream::SplitSink<Ws, Message>;
 
 enum ConnectError {
-    /// HTTP 401 on the upgrade: the token was refused, by the hub or by
+    /// HTTP 401 on the upgrade: the token was refused, by the server or by
     /// something in front of it.
     Unauthorized,
     Other(String),
@@ -55,9 +55,9 @@ pub(crate) async fn run(d: Arc<Daemon>) {
         match connect(&d).await {
             Ok(ws) => {
                 backoff = d.cfg.reconnect_min;
-                tracing::info!("connected to {}", d.ident.hub_url);
+                tracing::info!("connected to {}", d.ident.server_url);
                 if let Err(e) = session(&d, ws, &inbox_tx).await {
-                    tracing::info!("hub connection lost: {}", redact(&format!("{e:#}")));
+                    tracing::info!("server connection lost: {}", redact(&format!("{e:#}")));
                 }
                 d.set_connection(Connection::Offline);
             }
@@ -86,7 +86,7 @@ fn jitter(d: Duration) -> Duration {
 }
 
 async fn connect(d: &Daemon) -> std::result::Result<Ws, ConnectError> {
-    let other = |e: &dyn std::fmt::Display| ConnectError::Other(redact(&format!("hub unreachable (offline): {e}")));
+    let other = |e: &dyn std::fmt::Display| ConnectError::Other(redact(&format!("server unreachable (offline): {e}")));
     let mut req = d.ident.ws_url().into_client_request().map_err(|e| other(&e))?;
     let auth = HeaderValue::from_str(&format!("Bearer {}", d.ident.token)).map_err(|_| other(&"bad token"))?;
     req.headers_mut().insert(header::AUTHORIZATION, auth);
@@ -112,9 +112,9 @@ async fn send(ws: &mut Sink, msg: &DaemonMessage) -> anyhow::Result<()> {
 async fn flush_outbox(d: &Arc<Daemon>, sink: &mut Sink, sent: &mut MachineReport) -> anyhow::Result<()> {
     loop {
         // Capture the entry and the state used to filter it under the same
-        // engine mutex, so a concurrent Reset cannot queue against an older report.
+        // engine mutex, so a concurrent Restore cannot queue against an older report.
         // Adoption holds the engine mutex while waiting for its published
-        // draft to reach the Hub. Keep sending fresh reports even if an outbox
+        // draft to reach the Server. Keep sending fresh reports even if an outbox
         // refresh is waiting for that mutex.
         let mut view = d.subscribe_view();
         let refresh = d.blocking(|d, eng| {
@@ -161,13 +161,13 @@ async fn refresh_report(d: &Arc<Daemon>) -> anyhow::Result<MachineReport> {
     }).await {
         Ok(report) => Ok(report),
         Err(e) => {
-            d.set_error(format!("refreshing before reporting to the Hub: {e}"));
+            d.set_error(format!("refreshing before reporting to the Server: {e}"));
             Err(e.into())
         }
     }
 }
 
-async fn session(d: &Arc<Daemon>, ws: Ws, inbox: &mpsc::UnboundedSender<HubMessage>) -> anyhow::Result<()> {
+async fn session(d: &Arc<Daemon>, ws: Ws, inbox: &mpsc::UnboundedSender<ServerMessage>) -> anyhow::Result<()> {
     let (mut sink, mut stream) = ws.split();
     let mut view = d.subscribe_view();
     send(&mut sink, &DaemonMessage::Hello { machine_id: d.ident.machine_id.clone() }).await?;
@@ -187,15 +187,15 @@ async fn session(d: &Arc<Daemon>, ws: Ws, inbox: &mpsc::UnboundedSender<HubMessa
     loop {
         tokio::select! {
             msg = stream.next() => match msg {
-                Some(Ok(Message::Text(text))) => match serde_json::from_str::<HubMessage>(&text) {
-                    Ok(HubMessage::Revoked) => {
+                Some(Ok(Message::Text(text))) => match serde_json::from_str::<ServerMessage>(&text) {
+                    Ok(ServerMessage::Revoked) => {
                         d.blocking(|d, eng| d.revoke(eng, "removed from the fleet")).await?;
                         return Ok(());
                     }
                     Ok(m) => {
                         let _ = inbox.send(m);
                     }
-                    Err(e) => tracing::warn!("bad hub message: {e}"),
+                    Err(e) => tracing::warn!("bad server message: {e}"),
                 },
                 Some(Ok(Message::Close(_))) | None => return Ok(()),
                 // Pings are answered by tungstenite as we keep reading.
@@ -215,24 +215,24 @@ async fn session(d: &Arc<Daemon>, ws: Ws, inbox: &mpsc::UnboundedSender<HubMessa
                 }
             }
             () = d.outbox_ready.notified() => {
-                // The status that led to it goes first (e.g. the draft after a Reset).
+                // The status that led to it goes first (e.g. the draft after a Restore).
                 flush_outbox(d, &mut sink, &mut sent).await?;
             }
         }
     }
 }
 
-/// Handles hub messages in the order they arrived.
-async fn inbox(d: Arc<Daemon>, mut rx: mpsc::UnboundedReceiver<HubMessage>) {
+/// Handles server messages in the order they arrived.
+async fn inbox(d: Arc<Daemon>, mut rx: mpsc::UnboundedReceiver<ServerMessage>) {
     while let Some(m) = rx.recv().await {
         let result = match m {
-            HubMessage::Assignment(snap) => d.blocking(move |d, eng| d.apply_assignment(eng, snap).map(drop)).await,
-            HubMessage::Nudge { baseline } => d.blocking(move |d, eng| d.nudge(eng, baseline)).await,
-            HubMessage::ImportsChanged { updates } => {
+            ServerMessage::Assignment(snap) => d.blocking(move |d, eng| d.apply_assignment(eng, snap).map(drop)).await,
+            ServerMessage::Nudge { baseline } => d.blocking(move |d, eng| d.nudge(eng, baseline)).await,
+            ServerMessage::ImportsChanged { updates } => {
                 d.event(Event::Imports { updates });
                 Ok(())
             }
-            HubMessage::Revoked => d.blocking(|d, eng| d.revoke(eng, "removed from the fleet")).await,
+            ServerMessage::Revoked => d.blocking(|d, eng| d.revoke(eng, "removed from the fleet")).await,
         };
         if let Err(e) = result {
             d.set_error(e);
@@ -240,15 +240,15 @@ async fn inbox(d: Arc<Daemon>, mut rx: mpsc::UnboundedReceiver<HubMessage>) {
     }
 }
 
-/// Forwards a local API call to the hub's `/api` with the machine token.
+/// Forwards a local API call to the server's `/api` with the machine token.
 pub(crate) async fn proxy(d: &Daemon, method: Method, path_and_query: &str, body: Bytes) -> Result<Response> {
     if d.is_revoked() {
-        return Err(Error::Unavailable("this machine was removed from the fleet; it can't reach the hub".into()));
+        return Err(Error::Unavailable("this machine was removed from the fleet; it can't reach the server".into()));
     }
     let resp = request(&d.http, &d.ident, method.clone(), path_and_query, body).await?;
     let status = resp.status();
     let content_type = resp.headers().get(header::CONTENT_TYPE).cloned();
-    let bytes = resp.bytes().await.map_err(|e| Error::Unavailable(format!("reading the hub's response: {e}")))?;
+    let bytes = resp.bytes().await.map_err(|e| Error::Unavailable(format!("reading the server's response: {e}")))?;
     if method != Method::GET && status.is_success() {
         d.event(Event::Fleet);
     }
@@ -259,14 +259,14 @@ pub(crate) async fn proxy(d: &Daemon, method: Method, path_and_query: &str, body
     out.body(Body::from(bytes)).map_err(|e| Error::Internal(e.into()))
 }
 
-/// The authenticated Hub transport shared by the daemon and direct CLI.
+/// The authenticated Server transport shared by the daemon and direct CLI.
 async fn request(
     http: &reqwest::Client, state: &DaemonState, method: Method, path_and_query: &str, body: Bytes,
 ) -> Result<reqwest::Response> {
     if state.revoked {
-        return Err(Error::Unavailable("this machine was removed from the fleet; it can't reach the hub".into()));
+        return Err(Error::Unavailable("this machine was removed from the fleet; it can't reach the server".into()));
     }
-    let url = format!("{}/api{path_and_query}", state.hub_url);
+    let url = format!("{}/api{path_and_query}", state.server_url);
     let mut req = http.request(method, url).bearer_auth(&state.token).timeout(REQUEST_TIMEOUT);
     if !body.is_empty() {
         req = req.header(header::CONTENT_TYPE, "application/json").body(body);
@@ -274,10 +274,10 @@ async fn request(
     req
         .send()
         .await
-        .map_err(|e| Error::Unavailable(redact(&format!("offline: the hub is unreachable ({e})"))))
+        .map_err(|e| Error::Unavailable(redact(&format!("offline: the server is unreachable ({e})"))))
 }
 
-/// Changes this machine's assignment at the Hub while the daemon is stopped,
+/// Changes this machine's assignment at the Server while the daemon is stopped,
 /// then stores the returned authoritative snapshot. Hold the repo's engine
 /// lock across this call so a daemon cannot apply an older snapshot meanwhile.
 pub async fn set_assignment_direct(
@@ -288,7 +288,7 @@ pub async fn set_assignment_direct(
     let update = change_assignment(&reqwest::Client::new(), &state, changes).await?;
     let snap = AssignmentSnapshot { revision: update.revision, assignment: update.assignment.clone() };
     crate::state::save_snapshot(&cfg.snapshot_path(), &snap)
-        .context("Hub accepted the assignment, but saving its authoritative snapshot failed")?;
+        .context("Server accepted the assignment, but saving its authoritative snapshot failed")?;
     Ok(update)
 }
 
@@ -297,13 +297,13 @@ async fn change_assignment(http: &reqwest::Client, state: &DaemonState, changes:
     let path = format!("/machines/{}/assignment", state.machine_id);
     let resp = request(http, state, Method::PUT, &path, serde_json::to_vec(changes)?.into()).await?;
     let status = resp.status();
-    let body = resp.bytes().await.context("reading the Hub's assignment response")?;
+    let body = resp.bytes().await.context("reading the Server's assignment response")?;
     if !status.is_success() {
         let message = serde_json::from_slice::<sk1ll_proto::ErrorBody>(&body)
             .map_or_else(|_| String::from_utf8_lossy(&body).into_owned(), |e| e.error);
-        anyhow::bail!("Hub refused the assignment (HTTP {status}): {}", redact(&message));
+        anyhow::bail!("Server refused the assignment (HTTP {status}): {}", redact(&message));
     }
-    let update: AssignmentUpdate = serde_json::from_slice(&body).context("parsing the Hub's assignment response")?;
+    let update: AssignmentUpdate = serde_json::from_slice(&body).context("parsing the Server's assignment response")?;
     Ok(update)
 }
 
@@ -313,7 +313,7 @@ pub(crate) async fn assign_adoption(d: &Daemon, adoption: &sk1ll_core::sync::unm
     let item = sk1ll_proto::ItemRef::Skill(adoption.name.clone());
     tokio::time::timeout(SEND_TIMEOUT, async {
         loop {
-            anyhow::ensure!(d.is_connected(), "Adopt needs a connection to the Hub");
+            anyhow::ensure!(d.is_connected(), "Adopt needs a connection to the Server");
             let report = d.view().report;
             if !report.drafts.contains(&item) && !report.unpushed.contains(&item) {
                 break; // An unchanged baseline item needs no new draft report.
@@ -326,7 +326,7 @@ pub(crate) async fn assign_adoption(d: &Daemon, adoption: &sk1ll_core::sync::unm
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         Ok::<_, anyhow::Error>(())
-    }).await.map_err(|_| anyhow::anyhow!("Adopt timed out waiting for the Hub to receive the draft; retry Adopt"))??;
+    }).await.map_err(|_| anyhow::anyhow!("Adopt timed out waiting for the Server to receive the draft; retry Adopt"))??;
     let changes = AssignmentChanges { changes: adoption.locations.iter().map(|l| sk1ll_proto::ToggleChange {
         harness: l.harness.clone(), kind: sk1ll_proto::ToggleKind::Skill,
         name: Some(adoption.name.clone()), enabled: Some(true),

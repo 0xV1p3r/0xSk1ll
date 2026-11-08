@@ -33,7 +33,7 @@ export function Settings({ status, socket, revision, changed }: {
 }) {
   const harnesses = useResource(api.harnesses, revision);
   const fleet = useResource(api.fleet, revision);
-  const [hub, setHub] = useState(status.hub_url);
+  const [server, setServer] = useState(status.server_url);
   const [code, setCode] = useState('');
   const [id, setId] = useState(status.machine_id);
   const [copyFrom, setCopyFrom] = useState('');
@@ -47,7 +47,7 @@ export function Settings({ status, socket, revision, changed }: {
       <CardContent className="flex flex-col gap-3"><ErrorNotice error={harnesses.error} />
         {harnesses.loading && !harnesses.data && <Loading rows={2} />}
         {harnesses.data && <div className="overflow-hidden rounded-lg border"><Table aria-label="Harnesses on this Machine"><TableHeader><TableRow className="bg-muted/50 hover:bg-muted/50">
-          {['Harness', 'Skills', 'Fragments', 'Mode', 'Origin'].map(label => <TableHead key={label}>{label}</TableHead>)}
+          {['Harness', 'Skills', 'Rules', 'Mode', 'Origin'].map(label => <TableHead key={label}>{label}</TableHead>)}
         </TableRow></TableHeader><TableBody>{harnesses.data.map(h => <TableRow key={h.name}>
           <TableCell className="font-medium">{h.name}</TableCell><TableCell><code className="font-mono text-xs">{h.harness.skills ?? 'None'}</code></TableCell>
           <TableCell><code className="font-mono text-xs">{h.harness.instructions ?? 'None'}</code>
@@ -60,8 +60,8 @@ export function Settings({ status, socket, revision, changed }: {
       <Card><CardHeader><CardTitle>Join / rejoin this Machine</CardTitle>
         <CardDescription>Join uses a single-use join code. Rejoin replaces this Machine's credentials and restarts its Daemon.</CardDescription></CardHeader>
         <CardContent><form onSubmit={e => { e.preventDefault(); setConfirming(true); }}><FieldGroup>
-          <Field><FieldLabel htmlFor="hub-url">Hub URL</FieldLabel><Input id="hub-url" type="url" required aria-describedby={join.error ? 'join-error' : undefined} value={hub} disabled={join.pending}
-            onChange={e => setHub(e.target.value)} placeholder="https://skills.example.com" /></Field>
+          <Field><FieldLabel htmlFor="server-url">Server URL</FieldLabel><Input id="server-url" type="url" required aria-describedby={join.error ? 'join-error' : undefined} value={server} disabled={join.pending}
+            onChange={e => setServer(e.target.value)} placeholder="https://skills.example.com" /></Field>
           <Field><FieldLabel htmlFor="join-code">Join code</FieldLabel><Input id="join-code" autoComplete="off" type="password" required aria-describedby={join.error ? 'join-error' : undefined} value={code}
             disabled={join.pending} onChange={e => setCode(e.target.value)} /></Field>
           <Field><FieldLabel htmlFor="machine-id">Machine id</FieldLabel><Input id="machine-id" value={id} disabled={join.pending}
@@ -73,13 +73,13 @@ export function Settings({ status, socket, revision, changed }: {
           <div><Button type="submit" disabled={join.pending}><Pending pending={join.pending}>Join / rejoin</Pending></Button></div>
         </FieldGroup></form>
         <Dialog open={confirming} onOpenChange={open => { if (!join.pending) setConfirming(open); }}>
-          <DialogContent showCloseButton={!join.pending}><DialogHeader><DialogTitle>Join this Machine to the Hub?</DialogTitle>
+          <DialogContent showCloseButton={!join.pending}><DialogHeader><DialogTitle>Join this Machine to the Server?</DialogTitle>
             <DialogDescription>This replaces {status.machine_id}'s credentials and restarts its Daemon.</DialogDescription></DialogHeader>
-            <Details rows={[['Hub', <span className="break-all">{hub}</span>], ['Machine id', id || 'Default from machine.toml'],
+            <Details rows={[['Server', <span className="break-all">{server}</span>], ['Machine id', id || 'Default from machine.toml'],
               ['Assignment', copyFrom ? `Copied from ${copyFrom}` : 'Not copied']]} />
             <ErrorNotice error={join.error} /><DialogFooter>
               <Button variant="outline" disabled={join.pending} onClick={() => setConfirming(false)}>Cancel</Button>
-              <Button disabled={join.pending} onClick={() => void join.run(() => api.join({ hub_url: hub, code, machine_id: id || undefined,
+              <Button disabled={join.pending} onClick={() => void join.run(() => api.join({ server_url: server, code, machine_id: id || undefined,
                 copy_from: copyFrom || undefined }), value => {
                 setCode(''); setConfirming(false); setJoined(`Joined as ${value.machine_id}. The Daemon is restarting.`);
               })}><Pending pending={join.pending}>Join / rejoin</Pending></Button>
@@ -94,9 +94,9 @@ export function Settings({ status, socket, revision, changed }: {
         <Card className="@container"><CardHeader><CardTitle>Daemon connection</CardTitle></CardHeader>
           <CardContent><Details className="grid-cols-1 gap-y-1 [&_dd]:mb-3 @min-[28rem]:grid-cols-[minmax(0,10rem)_minmax(0,1fr)] @min-[28rem]:gap-y-2 @min-[28rem]:[&_dd]:mb-0" rows={[
             ['Socket', <code className="font-mono text-xs break-all">{socket}</code>],
-            ['Machine', status.machine_id], ['Hub', status.hub_url], ['Hub connection', <span className="capitalize">{connection}</span>],
+            ['Machine', status.machine_id], ['Server', status.server_url], ['Server connection', <span className="capitalize">{connection}</span>],
             ['Repo', <code className="font-mono text-xs break-all">{status.repo}</code>], ['Assignment revision', status.assignment_revision],
-            ['Pending Reset reports', status.pending_discards],
+            ['Pending Restore reports', status.pending_discards],
             ['Auth rejected since', status.auth_rejected_since === null ? 'Never' : new Date(status.auth_rejected_since * 1000).toLocaleString()],
           ]} />{status.last_error && <div className="mt-3"><ErrorNotice error={status.last_error} /></div>}</CardContent></Card>
       </div>

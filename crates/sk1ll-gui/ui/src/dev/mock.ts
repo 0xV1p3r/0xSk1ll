@@ -7,18 +7,18 @@ const report = (overrides: Partial<T.MachineReport> = {}): T.MachineReport => ({
   baseline: '9f3c2a17d4e1', drafts: [], unpushed: [], conflicts: [], harnesses: ['claude', 'codex'],
   blocked: false, clashes: [], behind: false, ...overrides,
 });
-const harness = (skills: Record<string, boolean> = {}, fragments: Record<string, boolean> = {}): T.HarnessAssignment =>
-  ({ new_skills_default: true, new_fragments_default: false, skills, fragments });
+const harness = (skills: Record<string, boolean> = {}, rules: Record<string, boolean> = {}): T.HarnessAssignment =>
+  ({ new_skills_default: true, new_rules_default: false, skills, rules });
 
 export function installMock(scenario: string) {
   const empty = scenario === 'empty';
-  const local = report({ drafts: empty ? [] : ['skill:release-notes', 'fragment:style'], unpushed: empty ? [] : ['skill:release-notes'],
+  const local = report({ drafts: empty ? [] : ['skill:release-notes', 'rule:style'], unpushed: empty ? [] : ['skill:release-notes'],
     conflicts: empty ? [] : [{ item: 'skill:code-review', harness: 'codex' }] });
   const status: T.StatusView = {
-    machine_id: 'workstation', hub_url: 'https://skills.example.com', repo: '/home/dev/.local/share/sk1ll/repo',
+    machine_id: 'workstation', server_url: 'https://skills.example.com', repo: '/home/dev/.local/share/sk1ll/repo',
     headline: empty ? 'in_sync' : 'conflict', connection: scenario === 'auth' ? 'auth_rejected' : 'connected',
-    last_error: scenario === 'auth' ? 'Hub returned 401 Unauthorized' : null, revoked: scenario === 'revoked',
-    hub_baseline: '9f3c2a17d4e1', assignment_revision: 42, awaiting_assignment: scenario === 'awaiting',
+    last_error: scenario === 'auth' ? 'Server returned 401 Unauthorized' : null, revoked: scenario === 'revoked',
+    server_baseline: '9f3c2a17d4e1', assignment_revision: 42, awaiting_assignment: scenario === 'awaiting',
     auth_rejected_since: scenario === 'auth' ? now - 600 : null, pending_discards: 0, report: local,
   };
   const machines: T.MachineRow[] = [
@@ -32,16 +32,16 @@ export function installMock(scenario: string) {
   ];
   const items: T.ItemView[] = empty ? [] : [
     { item: 'skill:code-review', in_baseline: true, draft: null, unpushed: false, description: 'Reviews a diff for correctness bugs and suggests fixes.' },
-    { item: 'skill:deploy', in_baseline: true, draft: null, unpushed: false, description: 'Builds and ships the hub container.' },
+    { item: 'skill:deploy', in_baseline: true, draft: null, unpushed: false, description: 'Builds and ships the server container.' },
     { item: 'skill:release-notes', in_baseline: false, draft: 'added', unpushed: true, description: 'Drafts release notes from merged pull requests.' },
-    { item: 'fragment:style', in_baseline: true, draft: 'modified', unpushed: false, description: 'House code style rules shared by every Harness.' },
-    { item: 'fragment:security', in_baseline: true, draft: null, unpushed: false, description: null },
+    { item: 'rule:style', in_baseline: true, draft: 'modified', unpushed: false, description: 'House code style rules shared by every Harness.' },
+    { item: 'rule:security', in_baseline: true, draft: null, unpushed: false, description: null },
   ];
   const content: T.ContentEntry[] = empty ? [] : [
     ...items.map((item): T.ContentEntry => {
       const [kind, name] = item.item.split(':');
-      return { name, item: item.item, type: kind === 'fragment' ? 'fragment' : 'personal', description: item.description,
-        draft: item.draft, in_baseline: item.in_baseline, path: `${status.repo}/${kind === 'fragment' ? `instructions/${name}.md` : `personal/${name}`}`,
+      return { name, item: item.item, type: kind === 'rule' ? 'rule' : 'personal', description: item.description,
+        draft: item.draft, in_baseline: item.in_baseline, path: `${status.repo}/${kind === 'rule' ? `instructions/${name}.md` : `personal/${name}`}`,
         enabled_harnesses: ['claude', 'codex'], clashes_with_repo: false, variants: [] };
     }),
     { name: 'pdf', item: 'skill:pdf', type: 'import', description: 'Work with PDFs.', draft: null, in_baseline: true,
@@ -61,11 +61,11 @@ export function installMock(scenario: string) {
   };
   const draft: T.DraftEntry[] = empty ? [] : [
     { item: 'skill:release-notes', change: 'added', paths: ['skills/release-notes/SKILL.md'], fingerprint: 'a1' },
-    { item: 'fragment:style', change: 'modified', paths: ['fragments/style.md'], fingerprint: 'b2' },
+    { item: 'rule:style', change: 'modified', paths: ['rules/style.md'], fingerprint: 'b2' },
   ];
   const diffs: Record<string, string> = {
     'skill:release-notes': '@@ -0,0 +1,6 @@\n+---\n+name: release-notes\n+description: Drafts release notes from merged pull requests.\n+---\n+\n+Group changes by area and link each pull request.',
-    'fragment:style': '@@ -3,4 +3,5 @@\n Prefer small functions.\n-Use tabs for indentation.\n+Use two spaces for indentation.\n+Wrap lines at 120 columns.\n Name things for what they do.',
+    'rule:style': '@@ -3,4 +3,5 @@\n Prefer small functions.\n-Use tabs for indentation.\n+Use two spaces for indentation.\n+Wrap lines at 120 columns.\n Name things for what they do.',
   };
   const conflicts: T.ConflictView[] = empty ? [] : [
     { harness: 'codex', name: 'code-review', items: ['skill:code-review'], dest: '/home/dev/.codex/skills/code-review',
@@ -77,7 +77,7 @@ export function installMock(scenario: string) {
   ];
   const log: T.LogEntry[] = empty ? [] : Array.from({ length: 8 }, (_, i) => ({
     id: 120 - i, at: now - i * 2400, author: i % 3 ? 'dev@workstation' : 'ops@laptop', machine: ['workstation', 'laptop'][i % 2],
-    harness: ['claude', 'codex'][i % 2], kind: i === 3 ? 'new_skills_default' : i % 2 ? 'fragment' : 'skill',
+    harness: ['claude', 'codex'][i % 2], kind: i === 3 ? 'new_skills_default' : i % 2 ? 'rule' : 'skill',
     name: i === 3 ? null : ['deploy', 'style', 'code-review', null, 'security', 'release-notes', 'deploy', 'style'][i],
     before: i % 2 ? null : true, after: i % 2 ? true : false,
     cause: i === 5 ? { type: 'undo', entry: 101 } : i === 6 ? { type: 'harness_added' } : { type: 'change' },
@@ -101,7 +101,7 @@ export function installMock(scenario: string) {
       case 'skills': return delay(structuredClone(content));
       case 'skill_tree': {
         const query = a.query as T.ContentQuery;
-        return delay(query.item.startsWith('fragment:') ? [{ path: `${query.item.slice(9)}.md`, kind: 'file', size: 120 }]
+        return delay(query.item.startsWith('rule:') ? [{ path: `${query.item.slice(9)}.md`, kind: 'file', size: 120 }]
           : [{ path: 'SKILL.md', kind: 'file', size: 120 }, { path: 'references', kind: 'directory', size: 0 }, { path: 'references/example.md', kind: 'file', size: 50 }]);
       }
       case 'skill_file': {
@@ -128,8 +128,8 @@ export function installMock(scenario: string) {
         const snapshot = assignments[a.machine as string];
         for (const change of (a.changes as T.AssignmentChanges).changes) {
           const h = snapshot.harnesses[change.harness] ??= harness();
-          if (change.kind === 'skill' || change.kind === 'fragment') {
-            const map = change.kind === 'skill' ? h.skills : h.fragments;
+          if (change.kind === 'skill' || change.kind === 'rule') {
+            const map = change.kind === 'skill' ? h.skills : h.rules;
             if (change.enabled === null) delete map[change.name!]; else map[change.name!] = change.enabled;
           } else h[change.kind] = !!change.enabled;
         }
@@ -139,9 +139,9 @@ export function installMock(scenario: string) {
       }
       case 'draft': return delay(draft);
       case 'diff': return delay({ item: a.item, diff: diffs[a.item as string] ?? '' }, 50);
-      case 'promote_message': return delay({ items: a.items, message: `Promote ${(a.items as string[]).join(', ')}` });
-      case 'promote': return delay({ sha: '7d1e9a0b3c5f8e2d', items: [], message: '', pushed: true, push_error: null }, 600);
-      case 'reset': return delay({ discarded: [] });
+      case 'commit_message': return delay({ items: a.items, message: `Commit ${(a.items as string[]).join(', ')}` });
+      case 'commit': return delay({ sha: '7d1e9a0b3c5f8e2d', items: [], message: '', pushed: true, push_error: null }, 600);
+      case 'restore': return delay({ discarded: [] });
       case 'pull': return delay({ state: 'up_to_date' }, 500);
       case 'conflicts': return delay(conflicts);
       case 'recovered': return delay(recovered);

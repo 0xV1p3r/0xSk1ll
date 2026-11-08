@@ -13,7 +13,7 @@ use walkdir::WalkDir;
 
 use crate::assignment::Assignment;
 use crate::hash::{hash_dir, hash_str};
-use crate::instructions::{self, Fragment};
+use crate::instructions::{self, Rule};
 use crate::machine::{Harness, InstructionsFormat, LinkMode};
 use crate::skill::Skill;
 use crate::{Error, IoExt, Repo, Result};
@@ -51,13 +51,13 @@ pub enum Item {
         expected: Option<String>,
     },
     Instructions {
-        fragments: Vec<String>,
+        rules: Vec<String>,
         content: Option<String>,
         /// Hash of the managed block as seen when planning; `apply` refuses
         /// to write if the file changed since.
         expected: Option<String>,
     },
-    /// One fragment as a file in a rules directory.
+    /// One rule as a file in a rules directory.
     Rule {
         file: String,
         /// `None` removes the file.
@@ -102,12 +102,12 @@ pub mod unmanaged;
 /// Repo content, resolved once per plan and filtered per harness by assignment.
 struct Selection {
     skills: Vec<Skill>,
-    fragments: Vec<Fragment>,
+    rules: Vec<Rule>,
 }
 
 impl Selection {
     fn new(repo: &Repo) -> Result<Self> {
-        Ok(Self { skills: repo.skills()?, fragments: repo.fragments()? })
+        Ok(Self { skills: repo.skills()?, rules: repo.rules()? })
     }
 
     fn skills_for(&self, assignment: &Assignment, harness: &str) -> Vec<&Skill> {
@@ -115,10 +115,10 @@ impl Selection {
         self.skills.iter().filter(|s| a.skill_enabled(&s.name)).collect()
     }
 
-    /// Assignment picks fragments; a fragment's own `harnesses:` restricts further.
-    fn fragments_for(&self, assignment: &Assignment, harness: &str) -> Vec<&Fragment> {
+    /// Assignment picks rules; a rule's own `harnesses:` restricts further.
+    fn rules_for(&self, assignment: &Assignment, harness: &str) -> Vec<&Rule> {
         let a = assignment.harness(harness);
-        self.fragments.iter().filter(|f| a.fragment_enabled(&f.name) && f.applies_to(harness)).collect()
+        self.rules.iter().filter(|f| a.rule_enabled(&f.name) && f.applies_to(harness)).collect()
     }
 }
 
@@ -137,10 +137,10 @@ pub fn plan(
             plan_skills(repo, hname, harness, &dir, &sel.skills_for(assignment, hname), opts, &mut actions)?;
         }
         if let Some(path) = harness.instructions_file() {
-            let fragments = sel.fragments_for(assignment, hname);
+            let rules = sel.rules_for(assignment, hname);
             match harness.instructions_format {
-                InstructionsFormat::Block => plan_instructions(hname, &path, &fragments, opts, &mut actions)?,
-                InstructionsFormat::Rules => plan_rules(hname, &path, &fragments, opts, &mut actions)?,
+                InstructionsFormat::Block => plan_instructions(hname, &path, &rules, opts, &mut actions)?,
+                InstructionsFormat::Rules => plan_rules(hname, &path, &rules, opts, &mut actions)?,
             }
         }
     }
@@ -160,12 +160,12 @@ pub fn render_instructions(
         return Ok(Vec::new());
     };
     let sel = Selection::new(repo)?;
-    let fragments = sel.fragments_for(assignment, harness);
+    let rules = sel.rules_for(assignment, harness);
     Ok(match h.instructions_format {
         InstructionsFormat::Block => {
-            instructions::render(&fragments).map(|content| RenderedFile { path, content }).into_iter().collect()
+            instructions::render(&rules).map(|content| RenderedFile { path, content }).into_iter().collect()
         }
-        InstructionsFormat::Rules => fragments
+        InstructionsFormat::Rules => rules
             .iter()
             .map(|f| {
                 let (file, content) = instructions::render_rule(f);
@@ -281,11 +281,11 @@ fn plan_skills(
 fn plan_instructions(
     hname: &str,
     file: &Path,
-    fragments: &[&Fragment],
+    rules: &[&Rule],
     opts: PlanOptions,
     actions: &mut Vec<Action>,
 ) -> Result<()> {
-    let content = instructions::render(fragments);
+    let content = instructions::render(rules);
     let text = instructions::read_optional(file)?;
     let block = match &text {
         Some(text) => instructions::find_block(text, file)?,
@@ -304,7 +304,7 @@ fn plan_instructions(
         kind,
         dest: file.to_path_buf(),
         item: Item::Instructions {
-            fragments: fragments.iter().map(|f| f.name.clone()).collect(),
+            rules: rules.iter().map(|f| f.name.clone()).collect(),
             content,
             expected: block.map(|b| hash_str(&b.inner)),
         },
@@ -316,7 +316,7 @@ fn plan_instructions(
 fn plan_rules(
     hname: &str,
     dir: &Path,
-    fragments: &[&Fragment],
+    rules: &[&Rule],
     opts: PlanOptions,
     actions: &mut Vec<Action>,
 ) -> Result<()> {
@@ -333,8 +333,8 @@ fn plan_rules(
     };
 
     let mut desired = BTreeSet::new();
-    for fragment in fragments {
-        let (file, content) = instructions::render_rule(fragment);
+    for rule in rules {
+        let (file, content) = instructions::render_rule(rule);
         let want = hash_str(&content);
         let current = current_hash(&file)?;
         let (kind, reason) = match (&current, index.get(&file)) {
@@ -997,7 +997,7 @@ fn recover_file_siblings(harness: &str, path: &Path) -> Result<Vec<displaced::En
 /// Resolves a conflict the other way round: copies the harness's content back
 /// into the repo, where it becomes a draft change. Works for copied skill
 /// directories (into the skill's repo directory, without the marker) and
-/// `rules` files (into `instructions/<name>.md`, keeping the fragment's
+/// `rules` files (into `instructions/<name>.md`, keeping the rule's
 /// `harnesses:` key). The harness copy is then recorded as managed, so the
 /// next plan has no conflict for it.
 pub fn adopt(repo: &Repo, action: &Action) -> Result<()> {
@@ -1008,7 +1008,7 @@ pub fn adopt(repo: &Repo, action: &Action) -> Result<()> {
         Item::Skill { name, .. } => adopt_skill(repo, &action.dest, name),
         Item::Rule { file, .. } => adopt_rule(repo, &action.dest, file),
         Item::Instructions { .. } => Err(Error::Invalid(
-            "adopt isn't supported for block instructions; one block mixes several fragments, so move the edits \
+            "adopt isn't supported for block instructions; one block mixes several rules, so move the edits \
              into instructions/ by hand, or overwrite them with `sk1ll sync --force`"
                 .into(),
         )),
@@ -1074,11 +1074,11 @@ fn adopt_rule(repo: &Repo, src: &Path, file: &str) -> Result<()> {
     instructions::save_rules_index(dir, &index)
 }
 
-/// Writes the rule file `file`'s `text` into the repo's fragment, keeping
-/// the fragment's `harnesses:` key.
+/// Writes the rule file `file`'s `text` into the repo's rule, keeping
+/// the rule's `harnesses:` key.
 fn rule_into_repo(repo: &Repo, file: &str, text: &str) -> Result<()> {
     let name = file.strip_suffix(".md").unwrap_or(file);
-    let original = repo.fragments()?.into_iter().find(|f| f.name == name);
+    let original = repo.rules()?.into_iter().find(|f| f.name == name);
     let content = match &original {
         Some(f) => instructions::restore_harnesses(f, text),
         None => text.to_string(),
@@ -1262,10 +1262,10 @@ pub mod displaced {
     /// Takes an entry's content back, then deletes the entry:
     ///
     /// - A copied skill becomes the repo's version of that skill, and a rule
-    ///   file its fragment (as [`super::adopt`] does for a conflict): a draft
+    ///   file its rule (as [`super::adopt`] does for a conflict): a draft
     ///   change, which the next sync brings to the harness.
     /// - A block instructions file goes back into the harness (one block
-    ///   mixes several fragments, so it can't go into the repo), with the
+    ///   mixes several rules, so it can't go into the repo), with the
     ///   current managed block in place of its own unless its own was edited
     ///   by hand; the next plan then shows that as a conflict. The file it
     ///   replaces is displaced in turn. Refused while the current managed
@@ -2387,7 +2387,7 @@ mod tests {
     }
 
     #[test]
-    fn assignment_selects_skills_and_fragments() {
+    fn assignment_selects_skills_and_rules() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("repo");
         write(&root.join("sk1ll.toml"), "");
@@ -2407,7 +2407,7 @@ mod tests {
         let harnesses = BTreeMap::from([("h".to_string(), harness)]);
         let mut assignment = Assignment::default();
         assignment.set_skill("h", "pdf", false);
-        assignment.set_fragment("h", "30-off", false);
+        assignment.set_rule("h", "30-off", false);
 
         let actions = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
         let created: Vec<&str> = actions
@@ -2419,11 +2419,11 @@ mod tests {
             })
             .collect();
         assert_eq!(created, ["git"]);
-        let fragments = actions.iter().find_map(|a| match &a.item {
-            Item::Instructions { fragments, .. } => Some(fragments.clone()),
+        let rules = actions.iter().find_map(|a| match &a.item {
+            Item::Instructions { rules, .. } => Some(rules.clone()),
             _ => None,
         });
-        assert_eq!(fragments, Some(vec!["20-legacy".to_string()]));
+        assert_eq!(rules, Some(vec!["20-legacy".to_string()]));
         assert!(actions.iter().all(|a| a.harness == "h"));
 
         // Turning an applied skill off removes it.
@@ -2503,7 +2503,7 @@ mod tests {
         let draft: Vec<(ItemRef, Change)> = repo.draft().unwrap().into_iter().map(|d| (d.item, d.change)).collect();
         assert_eq!(
             draft,
-            [(ItemRef::Skill("pdf".into()), Change::Modified), (ItemRef::Fragment("git".into()), Change::Modified)]
+            [(ItemRef::Skill("pdf".into()), Change::Modified), (ItemRef::Rule("git".into()), Change::Modified)]
         );
 
         // Only the block harness is still out of line (and its edit conflicts).
@@ -2601,8 +2601,8 @@ mod tests {
                     displaced::adopt(&repo, &entry.id).unwrap();
                     assert!(displaced::list().unwrap().iter().all(|e| e.id != entry.id), "{case}");
                     if format == InstructionsFormat::Rules {
-                        let fragment = fs::read_to_string(repo.root().join("instructions/git.md")).unwrap();
-                        assert!(fragment.ends_with("Late note.\n"), "{case}: {fragment}");
+                        let rule = fs::read_to_string(repo.root().join("instructions/git.md")).unwrap();
+                        assert!(rule.ends_with("Late note.\n"), "{case}: {rule}");
                     } else {
                         let now = fs::read_to_string(&file).unwrap();
                         assert!(now.contains("Use CC always.") && now.ends_with("Late note.\n"), "{case}: {now}");
@@ -2791,7 +2791,7 @@ mod tests {
                     let (tmp, repo, harnesses, path) = instructions_setup(format);
                     synced(&repo, &harnesses, &assignment);
                     write(&repo.root().join("instructions/git.md"), "Use CC always.\n");
-                    assignment.set_fragment("h", "git", !remove);
+                    assignment.set_rule("h", "git", !remove);
                     let dest = if kind == "rule" { path.join("git.md") } else { path.clone() };
                     let holder = dest.parent().unwrap().to_path_buf();
                     Self { tmp, repo, harnesses, assignment, file: dest.clone(), dest, holder }

@@ -5,7 +5,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use sk1ll_daemon::client::{
-    AddImportRequest, ChangeKind, Client, ConflictTarget, PromoteRequest, PullResult, ResetRequest, StatusView,
+    AddImportRequest, ChangeKind, Client, ConflictTarget, CommitRequest, PullResult, RestoreRequest, StatusView,
     SyncRequest, UpdateImportsRequest,
 };
 use sk1ll_daemon::{Config, DaemonState};
@@ -16,7 +16,7 @@ use crate::{Cli, Cmd, Kind, assign_target, check_exists, confirm, fetch_hint, na
 /// Sets up this process's environment, before any thread starts: the
 /// daemon's (`sk1ll daemon`), or for direct mode the machine's git
 /// credentials (which live only in the daemon's state file), so a direct
-/// push or pull to the hub authenticates.
+/// push or pull to the server authenticates.
 pub(crate) fn prepare(cli: &Cli) -> Result<()> {
     if matches!(cli.cmd, Cmd::Daemon) {
         let cfg = daemon_config(cli)?;
@@ -50,11 +50,11 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Builder::new_current_thread().enable_all().build()?)
 }
 
-/// A joined machine always changes assignments at the Hub, even without a daemon.
+/// A joined machine always changes assignments at the Server, even without a daemon.
 pub(crate) fn assign_direct(cli: &Cli, repo: &Path, lock: Option<&sk1ll_core::EngineLock>) -> Result<bool> {
     let cfg = daemon_config(cli)?;
     let Some(state) = DaemonState::load(&cfg.state)?.filter(|s| !s.revoked) else { return Ok(false) };
-    let Cmd::Assign { harness, kind, name, state: enabled, default_skills, default_fragments } = &cli.cmd else {
+    let Cmd::Assign { harness, kind, name, state: enabled, default_skills, default_rules } = &cli.cmd else {
         return Ok(false);
     };
     if !sk1ll_core::MachineConfig::load(&cfg.machine_config)?.harnesses().contains_key(harness) {
@@ -64,17 +64,17 @@ pub(crate) fn assign_direct(cli: &Cli, repo: &Path, lock: Option<&sk1ll_core::En
     let toggle = |kind, name, on: bool| ToggleChange {
         harness: harness.clone(), kind, name, enabled: Some(on),
     };
-    let target = assign_target(*kind, name.clone(), *enabled, *default_skills, *default_fragments)?;
+    let target = assign_target(*kind, name.clone(), *enabled, *default_skills, *default_rules)?;
     if let Some((kind, name, enabled)) = target {
         check_exists(&sk1ll_core::Repo::open(repo)?, kind, &name)?;
-        let kind = match kind { Kind::Skill => ToggleKind::Skill, Kind::Fragment => ToggleKind::Fragment };
+        let kind = match kind { Kind::Skill => ToggleKind::Skill, Kind::Rule => ToggleKind::Rule };
         changes.push(toggle(kind, Some(name), enabled.on()));
     }
     if let Some(s) = default_skills {
         changes.push(toggle(ToggleKind::NewSkillsDefault, None, s.on()));
     }
-    if let Some(s) = default_fragments {
-        changes.push(toggle(ToggleKind::NewFragmentsDefault, None, s.on()));
+    if let Some(s) = default_rules {
+        changes.push(toggle(ToggleKind::NewRulesDefault, None, s.on()));
     }
     let lock = lock.context("a fleet assignment change requires the engine lock")?;
     let update = runtime()?.block_on(sk1ll_daemon::set_assignment_direct(&cfg, lock, &AssignmentChanges { changes }))?;
@@ -117,7 +117,7 @@ pub(crate) fn queue_discarded(
         cfg.state = p.to_path_buf();
     }
     if DaemonState::load(&cfg.state)?.is_some_and(|s| !s.revoked) {
-        sk1ll_daemon::state::queue_discards(&cfg, lock.context("a fleet reset requires the engine lock")?, items)?;
+        sk1ll_daemon::state::queue_discards(&cfg, lock.context("a fleet restore requires the engine lock")?, items)?;
     }
     Ok(())
 }
@@ -130,7 +130,7 @@ pub(crate) fn require_standalone_adoption(state: Option<&Path>, repo: &sk1ll_cor
         anyhow::ensure!(repo.root() == joined,
             "selected repo {} differs from the joined repo {}; select the joined repo to change fleet content",
             repo.root().display(), joined.display());
-        bail!("Adopt needs a connection to the Hub; start the daemon with `sk1ll daemon` and wait for it to connect");
+        bail!("Adopt needs a connection to the Server; start the daemon with `sk1ll daemon` and wait for it to connect");
     }
     Ok(())
 }
@@ -158,17 +158,17 @@ pub(crate) fn command(cli: Cli) -> Result<()> {
 
 fn join(cli: Cli) -> Result<()> {
     let cfg = daemon_config(&cli)?;
-    let Cmd::Join { hub_url, code, id, copy_from } = cli.cmd else { unreachable!() };
+    let Cmd::Join { server_url, code, id, copy_from } = cli.cmd else { unreachable!() };
     let repo = match cli.repo {
         Some(r) => r,
         None => dirs::home_dir().context("cannot determine the home directory")?.join("skills"),
     };
-    let opts = sk1ll_daemon::JoinOptions { hub_url, code, machine_id: id, copy_from, repo };
+    let opts = sk1ll_daemon::JoinOptions { server_url, code, machine_id: id, copy_from, repo };
     let (joined, via_daemon) = runtime()?.block_on(sk1ll_daemon::join_or_rejoin(&cfg, opts))?;
     let how = match joined.setup {
         sk1ll_daemon::gitx::Setup::Cloned => "cloned the fleet repo into",
         sk1ll_daemon::gitx::Setup::Initialized => {
-            "the hub is empty; started a new skills repo (promote to share it) in"
+            "the server is empty; started a new skills repo (commit to share it) in"
         }
         sk1ll_daemon::gitx::Setup::Adopted => "using the existing clone at",
     };
@@ -304,24 +304,24 @@ impl Daemon {
             }
             Cmd::Recover { command: crate::RecoverCmd::Adopt { id } } => self.block(c.adopt_displaced(&id))?,
             Cmd::Recover { command: crate::RecoverCmd::Discard { id } } => self.block(c.discard_displaced(&id))?,
-            Cmd::Promote { items, message, author, push: _ } => {
-                let resp = self.block(c.promote(&PromoteRequest { items, message, author }))?;
-                println!("promoted {} as {}", names(&resp.items), short(&resp.sha));
+            Cmd::Commit { items, message, author, push: _ } => {
+                let resp = self.block(c.commit(&CommitRequest { items, message, author }))?;
+                println!("committed {} as {}", names(&resp.items), short(&resp.sha));
                 match (resp.pushed, resp.push_error) {
-                    (true, _) => println!("pushed to the hub"),
+                    (true, _) => println!("pushed to the server"),
                     (false, Some(e)) => println!("not pushed yet ({e}); the daemon pushes it when it can"),
                     (false, None) => println!("not pushed yet; the daemon pushes it when it can"),
                 }
             }
             Cmd::Push => match self.block(c.push())?.pushed {
-                true => println!("pushed to the hub"),
+                true => println!("pushed to the server"),
                 false => println!("nothing to push"),
             },
-            Cmd::Reset { items, all, yes } => {
+            Cmd::Restore { items, all, yes } => {
                 if all {
                     let draft = self.block(c.draft())?;
                     if draft.is_empty() {
-                        println!("no draft to reset");
+                        println!("no draft to restore");
                         return Ok(());
                     }
                     for d in &draft {
@@ -336,11 +336,11 @@ impl Daemon {
                         bail!("aborted");
                     }
                 }
-                let resp = self.block(c.reset(&ResetRequest { items, all }))?;
+                let resp = self.block(c.restore(&RestoreRequest { items, all }))?;
                 if resp.discarded.is_empty() {
-                    println!("nothing was reset");
+                    println!("nothing was restored");
                 } else {
-                    println!("reset {}", names(&resp.discarded));
+                    println!("restored {}", names(&resp.discarded));
                 }
             }
             Cmd::Pull => match self.block(c.pull())? {
@@ -349,7 +349,7 @@ impl Daemon {
                     println!("baseline {} -> {}", from.as_deref().map_or("(none)", short), short(&to));
                 }
                 PullResult::Blocked { baseline, items } => bail!(
-                    "blocked: baseline {} clashes with {}; promote or reset them (the daemon pulls again then)",
+                    "blocked: baseline {} clashes with {}; commit or restore them (the daemon pulls again then)",
                     short(&baseline),
                     names(&items)
                 ),
@@ -378,7 +378,7 @@ impl Daemon {
                 for r in self.block(c.update_imports(&UpdateImportsRequest { name, force }))? {
                     print_update(&r.name, r.old_commit.as_deref(), &r.new_commit, r.changed);
                 }
-                println!("review with `sk1ll diff`, then promote");
+                println!("review with `sk1ll diff`, then commit");
             }
             Cmd::Remove { name } => {
                 self.block(c.remove_import(&name))?;
@@ -388,8 +388,8 @@ impl Daemon {
                 self.block(c.fork(&name))?;
                 println!("moved {name} to personal/");
             }
-            Cmd::Assign { harness, kind, name, state, default_skills, default_fragments } => {
-                // Assignment is hub state: change it there, for this machine.
+            Cmd::Assign { harness, kind, name, state, default_skills, default_rules } => {
+                // Assignment is server state: change it there, for this machine.
                 if !self.block(c.harnesses())?.iter().any(|h| h.name == harness) {
                     bail!("unknown harness `{harness}` on this machine (see `sk1ll harnesses`)");
                 }
@@ -400,20 +400,20 @@ impl Daemon {
                     name,
                     enabled: Some(on),
                 };
-                let target = assign_target(kind, name, state, default_skills, default_fragments)?;
+                let target = assign_target(kind, name, state, default_skills, default_rules)?;
                 if let Some((kind, name, state)) = target {
                     check_exists(&sk1ll_core::Repo::open(repo)?, kind, &name)?;
                     let kind = match kind {
                         Kind::Skill => ToggleKind::Skill,
-                        Kind::Fragment => ToggleKind::Fragment,
+                        Kind::Rule => ToggleKind::Rule,
                     };
                     changes.push(toggle(kind, Some(name), state.on()));
                 }
                 if let Some(s) = default_skills {
                     changes.push(toggle(ToggleKind::NewSkillsDefault, None, s.on()));
                 }
-                if let Some(s) = default_fragments {
-                    changes.push(toggle(ToggleKind::NewFragmentsDefault, None, s.on()));
+                if let Some(s) = default_rules {
+                    changes.push(toggle(ToggleKind::NewRulesDefault, None, s.on()));
                 }
                 let machine = self.status.machine_id.clone();
                 let update = self.block(c.set_assignment(&machine, &AssignmentChanges { changes }))?;
@@ -423,8 +423,8 @@ impl Daemon {
                 for e in &update.entries {
                     let what = match (&e.kind, &e.name) {
                         (ToggleKind::NewSkillsDefault, _) => "skills default".to_string(),
-                        (ToggleKind::NewFragmentsDefault, _) => "fragments default".to_string(),
-                        (k, Some(n)) => format!("{} {n}", if *k == ToggleKind::Skill { "skill" } else { "fragment" }),
+                        (ToggleKind::NewRulesDefault, _) => "rules default".to_string(),
+                        (k, Some(n)) => format!("{} {n}", if *k == ToggleKind::Skill { "skill" } else { "rule" }),
                         (_, None) => "?".to_string(),
                     };
                     let after = match e.after {

@@ -1,6 +1,6 @@
-//! Assignment: which skills and fragments are enabled in which harness.
+//! Assignment: which skills and rules are enabled in which harness.
 //!
-//! The fleet-wide assignment will live on the hub (ADR 0001). Until then this
+//! The fleet-wide assignment will live on the server (ADR 0001). Until then this
 //! is this machine's slice of it, keyed by harness name and kept as a local
 //! cache file. A missing file means everything is enabled everywhere.
 
@@ -29,11 +29,11 @@ pub struct HarnessAssignment {
     #[serde(default = "yes")]
     pub new_skills_default: bool,
     #[serde(default = "yes")]
-    pub new_fragments_default: bool,
+    pub new_rules_default: bool,
     #[serde(default)]
     pub skills: BTreeMap<String, bool>,
     #[serde(default)]
-    pub fragments: BTreeMap<String, bool>,
+    pub rules: BTreeMap<String, bool>,
 }
 
 fn yes() -> bool {
@@ -45,17 +45,17 @@ static ALL_ENABLED: HarnessAssignment = HarnessAssignment::ALL_ENABLED;
 impl HarnessAssignment {
     const ALL_ENABLED: Self = Self {
         new_skills_default: true,
-        new_fragments_default: true,
+        new_rules_default: true,
         skills: BTreeMap::new(),
-        fragments: BTreeMap::new(),
+        rules: BTreeMap::new(),
     };
 
     pub fn skill_enabled(&self, name: &str) -> bool {
         self.skills.get(name).copied().unwrap_or(self.new_skills_default)
     }
 
-    pub fn fragment_enabled(&self, name: &str) -> bool {
-        self.fragments.get(name).copied().unwrap_or(self.new_fragments_default)
+    pub fn rule_enabled(&self, name: &str) -> bool {
+        self.rules.get(name).copied().unwrap_or(self.new_rules_default)
     }
 }
 
@@ -99,16 +99,16 @@ impl Assignment {
         self.harness(harness).skill_enabled(name)
     }
 
-    pub fn fragment_enabled(&self, harness: &str, name: &str) -> bool {
-        self.harness(harness).fragment_enabled(name)
+    pub fn rule_enabled(&self, harness: &str, name: &str) -> bool {
+        self.harness(harness).rule_enabled(name)
     }
 
     pub fn set_skill(&mut self, harness: &str, name: &str, enabled: bool) {
         self.entry(harness).skills.insert(name.to_string(), enabled);
     }
 
-    pub fn set_fragment(&mut self, harness: &str, name: &str, enabled: bool) {
-        self.entry(harness).fragments.insert(name.to_string(), enabled);
+    pub fn set_rule(&mut self, harness: &str, name: &str, enabled: bool) {
+        self.entry(harness).rules.insert(name.to_string(), enabled);
     }
 
     /// Records current values for existing skills before changing their default.
@@ -119,11 +119,11 @@ impl Assignment {
         }
     }
 
-    /// Records current values for existing fragments before changing their default.
-    pub fn materialize_fragments(&mut self, harness: &str, names: &[String]) {
+    /// Records current values for existing rules before changing their default.
+    pub fn materialize_rules(&mut self, harness: &str, names: &[String]) {
         let a = self.entry(harness);
         for name in names {
-            a.fragments.entry(name.clone()).or_insert(a.new_fragments_default);
+            a.rules.entry(name.clone()).or_insert(a.new_rules_default);
         }
     }
 
@@ -132,9 +132,9 @@ impl Assignment {
         self.entry(harness).new_skills_default = enabled;
     }
 
-    /// Changes the fallback for fragments without a toggle, including existing ones.
-    pub fn set_new_fragments_default(&mut self, harness: &str, enabled: bool) {
-        self.entry(harness).new_fragments_default = enabled;
+    /// Changes the fallback for rules without a toggle, including existing ones.
+    pub fn set_new_rules_default(&mut self, harness: &str, enabled: bool) {
+        self.entry(harness).new_rules_default = enabled;
     }
 
     fn entry(&mut self, harness: &str) -> &mut HarnessAssignment {
@@ -150,41 +150,41 @@ mod tests {
     fn materializing_preserves_existing_items_when_defaults_change() {
         let mut a = Assignment::default();
         a.set_skill("h", "off", false);
-        a.set_fragment("h", "off", false);
+        a.set_rule("h", "off", false);
         let names = vec!["implicit".to_string(), "off".to_string()];
         a.materialize_skills("h", &names);
-        a.materialize_fragments("h", &names);
+        a.materialize_rules("h", &names);
         a.set_new_skills_default("h", false);
-        a.set_new_fragments_default("h", false);
-        assert!(a.skill_enabled("h", "implicit") && a.fragment_enabled("h", "implicit"));
-        assert!(!a.skill_enabled("h", "off") && !a.fragment_enabled("h", "off"));
-        assert!(!a.skill_enabled("h", "later") && !a.fragment_enabled("h", "later"));
+        a.set_new_rules_default("h", false);
+        assert!(a.skill_enabled("h", "implicit") && a.rule_enabled("h", "implicit"));
+        assert!(!a.skill_enabled("h", "off") && !a.rule_enabled("h", "off"));
+        assert!(!a.skill_enabled("h", "later") && !a.rule_enabled("h", "later"));
         let names = vec!["implicit".to_string(), "later".to_string()];
         a.materialize_skills("h", &names);
-        a.materialize_fragments("h", &names);
+        a.materialize_rules("h", &names);
         a.set_new_skills_default("h", true);
-        a.set_new_fragments_default("h", true);
-        assert!(!a.skill_enabled("h", "later") && !a.fragment_enabled("h", "later"));
-        assert!(a.skill_enabled("h", "new") && a.fragment_enabled("h", "new"));
+        a.set_new_rules_default("h", true);
+        assert!(!a.skill_enabled("h", "later") && !a.rule_enabled("h", "later"));
+        assert!(a.skill_enabled("h", "new") && a.rule_enabled("h", "new"));
     }
 
     #[test]
     fn toggles_override_defaults() {
         let mut a = Assignment::default();
-        assert!(a.skill_enabled("claude", "pdf") && a.fragment_enabled("claude", "git"));
+        assert!(a.skill_enabled("claude", "pdf") && a.rule_enabled("claude", "git"));
 
         a.set_skill("claude", "pdf", false);
         a.set_new_skills_default("codex", false);
         a.set_skill("codex", "pdf", true);
-        a.set_new_fragments_default("codex", false);
+        a.set_new_rules_default("codex", false);
         assert!(!a.skill_enabled("claude", "pdf"));
         assert!(a.skill_enabled("claude", "other"));
         assert!(a.skill_enabled("codex", "pdf"));
         assert!(!a.skill_enabled("codex", "other"));
-        assert!(!a.fragment_enabled("codex", "git"));
+        assert!(!a.rule_enabled("codex", "git"));
 
-        a.set_fragment("codex", "git", true);
-        assert!(a.fragment_enabled("codex", "git"));
+        a.set_rule("codex", "git", true);
+        assert!(a.rule_enabled("codex", "git"));
         assert!(a.skill_enabled("gemini", "pdf"));
     }
 
@@ -196,7 +196,7 @@ mod tests {
 
         let mut a = Assignment::default();
         a.set_skill("claude", "pdf", false);
-        a.set_new_fragments_default("claude", false);
+        a.set_new_rules_default("claude", false);
         a.save(&path).unwrap();
         assert_eq!(Assignment::load(&path).unwrap(), a);
 

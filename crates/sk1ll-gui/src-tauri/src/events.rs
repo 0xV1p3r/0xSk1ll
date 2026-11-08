@@ -26,7 +26,7 @@ impl Backoff {
         delay
     }
 
-    fn reset(&mut self) {
+    fn restore(&mut self) {
         self.0 = 0;
     }
 }
@@ -41,7 +41,7 @@ pub async fn forward(client: Client, emit: impl Fn(&str, Value) + Send + 'static
                 let message = loop {
                     match stream.next().await {
                         Some(Ok(event)) => {
-                            backoff.reset();
+                            backoff.restore();
                             emit(event.name(), serde_json::to_value(&event).expect("serializing an event"));
                         }
                         Some(Err(error)) => break error.to_string(),
@@ -49,7 +49,7 @@ pub async fn forward(client: Client, emit: impl Fn(&str, Value) + Send + 'static
                     }
                 };
                 if started.elapsed() >= MAX_DELAY {
-                    backoff.reset();
+                    backoff.restore();
                 }
                 message
             }
@@ -74,11 +74,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backoff_doubles_caps_and_resets() {
+    fn backoff_doubles_caps_and_restores() {
         let mut b = Backoff::default();
         let delays: Vec<_> = (0..10).map(|_| b.next().as_millis()).collect();
         assert_eq!(delays, [500, 1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000, 30000]);
-        b.reset();
+        b.restore();
         assert_eq!(b.next(), MIN_DELAY);
     }
 }

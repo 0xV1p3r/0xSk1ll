@@ -1,6 +1,6 @@
 [package]
 name = "sk1ll-daemon"
-description = "Per-machine 0xSk1ll daemon: keeps harnesses in step and talks to the hub"
+description = "Per-machine 0xSk1ll daemon: keeps harnesses in step and talks to the server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -34,5 +34,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-sk1ll-hub = { path = "../sk1ll-hub" }
+sk1ll-server = { path = "../sk1ll-server" }
 tempfile.workspace = true

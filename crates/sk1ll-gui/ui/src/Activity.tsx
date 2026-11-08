@@ -27,7 +27,7 @@ function Conflict({ entry, displaced, changed, adopted }: {
         ...entry.path ? [['Recovery path', <code className="font-mono break-all">{entry.path}</code>] as [string, ReactNode]] : [],
         ...entry.displaced_at !== undefined ? [['Recovered', time(entry.displaced_at)] as [string, ReactNode]] : [],
       ]} />}
-      {!entry.adoptable && <p className="text-xs text-muted-foreground">This Harness combines Fragments in one file. Move its edits into the Draft by hand before Overwrite.</p>}
+      {!entry.adoptable && <p className="text-xs text-muted-foreground">This Harness combines Rules in one file. Move its edits into the Draft by hand before Overwrite.</p>}
     </CardContent>
     <CardFooter className="gap-2 border-t">
       <Confirm label="Adopt" variant="default" confirmLabel="Adopt into Draft" ariaLabel={`Adopt ${entry.name} from ${entry.harness}`}
@@ -50,7 +50,7 @@ function Section({ title, description, children }: { title: string; description:
     <p className="text-sm text-muted-foreground">{description}</p></div>{children}</section>;
 }
 function InDraft({ name, reviewDraft }: { name?: string; reviewDraft: () => void }) {
-  return name ? <Notice title={`${name} is in the Draft`}>Review it in the Draft, then Promote it to the Baseline.
+  return name ? <Notice title={`${name} is in the Draft`}>Review it in the Draft, then Commit it to the Baseline.
     <div><Button variant="outline" size="sm" className="mt-2" onClick={reviewDraft}>Review Draft</Button></div></Notice> : null;
 }
 export function Conflicts({ revision, changed, reviewDraft }: { revision: number; changed: () => void; reviewDraft: () => void }) {

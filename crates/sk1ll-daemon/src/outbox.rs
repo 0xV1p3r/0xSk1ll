@@ -1,7 +1,7 @@
-//! `draft_discarded` messages not yet delivered to the hub, kept in a small
+//! `draft_discarded` messages not yet delivered to the server, kept in a small
 //! private file next to the state file so a restart doesn't lose them. An
 //! entry is removed only after it was sent; sending one twice is harmless
-//! because the hub handles them idempotently.
+//! because the server handles them idempotently.
 
 use std::path::PathBuf;
 
@@ -82,14 +82,14 @@ mod tests {
         let path = dir.path().join("outbox.json");
         let mut o = Outbox::load(path.clone());
         o.push(vec![ItemRef::Skill("a".into())]).unwrap();
-        o.push(vec![ItemRef::Fragment("b".into())]).unwrap();
+        o.push(vec![ItemRef::Rule("b".into())]).unwrap();
         let mut o = Outbox::load(path.clone());
         assert_eq!(o.len(), 2);
         let first = o.front().unwrap();
         assert_eq!(first.items, [ItemRef::Skill("a".into())]);
         o.remove(first.id).unwrap();
         let mut o = Outbox::load(path.clone());
-        assert_eq!(o.front().unwrap().items, [ItemRef::Fragment("b".into())]);
+        assert_eq!(o.front().unwrap().items, [ItemRef::Rule("b".into())]);
         let id = o.front().unwrap().id;
         o.remove(id).unwrap();
         assert!(!path.exists());

@@ -1,13 +1,13 @@
-# The 0xSk1ll hub: the fleet's git remote, assignment and status server.
-#   docker build -f Dockerfile.hub -t sk1ll-hub .
+# The 0xSk1ll server: the fleet's git remote, assignment and status server.
+#   docker build -f Dockerfile.server -t sk1ll-server .
 FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked -p sk1ll-hub \
-    && cp target/release/sk1ll-hub /usr/local/bin/sk1ll-hub
+    cargo build --release --locked -p sk1ll-server \
+    && cp target/release/sk1ll-server /usr/local/bin/sk1ll-server
 
 FROM debian:bookworm-slim
 RUN apt-get update \
@@ -15,10 +15,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --home-dir /data sk1ll \
     && mkdir -p /data && chown sk1ll /data
-COPY --from=build /usr/local/bin/sk1ll-hub /usr/local/bin/sk1ll-hub
+COPY --from=build /usr/local/bin/sk1ll-server /usr/local/bin/sk1ll-server
 USER sk1ll
-ENV SK1LL_HUB_DATA=/data \
-    SK1LL_HUB_BIND=0.0.0.0:7878
+ENV SK1LL_SERVER_DATA=/data \
+    SK1LL_SERVER_BIND=0.0.0.0:7878
 VOLUME /data
 EXPOSE 7878
-ENTRYPOINT ["sk1ll-hub"]
+ENTRYPOINT ["sk1ll-server"]

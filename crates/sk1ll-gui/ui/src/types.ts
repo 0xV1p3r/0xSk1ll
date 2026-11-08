@@ -9,8 +9,8 @@ export interface MachineReport {
   blocked: boolean; clashes: ItemRef[]; behind: boolean;
 }
 export interface StatusView {
-  machine_id: string; hub_url: string; repo: string; headline: MachineStatus; connection: Connection;
-  last_error: string | null; revoked: boolean; hub_baseline: string | null; assignment_revision: number;
+  machine_id: string; server_url: string; repo: string; headline: MachineStatus; connection: Connection;
+  last_error: string | null; revoked: boolean; server_baseline: string | null; assignment_revision: number;
   awaiting_assignment: boolean; auth_rejected_since: number | null; pending_discards: number; report: MachineReport;
 }
 export interface MachineRow {
@@ -19,11 +19,11 @@ export interface MachineRow {
 }
 export interface FleetView { baseline: string | null; machines: MachineRow[] }
 export interface HarnessAssignment {
-  new_skills_default: boolean; new_fragments_default: boolean;
-  skills: Record<string, boolean>; fragments: Record<string, boolean>;
+  new_skills_default: boolean; new_rules_default: boolean;
+  skills: Record<string, boolean>; rules: Record<string, boolean>;
 }
 export interface Assignment { harnesses: Record<string, HarnessAssignment> }
-export type ToggleKind = 'skill' | 'fragment' | 'new_skills_default' | 'new_fragments_default';
+export type ToggleKind = 'skill' | 'rule' | 'new_skills_default' | 'new_rules_default';
 export interface ToggleChange { harness: string; kind: ToggleKind; name?: string; enabled: boolean | null }
 export interface AssignmentChanges { changes: ToggleChange[] }
 export interface AssignmentSnapshot extends Assignment { revision: number }
@@ -39,11 +39,11 @@ export interface LogQuery { machine?: string; before?: number; limit?: number }
 // The GUI bridge adds a byte fingerprint to the Daemon's Draft entry.
 export interface DraftEntry { item: ItemRef; change: 'added' | 'modified' | 'deleted'; paths: string[]; fingerprint: string }
 export interface DiffView { item: ItemRef; diff: string }
-export interface PromoteMessage { items: ItemRef[]; message: string }
-export interface PromoteRequest { items: string[]; message?: string; author?: string }
-export interface PromoteResponse { sha: string; items: ItemRef[]; message: string; pushed: boolean; push_error: string | null }
-export interface ResetRequest { items: string[]; all: boolean }
-export interface ResetResponse { discarded: ItemRef[] }
+export interface CommitMessage { items: ItemRef[]; message: string }
+export interface CommitRequest { items: string[]; message?: string; author?: string }
+export interface CommitResponse { sha: string; items: ItemRef[]; message: string; pushed: boolean; push_error: string | null }
+export interface RestoreRequest { items: string[]; all: boolean }
+export interface RestoreResponse { discarded: ItemRef[] }
 export type PullResult = { state: 'up_to_date' } | { state: 'updated'; from: string | null; to: string }
   | { state: 'blocked'; baseline: string; items: ItemRef[] };
 export interface ConflictView {
@@ -58,7 +58,7 @@ export interface HarnessView {
 export interface ImportUpdate { name: string; source: string; ref: string; locked: string; upstream: string }
 export interface ImportsView { checked_at: number | null; updates: ImportUpdate[]; errors: { name: string; message: string }[] }
 export interface ImportUpdated { name: string; old_commit: string | null; new_commit: string; changed: boolean }
-export interface JoinApiRequest { hub_url: string; code: string; machine_id?: string; copy_from?: string; repo?: string }
+export interface JoinApiRequest { server_url: string; code: string; machine_id?: string; copy_from?: string; repo?: string }
 export interface Joined { machine_id: string; repo: string; setup: 'cloned' | 'initialized' | 'adopted'; harnesses: string[]; revision: number }
 export interface JoinCode { code: string }
 export interface CommandError { message: string; status: number | null; unreachable: boolean }
@@ -75,7 +75,7 @@ export interface ResolvedSource { source: string; git_ref: string; commit: strin
 export interface ResolveRequest { link: string; path?: string }
 export interface AddImportRequest { name: string; source: string; path: string; ref: string; commit?: string }
 
-export type ContentType = 'personal' | 'import' | 'fragment' | 'unmanaged';
+export type ContentType = 'personal' | 'import' | 'rule' | 'unmanaged';
 export interface ContentVariant {
   hash: string; description: string | null; locations: { harness: string; path: string }[];
 }

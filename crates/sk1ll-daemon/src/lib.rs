@@ -1,18 +1,18 @@
 //! `sk1ll-daemon`: runs on every machine, keeps its harnesses matching the
-//! local draft and the hub's assignment. The CLI and GUI talk to it over a
-//! local API ([`client`]); a direct CLI command can use the same Hub client
+//! local draft and the server's assignment. The CLI and GUI talk to it over a
+//! local API ([`client`]); a direct CLI command can use the same Server client
 //! and persistent files while holding the engine lock if the daemon is stopped.
 //!
-//! - The repo is a full clone whose only remote is the hub. Its working tree
+//! - The repo is a full clone whose only remote is the server. Its working tree
 //!   is the draft: live in local harnesses, never sent; only its item list
 //!   is reported.
 //! - The daemon holds core's engine lock on the repo while it runs, so no
 //!   other sk1ll process changes it behind its back.
 //! - Assignment arrives as whole snapshots over the WebSocket and is applied
 //!   only if newer. The snapshot is stored with its revision next to the
-//!   state file, so the machine works while the hub is away; without one the
-//!   harnesses are left alone until the hub sends one.
-//! - Promotes are pushed right away, or queued while offline.
+//!   state file, so the machine works while the server is away; without one the
+//!   harnesses are left alone until the server sends one.
+//! - Commits are pushed right away, or queued while offline.
 //! - Pulls happen on nudge, on reconnect and periodically. A Blocked pull is
 //!   reported and the machine stays on its old baseline until resolved.
 //! - Conflicts are reported, never applied; the API adopts or overwrites them.
@@ -26,7 +26,7 @@ mod config;
 mod daemon;
 mod error;
 pub mod gitx;
-mod hub;
+mod server;
 pub mod join;
 mod outbox;
 pub mod state;
@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, bail};
 pub use config::{Config, parse_duration};
-pub use hub::set_assignment_direct;
+pub use server::set_assignment_direct;
 use daemon::Daemon;
 pub use join::{JoinOptions, Joined, join, join_or_rejoin};
 pub use state::DaemonState;
@@ -45,7 +45,7 @@ pub use state::DaemonState;
 static PREPARED: AtomicBool = AtomicBool::new(false);
 
 /// Sets up the process environment for a daemon: git must never prompt, and
-/// authenticates to the hub with this machine's credentials (see [`auth`]).
+/// authenticates to the server with this machine's credentials (see [`auth`]).
 ///
 /// # Safety
 ///
@@ -74,7 +74,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     }
     let state = DaemonState::load(&cfg.state)?.with_context(|| {
         format!(
-            "this machine hasn't joined a fleet ({} is missing); run `sk1ll join <hub-url> <join-code>`",
+            "this machine hasn't joined a fleet ({} is missing); run `sk1ll join <server-url> <join-code>`",
             cfg.state.display()
         )
     })?;
@@ -98,7 +98,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             Ok(()) => {}
         }
         tokio::spawn(watch::run(d.clone()));
-        tokio::spawn(hub::run(d.clone()));
+        tokio::spawn(server::run(d.clone()));
         tokio::spawn(periodic_pull(d.clone()));
     }
     let served = tokio::select! {
