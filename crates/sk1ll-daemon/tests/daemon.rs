@@ -1567,6 +1567,7 @@ async fn gui_creation_import_inventory_check_and_conflict_diff() {
     let diff = m.client.conflict_diff(&ConflictDiffRequest { harness: Some(HARNESS.into()), name: Some("x".into()), id: None }).await.unwrap();
     assert!(diff.diff.contains("-Harness edit"), "{}", diff.diff);
     assert!(diff.diff.contains("+x"), "{}", diff.diff);
+    assert!(!diff.diff.contains(".sk1ll-managed"), "{}", diff.diff);
     m.client.remove_import("external").await.unwrap();
     assert!(m.client.imports().await.unwrap().imports.is_empty());
     assert!(!m.repo().join("imported/external").exists());

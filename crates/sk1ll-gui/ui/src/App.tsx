@@ -78,7 +78,7 @@ export function AppSidebar({ screen, setScreen, status, unmanagedCount }: { scre
         <span className="truncate text-xs text-muted-foreground">{status.machine_id}</span></div>
     </div></SidebarHeader>
     <SidebarContent><nav aria-label="Main navigation" className="contents">
-      {['Fleet', 'This Machine'].map(label => <SidebarGroup key={label}><SidebarGroupLabel>{label}</SidebarGroupLabel>
+      {['Fleet', 'This Machine'].map(label => <SidebarGroup key={label}><SidebarGroupLabel className="group-data-[collapsible=icon]:pointer-events-none">{label}</SidebarGroupLabel>
         <SidebarGroupContent><SidebarMenu>{group(label).map(item)}</SidebarMenu></SidebarGroupContent></SidebarGroup>)}
       <SidebarGroup className="mt-auto"><SidebarGroupContent><SidebarMenu>{item('Settings')}</SidebarMenu></SidebarGroupContent></SidebarGroup>
     </nav></SidebarContent>

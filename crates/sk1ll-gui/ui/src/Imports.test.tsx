@@ -284,3 +284,13 @@ it('filters the loaded log page by machine, Harness, author and item', async () 
   }
   expect(screen.queryByText('change')).toBeNull(); expect(api.log).toHaveBeenCalledOnce();
 });
+it('does not offer Restore for a removed Machine', async () => {
+  vi.mocked(api.fleet).mockResolvedValue({ baseline: null, machines: [{ id: 'laptop' } as never] });
+  vi.mocked(api.log).mockResolvedValue([
+    { id: 7, machine: 'laptop', harness: 'claude', kind: 'skill', name: 'pdf', before: true, after: false, at: 1, author: 'user', cause: { type: 'change' } },
+    { id: 8, machine: 'old-box', harness: 'claude', kind: 'skill', name: 'pdf', before: true, after: false, at: 2, author: 'user', cause: { type: 'change' } }]);
+  render(<Log revision={0} changed={changed} />);
+  await screen.findByRole('button', { name: /Restore On for log entry 7/ });
+  expect(await screen.findByText('Machine removed')).toBeTruthy();
+  expect(screen.queryByRole('button', { name: /log entry 8/ })).toBeNull();
+});
