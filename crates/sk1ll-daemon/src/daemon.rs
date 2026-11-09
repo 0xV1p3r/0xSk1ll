@@ -1476,7 +1476,7 @@ impl Daemon {
             if check {
                 for i in &view.imports {
                     match sk1ll_core::imports::fetch_link(&root, &i.source, Some(&i.path), Some(&i.git_ref), None) {
-                        Ok(f) => if let Some(locked) = &i.locked { if locked != &f.resolved.commit { view.updates.push(sk1ll_proto::ImportUpdate { name: i.name.clone(), source: i.source.clone(), git_ref: i.git_ref.clone(), locked: locked.clone(), upstream: f.resolved.commit }); } },
+                        Ok(f) => if let Some(locked) = &i.locked && locked != &f.resolved.commit { view.updates.push(sk1ll_proto::ImportUpdate { name: i.name.clone(), source: i.source.clone(), git_ref: i.git_ref.clone(), locked: locked.clone(), upstream: f.resolved.commit }); },
                         Err(e) => view.errors.push(sk1ll_proto::ImportError { name: i.name.clone(), message: e.to_string() }),
                     }
                 }
@@ -1519,6 +1519,11 @@ impl Daemon {
             let content = sk1ll_core::instructions::managed_content(&text, &left)?;
             left = temp.path().join("Harness");
             std::fs::write(&left, content).map_err(anyhow::Error::from)?;
+        } else if left.is_dir() {
+            // Diff only authored files: the harness copy carries the management marker.
+            let copy = temp.path().join("Harness");
+            copy_authored(&left, &copy).map_err(anyhow::Error::from)?;
+            left = copy;
         }
         if !right.exists() {
             right = temp.path().join("Draft");
@@ -1529,4 +1534,17 @@ impl Daemon {
         if !matches!(output.status.code(), Some(0 | 1)) { return Err(Error::BadRequest(String::from_utf8_lossy(&output.stderr).into_owned())); }
         Ok(DiffView { item, diff: String::from_utf8_lossy(&output.stdout).into_owned() })
     }
+}
+
+fn copy_authored(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == sync::MARKER || name == ".git" { continue; }
+        let kind = entry.file_type()?;
+        if kind.is_dir() { copy_authored(&entry.path(), &to.join(&name))?; }
+        else if kind.is_file() { std::fs::copy(entry.path(), to.join(&name))?; }
+    }
+    Ok(())
 }

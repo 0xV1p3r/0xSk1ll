@@ -49,7 +49,7 @@ export function Skills({ entries, revision, changed, reviewDraft, assignment, ad
         {Object.entries(typeLabels).map(([type, label]) => <NativeSelectOption key={type} value={type}>{label}</NativeSelectOption>)}
       </NativeSelect></Field>
       <Field className="min-w-40 flex-1 sm:max-w-xs"><FieldLabel htmlFor="skill-search">Search by name</FieldLabel>
-        <Input id="skill-search" value={search} onChange={event => setSearch(event.target.value)} placeholder="Find a Skill or Rule…" /></Field>
+        <Input id="skill-search" type="search" value={search} onChange={event => setSearch(event.target.value)} placeholder="Find a Skill or Rule…" /></Field>
       <DropdownMenu><DropdownMenuTrigger render={<Button />}>New</DropdownMenuTrigger><DropdownMenuContent><DropdownMenuGroup><DropdownMenuItem onClick={() => startCreate('skill')}>New Skill</DropdownMenuItem><DropdownMenuItem onClick={() => startCreate('rule')}>New Rule</DropdownMenuItem></DropdownMenuGroup></DropdownMenuContent></DropdownMenu>
     </div>
     <Dialog open={!!creating} onOpenChange={open => { if (!open && !creation.pending) setCreating(undefined); }}><DialogContent><DialogHeader><DialogTitle>New {creating === 'rule' ? 'Rule' : 'Skill'}</DialogTitle><DialogDescription>Create an item in Draft.</DialogDescription></DialogHeader>

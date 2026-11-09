@@ -144,7 +144,7 @@ export function installMock(scenario: string) {
       case 'skills': return delay(structuredClone(content));
       case 'skill_tree': {
         const query = a.query as T.ContentQuery;
-        return delay(query.item.startsWith('rule:') ? [{ path: `${query.item.slice(9)}.md`, kind: 'file', size: 120 }]
+        return delay(query.item.startsWith('rule:') ? [{ path: `${query.item.slice(5)}.md`, kind: 'file', size: 120 }]
           : [{ path: 'SKILL.md', kind: 'file', size: 120 }, { path: 'references', kind: 'directory', size: 0 }, { path: 'references/example.md', kind: 'file', size: 50 }]);
       }
       case 'skill_file': {
@@ -212,7 +212,8 @@ export function installMock(scenario: string) {
       case 'join_code': return delay({ code: 'sk1ll-join-7Q2M-XK9P-44RD-ZT8W' });
       case 'connection_info': return delay('/run/user/1000/sk1ll/daemon.sock', 10);
       case 'adopt': case 'overwrite': case 'adopt_displaced': case 'discard_displaced': case 'undo':
-      case 'remove_machine': case 'join': return delay(undefined, 500);
+      case 'remove_machine': return delay(undefined, 500);
+      case 'join': return delay({ machine_id: (a.request as T.JoinApiRequest).machine_id ?? 'laptop', repo: '/home/user/.local/share/sk1ll/repo', setup: 'cloned', harnesses: ['claude', 'codex'], revision: 1 }, 500);
       default: return undefined;
     }
   }, { shouldMockEvents: true });

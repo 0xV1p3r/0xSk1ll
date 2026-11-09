@@ -115,6 +115,8 @@ export function Log({ revision, changed }: { revision: number; changed: () => vo
   const [pages, setPages] = useState<(number | undefined)[]>([]);
   const load = useCallback(() => api.log({ before, limit: 50 }), [before]);
   const { data, error, loading } = useResource(load, revision);
+  const fleet = useResource(api.fleet, revision);
+  const removed = (machine: string) => !!fleet.data && !fleet.data.machines.some(row => row.id === machine);
   useEffect(() => {
     if (restoreFocus.current && document.activeElement === document.body) {
       (log.current?.querySelector<HTMLElement>('[role="region"]') ?? log.current)?.focus();
@@ -136,10 +138,10 @@ export function Log({ revision, changed }: { revision: number; changed: () => vo
         <TableCell className="whitespace-nowrap">{toggleLabel(entry.before)} <span className="text-muted-foreground">→</span> {toggleLabel(entry.after)}</TableCell>
         <TableCell>{entry.cause.type !== 'change' && <Badge variant="secondary">{entry.cause.type.replaceAll('_', ' ')}{'entry' in entry.cause ? ` #${entry.cause.entry}` : ''}</Badge>}</TableCell>
         <TableCell className="text-muted-foreground">{entry.author}</TableCell>
-        <TableCell data-log-id={entry.id} className="[@media(hover:hover)]:opacity-0 group-hover:opacity-100 focus-within:opacity-100 w-24 min-w-24 max-w-24 whitespace-normal xl:w-36 xl:min-w-36 xl:max-w-36"><Action announceDone={false} className="h-10 w-full whitespace-normal xl:whitespace-nowrap" label={`Restore ${toggleLabel(entry.before)}`} doneLabel="Restored" variant="ghost"
+        <TableCell data-log-id={entry.id} className="[@media(hover:hover)]:opacity-0 group-hover:opacity-100 focus-within:opacity-100 w-24 min-w-24 max-w-24 whitespace-normal xl:w-36 xl:min-w-36 xl:max-w-36">{removed(entry.machine) ? <span className="text-xs text-muted-foreground" title="This Machine was removed. Join it again to restore its Assignment.">Machine removed</span> : <Action announceDone={false} className="h-10 w-full whitespace-normal xl:whitespace-nowrap" label={`Restore ${toggleLabel(entry.before)}`} doneLabel="Restored" variant="ghost"
           ariaLabel={`Restore ${toggleLabel(entry.before)} for log entry ${entry.id}: ${entry.name === null ? entry.kind.replaceAll('_', ' ') : `${entry.kind}:${entry.name}`} on ${entry.machine} / ${entry.harness}`} action={() => { restoreFocus.current = !!log.current?.contains(document.activeElement); return api.undo(entry.id); }} onDone={() => {
             toast({ title: `Restored Assignment ${entry.name === null ? entry.kind.replaceAll('_', ' ') : `${entry.kind}:${entry.name}`} on ${entry.machine} / ${entry.harness} to ${toggleLabel(entry.before)}.` }); changed();
-          }} /></TableCell>
+          }} />}</TableCell>
       </TableRow>)}</TableBody></Table></div>}</div>
     <div className="flex items-center justify-end gap-2">
       {before !== undefined && <Button variant="ghost" size="sm" onClick={() => { setBefore(undefined); setPages([]); }}>Latest</Button>}
