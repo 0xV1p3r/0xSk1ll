@@ -9,7 +9,7 @@ import { api } from './api';
 import type { ContentEntry, ContentType, StatusView } from './types';
 
 vi.mock('./api', () => ({ api: { skills: vi.fn(), skillTree: vi.fn(), skillFile: vi.fn(), editors: vi.fn(),
-  fork: vi.fn(), adoptUnmanaged: vi.fn(), openInEditor: vi.fn() }, errorMessage: (error: unknown) => String(error) }));
+  fork: vi.fn(), adoptUnmanaged: vi.fn(), openInEditor: vi.fn(), setPreferredEditor: vi.fn(), createItem: vi.fn() }, errorMessage: (error: unknown) => String(error) }));
 const entry = (name: string, type: ContentType, extra: Partial<ContentEntry> = {}): ContentEntry => ({
   name, item: type === 'unmanaged' ? null : `${type === 'rule' ? 'rule' : 'skill'}:${name}`, type,
   description: `About ${name}`, draft: null, in_baseline: type !== 'unmanaged', path: null,
@@ -36,7 +36,7 @@ afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 const mount = (values = entries) => render(<TooltipProvider><Skills {...props} entries={values} /></TooltipProvider>);
 async function select(name: string, type = 'Import') {
   fireEvent.click(screen.getByRole('row', { name: `View ${type} ${name}` }));
-  await screen.findByRole('button', { name: /Fork to edit|Adopt to edit|Open in VS Code/ });
+  await screen.findByRole('button', { name: /Fork to edit|Adopt|Open in VS Code/ });
 }
 it('filters four Types and searches by name in one table', () => {
   mount(); expect(screen.getAllByRole('table')).toHaveLength(1);
@@ -58,10 +58,10 @@ it('sorts Name and Type and opens rows using the keyboard', async () => {
 });
 it('places Skills first in This Machine and shows the Unmanaged count badge', () => {
   const status = { machine_id: 'test', report: { drafts: [], conflicts: [] } } as unknown as StatusView;
-  render(<TooltipProvider><SidebarProvider><AppSidebar screen="Skills" setScreen={vi.fn()} status={status} unmanagedCount={2} /></SidebarProvider></TooltipProvider>);
-  expect(screen.getByLabelText('2 Unmanaged skills').textContent).toBe('2');
-  const links = screen.getAllByRole('button').filter(button => ['Skills', 'Draft', 'Conflicts', 'Imports'].includes(button.textContent ?? ''));
-  expect(links[0].textContent).toBe('Skills');
+  render(<TooltipProvider><SidebarProvider><AppSidebar screen="Library" setScreen={vi.fn()} status={status} unmanagedCount={2} /></SidebarProvider></TooltipProvider>);
+  expect(screen.getByLabelText('2 Unmanaged skills to adopt').textContent).toBe('2');
+  const links = screen.getAllByRole('button').filter(button => ['Library', 'Draft', 'Conflicts', 'Imports'].includes(button.textContent ?? ''));
+  expect(links[0].textContent).toBe('Library');
 });
 it('confirms Fork before opening the Import in the preferred editor', async () => {
   mount(); await select('pdf'); fireEvent.click(screen.getByRole('button', { name: 'Fork to edit' }));
@@ -77,7 +77,8 @@ it('Adopts the selected variant before opening and passes its hash to browsing',
   fireEvent.change(screen.getByLabelText('Harness location and variant'), { target: { value: 'sha256:two:codex' } });
   await waitFor(() => expect(api.skillTree).toHaveBeenLastCalledWith({ item: 'unmanaged:notes', hash: 'sha256:two', harness: 'codex' }));
   await waitFor(() => expect(api.skillFile).toHaveBeenLastCalledWith({ item: 'unmanaged:notes', hash: 'sha256:two', harness: 'codex', path: 'SKILL.md' }));
-  fireEvent.click(screen.getByRole('button', { name: 'Adopt to edit' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Choose editor' }));
+  fireEvent.click(await screen.findByRole('menuitem', { name: 'Adopt and open in VS Code' }));
   expect(screen.getByText(/original is kept in recovery/)).toBeTruthy(); expect(screen.getByText(/selected variant from codex/)).toBeTruthy();
   fireEvent.click(screen.getByRole('button', { name: 'Adopt and open' }));
   await waitFor(() => expect(api.openInEditor).toHaveBeenCalledWith('code', 'skill:notes'));
@@ -133,10 +134,10 @@ it('keeps editor errors visible after Fork without repeating the conversion', as
 });
 it('stops after failed Adopt and blocks clashing names', async () => {
   vi.mocked(api.adoptUnmanaged).mockRejectedValueOnce('Cannot Adopt'); mount(); await select('notes', 'Unmanaged');
-  fireEvent.click(screen.getByRole('button', { name: 'Adopt to edit' })); fireEvent.click(screen.getByRole('button', { name: 'Adopt and open' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Choose editor' })); fireEvent.click(await screen.findByRole('menuitem', { name: 'Adopt and open in VS Code' })); fireEvent.click(screen.getByRole('button', { name: 'Adopt and open' }));
   await screen.findAllByText('Cannot Adopt'); expect(api.openInEditor).not.toHaveBeenCalled(); cleanup();
   mount([entry('notes', 'unmanaged', { clashes_with_repo: true })]); await select('notes', 'Unmanaged');
-  expect((screen.getByRole('button', { name: 'Adopt to edit' }) as HTMLButtonElement).disabled).toBe(true);
+  expect((screen.getByRole('button', { name: 'Adopt' }) as HTMLButtonElement).disabled).toBe(true);
 });
 it('Harness chips navigate to the Assignment matrix', () => {
   mount(); fireEvent.click(screen.getByRole('button', { name: 'Assignment for writing in claude' })); expect(assignment).toHaveBeenCalledWith('skill:writing', 'claude'); expect(screen.queryByRole('dialog')).toBeNull();
@@ -154,7 +155,7 @@ it('does not display the previous file when another file fails to load', async (
   vi.mocked(api.skillFile).mockResolvedValueOnce({ path: 'SKILL.md', text: '# Original', binary: false, too_large: false, size: 10 })
     .mockRejectedValueOnce('Cannot read file');
   mount(); await select('pdf'); await screen.findByRole('heading', { name: 'Original' });
-  fireEvent.click(screen.getByRole('button', { name: 'docs/example.md' }));
+  fireEvent.click(screen.getByRole('button', { name: 'example.md' }));
   await screen.findByText('Cannot read file'); expect(screen.queryByRole('heading', { name: 'Original' })).toBeNull();
 });
 it('does not keep another variant preview when reading the new variant fails', async () => {
@@ -168,15 +169,11 @@ it('does not keep another variant preview when reading the new variant fails', a
 it.each(['offline', 'connecting', 'auth_rejected', 'revoked'] as const)('disables adoption while %s and explains the connection requirement', async connection => {
   render(<TooltipProvider><Skills {...props} connection={connection} /></TooltipProvider>);
   await select('notes', 'Unmanaged');
-  for (const name of ['Adopt', 'Adopt to edit', 'Choose editor']) {
+  for (const name of ['Adopt', 'Choose editor']) {
     expect(screen.getByRole('button', { name }).hasAttribute('disabled')).toBe(true);
     fireEvent.click(screen.getByRole('button', { name }));
   }
-  const trigger = screen.getByRole('button', { name: 'Adopt' }).parentElement!;
-  fireEvent.pointerEnter(trigger, { pointerType: 'mouse' });
-  fireEvent.mouseMove(trigger);
-  fireEvent.mouseEnter(trigger);
-  expect(await screen.findByText('Needs a connection to the Server')).toBeTruthy();
+  expect(screen.getByText('Needs a connection to the Server')).toBeTruthy();
   expect(api.adoptUnmanaged).not.toHaveBeenCalled();
 });
 it('disables a pending adoption confirmation when the Server disconnects', async () => {
@@ -217,4 +214,36 @@ it('keeps confirmation focus inside the sheet on Cancel and Escape and focuses R
     await waitFor(() => expect(document.activeElement).toBe(target));
     expect(screen.getByRole('dialog', { name: 'notes' }).contains(document.activeElement)).toBe(true);
   }
+});
+
+it('applies initialSearch changes', () => {
+  const view = render(<Skills {...props} initialSearch="writing" />); expect((screen.getByLabelText('Search by name') as HTMLInputElement).value).toBe('writing');
+  view.rerender(<Skills {...props} initialSearch="pdf" />); expect((screen.getByLabelText('Search by name') as HTMLInputElement).value).toBe('pdf');
+});
+it('validates and creates a new Skill', async () => {
+  mount([]); fireEvent.click(screen.getByRole('button', { name: 'New Skill' }));
+  const input = screen.getByLabelText('Name'), create = screen.getByRole('button', { name: 'Create' });
+  fireEvent.change(input, { target: { value: 'bad name' } }); expect(create.hasAttribute('disabled')).toBe(true);
+  fireEvent.change(input, { target: { value: 'new-skill' } }); fireEvent.click(create);
+  await waitFor(() => expect(api.createItem).toHaveBeenCalledWith({ kind: 'skill', name: 'new-skill', description: undefined }));
+});
+it('explains missing editors', async () => {
+  vi.mocked(api.editors).mockResolvedValue({ preferred_editor: '', editors: [] }); mount();
+  fireEvent.click(screen.getByRole('row', { name: 'View Personal writing' }));
+  expect(await screen.findByText('No editors found')).toBeTruthy(); expect(screen.getByRole('button', { name: 'Open in editor' }).hasAttribute('disabled')).toBe(true);
+});
+
+it.each(['skill', 'rule'] as const)('checks collisions only in the %s namespace', async kind => {
+  mount();
+  fireEvent.click(screen.getByRole('button', { name: 'New' }));
+  fireEvent.click(await screen.findByRole('menuitem', { name: kind === 'rule' ? 'New Rule' : 'New Skill' }));
+  const input = screen.getByLabelText('Name'), create = screen.getByRole('button', { name: 'Create' });
+  for (const name of kind === 'rule' ? ['style'] : ['writing', 'pdf', 'notes']) {
+    fireEvent.change(input, { target: { value: name } });
+    expect(create.hasAttribute('disabled')).toBe(true);
+  }
+  fireEvent.change(input, { target: { value: kind === 'rule' ? 'writing' : 'style' } });
+  expect(create.hasAttribute('disabled')).toBe(false);
+  fireEvent.click(create);
+  await waitFor(() => expect(api.createItem).toHaveBeenCalledWith({ kind, name: kind === 'rule' ? 'writing' : 'style', description: undefined }));
 });

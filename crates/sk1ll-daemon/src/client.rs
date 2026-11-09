@@ -57,7 +57,7 @@ use serde::{Deserialize, Serialize};
 
 pub use sk1ll_core::content::{ContentEntry, ContentQuery, ContentType, FileContent, FileEntry, FileQuery};
 pub use sk1ll_proto::{
-    Assignment, AssignmentChanges, AssignmentSnapshot, AssignmentUpdate, ErrorBody, FleetView, ImportUpdate, ImportsView, ItemRef,
+    Assignment, AssignmentChanges, AssignmentSnapshot, AssignmentUpdate, ErrorBody, FleetView, ImportUpdate, ItemRef,
     JoinCode, LogEntry, LogQuery, MachineReport, MachineStatus,
 };
 use tokio::net::UnixStream;
@@ -397,6 +397,28 @@ impl Event {
 // ---------------------------------------------------------------------------
 // Client
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ImportsView {
+    pub checked_at: Option<i64>,
+    pub updates: Vec<ImportUpdate>,
+    pub errors: Vec<sk1ll_proto::ImportError>,
+    #[serde(default)]
+    pub imports: Vec<ImportEntry>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportEntry {
+    pub name: String,
+    pub source: String,
+    #[serde(rename = "ref")]
+    pub git_ref: String,
+    pub path: String,
+    pub locked: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateItemRequest { pub kind: String, pub name: String, pub description: Option<String> }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictDiffRequest { pub harness: Option<String>, pub name: Option<String>, pub id: Option<String> }
+
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 pub struct ClientError {
@@ -500,6 +522,9 @@ impl Client {
         self.raw(Method::POST, path, Some(body)).await.map(drop)
     }
 
+    pub async fn create_item(&self, request: &CreateItemRequest) -> Result<()> { self.post_empty("/items/create", request).await }
+    pub async fn conflict_diff(&self, request: &ConflictDiffRequest) -> Result<DiffView> { self.post("/conflicts/diff", request).await }
+    pub async fn check_imports(&self) -> Result<ImportsView> { self.post("/imports/check", &()).await }
     pub async fn status(&self) -> Result<StatusView> {
         self.get("/status").await
     }

@@ -52,7 +52,10 @@ pub(crate) fn router(d: Arc<Daemon>) -> Router {
         .route("/conflicts/adopt", post(adopt))
         .route("/conflicts/overwrite", post(overwrite))
         .route("/harnesses", get(harnesses))
-        .route("/imports", get(pass))
+        .route("/imports", get(imports))
+        .route("/imports/check", post(check_imports))
+        .route("/items/create", post(create_item))
+        .route("/conflicts/diff", post(conflict_diff))
         .route("/imports/{name}/update", post(update_import))
         .route("/imports/resolve", post(resolve_import))
         .route("/imports/add", post(add_import))
@@ -374,4 +377,30 @@ mod tests {
         assert_eq!(stream.peer_cred().unwrap().uid(), euid());
         client.await.unwrap();
     }
+}
+
+async fn create_item(State(d): St, Json(req): Json<crate::client::CreateItemRequest>) -> Result<StatusCode> {
+    d.blocking(move |d, eng| d.create_item(eng, req)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+async fn conflict_diff(State(d): St, Json(req): Json<crate::client::ConflictDiffRequest>) -> Result<Json<DiffView>> {
+    Ok(Json(d.blocking(move |d, eng| d.conflict_diff(eng, req)).await?))
+}
+async fn imports(State(d): St) -> Result<Json<crate::client::ImportsView>> {
+    let mut view = d.local_imports(false).await?;
+    if let Ok(response) = server::proxy(&d, Method::GET, "/imports", Bytes::new()).await {
+        if response.status().is_success() {
+            if let Ok(bytes) = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024).await {
+                if let Ok(remote) = serde_json::from_slice::<sk1ll_proto::ImportsView>(&bytes) {
+                    if remote.checked_at > view.checked_at { view.checked_at = remote.checked_at; view.updates = remote.updates; view.errors = remote.errors; }
+                }
+            }
+        }
+    }
+    view.updates.retain(|u| view.imports.iter().any(|i| i.name == u.name && i.locked.as_ref() == Some(&u.locked)));
+    view.errors.retain(|e| view.imports.iter().any(|i| i.name == e.name));
+    Ok(Json(view))
+}
+async fn check_imports(State(d): St) -> Result<Json<crate::client::ImportsView>> {
+    Ok(Json(d.local_imports(true).await?))
 }

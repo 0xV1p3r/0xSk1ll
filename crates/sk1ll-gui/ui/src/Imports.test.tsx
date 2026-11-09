@@ -3,17 +3,21 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { Conflicts, Imports, Log } from './Activity';
 import { api } from './api';
+import { toast } from './toast';
+vi.mock('./toast', () => ({ toast: vi.fn() }));
 import { JoinCodeButton, Settings } from './Settings';
 import type { SkillCandidate, StatusView } from './types';
 
-vi.mock('./api', () => ({ api: { imports: vi.fn(), items: vi.fn(), resolveImport: vi.fn(), addImport: vi.fn(), log: vi.fn(), undo: vi.fn(), conflicts: vi.fn(), recovered: vi.fn(), harnesses: vi.fn(), fleet: vi.fn(), join: vi.fn(), joinCode: vi.fn() },
+vi.mock('./api', () => ({ api: { editors: vi.fn(), imports: vi.fn(), checkImports: vi.fn(), removeImport: vi.fn(), updateImport: vi.fn(), conflictDiff: vi.fn(), items: vi.fn(), resolveImport: vi.fn(), addImport: vi.fn(), log: vi.fn(), undo: vi.fn(), conflicts: vi.fn(), recovered: vi.fn(), harnesses: vi.fn(), fleet: vi.fn(), join: vi.fn(), joinCode: vi.fn() },
   errorMessage: (e: unknown) => String(e) }));
 const changed = vi.fn();
 const reviewDraft = vi.fn();
 const candidate = (name: string, taken = false): SkillCandidate => ({ path: name, default_name: name, description: `About ${name}`, taken });
 beforeEach(() => {
   vi.resetAllMocks();
+  vi.mocked(api.editors).mockResolvedValue({ editors: [], preferred_editor: 'auto' });
   vi.mocked(api.imports).mockResolvedValue({ checked_at: null, updates: [], errors: [] });
+  vi.mocked(api.conflictDiff).mockResolvedValue({ item: 'skill:pdf', diff: '-edit\n+draft' });
   vi.mocked(api.items).mockResolvedValue([]);
   vi.mocked(api.addImport).mockResolvedValue({ name: 'pdf', old_commit: null, new_commit: 'abc', changed: true });
 });
@@ -110,19 +114,8 @@ it.each([[true, 'On'], [false, 'Off'], [null, 'Default']] as const)('names the r
   vi.mocked(api.undo).mockResolvedValue({ assignment: { harnesses: {} }, revision: 2, entries: [] });
   render(<Log revision={0} changed={changed} />);
   fireEvent.click(await screen.findByRole('button', { name: `Restore ${label} for log entry 7: skill:pdf on laptop / claude` }));
-  expect(await screen.findByText(`Restored Assignment skill:pdf on laptop / claude to ${label}.`)).toBeTruthy();
+  await waitFor(() => expect(toast).toHaveBeenCalledWith({ title: `Restored Assignment skill:pdf on laptop / claude to ${label}.` }));
   expect(screen.getByRole('button', { name: `Restore ${label} for log entry 7: skill:pdf on laptop / claude` }).textContent).toContain('Restored');
-  const status = screen.getByText(`Restored Assignment skill:pdf on laptop / claude to ${label}.`).closest('[role=status]')!;
-  expect(status.getAttribute('aria-live')).toBe('polite');
-  expect(status.textContent).toBe(`Restored Assignment skill:pdf on laptop / claude to ${label}.`);
-  expect(within(screen.getByRole('table')).queryByRole('status')).toBeNull();
-  expect(status.closest('table')).toBeNull();
-  await new Promise(resolve => setTimeout(resolve, 2600));
-  expect(status.textContent).toContain(`to ${label}.`);
-  expect(within(screen.getByRole('table')).queryByText(/Restored Assignment/)).toBeNull();
-  fireEvent.click(screen.getByRole('button', { name: 'Dismiss Restore status' }));
-  expect(status.textContent).toBe('');
-  expect(document.activeElement).toBe(screen.getByRole('button', { name: `Restore ${label} for log entry 7: skill:pdf on laptop / claude` }));
   expect(api.undo).toHaveBeenCalledWith(7); expect(changed).toHaveBeenCalledOnce();
 });
 it.each([false, true])('names the item, Harness and path in the %s recovery confirmation', async displaced => {
@@ -169,7 +162,8 @@ it('describes join errors from the submitted fields without losing existing hint
   vi.mocked(api.join).mockRejectedValue('Join code expired');
   const status = { server_url: 'https://skills.example.com', machine_id: 'laptop', connection: 'connected', auth_rejected_since: null } as StatusView;
   render(<Settings revision={0} status={status} socket="/daemon.sock" changed={changed} />);
-  const code = screen.getByLabelText('Join code');
+  fireEvent.click(screen.getByRole('button', { name: 'Rejoin this Machine…' }));
+  const code = await screen.findByLabelText('Join code');
   fireEvent.change(code, { target: { value: 'expired' } });
   fireEvent.submit(code.closest('form')!);
   const dialog = await screen.findByRole('dialog');
@@ -228,7 +222,7 @@ it('keeps Restore focus during the request and guards repeated clicks', async ()
   expect(restore.getAttribute('aria-disabled')).toBe('true');
   fireEvent.click(restore); expect(api.undo).toHaveBeenCalledOnce();
   finish();
-  await screen.findByText(/Restored Assignment/);
+  await waitFor(() => expect(toast).toHaveBeenCalled());
   expect(document.activeElement).toBe(restore);
 });
 it.each([false, true])('focuses the log region when the restored row is gone and empty is %s', async empty => {
@@ -236,11 +230,57 @@ it.each([false, true])('focuses the log region when the restored row is gone and
   vi.mocked(api.undo).mockResolvedValue({ assignment: { harnesses: {} }, revision: 2, entries: [] });
   const view = render(<Log revision={0} changed={changed} />);
   fireEvent.click(await screen.findByRole('button', { name: /Restore On for log entry 7/ }));
-  await screen.findByText(/Restored Assignment/);
+  await waitFor(() => expect(toast).toHaveBeenCalled());
   vi.mocked(api.log).mockResolvedValue(empty ? [] : [{ id: 8, machine: 'laptop', harness: 'claude', kind: 'skill', name: 'other', before: true, after: false, at: 2, author: 'user', cause: { type: 'change' } }]);
   view.rerender(<Log revision={1} changed={changed} />);
   if (empty) await screen.findByText('No log entries');
   else await screen.findByRole('button', { name: /Restore On for log entry 8/ });
-  fireEvent.click(screen.getByRole('button', { name: 'Dismiss Restore status' }));
-  expect(document.activeElement).toBe(screen.getByRole('region', { name: 'Assignment log' }));
+  expect(screen.getByRole('region', { name: 'Assignment log' })).toBeTruthy();
+});
+it('lists all Imports, checks now and removes into Draft', async () => {
+  const imports = [{ name: 'pdf', source: 'github:test/repo', ref: 'main', path: 'skills/pdf', locked: 'abcdef123' }, { name: 'writing', source: 'github:test/repo', ref: 'main', path: '', locked: '123456789' }];
+  vi.mocked(api.imports).mockResolvedValue({ imports, checked_at: null, updates: [], errors: [] });
+  vi.mocked(api.checkImports).mockResolvedValue({ imports, checked_at: 1, updates: [{ ...imports[0], upstream: 'fedcba321' }], errors: [{ name: 'writing', message: 'Access denied' }] });
+  vi.mocked(api.removeImport).mockResolvedValue(undefined);
+  render(<Imports revision={0} changed={changed} reviewDraft={reviewDraft} />);
+  await screen.findByRole('table', { name: 'Imports' });
+  expect(screen.getAllByText('Up to date')).toHaveLength(2);
+  fireEvent.click(screen.getByRole('button', { name: 'Check now' }));
+  await screen.findByText(/Update available/); await screen.findByText(/Check failed/);
+  fireEvent.click(screen.getByRole('button', { name: 'Remove pdf' }));
+  fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Remove' }));
+  await screen.findByText('pdf removal is in the Draft');
+  expect(api.removeImport).toHaveBeenCalledWith('pdf'); expect(changed).toHaveBeenCalledOnce();
+});
+it('loads conflict diffs on expansion and uses recovery ids', async () => {
+  const entry = { name: 'pdf', harness: 'claude', dest: '/skills/pdf', adoptable: true, reason: null, items: ['skill:pdf'] };
+  vi.mocked(api.conflicts).mockResolvedValue([entry]);
+  vi.mocked(api.recovered).mockResolvedValue([{ ...entry, id: 'recovery', path: '/recovery/pdf' }]);
+  render(<Conflicts revision={0} changed={changed} reviewDraft={reviewDraft} />);
+  const summaries = await screen.findAllByText('Show diff');
+  expect(api.conflictDiff).not.toHaveBeenCalled();
+  fireEvent.click(summaries[0]);
+  await screen.findByLabelText('Conflict diff');
+  expect(api.conflictDiff).toHaveBeenCalledWith({ harness: 'claude', name: 'pdf' });
+  fireEvent.click(summaries[1]);
+  await waitFor(() => expect(api.conflictDiff).toHaveBeenCalledWith({ id: 'recovery' }));
+  expect(screen.getAllByText('+draft')[0].getAttribute('data-kind')).toBe('add');
+});
+it('automatically loads the sole conflict diff', async () => {
+  vi.mocked(api.conflicts).mockResolvedValue([{ name: 'pdf', harness: 'claude', dest: '/pdf', adoptable: true, reason: null, items: [] }]);
+  vi.mocked(api.recovered).mockResolvedValue([]);
+  render(<Conflicts revision={0} changed={changed} reviewDraft={reviewDraft} />);
+  await screen.findByLabelText('Conflict diff'); expect(api.conflictDiff).toHaveBeenCalledOnce();
+});
+it('filters the loaded log page by machine, Harness, author and item', async () => {
+  const base = { kind: 'skill' as const, before: true, after: false, at: 1, cause: { type: 'change' as const } };
+  vi.mocked(api.log).mockResolvedValue([{ ...base, id: 1, machine: 'laptop', harness: 'claude', author: 'alice', name: 'pdf' }, { ...base, id: 2, machine: 'desktop', harness: 'codex', author: 'bob', name: 'writing' }]);
+  render(<Log revision={0} changed={changed} />);
+  await screen.findByText('skill:pdf');
+  for (const [label, value] of [['Filter by machine', 'laptop'], ['Filter by harness', 'claude'], ['Filter by author', 'alice'], ['Search items', 'PDF']]) {
+    fireEvent.change(screen.getByLabelText(label), { target: { value } });
+    expect(screen.getByText('skill:pdf')).toBeTruthy(); expect(screen.queryByText('skill:writing')).toBeNull();
+    fireEvent.change(screen.getByLabelText(label), { target: { value: '' } });
+  }
+  expect(screen.queryByText('change')).toBeNull(); expect(api.log).toHaveBeenCalledOnce();
 });

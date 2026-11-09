@@ -2,6 +2,12 @@ import { invoke } from '@tauri-apps/api/core';
 import type * as T from './types';
 
 export const api = {
+  push: () => invoke<T.PushResult>('push'),
+  createItem: (request: T.CreateItemRequest) => invoke<void>('create_item', { request }),
+  checkImports: () => invoke<T.ImportsView>('check_imports'),
+  removeImport: (name: string) => invoke<void>('remove_import', { name }),
+  conflictDiff: (request: T.ConflictDiffRequest) => invoke<T.DiffView>('conflict_diff', { request }),
+  setPreferredEditor: (editorId: string) => invoke<void>('set_preferred_editor', { editorId }),
   skills: () => invoke<T.ContentEntry[]>('skills'),
   skillTree: (query: T.ContentQuery) => invoke<T.FileEntry[]>('skill_tree', { query }),
   skillFile: (query: T.ContentQuery & { path: string }) => invoke<T.FileContent>('skill_file', { query }),

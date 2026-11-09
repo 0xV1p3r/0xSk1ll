@@ -13,7 +13,7 @@ describe('Machine status and badges', () => {
     expect(headline(false, { ...report, drafts: ['skill:pdf'] }, 'a')).toBe('drafting');
     expect(headline(false, report, 'a')).toBe('in_sync');
     expect(statusOrder.map(s => statusLabels[s])).toEqual(['Offline', 'Blocked', 'Conflict', 'Behind', 'Drafting', 'In sync']);
-    expect(statusOrder.map(s => statusTone[s])).toEqual(['secondary', 'destructive', 'warning', 'info', 'info', 'success']);
+    expect(statusOrder.map(s => statusTone[s])).toEqual(['secondary', 'destructive', 'warning', 'info', 'secondary', 'success']);
   });
   it('handles absent reports and a Baseline that has not been created', () => {
     expect(headline(false, null, 'a')).toBe('behind');

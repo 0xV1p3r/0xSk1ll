@@ -6,6 +6,9 @@ import { Checkbox } from '@/components/ui/checkbox';
 import { Field, FieldLabel, FieldSet, FieldLegend } from '@/components/ui/field';
 import { Textarea } from '@/components/ui/textarea';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog';
+import { Badge } from '@/components/ui/badge';
+import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
+import { toast } from './toast';
 import { api } from './api';
 import { useMutation, useResource } from './hooks';
 import { Action, ChangeBadge, ErrorNotice, Loading, Nothing, Notice, Pending } from './shared';
@@ -25,7 +28,7 @@ function DraftItem({ item, change, paths, diff, checked, toggle, disabled }: {
   return <Collapsible className="min-w-0 max-w-full px-4 py-3">
     <div className="flex flex-wrap items-center gap-3">
       <Checkbox aria-label={`Select ${item}`} checked={checked} onCheckedChange={toggle} disabled={disabled} />
-      <code className="font-mono text-sm font-medium">{item}</code><ChangeBadge change={change} />
+      <code className="font-mono text-sm font-medium">{item.replace(/^(skill|rule):/, '')}</code><Badge variant="outline">{item.startsWith('rule:') ? 'Rule' : 'Skill'}</Badge><ChangeBadge change={change} /><span className="font-mono text-xs">+{diff.split('\n').filter(line => line.startsWith('+') && !line.startsWith('+++')).length} / −{diff.split('\n').filter(line => line.startsWith('-') && !line.startsWith('---')).length}</span>
       <span className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground" title={paths.join(', ')}>{paths.join(', ')}</span>
       <CollapsibleTrigger render={<Button variant="ghost" size="sm" className="group/diff" aria-label={`Diff for ${item}`} />}>
         <ChevronRight className="transition-transform group-data-panel-open/diff:rotate-90" />Diff</CollapsibleTrigger>
@@ -55,6 +58,8 @@ export function Draft({ revision, status, changed }: { revision: number; status:
   const [pull, setPull] = useState<PullResult>();
   const mutation = useMutation(changed);
   const prefill = useMutation();
+  const push = useMutation(changed);
+  const pushNow = () => void push.run(api.push, value => { if (!value.pushed) throw new Error('Push did not reach the Server.'); setResult(previous => previous && { ...previous, pushed: true, push_error: null }); toast({ title: 'Push complete' }); });
   // Latch changes across refreshes, even if an item later returns to its reviewed content.
   useEffect(() => {
     if (!data) return;
@@ -79,18 +84,20 @@ export function Draft({ revision, status, changed }: { revision: number; status:
           void prefill.run(() => api.commitMessage(review.items), value => setCommit({ review, message: value.message }));
         }}>
         <Pending pending={prefill.pending}><ArrowUpFromLine data-icon="inline-start" />Commit {items.length > 0 ? `(${items.length})` : ''}</Pending></Button>
-      <Button variant="destructive" disabled={!items.length || reviewDisabled}
+      <Button variant="outline" className="text-destructive-foreground" disabled={!items.length || reviewDisabled}
         onClick={event => { if (data) { restoreTrigger.current = event.currentTarget; setRestore({ review: captureReview(data, items), all: false }); } }}>Restore selected</Button>
-      <Button variant="ghost" className="text-destructive-foreground hover:text-destructive-foreground" disabled={!data?.length || reviewDisabled}
-        onClick={event => { if (data) { restoreTrigger.current = event.currentTarget; setRestore({ review: captureReview(data, data.map(entry => entry.item), true), all: true }); } }}>Restore all</Button>
-      <div className="ml-auto"><Action label="Pull Baseline" action={async () => { const value = await api.pull(); setPull(value); }} onDone={changed} /></div>
+      <div className="ml-auto"><Action label="Pull Baseline" action={async () => { const value = await api.pull(); setPull(value); toast({ title: value.state === 'blocked' ? 'Pull blocked' : 'Pull complete' }); }} onDone={changed} /></div>
+      <DropdownMenu><DropdownMenuTrigger render={<Button variant="outline" ref={restoreTrigger} onClick={event => { restoreTrigger.current = event.currentTarget; }} />}>More</DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuGroup><DropdownMenuItem variant="destructive" disabled={!data?.length || reviewDisabled}
+        onClick={() => { if (data) setRestore({ review: captureReview(data, data.map(entry => entry.item), true), all: true }); }}>Restore all</DropdownMenuItem></DropdownMenuGroup></DropdownMenuContent></DropdownMenu>
     </div><ErrorNotice error={error} /><ErrorNotice error={prefill.error} />
+    <ErrorNotice error={push.error} />
+    {status.report.unpushed.length > 0 && <Notice title={`${status.report.unpushed.length} unpushed`}><ul>{status.report.unpushed.map(item => <li key={item}>{item.replace(/^(skill|rule):/, '')}</li>)}</ul><Button variant="outline" disabled={push.pending} onClick={pushNow}>Push now</Button></Notice>}
     {pull && <Notice title={pull.state === 'blocked' ? 'Blocked' : 'Pull complete'} tone={pull.state === 'blocked' ? 'destructive' : 'default'}>
       {pull.state === 'blocked' ? `Clashes: ${pull.items.join(', ')}` : pull.state === 'updated' ? `Baseline ${pull.to}` : 'Already on the latest Baseline.'}
     </Notice>}
     {result && <div ref={completion} tabIndex={-1} className="outline-none"><Notice title="Commit complete"><code className="font-mono text-xs">{result.sha}</code>
       <p>{result.pushed ? 'Pushed to the Server.' : 'Unpushed. The Daemon queued this Commit until it can reach the Server.'}</p>
-      {result.push_error && <p>{result.push_error}</p>}</Notice></div>}
+      {!result.pushed && <Button variant="outline" disabled={push.pending} onClick={pushNow}>Retry push</Button>}{result.push_error && <p>{result.push_error}</p>}</Notice></div>}
     {loading && !data && <Loading />}{data?.length === 0 && <Nothing title="Draft is clean">This Machine has no Draft changes.</Nothing>}
     {!!data?.length && <FieldSet className="min-w-0 w-full max-w-full gap-0"><FieldLegend className="sr-only">Draft items</FieldLegend>
       <div className="divide-y overflow-hidden rounded-lg border">
@@ -119,7 +126,7 @@ export function Draft({ revision, status, changed }: { revision: number; status:
           <Button disabled={!commit?.message.trim() || !commitReview?.items.length || !!commitReview.changes.length || reviewDisabled} onClick={() => {
             if (commit && commitReview && !commitReview.changes.length && !reviewDisabled) void mutation.run(
               () => api.commit({ items: commitReview.items, message: commit.message }), value => {
-              setResult(value); setSelected([]); setCommit(undefined);
+              toast({ title: 'Commit complete' }); setResult(value); setSelected([]); setCommit(undefined);
             });
           }}><Pending pending={mutation.pending}>Commit</Pending></Button>
         </DialogFooter></DialogContent></Dialog>
@@ -135,7 +142,7 @@ export function Draft({ revision, status, changed }: { revision: number; status:
           <Button variant="destructive" disabled={!restoreReview?.items.length || !!restoreReview.changes.length || reviewDisabled}
             onClick={() => {
               if (restoreReview && !restoreReview.changes.length && !reviewDisabled) void mutation.run(
-                () => api.restore({ items: restoreReview.items, all: false }), () => { setRestore(undefined); setSelected([]); });
+                () => api.restore({ items: restoreReview.items, all: false }), () => { toast({ title: 'Restore complete' }); setRestore(undefined); setSelected([]); });
             }}><Pending pending={mutation.pending}>{restore?.all ? 'Restore all' : 'Restore selected'}</Pending></Button>
         </DialogFooter></DialogContent>
     </Dialog>

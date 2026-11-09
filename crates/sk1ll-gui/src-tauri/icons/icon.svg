@@ -1,1 +1,11 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128"><rect width="128" height="128" rx="22" fill="#345e87"/><path d="M92 32H48L32 48v20h44v12H32v16h48l16-16V52H52v-4h40Z" fill="#fff"/></svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="0xSk1ll app icon">
+<title>0xSk1ll app icon</title>
+<rect width="512" height="512" rx="56" fill="#101820"/>
+<rect x="18" y="18" width="476" height="476" rx="40" fill="none" stroke="#17B4E8" stroke-width="12"/>
+<g transform="translate(100 80)"><g fill="#17B4E8" stroke="#101820" stroke-width="7" stroke-linejoin="miter">
+<path d="M84 24H246L292 70V270H84Z"/><path d="M246 24V70H292" fill="none"/>
+<path d="M52 50H214L260 96V302H52Z"/><path d="M214 50V96H260" fill="none"/>
+<path d="M16 76H176L228 128V328H16Z"/><path d="M176 76V128H228" fill="none"/>
+</g>
+<path fill="#101820" d="M98 152H125L119 181H145L151 152H178L172 181H194V205H167L162 230H191V254H157L151 284H124L130 254H104L98 284H71L77 254H57V230H82L87 205H64V181H92Z M114 205L109 230H135L140 205Z" fill-rule="evenodd"/></g>
+</svg>

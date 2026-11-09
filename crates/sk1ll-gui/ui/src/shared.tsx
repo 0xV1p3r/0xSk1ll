@@ -10,6 +10,7 @@ import { Input } from '@/components/ui/input';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { cn } from '@/lib/utils';
+import { toast } from './toast';
 import { useMutation } from './hooks';
 import { ago, statusLabels, statusTone, time } from './model';
 import type { MachineStatus } from './types';
@@ -54,9 +55,9 @@ export function When({ seconds }: { seconds: number | null }) {
     className="rounded-sm underline decoration-dotted underline-offset-4 outline-none focus-visible:ring-2 focus-visible:ring-ring" />}>
     {ago(seconds)}<span className="sr-only"> ({time(seconds)})</span></TooltipTrigger><TooltipContent>{time(seconds)}</TooltipContent></Tooltip>;
 }
-export function Action({ label, action, onDone, disabled = false, variant = 'outline', ariaLabel, doneLabel, className, announceDone = true }: {
+export function Action({ label, action, onDone, disabled = false, variant = 'outline', ariaLabel, doneLabel, className, announceDone = true, toastOnDone }: {
   label: string; action: () => Promise<unknown>; onDone?: () => void; disabled?: boolean;
-  variant?: 'outline' | 'default' | 'ghost' | 'secondary'; ariaLabel?: string; doneLabel?: string; className?: string; announceDone?: boolean;
+  variant?: 'outline' | 'default' | 'ghost' | 'secondary'; ariaLabel?: string; doneLabel?: string; className?: string; announceDone?: boolean; toastOnDone?: string;
 }) {
   const mutation = useMutation(onDone);
   const [done, setDone] = useState(false);
@@ -67,7 +68,7 @@ export function Action({ label, action, onDone, disabled = false, variant = 'out
   }, [done]);
   return <div className="flex min-w-0 flex-col items-start gap-2">
     <Button variant={variant} size="sm" className={className} aria-label={ariaLabel} disabled={disabled} aria-disabled={disabled || mutation.pending}
-      onClick={() => { if (!disabled && !mutation.pending) void mutation.run(action, () => setDone(!!doneLabel)); }}>
+      onClick={() => { if (!disabled && !mutation.pending) void mutation.run(action, () => { setDone(!!doneLabel); if (toastOnDone) toast({ title: toastOnDone }); }); }}>
       {done ? <><Check data-icon="inline-start" />{doneLabel}</> : <Pending pending={mutation.pending}>{label}</Pending>}</Button>
     {announceDone && <span role="status" className="sr-only">{done ? doneLabel : ''}</span>}
     <ErrorNotice error={mutation.error} /></div>;

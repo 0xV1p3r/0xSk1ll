@@ -553,3 +553,26 @@ fn mac_terminal_script_shell_quoting_round_trips_unusual_paths() {
         assert_eq!(output.stdout, path.as_bytes());
     }
 }
+
+#[tokio::test]
+async fn new_commands_forward_typed_payloads() {
+    let requests = Recorded::default();
+    let mut replies = Replies::new();
+    for path in ["POST /items/create", "POST /imports/remove"] {
+        replies.insert(path.into(), (StatusCode::NO_CONTENT, Value::Null));
+    }
+    replies.insert("POST /push".into(), (StatusCode::OK, json!({"pushed":true})));
+    replies.insert("POST /imports/check".into(), (StatusCode::OK, json!({"imports":[],"updates":[],"errors":[],"checked_at":1})));
+    replies.insert("POST /conflicts/diff".into(), (StatusCode::OK, json!({"item":"skill:pdf","diff":"+draft"})));
+    let daemon = FakeDaemon::start(Router::new().fallback(respond).with_state((requests.clone(), replies))).await;
+    let bridge = Bridge::new(daemon.client.clone());
+    assert!(bridge.push().await.unwrap().pushed);
+    bridge.create_item(CreateItemRequest { kind: "skill".into(), name: "pdf".into(), description: Some("PDF".into()) }).await.unwrap();
+    bridge.remove_import("pdf".into()).await.unwrap();
+    assert_eq!(bridge.check_imports().await.unwrap().checked_at, Some(1));
+    assert_eq!(bridge.conflict_diff(ConflictDiffRequest { harness: None, name: None, id: Some("recovered".into()) }).await.unwrap().diff, "+draft");
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests[1].2, json!({"kind":"skill","name":"pdf","description":"PDF"}));
+    assert_eq!(requests[2].2, json!({"name":"pdf"}));
+    assert_eq!(requests[4].2["id"], "recovered");
+}
