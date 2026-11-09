@@ -170,6 +170,8 @@
 [data-slot="table-frame"]::after { right: 0; background: linear-gradient(to left, color-mix(in oklch, var(--foreground) 18%, transparent), transparent); }
 [data-slot="table-frame"][data-overflow-start="true"]::before, [data-slot="table-frame"][data-overflow-end="true"]::after { opacity: 1; }
 [data-sticky-first] :is(thead > tr:first-child, tbody > tr) > :first-child:not([colspan]) { position: sticky; left: 0; z-index: 10; }
-[data-sticky-first] tbody > tr > :first-child:not([colspan]) { background: var(--background); }
+[data-sticky-first] tbody > tr > :first-child:not([colspan]) { background: var(--background); transition: background-color 150ms cubic-bezier(0.4, 0, 0.2, 1); }
 [data-sticky-first] thead > tr:first-child > :first-child { background: var(--muted); }
-[data-sticky-first] tbody > tr:is(:hover, [data-state="selected"]) > :first-child:not([colspan]) { background: var(--muted); }
+/* Opaque equivalent of the row's translucent bg-muted/50, so the sticky cell matches while still covering scrolled content. */
+[data-sticky-first] tbody > tr:is(:hover, :has([aria-expanded="true"])) > :first-child:not([colspan]) { background: color-mix(in srgb, var(--muted) 50%, var(--background)); }
+[data-sticky-first] tbody > tr[data-state="selected"] > :first-child:not([colspan]) { background: var(--muted); }
