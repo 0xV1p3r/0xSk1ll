@@ -1450,3 +1450,83 @@ mod tests {
     }
 
 }
+
+impl Daemon {
+    pub(crate) fn create_item(&self, eng: &mut Engine, req: crate::client::CreateItemRequest) -> Result<()> {
+        self.ensure_managed(eng)?;
+        self.lock_repo(eng)?;
+        Repo::open(Self::root(eng))?.create_item(&req.kind, &req.name, req.description.as_deref().unwrap_or(""))?;
+        self.refresh(eng)?;
+        Ok(())
+    }
+    pub(crate) async fn local_imports(self: &Arc<Self>, check: bool) -> Result<crate::client::ImportsView> {
+        let (root, entries) = self.blocking(|_, eng| {
+            let repo = Repo::open(Self::root(eng))?;
+            Ok((repo.root().to_path_buf(), repo.manifest.import.iter().map(|(name, i)| crate::client::ImportEntry {
+                name: name.clone(), source: i.source.clone(), git_ref: i.git_ref.clone(), path: i.path.clone(),
+                locked: repo.lock.skills.get(name).map(|l| l.commit.clone()),
+            }).collect::<Vec<_>>()))
+        }).await?;
+        tokio::task::spawn_blocking(move || {
+            static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeMap<PathBuf, crate::client::ImportsView>>> = std::sync::OnceLock::new();
+            let cache = CACHE.get_or_init(Default::default);
+            let previous = cache.lock().unwrap().get(&root).cloned().unwrap_or_default();
+            let mut view = crate::client::ImportsView { imports: entries, ..previous };
+            if check { view.updates.clear(); view.errors.clear(); }
+            if check {
+                for i in &view.imports {
+                    match sk1ll_core::imports::fetch_link(&root, &i.source, Some(&i.path), Some(&i.git_ref), None) {
+                        Ok(f) => if let Some(locked) = &i.locked { if locked != &f.resolved.commit { view.updates.push(sk1ll_proto::ImportUpdate { name: i.name.clone(), source: i.source.clone(), git_ref: i.git_ref.clone(), locked: locked.clone(), upstream: f.resolved.commit }); } },
+                        Err(e) => view.errors.push(sk1ll_proto::ImportError { name: i.name.clone(), message: e.to_string() }),
+                    }
+                }
+                view.checked_at = Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64);
+            }
+            view.updates.retain(|u| view.imports.iter().any(|i| i.name == u.name && i.locked.as_ref() == Some(&u.locked)));
+            view.errors.retain(|e| view.imports.iter().any(|i| i.name == e.name));
+            cache.lock().unwrap().insert(root, view.clone());
+            Ok(view)
+        }).await.map_err(|e| Error::Internal(e.into()))?
+    }
+    pub(crate) fn conflict_diff(&self, eng: &Engine, req: crate::client::ConflictDiffRequest) -> Result<DiffView> {
+        let view = if let Some(id) = req.id {
+            self.recovered()?.into_iter().find(|v| v.id.as_ref() == Some(&id))
+        } else {
+            self.conflicts(eng)?.into_iter().find(|v| Some(&v.harness) == req.harness.as_ref() && Some(&v.name) == req.name.as_ref())
+        }.ok_or_else(|| Error::NotFound("Conflict no longer exists".into()))?;
+        let item = if view.name == BLOCK_NAME { Some(ItemRef::Other(view.name.clone())) } else { None }.or(view.item.clone()).or_else(|| view.items.first().cloned()).unwrap_or(ItemRef::Other(view.name.clone()));
+        match &item {
+            ItemRef::Skill(name) | ItemRef::Rule(name) => imports::validate_name(name)?,
+            _ => {}
+        }
+        let repo = Repo::open(Self::root(eng))?;
+        let temp = tempfile::tempdir().map_err(anyhow::Error::from)?;
+        let mut right = match &item {
+            ItemRef::Skill(name) => { let p = repo.root().join("personal").join(name); if p.exists() { p } else { repo.root().join("imported").join(name) } },
+            ItemRef::Rule(name) => repo.root().join("instructions").join(format!("{name}.md")),
+            _ => {
+                let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
+                let assignment = &eng.snapshot.as_ref().ok_or_else(|| Error::Conflict("Awaiting Assignment".into()))?.assignment;
+                let files = sync::render_instructions(&repo, &harnesses, assignment, &view.harness)?;
+                let path = temp.path().join("Draft");
+                std::fs::write(&path, files.into_iter().map(|f| f.content).collect::<Vec<_>>().join("\n")).map_err(anyhow::Error::from)?;
+                path
+            },
+        };
+        let mut left = view.path.unwrap_or(view.dest);
+        if view.name == BLOCK_NAME && matches!(item, ItemRef::Other(_)) {
+            let text = std::fs::read_to_string(&left).map_err(anyhow::Error::from)?;
+            let content = sk1ll_core::instructions::managed_content(&text, &left)?;
+            left = temp.path().join("Harness");
+            std::fs::write(&left, content).map_err(anyhow::Error::from)?;
+        }
+        if !right.exists() {
+            right = temp.path().join("Draft");
+            if left.is_dir() { std::fs::create_dir(&right).map_err(anyhow::Error::from)?; }
+            else { std::fs::write(&right, "").map_err(anyhow::Error::from)?; }
+        }
+        let output = std::process::Command::new("git").args(["diff", "--no-index", "--no-ext-diff", "--no-textconv", "--"]).arg(&left).arg(&right).output().map_err(anyhow::Error::from)?;
+        if !matches!(output.status.code(), Some(0 | 1)) { return Err(Error::BadRequest(String::from_utf8_lossy(&output.stderr).into_owned())); }
+        Ok(DiffView { item, diff: String::from_utf8_lossy(&output.stdout).into_owned() })
+    }
+}

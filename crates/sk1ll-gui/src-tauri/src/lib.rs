@@ -22,6 +22,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::push, commands::create_item, commands::check_imports, commands::remove_import, commands::conflict_diff, commands::set_preferred_editor,
             commands::skills, commands::skill_tree, commands::skill_file, commands::adopt_unmanaged, commands::fork,
             commands::status, commands::fleet, commands::items, commands::draft, commands::diff, commands::commit_message,
             commands::commit, commands::restore, commands::pull, commands::conflicts, commands::recovered,

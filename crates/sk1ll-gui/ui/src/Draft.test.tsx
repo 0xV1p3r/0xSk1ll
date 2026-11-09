@@ -7,9 +7,9 @@ import { api } from './api';
 import type { DraftEntry, StatusView } from './types';
 
 vi.mock('./api', () => ({ api: {
-  draft: vi.fn(), diff: vi.fn(), commitMessage: vi.fn(), commit: vi.fn(), restore: vi.fn(), pull: vi.fn(),
+  draft: vi.fn(), diff: vi.fn(), commitMessage: vi.fn(), commit: vi.fn(), restore: vi.fn(), pull: vi.fn(), push: vi.fn(),
 }, errorMessage: (error: unknown) => String(error) }));
-const status = { report: { blocked: false, clashes: [] } } as unknown as StatusView;
+const status = { report: { blocked: false, clashes: [], unpushed: [] } } as unknown as StatusView;
 const entry = (item: string): DraftEntry => ({ item, change: 'added', paths: [`${item}/SKILL.md`], fingerprint: 'initial' });
 let entries: DraftEntry[];
 let diffs: Record<string, string>;
@@ -34,7 +34,8 @@ const button = (root: HTMLElement, name: string) => within(root).getByRole('butt
 describe('Draft confirmations', () => {
   it('freezes Restore all items and requires review when a new item arrives', async () => {
     const view = mount();
-    fireEvent.click(await screen.findByRole('button', { name: 'Restore all' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'More' }));
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Restore all' }));
     const dialog = await screen.findByRole('dialog');
     expect(within(dialog).getByText(/Return skill:reviewed/)).toBeTruthy();
     entries.push(entry('skill:new'));
@@ -133,9 +134,10 @@ describe('Draft confirmations', () => {
 it.each(['Restore all', 'Restore selected'])('returns focus to %s after Cancel and Escape', async label => {
   mount();
   fireEvent.click(await screen.findByRole('checkbox', { name: 'Select skill:reviewed' }));
-  const trigger = screen.getByRole('button', { name: label });
+  const trigger = screen.getByRole('button', { name: label === 'Restore all' ? 'More' : label });
   for (const close of ['Cancel', 'Escape']) {
     trigger.focus(); fireEvent.click(trigger);
+    if (label === 'Restore all') fireEvent.click(await screen.findByRole('menuitem', { name: label }));
     const dialog = await screen.findByRole('dialog');
     if (close === 'Cancel') fireEvent.click(button(dialog, 'Cancel'));
     else fireEvent.keyDown(dialog, { key: 'Escape' });
@@ -158,4 +160,15 @@ it('returns focus to Commit after Cancel and Escape and to its completion notice
       expect(trigger.hasAttribute('disabled')).toBe(true);
     } else await waitFor(() => expect(document.activeElement).toBe(trigger));
   }
+});
+
+it('counts added and removed lines without headers and shows friendly names', async () => {
+  diffs['skill:reviewed'] = '+++ b/file\n--- a/file\n+one\n+two\n-old'; mount();
+  expect(await screen.findByText('+2 / −1')).toBeTruthy(); expect(screen.getByText('reviewed')).toBeTruthy();
+});
+it('pushes unpushed items', async () => {
+  vi.mocked(api.push).mockResolvedValue({ pushed: true });
+  render(<Draft revision={0} status={{ ...status, report: { ...status.report, unpushed: ['skill:reviewed'] } }} changed={changed} />);
+  expect(screen.getByText('1 unpushed')).toBeTruthy(); fireEvent.click(screen.getByRole('button', { name: 'Push now' }));
+  await waitFor(() => expect(api.push).toHaveBeenCalledOnce()); await waitFor(() => expect(changed).toHaveBeenCalledOnce());
 });

@@ -86,7 +86,7 @@ export function installMock(scenario: string) {
     { name: 'claude', origin: 'detected', harness: { skills: '~/.claude/skills', instructions: '~/.claude/CLAUDE.md', instructions_format: 'block', mode: 'symlink' } },
     { name: 'codex', origin: 'machine.toml', harness: { skills: '~/.codex/skills', instructions: '~/.codex/AGENTS.md', instructions_format: 'block', mode: 'copy' } },
   ];
-  const imports: T.ImportsView = { checked_at: now - 900, errors: empty ? [] : [{ name: 'internal-skills', message: 'git fetch failed: repository not found' }],
+  const imports: T.ImportsView & { imports: T.ImportEntry[] } = { imports: empty ? [] : [{ name: 'pdf', source: 'github:example/skills', ref: 'main', path: 'skills/pdf', locked: '4e5f6a7b8c9d' }, { name: 'anthropic-skills', source: 'https://github.com/anthropics/skills', ref: 'main', path: '', locked: '4e5f6a7b8c9d' }, { name: 'internal-skills', source: 'github:example/internal-skills', ref: 'main', path: '', locked: '123456789abc' }], checked_at: now - 900, errors: empty ? [] : [{ name: 'internal-skills', message: 'git fetch failed: repository not found' }],
     updates: empty ? [] : [{ name: 'anthropic-skills', source: 'https://github.com/anthropics/skills', ref: 'main', locked: '4e5f6a7b8c9d', upstream: 'c0ffee123456' }] };
   const delay = <V,>(value: V, ms = 250) => new Promise<V>(resolve => setTimeout(() => resolve(value), ms));
 
@@ -95,6 +95,49 @@ export function installMock(scenario: string) {
     if (scenario === 'unreachable' && cmd !== 'connection_info' && !cmd.startsWith('plugin:'))
       return Promise.reject({ message: 'connect ECONNREFUSED /run/user/1000/sk1ll/daemon.sock', status: null, unreachable: true });
     switch (cmd) {
+      case 'push': {
+        const pushed = local.unpushed.length > 0; local.unpushed = [];
+        items.forEach(item => { item.unpushed = false; });
+        return delay({ pushed });
+      }
+      case 'set_preferred_editor':
+        if (!['code', 'nvim', 'file-manager'].includes(a.editorId as string)) return Promise.reject({ message: 'Editor is not available' });
+        preferredEditor = a.editorId as string; return delay(undefined);
+      case 'create_item': {
+        const r = a.request as T.CreateItemRequest;
+        if (!/^[a-zA-Z0-9_-][a-zA-Z0-9_.-]*$/.test(r.name) || !['skill', 'rule'].includes(r.kind)) return Promise.reject({ message: 'Invalid item name or kind' });
+        const item = `${r.kind}:${r.name}`;
+        if (content.some(e => e.item === item)) return Promise.reject({ message: 'Name is taken' });
+        const path = r.kind === 'skill' ? `personal/${r.name}/SKILL.md` : `instructions/${r.name}.md`;
+        content.push({ name: r.name, item, type: r.kind === 'skill' ? 'personal' : 'rule', description: r.description ?? null, draft: 'added', in_baseline: false, path: `${status.repo}/${path}`, enabled_harnesses: [], clashes_with_repo: false, variants: [] });
+        items.push({ item, in_baseline: false, draft: 'added', unpushed: false, description: r.description ?? null });
+        draft.push({ item, change: 'added', paths: [path], fingerprint: `created-${r.name}` }); local.drafts.push(item);
+        return delay(undefined);
+      }
+      case 'conflict_diff': {
+        const r = a.request as T.ConflictDiffRequest;
+        const v = r.id ? recovered.find(v => v.id === r.id) : conflicts.find(v => v.harness === r.harness && v.name === r.name);
+        if (!v) return Promise.reject({ message: 'Conflict no longer exists' });
+        return delay({ item: v.items[0] ?? `skill:${v.name}`, diff: '--- Harness\n+++ Draft\n@@ -1 +1 @@\n-Harness content\n+Draft content\n' });
+      }
+      case 'remove_import': {
+        const index = imports.imports.findIndex(i => i.name === a.name);
+        if (index < 0) return Promise.reject({ message: 'Import no longer exists' });
+        imports.imports.splice(index, 1); imports.updates = imports.updates.filter(i => i.name !== a.name);
+        const item = `skill:${a.name}`;
+        const ci = content.findIndex(e => e.item === item); if (ci >= 0) content.splice(ci, 1);
+        draft.push({ item, change: 'deleted', paths: [`imported/${a.name}/SKILL.md`], fingerprint: 'removed' }); local.drafts.push(item);
+        return delay(undefined);
+      }
+      case 'update_import': {
+        const entry = imports.imports.find(i => i.name === a.name);
+        if (!entry) return Promise.reject({ message: 'Import no longer exists' });
+        const update = imports.updates.find(i => i.name === a.name);
+        const old = entry.locked; entry.locked = update?.upstream ?? entry.locked;
+        imports.updates = imports.updates.filter(i => i.name !== a.name);
+        return delay({ name: entry.name, old_commit: old, new_commit: entry.locked ?? '', changed: old !== entry.locked });
+      }
+      case 'check_imports': imports.checked_at = Math.floor(Date.now() / 1000); return delay(imports);
       case 'status': return delay(status, 60);
       case 'fleet': return delay({ baseline: '9f3c2a17d4e1', machines: empty ? machines.slice(0, 1) : machines });
       case 'items': return delay(items);
@@ -159,6 +202,7 @@ export function installMock(scenario: string) {
         const request = a.request as T.AddImportRequest;
         if (items.some(i => i.item === `skill:${request.name}`))
           return Promise.reject({ message: 'Import name already exists', status: 409, unreachable: false });
+        imports.imports.push({ name: request.name, source: request.source, ref: request.ref, path: request.path, locked: request.commit ?? 'c0ffee1234567890' });
         content.push({ name: request.name, item: `skill:${request.name}`, type: 'import', description: null, draft: 'added', in_baseline: false, path: `${status.repo}/imported/${request.name}`, enabled_harnesses: [], clashes_with_repo: false, variants: [] });
         items.push({ item: `skill:${request.name}`, in_baseline: false, draft: 'added', unpushed: false, description: null });
         draft.push({ item: `skill:${request.name}`, change: 'added', paths: [`imported/${request.name}/SKILL.md`], fingerprint: 'new' });
@@ -168,7 +212,7 @@ export function installMock(scenario: string) {
       case 'join_code': return delay({ code: 'sk1ll-join-7Q2M-XK9P-44RD-ZT8W' });
       case 'connection_info': return delay('/run/user/1000/sk1ll/daemon.sock', 10);
       case 'adopt': case 'overwrite': case 'adopt_displaced': case 'discard_displaced': case 'undo':
-      case 'update_import': case 'remove_machine': case 'join': return delay(undefined, 500);
+      case 'remove_machine': case 'join': return delay(undefined, 500);
       default: return undefined;
     }
   }, { shouldMockEvents: true });

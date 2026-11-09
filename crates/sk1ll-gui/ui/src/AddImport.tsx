@@ -1,3 +1,4 @@
+import { toast } from './toast';
 import { useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
@@ -71,7 +72,7 @@ function AddImportForm({ busy, changed, reviewDraft, finalFocus }: {
         current = names[i];
         await api.addImport({ name: names[i], source: resolved.source, path: resolved.candidates[i].path, ref: resolved.git_ref, commit: resolved.commit });
         setResults(r => [...r, `${names[i]} added into Draft.`]);
-        setAnnouncement(`Added ${names[i]} into Draft.`);
+        setAnnouncement(`Added ${names[i]} into Draft.`); toast({ title: `Added ${names[i]} into Draft.` });
       }
     } catch (e) {
       setResults(r => [...r, `${current} may not have been added; check the Draft.`]);

@@ -33,6 +33,31 @@ pub struct Repo {
 }
 
 impl Repo {
+    /// Creates a new personal Skill or Rule in the Draft.
+    pub fn create_item(&self, kind: &str, name: &str, description: &str) -> Result<()> {
+        crate::imports::validate_name(name)?;
+        let path = match kind {
+            "skill" => {
+                if self.manifest.import.contains_key(name) || self.root.join("imported").join(name).symlink_metadata().is_ok() {
+                    return Err(Error::Invalid(format!("name `{name}` is taken")));
+                }
+                self.root.join("personal").join(name)
+            }
+            "rule" => self.root.join(INSTRUCTIONS_DIR).join(format!("{name}.md")),
+            _ => return Err(Error::Invalid("expected skill or rule".into())),
+        };
+        if path.symlink_metadata().is_ok() { return Err(Error::Invalid(format!("name `{name}` is taken"))); }
+        let parent = path.parent().unwrap();
+        if parent.symlink_metadata().is_ok_and(|m| m.is_symlink()) { return Err(Error::Invalid("content directory is a symlink".into())); }
+        fs::create_dir_all(parent).at(&path)?;
+        let file = if kind == "skill" { fs::create_dir(&path).at(&path)?; path.join("SKILL.md") } else { path };
+        let quoted = serde_json::to_string(description).expect("string");
+        let body = format!("---\nname: {name}\ndescription: {quoted}\n---\n\n");
+        use std::io::Write;
+        let mut out = fs::OpenOptions::new().write(true).create_new(true).open(&file).at(&file)?;
+        out.write_all(body.as_bytes()).at(&file)
+    }
+
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         if !root.join(MANIFEST_FILE).is_file() {
@@ -243,5 +268,23 @@ mod tests {
         commit_all(&top, "drop manifest");
         assert_eq!(Repo::locate_git(&root.join(PERSONAL_DIR)), Some(root.clone()));
         assert_eq!(Repo::locate_git(&top), default_location());
+    }
+}
+
+#[cfg(test)]
+mod create_tests {
+    use super::*;
+    #[test]
+    fn creates_draft_content_and_refuses_invalid_or_taken_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repo::init(dir.path()).unwrap();
+        repo.create_item("skill", "new-skill", "quotes: \" and\nnewlines").unwrap();
+        assert!(dir.path().join("personal/new-skill/SKILL.md").exists());
+        assert!(repo.create_item("skill", "new-skill", "").is_err());
+        for name in ["", "..", "../escape", ".hidden", "a/b", "with space"] { assert!(repo.create_item("rule", name, "").is_err()); }
+        repo.create_item("rule", "style", "House style").unwrap();
+        assert!(dir.path().join("instructions/style.md").exists());
+        assert!(repo.create_item("rule", "style", "").is_err());
+        assert!(repo.create_item("other", "x", "").is_err());
     }
 }

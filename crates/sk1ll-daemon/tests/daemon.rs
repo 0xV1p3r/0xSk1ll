@@ -1536,3 +1536,62 @@ async fn unmanaged_adoption_retries_after_crash_between_publication_and_assignme
     assert!(m.skills().join("pdf/.sk1ll-managed").is_file());
     assert_eq!(m.harness_skill("pdf").unwrap(), "original user content");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gui_creation_import_inventory_check_and_conflict_diff() {
+    use sk1ll_daemon::client::{CreateItemRequest, ConflictDiffRequest};
+    let mut m = solo("gui", "http://127.0.0.1:1", Some(snapshot(1, &["x"])));
+    m.start().await;
+    m.client.create_item(&CreateItemRequest { kind: "rule".into(), name: "style".into(), description: Some("House style".into()) }).await.unwrap();
+    assert!(m.repo().join("instructions/style.md").exists());
+    assert!(m.client.create_item(&CreateItemRequest { kind: "rule".into(), name: "style".into(), description: None }).await.is_err());
+    let upstream = tempfile::tempdir().unwrap();
+    git(upstream.path(), &["init", "-q", "-b", "main"]);
+    write(upstream.path(), "SKILL.md", "upstream v1\n");
+    git(upstream.path(), &["add", "."]);
+    git(upstream.path(), &["commit", "-qm", "first"]);
+    m.client.add_import(&AddImportRequest { name: "external".into(), source: upstream.path().display().to_string(), path: Some("".into()), git_ref: Some("main".into()), commit: None }).await.unwrap();
+    let inventory = m.client.imports().await.unwrap();
+    assert_eq!(inventory.imports.len(), 1);
+    assert_eq!(inventory.imports[0].name, "external");
+    assert!(inventory.imports[0].locked.is_some());
+    write(upstream.path(), "SKILL.md", "upstream v2\n");
+    git(upstream.path(), &["commit", "-qam", "second"]);
+    let checked = m.client.check_imports().await.unwrap();
+    assert!(checked.errors.is_empty(), "{:?}", checked.errors);
+    assert_eq!(checked.updates.len(), 1);
+    assert_eq!(m.client.imports().await.unwrap().updates, checked.updates);
+    eventually(|| async { m.harness_skill("x").filter(|s| s == "x\n") }).await;
+    write(&m.skills().join("x"), "SKILL.md", "Harness edit\n");
+    eventually(|| async { m.client.conflicts().await.ok().filter(|v| v.iter().any(|v| v.name == "x")) }).await;
+    let diff = m.client.conflict_diff(&ConflictDiffRequest { harness: Some(HARNESS.into()), name: Some("x".into()), id: None }).await.unwrap();
+    assert!(diff.diff.contains("-Harness edit"), "{}", diff.diff);
+    assert!(diff.diff.contains("+x"), "{}", diff.diff);
+    m.client.remove_import("external").await.unwrap();
+    assert!(m.client.imports().await.unwrap().imports.is_empty());
+    assert!(!m.repo().join("imported/external").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn block_conflict_diff_preserves_surrounding_notes() {
+    use sk1ll_daemon::client::ConflictDiffRequest;
+    let mut snap = snapshot(1, &[]);
+    snap.assignment.harnesses.get_mut(HARNESS).unwrap().new_rules_default = true;
+    let mut m = solo("block-diff", "http://127.0.0.1:1", Some(snap));
+    let config = m.home.path().join(".config/sk1ll/machine.toml");
+    let cfg = std::fs::read_to_string(&config).unwrap().replace("instructions_format = \"rules\"", "instructions_format = \"block\"");
+    std::fs::write(config, cfg).unwrap();
+    m.write("instructions/style.md", "---\ndescription: Style\n---\nExpected rule\n");
+    git(&m.repo(), &["add", "."]);
+    git(&m.repo(), &["commit", "-qm", "rule"]);
+    m.start().await;
+    let path = m.home.path().join("agent/rules");
+    let original = eventually(|| async { std::fs::read_to_string(&path).ok().filter(|s| s.contains("Expected rule")) }).await;
+    std::fs::write(&path, format!("My private notes\n{}\nMore notes\n", original.replace("Expected rule", "Edited rule"))).unwrap();
+    eventually(|| async { m.client.conflicts().await.ok().filter(|v| v.iter().any(|v| v.name == "instructions")) }).await;
+    let diff = m.client.conflict_diff(&ConflictDiffRequest { harness: Some(HARNESS.into()), name: Some("instructions".into()), id: None }).await.unwrap();
+    assert!(diff.diff.contains("-Edited rule"), "{}", diff.diff);
+    assert!(diff.diff.contains("+Expected rule"), "{}", diff.diff);
+    assert!(!diff.diff.contains("private notes"), "{}", diff.diff);
+    assert!(!diff.diff.contains("More notes"), "{}", diff.diff);
+}

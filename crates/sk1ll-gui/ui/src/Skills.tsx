@@ -1,5 +1,5 @@
-import { useCallback, useRef, useState, type ReactNode } from 'react';
-import { ArrowDown, ArrowUp, ChevronDown, File, Folder } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { ArrowDown, ArrowUp, ArrowUpRight, ChevronDown, File, Folder } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
@@ -10,6 +10,7 @@ import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuLabel, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { toast } from './toast';
 import { api } from './api';
 import { useMutation, useResource } from './hooks';
 import { ChangeBadge, ErrorNotice, Loading, Nothing, Notice, Pending } from './shared';
@@ -20,14 +21,20 @@ const typeLabels: Record<ContentType, string> = { personal: 'Personal', import: 
 const loadEditors = () => api.editors(true);
 const keyFor = (entry: ContentEntry) => entry.item ?? `unmanaged:${entry.name}`;
 function DraftBadge({ entry }: { entry: ContentEntry }) {
-  return entry.draft && <ChangeBadge change={entry.draft} />;
+  return entry.draft ? <ChangeBadge change={entry.draft} /> : <span className="text-muted-foreground">—</span>;
 }
 
-export function Skills({ entries, revision, changed, reviewDraft, assignment, addImport, connection }: {
-  connection: StatusView['connection']; entries: ContentEntry[]; revision: number; changed: () => void; reviewDraft: () => void; assignment: (item: string, harness: string) => void; addImport: () => void;
+export function Skills({ entries, revision, changed, reviewDraft, assignment, addImport, connection, initialSearch }: {
+  initialSearch?: string; connection: StatusView['connection']; entries: ContentEntry[]; revision: number; changed: () => void; reviewDraft: () => void; assignment: (item: string, harness: string) => void; addImport: () => void;
 }) {
   const [filter, setFilter] = useState('all');
-  const [search, setSearch] = useState('');
+  const [search, setSearch] = useState(initialSearch ?? '');
+  useEffect(() => { if (initialSearch !== undefined) setSearch(initialSearch); }, [initialSearch]);
+  const [creating, setCreating] = useState<'skill' | 'rule'>();
+  const [name, setName] = useState(''), [description, setDescription] = useState('');
+  const creation = useMutation(changed);
+  const nameError = (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) || name.includes('..')) ? 'Use letters, numbers, dots, underscores or hyphens; start with a letter or number.' : entries.some(entry => (creating === 'rule' ? entry.type === 'rule' : entry.type !== 'rule') && entry.name.toLowerCase() === name.toLowerCase()) ? 'This name is already taken.' : '';
+  const startCreate = (kind: 'skill' | 'rule') => { setName(''); setDescription(''); setCreating(kind); };
   const [sort, setSort] = useState<{ column: 'name' | 'type'; descending: boolean }>({ column: 'name', descending: false });
   const [selected, setSelected] = useState<{ key: string; harness?: string; optimistic?: { entry: ContentEntry; inventory: ContentEntry[] } }>();
   const current = entries.find(value => keyFor(value) === selected?.key);
@@ -43,7 +50,13 @@ export function Skills({ entries, revision, changed, reviewDraft, assignment, ad
       </NativeSelect></Field>
       <Field className="min-w-40 flex-1 sm:max-w-xs"><FieldLabel htmlFor="skill-search">Search by name</FieldLabel>
         <Input id="skill-search" value={search} onChange={event => setSearch(event.target.value)} placeholder="Find a Skill or Rule…" /></Field>
+      <DropdownMenu><DropdownMenuTrigger render={<Button />}>New</DropdownMenuTrigger><DropdownMenuContent><DropdownMenuGroup><DropdownMenuItem onClick={() => startCreate('skill')}>New Skill</DropdownMenuItem><DropdownMenuItem onClick={() => startCreate('rule')}>New Rule</DropdownMenuItem></DropdownMenuGroup></DropdownMenuContent></DropdownMenu>
     </div>
+    <Dialog open={!!creating} onOpenChange={open => { if (!open && !creation.pending) setCreating(undefined); }}><DialogContent><DialogHeader><DialogTitle>New {creating === 'rule' ? 'Rule' : 'Skill'}</DialogTitle><DialogDescription>Create an item in Draft.</DialogDescription></DialogHeader>
+      <Field><FieldLabel htmlFor="new-name">Name</FieldLabel><Input id="new-name" value={name} onChange={event => setName(event.target.value)} aria-invalid={!!name && !!nameError} aria-describedby="name-error" /><p id="name-error" className="text-xs text-muted-foreground">{name && nameError}</p></Field>
+      <Field><FieldLabel htmlFor="new-description">Description (optional)</FieldLabel><Input id="new-description" value={description} onChange={event => setDescription(event.target.value)} /></Field><ErrorNotice error={creation.error} />
+      <DialogFooter><Button variant="outline" disabled={creation.pending} onClick={() => setCreating(undefined)}>Cancel</Button><Button disabled={!!nameError || creation.pending} onClick={() => { if (creating) void creation.run(() => api.createItem({ kind: creating, name, description: description.trim() || undefined }), () => { setSelected({ key: `${creating}:${name}` }); setSearch(''); setFilter('all'); setCreating(undefined); toast({ title: `${creating === 'rule' ? 'Rule' : 'Skill'} created` }); }); }}>Create</Button></DialogFooter></DialogContent>
+    </Dialog>
     {visible.length ? <div className="overflow-hidden rounded-lg border"><Table aria-label="Skills" stickyFirstColumn>
       <TableHeader><TableRow className="bg-muted hover:bg-muted">{(['name', 'type'] as const).map(column => <TableHead key={column}
         aria-sort={sort.column === column ? sort.descending ? 'descending' : 'ascending' : 'none'}>
@@ -58,18 +71,18 @@ export function Skills({ entries, revision, changed, reviewDraft, assignment, ad
             {value.description && <p className="mt-1 max-w-md text-xs text-muted-foreground">{value.description}</p>}</TableCell>
           <TableCell>{typeLabels[value.type]}</TableCell><TableCell><DraftBadge entry={value} /></TableCell>
           <TableCell><div className="flex max-w-sm flex-wrap gap-1">
-            {harnesses.map(name => <Badge key={name} variant="outline" render={<button type="button" aria-label={`${value.type === 'unmanaged' ? 'View' : 'Assignment for'} ${value.name} in ${name}`}
-              onClick={event => { event.stopPropagation(); if (value.type === 'unmanaged') setSelected({ key: keyFor(value), harness: name }); else if (value.item) assignment(value.item, name); }} />}>{name}</Badge>)}
+            {harnesses.map(name => <Badge key={name} variant="outline" className="hover:underline" title={value.type === 'unmanaged' ? 'View this location' : 'Open in Assignment matrix'} render={<button type="button" aria-label={`${value.type === 'unmanaged' ? 'View' : 'Assignment for'} ${value.name} in ${name}`}
+              onClick={event => { event.stopPropagation(); if (value.type === 'unmanaged') setSelected({ key: keyFor(value), harness: name }); else if (value.item) assignment(value.item, name); }} />}>{name}<ArrowUpRight className="size-3" /></Badge>)}
             {value.variants.length > 1 && <Badge variant="warning">Differs</Badge>}
             {value.clashes_with_repo && <Badge variant="warning">Clashes with repo</Badge>}
           </div></TableCell>
         </TableRow>;
       })}</TableBody>
-    </Table></div> : <Nothing title={entries.length ? 'No matching Skills' : 'No Skills yet'} action={!entries.length && <Button onClick={addImport}>Add Import</Button>}>{entries.length ? 'Choose another Type or name.' : 'Personal Skills, Imports, Rules, and Unmanaged skills will appear here.'}</Nothing>}
+    </Table></div> : <Nothing title={entries.length ? 'No matching Skills' : 'No Skills yet'} action={!entries.length && <div className="flex gap-2"><Button onClick={() => startCreate('skill')}>New Skill</Button><Button variant="outline" onClick={addImport}>Add Import</Button></div>}>{entries.length ? 'Choose another Type or name.' : 'Personal Skills, Imports, Rules, and Unmanaged skills will appear here.'}</Nothing>}
     <Sheet open={!!entry} onOpenChange={open => { if (!open) setSelected(undefined); }}>
       <SheetContent className="overflow-y-auto data-[side=right]:w-full data-[side=right]:sm:max-w-3xl">
         {entry && <SkillDetail key={`${entry.type === 'rule' ? 'rule' : 'skill'}:${entry.name}`} entry={entry} initialHarness={selected?.harness} connection={connection} revision={revision} changed={changed} reviewDraft={() => { setSelected(undefined); reviewDraft(); }}
-          converted={next => setSelected({ key: keyFor(next), optimistic: { entry: next, inventory: entries } })} />}
+          assignment={assignment} converted={next => setSelected({ key: keyFor(next), optimistic: { entry: next, inventory: entries } })} />}
       </SheetContent>
     </Sheet>
   </div>;
@@ -90,9 +103,9 @@ function SkillBrowser({ query, revision }: { query: () => ContentQuery; revision
       <div className="grid min-w-0 gap-4 md:grid-cols-[12rem_minmax(0,1fr)]">
         <nav aria-label="Files" className="flex max-h-64 min-w-0 flex-col gap-1 overflow-auto md:max-h-none">
           {tree.loading ? <Loading rows={2} /> : tree.data?.length ? tree.data.map(value => value.kind === 'directory'
-            ? <span key={value.path} className="flex items-center gap-2 px-2 py-1 text-xs text-muted-foreground" style={{ paddingLeft: 8 + (value.path.split('/').length - 1) * 12 }}><Folder className="size-3 shrink-0" />{value.path}</span>
+            ? <span key={value.path} title={value.path} className="flex items-center gap-2 px-2 py-1 text-xs text-muted-foreground" style={{ paddingLeft: 8 + (value.path.split('/').length - 1) * 12 }}><Folder className="size-3 shrink-0" />{value.path.split('/').pop()}</span>
             : <Button key={value.path} variant={path === value.path ? 'secondary' : 'ghost'} size="sm" className="justify-start" aria-current={path === value.path ? 'page' : undefined}
-              style={{ paddingLeft: 8 + (value.path.split('/').length - 1) * 12 }} title={value.path} onClick={() => setSelectedPath(value.path)}><File data-icon="inline-start" /><span className="truncate">{value.path}</span></Button>)
+              style={{ paddingLeft: 8 + (value.path.split('/').length - 1) * 12 }} title={value.path} onClick={() => setSelectedPath(value.path)}><File data-icon="inline-start" /><span className="truncate">{value.path.split('/').pop()}</span></Button>)
             : <p className="text-sm text-muted-foreground">No files.</p>}
         </nav>
         <div className="min-w-0">{path && <SkillFilePreview key={path} query={query} path={path} revision={revision} />}</div>
@@ -105,8 +118,8 @@ function ServerRequired({ needed, children }: { needed: boolean; children: React
     <TooltipContent>Needs a connection to the Server</TooltipContent></Tooltip> : children;
 }
 
-function SkillDetail({ entry, initialHarness, revision, changed, reviewDraft, converted, connection }: {
-  connection: StatusView['connection']; entry: ContentEntry; initialHarness?: string; revision: number; changed: () => void; reviewDraft: () => void; converted: (entry: ContentEntry) => void;
+function SkillDetail({ entry, initialHarness, revision, changed, reviewDraft, converted, connection, assignment }: {
+  assignment: (item: string, harness: string) => void; connection: StatusView['connection']; entry: ContentEntry; initialHarness?: string; revision: number; changed: () => void; reviewDraft: () => void; converted: (entry: ContentEntry) => void;
 }) {
   const [location, setLocation] = useState(() => {
     const variant = entry.variants.find(value => value.locations.some(loc => loc.harness === initialHarness));
@@ -142,10 +155,12 @@ function SkillDetail({ entry, initialHarness, revision, changed, reviewDraft, co
     }
     setConfirmation(undefined);
     if (editorId && destination) {
+      await api.setPreferredEditor(editorId);
       await api.openInEditor(editorId, destination);
       await editors.refresh();
     }
   });
+  const disabledReason = needsServer ? 'Needs a connection to the Server' : entry.clashes_with_repo ? 'Name clashes with a repo Skill' : editors.loading ? 'Loading editors…' : !preferred ? 'No editors found' : '';
   const edit = (editorId: string) => { if (needsConversion) setConfirmation({ editorId }); else execute(editorId); };
   return <>
     <SheetHeader className="pr-12"><SheetTitle>{entry.name}</SheetTitle>
@@ -158,22 +173,24 @@ function SkillDetail({ entry, initialHarness, revision, changed, reviewDraft, co
         {entry.draft && <Button ref={reviewButton} variant="outline" size="sm" onClick={reviewDraft}>Review in Draft</Button>}
         {entry.draft !== 'deleted' && <>
           <ServerRequired needed={needsServer}><div className="flex" role="group" aria-label="Edit Skill">
-            <Button size="sm" className="rounded-r-none" disabled={!preferred || mutation.pending || (entry.type === 'unmanaged' && !canAdopt)}
-              onClick={event => { confirmationTrigger.current = event.currentTarget; if (preferred) edit(preferred.id); }}><Pending pending={mutation.pending}>
-                {entry.type === 'import' ? 'Fork to edit' : entry.type === 'unmanaged' ? 'Adopt to edit' : `Open in ${preferred?.name ?? 'editor'}`}
+            <Button size="sm" className="rounded-r-none" disabled={(entry.type !== 'unmanaged' && !preferred) || mutation.pending || (entry.type === 'unmanaged' && !canAdopt)}
+              onClick={event => { confirmationTrigger.current = event.currentTarget; if (entry.type === 'unmanaged') setConfirmation({}); else if (preferred) edit(preferred.id); }}><Pending pending={mutation.pending}>
+                {entry.type === 'import' ? 'Fork to edit' : entry.type === 'unmanaged' ? 'Adopt' : `Open in ${preferred?.name ?? 'editor'}`}
               </Pending></Button>
-            <DropdownMenu><DropdownMenuTrigger render={<Button size="icon-sm" className="rounded-l-none border-l" ref={editorTrigger} aria-label="Choose editor" disabled={mutation.pending || (entry.type === 'unmanaged' && !canAdopt)} />}><ChevronDown /></DropdownMenuTrigger>
+            <DropdownMenu><DropdownMenuTrigger render={<Button size="icon-sm" className="rounded-l-none border-l" ref={editorTrigger} aria-label="Choose editor" disabled={!editors.data?.editors.length || mutation.pending || (entry.type === 'unmanaged' && !canAdopt)} />}><ChevronDown /></DropdownMenuTrigger>
               <DropdownMenuContent align="end">{(['gui', 'terminal', 'system'] as const).map(kind => {
                 const choices = editors.data?.editors.filter(editor => editor.kind === kind) ?? [];
                 return choices.length > 0 && <DropdownMenuGroup key={kind}><DropdownMenuLabel>{kind === 'gui' ? 'GUI' : kind === 'terminal' ? 'Terminal' : 'System'}</DropdownMenuLabel>
-                  {choices.map(editor => <DropdownMenuItem key={editor.id} onClick={() => { confirmationTrigger.current = editorTrigger.current; edit(editor.id); }}>{editor.name}</DropdownMenuItem>)}
+                  {choices.map(editor => <DropdownMenuItem key={editor.id} onClick={() => { confirmationTrigger.current = editorTrigger.current; edit(editor.id); }}>{entry.type === 'unmanaged' ? `Adopt and open in ${editor.name}` : editor.name}</DropdownMenuItem>)}
                 </DropdownMenuGroup>;
               })}<DropdownMenuGroup><DropdownMenuItem onClick={() => void editors.refresh()}>Refresh editors</DropdownMenuItem></DropdownMenuGroup></DropdownMenuContent>
             </DropdownMenu>
           </div></ServerRequired>
-          {entry.type === 'unmanaged' && <ServerRequired needed={needsServer}><Button variant="outline" size="sm" disabled={mutation.pending || !canAdopt} onClick={event => { confirmationTrigger.current = event.currentTarget; setConfirmation({}); }}>Adopt</Button></ServerRequired>}
+
         </>}
       </div>
+      {disabledReason && entry.draft !== 'deleted' && <p className="text-xs text-muted-foreground">{disabledReason}</p>}
+      {entry.type !== 'unmanaged' && <div className="flex flex-wrap items-center gap-2 text-xs"><span className="text-muted-foreground">Harnesses: {entry.enabled_harnesses.join(', ') || 'None'}</span><Button variant="link" size="sm" onClick={() => assignment(item, entry.enabled_harnesses[0] ?? '')}>Edit in Assignment matrix</Button></div>}
       <ErrorNotice error={editors.error || mutation.error} />
       {entry.draft === 'deleted' && <Notice title="Deleted in Draft">Browse the read-only Baseline files below.</Notice>}
       {entry.clashes_with_repo && <Notice title="Clashes with repo">A repo Skill already has this name. Adopt is unavailable.</Notice>}

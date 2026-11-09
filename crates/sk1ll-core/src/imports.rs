@@ -271,6 +271,23 @@ impl Repo {
 
     /// Deletes an import from manifest, lock and disk.
     pub fn remove_import(&mut self, name: &str) -> Result<()> {
+        validate_name(name)?;
+        let parent = self.imported_dir();
+        let dir = parent.join(name);
+        for path in [&parent, &dir] {
+            match fs::symlink_metadata(path) {
+                Ok(meta) if meta.is_symlink() => return Err(Error::Invalid("import path is a symlink".into())),
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e).at(path),
+                _ => {}
+            }
+        }
+        if dir.exists() {
+            let base = fs::canonicalize(&parent).at(&parent)?;
+            let target = fs::canonicalize(&dir).at(&dir)?;
+            if target == base || !target.starts_with(&base) {
+                return Err(Error::Invalid("import path escapes imported directory".into()));
+            }
+        }
         if self.manifest.import.remove(name).is_none() {
             return Err(Error::Invalid(format!("no import named `{name}`")));
         }
@@ -286,6 +303,7 @@ impl Repo {
 
     /// Turns an import into a personal skill you own and edit freely.
     pub fn fork(&mut self, name: &str) -> Result<()> {
+        validate_name(name)?;
         let from = self.imported_dir().join(name);
         let to = self.personal_dir().join(name);
         if !from.is_dir() {
@@ -467,9 +485,11 @@ pub fn fetch_updates(root: &Path, targets: UpdateTargets) -> Result<FetchedUpdat
     Ok(FetchedUpdates(out))
 }
 
-fn validate_name(name: &str) -> Result<()> {
+/// Validates a single content name before constructing repository paths.
+pub fn validate_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
-        && !name.starts_with('.')
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && !name.contains("..")
         && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
     if ok { Ok(()) } else { Err(Error::Invalid(format!("invalid skill name `{name}`"))) }
 }
@@ -480,6 +500,46 @@ mod tests {
 
     use super::*;
     use crate::git::Git;
+
+    #[test]
+    fn remove_rejects_unsafe_paths_before_mutating() {
+        let src = Source::new();
+        let mut repo = src.repo();
+        repo.manifest.import.insert("../personal".into(), Import {
+            source: "unused".into(), path: String::new(), git_ref: "HEAD".into(),
+        });
+        fs::write(repo.root().join("sk1ll.toml"), toml::to_string(&repo.manifest).unwrap()).unwrap();
+        fs::write(repo.personal_dir().join("keep.txt"), "personal content").unwrap();
+        let before = fs::read(repo.root().join("sk1ll.toml")).unwrap();
+        for name in ["../personal", "a..b", "a/b", "a\\b", "-bad", "_bad"] {
+            assert!(repo.remove_import(name).is_err());
+            assert!(repo.create_item("skill", name, "").is_err());
+        }
+        assert_eq!(fs::read(repo.root().join("sk1ll.toml")).unwrap(), before);
+        assert_eq!(fs::read_to_string(repo.personal_dir().join("keep.txt")).unwrap(), "personal content");
+        assert!(repo.manifest.import.contains_key("../personal"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_rejects_symlink_target_and_parent() {
+        let src = Source::new();
+        let mut repo = src.repo();
+        repo.add_link(None, &src.origin(), Some("skills/pdf"), None, None).unwrap();
+        let before = fs::read(repo.root().join("sk1ll.toml")).unwrap();
+        let target = repo.imported_dir().join("pdf");
+        fs::rename(&target, repo.root().join("saved")).unwrap();
+        std::os::unix::fs::symlink(repo.root().join("saved"), &target).unwrap();
+        assert!(repo.remove_import("pdf").is_err());
+        fs::remove_file(&target).unwrap();
+        fs::rename(repo.root().join("saved"), &target).unwrap();
+        fs::rename(repo.imported_dir(), repo.root().join("saved-imported")).unwrap();
+        std::os::unix::fs::symlink(repo.root().join("saved-imported"), repo.imported_dir()).unwrap();
+        assert!(repo.remove_import("pdf").is_err());
+        assert_eq!(fs::read(repo.root().join("sk1ll.toml")).unwrap(), before);
+        assert!(repo.manifest.import.contains_key("pdf"));
+        assert!(target.join("SKILL.md").exists());
+    }
 
     /// A local source repo with skills at `skills/pdf`, `skills/web` and
     /// `skills/web/nested`, on `main` and a slashed branch `feature/x`.

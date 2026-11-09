@@ -321,6 +321,11 @@ impl Block {
     }
 }
 
+/// Extracts managed content for conflict previews, excluding surrounding user notes.
+pub fn managed_content(text: &str, path: &Path) -> Result<String> {
+    Ok(find_block(text, path)?.map(|block| block.inner).unwrap_or_default())
+}
+
 pub(crate) fn find_block(text: &str, path: &Path) -> Result<Option<Block>> {
     let Some(start) = find_at_line_start(text, BEGIN) else {
         return Ok(None);

@@ -56,7 +56,7 @@ export interface HarnessView {
   harness: { skills: string | null; instructions: string | null; instructions_format: 'block' | 'rules'; mode: 'symlink' | 'copy' };
 }
 export interface ImportUpdate { name: string; source: string; ref: string; locked: string; upstream: string }
-export interface ImportsView { checked_at: number | null; updates: ImportUpdate[]; errors: { name: string; message: string }[] }
+export interface ImportsView { imports?: ImportEntry[]; checked_at: number | null; updates: ImportUpdate[]; errors: { name: string; message: string }[] }
 export interface ImportUpdated { name: string; old_commit: string | null; new_commit: string; changed: boolean }
 export interface JoinApiRequest { server_url: string; code: string; machine_id?: string; copy_from?: string; repo?: string }
 export interface Joined { machine_id: string; repo: string; setup: 'cloned' | 'initialized' | 'adopted'; harnesses: string[]; revision: number }
@@ -89,3 +89,8 @@ export interface FileEntry { path: string; kind: 'file' | 'directory' | 'symlink
 export interface FileContent { path: string; text: string | null; binary: boolean; too_large: boolean; size: number }
 export interface Editor { id: string; name: string; kind: 'gui' | 'terminal' | 'system' }
 export interface EditorsView { editors: Editor[]; preferred_editor: string }
+
+export interface PushResult { pushed: boolean }
+export interface CreateItemRequest { kind: 'skill' | 'rule'; name: string; description?: string }
+export type ConflictDiffRequest = { harness: string; name: string; id?: never } | { id: string; harness?: never; name?: never };
+export interface ImportEntry { name: string; source: string; ref: string; path: string; locked: string | null }

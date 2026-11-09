@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
-import { ArrowDownToLine, BookOpen, FilePen, History, LayoutGrid, LoaderCircle, RefreshCw, Server, Settings as SettingsIcon, TriangleAlert } from 'lucide-react';
+import { ArrowDownToLine, BookOpen, FilePen, History, Info, LayoutGrid, LoaderCircle, RefreshCw, Server, Settings as SettingsIcon, TriangleAlert } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -12,6 +12,8 @@ import {
 } from '@/components/ui/sidebar';
 import { ThemeSelector } from '@/components/theme-selector';
 import { api, errorMessage } from './api';
+import { ToastProvider } from './toast';
+import { CommandPalette } from './CommandPalette';
 import { Fleet } from './Fleet';
 import { Matrix } from './Matrix';
 import { Draft } from './Draft';
@@ -26,13 +28,15 @@ const screens = {
   Fleet: { icon: Server, group: 'Fleet', description: 'Machines sharing this Baseline. Reports refresh live and every 15 seconds.' },
   'Assignment matrix': { icon: LayoutGrid, group: 'Fleet', description: 'Assignment takes effect immediately. Explicit toggles override a Harness default.' },
   Log: { icon: History, group: 'Fleet', description: 'Assignment log, newest first. Restore applies an entry\'s previous value and adds a new log entry.' },
-  Skills: { icon: BookOpen, group: 'This Machine', description: 'Browse Personal Skills, Imports, Rules, and Unmanaged skills on this Machine.' },
+  Library: { icon: BookOpen, group: 'This Machine', description: 'Browse Personal Skills, Imports, Rules, and Unmanaged skills on this Machine.' },
   Draft: { icon: FilePen, group: 'This Machine', description: 'This Machine\'s Draft is live in its Harnesses. Commit sends selected items to the Fleet Baseline.' },
   Conflicts: { icon: TriangleAlert, group: 'This Machine', description: 'A Conflict is a Harness edit that differs from this Machine\'s Draft.' },
   Imports: { icon: ArrowDownToLine, group: 'This Machine', description: 'Available upstream updates. Review each update in the Draft before Commit.' },
   Settings: { icon: SettingsIcon, group: 'Settings', description: 'Harnesses, Fleet membership, and the Daemon connection for this Machine.' },
 } as const;
+export type SkillsHandoff = { search?: string };
 type Screen = keyof typeof screens;
+const summaries: Record<Screen, string> = { Fleet: 'Monitor Machines sharing this Baseline.', 'Assignment matrix': 'Choose what each Harness receives.', Log: 'Review Assignment changes.', Library: 'Browse Skills and Rules on this Machine.', Draft: 'Review changes before Commit.', Conflicts: 'Resolve edits made in Harnesses.', Imports: 'Review upstream updates.', Settings: 'Manage this Machine and its connection.' };
 const connectionLabel = (connection: StatusView['connection']) => connection.replaceAll('_', ' ');
 
 function ConnectionPage({ socket, error }: { socket: string; error: string }) {
@@ -57,13 +61,13 @@ function ConnectionPage({ socket, error }: { socket: string; error: string }) {
 
 export function AppSidebar({ screen, setScreen, status, unmanagedCount }: { screen: Screen; setScreen: (screen: Screen) => void; status: StatusView; unmanagedCount: number }) {
   const { isMobile, setOpenMobile } = useSidebar();
-  const counts: Partial<Record<Screen, number>> = { Skills: unmanagedCount, Draft: status.report.drafts.length, Conflicts: status.report.conflicts.length };
+  const counts: Partial<Record<Screen, number>> = { Library: unmanagedCount, Draft: status.report.drafts.length, Conflicts: status.report.conflicts.length };
   const item = (name: Screen) => {
     const Icon = screens[name].icon;
     return <SidebarMenuItem key={name}>
       <SidebarMenuButton isActive={screen === name} tooltip={name} aria-current={screen === name ? 'page' : undefined}
         onClick={() => { if (isMobile) setOpenMobile(false); setScreen(name); }}><Icon /><span>{name}</span></SidebarMenuButton>
-      {!!counts[name] && <SidebarMenuBadge aria-label={name === 'Skills' ? `${counts[name]} Unmanaged skills` : undefined}>{counts[name]}</SidebarMenuBadge>}
+      {!!counts[name] && <SidebarMenuBadge className={name !== 'Draft' ? 'text-warning' : undefined} aria-label={name === 'Library' ? `${counts[name]} Unmanaged skill${counts[name] === 1 ? '' : 's'} to adopt` : name === 'Conflicts' ? `${counts[name]} Conflict${counts[name] === 1 ? '' : 's'} to resolve` : `${counts[name]} Draft items`}>{counts[name]}</SidebarMenuBadge>}
     </SidebarMenuItem>;
   };
   const group = (label: string) => (Object.keys(screens) as Screen[]).filter(name => screens[name].group === label);
@@ -85,6 +89,9 @@ export function AppSidebar({ screen, setScreen, status, unmanagedCount }: { scre
 
 export function App() {
   const [screen, setScreen] = useState<Screen>('Fleet');
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth >= 1000);
+  const [skillsHandoff, setSkillsHandoff] = useState<SkillsHandoff>({});
   const [openAdd, setOpenAdd] = useState(false);
   const [matrixTarget, setMatrixTarget] = useState<{ item: string; harness: string }>();
   const [status, setStatus] = useState<StatusView>();
@@ -97,6 +104,18 @@ export function App() {
   const heading = useRef<HTMLHeadingElement>(null);
   const navigated = useRef(false);
   const navigate = useCallback((next: Screen) => { navigated.current = true; setMatrixTarget(undefined); setOpenAdd(false); setScreen(next); }, []);
+  useEffect(() => {
+    const resize = () => setSidebarOpen(window.innerWidth >= 1000);
+    const keydown = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); setPaletteOpen(value => !value); }
+      if (event.key === '/' && !event.metaKey && !event.ctrlKey && !event.altKey && !(event.target instanceof HTMLElement && event.target.closest('input, textarea, select, [contenteditable="true"]')) && !document.querySelector('[role="dialog"]')) {
+        const input = document.querySelector<HTMLInputElement>('#main input[type="search"], #main input[aria-label*="Search"], #main input[placeholder*="Search"]');
+        if (input) { event.preventDefault(); input.focus(); }
+      }
+    };
+    window.addEventListener('resize', resize); window.addEventListener('keydown', keydown);
+    return () => { window.removeEventListener('resize', resize); window.removeEventListener('keydown', keydown); };
+  }, []);
   useEffect(() => {
     // Move keyboard and screen-reader focus to the new screen after navigation.
     if (navigated.current) { navigated.current = false; heading.current?.focus(); }
@@ -158,7 +177,7 @@ export function App() {
   if (!status) return <main className="grid min-h-svh place-items-center p-6"><div className="flex w-full max-w-sm flex-col gap-3">
     <p className="text-sm text-muted-foreground" role="status">Connecting to the Daemon…</p><Loading /><ErrorNotice error={error} /></div></main>;
   const serverConnected = status.connection === 'connected';
-  return <TooltipProvider><SidebarProvider>
+  return <ToastProvider><TooltipProvider><SidebarProvider open={sidebarOpen} onOpenChange={setSidebarOpen}>
     <a href="#main" className="sr-only z-50 rounded-md bg-background px-3 py-2 text-sm shadow focus:not-sr-only focus:fixed focus:top-2 focus:left-2">Skip to content</a>
     <AppSidebar screen={screen} setScreen={navigate} status={status} unmanagedCount={skills.data?.filter(entry => entry.type === 'unmanaged').length ?? 0} />
     <SidebarInset className="min-w-0">
@@ -174,12 +193,12 @@ export function App() {
           </Badge>
           <Tooltip><TooltipTrigger render={<Button variant="ghost" size="icon" aria-label="Refresh" onClick={changed} />}>
             <RefreshCw /></TooltipTrigger><TooltipContent>Refresh</TooltipContent></Tooltip>
-          <ThemeSelector />
+          <Button variant="outline" size="sm" aria-label="Open command palette" onClick={() => setPaletteOpen(true)}>⌘K</Button><ThemeSelector />
         </div>
       </header>
-      <main id="main" className="mx-auto flex w-full max-w-6xl min-w-0 flex-col gap-6 p-4 md:p-6">
-        <div className="flex flex-col gap-1"><h1 ref={heading} tabIndex={-1} className="rounded-sm text-2xl font-semibold tracking-tight outline-none focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-ring">{screen}</h1>
-          <p className="text-sm text-muted-foreground">{screen === 'Draft' && status.revoked ? "This Machine's Draft is private. The Daemon has stopped managing its Harnesses until this Machine rejoins." : screen === 'Draft' && status.awaiting_assignment ? "This Machine's Draft is private. Harnesses stay unchanged until the Server sends an Assignment." : screens[screen].description}</p></div>
+      <main data-library-search={skillsHandoff.search} id="main" className="mx-auto flex w-full max-w-6xl min-w-0 flex-col gap-6 p-4 md:p-6">
+        <div className="flex flex-col gap-1"><div className="flex items-center gap-2"><h1 ref={heading} tabIndex={-1} className="rounded-sm text-2xl font-semibold tracking-tight outline-none focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-ring">{screen}</h1><Tooltip><TooltipTrigger render={<Button variant="ghost" size="icon-xs" aria-label={`About ${screen}`} />}><Info /></TooltipTrigger><TooltipContent>{screens[screen].description}</TooltipContent></Tooltip></div>
+          <p className="text-sm text-muted-foreground">{screen === 'Draft' && status.revoked ? "This Machine's Draft is private. The Daemon has stopped managing its Harnesses until this Machine rejoins." : screen === 'Draft' && status.awaiting_assignment ? "This Machine's Draft is private. Harnesses stay unchanged until the Server sends an Assignment." : summaries[screen]}</p></div>
         {status.revoked && <Notice title="Machine revoked" tone="destructive">This Machine was removed from the Fleet. The Daemon has stopped managing its Harnesses.
           <div><Button variant="outline" size="sm" className="mt-2" onClick={() => navigate('Settings')}>Rejoin in Settings</Button></div></Notice>}
         {status.awaiting_assignment && <Notice title="Awaiting Assignment">The Daemon has no Assignment snapshot. Harnesses are left alone until the Server sends one.</Notice>}
@@ -188,7 +207,7 @@ export function App() {
           <p>If this Machine was removed or its credential rotated, create a join code on another Machine and rejoin.</p>
           <div><Button variant="outline" size="sm" className="mt-2" onClick={() => navigate('Settings')}>Rejoin in Settings</Button></div></Notice>}
         <ErrorNotice error={error} />
-        {screen === 'Skills' && <><ErrorNotice error={skills.error} />{skills.loading && !skills.data ? <Loading /> : <Skills connection={status.connection} entries={skills.data ?? []} revision={revision} changed={changed} reviewDraft={() => navigate('Draft')} assignment={(item, harness) => { navigate('Assignment matrix'); setMatrixTarget({ item, harness }); }} addImport={() => { navigate('Imports'); setOpenAdd(true); }} />}</>}
+        {screen === 'Library' && <><ErrorNotice error={skills.error} />{skills.loading && !skills.data ? <Loading /> : <Skills initialSearch={skillsHandoff.search} connection={status.connection} entries={skills.data ?? []} revision={revision} changed={changed} reviewDraft={() => navigate('Draft')} assignment={(item, harness) => { navigate('Assignment matrix'); setMatrixTarget({ item, harness }); }} addImport={() => { navigate('Imports'); setOpenAdd(true); }} />}</>}
         {screen === 'Fleet' && <Fleet revision={revision} machineId={status.machine_id} navigate={navigate} changed={changed} live={status.connection === 'connected'} />}
         {screen === 'Assignment matrix' && <Matrix revision={revision} status={status} target={matrixTarget} />}
         {screen === 'Draft' && <Draft revision={revision} status={status} changed={changed} />}
@@ -198,5 +217,9 @@ export function App() {
         {screen === 'Settings' && <Settings revision={revision} status={status} socket={socket} changed={changed} />}
       </main>
     </SidebarInset>
-  </SidebarProvider></TooltipProvider>;
+    <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} commands={[
+      ...(Object.keys(screens) as Screen[]).map(name => ({ id: `screen-${name.replaceAll(' ', '-')}`, label: name, select: () => navigate(name) })),
+      ...(skills.data ?? []).map((entry, index) => ({ id: `content-${index}`, label: `${entry.type === 'rule' ? 'Rule' : 'Skill'}: ${entry.name}`, select: () => { setSkillsHandoff({ search: entry.name }); navigate('Library'); } })),
+    ]} />
+  </SidebarProvider></TooltipProvider></ToastProvider>;
 }

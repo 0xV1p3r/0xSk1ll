@@ -23,6 +23,7 @@ const cell = (machine: string) => screen.getByRole('checkbox', { name: `skill:pd
 const enabled = (machine: string) => cell(machine).getAttribute('aria-checked') === 'true';
 beforeEach(() => {
   vi.resetAllMocks();
+  localStorage.clear();
   vi.mocked(api.fleet).mockResolvedValue({ baseline: 'abc', machines: ['a', 'b'].map(id => ({
     id, status: 'in_sync', connected: true, joined_at: 1, last_seen: 1, report: null,
   })) });
@@ -122,8 +123,8 @@ describe('Assignment response cache', () => {
       { item: 'skill:local', in_baseline: false, draft: 'added', unpushed: false, description: null },
     ]);
     render(<Matrix revision={0} status={status} />);
-    const queued = (await screen.findByText('skill:queued')).closest('tr')!;
-    const local = screen.getByText('skill:local').closest('tr')!;
+    const queued = (await screen.findByText('queued')).closest('tr')!;
+    const local = screen.getByText('local').closest('tr')!;
     expect(within(queued).getByText('Unpushed')).toBeTruthy();
     expect(within(local).getByText('Draft only')).toBeTruthy();
     expect(screen.queryByText(/not committed/i)).toBeNull();
@@ -134,11 +135,11 @@ it('toggles an Assignment and a Harness default from their state labels', async 
   await mount();
   const label = cell('a').closest('label')!;
   expect(label.className).toContain('min-h-8');
-  fireEvent.click(within(label).getByText('Explicit'));
+  fireEvent.click(label);
   await waitFor(() => expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: true }] }));
   await waitFor(() => expect(cell('a').hasAttribute('data-disabled')).toBe(false));
   const defaultLabel = screen.getByRole('checkbox', { name: 'Default for new skills in a / claude' }).closest('label')!;
-  fireEvent.click(within(defaultLabel).getByText('Default'));
+  fireEvent.click(defaultLabel);
   await waitFor(() => expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'new_skills_default', enabled: true }] }));
 });
 
@@ -158,4 +159,62 @@ it('focuses and highlights the requested local cell after loading without changi
     await waitFor(() => expect(api.assignment).toHaveBeenCalledTimes(4));
     expect(document.activeElement).toBe(cell('b'));
   } finally { HTMLElement.prototype.scrollIntoView = previous; }
+});
+
+it('filters by description and kind and shows friendly names', async () => {
+  vi.mocked(api.items).mockResolvedValue([
+    { item: 'skill:pdf', in_baseline: true, draft: null, unpushed: false, description: 'Read documents' },
+    { item: 'rule:safety', in_baseline: true, draft: null, unpushed: false, description: 'Review changes' },
+  ]);
+  await mount();
+  expect(screen.getByText('pdf')).toBeTruthy();
+  fireEvent.change(screen.getByRole('textbox', { name: 'Search items' }), { target: { value: 'documents' } });
+  expect(screen.queryByText('safety')).toBeNull();
+  fireEvent.change(screen.getByRole('textbox', { name: 'Search items' }), { target: { value: '' } });
+  fireEvent.change(screen.getByRole('combobox', { name: 'Item kind' }), { target: { value: 'rule' } });
+  expect(screen.queryByText('pdf')).toBeNull();
+  expect(screen.getByText('safety')).toBeTruthy();
+});
+
+it('marks mixed states and batches row changes once per machine', async () => {
+  vi.mocked(api.assignment).mockImplementation(async machine => {
+    const next = snapshot(machine === 'a');
+    next.assignment.harnesses.codex = { ...emptyHarness(), skills: { pdf: false } };
+    return next;
+  });
+  await mount();
+  expect(screen.getByText('Mixed')).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: 'Actions for skill:pdf' }));
+  fireEvent.click(await screen.findByRole('menuitem', { name: 'Enable in all visible Harnesses' }));
+  await waitFor(() => expect(api.setAssignment).toHaveBeenCalledTimes(2));
+  for (const machine of ['a', 'b']) expect(api.setAssignment).toHaveBeenCalledWith(machine, { changes: [
+    { harness: 'claude', kind: 'skill', name: 'pdf', enabled: true },
+    { harness: 'codex', kind: 'skill', name: 'pdf', enabled: true },
+  ] });
+});
+
+it('persists hidden machines and limits column bulk changes to filtered items', async () => {
+  await mount();
+  fireEvent.click(screen.getByRole('button', { name: 'Machines (2)' }));
+  fireEvent.click(await screen.findByRole('menuitemcheckbox', { name: 'b' }));
+  expect(localStorage.getItem('assignment-matrix-machines')).toBe('["a"]');
+  expect(screen.queryByRole('checkbox', { name: 'skill:pdf in b / claude, explicit' })).toBeNull();
+  fireEvent.keyDown(screen.getByRole('menuitemcheckbox', { name: 'a' }), { key: 'Escape' });
+  fireEvent.click(screen.getByRole('button', { name: 'Actions for a / claude' }));
+  fireEvent.click(await screen.findByRole('menuitem', { name: 'Disable all visible items' }));
+  await waitFor(() => expect(api.setAssignment).toHaveBeenCalledTimes(1));
+  expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: false }] });
+});
+
+it('resets row overrides optimistically and skips unavailable remote Draft items', async () => {
+  vi.mocked(api.items).mockResolvedValue([{ item: 'skill:pdf', in_baseline: false, draft: 'added', unpushed: false, description: null }]);
+  const save = deferred<AssignmentUpdate>();
+  vi.mocked(api.setAssignment).mockReturnValue(save.promise);
+  await mount();
+  fireEvent.click(screen.getByRole('button', { name: 'Actions for skill:pdf' }));
+  fireEvent.click(await screen.findByRole('menuitem', { name: 'Reset all to default' }));
+  expect(api.setAssignment).toHaveBeenCalledTimes(1);
+  expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: null }] });
+  expect(screen.getByRole('checkbox', { name: 'skill:pdf in a / claude, inherited' }).className).toContain('border-dashed');
+  await act(async () => { save.resolve(snapshot()); });
 });

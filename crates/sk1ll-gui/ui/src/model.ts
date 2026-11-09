@@ -5,7 +5,7 @@ export const statusLabels: Record<MachineStatus, string> = {
   offline: 'Offline', blocked: 'Blocked', conflict: 'Conflict', behind: 'Behind', drafting: 'Drafting', in_sync: 'In sync',
 };
 export const statusTone: Record<MachineStatus, 'secondary' | 'destructive' | 'warning' | 'info' | 'success'> = {
-  offline: 'secondary', blocked: 'destructive', conflict: 'warning', behind: 'info', drafting: 'info', in_sync: 'success',
+  offline: 'secondary', blocked: 'destructive', conflict: 'warning', behind: 'info', drafting: 'secondary', in_sync: 'success',
 };
 export function headline(offline: boolean, report: MachineReport | null, baseline: string | null): MachineStatus {
   if (offline) return 'offline';

@@ -204,3 +204,20 @@ pub async fn open_in_editor(app: tauri::AppHandle, bridge: State<'_, Bridge>, ca
     std::fs::write(path, bytes).map_err(|e| editor_error(format!("Editor opened, but preference could not be saved: {e}")))?;
     Ok(())
 }
+
+command!(push() -> PushResult, push());
+command!(create_item(request: CreateItemRequest) -> (), create_item(&request));
+command!(check_imports() -> ImportsView, check_imports());
+command!(remove_import(name: String) -> (), remove_import(&name));
+command!(conflict_diff(request: ConflictDiffRequest) -> DiffView, conflict_diff(&request));
+
+#[tauri::command]
+pub fn set_preferred_editor(app: tauri::AppHandle, cache: State<'_, crate::editors::EditorCache>, editor_id: String) -> Result<()> {
+    let mut guard = cache.0.lock().map_err(|_| editor_error("Editor cache unavailable"))?;
+    let editors = guard.get_or_insert_with(|| crate::editors::Discovery::environment().detect());
+    if !editors.iter().any(|e| e.view.id == editor_id) { return Err(editor_error("Editor is not available; refresh the editor list")); }
+    let path = preference_path(&app)?;
+    std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| editor_error(e.to_string()))?;
+    let bytes = serde_json::to_vec(&crate::editors::Preferences { preferred_editor: Some(editor_id) }).map_err(|e| editor_error(e.to_string()))?;
+    std::fs::write(path, bytes).map_err(|e| editor_error(e.to_string()))
+}
