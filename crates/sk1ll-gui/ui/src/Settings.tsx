@@ -1,4 +1,5 @@
 import { useCallback, useRef, useState } from 'react';
+import { LoaderCircle, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -20,8 +21,10 @@ export function JoinCodeButton({ label, variant = 'outline' }: { label: string; 
   const createCode = useMutation();
   const trigger = useRef<HTMLButtonElement>(null);
   return <div className="flex flex-col items-start gap-3">
-    <Button ref={trigger} variant={variant} disabled={createCode.pending} onClick={() => void createCode.run(api.joinCode, value => setJoinCode(value.code))}>
-      <Pending pending={createCode.pending}>{label}</Pending></Button><ErrorNotice error={createCode.error} />
+    <Button ref={trigger} variant={variant} className="relative" aria-label={label} aria-busy={createCode.pending} disabled={createCode.pending} onClick={() => void createCode.run(api.joinCode, value => setJoinCode(value.code))}>
+      {/* Keep the label's width while pending so the header doesn't reflow. */}
+      <span className={createCode.pending ? 'invisible' : undefined}>{label}</span>
+      {createCode.pending && <LoaderCircle aria-hidden className="absolute inset-0 m-auto animate-spin" />}</Button><ErrorNotice error={createCode.error} />
     <Dialog open={joinCode !== undefined} onOpenChange={open => { if (!open) setJoinCode(undefined); }}>
       <DialogContent finalFocus={trigger}><DialogHeader><DialogTitle>Join code</DialogTitle>
         <DialogDescription>Copy this code now. It cannot be shown again. On the new Machine, enter it under Settings → Join / rejoin this Machine,
@@ -65,14 +68,15 @@ export function Settings({ status, socket, revision, changed }: {
 
     <Card className="pt-0"><CardHeader className="border-b border-border bg-muted/40 py-3"><CardTitle className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">Editor</CardTitle></CardHeader>
       <CardContent className="flex flex-col gap-3"><ErrorNotice error={editorData.error || saveEditor.error} />
-        {editorData.loading && <Loading rows={1} />}
-        {editorData.data && <Field><FieldLabel htmlFor="preferred-editor">Preferred editor</FieldLabel>
-          <NativeSelect id="preferred-editor" value={preferred ?? editorData.data.preferred_editor} disabled={saveEditor.pending}
+        {editorData.loading && !editorData.data && <Loading rows={1} />}
+        {!editorData.data && !editorData.loading && <div><Button variant="outline" onClick={() => { setPreferred(undefined); setRefresh(value => value + 1); }}><RefreshCw data-icon="inline-start" />Refresh editors</Button></div>}
+        {editorData.data && <Field className="max-w-sm"><FieldLabel htmlFor="preferred-editor">Preferred editor</FieldLabel>
+          <div className="flex items-center gap-2"><NativeSelect id="preferred-editor" className="w-full" value={preferred ?? editorData.data.preferred_editor} disabled={saveEditor.pending}
             onChange={e => { const value = e.target.value; void saveEditor.run(() => api.setPreferredEditor(value), () => { setPreferred(value); toast({ title: 'Preferred editor saved' }); }); }}>
             {(['gui', 'terminal', 'system'] as const).map(kind => <optgroup key={kind} label={{ gui: 'GUI', terminal: 'Terminal', system: 'System' }[kind]}>
               {editorData.data?.editors.filter(editor => editor.kind === kind).map(editor => <option key={editor.id} value={editor.id}>{editor.name}</option>)}</optgroup>)}
-          </NativeSelect></Field>}
-        <Button variant="ghost" onClick={() => { setPreferred(undefined); setRefresh(value => value + 1); }}>Refresh</Button>
+          </NativeSelect>
+          <Button variant="outline" size="icon" aria-label="Refresh editors" title="Refresh editors" disabled={editorData.loading} onClick={() => { setPreferred(undefined); setRefresh(value => value + 1); }}><RefreshCw /></Button></div></Field>}
       </CardContent></Card>
 
         <Card className="@container pt-0"><CardHeader className="border-b border-border bg-muted/40 py-3"><CardTitle className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">Daemon connection</CardTitle></CardHeader>
@@ -84,8 +88,8 @@ export function Settings({ status, socket, revision, changed }: {
             ['Auth rejected since', status.auth_rejected_since === null ? 'Never' : new Date(status.auth_rejected_since * 1000).toLocaleString()],
           ]} />{status.last_error && <div className="mt-3"><ErrorNotice error={status.last_error} /></div>}</CardContent></Card>
     <Card className="pt-0"><CardHeader className="border-b border-border bg-muted/40 py-3"><CardTitle className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">Join code</CardTitle>
-      <CardDescription>Create a single-use code for another Machine. The code is shown once.</CardDescription></CardHeader>
-      <CardContent><JoinCodeButton label="Create join code" /><p className="mt-3 text-sm text-muted-foreground">Remove Machines from the Fleet screen.</p></CardContent></Card>
+      <CardDescription>Create a single-use code for another Machine. The code is shown once. Remove Machines from the Fleet screen.</CardDescription></CardHeader>
+      <CardContent><JoinCodeButton label="Create join code" /></CardContent></Card>
       <Card className="pt-0"><CardHeader className="border-b border-border bg-muted/40 py-3"><CardTitle className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">Join / rejoin this Machine</CardTitle>
         <CardDescription>Join uses a single-use join code. Rejoin replaces this Machine's credentials and restarts its Daemon.</CardDescription></CardHeader>
         <CardContent><Collapsible key={String(alreadyJoined)} defaultOpen={!alreadyJoined}>

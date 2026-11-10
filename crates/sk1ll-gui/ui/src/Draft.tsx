@@ -7,21 +7,18 @@ import { Checkbox } from '@/components/ui/checkbox';
 import { Field, FieldLabel, FieldSet, FieldLegend } from '@/components/ui/field';
 import { Textarea } from '@/components/ui/textarea';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog';
-import { Badge } from '@/components/ui/badge';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { toast } from './toast';
 import { api } from './api';
 import { useMutation, useResource } from './hooks';
-import { Action, ChangeBadge, ErrorNotice, Loading, Nothing, Notice, Pending } from './shared';
+import { Action, ChangeBadge, DiffLines, ErrorNotice, KindBadge, Loading, Nothing, Notice, Pending } from './shared';
 import { captureReview, confirmReview, loadDraft, reconcileReview, type DraftReview } from './draftReview';
 import type { DraftEntry, CommitResponse, PullResult, StatusView } from './types';
 
 function Diff({ item, diff }: { item: string; diff: string }) {
   return <pre tabIndex={0} className="diff mt-2 min-w-0 max-w-full max-h-[32rem] overflow-auto rounded-md border bg-muted/40 p-3 font-mono text-xs leading-relaxed outline-none [tab-size:4] focus-visible:ring-3 focus-visible:ring-ring"
     aria-label={`Unified diff for ${item}`}>
-    {diff ? diff.split('\n').map((line, i) => <span key={i}
-      data-kind={line.startsWith('+') ? 'add' : line.startsWith('-') ? 'delete' : line.startsWith('@@') ? 'hunk' : undefined}>
-      {line}{'\n'}</span>) : <span className="text-muted-foreground">No textual diff.</span>}</pre>;
+    {diff ? <DiffLines diff={diff} /> : <span className="text-muted-foreground">No textual diff.</span>}</pre>;
 }
 function DraftItem({ item, change, paths, diff, checked, toggle, disabled }: {
   item: string; change: DraftEntry['change']; paths: string[]; diff: string; checked: boolean; toggle: () => void; disabled: boolean;
@@ -30,7 +27,7 @@ function DraftItem({ item, change, paths, diff, checked, toggle, disabled }: {
   return <Collapsible className="min-w-0 max-w-full px-4 py-3">
     <div className="flex flex-wrap items-center gap-3">
       <Checkbox aria-label={`Select ${item}`} checked={checked} onCheckedChange={toggle} disabled={disabled} />
-      <span className="text-sm font-medium">{item.replace(/^(skill|rule):/, '')}</span><Badge variant="outline">{item.startsWith('rule:') ? 'Rule' : 'Skill'}</Badge><ChangeBadge change={change} /><span className="text-xs tabular-nums" aria-label={`+${additions} / −${deletions}`}><span className={additions ? 'text-success-foreground' : 'text-muted-foreground'}>+{additions}</span>{' / '}<span className={deletions ? 'text-destructive-foreground' : 'text-muted-foreground'}>−{deletions}</span></span>
+      <span className="text-sm font-medium">{item.replace(/^(skill|rule):/, '')}</span><KindBadge kind={item.startsWith('rule:') ? 'rule' : 'skill'} /><ChangeBadge change={change} /><span className="text-xs tabular-nums" aria-label={`+${additions} / −${deletions}`}><span className={additions ? 'text-success-foreground' : 'text-muted-foreground'}>+{additions}</span>{' / '}<span className={deletions ? 'text-destructive-foreground' : 'text-muted-foreground'}>−{deletions}</span></span>
       <span className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground" title={paths.join(', ')}>{paths.join(', ')}</span>
       <CollapsibleTrigger render={<Button variant="ghost" size="default" className="group/diff" aria-label={`Diff for ${item}`} />}>
         <ChevronRight className="transition-transform group-data-panel-open/diff:rotate-90" />Diff</CollapsibleTrigger>
@@ -78,7 +75,7 @@ export function Draft({ revision, status, changed }: { revision: number; status:
       The new Baseline clashes with this Draft. Commit or Restore the clashing items, then Pull.
       <p className="font-mono text-xs">{status.report.clashes.join(', ')}</p></Notice>}
     <div className="flex flex-wrap items-center gap-2 rounded-xl border border-border bg-card px-4 py-3">
-      <Button ref={commitTrigger} disabled={!items.length || prefill.pending || reviewDisabled}
+      {data?.length !== 0 && <><Button ref={commitTrigger} disabled={!items.length || prefill.pending || reviewDisabled}
         onClick={() => {
           if (!data) return;
           setResult(undefined);
@@ -86,11 +83,11 @@ export function Draft({ revision, status, changed }: { revision: number; status:
           void prefill.run(() => api.commitMessage(review.items), value => setCommit({ review, message: value.message }));
         }}>
         <Pending pending={prefill.pending}><ArrowUpFromLine data-icon="inline-start" />Commit {items.length > 0 ? `(${items.length})` : ''}</Pending></Button>
-      <Button variant="outline" className="text-destructive-foreground" disabled={!items.length || reviewDisabled}
-        onClick={event => { if (data) { restoreTrigger.current = event.currentTarget; setRestore({ review: captureReview(data, items), all: false }); } }}>Restore selected</Button>
+      <Button variant="outline" className="enabled:text-destructive-foreground" disabled={!items.length || reviewDisabled}
+        onClick={event => { if (data) { restoreTrigger.current = event.currentTarget; setRestore({ review: captureReview(data, items), all: false }); } }}>Restore selected</Button></>}
       <div className="ml-auto"><Action className="h-8" label="Pull Baseline" action={async () => { const value = await api.pull(); setPull(value); toast({ title: value.state === 'blocked' ? 'Pull blocked' : 'Pull complete' }); }} onDone={changed} /></div>
-      <DropdownMenu><DropdownMenuTrigger render={<Button variant="outline" ref={restoreTrigger} onClick={event => { restoreTrigger.current = event.currentTarget; }} />}>More</DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuGroup><DropdownMenuItem variant="destructive" disabled={!data?.length || reviewDisabled}
-        onClick={() => { if (data) setRestore({ review: captureReview(data, data.map(entry => entry.item), true), all: true }); }}>Restore all</DropdownMenuItem></DropdownMenuGroup></DropdownMenuContent></DropdownMenu>
+      {data?.length !== 0 && <DropdownMenu><DropdownMenuTrigger render={<Button variant="outline" ref={restoreTrigger} onClick={event => { restoreTrigger.current = event.currentTarget; }} />}>More</DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuGroup><DropdownMenuItem variant="destructive" disabled={!data?.length || reviewDisabled}
+        onClick={() => { if (data) setRestore({ review: captureReview(data, data.map(entry => entry.item), true), all: true }); }}>Restore all</DropdownMenuItem></DropdownMenuGroup></DropdownMenuContent></DropdownMenu>}
     </div><ErrorNotice error={error} /><ErrorNotice error={prefill.error} />
     <ErrorNotice error={push.error} />
     {status.report.unpushed.length > 0 && <Alert role="status" className="border-info/30 bg-brand-soft"><ArrowUpFromLine /><AlertTitle>{status.report.unpushed.length} unpushed</AlertTitle><AlertDescription className="flex flex-wrap items-center gap-3"><ul className="min-w-0 flex-1">{status.report.unpushed.map(item => <li className="font-medium" key={item}>{item.replace(/^(skill|rule):/, '')}</li>)}</ul><Button disabled={push.pending} onClick={pushNow}>Push now</Button></AlertDescription></Alert>}

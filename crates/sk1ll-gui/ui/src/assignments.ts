@@ -5,7 +5,7 @@ import { applyToggle, mergeAssignments } from './model';
 import { cn } from '@/lib/utils';
 import type { CachedAssignmentSnapshot as AssignmentSnapshot, ToggleChange } from './types';
 
-export const matrixCheckbox = (explicit: boolean, enabled: boolean) => cn('size-[22px] rounded-[6px]', !enabled && 'border-dashed', !explicit && 'border-dashed border-primary/35 bg-brand-soft data-checked:border-primary/35 data-checked:bg-brand-soft data-checked:text-brand-ink', !explicit && !enabled && 'bg-muted/60 border-control-border/50');
+export const matrixCheckbox = (explicit: boolean, enabled: boolean) => cn('size-[22px] rounded-[6px]', !enabled && 'border-dashed', !explicit && 'border-dashed border-primary/55 bg-brand-soft data-checked:border-primary/55 data-checked:bg-brand-soft data-checked:text-brand-ink dark:border-primary/35 dark:data-checked:border-primary/35', !explicit && !enabled && 'bg-muted/60 border-control-border/50');
 
 export function useAssignmentWrites<D extends { assignments: Record<string, AssignmentSnapshot> }>(resource: { data: D | undefined; setData: Dispatch<SetStateAction<D | undefined>>; refresh: () => Promise<void> }) {
   const locks = useRef(new Set<string>());

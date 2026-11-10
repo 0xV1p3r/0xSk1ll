@@ -13,7 +13,7 @@ import { cellState, emptyHarness, itemStateLabel, mergeAssignments, splitItem } 
 import { matrixCheckbox, useAssignmentWrites } from './assignments';
 import { useResource } from './hooks';
 import { cn } from '@/lib/utils';
-import { ErrorNotice, Loading, Nothing, Pending } from './shared';
+import { CheckboxSwatch, ErrorNotice, KindBadge, Loading, Nothing, Pending } from './shared';
 import type { CachedAssignmentSnapshot as AssignmentSnapshot, ItemView, StatusView, ToggleChange } from './types';
 
 const loadMatrix = async () => {
@@ -128,8 +128,8 @@ export function Matrix({ revision, status, target }: { revision: number; status:
           })}>{machine.id}</DropdownMenuCheckboxItem>)}</DropdownMenuGroup></DropdownMenuContent>
       </DropdownMenu>
       <div className="ml-auto flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
-        <span className="inline-flex items-center gap-1.5"><span aria-hidden="true" className="inline-flex size-[22px] items-center justify-center rounded-[6px] border border-dashed border-primary/35 bg-brand-soft text-brand-ink">✓</span>Inherited from Harness default</span>
-        <span className="inline-flex items-center gap-1.5"><span aria-hidden="true" className="inline-flex size-[22px] items-center justify-center rounded-[6px] border border-primary bg-primary text-primary-foreground">✓</span>Explicit Assignment</span>
+        <span className="inline-flex items-center gap-1.5"><CheckboxSwatch explicit={false} enabled /><CheckboxSwatch explicit={false} enabled={false} />Inherited from Harness default</span>
+        <span className="inline-flex items-center gap-1.5"><CheckboxSwatch explicit enabled /><CheckboxSwatch explicit enabled={false} />Explicit Assignment</span>
       </div>
     </div>
     <div className="flex min-h-5 flex-wrap items-center gap-x-4 gap-y-1 border-b px-3.5 py-2 text-xs text-muted-foreground">
@@ -150,7 +150,7 @@ export function Matrix({ revision, status, target }: { revision: number; status:
         ], !!pending[c.machine] || !items.some(item => item.in_baseline || c.machine === status.machine_id))}</div></TableHead>)}
       </TableRow></TableHeader>
       <TableBody>
-        <TableRow className="bg-muted/40 hover:bg-muted/40"><TableHead colSpan={columns.length + 1} className="h-7 text-[11px] font-medium text-muted-foreground">Defaults for new items</TableHead></TableRow>
+        <TableRow className="border-t-2 bg-card hover:bg-card"><TableHead colSpan={columns.length + 1} className="h-8 text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">Defaults for new items</TableHead></TableRow>
         {(['skill', 'rule'] as const).map(kind => <TableRow key={kind} className="bg-muted/40 hover:bg-muted/40">
           <TableHead scope="row" className="sticky left-0 z-10 h-auto bg-muted py-3 whitespace-normal">
             <span className="font-medium">Default for new {kind === 'skill' ? 'Skills' : 'Rules'}</span></TableHead>
@@ -162,15 +162,15 @@ export function Matrix({ revision, status, target }: { revision: number; status:
         </TableRow>)}
         {items.map(item => <TableRow key={item.item}>
           <TableHead scope="row" className="sticky left-0 z-10 h-14 min-w-60 max-w-80 bg-background py-2 pr-9 font-normal whitespace-normal">
-            <div className="flex flex-wrap items-center gap-2"><span className="text-sm font-medium">{splitItem(item.item).name}</span><span className="rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">{splitItem(item.item).kind}</span>
+            <div className="flex flex-wrap items-center gap-2"><span className="text-sm font-medium">{splitItem(item.item).name}</span><KindBadge kind={splitItem(item.item).kind} />
               {new Set(columns.map(c => cellState(assignment(c.machine), c.harness, item.item).enabled)).size > 1 &&
-                <Tooltip><TooltipTrigger render={<Badge variant="warning" tabIndex={0} />}>Mixed</TooltipTrigger><TooltipContent>Enabled in some visible Harnesses and disabled in others.</TooltipContent></Tooltip>}
+                <Tooltip><TooltipTrigger render={<Badge variant="secondary" tabIndex={0} />}>Mixed</TooltipTrigger><TooltipContent>Enabled in some visible Harnesses and disabled in others.</TooltipContent></Tooltip>}
               <span className="absolute top-1/2 right-2 -translate-y-1/2">{menu(`Actions for ${item.item}`, [
                 { label: 'Enable in all visible Harnesses', run: () => bulk([item], columns, true) },
                 { label: 'Disable in all visible Harnesses', run: () => bulk([item], columns, false) },
                 { label: 'Reset all to default', run: () => bulk([item], columns, null) },
               ], !columns.length || columns.some(c => pending[c.machine]) || !columns.some(c => item.in_baseline || c.machine === status.machine_id))}</span>
-              {itemStateLabel(item) && <Badge variant="outline">{itemStateLabel(item)}</Badge>}</div>
+              {itemStateLabel(item) && <Badge variant="info">{itemStateLabel(item)}</Badge>}</div>
             {item.description && <p className="mt-1 text-xs text-muted-foreground">{item.description}</p>}
           </TableHead>
           {columns.map(c => cell(item, c.machine, c.harness))}
