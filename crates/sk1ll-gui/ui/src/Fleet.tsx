@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useRef, useState, type ReactNode } from 'react';
-import { Check, ChevronRight, FilePenLine, TriangleAlert } from 'lucide-react';
+import { ArrowUpFromLine, BookOpen, Check, ChevronRight, FilePenLine, TriangleAlert } from 'lucide-react';
 import { Toggle } from '@base-ui/react/toggle';
 import { ToggleGroup } from '@base-ui/react/toggle-group';
 import { Badge } from '@/components/ui/badge';
@@ -10,10 +10,11 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { toast } from './toast';
 import { cn } from '@/lib/utils';
-import { useResource } from './hooks';
+import { useMutation, useResource } from './hooks';
 import { api } from './api';
 import { ago, shortSha, splitItem, statusLabels, statusOrder, time } from './model';
 import { Action, Confirm, Details, ErrorNotice, Loading, Nothing, Notice, StatusBadge, When } from './shared';
+import { FleetAssignments } from './FleetAssignments';
 import { JoinCodeButton } from './Settings';
 import type { MachineReport, MachineRow, MachineStatus } from './types';
 
@@ -56,8 +57,8 @@ function MachineDetails({ machine }: { machine: MachineRow }) {
     ['Behind', report?.behind ? 'Yes' : 'No'],
   ]} />;
 }
-export function Fleet({ revision, machineId, localReport, navigate, changed, live }: {
-  revision: number; machineId: string; localReport?: MachineReport; navigate: (screen: 'Draft' | 'Conflicts') => void; changed: () => void; live: boolean;
+export function Fleet({ revision, machineId, localReport, unmanaged = [], discovery, navigate, changed, live }: {
+  revision: number; machineId: string; localReport?: MachineReport; unmanaged?: { name: string }[]; discovery?: { loading: boolean; error: string }; navigate: (screen: 'Draft' | 'Conflicts' | 'Library' | 'Assignment matrix') => void; changed: () => void; live: boolean;
 }) {
   const { data, error, loading, updatedAt } = useResource(api.fleet, revision);
   const [filter, setFilter] = useState<'attention' | 'connected' | null>(null);
@@ -73,7 +74,9 @@ export function Fleet({ revision, machineId, localReport, navigate, changed, liv
   const report = localReport ?? machines.find(machine => machine.id === machineId)?.report;
   const conflicts = report?.conflicts ?? [];
   const drafts = report?.drafts.length ?? 0, unpushed = report?.unpushed.length ?? 0;
-  const queue = Number(conflicts.length > 0) + Number(drafts + unpushed > 0);
+  const queue = Number(conflicts.length > 0) + Number(drafts > 0) + Number(unpushed > 0) + Number(unmanaged.length > 0);
+  const push = useMutation(changed);
+  const pushNow = () => void push.run(api.push, value => { if (!value.pushed) throw new Error('Push did not reach the Server.'); toast({ title: 'Push complete' }); });
   const visible = machines.filter(machine => filter === 'attention' ? ['offline', 'blocked', 'conflict'].includes(machine.status) : filter === 'connected' ? machine.connected : true);
   useEffect(() => {
     const node = table.current;
@@ -144,15 +147,18 @@ export function Fleet({ revision, machineId, localReport, navigate, changed, liv
       </Table> : <Nothing className="rounded-none border-0" title={filter ? "No matching Machines" : "No Machines"} action={filter ? <Button variant="outline" size="sm" aria-label="Clear Machine filter" onClick={() => setFilter(null)}>Show all Machines</Button> : undefined}>{filter ? "Clear the filter to see all Machines." : "Use Add Machine to create a join code for another Machine."}</Nothing>}
             </CardContent>
           </Card>
+          <FleetAssignments key={machineId} revision={revision} machineId={machineId} harnesses={report?.harnesses ?? []} navigate={navigate} />
         </div>
         <Card role="region" aria-labelledby="fleet-next-title" className="min-w-0 gap-0 border py-0 ring-0">
           <CardHeader className="flex flex-row items-center gap-2.5 border-b px-3.5 pt-2.5 [--card-spacing:--spacing(2.5)]"><CardTitle><h2 id="fleet-next-title" className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">Up next</h2></CardTitle><Badge variant="secondary" className="ml-auto font-mono tabular-nums">{queue}</Badge></CardHeader>
           <CardContent className="p-0">{queue ? <ul className="divide-y">
             {!!conflicts.length && <li><button type="button" aria-label="Resolve conflict" onClick={() => navigate('Conflicts')} className="flex w-full items-center gap-2.5 px-3.5 py-3 text-left outline-none hover:bg-muted/50 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset">
               <span aria-hidden className="grid size-7 shrink-0 place-items-center rounded-lg bg-warning/13 text-warning-foreground"><TriangleAlert className="size-4" /></span><span className="min-w-0"><span className="block text-sm font-medium">Resolve conflict</span><span className="block truncate text-xs text-muted-foreground">{splitItem(conflicts[0].item).name} in {conflicts[0].harness}{conflicts.length > 1 ? `, plus ${conflicts.length - 1} more` : ''}</span></span><ChevronRight aria-hidden className="ml-auto size-4 shrink-0 text-muted-foreground" /></button></li>}
-            {!!(drafts + unpushed) && <li><button type="button" aria-label="Review Draft" onClick={() => navigate('Draft')} className="flex w-full items-center gap-2.5 px-3.5 py-3 text-left outline-none hover:bg-muted/50 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset">
-              <span aria-hidden className="grid size-7 shrink-0 place-items-center rounded-lg bg-brand-soft text-brand-ink"><FilePenLine className="size-4" /></span><span className="min-w-0"><span className="block text-sm font-medium">Review Draft</span><span className="block text-xs text-muted-foreground">{[drafts ? `${drafts} Draft ${drafts === 1 ? 'item' : 'items'}` : '', unpushed ? `${unpushed} unpushed ${unpushed === 1 ? 'item' : 'items'}` : ''].filter(Boolean).join(', ')}</span></span><ChevronRight aria-hidden className="ml-auto size-4 shrink-0 text-muted-foreground" /></button></li>}
-          </ul> : <Empty className="py-6"><EmptyHeader><EmptyMedia variant="icon"><Check /></EmptyMedia><EmptyTitle>All caught up</EmptyTitle><EmptyDescription>No Draft items, unpushed items, or Conflicts reported for this Machine.</EmptyDescription></EmptyHeader></Empty>}</CardContent>
+            {!!unpushed && <li className="flex items-center gap-2.5 px-3.5 py-3"><span aria-hidden className="grid size-7 shrink-0 place-items-center rounded-lg bg-brand-soft text-brand-ink"><ArrowUpFromLine className="size-4" /></span><span className="min-w-0"><span className="block text-sm font-medium">Push {unpushed} unpushed {unpushed === 1 ? 'item' : 'items'}</span><span className="block truncate text-xs text-muted-foreground">{splitItem(report!.unpushed[0]).name}</span></span><Button size="sm" className="ml-auto" disabled={push.pending} onClick={pushNow}>{push.pending ? 'Pushing…' : 'Push'}</Button></li>}
+            {!!drafts && <li><button type="button" aria-label="Review Draft" onClick={() => navigate('Draft')} className="flex w-full items-center gap-2.5 px-3.5 py-3 text-left outline-none hover:bg-muted/50 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset">
+              <span aria-hidden className="grid size-7 shrink-0 place-items-center rounded-lg bg-brand-soft text-brand-ink"><FilePenLine className="size-4" /></span><span className="min-w-0"><span className="block text-sm font-medium">Review Draft</span><span className="block text-xs text-muted-foreground">{drafts} Draft {drafts === 1 ? 'item' : 'items'}</span></span><ChevronRight aria-hidden className="ml-auto size-4 shrink-0 text-muted-foreground" /></button></li>}
+            {!!unmanaged.length && <li><button type="button" aria-label="Adopt unmanaged skills" onClick={() => navigate('Library')} className="flex w-full items-center gap-2.5 px-3.5 py-3 text-left outline-none hover:bg-muted/50 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"><span aria-hidden className="grid size-7 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground"><BookOpen className="size-4" /></span><span className="min-w-0"><span className="block text-sm font-medium">Adopt unmanaged skills</span><span className="block truncate text-xs text-muted-foreground">{unmanaged.length} unmanaged {unmanaged.length === 1 ? 'skill' : 'skills'} · {unmanaged[0].name}</span></span><ChevronRight aria-hidden className="ml-auto size-4 shrink-0 text-muted-foreground" /></button></li>}
+          </ul> : <Empty className="py-6"><EmptyHeader><EmptyMedia variant="icon"><Check /></EmptyMedia><EmptyTitle>{discovery?.error ? 'Skill discovery failed' : discovery?.loading ? 'Checking for unmanaged skills…' : 'All caught up'}</EmptyTitle><EmptyDescription>{discovery?.error ? 'Unmanaged skills could not be listed, so this queue may be incomplete.' : 'No Draft items, unpushed items, or Conflicts reported for this Machine.'}</EmptyDescription></EmptyHeader></Empty>}{!!queue && discovery?.error && <p role="status" className="border-t px-3.5 py-2 text-xs text-warning-foreground">Unmanaged skills could not be listed.</p>}<ErrorNotice error={push.error} /></CardContent>
         </Card>
       </div></div>
     </>}
