@@ -43,32 +43,33 @@ export function Skills({ entries, revision, changed, reviewDraft, assignment, ad
     .sort((a, b) => ((sort.column === 'type' ? typeLabels[a.type].localeCompare(typeLabels[b.type]) : 0) || a.name.localeCompare(b.name)) * (sort.descending ? -1 : 1));
   const sortBy = (column: 'name' | 'type') => setSort(previous => ({ column, descending: previous.column === column && !previous.descending }));
   return <div className="flex min-w-0 flex-col gap-4">
-    <div className="flex flex-wrap items-end gap-3">
-      <Field className="w-44"><FieldLabel htmlFor="skill-type">Type</FieldLabel><NativeSelect id="skill-type" value={filter} onChange={event => setFilter(event.target.value)}>
+    <div className="flex flex-wrap items-center gap-2 rounded-t-xl border border-border bg-muted/40 px-4 py-3">
+      <h2 className="mr-2 text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">Library</h2>
+      <Field className="min-w-40 flex-1 sm:max-w-xs"><FieldLabel className="sr-only" htmlFor="skill-search">Search by name</FieldLabel>
+        <Input id="skill-search" type="search" value={search} onChange={event => setSearch(event.target.value)} placeholder="Find a Skill or Rule…" /></Field>
+      <Field className="w-36"><FieldLabel className="sr-only" htmlFor="skill-type">Type</FieldLabel><NativeSelect id="skill-type" value={filter} onChange={event => setFilter(event.target.value)}>
         <NativeSelectOption value="all">All types</NativeSelectOption>
         {Object.entries(typeLabels).map(([type, label]) => <NativeSelectOption key={type} value={type}>{label}</NativeSelectOption>)}
       </NativeSelect></Field>
-      <Field className="min-w-40 flex-1 sm:max-w-xs"><FieldLabel htmlFor="skill-search">Search by name</FieldLabel>
-        <Input id="skill-search" type="search" value={search} onChange={event => setSearch(event.target.value)} placeholder="Find a Skill or Rule…" /></Field>
-      <DropdownMenu><DropdownMenuTrigger render={<Button />}>New</DropdownMenuTrigger><DropdownMenuContent><DropdownMenuGroup><DropdownMenuItem onClick={() => startCreate('skill')}>New Skill</DropdownMenuItem><DropdownMenuItem onClick={() => startCreate('rule')}>New Rule</DropdownMenuItem></DropdownMenuGroup></DropdownMenuContent></DropdownMenu>
+      <DropdownMenu><DropdownMenuTrigger render={<Button className="ml-auto" />}>New</DropdownMenuTrigger><DropdownMenuContent><DropdownMenuGroup><DropdownMenuItem onClick={() => startCreate('skill')}>New Skill</DropdownMenuItem><DropdownMenuItem onClick={() => startCreate('rule')}>New Rule</DropdownMenuItem></DropdownMenuGroup></DropdownMenuContent></DropdownMenu>
     </div>
     <Dialog open={!!creating} onOpenChange={open => { if (!open && !creation.pending) setCreating(undefined); }}><DialogContent><DialogHeader><DialogTitle>New {creating === 'rule' ? 'Rule' : 'Skill'}</DialogTitle><DialogDescription>Create an item in Draft.</DialogDescription></DialogHeader>
       <Field><FieldLabel htmlFor="new-name">Name</FieldLabel><Input id="new-name" value={name} onChange={event => setName(event.target.value)} aria-invalid={!!name && !!nameError} aria-describedby="name-error" /><p id="name-error" className="text-xs text-muted-foreground">{name && nameError}</p></Field>
       <Field><FieldLabel htmlFor="new-description">Description (optional)</FieldLabel><Input id="new-description" value={description} onChange={event => setDescription(event.target.value)} /></Field><ErrorNotice error={creation.error} />
       <DialogFooter><Button variant="outline" disabled={creation.pending} onClick={() => setCreating(undefined)}>Cancel</Button><Button disabled={!!nameError || creation.pending} onClick={() => { if (creating) void creation.run(() => api.createItem({ kind: creating, name, description: description.trim() || undefined }), () => { setSelected({ key: `${creating}:${name}` }); setSearch(''); setFilter('all'); setCreating(undefined); toast({ title: `${creating === 'rule' ? 'Rule' : 'Skill'} created` }); }); }}>Create</Button></DialogFooter></DialogContent>
     </Dialog>
-    {visible.length ? <div className="overflow-hidden rounded-lg border"><Table aria-label="Skills" stickyFirstColumn>
+    {visible.length ? <div className="overflow-hidden rounded-xl border border-border bg-card"><Table aria-label="Skills" stickyFirstColumn>
       <TableHeader><TableRow className="bg-muted hover:bg-muted">{(['name', 'type'] as const).map(column => <TableHead key={column}
         aria-sort={sort.column === column ? sort.descending ? 'descending' : 'ascending' : 'none'}>
-        <Button variant="ghost" size="sm" className="-ml-2.5" onClick={() => sortBy(column)}>{column === 'name' ? 'Name' : 'Type'}
+        <Button variant="ghost" size="default" className="-ml-2.5" onClick={() => sortBy(column)}>{column === 'name' ? 'Name' : 'Type'}
           {sort.column === column && (sort.descending ? <ArrowDown data-icon="inline-end" /> : <ArrowUp data-icon="inline-end" />)}</Button>
       </TableHead>)}<TableHead>Draft state</TableHead><TableHead>Harnesses</TableHead></TableRow></TableHeader>
       <TableBody>{visible.map(value => {
         const harnesses = value.type === 'unmanaged' ? [...new Set(value.variants.flatMap(variant => variant.locations.map(location => location.harness)))] : value.enabled_harnesses;
         return <TableRow key={keyFor(value)} tabIndex={0} aria-label={`View ${typeLabels[value.type]} ${value.name}`} className="cursor-pointer focus-visible:outline-2 focus-visible:outline-ring focus-visible:-outline-offset-2"
           onClick={() => setSelected({ key: keyFor(value) })} onKeyDown={event => { if (event.target === event.currentTarget && ['Enter', ' '].includes(event.key)) { event.preventDefault(); setSelected({ key: keyFor(value) }); } }}>
-          <TableCell className="min-w-48 whitespace-normal"><span className="font-medium">{value.name}</span>
-            {value.description && <p className="mt-1 max-w-md text-xs text-muted-foreground">{value.description}</p>}</TableCell>
+          <TableCell className="h-16 min-w-48 whitespace-normal"><span className="font-medium">{value.name}</span>
+            {value.description && <p className="mt-1 max-w-md truncate text-xs text-muted-foreground">{value.description}</p>}</TableCell>
           <TableCell>{typeLabels[value.type]}</TableCell><TableCell><DraftBadge entry={value} /></TableCell>
           <TableCell><div className="flex max-w-sm flex-wrap gap-1">
             {harnesses.map(name => <Badge key={name} variant="outline" className="hover:underline" title={value.type === 'unmanaged' ? 'View this location' : 'Open in Assignment matrix'} render={<button type="button" aria-label={`${value.type === 'unmanaged' ? 'View' : 'Assignment for'} ${value.name} in ${name}`}
@@ -104,7 +105,7 @@ function SkillBrowser({ query, revision }: { query: () => ContentQuery; revision
         <nav aria-label="Files" className="flex max-h-64 min-w-0 flex-col gap-1 overflow-auto md:max-h-none">
           {tree.loading ? <Loading rows={2} /> : tree.data?.length ? tree.data.map(value => value.kind === 'directory'
             ? <span key={value.path} title={value.path} className="flex items-center gap-2 px-2 py-1 text-xs text-muted-foreground" style={{ paddingLeft: 8 + (value.path.split('/').length - 1) * 12 }}><Folder className="size-3 shrink-0" />{value.path.split('/').pop()}</span>
-            : <Button key={value.path} variant={path === value.path ? 'secondary' : 'ghost'} size="sm" className="justify-start" aria-current={path === value.path ? 'page' : undefined}
+            : <Button key={value.path} variant={path === value.path ? 'secondary' : 'ghost'} size="default" className="justify-start" aria-current={path === value.path ? 'page' : undefined}
               style={{ paddingLeft: 8 + (value.path.split('/').length - 1) * 12 }} title={value.path} onClick={() => setSelectedPath(value.path)}><File data-icon="inline-start" /><span className="truncate">{value.path.split('/').pop()}</span></Button>)
             : <p className="text-sm text-muted-foreground">No files.</p>}
         </nav>
@@ -170,14 +171,14 @@ function SkillDetail({ entry, initialHarness, revision, changed, reviewDraft, co
     </SheetHeader>
     <div className="flex min-w-0 flex-col gap-4 px-4 pb-6">
       <div className="flex flex-wrap gap-2">
-        {entry.draft && <Button ref={reviewButton} variant="outline" size="sm" onClick={reviewDraft}>Review in Draft</Button>}
+        {entry.draft && <Button ref={reviewButton} variant="outline" size="default" onClick={reviewDraft}>Review in Draft</Button>}
         {entry.draft !== 'deleted' && <>
           <ServerRequired needed={needsServer}><div className="flex" role="group" aria-label="Edit Skill">
-            <Button size="sm" className="rounded-r-none" disabled={(entry.type !== 'unmanaged' && !preferred) || mutation.pending || (entry.type === 'unmanaged' && !canAdopt)}
+            <Button size="default" className="rounded-r-none" disabled={(entry.type !== 'unmanaged' && !preferred) || mutation.pending || (entry.type === 'unmanaged' && !canAdopt)}
               onClick={event => { confirmationTrigger.current = event.currentTarget; if (entry.type === 'unmanaged') setConfirmation({}); else if (preferred) edit(preferred.id); }}><Pending pending={mutation.pending}>
                 {entry.type === 'import' ? 'Fork to edit' : entry.type === 'unmanaged' ? 'Adopt' : `Open in ${preferred?.name ?? 'editor'}`}
               </Pending></Button>
-            <DropdownMenu><DropdownMenuTrigger render={<Button size="icon-sm" className="rounded-l-none border-l" ref={editorTrigger} aria-label="Choose editor" disabled={!editors.data?.editors.length || mutation.pending || (entry.type === 'unmanaged' && !canAdopt)} />}><ChevronDown /></DropdownMenuTrigger>
+            <DropdownMenu><DropdownMenuTrigger render={<Button size="icon" className="rounded-l-none border-l" ref={editorTrigger} aria-label="Choose editor" disabled={!editors.data?.editors.length || mutation.pending || (entry.type === 'unmanaged' && !canAdopt)} />}><ChevronDown /></DropdownMenuTrigger>
               <DropdownMenuContent align="end">{(['gui', 'terminal', 'system'] as const).map(kind => {
                 const choices = editors.data?.editors.filter(editor => editor.kind === kind) ?? [];
                 return choices.length > 0 && <DropdownMenuGroup key={kind}><DropdownMenuLabel>{kind === 'gui' ? 'GUI' : kind === 'terminal' ? 'Terminal' : 'System'}</DropdownMenuLabel>
@@ -190,7 +191,7 @@ function SkillDetail({ entry, initialHarness, revision, changed, reviewDraft, co
         </>}
       </div>
       {disabledReason && entry.draft !== 'deleted' && <p className="text-xs text-muted-foreground">{disabledReason}</p>}
-      {entry.type !== 'unmanaged' && <div className="flex flex-wrap items-center gap-2 text-xs"><span className="text-muted-foreground">Harnesses: {entry.enabled_harnesses.join(', ') || 'None'}</span><Button variant="link" size="sm" onClick={() => assignment(item, entry.enabled_harnesses[0] ?? '')}>Edit in Assignment matrix</Button></div>}
+      {entry.type !== 'unmanaged' && <div className="flex flex-wrap items-center gap-2 text-xs"><span className="text-muted-foreground">Harnesses: {entry.enabled_harnesses.join(', ') || 'None'}</span><Button variant="link" size="default" onClick={() => assignment(item, entry.enabled_harnesses[0] ?? '')}>Edit in Assignment matrix</Button></div>}
       <ErrorNotice error={editors.error || mutation.error} />
       {entry.draft === 'deleted' && <Notice title="Deleted in Draft">Browse the read-only Baseline files below.</Notice>}
       {entry.clashes_with_repo && <Notice title="Clashes with repo">A repo Skill already has this name. Adopt is unavailable.</Notice>}

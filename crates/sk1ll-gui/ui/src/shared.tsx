@@ -21,7 +21,7 @@ export function ChangeBadge({ change }: { change: keyof typeof changeTone }) {
   return <Badge variant={changeTone[change]}>{changeLabels[change]}</Badge>;
 }
 export function StatusBadge({ status }: { status: MachineStatus }) {
-  return <Badge variant={statusTone[status]}>{statusLabels[status]}</Badge>;
+  return <Badge variant={statusTone[status]}><span aria-hidden className="size-1.5 shrink-0 rounded-full bg-current" />{statusLabels[status]}</Badge>;
 }
 export function ErrorNotice({ error, title = 'Could not complete the request' }: { error?: string; title?: string }) {
   return error ? <Alert variant="destructive" role="alert"><CircleAlert /><AlertTitle>{title}</AlertTitle>

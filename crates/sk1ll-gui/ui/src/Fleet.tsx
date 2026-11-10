@@ -1,29 +1,36 @@
-import { Fragment, useState, type ReactNode } from 'react';
-import { ChevronRight } from 'lucide-react';
+import { Fragment, useEffect, useRef, useState, type ReactNode } from 'react';
+import { Check, ChevronRight, FilePenLine, TriangleAlert } from 'lucide-react';
+import { Toggle } from '@base-ui/react/toggle';
+import { ToggleGroup } from '@base-ui/react/toggle-group';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { Card, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { toast } from './toast';
 import { cn } from '@/lib/utils';
 import { useResource } from './hooks';
 import { api } from './api';
-import { ago, shortSha, statusOrder, time } from './model';
+import { ago, shortSha, splitItem, statusLabels, statusOrder, time } from './model';
 import { Action, Confirm, Details, ErrorNotice, Loading, Nothing, Notice, StatusBadge, When } from './shared';
 import { JoinCodeButton } from './Settings';
-import type { MachineRow } from './types';
+import type { MachineReport, MachineRow, MachineStatus } from './types';
 
 const list = (values: string[] | undefined, none = 'None') => values?.length ? values.join(', ') : none;
-function NextStep({ machine, local, navigate, changed }: {
-  machine: MachineRow; local: boolean; navigate: (screen: 'Draft' | 'Conflicts') => void; changed: () => void;
+const statusColor: Record<MachineStatus, string> = { in_sync: 'bg-success', drafting: 'bg-brand-ink', behind: 'bg-info', conflict: 'bg-warning', blocked: 'bg-destructive', offline: 'bg-muted-foreground' };
+const healthOrder: MachineStatus[] = ['in_sync', 'drafting', 'behind', 'conflict', 'blocked', 'offline'];
+function guidance(machine: MachineRow, local: boolean) {
+  if (!local) return { offline: 'Start its Daemon, or check its network path to the Server.', blocked: `Commit or Restore the clashing items on ${machine.id}, then Pull.`,
+    conflict: `Resolve its Conflicts in the GUI on ${machine.id}.`, behind: `${machine.id} Pulls the new Baseline once its Draft allows it.`,
+    drafting: 'Draft changes are live in its Harnesses.', in_sync: 'Up to date with the Fleet Baseline.' }[machine.status];
+  return { offline: 'Start the Daemon, or check its network path to the Server.', blocked: 'Commit or Restore clashing items, then Pull.', conflict: 'Review Conflicts to resolve edits in your Harnesses.',
+    behind: 'Pull the new Baseline once your Draft allows it.', drafting: 'Review your Draft before Commit.', in_sync: 'Up to date with the Fleet Baseline.' }[machine.status];
+}
+function NextStep({ machine, navigate, changed }: {
+  machine: MachineRow; navigate: (screen: 'Draft' | 'Conflicts') => void; changed: () => void;
 }) {
   const report = machine.report;
-  if (!local) {
-    const hint = { offline: 'Start its Daemon, or check its network path to the Server.', blocked: `Commit or Restore the clashing items on ${machine.id}, then Pull.`,
-      conflict: `Resolve its Conflicts in the GUI on ${machine.id}.`, behind: `${machine.id} Pulls the new Baseline once its Draft allows it.` } as Record<string, string>;
-    return hint[machine.status] ? <p className="text-xs text-muted-foreground">{hint[machine.status]}</p> : null;
-  }
   return <div className="flex flex-wrap gap-2">
     {!!report?.conflicts.length && <Button size="sm" onClick={() => navigate('Conflicts')}>Review Conflicts</Button>}
     {(!!report?.drafts.length || report?.blocked) && <Button size="sm" variant="outline" onClick={() => navigate('Draft')}>Review Draft</Button>}
@@ -49,66 +56,105 @@ function MachineDetails({ machine }: { machine: MachineRow }) {
     ['Behind', report?.behind ? 'Yes' : 'No'],
   ]} />;
 }
-function Stat({ label, value, hint, onClick, active }: { label: string; value: ReactNode; hint?: string; onClick?: () => void; active?: boolean }) {
-  const content = <Card><CardHeader><CardDescription>{label}</CardDescription>
-    <CardTitle className="text-2xl font-semibold tabular-nums">{value}</CardTitle>
-    {hint && <CardDescription className="text-xs">{hint}</CardDescription>}</CardHeader></Card>;
-  return onClick ? <button type="button" aria-label={`Filter: ${label}`} aria-pressed={active} onClick={onClick} className="rounded-lg text-left focus-visible:outline-2 focus-visible:outline-ring">{content}</button> : content;
-}
-export function Fleet({ revision, machineId, navigate, changed, live }: {
-  revision: number; machineId: string; navigate: (screen: 'Draft' | 'Conflicts') => void; changed: () => void; live: boolean;
+export function Fleet({ revision, machineId, localReport, navigate, changed, live }: {
+  revision: number; machineId: string; localReport?: MachineReport; navigate: (screen: 'Draft' | 'Conflicts') => void; changed: () => void; live: boolean;
 }) {
   const { data, error, loading, updatedAt } = useResource(api.fleet, revision);
   const [filter, setFilter] = useState<'attention' | 'connected' | null>(null);
   const [open, setOpen] = useState<string[]>([]);
+  const table = useRef<HTMLTableElement>(null);
+  const [columns, setColumns] = useState(7);
   const toggle = (id: string) => setOpen(value => value.includes(id) ? value.filter(v => v !== id) : [...value, id]);
   const machines = [...data?.machines ?? []]
     .sort((a, b) => statusOrder.indexOf(a.status) - statusOrder.indexOf(b.status) || a.id.localeCompare(b.id));
   const attention = machines.filter(m => ['offline', 'blocked', 'conflict'].includes(m.status)).length;
+  const connected = machines.filter(m => m.connected).length;
+  const health = healthOrder.map(status => ({ status, count: machines.filter(machine => machine.status === status).length }));
+  const report = localReport ?? machines.find(machine => machine.id === machineId)?.report;
+  const conflicts = report?.conflicts ?? [];
+  const drafts = report?.drafts.length ?? 0, unpushed = report?.unpushed.length ?? 0;
+  const queue = Number(conflicts.length > 0) + Number(drafts + unpushed > 0);
   const visible = machines.filter(machine => filter === 'attention' ? ['offline', 'blocked', 'conflict'].includes(machine.status) : filter === 'connected' ? machine.connected : true);
+  useEffect(() => {
+    const node = table.current;
+    if (!node) return;
+    const update = () => setColumns([...node.querySelectorAll('thead th')].filter(head => getComputedStyle(head).display !== 'none').length);
+    update();
+    if (typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(update);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [visible.length]);
   const count = (machine: MachineRow, value: ReactNode) => machine.status === 'offline' || !machine.connected ? <Tooltip><TooltipTrigger render={<span tabIndex={0} className="text-muted-foreground opacity-60" />}>{value}</TooltipTrigger><TooltipContent>As of last report {ago(machine.last_seen)} ({time(machine.last_seen)})</TooltipContent></Tooltip> : value;
   return <>
     <ErrorNotice error={error} />{loading && !data && <Loading />}
     {data && <>
       {(!!error || !live) && <Notice title="Showing last available Fleet data">Server updates are unavailable, so Machine reports may be out of date.
         Read from the Daemon {ago(updatedAt ?? null).toLowerCase()}.</Notice>}
-      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
-        <Stat label="Machines" value={machines.length} active={!filter} onClick={() => setFilter(null)} />
-        <Stat label="Connected" active={filter === 'connected'} onClick={() => setFilter('connected')} value={machines.filter(m => m.connected).length} />
-        <Stat label="Need attention" active={filter === 'attention'} onClick={() => setFilter('attention')} value={attention} hint="Offline, Blocked, or in Conflict" />
-        <Stat label="Fleet Baseline" value={<code className="font-mono text-xl">{shortSha(data.baseline)}</code>} />
-      </div>
-      <div className="flex items-center justify-between gap-4"><h2 className="text-base font-semibold">Machines</h2>
-        <JoinCodeButton label="Add Machine" /></div>
-      {filter && <div><Button variant="secondary" size="sm" aria-label="Clear Machine filter" onClick={() => setFilter(null)}>{filter === 'attention' ? 'Need attention' : 'Connected'} ×</Button></div>}
-      {visible.length > 0 ? <div className="overflow-hidden rounded-lg border"><Table aria-label="Machines" stickyFirstColumn>
-        <TableHeader><TableRow className="bg-muted hover:bg-muted">
-          {['Machine', 'Status', 'Baseline', 'Draft items', 'Conflicts', 'Last seen'].map(label =>
-            <TableHead key={label} className={cn(['Draft items', 'Conflicts'].includes(label) && 'text-right')}>{label}</TableHead>)}
+      <div className="@container min-w-0"><div className="grid min-w-0 items-start gap-3.5 @min-[1000px]:grid-cols-[minmax(0,1fr)_320px]">
+        <div className="flex min-w-0 flex-col gap-3.5">
+          <Card role="region" aria-labelledby="fleet-health-title" className="gap-0 border py-0 ring-0">
+            <CardHeader className="flex flex-row flex-wrap items-center gap-2.5 border-b px-3.5 pt-2.5 [--card-spacing:--spacing(2.5)]"><CardTitle><h2 id="fleet-health-title" className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">Fleet health</h2></CardTitle>
+              <div className="ml-auto flex items-center gap-2 font-mono text-xs"><span className="text-muted-foreground">baseline</span><code className="text-brand-ink">{shortSha(data.baseline)}</code></div></CardHeader>
+            <CardContent className="flex flex-col gap-2.5 p-3.5">
+              <div role="img" aria-label={machines.length ? `Fleet health: ${health.map(group => `${group.count} ${statusLabels[group.status]}`).join(', ')}. ${machines.length} Machines total.` : 'Fleet health: No Machines.'} className="flex h-2 gap-0.5 overflow-hidden rounded-full bg-muted">
+                {health.filter(group => group.count > 0).map(group => <span key={group.status} aria-hidden className={statusColor[group.status]} style={{ flex: group.count }} />)}</div>
+              <div className="flex flex-wrap gap-x-3.5 gap-y-2 text-xs text-muted-foreground">{health.map(group => <span key={group.status} className="inline-flex items-center gap-1.5"><span aria-hidden className={cn('size-2 rounded-xs', statusColor[group.status])} />{statusLabels[group.status]} <b className="font-mono font-medium text-foreground tabular-nums">{group.count}</b></span>)}</div>
+            </CardContent>
+          </Card>
+          <Card role="region" aria-labelledby="fleet-machines-title" className="@container/machines min-w-0 gap-0 border py-0 ring-0">
+            <CardHeader className="flex flex-row flex-wrap items-center gap-2.5 border-b px-3.5 pt-2.5 [--card-spacing:--spacing(2.5)]"><CardTitle><h2 id="fleet-machines-title" className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">Machines</h2></CardTitle>
+              <ToggleGroup aria-label="Machine filter" value={[filter ?? 'all']} onValueChange={value => { if (value.length) setFilter(value[0] === 'all' ? null : value[0] as 'attention' | 'connected'); }} className="flex rounded-lg border bg-background p-0.5">
+                {([{ value: 'all', label: 'All', count: machines.length }, { value: 'attention', label: 'Attention', count: attention }, { value: 'connected', label: 'Connected', count: connected }] as const).map(option =>
+                  <Toggle key={option.value} value={option.value} aria-label={`Filter: ${option.label}`} className="flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring aria-pressed:bg-muted aria-pressed:text-foreground"><span>{option.label}</span><span className="font-mono text-[11px] text-muted-foreground tabular-nums">{option.count}</span></Toggle>)}
+              </ToggleGroup><div className="ml-auto"><JoinCodeButton label="Add Machine" /></div></CardHeader>
+            <CardContent className="min-w-0 p-0">
+      {visible.length > 0 ? <Table ref={table} aria-label="Machines" className="table-fixed">
+        <TableHeader><TableRow className="hover:bg-transparent [&_th]:h-8 [&_th]:text-[11px] [&_th]:text-muted-foreground">
+          <TableHead className="pl-4">Machine</TableHead><TableHead className="w-24">Status</TableHead>
+          <TableHead className="hidden w-22 @min-[620px]/machines:table-cell">Baseline</TableHead>
+          <TableHead className="hidden w-14 text-right @min-[520px]/machines:table-cell">Draft<span className="sr-only"> items</span></TableHead>
+          <TableHead className="w-18 text-right">Conflicts</TableHead>
+          <TableHead className="hidden w-28 @min-[740px]/machines:table-cell">Last seen</TableHead><TableHead className="w-10"><span className="sr-only">Details</span></TableHead>
         </TableRow></TableHeader>
         <TableBody>{visible.map(machine => {
           const expanded = open.includes(machine.id);
           return <Fragment key={machine.id}>
-            <TableRow data-state={expanded ? 'selected' : undefined} className="cursor-pointer" onClick={() => toggle(machine.id)}>
-              <TableCell className="font-medium"><Button variant="ghost" size="icon-xs" aria-expanded={expanded} aria-controls={`machine-${machine.id}`}
-                aria-label={`${expanded ? 'Hide' : 'Show'} details for ${machine.id}`} onClick={event => { event.stopPropagation(); toggle(machine.id); }}>
-                <ChevronRight className={cn('transition-transform', expanded && 'rotate-90')} /></Button><span className="ml-2">{machine.id}</span>{machine.id === machineId && <Badge variant="secondary" className="ml-2">This Machine</Badge>}{machine.id !== machineId && <div className="mt-1 whitespace-normal"><NextStep machine={machine} local={false} navigate={navigate} changed={changed} /></div>}</TableCell>
+            <TableRow data-state={expanded ? 'selected' : undefined} className="h-14 cursor-pointer" onClick={() => toggle(machine.id)}>
+              <TableCell className="relative pl-4"><span aria-hidden className={cn('absolute inset-y-0 left-0 w-1', statusColor[machine.status])} /><div className="flex min-w-0 items-center gap-2"><span className="truncate font-medium" title={machine.id}>{machine.id}</span>{machine.id === machineId && <Badge variant="info" className="shrink-0">This Machine</Badge>}</div>
+                <p className="mt-0.5 truncate text-xs text-muted-foreground" title={guidance(machine, machine.id === machineId)}>{guidance(machine, machine.id === machineId)}</p></TableCell>
               <TableCell><StatusBadge status={machine.status} /></TableCell>
-              <TableCell><code className="font-mono text-xs">{shortSha(machine.report?.baseline)}</code></TableCell>
-              <TableCell className="text-right tabular-nums">{count(machine, machine.report?.drafts.length ?? '—')}</TableCell>
-              <TableCell className="text-right tabular-nums">{count(machine, machine.report?.conflicts.length ?? '—')}</TableCell>
-              <TableCell className="text-muted-foreground" onClick={event => event.stopPropagation()}><When seconds={machine.last_seen} /></TableCell>
+              <TableCell className="hidden @min-[620px]/machines:table-cell"><code className={cn('font-mono text-xs text-muted-foreground', machine.report && machine.report.baseline !== data.baseline && 'text-warning-foreground')}>{shortSha(machine.report?.baseline)}</code></TableCell>
+              <TableCell className={cn('hidden text-right font-mono text-xs tabular-nums @min-[520px]/machines:table-cell', machine.report?.drafts.length ? 'font-semibold text-brand-ink' : 'text-muted-foreground')}>{count(machine, machine.report?.drafts.length ?? '—')}</TableCell>
+              <TableCell className={cn('text-right font-mono text-xs tabular-nums', machine.report?.conflicts.length ? 'font-semibold text-warning-foreground' : 'text-muted-foreground')}>{count(machine, machine.report?.conflicts.length ?? '—')}</TableCell>
+              <TableCell className="hidden text-xs text-muted-foreground @min-[740px]/machines:table-cell" onClick={event => event.stopPropagation()}><When seconds={machine.last_seen} /></TableCell>
+              <TableCell><Button variant="ghost" size="icon-xs" aria-expanded={expanded} aria-controls={`machine-${machine.id}`}
+                aria-label={`${expanded ? 'Hide' : 'Show'} details for ${machine.id}`} onClick={event => { event.stopPropagation(); toggle(machine.id); }}>
+                <ChevronRight className={cn('transition-transform', expanded && 'rotate-90')} /></Button></TableCell>
             </TableRow>
             {expanded && <TableRow id={`machine-${machine.id}`} className="bg-muted/30 hover:bg-muted/30">
-              <TableCell colSpan={6} className="whitespace-normal"><div className="flex flex-col gap-3 py-2"><MachineDetails machine={machine} />
-                {machine.id === machineId && <NextStep machine={machine} local navigate={navigate} changed={changed} />}
+              <TableCell colSpan={columns} className="whitespace-normal px-4"><div className="flex min-w-0 flex-col gap-3 py-2"><p className="text-xs text-muted-foreground">{guidance(machine, machine.id === machineId)}</p><MachineDetails machine={machine} />
+                {machine.id === machineId && <NextStep machine={machine} navigate={navigate} changed={changed} />}
                 <div><Confirm label="Remove Machine" ariaLabel={`Remove ${machine.id} from the Fleet`} title={`Remove ${machine.id} from the Fleet?`} typed={machine.id}
                   description={machine.id === machineId ? "This removes THIS Machine, revokes its credential, and removes its Assignment. The Daemon will stop managing its Harnesses. Content in the Baseline is kept." : "This revokes the Machine's credential and removes its Assignment. Content in the Baseline is kept."}
                   action={() => api.removeMachine(machine.id)} onDone={() => { toast({ title: 'Machine removed' }); changed(); }} /></div></div></TableCell>
             </TableRow>}
           </Fragment>;
         })}</TableBody>
-      </Table></div> : <Nothing title={filter ? "No matching Machines" : "No Machines"}>{filter ? "Clear the filter to see all Machines." : "Use Add Machine to create a join code for another Machine."}</Nothing>}
+      </Table> : <Nothing className="rounded-none border-0" title={filter ? "No matching Machines" : "No Machines"} action={filter ? <Button variant="outline" size="sm" aria-label="Clear Machine filter" onClick={() => setFilter(null)}>Show all Machines</Button> : undefined}>{filter ? "Clear the filter to see all Machines." : "Use Add Machine to create a join code for another Machine."}</Nothing>}
+            </CardContent>
+          </Card>
+        </div>
+        <Card role="region" aria-labelledby="fleet-next-title" className="min-w-0 gap-0 border py-0 ring-0">
+          <CardHeader className="flex flex-row items-center gap-2.5 border-b px-3.5 pt-2.5 [--card-spacing:--spacing(2.5)]"><CardTitle><h2 id="fleet-next-title" className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">Up next</h2></CardTitle><Badge variant="secondary" className="ml-auto font-mono tabular-nums">{queue}</Badge></CardHeader>
+          <CardContent className="p-0">{queue ? <ul className="divide-y">
+            {!!conflicts.length && <li><button type="button" aria-label="Resolve conflict" onClick={() => navigate('Conflicts')} className="flex w-full items-center gap-2.5 px-3.5 py-3 text-left outline-none hover:bg-muted/50 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset">
+              <span aria-hidden className="grid size-7 shrink-0 place-items-center rounded-lg bg-warning/13 text-warning-foreground"><TriangleAlert className="size-4" /></span><span className="min-w-0"><span className="block text-sm font-medium">Resolve conflict</span><span className="block truncate text-xs text-muted-foreground">{splitItem(conflicts[0].item).name} in {conflicts[0].harness}{conflicts.length > 1 ? `, plus ${conflicts.length - 1} more` : ''}</span></span><ChevronRight aria-hidden className="ml-auto size-4 shrink-0 text-muted-foreground" /></button></li>}
+            {!!(drafts + unpushed) && <li><button type="button" aria-label="Review Draft" onClick={() => navigate('Draft')} className="flex w-full items-center gap-2.5 px-3.5 py-3 text-left outline-none hover:bg-muted/50 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset">
+              <span aria-hidden className="grid size-7 shrink-0 place-items-center rounded-lg bg-brand-soft text-brand-ink"><FilePenLine className="size-4" /></span><span className="min-w-0"><span className="block text-sm font-medium">Review Draft</span><span className="block text-xs text-muted-foreground">{[drafts ? `${drafts} Draft ${drafts === 1 ? 'item' : 'items'}` : '', unpushed ? `${unpushed} unpushed ${unpushed === 1 ? 'item' : 'items'}` : ''].filter(Boolean).join(', ')}</span></span><ChevronRight aria-hidden className="ml-auto size-4 shrink-0 text-muted-foreground" /></button></li>}
+          </ul> : <Empty className="py-6"><EmptyHeader><EmptyMedia variant="icon"><Check /></EmptyMedia><EmptyTitle>All caught up</EmptyTitle><EmptyDescription>No Draft items, unpushed items, or Conflicts reported for this Machine.</EmptyDescription></EmptyHeader></Empty>}</CardContent>
+        </Card>
+      </div></div>
     </>}
   </>;
 }

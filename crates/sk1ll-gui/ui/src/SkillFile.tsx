@@ -24,11 +24,11 @@ export function SkillFile({ file }: { file: FileContent }) {
   if (file.binary || file.text === null) return <Notice title="Binary file">This file has no text preview.</Notice>;
   const markdown = /\.md$/i.test(file.path);
   const { body, rows } = markdown ? frontmatter(file.text) : { body: file.text, rows: [] };
-  return <div className="flex min-w-0 flex-col gap-4">
-    <div className="flex flex-wrap items-center justify-between gap-2"><h3 className="break-all font-mono text-xs">{file.path}</h3>
+  return <div className="flex min-w-0 flex-col gap-4 rounded-xl border border-border bg-card p-4">
+    <div className="-mx-4 -mt-4 flex flex-wrap items-center justify-between gap-2 border-b border-border bg-muted/40 px-4 py-3"><h3 className="break-all font-mono text-xs">{file.path}</h3>
       {markdown && <div role="group" aria-label="Markdown view" className="flex gap-1">
-        <Button size="sm" variant={raw ? 'ghost' : 'secondary'} aria-pressed={!raw} onClick={() => setRaw(false)}>Rendered</Button>
-        <Button size="sm" variant={raw ? 'secondary' : 'ghost'} aria-pressed={raw} onClick={() => setRaw(true)}>Raw</Button>
+        <Button size="default" variant={raw ? 'ghost' : 'secondary'} aria-pressed={!raw} onClick={() => setRaw(false)}>Rendered</Button>
+        <Button size="default" variant={raw ? 'secondary' : 'ghost'} aria-pressed={raw} onClick={() => setRaw(true)}>Raw</Button>
       </div>}
     </div>
     {!!rows.length && <section aria-label="Frontmatter" className="rounded-md border bg-muted/30 p-3"><Details rows={rows} /></section>}

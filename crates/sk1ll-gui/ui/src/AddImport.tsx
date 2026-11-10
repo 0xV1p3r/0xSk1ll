@@ -89,8 +89,8 @@ function AddImportForm({ busy, changed, reviewDraft, finalFocus }: {
         <CollapsibleContent><Field><FieldLabel htmlFor="import-path">Path (subdirectory for other git URLs)</FieldLabel>
           <Input id="import-path" value={path} disabled={pending} onChange={e => setPath(e.target.value)} /></Field></CollapsibleContent></Collapsible>
       <Button disabled={pending || !link.trim()} onClick={resolve}>{pending ? 'Resolving…' : 'Resolve'}</Button></FieldGroup>}
-    {resolved && <><dl className="text-xs break-all"><dt>Source</dt><dd>{resolved.source}</dd><dt>Ref</dt><dd>{resolved.git_ref}</dd><dt>Commit</dt><dd>{shortSha(resolved.commit)}</dd></dl>
-      <FieldGroup ref={candidates}><h2 tabIndex={-1} className="font-medium outline-none">Resolved Skills</h2>{resolved.candidates.map((candidate, i) => <Field key={candidate.path} data-invalid={selected[i] && !!problems[i]}>
+    {resolved && <><dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2 rounded-xl border border-border bg-muted/40 p-3 text-xs break-all [&_dt]:text-muted-foreground [&_dd]:font-mono"><dt>Source</dt><dd>{resolved.source}</dd><dt>Ref</dt><dd>{resolved.git_ref}</dd><dt>Commit</dt><dd>{shortSha(resolved.commit)}</dd></dl>
+      <FieldGroup className="rounded-xl border border-border bg-card p-4" ref={candidates}><h2 tabIndex={-1} className="font-medium outline-none">Resolved Skills</h2>{resolved.candidates.map((candidate, i) => <Field key={candidate.path} data-invalid={selected[i] && !!problems[i]}>
         {resolved.candidates.length > 1 && <FieldLabel><Checkbox aria-label={`Select ${candidate.path || 'root'}`} checked={selected[i]} disabled={pending || finished}
           onCheckedChange={checked => setSelected(s => s.map((v, j) => j === i ? !!checked : v))} />{candidate.path || '(root)'}</FieldLabel>}
         <p>{candidate.description}</p>

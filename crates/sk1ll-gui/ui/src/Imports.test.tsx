@@ -257,9 +257,11 @@ it('loads conflict diffs on expansion and uses recovery ids', async () => {
   vi.mocked(api.conflicts).mockResolvedValue([entry]);
   vi.mocked(api.recovered).mockResolvedValue([{ ...entry, id: 'recovery', path: '/recovery/pdf' }]);
   render(<Conflicts revision={0} changed={changed} reviewDraft={reviewDraft} />);
-  const summaries = await screen.findAllByText('Show diff');
+  const summaries = await screen.findAllByRole('button', { name: 'Show diff' });
   expect(api.conflictDiff).not.toHaveBeenCalled();
+  expect(summaries[0].getAttribute('aria-expanded')).toBe('false');
   fireEvent.click(summaries[0]);
+  expect(summaries[0].getAttribute('aria-expanded')).toBe('true');
   await screen.findByLabelText('Conflict diff');
   expect(api.conflictDiff).toHaveBeenCalledWith({ harness: 'claude', name: 'pdf' });
   fireEvent.click(summaries[1]);
