@@ -106,6 +106,7 @@ it('preserves the chosen editor through Fork confirmation', async () => {
 });
 it('shows frontmatter separately and toggles Rendered and Raw without raw HTML', async () => {
   mount(); await select('pdf'); expect(await screen.findByRole('heading', { name: 'Guide' })).toBeTruthy();
+  expect(screen.getByRole('navigation', { name: 'Files' })).toBeTruthy();
   const header = screen.getByRole('region', { name: 'Frontmatter' });
   expect(within(header).getByText('Read PDFs')).toBeTruthy(); expect(within(header).getByText('["claude","codex"]')).toBeTruthy();
   expect(document.querySelector('script')).toBeNull(); fireEvent.click(screen.getByRole('button', { name: 'Raw' }));
@@ -118,6 +119,7 @@ it('browses a Rule single file and keeps deleted items read-only', async () => {
   vi.mocked(api.skillFile).mockResolvedValue({ path: 'style.md', text: '# Style', binary: false, too_large: false, size: 100 });
   mount([entry('style', 'rule', { draft: 'deleted' })]); fireEvent.click(screen.getByRole('row', { name: 'View Rule style' }));
   expect(await screen.findByRole('heading', { name: 'Style' })).toBeTruthy(); expect(api.skillFile).toHaveBeenCalledWith({ item: 'rule:style', path: 'style.md' });
+  expect(screen.queryByRole('navigation', { name: 'Files' })).toBeNull();
   expect(screen.queryByRole('button', { name: 'Choose editor' })).toBeNull(); fireEvent.click(screen.getByRole('button', { name: 'Review in Draft' })); expect(reviewDraft).toHaveBeenCalledOnce();
 });
 it('shows binary and size notices and reloads on revision changes', async () => {
@@ -202,7 +204,7 @@ it('offers Add Import for an empty inventory and keeps filtered empty results di
   expect(screen.queryByRole('button', { name: 'Add Import' })).toBeNull();
 });
 
-it('keeps confirmation focus inside the sheet on Cancel and Escape and focuses Review after Adopt', async () => {
+it('keeps confirmation focus inside the detail dialog on Cancel and Escape and focuses Review after Adopt', async () => {
   mount(); await select('notes', 'Unmanaged');
   const trigger = screen.getByRole('button', { name: 'Adopt' });
   for (const close of ['Cancel', 'Escape', 'Adopt into Draft']) {
