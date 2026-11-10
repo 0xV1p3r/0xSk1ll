@@ -42,7 +42,7 @@ const screens = {
 export type SkillsHandoff = { search?: string };
 type Screen = keyof typeof screens;
 const summaries: Record<Screen, string> = { Fleet: 'Monitor Machines sharing this Baseline.', 'Assignment matrix': 'Choose what each Harness receives.', Log: 'Review Assignment changes.', Library: 'Browse Skills and Rules on this Machine.', Draft: 'Review changes before Commit.', Conflicts: 'Resolve edits made in Harnesses.', Imports: 'Review upstream updates.', Settings: 'Manage this Machine and its connection.' };
-const connectionLabel = (connection: StatusView['connection']) => connection.replaceAll('_', ' ');
+const connectionLabel = (connection: StatusView['connection']) => { const text = connection.replaceAll('_', ' '); return text.charAt(0).toUpperCase() + text.slice(1); };
 const sidebarKey = 'sk1ll-sidebar-open';
 function storedSidebar() {
   try { const value = localStorage.getItem(sidebarKey); return value === 'true' ? true : value === 'false' ? false : null; } catch { return null; }
@@ -79,6 +79,7 @@ export function AppSidebar({ screen, setScreen, status, unmanagedCount }: { scre
     return <SidebarMenuItem key={name}>
       <SidebarMenuButton isActive={screen === name} tooltip={name} aria-current={screen === name ? 'page' : undefined}
         onClick={() => { if (isMobile) setOpenMobile(false); setScreen(name); }}><Icon /><span>{name}</span></SidebarMenuButton>
+      {!!counts[name] && <span aria-hidden className={cn('pointer-events-none absolute top-1 right-1 hidden size-2 rounded-full group-data-[collapsible=icon]:block', name === 'Conflicts' ? 'bg-warning' : 'bg-primary')} />}
       {!!counts[name] && <SidebarMenuBadge className={cn(name === 'Conflicts' ? 'bg-warning/13 text-warning-foreground' : 'bg-brand-soft text-brand-ink')} aria-label={name === 'Library' ? `${counts[name]} Unmanaged skill${counts[name] === 1 ? '' : 's'} to adopt` : name === 'Conflicts' ? `${counts[name]} Conflict${counts[name] === 1 ? '' : 's'} to resolve` : `${counts[name]} Draft items`}>{counts[name]}</SidebarMenuBadge>}
     </SidebarMenuItem>;
   };
@@ -196,8 +197,8 @@ export function App() {
     return () => { alive = false; };
   }, [revision]);
   if (reachable === false) return <TooltipProvider><ConnectionPage socket={socket} error={error} /></TooltipProvider>;
-  if (!status) return <main className="grid min-h-svh place-items-center p-6"><div className="flex w-full max-w-sm flex-col gap-3">
-    <p className="text-sm text-muted-foreground" role="status">Connecting to the Daemon…</p><Loading /><ErrorNotice error={error} /></div></main>;
+  if (!status) return <main className="grid min-h-svh place-items-center bg-muted/40 p-6"><div className="flex w-full max-w-sm flex-col items-start gap-3">
+    <Wordmark /><p className="flex items-center gap-2 text-sm text-muted-foreground" role="status"><LoaderCircle aria-hidden className="size-4 animate-spin" />Connecting to the Daemon…</p><ErrorNotice error={error} /></div></main>;
   const serverConnected = status.connection === 'connected';
   const conflict = status.report.conflicts[0];
   const server = status.server_url?.replace(/^https?:\/\//, '').replace(/\/$/, '') || 'Server';
@@ -221,13 +222,6 @@ export function App() {
           <RefreshCw /></TooltipTrigger><TooltipContent>Refresh</TooltipContent></Tooltip>
         <ThemeSelector />
       </header>
-      {conflict && screen !== 'Conflicts' && <div className="mx-auto mt-3.5 w-full max-w-6xl px-4 md:px-[18px]">
-        <Alert variant="warning" role="status" className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg px-3 py-2.5">
-          <TriangleAlert /><AlertTitle>This machine has {status.report.conflicts.length === 1 ? 'a conflict' : `${status.report.conflicts.length} conflicts`}</AlertTitle>
-          <AlertDescription className="min-w-0 [overflow-wrap:anywhere]"><code className="font-mono">{conflict.item.replace(/^(skill|rule):/, '')}</code> was edited in {conflict.harness} after the last sync.</AlertDescription>
-          <Button size="sm" className="ml-auto" onClick={() => navigate('Conflicts')}>Resolve</Button>
-        </Alert>
-      </div>}
       <main data-library-search={skillsHandoff.search} id="main" className="mx-auto flex w-full max-w-6xl min-w-0 flex-col gap-5 p-4 md:px-[18px] md:py-4">
         <div className="flex flex-col gap-1"><div className="flex items-center gap-2"><h1 ref={heading} tabIndex={-1} className="rounded-sm text-2xl font-semibold tracking-tight outline-none focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-ring">{screen}</h1><Tooltip><TooltipTrigger render={<Button variant="ghost" size="icon-xs" aria-label={`About ${screen}`} />}><Info /></TooltipTrigger><TooltipContent>{screens[screen].description}</TooltipContent></Tooltip></div>
           <p className="text-sm text-muted-foreground">{screen === 'Draft' && status.revoked ? "This Machine's Draft is private. The Daemon has stopped managing its Harnesses until this Machine rejoins." : screen === 'Draft' && status.awaiting_assignment ? "This Machine's Draft is private. Harnesses stay unchanged until the Server sends an Assignment." : summaries[screen]}</p></div>
@@ -239,6 +233,11 @@ export function App() {
           <p>If this Machine was removed or its credential rotated, create a join code on another Machine and rejoin.</p>
           <div><Button variant="outline" size="sm" className="mt-2" onClick={() => navigate('Settings')}>Rejoin in Settings</Button></div></Notice>}
         <ErrorNotice error={error} />
+        {conflict && screen !== 'Conflicts' && <Alert variant="warning" role="status" className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg px-3 py-2.5">
+          <TriangleAlert /><AlertTitle>This machine has {status.report.conflicts.length === 1 ? 'a conflict' : `${status.report.conflicts.length} conflicts`}</AlertTitle>
+          <AlertDescription className="min-w-0 [overflow-wrap:anywhere]"><code className="font-mono">{conflict.item.replace(/^(skill|rule):/, '')}</code> was edited in {conflict.harness} after the last sync.</AlertDescription>
+          <Button size="sm" className="ml-auto" onClick={() => navigate('Conflicts')}>Resolve</Button>
+        </Alert>}
         {screen === 'Library' && <><ErrorNotice error={skills.error} />{skills.loading && !skills.data ? <Loading /> : <Skills initialSearch={skillsHandoff.search} connection={status.connection} entries={skills.data ?? []} revision={revision} changed={changed} reviewDraft={() => navigate('Draft')} assignment={(item, harness) => { navigate('Assignment matrix'); setMatrixTarget({ item, harness }); }} addImport={() => { navigate('Imports'); setOpenAdd(true); }} />}</>}
         {screen === 'Fleet' && <Fleet revision={revision} machineId={status.machine_id} localReport={status.report} unmanaged={skills.data?.filter(entry => entry.type === 'unmanaged')} discovery={{ loading: !skills.data && skills.loading, error: skills.error }} navigate={navigate} changed={changed} live={status.connection === 'connected'} />}
         {screen === 'Assignment matrix' && <Matrix revision={revision} status={status} target={matrixTarget} />}

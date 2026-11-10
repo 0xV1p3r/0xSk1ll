@@ -278,10 +278,10 @@ it('filters the loaded log page by machine, Harness, author and item', async () 
   const base = { kind: 'skill' as const, before: true, after: false, at: 1, cause: { type: 'change' as const } };
   vi.mocked(api.log).mockResolvedValue([{ ...base, id: 1, machine: 'laptop', harness: 'claude', author: 'alice', name: 'pdf' }, { ...base, id: 2, machine: 'desktop', harness: 'codex', author: 'bob', name: 'writing' }]);
   render(<Log revision={0} changed={changed} />);
-  await screen.findByText('skill:pdf');
+  await screen.findByText('pdf');
   for (const [label, value] of [['Filter by machine', 'laptop'], ['Filter by harness', 'claude'], ['Filter by author', 'alice'], ['Search items', 'PDF']]) {
     fireEvent.change(screen.getByLabelText(label), { target: { value } });
-    expect(screen.getByText('skill:pdf')).toBeTruthy(); expect(screen.queryByText('skill:writing')).toBeNull();
+    expect(screen.getByText('pdf')).toBeTruthy(); expect(screen.queryByText('writing')).toBeNull();
     fireEvent.change(screen.getByLabelText(label), { target: { value: '' } });
   }
   expect(screen.queryByText('change')).toBeNull(); expect(api.log).toHaveBeenCalledOnce();

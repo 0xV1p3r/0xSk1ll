@@ -2,6 +2,7 @@ import { useEffect, useState, type ReactNode } from 'react';
 import { Check, CircleAlert, Info, Inbox, LoaderCircle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
+import { Checkbox } from '@/components/ui/checkbox';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Empty, EmptyContent, EmptyHeader, EmptyMedia, EmptyTitle, EmptyDescription } from '@/components/ui/empty';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter, DialogTrigger } from '@/components/ui/dialog';
@@ -12,6 +13,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { cn } from '@/lib/utils';
 import { toast } from './toast';
 import { useMutation } from './hooks';
+import { matrixCheckbox } from './assignments';
 import { ago, statusLabels, statusTone, time } from './model';
 import type { MachineStatus } from './types';
 
@@ -19,6 +21,18 @@ const changeTone = { added: 'success', modified: 'info', deleted: 'destructive' 
 const changeLabels = { added: 'Added', modified: 'Modified', deleted: 'Deleted' };
 export function ChangeBadge({ change }: { change: keyof typeof changeTone }) {
   return <Badge variant={changeTone[change]}>{changeLabels[change]}</Badge>;
+}
+export function KindBadge({ kind }: { kind: string }) {
+  return <Badge variant="secondary" className="font-sans">{kind === 'rule' ? 'Rule' : 'Skill'}</Badge>;
+}
+// Inert copy of an Assignment checkbox, for legends.
+export function CheckboxSwatch({ explicit, enabled }: { explicit: boolean; enabled: boolean }) {
+  return <span inert aria-hidden className="inline-flex"><Checkbox tabIndex={-1} className={matrixCheckbox(explicit, enabled)} checked={enabled} /></span>;
+}
+// Unified diff lines whose colours span the full scroll width.
+export function DiffLines({ diff }: { diff: string }) {
+  return <div className="w-max min-w-full">{diff.split('\n').map((line, i) => <div key={i} className="-mx-3 px-3"
+    data-kind={line.startsWith('@@') ? 'hunk' : line.startsWith('+') ? 'add' : line.startsWith('-') ? 'delete' : undefined}>{line || ' '}</div>)}</div>;
 }
 export function StatusBadge({ status }: { status: MachineStatus }) {
   return <Badge variant={statusTone[status]}><span aria-hidden className="size-1.5 shrink-0 rounded-full bg-current" />{statusLabels[status]}</Badge>;
@@ -29,7 +43,7 @@ export function ErrorNotice({ error, title = 'Could not complete the request' }:
 }
 export function Notice({ title, children, tone = 'default' }: { title: string; children: ReactNode; tone?: 'default' | 'destructive' }) {
   return <Alert variant={tone} role={tone === 'destructive' ? 'alert' : 'status'}>{tone === 'destructive' ? <CircleAlert /> : <Info />}
-    <AlertTitle>{title}</AlertTitle><AlertDescription>{children}</AlertDescription></Alert>;
+    <AlertTitle>{title}</AlertTitle><AlertDescription className={tone === 'destructive' ? 'text-foreground/85!' : undefined}>{children}</AlertDescription></Alert>;
 }
 export function Nothing({ title = 'Nothing here', children, className, action }: { title?: string; children: ReactNode; className?: string; action?: ReactNode }) {
   return <Empty className={cn('border border-dashed', className)}><EmptyHeader><EmptyMedia variant="icon"><Inbox /></EmptyMedia>
@@ -73,16 +87,16 @@ export function Action({ label, action, onDone, disabled = false, variant = 'out
     {announceDone && <span role="status" className="sr-only">{done ? doneLabel : ''}</span>}
     <ErrorNotice error={mutation.error} /></div>;
 }
-export function Confirm({ label, title, description, action, onDone, disabled = false, typed, ariaLabel, confirmLabel = label, variant = 'destructive' }: {
+export function Confirm({ label, title, description, action, onDone, disabled = false, typed, ariaLabel, confirmLabel = label, variant = 'destructive', triggerVariant = variant }: {
   label: string; title: string; description: ReactNode; action: () => Promise<unknown>;
   onDone: () => void; disabled?: boolean; typed?: string; ariaLabel?: string; confirmLabel?: string;
-  variant?: 'destructive' | 'default';
+  variant?: 'destructive' | 'default'; triggerVariant?: 'destructive' | 'default' | 'outline';
 }) {
   const [open, setOpen] = useState(false);
   const [text, setText] = useState('');
   const mutation = useMutation();
   return <Dialog open={open} onOpenChange={value => { if (!mutation.pending) { if (value) setText(''); setOpen(value); } }}>
-    <DialogTrigger render={<Button variant={variant} size="sm" aria-label={ariaLabel} disabled={disabled} />}>{label}</DialogTrigger>
+    <DialogTrigger render={<Button variant={triggerVariant} size="sm" aria-label={ariaLabel} disabled={disabled} />}>{label}</DialogTrigger>
     <DialogContent showCloseButton={!mutation.pending}><DialogHeader><DialogTitle>{title}</DialogTitle>
       <DialogDescription>{description}</DialogDescription></DialogHeader>
       {typed && <Field><FieldLabel htmlFor="confirm-machine">Type <code className="font-mono">{typed}</code> to confirm</FieldLabel>

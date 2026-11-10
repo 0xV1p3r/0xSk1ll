@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
-import { ArrowDown, ArrowUp, ArrowUpRight, ChevronDown, File, Folder } from 'lucide-react';
+import { ArrowDown, ArrowUp, ChevronDown, Eye, File, Folder, LayoutGrid } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
@@ -37,6 +37,7 @@ export function Skills({ entries, revision, changed, reviewDraft, assignment, ad
   const startCreate = (kind: 'skill' | 'rule') => { setName(''); setDescription(''); setCreating(kind); };
   const [sort, setSort] = useState<{ column: 'name' | 'type'; descending: boolean }>({ column: 'name', descending: false });
   const [selected, setSelected] = useState<{ key: string; harness?: string; optimistic?: { entry: ContentEntry; inventory: ContentEntry[] } }>();
+  const sheet = useRef<HTMLDivElement>(null);
   const current = entries.find(value => keyFor(value) === selected?.key);
   const entry = selected?.optimistic?.inventory === entries ? selected.optimistic.entry : current;
   const visible = entries.filter(value => (filter === 'all' || value.type === filter) && value.name.toLowerCase().includes(search.toLowerCase()))
@@ -44,11 +45,11 @@ export function Skills({ entries, revision, changed, reviewDraft, assignment, ad
   const sortBy = (column: 'name' | 'type') => setSort(previous => ({ column, descending: previous.column === column && !previous.descending }));
   return <div className="flex min-w-0 flex-col gap-4">
     <div className="flex flex-wrap items-center gap-2 rounded-t-xl border border-border bg-muted/40 px-4 py-3">
-      <h2 className="mr-2 text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">Library</h2>
+      <h2 className="sr-only">Library</h2>
       <Field className="min-w-40 flex-1 sm:max-w-xs"><FieldLabel className="sr-only" htmlFor="skill-search">Search by name</FieldLabel>
         <Input id="skill-search" type="search" value={search} onChange={event => setSearch(event.target.value)} placeholder="Find a Skill or Rule…" /></Field>
       <Field className="w-36"><FieldLabel className="sr-only" htmlFor="skill-type">Type</FieldLabel><NativeSelect id="skill-type" value={filter} onChange={event => setFilter(event.target.value)}>
-        <NativeSelectOption value="all">All types</NativeSelectOption>
+        <NativeSelectOption value="all">All Types</NativeSelectOption>
         {Object.entries(typeLabels).map(([type, label]) => <NativeSelectOption key={type} value={type}>{label}</NativeSelectOption>)}
       </NativeSelect></Field>
       <DropdownMenu><DropdownMenuTrigger render={<Button className="ml-auto" />}>New</DropdownMenuTrigger><DropdownMenuContent><DropdownMenuGroup><DropdownMenuItem onClick={() => startCreate('skill')}>New Skill</DropdownMenuItem><DropdownMenuItem onClick={() => startCreate('rule')}>New Rule</DropdownMenuItem></DropdownMenuGroup></DropdownMenuContent></DropdownMenu>
@@ -73,7 +74,7 @@ export function Skills({ entries, revision, changed, reviewDraft, assignment, ad
           <TableCell>{typeLabels[value.type]}</TableCell><TableCell><DraftBadge entry={value} /></TableCell>
           <TableCell><div className="flex max-w-sm flex-wrap gap-1">
             {harnesses.map(name => <Badge key={name} variant="outline" className="hover:underline" title={value.type === 'unmanaged' ? 'View this location' : 'Open in Assignment matrix'} render={<button type="button" aria-label={`${value.type === 'unmanaged' ? 'View' : 'Assignment for'} ${value.name} in ${name}`}
-              onClick={event => { event.stopPropagation(); if (value.type === 'unmanaged') setSelected({ key: keyFor(value), harness: name }); else if (value.item) assignment(value.item, name); }} />}>{name}<ArrowUpRight className="size-3" /></Badge>)}
+              onClick={event => { event.stopPropagation(); if (value.type === 'unmanaged') setSelected({ key: keyFor(value), harness: name }); else if (value.item) assignment(value.item, name); }} />}>{name}{value.type === 'unmanaged' ? <Eye className="size-3" /> : <LayoutGrid className="size-3" />}</Badge>)}
             {value.variants.length > 1 && <Badge variant="warning">Differs</Badge>}
             {value.clashes_with_repo && <Badge variant="warning">Clashes with repo</Badge>}
           </div></TableCell>
@@ -81,7 +82,7 @@ export function Skills({ entries, revision, changed, reviewDraft, assignment, ad
       })}</TableBody>
     </Table></div> : <Nothing title={entries.length ? 'No matching Skills' : 'No Skills yet'} action={!entries.length && <div className="flex gap-2"><Button onClick={() => startCreate('skill')}>New Skill</Button><Button variant="outline" onClick={addImport}>Add Import</Button></div>}>{entries.length ? 'Choose another Type or name.' : 'Personal Skills, Imports, Rules, and Unmanaged skills will appear here.'}</Nothing>}
     <Sheet open={!!entry} onOpenChange={open => { if (!open) setSelected(undefined); }}>
-      <SheetContent className="overflow-y-auto data-[side=right]:w-full data-[side=right]:sm:max-w-3xl">
+      <SheetContent ref={sheet} initialFocus={sheet} className="overflow-y-auto outline-none data-[side=right]:w-full data-[side=right]:sm:max-w-3xl">
         {entry && <SkillDetail key={`${entry.type === 'rule' ? 'rule' : 'skill'}:${entry.name}`} entry={entry} initialHarness={selected?.harness} connection={connection} revision={revision} changed={changed} reviewDraft={() => { setSelected(undefined); reviewDraft(); }}
           assignment={assignment} converted={next => setSelected({ key: keyFor(next), optimistic: { entry: next, inventory: entries } })} />}
       </SheetContent>
@@ -104,7 +105,7 @@ function SkillBrowser({ query, revision }: { query: () => ContentQuery; revision
       <div className="grid min-w-0 gap-4 md:grid-cols-[12rem_minmax(0,1fr)]">
         <nav aria-label="Files" className="flex max-h-64 min-w-0 flex-col gap-1 overflow-auto md:max-h-none">
           {tree.loading ? <Loading rows={2} /> : tree.data?.length ? tree.data.map(value => value.kind === 'directory'
-            ? <span key={value.path} title={value.path} className="flex items-center gap-2 px-2 py-1 text-xs text-muted-foreground" style={{ paddingLeft: 8 + (value.path.split('/').length - 1) * 12 }}><Folder className="size-3 shrink-0" />{value.path.split('/').pop()}</span>
+            ? <span key={value.path} title={value.path} className="flex h-8 items-center gap-1.5 text-sm text-muted-foreground" style={{ paddingLeft: 8 + (value.path.split('/').length - 1) * 12 }}><Folder className="size-4 shrink-0" /><span className="truncate">{value.path.split('/').pop()}</span></span>
             : <Button key={value.path} variant={path === value.path ? 'secondary' : 'ghost'} size="default" className="justify-start" aria-current={path === value.path ? 'page' : undefined}
               style={{ paddingLeft: 8 + (value.path.split('/').length - 1) * 12 }} title={value.path} onClick={() => setSelectedPath(value.path)}><File data-icon="inline-start" /><span className="truncate">{value.path.split('/').pop()}</span></Button>)
             : <p className="text-sm text-muted-foreground">No files.</p>}
@@ -161,12 +162,12 @@ function SkillDetail({ entry, initialHarness, revision, changed, reviewDraft, co
       await editors.refresh();
     }
   });
-  const disabledReason = needsServer ? 'Needs a connection to the Server' : entry.clashes_with_repo ? 'Name clashes with a repo Skill' : editors.loading ? 'Loading editors…' : !preferred ? 'No editors found' : '';
+  const disabledReason = needsServer ? 'Needs a connection to the Server' : entry.clashes_with_repo ? 'Name clashes with a repo Skill' : !editors.data ? '' : !preferred ? 'No editors found' : '';
   const edit = (editorId: string) => { if (needsConversion) setConfirmation({ editorId }); else execute(editorId); };
   return <>
     <SheetHeader className="pr-12"><SheetTitle>{entry.name}</SheetTitle>
       <SheetDescription>{choice?.description ?? entry.description ?? `${typeLabels[entry.type]} ${entry.type === 'rule' ? '' : 'Skill'}`}</SheetDescription>
-      <div className="mt-2 flex flex-wrap gap-2"><Badge variant="secondary">{typeLabels[entry.type]}</Badge><DraftBadge entry={entry} />
+      <div className="mt-2 flex flex-wrap gap-2"><Badge variant="secondary">{typeLabels[entry.type]}</Badge>{entry.draft && <ChangeBadge change={entry.draft} />}
         {entry.variants.length > 1 && <Badge variant="warning">Differs</Badge>}{entry.clashes_with_repo && <Badge variant="warning">Clashes with repo</Badge>}</div>
     </SheetHeader>
     <div className="flex min-w-0 flex-col gap-4 px-4 pb-6">

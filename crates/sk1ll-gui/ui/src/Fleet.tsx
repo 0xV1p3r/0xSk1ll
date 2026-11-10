@@ -19,11 +19,11 @@ import { JoinCodeButton } from './Settings';
 import type { MachineReport, MachineRow, MachineStatus } from './types';
 
 const list = (values: string[] | undefined, none = 'None') => values?.length ? values.join(', ') : none;
-const statusColor: Record<MachineStatus, string> = { in_sync: 'bg-success', drafting: 'bg-brand-ink', behind: 'bg-info', conflict: 'bg-warning', blocked: 'bg-destructive', offline: 'bg-muted-foreground' };
+const statusColor: Record<MachineStatus, string> = { in_sync: 'bg-success', drafting: 'bg-drafting', behind: 'bg-info', conflict: 'bg-warning', blocked: 'bg-destructive', offline: 'bg-muted-foreground' };
 const healthOrder: MachineStatus[] = ['in_sync', 'drafting', 'behind', 'conflict', 'blocked', 'offline'];
 function guidance(machine: MachineRow, local: boolean) {
   if (!local) return { offline: 'Start its Daemon, or check its network path to the Server.', blocked: `Commit or Restore the clashing items on ${machine.id}, then Pull.`,
-    conflict: `Resolve its Conflicts in the GUI on ${machine.id}.`, behind: `${machine.id} Pulls the new Baseline once its Draft allows it.`,
+    conflict: `Resolve its Conflicts in the GUI on ${machine.id}.`, behind: 'Pulls the new Baseline once its Draft allows it.',
     drafting: 'Draft changes are live in its Harnesses.', in_sync: 'Up to date with the Fleet Baseline.' }[machine.status];
   return { offline: 'Start the Daemon, or check its network path to the Server.', blocked: 'Commit or Restore clashing items, then Pull.', conflict: 'Review Conflicts to resolve edits in your Harnesses.',
     behind: 'Pull the new Baseline once your Draft allows it.', drafting: 'Review your Draft before Commit.', in_sync: 'Up to date with the Fleet Baseline.' }[machine.status];
@@ -41,14 +41,14 @@ function NextStep({ machine, navigate, changed }: {
 function MachineDetails({ machine }: { machine: MachineRow }) {
   const report = machine.report;
   if (!report) return <Details className="py-1" rows={[
-    ['Connection', machine.connected ? 'Connected' : 'Disconnected'], ['Joined', time(machine.joined_at)],
-    ['Last seen', time(machine.last_seen)], ['Report', 'Not reported. This Machine has not sent a report to the Server yet.'],
+    ['Connection', machine.connected ? 'Connected' : 'Disconnected'], ['Joined', <When seconds={machine.joined_at} />],
+    ['Last seen', <When seconds={machine.last_seen} />], ['Report', 'Not reported. This Machine has not sent a report to the Server yet.'],
   ]} />;
   return <Details className="py-1 md:grid-cols-[max-content_minmax(0,1fr)_max-content_minmax(0,1fr)]" rows={[
     ['Connection', machine.connected ? 'Connected' : 'Disconnected'],
-    ['Joined', time(machine.joined_at)],
+    ['Joined', <When seconds={machine.joined_at} />],
     ['Harnesses', list(report?.harnesses, 'None reported')],
-    ['Last seen', time(machine.last_seen)],
+    ['Last seen', <When seconds={machine.last_seen} />],
     ['Draft', list(report?.drafts)],
     ['Unpushed', list(report?.unpushed)],
     ['Conflicts', list(report?.conflicts.map(c => `${c.item} in ${c.harness}`))],
@@ -124,7 +124,7 @@ export function Fleet({ revision, machineId, localReport, unmanaged = [], discov
           const expanded = open.includes(machine.id);
           return <Fragment key={machine.id}>
             <TableRow data-state={expanded ? 'selected' : undefined} className="h-14 cursor-pointer" onClick={() => toggle(machine.id)}>
-              <TableCell className="relative pl-4"><span aria-hidden className={cn('absolute inset-y-0 left-0 w-1', statusColor[machine.status])} /><div className="flex min-w-0 items-center gap-2"><span className="truncate font-medium" title={machine.id}>{machine.id}</span>{machine.id === machineId && <Badge variant="info" className="shrink-0">This Machine</Badge>}</div>
+              <TableCell className="relative pl-4"><span aria-hidden className={cn('absolute inset-y-0 left-0 w-1', statusColor[machine.status])} /><div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5"><span className="max-w-full truncate font-medium" title={machine.id}>{machine.id}</span>{machine.id === machineId && <Badge variant="info" className="shrink-0">This Machine</Badge>}</div>
                 <p className="mt-0.5 truncate text-xs text-muted-foreground" title={guidance(machine, machine.id === machineId)}>{guidance(machine, machine.id === machineId)}</p></TableCell>
               <TableCell><StatusBadge status={machine.status} /></TableCell>
               <TableCell className="hidden @min-[620px]/machines:table-cell"><code className={cn('font-mono text-xs text-muted-foreground', machine.report && machine.report.baseline !== data.baseline && 'text-warning-foreground')}>{shortSha(machine.report?.baseline)}</code></TableCell>
@@ -136,7 +136,7 @@ export function Fleet({ revision, machineId, localReport, unmanaged = [], discov
                 <ChevronRight className={cn('transition-transform', expanded && 'rotate-90')} /></Button></TableCell>
             </TableRow>
             {expanded && <TableRow id={`machine-${machine.id}`} className="bg-muted/30 hover:bg-muted/30">
-              <TableCell colSpan={columns} className="whitespace-normal px-4"><div className="flex min-w-0 flex-col gap-3 py-2"><p className="text-xs text-muted-foreground">{guidance(machine, machine.id === machineId)}</p><MachineDetails machine={machine} />
+              <TableCell colSpan={columns} className="relative whitespace-normal px-4"><span aria-hidden className={cn('absolute inset-y-0 left-0 w-1', statusColor[machine.status])} /><div className="flex min-w-0 flex-col gap-3 py-2"><MachineDetails machine={machine} />
                 {machine.id === machineId && <NextStep machine={machine} navigate={navigate} changed={changed} />}
                 <div><Confirm label="Remove Machine" ariaLabel={`Remove ${machine.id} from the Fleet`} title={`Remove ${machine.id} from the Fleet?`} typed={machine.id}
                   description={machine.id === machineId ? "This removes THIS Machine, revokes its credential, and removes its Assignment. The Daemon will stop managing its Harnesses. Content in the Baseline is kept." : "This revokes the Machine's credential and removes its Assignment. Content in the Baseline is kept."}
@@ -150,7 +150,7 @@ export function Fleet({ revision, machineId, localReport, unmanaged = [], discov
           <FleetAssignments key={machineId} revision={revision} machineId={machineId} harnesses={report?.harnesses ?? []} navigate={navigate} />
         </div>
         <Card role="region" aria-labelledby="fleet-next-title" className="min-w-0 gap-0 border py-0 ring-0">
-          <CardHeader className="flex flex-row items-center gap-2.5 border-b px-3.5 pt-2.5 [--card-spacing:--spacing(2.5)]"><CardTitle><h2 id="fleet-next-title" className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">Up next</h2></CardTitle><Badge variant="secondary" className="ml-auto font-mono tabular-nums">{queue}</Badge></CardHeader>
+          <CardHeader className="flex flex-row items-center gap-2.5 border-b px-3.5 pt-2.5 [--card-spacing:--spacing(2.5)]"><CardTitle><h2 id="fleet-next-title" className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">Up next</h2></CardTitle>{queue > 0 && <Badge variant="secondary" className="ml-auto font-mono tabular-nums">{queue}</Badge>}</CardHeader>
           <CardContent className="p-0">{queue ? <ul className="divide-y">
             {!!conflicts.length && <li><button type="button" aria-label="Resolve conflict" onClick={() => navigate('Conflicts')} className="flex w-full items-center gap-2.5 px-3.5 py-3 text-left outline-none hover:bg-muted/50 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset">
               <span aria-hidden className="grid size-7 shrink-0 place-items-center rounded-lg bg-warning/13 text-warning-foreground"><TriangleAlert className="size-4" /></span><span className="min-w-0"><span className="block text-sm font-medium">Resolve conflict</span><span className="block truncate text-xs text-muted-foreground">{splitItem(conflicts[0].item).name} in {conflicts[0].harness}{conflicts.length > 1 ? `, plus ${conflicts.length - 1} more` : ''}</span></span><ChevronRight aria-hidden className="ml-auto size-4 shrink-0 text-muted-foreground" /></button></li>}

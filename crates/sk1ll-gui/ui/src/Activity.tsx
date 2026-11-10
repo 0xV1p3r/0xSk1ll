@@ -11,8 +11,8 @@ import { toast } from './toast';
 import { api } from './api';
 import { AddImport } from './AddImport';
 import { useResource } from './hooks';
-import { Action, Confirm, Details, ErrorNotice, Loading, Nothing, Notice, When } from './shared';
-import { ago, shortSha, time } from './model';
+import { Action, Confirm, Details, DiffLines, ErrorNotice, KindBadge, Loading, Nothing, Notice, When } from './shared';
+import { ago, shortSha } from './model';
 import type { ConflictView } from './types';
 
 function ConflictDiff({ entry, displaced }: { entry: ConflictView; displaced: boolean }) {
@@ -20,14 +20,15 @@ function ConflictDiff({ entry, displaced }: { entry: ConflictView; displaced: bo
   const { data, error, loading } = useResource(load, 0);
   return <><p className="text-xs text-muted-foreground">− {displaced ? 'Recovered content' : 'Harness edit'} / + Draft</p>
     <ErrorNotice error={error} />{loading && <Loading rows={2} />}
-    {data && <pre className="diff max-h-[32rem] overflow-auto rounded-lg border border-border bg-muted/40 p-3 font-mono text-xs" aria-label="Conflict diff">{data.diff ? data.diff.split('\n').map((line, i) => <div key={i} data-kind={line.startsWith('@@') ? 'hunk' : line.startsWith('+') ? 'add' : line.startsWith('-') ? 'delete' : undefined}>{line || ' '}</div>) : 'No differences.'}</pre>}</>;
+    {data && <pre className="diff max-h-[32rem] overflow-auto rounded-lg border border-border bg-muted/40 p-3 font-mono text-xs" aria-label="Conflict diff">{data.diff ? <DiffLines diff={data.diff} /> : 'No differences.'}</pre>}</>;
 }
 function Conflict({ entry, displaced, changed, adopted, expanded }: {
   entry: ConflictView; displaced: boolean; expanded: boolean; changed: () => void; adopted: (name: string) => void;
 }) {
   const [open, setOpen] = useState(expanded);
   const target = { harness: entry.harness, name: entry.name };
-  return <Card size="default" className={displaced ? 'border-l-4 border-l-border pt-0' : 'border-l-4 border-l-warning pt-0'}>
+  return <Card size="default" className="relative overflow-hidden pt-0">
+    <span aria-hidden className={`absolute inset-y-3 left-0 w-1 rounded-r-full ${displaced ? 'bg-info' : 'bg-warning'}`} />
     <CardHeader className="border-b border-border bg-muted/40 py-3">
       <CardTitle className="flex flex-wrap items-center gap-2"><span className="font-medium">{entry.name}</span>
         <Badge variant="outline">{entry.harness}</Badge></CardTitle>
@@ -37,7 +38,7 @@ function Conflict({ entry, displaced, changed, adopted, expanded }: {
       {entry.reason && <p>{entry.reason}</p>}
       {(entry.path || entry.displaced_at !== undefined) && <Details className="text-xs" rows={[
         ...entry.path ? [['Recovery path', <code className="font-mono break-all">{entry.path}</code>] as [string, ReactNode]] : [],
-        ...entry.displaced_at !== undefined ? [['Recovered', time(entry.displaced_at)] as [string, ReactNode]] : [],
+        ...entry.displaced_at !== undefined ? [['Recovered', <When seconds={entry.displaced_at} />] as [string, ReactNode]] : [],
       ]} />}
       <Collapsible open={open} onOpenChange={setOpen}><CollapsibleTrigger render={<Button variant="ghost" className="group/diff" />}><ChevronRight className="transition-transform group-data-panel-open/diff:rotate-90" />Show diff</CollapsibleTrigger><CollapsibleContent>{open && <ConflictDiff entry={entry} displaced={displaced} />}</CollapsibleContent></Collapsible>
       {!entry.adoptable && <p className="text-xs text-muted-foreground">This Harness combines Rules in one file. Move its edits into the Draft by hand before Overwrite.</p>}
@@ -72,7 +73,7 @@ export function Conflicts({ revision, changed, reviewDraft }: { revision: number
   const displaced = useResource(api.recovered, revision);
   return <>
     <InDraft name={adopted} reviewDraft={reviewDraft} />
-    <Section title="Harness Conflicts" description="Adopt copies a Harness edit into the Draft. Overwrite replaces it with the Draft.">
+    <Section title="Harness conflicts" description="Adopt copies a Harness edit into the Draft. Overwrite replaces it with the Draft.">
       <ErrorNotice error={conflicts.error} />{conflicts.loading && !conflicts.data && <Loading rows={2} />}
       {conflicts.data?.length === 0 && <Nothing title="No Conflicts">Every Harness matches this Machine's Draft.</Nothing>}
       {conflicts.data?.map((entry, i) => <Conflict key={`${entry.harness}/${entry.name}/${i}`} entry={entry} expanded={(conflicts.data?.length ?? 0) + (displaced.data?.length ?? 0) === 1} displaced={false} changed={changed} adopted={setAdopted} />)}
@@ -89,19 +90,21 @@ export function Imports({ revision, changed, reviewDraft, openAdd = false }: { r
   const [updated, setUpdated] = useState<string>();
   const rows = data?.imports ?? data?.updates.map(update => ({ ...update, path: '' })) ?? [];
   return <>
-    <div className="flex flex-wrap items-center gap-3 rounded-xl border border-border bg-muted/40 px-4 py-3"><h2 className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">Imports</h2>{data && <p className="text-xs text-muted-foreground">Last checked {ago(data.checked_at)}</p>}
+    <div className="flex flex-wrap items-center gap-3 rounded-xl border border-border bg-muted/40 px-4 py-3"><h2 className="sr-only">Imports</h2>{data && <p className="text-xs text-muted-foreground">Last checked {ago(data.checked_at)}</p>}
       <Action className="h-8" label="Check now" action={async () => setData(await api.checkImports())} />
       <div className="ml-auto"><AddImport initiallyOpen={openAdd} changed={changed} reviewDraft={reviewDraft} /></div></div>
     <InDraft name={updated} reviewDraft={reviewDraft} />
     <ErrorNotice error={error} />{loading && !data && <Loading rows={2} />}
     {data && (!rows.length ? <Nothing title="No Imports yet">Add an Import to bring Skills from a git source into the Draft.</Nothing> : <div className="overflow-hidden rounded-xl border border-border bg-card"><Table aria-label="Imports">
-      <TableHeader><TableRow>{['Name', 'Source', 'Ref', 'Path', 'Locked commit', 'Status', 'Actions'].map(label => <TableHead key={label}>{label}</TableHead>)}</TableRow></TableHeader>
+      <TableHeader><TableRow>{['Name', 'Source', 'Ref', 'Path', 'Locked commit', 'Status'].map(label => <TableHead key={label}>{label}</TableHead>)}<TableHead className="text-right">Actions</TableHead></TableRow></TableHeader>
       <TableBody>{rows.map(entry => {
         const update = data.updates.find(u => u.name === entry.name), failure = data.errors.find(e => e.name === entry.name);
-        return <TableRow className="h-14" key={entry.name}><TableCell className="font-medium">{entry.name}</TableCell><TableCell className="max-w-64 break-all whitespace-normal">{entry.source}</TableCell><TableCell>{entry.ref}</TableCell><TableCell className={entry.path ? 'font-mono text-xs' : 'text-muted-foreground'}>{entry.path || '—'}</TableCell><TableCell><code className={entry.locked ? 'font-mono text-xs' : 'text-muted-foreground'} title={entry.locked ?? undefined}>{shortSha(entry.locked)}</code></TableCell>
-          <TableCell>{failure ? <span title={failure.message}>Check failed: {failure.message}</span> : update ? `Update available ${shortSha(update.locked)}→${shortSha(update.upstream)}` : 'Up to date'}</TableCell>
-          <TableCell><div className="flex gap-2 [&_button]:h-8">{update && <Action label="Update into Draft" ariaLabel={`Update ${entry.name} into Draft`} action={() => api.updateImport(entry.name)} toastOnDone={`${entry.name} updated into Draft`} onDone={() => { setUpdated(entry.name); changed(); }} />}
-            <Confirm label="Remove" ariaLabel={`Remove ${entry.name}`} title={`Remove ${entry.name}?`} description="Remove this Import into the Draft. Review and Commit the removal to update the Baseline."
+        return <TableRow className="h-14" key={entry.name}><TableCell className="font-medium">{entry.name}</TableCell><TableCell className="max-w-40 truncate" title={entry.source}>{entry.source}</TableCell><TableCell>{entry.ref}</TableCell><TableCell className={entry.path ? 'font-mono text-xs' : 'text-muted-foreground'}>{entry.path || '—'}</TableCell><TableCell><code className={entry.locked ? 'font-mono text-xs' : 'text-muted-foreground'} title={entry.locked ?? undefined}>{shortSha(entry.locked)}</code></TableCell>
+          <TableCell className="whitespace-normal">{failure ? <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1"><Badge variant="destructive">Check failed</Badge><span className="max-w-48 truncate text-xs text-muted-foreground" title={failure.message}>{failure.message}</span></div>
+            : update ? <div className="flex flex-wrap items-center gap-x-2 gap-y-1"><Badge variant="info">Update available</Badge><code className="font-mono text-xs text-muted-foreground">{shortSha(update.locked)} → {shortSha(update.upstream)}</code></div>
+            : <span className="text-muted-foreground">Up to date</span>}</TableCell>
+          <TableCell><div className="flex justify-end gap-2 [&_button]:h-8">{update && <Action label="Update into Draft" ariaLabel={`Update ${entry.name} into Draft`} action={() => api.updateImport(entry.name)} toastOnDone={`${entry.name} updated into Draft`} onDone={() => { setUpdated(entry.name); changed(); }} />}
+            <Confirm label="Remove" triggerVariant="outline" ariaLabel={`Remove ${entry.name}`} title={`Remove ${entry.name}?`} description="Remove this Import into the Draft. Review and Commit the removal to update the Baseline."
               action={() => api.removeImport(entry.name)} onDone={() => { setUpdated(`${entry.name} removal`); setData(previous => previous && { ...previous, imports: rows.filter(row => row.name !== entry.name), updates: previous.updates.filter(row => row.name !== entry.name), errors: previous.errors.filter(row => row.name !== entry.name) }); toast({ title: `${entry.name} removal is in the Draft` }); changed(); }} /></div></TableCell></TableRow>;
       })}</TableBody></Table></div>)}
   </>;
@@ -125,26 +128,27 @@ export function Log({ revision, changed }: { revision: number; changed: () => vo
     }
   }, [data]);
   return <>
-    <ErrorNotice error={error} />{loading && !data && <Loading />}
-    <div className="flex flex-wrap items-center gap-2 rounded-xl border border-border bg-muted/40 px-4 py-3"><h2 className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">Log</h2><Input className="min-w-36 flex-1 basis-36" aria-label="Search items" placeholder="Search items…" value={item} onChange={e => setItem(e.target.value)} />{(['machine', 'harness', 'author'] as const).map(key => <NativeSelect key={key} aria-label={`Filter by ${key}`} value={{ machine, harness, author }[key]} onChange={e => ({ machine: setMachine, harness: setHarness, author: setAuthor }[key])(e.target.value)}>
-      <NativeSelectOption value="">All {key === 'machine' ? 'Machines' : key === 'harness' ? 'Harnesses' : 'authors'}</NativeSelectOption>{[...new Set(data?.map(entry => entry[key]) ?? [])].sort().map(value => <NativeSelectOption key={value} value={value}>{value}</NativeSelectOption>)}</NativeSelect>)}
+    <ErrorNotice error={error} />
+    <div className="flex flex-wrap items-center gap-2 rounded-xl border border-border bg-muted/40 px-4 py-3"><h2 className="sr-only">Log</h2><Input className="min-w-36 flex-1 basis-36" aria-label="Search items" placeholder="Search items…" value={item} onChange={e => setItem(e.target.value)} />{(['machine', 'harness', 'author'] as const).map(key => <NativeSelect key={key} aria-label={`Filter by ${key}`} value={{ machine, harness, author }[key]} onChange={e => ({ machine: setMachine, harness: setHarness, author: setAuthor }[key])(e.target.value)}>
+      <NativeSelectOption value="">All {key === 'machine' ? 'Machines' : key === 'harness' ? 'Harnesses' : 'Authors'}</NativeSelectOption>{[...new Set(data?.map(entry => entry[key]) ?? [])].sort().map(value => <NativeSelectOption key={value} value={value}>{value}</NativeSelectOption>)}</NativeSelect>)}
       </div>
+    {loading && !data && <Loading />}
     <div ref={log} tabIndex={-1} role={!data?.length ? 'region' : undefined} aria-label={!data?.length ? 'Assignment log' : undefined} className="outline-none">{data?.length === 0 ? <Nothing title="No log entries">No Assignment log entries on this page.</Nothing> : data && <div className="overflow-hidden rounded-xl border border-border bg-card"><Table aria-label="Assignment log">
       <TableHeader><TableRow className="bg-muted/50 hover:bg-muted/50">{['Time', 'Assignment', 'Change', 'Cause', 'Author'].map(label =>
         <TableHead key={label}>{label}</TableHead>)}<TableHead><span className="sr-only">Actions</span></TableHead></TableRow></TableHeader>
       <TableBody>{data.filter(entry => (!machine || entry.machine === machine) && (!harness || entry.harness === harness) && (!author || entry.author === author) && `${entry.kind}:${entry.name ?? ''}`.toLowerCase().includes(item.toLowerCase())).map(entry => <TableRow className="group" key={entry.id}>
         <TableCell className="text-muted-foreground"><When seconds={entry.at} /></TableCell>
-        <TableCell><code className="font-mono text-xs">{entry.machine} / {entry.harness}</code>
-          <p className="text-xs font-medium">{entry.name === null ? entry.kind.replaceAll('_', ' ') : `${entry.kind}:${entry.name}`}</p></TableCell>
+        <TableCell><code className="font-mono text-xs text-muted-foreground">{entry.machine} / {entry.harness}</code>
+          <p className="mt-0.5 flex items-center gap-2 text-sm font-medium">{entry.name === null ? <span className="first-letter:uppercase">{entry.kind.replaceAll('_', ' ')}</span> : <><span>{entry.name}</span><KindBadge kind={entry.kind} /></>}</p></TableCell>
         <TableCell className="whitespace-nowrap">{toggleLabel(entry.before)} <span className="text-muted-foreground">→</span> {toggleLabel(entry.after)}</TableCell>
-        <TableCell>{entry.cause.type !== 'change' && <Badge variant="secondary">{entry.cause.type.replaceAll('_', ' ')}{'entry' in entry.cause ? ` #${entry.cause.entry}` : ''}</Badge>}</TableCell>
+        <TableCell>{entry.cause.type === 'change' ? <span className="text-muted-foreground">—</span> : <Badge variant="secondary">{entry.cause.type.replaceAll('_', ' ')}{'entry' in entry.cause ? ` #${entry.cause.entry}` : ''}</Badge>}</TableCell>
         <TableCell className="text-muted-foreground">{entry.author}</TableCell>
-        <TableCell data-log-id={entry.id} className="[@media(hover:hover)]:opacity-0 group-hover:opacity-100 focus-within:opacity-100 w-24 min-w-24 max-w-24 whitespace-normal xl:w-36 xl:min-w-36 xl:max-w-36">{removed(entry.machine) ? <span className="text-xs text-muted-foreground" title="This Machine was removed. Join it again to restore its Assignment.">Machine removed</span> : <Action announceDone={false} className="h-8 w-full whitespace-normal xl:whitespace-nowrap" label={`Restore ${toggleLabel(entry.before)}`} doneLabel="Restored" variant="ghost"
+        <TableCell data-log-id={entry.id} className="[@media(hover:hover)]:opacity-50 group-hover:opacity-100 focus-within:opacity-100 w-24 min-w-24 max-w-24 whitespace-normal xl:w-36 xl:min-w-36 xl:max-w-36">{removed(entry.machine) ? <span className="text-xs text-muted-foreground" title="This Machine was removed. Join it again to restore its Assignment.">Machine removed</span> : <Action announceDone={false} className="h-8 w-full whitespace-normal xl:whitespace-nowrap" label={`Restore ${toggleLabel(entry.before)}`} doneLabel="Restored" variant="ghost"
           ariaLabel={`Restore ${toggleLabel(entry.before)} for log entry ${entry.id}: ${entry.name === null ? entry.kind.replaceAll('_', ' ') : `${entry.kind}:${entry.name}`} on ${entry.machine} / ${entry.harness}`} action={() => { restoreFocus.current = !!log.current?.contains(document.activeElement); return api.undo(entry.id); }} onDone={() => {
             toast({ title: `Restored Assignment ${entry.name === null ? entry.kind.replaceAll('_', ' ') : `${entry.kind}:${entry.name}`} on ${entry.machine} / ${entry.harness} to ${toggleLabel(entry.before)}.` }); changed();
           }} />}</TableCell>
       </TableRow>)}</TableBody></Table></div>}</div>
-    <div className="flex items-center justify-end gap-2">
+    {(before !== undefined || pages.length > 0 || (data?.length ?? 0) >= 50) && <div className="flex items-center justify-end gap-2">
       {before !== undefined && <Button variant="ghost" size="default" onClick={() => { setBefore(undefined); setPages([]); }}>Latest</Button>}
       <Button variant="outline" size="default" disabled={!pages.length || loading} onClick={() => {
         setBefore(pages.at(-1)); setPages(p => p.slice(0, -1));
@@ -152,6 +156,6 @@ export function Log({ revision, changed }: { revision: number; changed: () => vo
       <Button variant="outline" size="default" disabled={!data?.length || data.length < 50 || loading} onClick={() => {
         setPages(p => [...p, before]); setBefore(data?.at(-1)?.id);
       }}>Older<ChevronRight data-icon="inline-end" /></Button>
-    </div>
+    </div>}
   </>;
 }

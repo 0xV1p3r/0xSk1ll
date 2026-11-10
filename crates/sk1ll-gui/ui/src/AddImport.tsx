@@ -1,5 +1,6 @@
 import { toast } from './toast';
 import { useEffect, useRef, useState } from 'react';
+import { ChevronRight } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
@@ -84,8 +85,8 @@ function AddImportForm({ busy, changed, reviewDraft, finalFocus }: {
   return <DialogContent finalFocus={finalFocus} showCloseButton={!pending}>
     <DialogHeader><DialogTitle>Add Import</DialogTitle><DialogDescription>Resolve a link, then add Skills into this Machine's Draft.</DialogDescription></DialogHeader>
     {!resolved && <FieldGroup><Field><FieldLabel htmlFor="import-link">Link</FieldLabel>
-      <Input ref={linkInput} id="import-link" value={link} disabled={pending} onChange={e => setLink(e.target.value)} /></Field>
-      <Collapsible><CollapsibleTrigger render={<Button variant="ghost" disabled={pending} />}>Advanced</CollapsibleTrigger>
+      <Input ref={linkInput} id="import-link" placeholder="https://github.com/owner/repo" value={link} disabled={pending} onChange={e => setLink(e.target.value)} /></Field>
+      <Collapsible><CollapsibleTrigger render={<Button variant="ghost" className="group/advanced -ml-2.5" disabled={pending} />}><ChevronRight className="transition-transform group-data-panel-open/advanced:rotate-90" />Advanced</CollapsibleTrigger>
         <CollapsibleContent><Field><FieldLabel htmlFor="import-path">Path (subdirectory for other git URLs)</FieldLabel>
           <Input id="import-path" value={path} disabled={pending} onChange={e => setPath(e.target.value)} /></Field></CollapsibleContent></Collapsible>
       <Button disabled={pending || !link.trim()} onClick={resolve}>{pending ? 'Resolving…' : 'Resolve'}</Button></FieldGroup>}
@@ -99,10 +100,10 @@ function AddImportForm({ busy, changed, reviewDraft, finalFocus }: {
             onChange={e => setNames(n => n.map((v, j) => j === i ? e.target.value : v))} />
           {problems[i] && <FieldError id={`import-name-error-${i}`}>{problems[i]}</FieldError>}</>}
       </Field>)}</FieldGroup></>}
-    <div ref={errorSummary} tabIndex={-1} className="outline-none"><ErrorNotice error={error || undefined} /></div>
-    <div>{results.map(result => <p key={result}>{result}</p>)}</div>
+    <div ref={errorSummary} tabIndex={-1} className="outline-none empty:hidden"><ErrorNotice error={error || undefined} /></div>
+    {results.length > 0 && <div>{results.map(result => <p key={result}>{result}</p>)}</div>}
     <p role="status" aria-live="polite" aria-atomic="true" className="sr-only">{announcement}</p>
-    <DialogFooter>{resolved && !finished && <Button variant="outline" disabled={pending} onClick={() => { setResolved(undefined); setTaken([]); setNames([]); setSelected([]); setError(''); setResults([]); setAnnouncement(''); }}>Change source</Button>}{finished ? <Button ref={reviewButton} onClick={reviewDraft}>Review in Draft</Button>
-      : resolved && <Button disabled={pending || !selected.some(Boolean) || problems.some((p, i) => selected[i] && !!p)} onClick={add}>{pending ? 'Adding…' : 'Add into Draft'}</Button>}</DialogFooter>
+    {(resolved || finished) && <DialogFooter>{resolved && !finished && <Button variant="outline" disabled={pending} onClick={() => { setResolved(undefined); setTaken([]); setNames([]); setSelected([]); setError(''); setResults([]); setAnnouncement(''); }}>Change source</Button>}{finished ? <Button ref={reviewButton} onClick={reviewDraft}>Review in Draft</Button>
+      : resolved && <Button disabled={pending || !selected.some(Boolean) || problems.some((p, i) => selected[i] && !!p)} onClick={add}>{pending ? 'Adding…' : 'Add into Draft'}</Button>}</DialogFooter>}
   </DialogContent>;
 }

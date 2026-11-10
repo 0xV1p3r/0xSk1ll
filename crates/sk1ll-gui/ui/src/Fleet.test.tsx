@@ -98,7 +98,7 @@ it('preserves Machine details, local actions, timestamps, and removal confirmati
   fireEvent.click(button); expect(button.getAttribute('aria-expanded')).toBe('true');
   const details = within(document.getElementById(button.getAttribute('aria-controls')!)!);
   expect(details.getByText('skill:draft')).toBeTruthy(); expect(details.getByText('skill:release')).toBeTruthy(); expect(details.getByText('skill:clash')).toBeTruthy();
-  expect(details.getByText('skill:review in codex')).toBeTruthy(); expect(details.getByText(new Date(2000).toLocaleString())).toBeTruthy();
+  expect(details.getByText('skill:review in codex')).toBeTruthy(); expect(details.getByText(`(${new Date(2000).toLocaleString()})`)).toBeTruthy();
   fireEvent.click(details.getByRole('button', { name: 'Review Conflicts' })); expect(navigate).toHaveBeenLastCalledWith('Conflicts');
   fireEvent.click(details.getByRole('button', { name: 'Review Draft' })); expect(navigate).toHaveBeenLastCalledWith('Draft');
   fireEvent.click(details.getByRole('button', { name: 'Pull Baseline' })); await waitFor(() => expect(changed).toHaveBeenCalledOnce());
@@ -279,7 +279,7 @@ it('keeps a toggled row in place even when it drops below the six-row ranking', 
   vi.mocked(api.assignment).mockClear().mockResolvedValueOnce(diverging).mockResolvedValue(matching); vi.mocked(api.setAssignment).mockResolvedValue({ ...matching, entries: [] });
   renderFleet();
   const panel = within(await screen.findByRole('table', { name: 'This Machine assignments' }));
-  expect(panel.getAllByRole('row').slice(1).map(row => row.textContent)).toEqual(['z-taskskill', 'askill', 'bskill', 'cskill', 'dskill', 'eskill']);
+  expect(panel.getAllByRole('row').slice(1).map(row => row.textContent)).toEqual(['z-taskSkill', 'aSkill', 'bSkill', 'cSkill', 'dSkill', 'eSkill']);
   const cell = panel.getByRole('checkbox', { name: 'skill:z-task in local / codex, explicit' }); cell.focus(); fireEvent.click(cell);
   await waitFor(() => expect(api.assignment).toHaveBeenCalledTimes(2));
   expect(panel.getByRole('checkbox', { name: 'skill:z-task in local / codex, explicit' }).getAttribute('aria-checked')).toBe('true');
