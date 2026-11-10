@@ -8,7 +8,7 @@ import { App, AppSidebar } from './App';
 import { CommandPalette } from './CommandPalette';
 import { api } from './api';
 import type { FleetView, MachineReport, MachineRow, StatusView } from './types';
-vi.mock('./api', () => ({ api: { fleet: vi.fn(), status: vi.fn(), skills: vi.fn(), connectionInfo: vi.fn(), joinCode: vi.fn(), pull: vi.fn(), removeMachine: vi.fn(), conflicts: vi.fn().mockResolvedValue([]), recovered: vi.fn().mockResolvedValue([]) }, errorMessage: String }));
+vi.mock('./api', () => ({ api: { items: vi.fn().mockResolvedValue([]), assignment: vi.fn().mockResolvedValue({ assignment: { harnesses: {} }, revision: 0 }), setAssignment: vi.fn(), push: vi.fn(), fleet: vi.fn(), status: vi.fn(), skills: vi.fn(), connectionInfo: vi.fn(), joinCode: vi.fn(), pull: vi.fn(), removeMachine: vi.fn(), conflicts: vi.fn().mockResolvedValue([]), recovered: vi.fn().mockResolvedValue([]) }, errorMessage: String }));
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn().mockResolvedValue(() => {}) }));
 beforeEach(() => vi.stubGlobal('matchMedia', vi.fn(() => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }))));
 afterEach(() => { cleanup(); localStorage.clear(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
@@ -65,21 +65,21 @@ it('queues only this Machine’s work and navigates without changing state', asy
   ] });
   const navigate = vi.fn(); renderFleet({ navigate });
   const next = within(await screen.findByRole('region', { name: 'Up next' }));
-  expect(next.getAllByRole('listitem')).toHaveLength(2);
-  expect(next.getByText('review in codex')).toBeTruthy(); expect(next.getByText('2 Draft items, 1 unpushed item')).toBeTruthy();
+  expect(next.getAllByRole('listitem')).toHaveLength(3);
+  expect(next.getByText('review in codex')).toBeTruthy(); expect(next.getByText('2 Draft items')).toBeTruthy();
   expect(next.queryByText(/remote/)).toBeNull();
   fireEvent.click(next.getByRole('button', { name: 'Resolve conflict' })); expect(navigate).toHaveBeenLastCalledWith('Conflicts');
   fireEvent.click(next.getByRole('button', { name: 'Review Draft' })); expect(navigate).toHaveBeenLastCalledWith('Draft');
   expect(api.pull).not.toHaveBeenCalled(); expect(api.removeMachine).not.toHaveBeenCalled();
-  fireEvent.click(screen.getByRole('button', { name: 'Filter: Connected' })); expect(next.getAllByRole('listitem')).toHaveLength(2);
+  fireEvent.click(screen.getByRole('button', { name: 'Filter: Connected' })); expect(next.getAllByRole('listitem')).toHaveLength(3);
 });
 it.each(['drafts', 'unpushed'] as const)('offers Review Draft when only %s are reported', async kind => {
   vi.mocked(api.fleet).mockResolvedValue({ baseline: null, machines: [machineRow({ report: machineReport({ [kind]: ['skill:one'] }) })] });
   const navigate = vi.fn(); renderFleet({ navigate });
   const next = within(await screen.findByRole('region', { name: 'Up next' }));
   expect(next.getAllByRole('listitem')).toHaveLength(1);
-  expect(next.getByText(kind === 'drafts' ? '1 Draft item' : '1 unpushed item')).toBeTruthy();
-  fireEvent.click(next.getByRole('button', { name: 'Review Draft' })); expect(navigate).toHaveBeenCalledWith('Draft');
+  expect(next.getByText(kind === 'drafts' ? '1 Draft item' : 'Push 1 unpushed item')).toBeTruthy();
+  if (kind === 'drafts') { fireEvent.click(next.getByRole('button', { name: 'Review Draft' })); expect(navigate).toHaveBeenCalledWith('Draft'); } else expect(next.getByRole('button', { name: 'Push' })).toBeTruthy();
 });
 it.each(['empty report', 'missing report', 'missing Machine'])('shows All caught up for %s and ignores remote work', async kind => {
   vi.mocked(api.fleet).mockResolvedValue({ baseline: null, machines: [
@@ -232,4 +232,68 @@ it('omits the attention banner when there are no conflicts', async () => {
   expect(screen.queryByRole('button', { name: 'Resolve' })).toBeNull();
   fireEvent.click(screen.getByRole('button', { name: 'Open command palette' }));
   expect(await screen.findByRole('combobox')).toBeTruthy();
+});
+
+it.each([true, false])('push handles pushed=%s', async pushed => {
+  vi.mocked(api.fleet).mockResolvedValue({ baseline: null, machines: [] });
+  vi.mocked(api.push).mockResolvedValue({ pushed });
+  const changed = vi.fn(); renderFleet({ changed, localReport: machineReport({ unpushed: ['skill:release'] }) });
+  fireEvent.click(await screen.findByRole('button', { name: 'Push' }));
+  if (pushed) await waitFor(() => expect(changed).toHaveBeenCalledOnce());
+  else { expect(await screen.findByText('Error: Push did not reach the Server.')).toBeTruthy(); expect(changed).not.toHaveBeenCalled(); }
+});
+it('counts queue entries, adopts in Library, and hides Push without unpushed items', async () => {
+  const navigate = vi.fn(); renderFleet({ navigate, unmanaged: [{ name: 'notes' }], localReport: machineReport({ drafts: ['skill:a'] }) });
+  const next = within(await screen.findByRole('region', { name: 'Up next' }));
+  expect(next.getAllByRole('listitem')).toHaveLength(2); expect(next.getByText('2')).toBeTruthy(); expect(next.queryByRole('button', { name: 'Push' })).toBeNull();
+  expect(next.getByText('1 unmanaged skill · notes')).toBeTruthy(); fireEvent.click(next.getByRole('button', { name: 'Adopt unmanaged skills' })); expect(navigate).toHaveBeenCalledWith('Library');
+});
+it('renders local assignments, toggles a cell and opens the matrix', async () => {
+  vi.mocked(api.items).mockResolvedValue([{ item: 'skill:review', in_baseline: true, draft: null, unpushed: false, description: null }]);
+  const snapshot = { assignment: { harnesses: { codex: { new_skills_default: true, new_rules_default: true, skills: {}, rules: {} } } }, revision: 1 };
+  const updated = { assignment: { harnesses: { codex: { new_skills_default: true, new_rules_default: true, skills: { review: false }, rules: {} } } }, revision: 2 };
+  vi.mocked(api.assignment).mockClear().mockResolvedValueOnce(snapshot).mockResolvedValue(updated); vi.mocked(api.setAssignment).mockResolvedValue({ ...updated, entries: [] });
+  const navigate = vi.fn(); renderFleet({ navigate });
+  const cell = await screen.findByRole('checkbox', { name: 'skill:review in local / codex, inherited' });
+  expect(cell.getAttribute('aria-checked')).toBe('true'); fireEvent.click(cell);
+  expect(screen.getByRole('checkbox', { name: 'skill:review in local / codex, explicit' }).getAttribute('aria-checked')).toBe('false');
+  await waitFor(() => expect(api.setAssignment).toHaveBeenCalledWith('local', { changes: [{ harness: 'codex', kind: 'skill', name: 'review', enabled: false }] }));
+  await waitFor(() => expect(api.assignment).toHaveBeenCalledTimes(2));
+  expect(screen.getByRole('checkbox', { name: 'skill:review in local / codex, explicit' }).getAttribute('aria-checked')).toBe('false');
+  fireEvent.click(screen.getByRole('button', { name: 'Open matrix' })); expect(navigate).toHaveBeenCalledWith('Assignment matrix');
+});
+
+const harness = (skills: Record<string, boolean> = {}) => ({ assignment: { harnesses: { codex: { new_skills_default: true, new_rules_default: true, skills, rules: {} } } }, revision: 1 });
+const item = (name: string) => ({ item: `skill:${name}`, in_baseline: true, draft: null, unpushed: false, description: null });
+it('rolls a failed local assignment toggle back and shows the error', async () => {
+  vi.mocked(api.items).mockResolvedValue([item('review')]); vi.mocked(api.assignment).mockResolvedValue(harness());
+  vi.mocked(api.setAssignment).mockRejectedValue(new Error('Server refused'));
+  renderFleet(); fireEvent.click(await screen.findByRole('checkbox', { name: 'skill:review in local / codex, inherited' }));
+  expect(await screen.findByText('Error: Server refused')).toBeTruthy();
+  expect(screen.getByRole('checkbox', { name: 'skill:review in local / codex, inherited' }).getAttribute('aria-checked')).toBe('true');
+});
+it('keeps a toggled row in place even when it drops below the six-row ranking', async () => {
+  vi.mocked(api.items).mockResolvedValue(['a', 'b', 'c', 'd', 'e', 'f', 'z-task'].map(item));
+  const diverging = harness({ a: true, b: true, c: true, d: true, e: true, f: true, 'z-task': false });
+  const matching = { ...harness({ a: true, b: true, c: true, d: true, e: true, f: true, 'z-task': true }), revision: 2 };
+  vi.mocked(api.assignment).mockClear().mockResolvedValueOnce(diverging).mockResolvedValue(matching); vi.mocked(api.setAssignment).mockResolvedValue({ ...matching, entries: [] });
+  renderFleet();
+  const panel = within(await screen.findByRole('table', { name: 'This Machine assignments' }));
+  expect(panel.getAllByRole('row').slice(1).map(row => row.textContent)).toEqual(['z-taskskill', 'askill', 'bskill', 'cskill', 'dskill', 'eskill']);
+  const cell = panel.getByRole('checkbox', { name: 'skill:z-task in local / codex, explicit' }); cell.focus(); fireEvent.click(cell);
+  await waitFor(() => expect(api.assignment).toHaveBeenCalledTimes(2));
+  expect(panel.getByRole('checkbox', { name: 'skill:z-task in local / codex, explicit' }).getAttribute('aria-checked')).toBe('true');
+  expect(document.activeElement).toBe(panel.getByRole('checkbox', { name: 'skill:z-task in local / codex, explicit' }));
+});
+it('reloads the assignments panel when the machine identity changes', async () => {
+  vi.mocked(api.items).mockResolvedValue([item('review')]); vi.mocked(api.assignment).mockResolvedValue(harness());
+  const view = renderFleet(); await screen.findByRole('checkbox', { name: 'skill:review in local / codex, inherited' });
+  view.rerender(<TooltipProvider><Fleet revision={0} machineId="other" navigate={vi.fn()} changed={vi.fn()} live /></TooltipProvider>);
+  expect(await screen.findByRole('checkbox', { name: 'skill:review in other / codex, inherited' })).toBeTruthy();
+});
+it('does not claim the queue is empty while unmanaged-skill discovery fails or loads', async () => {
+  const view = renderFleet({ discovery: { loading: false, error: 'boom' } });
+  expect(await screen.findByText('Skill discovery failed')).toBeTruthy(); expect(screen.queryByText('All caught up')).toBeNull();
+  view.rerender(<TooltipProvider><Fleet revision={0} machineId="local" navigate={vi.fn()} changed={vi.fn()} live discovery={{ loading: true, error: '' }} /></TooltipProvider>);
+  expect(screen.getByText('Checking for unmanaged skills…')).toBeTruthy();
 });

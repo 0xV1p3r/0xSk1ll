@@ -8,14 +8,13 @@ import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuGro
 import { Checkbox } from '@/components/ui/checkbox';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
-import { api, errorMessage } from './api';
-import { applyToggle, cellState, emptyHarness, itemStateLabel, mergeAssignments, splitItem } from './model';
+import { api } from './api';
+import { cellState, emptyHarness, itemStateLabel, mergeAssignments, splitItem } from './model';
+import { matrixCheckbox, useAssignmentWrites } from './assignments';
 import { useResource } from './hooks';
 import { cn } from '@/lib/utils';
 import { ErrorNotice, Loading, Nothing, Pending } from './shared';
 import type { CachedAssignmentSnapshot as AssignmentSnapshot, ItemView, StatusView, ToggleChange } from './types';
-
-const matrixCheckbox = (explicit: boolean, enabled: boolean) => cn('size-[22px] rounded-[6px]', !enabled && 'border-dashed', !explicit && 'border-dashed border-primary/35 bg-brand-soft data-checked:border-primary/35 data-checked:bg-brand-soft data-checked:text-brand-ink', !explicit && !enabled && 'bg-muted/60 border-control-border/50');
 
 const loadMatrix = async () => {
   const [fleet, items] = await Promise.all([api.fleet(), api.items()]);
@@ -47,18 +46,8 @@ export function Matrix({ revision, status, target }: { revision: number; status:
   const destination = useRef<HTMLButtonElement>(null);
   const visited = useRef<typeof target>(undefined);
   const [highlighted, setHighlighted] = useState(false);
-  const locks = useRef(new Set<string>());
-  const [pending, setPending] = useState<Record<string, boolean>>({});
-  const [errors, setErrors] = useState<Record<string, string>>({});
   const resource = useResource(loadMatrix, revision, mergeMatrix);
-  // Keep optimistic state separate from refreshes arriving while a write is in flight.
-  const [overrides, setOverrides] = useState<Record<string, AssignmentSnapshot & { saving?: boolean }>>({});
-  useEffect(() => {
-    if (!resource.data) return;
-    const accepted = resource.data.assignments;
-    setOverrides(old => Object.fromEntries(Object.entries(old).filter(([machine, override]) =>
-      override.saving || !accepted[machine] || accepted[machine].revision < override.revision)));
-  }, [resource.data]);
+  const { pending, errors, write, assignment } = useAssignmentWrites(resource);
   useEffect(() => {
     if (!target || visited.current === target || !destination.current) return;
     visited.current = target;
@@ -71,30 +60,6 @@ export function Matrix({ revision, status, target }: { revision: number; status:
     const timer = setTimeout(() => setHighlighted(false), 2500);
     return () => clearTimeout(timer);
   }, [highlighted]);
-  const write = async (machine: string, changes: ToggleChange[]) => {
-    if (!changes.length || !resource.data || locks.current.has(machine)) return;
-    locks.current.add(machine);
-    setPending(p => ({ ...p, [machine]: true })); setErrors(e => ({ ...e, [machine]: '' }));
-    const before = overrides[machine] ?? resource.data.assignments[machine];
-    const clearOverride = () => setOverrides(old => { const next = { ...old }; delete next[machine]; return next; });
-    if (changes.some(change => change.kind === 'skill' || change.kind === 'rule')) {
-      setOverrides(old => ({ ...old, [machine]: { ...before, assignment: changes.reduce(applyToggle, before.assignment), saving: true } }));
-    }
-    try {
-      const response = await api.setAssignment(machine, { changes });
-      // Accept each mutation directly, independently of superseded refresh generations.
-      resource.setData(previous => previous && { ...previous,
-        assignments: mergeAssignments(previous.assignments, { [machine]: response }),
-      });
-      setOverrides(old => ({ ...old, [machine]: response }));
-    } catch (error) {
-      clearOverride(); setErrors(old => ({ ...old, [machine]: errorMessage(error) }));
-    } finally {
-      locks.current.delete(machine); setPending(p => ({ ...p, [machine]: false }));
-      // useResource surfaces refresh failures while retaining accepted Assignment snapshots.
-      void resource.refresh();
-    }
-  };
   const data = resource.data;
   if (!data) return <><ErrorNotice error={resource.error} />{resource.loading && <Loading />}</>;
   const items = data.items.filter(i => ['skill', 'rule'].includes(splitItem(i.item).kind)
@@ -104,10 +69,6 @@ export function Matrix({ revision, status, target }: { revision: number; status:
     ...(machine.report?.harnesses ?? []), ...Object.keys(data.assignments[machine.id].assignment.harnesses),
   ])].sort() }));
   const columns = groups.flatMap(({ machine, harnesses }) => harnesses.map(harness => ({ machine: machine.id, harness })));
-  const assignment = (machine: string) => {
-    const override = overrides[machine], accepted = data.assignments[machine];
-    return override && (override.saving || override.revision > accepted.revision) ? override.assignment : accepted.assignment;
-  };
   const cell = (item: ItemView, machine: string, harness: string) => {
     const state = cellState(assignment(machine), harness, item.item);
     const defaults = assignment(machine).harnesses[harness] ?? emptyHarness();

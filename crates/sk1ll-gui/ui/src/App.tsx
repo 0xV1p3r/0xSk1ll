@@ -240,7 +240,7 @@ export function App() {
           <div><Button variant="outline" size="sm" className="mt-2" onClick={() => navigate('Settings')}>Rejoin in Settings</Button></div></Notice>}
         <ErrorNotice error={error} />
         {screen === 'Library' && <><ErrorNotice error={skills.error} />{skills.loading && !skills.data ? <Loading /> : <Skills initialSearch={skillsHandoff.search} connection={status.connection} entries={skills.data ?? []} revision={revision} changed={changed} reviewDraft={() => navigate('Draft')} assignment={(item, harness) => { navigate('Assignment matrix'); setMatrixTarget({ item, harness }); }} addImport={() => { navigate('Imports'); setOpenAdd(true); }} />}</>}
-        {screen === 'Fleet' && <Fleet revision={revision} machineId={status.machine_id} localReport={status.report} navigate={navigate} changed={changed} live={status.connection === 'connected'} />}
+        {screen === 'Fleet' && <Fleet revision={revision} machineId={status.machine_id} localReport={status.report} unmanaged={skills.data?.filter(entry => entry.type === 'unmanaged')} discovery={{ loading: !skills.data && skills.loading, error: skills.error }} navigate={navigate} changed={changed} live={status.connection === 'connected'} />}
         {screen === 'Assignment matrix' && <Matrix revision={revision} status={status} target={matrixTarget} />}
         {screen === 'Draft' && <Draft revision={revision} status={status} changed={changed} />}
         {screen === 'Conflicts' && <Conflicts revision={revision} changed={changed} reviewDraft={() => navigate('Draft')} />}
