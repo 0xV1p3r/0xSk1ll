@@ -27,7 +27,7 @@ export function JoinCodeButton({ label, variant = 'outline' }: { label: string; 
         <DialogDescription>Copy this code now. It cannot be shown again. On the new Machine, enter it under Settings → Join / rejoin this Machine,
           or run <code className="font-mono">sk1ll join</code>.</DialogDescription></DialogHeader>
         <code className="rounded-md border bg-muted px-3 py-2 font-mono text-base break-all select-all">{joinCode}</code>
-        <Action label="Copy code" doneLabel="Copied" action={() => navigator.clipboard.writeText(joinCode ?? '')} />
+        <Action className="h-8" label="Copy code" doneLabel="Copied" action={() => navigator.clipboard.writeText(joinCode ?? '')} />
       </DialogContent></Dialog>
   </div>;
 }
@@ -49,7 +49,7 @@ export function Settings({ status, socket, revision, changed }: {
   const join = useMutation(changed);
   const connection = status.connection.replaceAll('_', ' ');
   return <>
-    <Card><CardHeader><CardTitle>Harnesses on this Machine</CardTitle>
+    <Card className="pt-0"><CardHeader className="border-b border-border bg-muted/40 py-3"><CardTitle className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">Harnesses on this Machine</CardTitle>
       <CardDescription>Harnesses are configured in this Machine's <code className="font-mono">machine.toml</code>.</CardDescription></CardHeader>
       <CardContent className="flex flex-col gap-3"><ErrorNotice error={harnesses.error} />
         {harnesses.loading && !harnesses.data && <Loading rows={2} />}
@@ -63,7 +63,7 @@ export function Settings({ status, socket, revision, changed }: {
         </TableRow>)}</TableBody></Table></div>}
       </CardContent></Card>
 
-    <Card><CardHeader><CardTitle>Editor</CardTitle></CardHeader>
+    <Card className="pt-0"><CardHeader className="border-b border-border bg-muted/40 py-3"><CardTitle className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">Editor</CardTitle></CardHeader>
       <CardContent className="flex flex-col gap-3"><ErrorNotice error={editorData.error || saveEditor.error} />
         {editorData.loading && <Loading rows={1} />}
         {editorData.data && <Field><FieldLabel htmlFor="preferred-editor">Preferred editor</FieldLabel>
@@ -75,7 +75,7 @@ export function Settings({ status, socket, revision, changed }: {
         <Button variant="ghost" onClick={() => { setPreferred(undefined); setRefresh(value => value + 1); }}>Refresh</Button>
       </CardContent></Card>
 
-        <Card className="@container"><CardHeader><CardTitle>Daemon connection</CardTitle></CardHeader>
+        <Card className="@container pt-0"><CardHeader className="border-b border-border bg-muted/40 py-3"><CardTitle className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">Daemon connection</CardTitle></CardHeader>
           <CardContent><Details className="grid-cols-1 gap-y-1 [&_dd]:mb-3 @min-[28rem]:grid-cols-[minmax(0,10rem)_minmax(0,1fr)] @min-[28rem]:gap-y-2 @min-[28rem]:[&_dd]:mb-0" rows={[
             ['Socket', <code className="font-mono text-xs break-all">{socket}</code>],
             ['Machine', status.machine_id], ['Server', status.server_url], ['Server connection', <span className="capitalize">{connection}</span>],
@@ -83,10 +83,10 @@ export function Settings({ status, socket, revision, changed }: {
             ['Pending Restore reports', status.pending_discards],
             ['Auth rejected since', status.auth_rejected_since === null ? 'Never' : new Date(status.auth_rejected_since * 1000).toLocaleString()],
           ]} />{status.last_error && <div className="mt-3"><ErrorNotice error={status.last_error} /></div>}</CardContent></Card>
-    <Card><CardHeader><CardTitle>Join code</CardTitle>
+    <Card className="pt-0"><CardHeader className="border-b border-border bg-muted/40 py-3"><CardTitle className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">Join code</CardTitle>
       <CardDescription>Create a single-use code for another Machine. The code is shown once.</CardDescription></CardHeader>
       <CardContent><JoinCodeButton label="Create join code" /><p className="mt-3 text-sm text-muted-foreground">Remove Machines from the Fleet screen.</p></CardContent></Card>
-      <Card><CardHeader><CardTitle>Join / rejoin this Machine</CardTitle>
+      <Card className="pt-0"><CardHeader className="border-b border-border bg-muted/40 py-3"><CardTitle className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">Join / rejoin this Machine</CardTitle>
         <CardDescription>Join uses a single-use join code. Rejoin replaces this Machine's credentials and restarts its Daemon.</CardDescription></CardHeader>
         <CardContent><Collapsible key={String(alreadyJoined)} defaultOpen={!alreadyJoined}>
           {alreadyJoined && <><p className="mb-3 text-sm text-muted-foreground">This Machine is joined. Rejoin to replace its credentials.</p><CollapsibleTrigger render={<Button variant="outline" />}>Rejoin this Machine…</CollapsibleTrigger></>}

@@ -164,7 +164,7 @@ it('returns focus to Commit after Cancel and Escape and to its completion notice
 
 it('counts added and removed lines without headers and shows friendly names', async () => {
   diffs['skill:reviewed'] = '+++ b/file\n--- a/file\n+one\n+two\n-old'; mount();
-  expect(await screen.findByText('+2 / −1')).toBeTruthy(); expect(screen.getByText('reviewed')).toBeTruthy();
+  expect(await screen.findByLabelText('+2 / −1')).toBeTruthy(); expect(screen.getByText('reviewed')).toBeTruthy();
 });
 it('pushes unpushed items', async () => {
   vi.mocked(api.push).mockResolvedValue({ pushed: true });

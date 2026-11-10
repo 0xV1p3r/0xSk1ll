@@ -4,7 +4,7 @@
     "skipLibCheck": true, "moduleResolution": "bundler", "allowImportingTsExtensions": true,
     "resolveJsonModule": true, "isolatedModules": true, "noEmit": true, "jsx": "react-jsx",
     "strict": true, "noUnusedLocals": true, "noUnusedParameters": true,
-    "baseUrl": ".", "paths": { "@/*": ["./src/*"] }
+    "baseUrl": ".", "paths": { "@/*": ["./src/*"], "@branding/*": ["../../../assets/branding/*"] }
   },
   "include": ["src", "vite.config.ts"]
 }

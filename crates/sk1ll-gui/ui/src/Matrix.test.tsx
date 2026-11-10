@@ -218,3 +218,19 @@ it('resets row overrides optimistically and skips unavailable remote Draft items
   expect(screen.getByRole('checkbox', { name: 'skill:pdf in a / claude, inherited' }).className).toContain('border-dashed');
   await act(async () => { save.resolve(snapshot()); });
 });
+
+
+it('marks only explicit values that diverge from the Harness default and clears the marker on reset', async () => {
+  vi.mocked(api.assignment).mockImplementation(async machine => snapshot(machine === 'a'));
+  const save = deferred<AssignmentUpdate>();
+  vi.mocked(api.setAssignment).mockReturnValue(save.promise);
+  await mount();
+  expect(cell('a').closest('td')?.getAttribute('data-diverges')).toBe('true');
+  expect(cell('b').closest('td')?.hasAttribute('data-diverges')).toBe(false);
+  fireEvent.click(screen.getByRole('button', { name: 'Use default for skill:pdf in a / claude' }));
+  const inherited = screen.getByRole('checkbox', { name: 'skill:pdf in a / claude, inherited' });
+  expect(inherited.closest('td')?.hasAttribute('data-diverges')).toBe(false);
+  expect(inherited.getAttribute('aria-checked')).toBe('false');
+  expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: null }] });
+  await act(async () => { save.resolve(snapshot()); });
+});
