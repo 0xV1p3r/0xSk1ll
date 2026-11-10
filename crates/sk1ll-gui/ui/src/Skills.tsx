@@ -6,7 +6,6 @@ import { Input } from '@/components/ui/input';
 import { Field, FieldLabel } from '@/components/ui/field';
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
-import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuLabel, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
@@ -81,12 +80,12 @@ export function Skills({ entries, revision, changed, reviewDraft, assignment, ad
         </TableRow>;
       })}</TableBody>
     </Table></div> : <Nothing title={entries.length ? 'No matching Skills' : 'No Skills yet'} action={!entries.length && <div className="flex gap-2"><Button onClick={() => startCreate('skill')}>New Skill</Button><Button variant="outline" onClick={addImport}>Add Import</Button></div>}>{entries.length ? 'Choose another Type or name.' : 'Personal Skills, Imports, Rules, and Unmanaged skills will appear here.'}</Nothing>}
-    <Sheet open={!!entry} onOpenChange={open => { if (!open) setSelected(undefined); }}>
-      <SheetContent ref={sheet} initialFocus={sheet} className="overflow-y-auto outline-none data-[side=right]:w-full data-[side=right]:sm:max-w-3xl">
+    <Dialog open={!!entry} onOpenChange={open => { if (!open) setSelected(undefined); }}>
+      <DialogContent ref={sheet} initialFocus={sheet} className="flex h-[calc(100dvh-2rem)] flex-col gap-0 overflow-hidden p-0 sm:h-[calc(100dvh-4rem)] sm:max-w-[min(72rem,calc(100%-4rem))]">
         {entry && <SkillDetail key={`${entry.type === 'rule' ? 'rule' : 'skill'}:${entry.name}`} entry={entry} initialHarness={selected?.harness} connection={connection} revision={revision} changed={changed} reviewDraft={() => { setSelected(undefined); reviewDraft(); }}
           assignment={assignment} converted={next => setSelected({ key: keyFor(next), optimistic: { entry: next, inventory: entries } })} />}
-      </SheetContent>
-    </Sheet>
+      </DialogContent>
+    </Dialog>
   </div>;
 }
 
@@ -100,16 +99,18 @@ function SkillBrowser({ query, revision }: { query: () => ContentQuery; revision
   const [selectedPath, setSelectedPath] = useState('');
   const path = tree.data?.some(file => file.path === selectedPath && file.kind !== 'directory') ? selectedPath
     : tree.data?.find(file => file.path === 'SKILL.md')?.path ?? tree.data?.find(file => file.kind !== 'directory')?.path;
+  const multiple = (tree.data?.filter(file => file.kind !== 'directory').length ?? 0) > 1;
+  if (tree.loading) return <Loading rows={2} />;
+  if (!tree.data?.length) return <><ErrorNotice error={tree.error} />{!tree.error && <p className="text-sm text-muted-foreground">No files.</p>}</>;
   return <>
       <ErrorNotice error={tree.error} />
-      <div className="grid min-w-0 gap-4 md:grid-cols-[12rem_minmax(0,1fr)]">
-        <nav aria-label="Files" className="flex max-h-64 min-w-0 flex-col gap-1 overflow-auto md:max-h-none">
-          {tree.loading ? <Loading rows={2} /> : tree.data?.length ? tree.data.map(value => value.kind === 'directory'
+      <div className={multiple ? 'grid min-w-0 gap-4 md:grid-cols-[13rem_minmax(0,1fr)]' : 'min-w-0'}>
+        {multiple && <nav aria-label="Files" className="flex max-h-64 min-w-0 flex-col gap-1 overflow-auto md:sticky md:top-0 md:max-h-[calc(100dvh-16rem)] md:self-start">
+          {tree.data.map(value => value.kind === 'directory'
             ? <span key={value.path} title={value.path} className="flex h-8 items-center gap-1.5 text-sm text-muted-foreground" style={{ paddingLeft: 8 + (value.path.split('/').length - 1) * 12 }}><Folder className="size-4 shrink-0" /><span className="truncate">{value.path.split('/').pop()}</span></span>
             : <Button key={value.path} variant={path === value.path ? 'secondary' : 'ghost'} size="default" className="justify-start" aria-current={path === value.path ? 'page' : undefined}
-              style={{ paddingLeft: 8 + (value.path.split('/').length - 1) * 12 }} title={value.path} onClick={() => setSelectedPath(value.path)}><File data-icon="inline-start" /><span className="truncate">{value.path.split('/').pop()}</span></Button>)
-            : <p className="text-sm text-muted-foreground">No files.</p>}
-        </nav>
+              style={{ paddingLeft: 8 + (value.path.split('/').length - 1) * 12 }} title={value.path} onClick={() => setSelectedPath(value.path)}><File data-icon="inline-start" /><span className="truncate">{value.path.split('/').pop()}</span></Button>)}
+        </nav>}
         <div className="min-w-0">{path && <SkillFilePreview key={path} query={query} path={path} revision={revision} />}</div>
       </div>
   </>;
@@ -165,13 +166,14 @@ function SkillDetail({ entry, initialHarness, revision, changed, reviewDraft, co
   const disabledReason = needsServer ? 'Needs a connection to the Server' : entry.clashes_with_repo ? 'Name clashes with a repo Skill' : !editors.data ? '' : !preferred ? 'No editors found' : '';
   const edit = (editorId: string) => { if (needsConversion) setConfirmation({ editorId }); else execute(editorId); };
   return <>
-    <SheetHeader className="pr-12"><SheetTitle>{entry.name}</SheetTitle>
-      <SheetDescription>{choice?.description ?? entry.description ?? `${typeLabels[entry.type]} ${entry.type === 'rule' ? '' : 'Skill'}`}</SheetDescription>
-      <div className="mt-2 flex flex-wrap gap-2"><Badge variant="secondary">{typeLabels[entry.type]}</Badge>{entry.draft && <ChangeBadge change={entry.draft} />}
-        {entry.variants.length > 1 && <Badge variant="warning">Differs</Badge>}{entry.clashes_with_repo && <Badge variant="warning">Clashes with repo</Badge>}</div>
-    </SheetHeader>
-    <div className="flex min-w-0 flex-col gap-4 px-4 pb-6">
-      <div className="flex flex-wrap gap-2">
+    <div className="flex shrink-0 flex-wrap items-start justify-between gap-x-6 gap-y-3 border-b border-border px-5 py-4 pr-12">
+      <DialogHeader className="min-w-0 flex-1 gap-1.5"><DialogTitle className="text-lg">{entry.name}</DialogTitle>
+        <DialogDescription>{choice?.description ?? entry.description ?? `${typeLabels[entry.type]} ${entry.type === 'rule' ? '' : 'Skill'}`}</DialogDescription>
+        <div className="mt-1 flex flex-wrap items-center gap-2 text-xs"><Badge variant="secondary">{typeLabels[entry.type]}</Badge>{entry.draft && <ChangeBadge change={entry.draft} />}
+          {entry.variants.length > 1 && <Badge variant="warning">Differs</Badge>}{entry.clashes_with_repo && <Badge variant="warning">Clashes with repo</Badge>}
+          {entry.type !== 'unmanaged' && <><span className="text-muted-foreground">Harnesses: {entry.enabled_harnesses.join(', ') || 'None'}</span><Button variant="link" size="default" className="h-auto p-0 text-xs" onClick={() => assignment(item, entry.enabled_harnesses[0] ?? '')}>Edit in Assignment matrix</Button></>}</div>
+      </DialogHeader>
+      <div className="flex flex-col items-end gap-1.5"><div className="flex flex-wrap justify-end gap-2">
         {entry.draft && <Button ref={reviewButton} variant="outline" size="default" onClick={reviewDraft}>Review in Draft</Button>}
         {entry.draft !== 'deleted' && <>
           <ServerRequired needed={needsServer}><div className="flex" role="group" aria-label="Edit Skill">
@@ -188,11 +190,11 @@ function SkillDetail({ entry, initialHarness, revision, changed, reviewDraft, co
               })}<DropdownMenuGroup><DropdownMenuItem onClick={() => void editors.refresh()}>Refresh editors</DropdownMenuItem></DropdownMenuGroup></DropdownMenuContent>
             </DropdownMenu>
           </div></ServerRequired>
-
         </>}
       </div>
-      {disabledReason && entry.draft !== 'deleted' && <p className="text-xs text-muted-foreground">{disabledReason}</p>}
-      {entry.type !== 'unmanaged' && <div className="flex flex-wrap items-center gap-2 text-xs"><span className="text-muted-foreground">Harnesses: {entry.enabled_harnesses.join(', ') || 'None'}</span><Button variant="link" size="default" onClick={() => assignment(item, entry.enabled_harnesses[0] ?? '')}>Edit in Assignment matrix</Button></div>}
+      {disabledReason && entry.draft !== 'deleted' && <p className="text-xs text-muted-foreground">{disabledReason}</p>}</div>
+    </div>
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-4 overflow-y-auto px-5 py-4">
       <ErrorNotice error={editors.error || mutation.error} />
       {entry.draft === 'deleted' && <Notice title="Deleted in Draft">Browse the read-only Baseline files below.</Notice>}
       {entry.clashes_with_repo && <Notice title="Clashes with repo">A repo Skill already has this name. Adopt is unavailable.</Notice>}
