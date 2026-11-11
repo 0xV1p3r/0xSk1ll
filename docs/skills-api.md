@@ -111,7 +111,7 @@ Repo reads use Draft content on disk. Fully deleted Draft items use their
 Baseline version from Git `HEAD`. Deleting only `SKILL.md` still exposes any
 remaining Draft files. Unmanaged reads use the selected Harness location.
 
-## Adopt and Fork
+## Adopt and fork
 
 `POST /skills/adopt` takes:
 

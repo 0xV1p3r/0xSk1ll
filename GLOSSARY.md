@@ -16,7 +16,7 @@ A skill in a harness's skills directory that sk1ll did not put there and does no
 _Avoid_: Installed skill, stray, foreign skill
 
 **Rule**:
-One instruction file ("for X do Y"), kept in `rules/`. A harness's **instructions** are all its enabled rules rendered together (into a block or as rule files).
+One instruction file ("for X do Y"), kept in `instructions/`. A harness's **instructions** are all its enabled rules rendered together (into a block or as rule files).
 _Avoid_: Fragment, instruction (when meaning a single file)
 
 ## Where content goes

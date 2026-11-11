@@ -10,5 +10,5 @@ Draft and Baseline stay: they are fleet-level concepts behind the machine status
 
 ## Consequences
 
-- This is a clean break before the first release: the `sk1ll-hub` crate, the `SK1LL_HUB_*` environment variables, the `hub_url` state field, the `fragments/` directory, `fragment:<name>` item references and the `promote`/`reset` commands have no compatibility aliases. Existing test fleets must rejoin, and existing repos must `git mv fragments rules`.
+- This is a clean break before the first release: the `sk1ll-hub` crate, the `SK1LL_HUB_*` environment variables, the `hub_url` state field, `fragment:<name>` item references and the `promote`/`reset` commands have no compatibility aliases. Existing test fleets must rejoin. Rule files stay in `instructions/`.
 - Users who know git may expect full git behavior. Commit only covers the named items, and Pull blocks instead of merging; both are documented under their glossary entries.
