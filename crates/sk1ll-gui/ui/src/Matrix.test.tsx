@@ -4,11 +4,13 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import { Matrix } from './Matrix';
 import { api } from './api';
 import { emptyHarness } from './model';
+import { toast } from './toast';
 import type { Assignment, AssignmentUpdate, StatusView } from './types';
 
 vi.mock('./api', () => ({ api: {
   fleet: vi.fn(), items: vi.fn(), assignment: vi.fn(), setAssignment: vi.fn(),
 }, errorMessage: (error: unknown) => error instanceof Error ? error.message : String(error) }));
+vi.mock('./toast', () => ({ toast: vi.fn() }));
 const status = { machine_id: 'a' } as StatusView;
 const assignment = (enabled = false): Assignment => ({ harnesses: { claude: {
   ...emptyHarness(), new_skills_default: false, skills: { pdf: enabled },
@@ -109,12 +111,12 @@ describe('Assignment response cache', () => {
     const save = deferred<AssignmentUpdate>();
     vi.mocked(api.setAssignment).mockReturnValue(save.promise);
     await mount();
-    fireEvent.click(screen.getByRole('checkbox', { name: 'Default for new skills in a / claude' }));
+    fireEvent.click(screen.getByRole('switch', { name: 'Default for new skills in a / claude' }));
     expect(enabled('a')).toBe(false);
     expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'new_skills_default', enabled: true }] });
     const next = snapshot(false, 2); next.assignment.harnesses.claude.new_skills_default = true;
     await act(async () => { save.resolve(next); });
-    expect(screen.getByRole('checkbox', { name: 'Default for new skills in a / claude' }).getAttribute('aria-checked')).toBe('true');
+    expect(screen.getByRole('switch', { name: 'Default for new skills in a / claude' }).getAttribute('aria-checked')).toBe('true');
     expect(enabled('a')).toBe(false);
   });
   it('labels unpushed Commits and Draft-only additions consistently', async () => {
@@ -138,7 +140,7 @@ it('toggles an Assignment and a Harness default from their state labels', async 
   fireEvent.click(label);
   await waitFor(() => expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: true }] }));
   await waitFor(() => expect(cell('a').hasAttribute('data-disabled')).toBe(false));
-  const defaultLabel = screen.getByRole('checkbox', { name: 'Default for new skills in a / claude' }).closest('label')!;
+  const defaultLabel = screen.getByRole('switch', { name: 'Default for new skills in a / claude' }).closest('label')!;
   fireEvent.click(defaultLabel);
   await waitFor(() => expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'new_skills_default', enabled: true }] }));
 });
@@ -220,17 +222,104 @@ it('resets row overrides optimistically and skips unavailable remote Draft items
 });
 
 
-it('marks only explicit values that diverge from the Harness default and clears the marker on reset', async () => {
+it('describes explicit values that override the Harness default and clears the note on reset', async () => {
   vi.mocked(api.assignment).mockImplementation(async machine => snapshot(machine === 'a'));
   const save = deferred<AssignmentUpdate>();
   vi.mocked(api.setAssignment).mockReturnValue(save.promise);
   await mount();
-  expect(cell('a').closest('td')?.getAttribute('data-diverges')).toBe('true');
-  expect(cell('b').closest('td')?.hasAttribute('data-diverges')).toBe(false);
+  expect(cell('a').getAttribute('aria-description')).toBe('Overrides the Harness default.');
+  expect(cell('b').hasAttribute('aria-description')).toBe(false);
+  expect(cell('a').closest('td')?.className).not.toContain('bg-warning');
   fireEvent.click(screen.getByRole('button', { name: 'Use default for skill:pdf in a / claude' }));
   const inherited = screen.getByRole('checkbox', { name: 'skill:pdf in a / claude, inherited' });
-  expect(inherited.closest('td')?.hasAttribute('data-diverges')).toBe(false);
+  expect(inherited.hasAttribute('aria-description')).toBe(false);
   expect(inherited.getAttribute('aria-checked')).toBe('false');
   expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: null }] });
   await act(async () => { save.resolve(snapshot()); });
+});
+
+it('describes defaults rows without a visible hint row', async () => {
+  await mount();
+  const toggle = screen.getByRole('switch', { name: 'Default for new skills in a / claude' });
+  expect(document.getElementById(toggle.getAttribute('aria-describedby')!)?.textContent).toMatch(/applies to items added later/);
+  expect(document.getElementById('default-hint')?.className).toContain('sr-only');
+  expect(screen.queryByText(/defaults for new items/i)).toBeNull();
+});
+
+it('marks offline Machines in the header and on their cells while keeping them editable', async () => {
+  vi.mocked(api.fleet).mockResolvedValue({ baseline: 'abc', machines: [
+    { id: 'a', status: 'in_sync', connected: true, joined_at: 1, last_seen: 1, report: null },
+    { id: 'b', status: 'offline', connected: false, joined_at: 1, last_seen: 1, report: null },
+  ] });
+  await mount();
+  expect(within(screen.getByRole('columnheader', { name: 'b, Offline' })).getByText('Offline')).toBeTruthy();
+  expect(within(screen.getByRole('columnheader', { name: 'a, This Machine' })).queryByText('Offline')).toBeNull();
+  expect(cell('b').getAttribute('aria-description')).toBe('Applies when b reconnects.');
+  expect(cell('b').hasAttribute('data-disabled')).toBe(false);
+});
+
+it('collapses a Machine to a summary column and remembers it', async () => {
+  const view = await mount();
+  fireEvent.click(screen.getByRole('button', { name: 'b Harnesses' }));
+  expect(screen.getByRole('button', { name: 'b Harnesses' }).getAttribute('aria-expanded')).toBe('false');
+  expect(screen.queryByRole('checkbox', { name: 'skill:pdf in b / claude, explicit' })).toBeNull();
+  expect(screen.queryByRole('switch', { name: 'Default for new skills in b / claude' })).toBeNull();
+  expect(screen.getByText('Enabled in 0 of 1 Harness')).toBeTruthy();
+  expect(localStorage.getItem('assignment-matrix-collapsed')).toBe('["b"]');
+  view.unmount();
+  await mount();
+  expect(screen.queryByRole('checkbox', { name: 'skill:pdf in b / claude, explicit' })).toBeNull();
+  fireEvent.click(screen.getByRole('button', { name: 'b Harnesses' }));
+  expect(cell('b')).toBeTruthy();
+  expect(localStorage.getItem('assignment-matrix-collapsed')).toBe('[]');
+});
+
+it('shows only this Machine or all Machines from the filter shortcuts', async () => {
+  await mount();
+  fireEvent.click(screen.getByRole('button', { name: 'Machines (2)' }));
+  fireEvent.click(await screen.findByRole('menuitem', { name: 'Only this Machine' }));
+  await waitFor(() => expect(screen.queryByRole('checkbox', { name: 'skill:pdf in b / claude, explicit' })).toBeNull());
+  expect(localStorage.getItem('assignment-matrix-machines')).toBe('["a"]');
+  fireEvent.click(screen.getByRole('button', { name: 'Machines (1)' }));
+  fireEvent.click(await screen.findByRole('menuitem', { name: 'All Machines' }));
+  await waitFor(() => expect(cell('b')).toBeTruthy());
+  expect(localStorage.getItem('assignment-matrix-machines')).toBe('null');
+});
+
+it('announces accepted bulk changes but not failed ones', async () => {
+  vi.mocked(api.setAssignment).mockImplementation(async machine => {
+    if (machine === 'b') throw new Error('b rejected');
+    return snapshot(true, 2);
+  });
+  await mount();
+  fireEvent.click(screen.getByRole('button', { name: 'Actions for skill:pdf' }));
+  fireEvent.click(await screen.findByRole('menuitem', { name: 'Enable in all visible Harnesses' }));
+  await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Enabled pdf in 1 Harness', action: expect.objectContaining({ label: 'Undo' }) })));
+  await screen.findByText('b: b rejected');
+  fireEvent.click(screen.getByRole('button', { name: 'Actions for a / claude' }));
+  fireEvent.click(await screen.findByRole('menuitem', { name: 'Disable all visible items' }));
+  await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Disabled 1 item in a / claude', action: expect.objectContaining({ label: 'Undo' }) })));
+});
+
+it('undo restores explicit and inherited values only for accepted Machines', async () => {
+  vi.mocked(api.assignment).mockImplementation(async () => {
+    const next = snapshot(); next.assignment.harnesses.codex = emptyHarness(); return next;
+  });
+  vi.mocked(api.setAssignment).mockImplementation(async machine => {
+    if (machine === 'b') throw new Error('rejected');
+    return snapshot(true, 2);
+  });
+  await mount();
+  fireEvent.click(screen.getByRole('button', { name: 'Actions for skill:pdf' }));
+  fireEvent.click(await screen.findByRole('menuitem', { name: 'Enable in all visible Harnesses' }));
+  await waitFor(() => expect(toast).toHaveBeenCalled());
+  const action = vi.mocked(toast).mock.calls[0][0].action!;
+  expect(action.label).toBe('Undo');
+  await act(async () => { action.run(); });
+  expect(api.setAssignment).toHaveBeenCalledTimes(3);
+  expect(api.setAssignment).toHaveBeenLastCalledWith('a', { changes: [
+    { harness: 'claude', kind: 'skill', name: 'pdf', enabled: false },
+    { harness: 'codex', kind: 'skill', name: 'pdf', enabled: null },
+  ] });
+  expect(toast).toHaveBeenLastCalledWith(expect.objectContaining({ title: 'Restored 2 Assignments', tone: 'default' }));
 });

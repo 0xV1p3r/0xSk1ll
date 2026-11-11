@@ -1,14 +1,16 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { Conflicts, Imports, Log } from './Activity';
+import { Conflicts } from './Conflicts';
+import { Imports } from './Imports';
+import { Log } from './Log';
 import { api } from './api';
 import { toast } from './toast';
 vi.mock('./toast', () => ({ toast: vi.fn() }));
 import { JoinCodeButton, Settings } from './Settings';
 import type { SkillCandidate, StatusView } from './types';
 
-vi.mock('./api', () => ({ api: { editors: vi.fn(), imports: vi.fn(), checkImports: vi.fn(), removeImport: vi.fn(), updateImport: vi.fn(), conflictDiff: vi.fn(), items: vi.fn(), resolveImport: vi.fn(), addImport: vi.fn(), log: vi.fn(), undo: vi.fn(), conflicts: vi.fn(), recovered: vi.fn(), harnesses: vi.fn(), fleet: vi.fn(), join: vi.fn(), joinCode: vi.fn() },
+vi.mock('./api', () => ({ api: { editors: vi.fn(), imports: vi.fn(), checkImports: vi.fn(), removeImport: vi.fn(), updateImport: vi.fn(), conflictDiff: vi.fn(), items: vi.fn(), resolveImport: vi.fn(), addImport: vi.fn(), log: vi.fn(), logFacets: vi.fn(), undo: vi.fn(), conflicts: vi.fn(), recovered: vi.fn(), harnesses: vi.fn(), fleet: vi.fn(), join: vi.fn(), joinCode: vi.fn() },
   errorMessage: (e: unknown) => String(e) }));
 const changed = vi.fn();
 const reviewDraft = vi.fn();
@@ -114,8 +116,9 @@ it.each([[true, 'On'], [false, 'Off'], [null, 'Default']] as const)('names the r
   vi.mocked(api.undo).mockResolvedValue({ assignment: { harnesses: {} }, revision: 2, entries: [] });
   render(<Log revision={0} changed={changed} />);
   fireEvent.click(await screen.findByRole('button', { name: `Restore ${label} for log entry 7: skill:pdf on laptop / claude` }));
+  fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Restore' }));
   await waitFor(() => expect(toast).toHaveBeenCalledWith({ title: `Restored Assignment skill:pdf on laptop / claude to ${label}.` }));
-  expect(screen.getByRole('button', { name: `Restore ${label} for log entry 7: skill:pdf on laptop / claude` }).textContent).toContain('Restored');
+  await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
   expect(api.undo).toHaveBeenCalledWith(7); expect(changed).toHaveBeenCalledOnce();
 });
 it.each([false, true])('names the item, Harness and path in the %s recovery confirmation', async displaced => {
@@ -135,7 +138,8 @@ it.each([1, 2, 0])('focuses resolved results and announces %s Skills found', asy
   const announcement = within(screen.getByRole('dialog')).getByRole('status');
   expect(announcement.textContent).toBe(count ? `${count} ${count === 1 ? 'Skill' : 'Skills'} found` : '');
   if (!count) {
-    expect(screen.getByRole('alert').textContent).toContain('No Skills found at this source.');
+    expect(screen.getByText(/No Skills found at this source/).textContent).toContain('Advanced → Path');
+    expect(screen.queryByRole('alert')).toBeNull();
     expect(screen.queryByText('0 Skills found')).toBeNull();
   }
   expect(announcement.getAttribute('aria-live')).toBe('polite');
@@ -210,26 +214,28 @@ it('returns focus to Create join code on close', async () => {
   fireEvent.keyDown(dialog, { key: 'Escape' });
   await waitFor(() => expect(document.activeElement).toBe(trigger));
 });
-it('keeps Restore focus during the request and guards repeated clicks', async () => {
+it('confirms Restore and guards repeated requests while pending', async () => {
   let finish!: () => void;
   vi.mocked(api.log).mockResolvedValue([{ id: 7, machine: 'laptop', harness: 'claude', kind: 'skill', name: 'pdf', before: true, after: false, at: 1, author: 'user', cause: { type: 'change' } }]);
   vi.mocked(api.undo).mockImplementation(() => new Promise(resolve => { finish = () => resolve({ assignment: { harnesses: {} }, revision: 2, entries: [] }); }));
   render(<Log revision={0} changed={changed} />);
-  const restore = await screen.findByRole('button', { name: /Restore On for log entry 7/ });
-  restore.focus(); fireEvent.click(restore);
-  expect(document.activeElement).toBe(restore);
-  expect(restore.hasAttribute('disabled')).toBe(false);
-  expect(restore.getAttribute('aria-disabled')).toBe('true');
+  fireEvent.click(await screen.findByRole('button', { name: /Restore On for log entry 7/ }));
+  const dialog = await screen.findByRole('dialog');
+  expect(dialog.textContent).toContain('Restore skill:pdf on Machine laptop / Harness claude to On?');
+  expect(api.undo).not.toHaveBeenCalled();
+  const restore = within(dialog).getByRole('button', { name: 'Restore' });
+  fireEvent.click(restore);
+  await waitFor(() => expect(restore.hasAttribute('disabled')).toBe(true));
   fireEvent.click(restore); expect(api.undo).toHaveBeenCalledOnce();
   finish();
   await waitFor(() => expect(toast).toHaveBeenCalled());
-  expect(document.activeElement).toBe(restore);
 });
 it.each([false, true])('focuses the log region when the restored row is gone and empty is %s', async empty => {
   vi.mocked(api.log).mockResolvedValue([{ id: 7, machine: 'laptop', harness: 'claude', kind: 'skill', name: 'pdf', before: true, after: false, at: 1, author: 'user', cause: { type: 'change' } }]);
   vi.mocked(api.undo).mockResolvedValue({ assignment: { harnesses: {} }, revision: 2, entries: [] });
   const view = render(<Log revision={0} changed={changed} />);
   fireEvent.click(await screen.findByRole('button', { name: /Restore On for log entry 7/ }));
+  fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Restore' }));
   await waitFor(() => expect(toast).toHaveBeenCalled());
   vi.mocked(api.log).mockResolvedValue(empty ? [] : [{ id: 8, machine: 'laptop', harness: 'claude', kind: 'skill', name: 'other', before: true, after: false, at: 2, author: 'user', cause: { type: 'change' } }]);
   view.rerender(<Log revision={1} changed={changed} />);
@@ -254,7 +260,7 @@ it('lists all Imports, checks now and removes into Draft', async () => {
 });
 it('loads conflict diffs on expansion and uses recovery ids', async () => {
   const entry = { name: 'pdf', harness: 'claude', dest: '/skills/pdf', adoptable: true, reason: null, items: ['skill:pdf'] };
-  vi.mocked(api.conflicts).mockResolvedValue([entry]);
+  vi.mocked(api.conflicts).mockResolvedValue([entry, { ...entry, name: 'writing' }, { ...entry, name: 'review' }]);
   vi.mocked(api.recovered).mockResolvedValue([{ ...entry, id: 'recovery', path: '/recovery/pdf' }]);
   render(<Conflicts revision={0} changed={changed} reviewDraft={reviewDraft} />);
   const summaries = await screen.findAllByRole('button', { name: 'Show diff' });
@@ -264,7 +270,7 @@ it('loads conflict diffs on expansion and uses recovery ids', async () => {
   expect(summaries[0].getAttribute('aria-expanded')).toBe('true');
   await screen.findByLabelText('Conflict diff');
   expect(api.conflictDiff).toHaveBeenCalledWith({ harness: 'claude', name: 'pdf' });
-  fireEvent.click(summaries[1]);
+  fireEvent.click(summaries[3]);
   await waitFor(() => expect(api.conflictDiff).toHaveBeenCalledWith({ id: 'recovery' }));
   expect(screen.getAllByText('+draft')[0].getAttribute('data-kind')).toBe('add');
 });
@@ -274,17 +280,18 @@ it('automatically loads the sole conflict diff', async () => {
   render(<Conflicts revision={0} changed={changed} reviewDraft={reviewDraft} />);
   await screen.findByLabelText('Conflict diff'); expect(api.conflictDiff).toHaveBeenCalledOnce();
 });
-it('filters the loaded log page by machine, Harness, author and item', async () => {
+it('queries the server by machine, Harness, author and item', async () => {
   const base = { kind: 'skill' as const, before: true, after: false, at: 1, cause: { type: 'change' as const } };
   vi.mocked(api.log).mockResolvedValue([{ ...base, id: 1, machine: 'laptop', harness: 'claude', author: 'alice', name: 'pdf' }, { ...base, id: 2, machine: 'desktop', harness: 'codex', author: 'bob', name: 'writing' }]);
   render(<Log revision={0} changed={changed} />);
   await screen.findByText('pdf');
   for (const [label, value] of [['Filter by machine', 'laptop'], ['Filter by harness', 'claude'], ['Filter by author', 'alice'], ['Search items', 'PDF']]) {
     fireEvent.change(screen.getByLabelText(label), { target: { value } });
-    expect(screen.getByText('pdf')).toBeTruthy(); expect(screen.queryByText('writing')).toBeNull();
+    const key = label === 'Search items' ? 'item' : label.replace('Filter by ', '');
+    await waitFor(() => expect(api.log).toHaveBeenLastCalledWith(expect.objectContaining({ [key]: value }))); 
     fireEvent.change(screen.getByLabelText(label), { target: { value: '' } });
   }
-  expect(screen.queryByText('change')).toBeNull(); expect(api.log).toHaveBeenCalledOnce();
+  expect(screen.queryByText('change')).toBeNull();
 });
 it('does not offer Restore for a removed Machine', async () => {
   vi.mocked(api.fleet).mockResolvedValue({ baseline: null, machines: [{ id: 'laptop' } as never] });
@@ -295,4 +302,51 @@ it('does not offer Restore for a removed Machine', async () => {
   await screen.findByRole('button', { name: /Restore On for log entry 7/ });
   expect(await screen.findByText('Machine removed')).toBeTruthy();
   expect(screen.queryByRole('button', { name: /log entry 8/ })).toBeNull();
+});
+
+it('updates all Imports sequentially and reports failures while continuing', async () => {
+  const updates = ['one', 'two', 'three'].map(name => ({ name, source: 'github:test/repo', ref: 'main', locked: 'abc', upstream: 'def' }));
+  vi.mocked(api.imports).mockResolvedValue({ checked_at: null, updates, errors: [] });
+  let finish!: () => void;
+  vi.mocked(api.updateImport).mockImplementationOnce(() => new Promise(resolve => { finish = () => resolve({ name: 'one', old_commit: 'abc', new_commit: 'def', changed: true }); }))
+    .mockRejectedValueOnce('Fetch failed').mockResolvedValueOnce({ name: 'three', old_commit: 'abc', new_commit: 'def', changed: true });
+  render(<Imports revision={0} changed={changed} reviewDraft={reviewDraft} />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Update all into Draft' }));
+  expect(api.updateImport).toHaveBeenCalledTimes(1);
+  finish();
+  await screen.findByText('two: Failed: Fetch failed');
+  expect(vi.mocked(api.updateImport).mock.calls.map(call => call[0])).toEqual(['one', 'two', 'three']);
+  expect(await screen.findByText('three: Updated into Draft.')).toBeTruthy();
+  expect(changed).toHaveBeenCalledOnce();
+});
+
+it('submits both Import steps through forms and keeps name failures free of repository advice', async () => {
+  vi.mocked(api.resolveImport).mockResolvedValue({ source: 'github:test/repo', git_ref: 'main', commit: 'abc', candidates: [candidate('pdf')] });
+  vi.mocked(api.addImport).mockRejectedValueOnce('Name already exists');
+  render(<Imports revision={0} changed={changed} reviewDraft={reviewDraft} openAdd />);
+  const link = await screen.findByLabelText('Link');
+  fireEvent.change(link, { target: { value: 'github:test/repo' } });
+  fireEvent.submit(link.closest('form')!);
+  const name = await screen.findByLabelText('Name');
+  fireEvent.submit(name.closest('form')!);
+  const error = await screen.findByRole('alert');
+  expect(error.textContent).toContain('Name already exists');
+  expect(error.textContent).not.toContain('credentials');
+  expect(screen.getByRole('list', { name: 'Import results' })).toBeTruthy();
+});
+
+it.each([['Fetch failed', true], ['Invalid name', false]] as const)('adds repository guidance only for relevant resolve errors: %s', async (message, guidance) => {
+  vi.mocked(api.resolveImport).mockRejectedValueOnce(message);
+  render(<Imports revision={0} changed={changed} reviewDraft={reviewDraft} openAdd />);
+  fireEvent.change(await screen.findByLabelText('Link'), { target: { value: 'github:test/repo' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Resolve' }));
+  const error = await screen.findByRole('alert');
+  expect(error.textContent?.includes('credentials')).toBe(guidance);
+});
+it('reopens Add Import for each new request while the screen stays mounted', async () => {
+  vi.mocked(api.imports).mockResolvedValue({ checked_at: null, imports: [], updates: [], errors: [] });
+  const view = render(<Imports revision={0} changed={changed} reviewDraft={reviewDraft} openAdd={0} />);
+  expect(screen.queryByRole('dialog')).toBeNull();
+  view.rerender(<Imports revision={0} changed={changed} reviewDraft={reviewDraft} openAdd={1} />);
+  expect(await screen.findByRole('dialog', { name: 'Add Import' })).toBeTruthy();
 });

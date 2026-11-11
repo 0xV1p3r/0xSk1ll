@@ -4,9 +4,13 @@ export const statusOrder: MachineStatus[] = ['offline', 'blocked', 'conflict', '
 export const statusLabels: Record<MachineStatus, string> = {
   offline: 'Offline', blocked: 'Blocked', conflict: 'Conflict', behind: 'Behind', drafting: 'Drafting', in_sync: 'In sync',
 };
-export const statusTone: Record<MachineStatus, 'secondary' | 'destructive' | 'warning' | 'info' | 'success'> = {
-  offline: 'secondary', blocked: 'destructive', conflict: 'warning', behind: 'info', drafting: 'secondary', in_sync: 'success',
+// Badge tones; keep in step with the status bar colours in Fleet.
+export const statusTone: Record<MachineStatus, 'secondary' | 'destructive' | 'warning' | 'info' | 'success' | 'drafting'> = {
+  offline: 'secondary', blocked: 'destructive', conflict: 'warning', behind: 'info', drafting: 'drafting', in_sync: 'success',
 };
+export const plural = (count: number, one: string, many = `${one}s`) => `${count} ${count === 1 ? one : many}`;
+// Shared vocabulary so every screen names the same things the same way.
+export const terms = { explicit: 'Explicit', inherited: 'Inherited', inheritedLong: 'Inherited from the Harness default', search: 'Search Skills and Rules' } as const;
 export function headline(offline: boolean, report: MachineReport | null, baseline: string | null): MachineStatus {
   if (offline) return 'offline';
   if (report?.blocked) return 'blocked';

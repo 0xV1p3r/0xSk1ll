@@ -3,15 +3,16 @@ import { Toast } from '@base-ui/react/toast';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 
-export type ToastOptions = { title: string; description?: string; tone?: 'default' | 'destructive' };
-const manager = Toast.createToastManager();
+export type ToastOptions = { title: string; description?: string; tone?: 'default' | 'destructive'; action?: { label: string; run: () => void } };
+const manager = Toast.createToastManager<{ action?: ToastOptions['action'] }>();
 // Call toast({ title, description?, tone? }) from any screen to announce a result.
-export const toast = ({ tone = 'default', ...options }: ToastOptions) => manager.add({ ...options, type: tone });
+export const toast = ({ tone = 'default', action, ...options }: ToastOptions) => manager.add({ ...options, type: tone, data: { action } });
 export function useToast() { return { toast }; }
 function ToastList() {
-  const { toasts } = Toast.useToastManager();
+  const { toasts } = Toast.useToastManager<{ action?: ToastOptions['action'] }>();
   return toasts.map(item => <Toast.Root key={item.id} toast={item} className={cn('rounded-lg border bg-popover p-3 text-popover-foreground shadow-lg', item.type === 'destructive' && 'border-destructive text-destructive')}>
     <Toast.Content className="flex items-start gap-3"><div className="flex flex-1 flex-col gap-1"><Toast.Title className="text-sm font-medium" /><Toast.Description className="text-xs" /></div>
+      {item.data?.action && <Toast.Close render={<Button variant="outline" size="sm" onClick={() => item.data?.action?.run()} />}>{item.data.action.label}</Toast.Close>}
       <Toast.Close render={<Button variant="ghost" size="sm" />}>Dismiss</Toast.Close></Toast.Content>
   </Toast.Root>);
 }

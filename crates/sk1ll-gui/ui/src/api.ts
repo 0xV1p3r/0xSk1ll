@@ -4,6 +4,8 @@ import type * as T from './types';
 export const api = {
   push: () => invoke<T.PushResult>('push'),
   createItem: (request: T.CreateItemRequest) => invoke<void>('create_item', { request }),
+  deleteItem: (request: T.DeleteItemRequest) => invoke<void>('delete_item', { request }),
+  renameItem: (request: T.RenameItemRequest) => invoke<T.RenameItemResponse>('rename_item', { request }),
   checkImports: () => invoke<T.ImportsView>('check_imports'),
   removeImport: (name: string) => invoke<void>('remove_import', { name }),
   conflictDiff: (request: T.ConflictDiffRequest) => invoke<T.DiffView>('conflict_diff', { request }),
@@ -42,6 +44,7 @@ export const api = {
   setAssignment: (machine: string, changes: T.AssignmentChanges) =>
     invoke<T.AssignmentUpdate>('set_assignment', { machine, changes }),
   log: (query: T.LogQuery) => invoke<T.LogEntry[]>('log', { query }),
+  logFacets: () => invoke<T.LogFacets>('log_facets'),
   undo: (entry: number) => invoke<T.AssignmentUpdate>('undo', { entry }),
   join: (request: T.JoinApiRequest) => invoke<T.Joined>('join', { request }),
   joinCode: () => invoke<T.JoinCode>('join_code'),

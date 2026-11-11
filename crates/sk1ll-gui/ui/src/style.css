@@ -42,9 +42,11 @@
   --success-foreground: #107446;
   --warning: #e59a1a;
   --warning-foreground: #995700;
-  --info: var(--primary);
-  --info-foreground: var(--brand-ink);
+  /* Info (and the Behind status) is a distinct blue so it never reads as the cyan action colour. */
+  --info: #3d6fe0;
+  --info-foreground: #2753b8;
   --drafting: #7c5cdb;
+  --drafting-foreground: #6145c4;
 }
 
 .dark {
@@ -63,7 +65,10 @@
   --success-foreground: #3ddc8e;
   --warning: #f5b84a;
   --warning-foreground: #f5b84a;
+  --info: #7a9cff;
+  --info-foreground: #93afff;
   --drafting: #a38cff;
+  --drafting-foreground: #b6a3ff;
 }
 
 @theme inline {
@@ -106,6 +111,7 @@
   --color-info: var(--info);
   --color-info-foreground: var(--info-foreground);
   --color-drafting: var(--drafting);
+  --color-drafting-foreground: var(--drafting-foreground);
   --radius-sm: calc(var(--radius) * 0.6);
   --radius-md: calc(var(--radius) * 0.8);
   --radius-lg: var(--radius);

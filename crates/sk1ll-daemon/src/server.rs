@@ -310,26 +310,32 @@ async fn change_assignment(http: &reqwest::Client, state: &DaemonState, changes:
 /// Wait for the existing status protocol to report this local draft before PUT.
 /// HTTP and WebSocket requests have no ordering guarantee across transports.
 pub(crate) async fn assign_adoption(d: &Daemon, adoption: &sk1ll_core::sync::unmanaged::Adoption) -> anyhow::Result<AssignmentUpdate> {
-    let item = sk1ll_proto::ItemRef::Skill(adoption.name.clone());
+    let changes = AssignmentChanges { changes: adoption.locations.iter().map(|l| sk1ll_proto::ToggleChange {
+        harness: l.harness.clone(), kind: sk1ll_proto::ToggleKind::Skill,
+        name: Some(adoption.name.clone()), enabled: Some(true),
+    }).collect() };
+    assign_draft_item(d, &sk1ll_proto::ItemRef::Skill(adoption.name.clone()), &changes, "Adopt").await
+}
+
+/// Changes this machine's toggles for `item` once the Server has its draft report.
+pub(crate) async fn assign_draft_item(
+    d: &Daemon, item: &sk1ll_proto::ItemRef, changes: &AssignmentChanges, action: &str,
+) -> anyhow::Result<AssignmentUpdate> {
     tokio::time::timeout(SEND_TIMEOUT, async {
         loop {
-            anyhow::ensure!(d.is_connected(), "Adopt needs a connection to the Server");
+            anyhow::ensure!(d.is_connected(), "{action} needs a connection to the Server");
             let report = d.view().report;
-            if !report.drafts.contains(&item) && !report.unpushed.contains(&item) {
+            if !report.drafts.contains(item) && !report.unpushed.contains(item) {
                 break; // An unchanged baseline item needs no new draft report.
             }
             let fleet: sk1ll_proto::FleetView = request(&d.http, &d.ident, Method::GET, "/fleet", Bytes::new())
                 .await?.error_for_status()?.json().await?;
             if fleet.machines.iter().any(|m| m.id == d.ident.machine_id && m.report.as_ref().is_some_and(|r| {
-                r.drafts.contains(&item) || r.unpushed.contains(&item)
+                r.drafts.contains(item) || r.unpushed.contains(item)
             })) { break; }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         Ok::<_, anyhow::Error>(())
-    }).await.map_err(|_| anyhow::anyhow!("Adopt timed out waiting for the Server to receive the draft; retry Adopt"))??;
-    let changes = AssignmentChanges { changes: adoption.locations.iter().map(|l| sk1ll_proto::ToggleChange {
-        harness: l.harness.clone(), kind: sk1ll_proto::ToggleKind::Skill,
-        name: Some(adoption.name.clone()), enabled: Some(true),
-    }).collect() };
-    change_assignment(&d.http, &d.ident, &changes).await
+    }).await.map_err(|_| anyhow::anyhow!("{action} timed out waiting for the Server to receive the draft; try again"))??;
+    change_assignment(&d.http, &d.ident, changes).await
 }

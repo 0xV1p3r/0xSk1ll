@@ -22,13 +22,13 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            commands::push, commands::create_item, commands::check_imports, commands::remove_import, commands::conflict_diff, commands::set_preferred_editor,
+            commands::push, commands::create_item, commands::delete_item, commands::rename_item, commands::check_imports, commands::remove_import, commands::conflict_diff, commands::set_preferred_editor,
             commands::skills, commands::skill_tree, commands::skill_file, commands::adopt_unmanaged, commands::fork,
             commands::status, commands::fleet, commands::items, commands::draft, commands::diff, commands::commit_message,
             commands::commit, commands::restore, commands::pull, commands::conflicts, commands::recovered,
             commands::adopt, commands::overwrite, commands::adopt_displaced, commands::discard_displaced,
             commands::harnesses, commands::imports, commands::resolve_import, commands::add_import, commands::update_import, commands::assignment,
-            commands::set_assignment, commands::log, commands::undo, commands::join, commands::join_code,
+            commands::set_assignment, commands::log, commands::log_facets, commands::undo, commands::join, commands::join_code,
             commands::remove_machine, commands::connection_info, commands::editors, commands::open_in_editor,
         ])
         .run(tauri::generate_context!())

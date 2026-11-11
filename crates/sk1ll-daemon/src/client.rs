@@ -10,6 +10,9 @@
 //! | GET | `/skills/tree?item=skill:pdf` | → `Vec<FileEntry>` |
 //! | GET | `/skills/file?item=skill:pdf&path=SKILL.md` | → `FileContent` |
 //! | POST | `/skills/adopt` | `ConflictTarget` → 204; unmanaged Adopt needs a Server connection |
+//! | POST | `/items/create` | [`CreateItemRequest`] → 204 |
+//! | POST | `/items/delete` | [`DeleteItemRequest`] → 204 (a Draft deletion) |
+//! | POST | `/items/rename` | [`RenameItemRequest`] → [`RenameItemResponse`] |
 //! | GET | `/draft` | → `Vec<`[`DraftEntry`]`>` |
 //! | GET | `/draft/diff?item=` | → [`DiffView`] |
 //! | GET | `/commit/message?items=a,b` | → [`CommitMessage`] |
@@ -40,7 +43,7 @@
 //!
 //! Server pass-throughs (the daemon adds its machine token; 503 while the server
 //! is unreachable): `GET /fleet`, `GET|PUT /machines/{id}/assignment`,
-//! `DELETE /machines/{id}`, `GET /log`, `POST /log/{id}/undo`,
+//! `DELETE /machines/{id}`, `GET /log`, `GET /log/facets`, `POST /log/{id}/undo`,
 //! `GET /imports`, `POST /join-codes`. Bodies are the server's (`sk1ll-proto`).
 //!
 //! Errors are [`ErrorBody`] with a 4xx/5xx status.
@@ -58,7 +61,7 @@ use serde::{Deserialize, Serialize};
 pub use sk1ll_core::content::{ContentEntry, ContentQuery, ContentType, FileContent, FileEntry, FileQuery};
 pub use sk1ll_proto::{
     Assignment, AssignmentChanges, AssignmentSnapshot, AssignmentUpdate, ErrorBody, FleetView, ImportUpdate, ItemRef,
-    JoinCode, LogEntry, LogQuery, MachineReport, MachineStatus,
+    JoinCode, LogEntry, LogFacets, LogQuery, MachineReport, MachineStatus,
 };
 use tokio::net::UnixStream;
 
@@ -219,6 +222,10 @@ pub struct ConflictView {
     pub path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub displaced_at: Option<u64>,
+    /// Harness conflicts: the newest modification time (Unix seconds) of the
+    /// Harness content, i.e. when it was last edited, not a first-seen time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detected_at: Option<u64>,
     pub harness: String,
     /// What to pass to adopt/overwrite: a skill name, or a rule's rule name.
     pub name: String,
@@ -416,6 +423,18 @@ pub struct ImportEntry {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateItemRequest { pub kind: String, pub name: String, pub description: Option<String> }
+/// A personal Skill or Rule (`kind` is `skill` or `rule`); Imports use `/imports/remove`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteItemRequest { pub kind: String, pub name: String }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenameItemRequest { pub kind: String, pub name: String, pub to: String }
+/// The rename is in the Draft either way. This machine's explicit toggles for
+/// the old name are copied to the new one in `migrated` harnesses; when that
+/// fails (offline, Server refused), `assignment_error` says why. Other
+/// machines' toggles are not copied: once the rename is pushed, the old
+/// name's are dropped (`item_removed`) and the new name follows their defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenameItemResponse { pub item: ItemRef, pub migrated: Vec<String>, pub assignment_error: Option<String> }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConflictDiffRequest { pub harness: Option<String>, pub name: Option<String>, pub id: Option<String> }
 
@@ -523,6 +542,8 @@ impl Client {
     }
 
     pub async fn create_item(&self, request: &CreateItemRequest) -> Result<()> { self.post_empty("/items/create", request).await }
+    pub async fn delete_item(&self, request: &DeleteItemRequest) -> Result<()> { self.post_empty("/items/delete", request).await }
+    pub async fn rename_item(&self, request: &RenameItemRequest) -> Result<RenameItemResponse> { self.post("/items/rename", request).await }
     pub async fn conflict_diff(&self, request: &ConflictDiffRequest) -> Result<DiffView> { self.post("/conflicts/diff", request).await }
     pub async fn check_imports(&self) -> Result<ImportsView> { self.post("/imports/check", &()).await }
     pub async fn status(&self) -> Result<StatusView> {
@@ -663,8 +684,10 @@ impl Client {
 
     pub async fn log(&self, query: &LogQuery) -> Result<Vec<LogEntry>> {
         let mut params = Vec::new();
-        if let Some(m) = &query.machine {
-            params.push(format!("machine={}", encode(m)));
+        for (key, value) in [("machine", &query.machine), ("harness", &query.harness), ("author", &query.author), ("item", &query.item)] {
+            if let Some(v) = value {
+                params.push(format!("{key}={}", encode(v)));
+            }
         }
         if let Some(b) = query.before {
             params.push(format!("before={b}"));
@@ -674,6 +697,11 @@ impl Client {
         }
         let q = if params.is_empty() { String::new() } else { format!("?{}", params.join("&")) };
         self.get(&format!("/log{q}")).await
+    }
+
+    /// The distinct machines, harnesses and authors in the whole log.
+    pub async fn log_facets(&self) -> Result<LogFacets> {
+        self.get("/log/facets").await
     }
 
     pub async fn undo(&self, entry: i64) -> Result<AssignmentUpdate> {

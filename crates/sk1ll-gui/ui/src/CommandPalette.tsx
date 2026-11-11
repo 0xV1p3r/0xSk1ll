@@ -2,18 +2,19 @@ import { useEffect, useRef, useState } from 'react';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { cn } from '@/lib/utils';
-export type Command = { id: string; label: string; select: () => void };
+// `background` commands run in place, so focus returns to where it was instead of to a new screen.
+export type Command = { id: string; label: string; select: () => void; background?: boolean };
 export function CommandPalette({ open, onOpenChange, commands }: { open: boolean; onOpenChange: (open: boolean) => void; commands: Command[] }) {
   const navigating = useRef(false);
   const previousFocus = useRef<HTMLElement | null>(null);
   const [query, setQuery] = useState('');
   const [active, setActive] = useState(0);
-  const matches = commands.filter(command => command.label.toLowerCase().includes(query.toLowerCase()));
+  const matches = commands.filter(command => query.toLowerCase().trim().split(/\s+/).every(word => command.label.toLowerCase().includes(word)));
   useEffect(() => { if (open) { navigating.current = false; setQuery(''); setActive(0); } }, [open]);
-  const select = (command: Command) => { navigating.current = true; onOpenChange(false); command.select(); };
+  const select = (command: Command) => { navigating.current = !command.background; onOpenChange(false); command.select(); };
   return <Dialog open={open} onOpenChange={onOpenChange}><DialogContent initialFocus={() => { previousFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null; return true; }} finalFocus={() => navigating.current ? false : previousFocus.current}>
-    <DialogHeader><DialogTitle>Go to…</DialogTitle><DialogDescription>Search screens, Skills, and Rules.</DialogDescription></DialogHeader>
-    <Input aria-label="Search commands" role="combobox" aria-autocomplete="list" aria-expanded="true" aria-controls="command-results"
+    <DialogHeader><DialogTitle>Go to…</DialogTitle><DialogDescription>Search screens, Machines, Skills, Rules, and actions.</DialogDescription></DialogHeader>
+    <Input placeholder="Search machine, skill, action…" aria-label="Search commands" role="combobox" aria-autocomplete="list" aria-expanded="true" aria-controls="command-results"
       aria-activedescendant={matches[active]?.id} value={query} onChange={event => { setQuery(event.target.value); setActive(0); }}
       onKeyDown={event => { if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); setActive(index => matches.length ? (index + (event.key === 'ArrowDown' ? 1 : -1) + matches.length) % matches.length : 0); }
         if (event.key === 'Enter' && matches[active]) { event.preventDefault(); select(matches[active]); } }} />

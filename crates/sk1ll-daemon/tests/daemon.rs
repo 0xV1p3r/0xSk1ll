@@ -1564,6 +1564,10 @@ async fn gui_creation_import_inventory_check_and_conflict_diff() {
     eventually(|| async { m.harness_skill("x").filter(|s| s == "x\n") }).await;
     write(&m.skills().join("x"), "SKILL.md", "Harness edit\n");
     eventually(|| async { m.client.conflicts().await.ok().filter(|v| v.iter().any(|v| v.name == "x")) }).await;
+    let edited = std::fs::metadata(m.skills().join("x/SKILL.md")).unwrap().modified().unwrap()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let conflict = m.client.conflicts().await.unwrap().into_iter().find(|v| v.name == "x").unwrap();
+    assert!(conflict.detected_at.is_some_and(|at| at >= edited), "{conflict:?}");
     let diff = m.client.conflict_diff(&ConflictDiffRequest { harness: Some(HARNESS.into()), name: Some("x".into()), id: None }).await.unwrap();
     assert!(diff.diff.contains("-Harness edit"), "{}", diff.diff);
     assert!(diff.diff.contains("+x"), "{}", diff.diff);
@@ -1571,6 +1575,73 @@ async fn gui_creation_import_inventory_check_and_conflict_diff() {
     m.client.remove_import("external").await.unwrap();
     assert!(m.client.imports().await.unwrap().imports.is_empty());
     assert!(!m.repo().join("imported/external").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_and_renaming_are_draft_changes_and_report_unmigrated_toggles_offline() {
+    use sk1ll_daemon::client::{ChangeKind, DeleteItemRequest, RenameItemRequest};
+    let mut m = solo("items", "http://127.0.0.1:1", Some(snapshot(1, &["x"])));
+    m.write("instructions/style.md", "---\nname: style\n---\nRule\n");
+    git(&m.repo(), &["add", "."]);
+    git(&m.repo(), &["commit", "-qm", "rule"]);
+    m.start().await;
+    let delete = |kind: &str, name: &str| DeleteItemRequest { kind: kind.into(), name: name.into() };
+    let rename = |kind: &str, name: &str, to: &str| RenameItemRequest { kind: kind.into(), name: name.into(), to: to.into() };
+
+    m.client.delete_item(&delete("skill", "y")).await.unwrap();
+    m.client.delete_item(&delete("rule", "style")).await.unwrap();
+    assert!(m.client.delete_item(&delete("skill", "y")).await.is_err(), "already deleted");
+    assert!(m.client.rename_item(&rename("skill", "x", "z")).await.is_err(), "taken");
+    // `x` is explicitly on here, but the Server is unreachable.
+    let renamed = m.client.rename_item(&rename("skill", "x", "x2")).await.unwrap();
+    assert_eq!(renamed.item, ItemRef::Skill("x2".into()));
+    assert!(renamed.migrated.is_empty());
+    assert!(renamed.assignment_error.as_deref().is_some_and(|e| e.contains("offline")), "{renamed:?}");
+    // An item without explicit toggles has nothing to carry over.
+    m.client.create_item(&sk1ll_daemon::client::CreateItemRequest { kind: "rule".into(), name: "fresh".into(), description: None }).await.unwrap();
+    let plain = m.client.rename_item(&rename("rule", "fresh", "newer")).await.unwrap();
+    assert_eq!((plain.migrated.len(), plain.assignment_error), (0, None));
+
+    let draft: BTreeMap<String, ChangeKind> =
+        m.client.draft().await.unwrap().into_iter().map(|d| (d.item.to_string(), d.change)).collect();
+    assert_eq!(draft, BTreeMap::from([
+        ("rule:newer".to_string(), ChangeKind::Added), ("rule:style".to_string(), ChangeKind::Deleted),
+        ("skill:x".to_string(), ChangeKind::Deleted), ("skill:x2".to_string(), ChangeKind::Added),
+        ("skill:y".to_string(), ChangeKind::Deleted),
+    ]));
+    assert_eq!(std::fs::read_to_string(m.repo().join("personal/x2/SKILL.md")).unwrap(), "x\n");
+    eventually(|| async { (!m.skills().join("x").exists()).then_some(()) }).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn renaming_carries_this_machines_toggles_over() {
+    use sk1ll_daemon::client::RenameItemRequest;
+    let server = Server::start().await;
+    let mut a = Machine::new("alpha");
+    a.join(&server).await;
+    a.start_connected().await;
+    a.write("personal/x/SKILL.md", "---\nname: x\n---\nx v1\n");
+    assert!(a.commit_all().await.pushed);
+    assign(&a, "alpha", vec![toggle("x", true)]).await;
+    eventually(|| async { a.harness_skill("x").map(drop) }).await;
+
+    let renamed = a.client.rename_item(&RenameItemRequest { kind: "skill".into(), name: "x".into(), to: "renamed".into() }).await.unwrap();
+    assert_eq!((renamed.migrated.as_slice(), renamed.assignment_error.as_deref()), ([HARNESS.to_string()].as_slice(), None));
+    let snapshot = a.client.assignment("alpha").await.unwrap();
+    assert_eq!(snapshot.assignment.harness(HARNESS).skills.get("renamed"), Some(&true));
+    let text = eventually(|| async { a.harness_skill("renamed") }).await;
+    assert_eq!(text, "---\nname: renamed\n---\nx v1\n");
+    eventually(|| async { (!a.skills().join("x").exists()).then_some(()) }).await;
+
+    // The copy is an ordinary logged change, found through the log filters.
+    let query = sk1ll_proto::LogQuery { item: Some("SKILL:renamed".into()), author: Some("alpha".into()), ..Default::default() };
+    let log = a.client.log(&query).await.unwrap();
+    assert_eq!(log.len(), 1, "{log:?}");
+    assert_eq!((log[0].cause.clone(), log[0].after), (LogCause::Change, Some(true)));
+    let facets = a.client.log_facets().await.unwrap();
+    assert!(facets.harnesses.contains(&HARNESS.to_string()) && facets.machines == ["alpha"], "{facets:?}");
+    assert!(a.commit_all().await.pushed);
+    assert_eq!(a.client.assignment("alpha").await.unwrap().assignment.harness(HARNESS).skills.get("renamed"), Some(&true));
 }
 
 #[tokio::test(flavor = "multi_thread")]

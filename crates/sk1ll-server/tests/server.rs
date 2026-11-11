@@ -481,6 +481,41 @@ async fn assignment_changes_are_logged_and_undoable() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn log_filters_and_facets_cover_the_whole_log() {
+    let server = start().await;
+    let token = server.join("ws", &["claude", "codex"]).await;
+    seed(&server, "ws", &token, &["personal/pdf/SKILL.md"]).await;
+    let pdf = server
+        .put_assignment(&token, "ws", json!([{"harness": "codex", "kind": "skill", "name": "pdf", "enabled": true}]))
+        .await
+        .entries[0]
+        .clone();
+    let changed = server
+        .put_assignment(ADMIN, "ws", json!([{"harness": "claude", "kind": "new_rules_default", "enabled": true}]))
+        .await;
+    let newest = changed.entries.last().unwrap().id;
+
+    // The match is older than a one-entry page of everything.
+    let page: Vec<LogEntry> = server.get_json(ADMIN, "/log?limit=1").await;
+    assert_eq!(page[0].id, newest);
+    let found: Vec<LogEntry> = server.get_json(ADMIN, "/log?item=Skill%3APD&limit=1").await;
+    assert_eq!(found, std::slice::from_ref(&pdf));
+    let found: Vec<LogEntry> = server.get_json(ADMIN, &format!("/log?harness=codex&author=ws&before={newest}")).await;
+    assert_eq!(found, std::slice::from_ref(&pdf));
+    let none: Vec<LogEntry> = server.get_json(ADMIN, &format!("/log?item=pdf&before={}", pdf.id)).await;
+    assert!(none.is_empty());
+    let admin: Vec<LogEntry> = server.get_json(ADMIN, "/log?author=admin&machine=ws").await;
+    assert!(!admin.is_empty() && admin.iter().all(|e| e.author == "admin" && e.harness == "claude"));
+
+    let facets: Value = server.get_json(&token, "/log/facets").await;
+    assert_eq!(facets["machines"], json!(["ws"]));
+    assert_eq!(facets["harnesses"], json!(["claude", "codex"]));
+    let authors = facets["authors"].as_array().unwrap();
+    assert!(authors.contains(&json!("ws")) && authors.contains(&json!("admin")), "{authors:?}");
+    assert_eq!(server.http.get(server.url("/log/facets")).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn websocket_gets_assignment_nudge_and_status() {
     let server = start().await;
     let token = server.join("ws", &["claude"]).await;

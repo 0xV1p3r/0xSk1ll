@@ -79,6 +79,7 @@ command!(assignment(machine: String) -> AssignmentSnapshot, assignment(&machine)
 command!(set_assignment(machine: String, changes: AssignmentChanges) -> AssignmentUpdate,
     set_assignment(&machine, &changes));
 command!(log(query: LogQuery) -> Vec<LogEntry>, log(&query));
+command!(log_facets() -> LogFacets, log_facets());
 command!(undo(entry: i64) -> AssignmentUpdate, undo(entry));
 command!(join(request: JoinApiRequest) -> Joined, join(&request));
 command!(join_code() -> JoinCode, join_code());
@@ -207,6 +208,8 @@ pub async fn open_in_editor(app: tauri::AppHandle, bridge: State<'_, Bridge>, ca
 
 command!(push() -> PushResult, push());
 command!(create_item(request: CreateItemRequest) -> (), create_item(&request));
+command!(delete_item(request: DeleteItemRequest) -> (), delete_item(&request));
+command!(rename_item(request: RenameItemRequest) -> RenameItemResponse, rename_item(&request));
 command!(check_imports() -> ImportsView, check_imports());
 command!(remove_import(name: String) -> (), remove_import(&name));
 command!(conflict_diff(request: ConflictDiffRequest) -> DiffView, conflict_diff(&request));

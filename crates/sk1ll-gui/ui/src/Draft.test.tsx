@@ -34,8 +34,7 @@ const button = (root: HTMLElement, name: string) => within(root).getByRole('butt
 describe('Draft confirmations', () => {
   it('freezes Restore all items and requires review when a new item arrives', async () => {
     const view = mount();
-    fireEvent.click(await screen.findByRole('button', { name: 'More' }));
-    fireEvent.click(await screen.findByRole('menuitem', { name: 'Restore all' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Restore all' }));
     const dialog = await screen.findByRole('dialog');
     expect(within(dialog).getByText(/Return skill:reviewed/)).toBeTruthy();
     entries.push(entry('skill:new'));
@@ -50,7 +49,7 @@ describe('Draft confirmations', () => {
   });
   it('invalidates Restore selected when content changes at the same paths', async () => {
     const view = mount();
-    fireEvent.click(await screen.findByRole('checkbox', { name: 'Select skill:reviewed' }));
+    await screen.findByRole('checkbox', { name: 'Select skill:reviewed' });
     fireEvent.click(screen.getByRole('button', { name: 'Restore selected' }));
     const dialog = await screen.findByRole('dialog');
     diffs['skill:reviewed'] = '+second version';
@@ -61,7 +60,7 @@ describe('Draft confirmations', () => {
   it('revalidates Commit content and missing items and keeps the edited message on review', async () => {
     entries.push(entry('rule:gone'));
     const view = mount();
-    fireEvent.click(await screen.findByRole('checkbox', { name: 'Check all items' }));
+    await screen.findByRole('checkbox', { name: 'Clear checkboxes' });
     fireEvent.click(screen.getByRole('button', { name: 'Commit (2)' }));
     const dialog = await screen.findByRole('dialog');
     fireEvent.change(within(dialog).getByRole('textbox'), { target: { value: 'My message' } });
@@ -76,7 +75,7 @@ describe('Draft confirmations', () => {
   });
   it('invalidates review for binary edits whose textual diff is unchanged', async () => {
     const view = mount();
-    fireEvent.click(await screen.findByRole('checkbox', { name: 'Select skill:reviewed' }));
+    await screen.findByRole('checkbox', { name: 'Select skill:reviewed' });
     fireEvent.click(screen.getByRole('button', { name: 'Commit (1)' }));
     const dialog = await screen.findByRole('dialog');
     entries[0].fingerprint = 'binary-content-changed';
@@ -87,7 +86,7 @@ describe('Draft confirmations', () => {
   });
   it('cannot reconfirm Commit when all selected items disappeared', async () => {
     const view = mount();
-    fireEvent.click(await screen.findByRole('checkbox', { name: 'Select skill:reviewed' }));
+    await screen.findByRole('checkbox', { name: 'Select skill:reviewed' });
     fireEvent.click(screen.getByRole('button', { name: 'Commit (1)' }));
     const dialog = await screen.findByRole('dialog');
     entries = [];
@@ -99,7 +98,7 @@ describe('Draft confirmations', () => {
   });
   it('keeps review invalidated even if a later refresh restores the original content', async () => {
     const view = mount();
-    fireEvent.click(await screen.findByRole('checkbox', { name: 'Select skill:reviewed' }));
+    await screen.findByRole('checkbox', { name: 'Select skill:reviewed' });
     fireEvent.click(screen.getByRole('button', { name: 'Restore selected' }));
     const dialog = await screen.findByRole('dialog');
     diffs['skill:reviewed'] = '+temporary edit';
@@ -111,7 +110,7 @@ describe('Draft confirmations', () => {
   });
   it('blocks confirmation and shows errors when a Draft refresh fails', async () => {
     const view = mount();
-    fireEvent.click(await screen.findByRole('checkbox', { name: 'Select skill:reviewed' }));
+    await screen.findByRole('checkbox', { name: 'Select skill:reviewed' });
     fireEvent.click(screen.getByRole('button', { name: 'Commit (1)' }));
     const dialog = await screen.findByRole('dialog');
     vi.mocked(api.draft).mockRejectedValueOnce(new Error('Draft refresh failed'));
@@ -133,11 +132,10 @@ describe('Draft confirmations', () => {
 
 it.each(['Restore all', 'Restore selected'])('returns focus to %s after Cancel and Escape', async label => {
   mount();
-  fireEvent.click(await screen.findByRole('checkbox', { name: 'Select skill:reviewed' }));
-  const trigger = screen.getByRole('button', { name: label === 'Restore all' ? 'More' : label });
+  await screen.findByRole('checkbox', { name: 'Select skill:reviewed' });
+  const trigger = screen.getByRole('button', { name: label });
   for (const close of ['Cancel', 'Escape']) {
     trigger.focus(); fireEvent.click(trigger);
-    if (label === 'Restore all') fireEvent.click(await screen.findByRole('menuitem', { name: label }));
     const dialog = await screen.findByRole('dialog');
     if (close === 'Cancel') fireEvent.click(button(dialog, 'Cancel'));
     else fireEvent.keyDown(dialog, { key: 'Escape' });
@@ -147,7 +145,7 @@ it.each(['Restore all', 'Restore selected'])('returns focus to %s after Cancel a
 
 it('returns focus to Commit after Cancel and Escape and to its completion notice after success', async () => {
   mount();
-  fireEvent.click(await screen.findByRole('checkbox', { name: 'Select skill:reviewed' }));
+  await screen.findByRole('checkbox', { name: 'Select skill:reviewed' });
   const trigger = screen.getByRole('button', { name: 'Commit (1)' });
   for (const close of ['Cancel', 'Escape', 'Commit']) {
     trigger.focus(); fireEvent.click(trigger);
@@ -156,7 +154,7 @@ it('returns focus to Commit after Cancel and Escape and to its completion notice
     else fireEvent.click(button(dialog, close));
     if (close === 'Commit') {
       await screen.findByText('Commit complete');
-      await waitFor(() => expect(document.activeElement?.textContent).toContain('Commit complete'));
+      await waitFor(() => expect(screen.getByText('Commit complete').closest('[tabindex="-1"]')?.contains(document.activeElement)).toBe(true));
       expect(trigger.hasAttribute('disabled')).toBe(true);
     } else await waitFor(() => expect(document.activeElement).toBe(trigger));
   }
@@ -171,4 +169,56 @@ it('pushes unpushed items', async () => {
   render(<Draft revision={0} status={{ ...status, report: { ...status.report, unpushed: ['skill:reviewed'] } }} changed={changed} />);
   expect(screen.getByText('1 unpushed')).toBeTruthy(); fireEvent.click(screen.getByRole('button', { name: 'Push now' }));
   await waitFor(() => expect(api.push).toHaveBeenCalledOnce()); await waitFor(() => expect(changed).toHaveBeenCalledOnce());
+});
+
+it('selects arriving items until selection is changed by hand', async () => {
+  const view = mount();
+  expect((await screen.findByRole('button', { name: 'Commit (1)' })).hasAttribute('disabled')).toBe(false);
+  entries.push(entry('skill:new'));
+  await refresh(view, 1);
+  await screen.findByRole('button', { name: 'Commit (2)' });
+  fireEvent.click(screen.getByRole('checkbox', { name: 'Select skill:new' }));
+  entries.push(entry('rule:later'));
+  await refresh(view, 2);
+  await waitFor(() => expect(screen.getByRole('checkbox', { name: 'Select rule:later' }).getAttribute('aria-checked')).toBe('false'));
+  expect(screen.getByRole('button', { name: 'Commit (1)' })).toBeTruthy();
+});
+it('expands all diffs in the list and confirmation', async () => {
+  mount();
+  fireEvent.click(await screen.findByRole('button', { name: 'Expand all diffs' }));
+  expect(screen.getByRole('button', { name: 'Diff for skill:reviewed' }).getAttribute('aria-expanded')).toBe('true');
+  fireEvent.click(screen.getByRole('button', { name: 'Restore selected' }));
+  const dialog = await screen.findByRole('dialog');
+  expect(within(dialog).getByText('Restore 1 selected items?')).toBeTruthy();
+  fireEvent.click(button(dialog, 'Expand all diffs'));
+  expect(button(dialog, 'skill:reviewed').getAttribute('aria-expanded')).toBe('true');
+  fireEvent.click(button(dialog, 'Collapse all'));
+  expect(button(dialog, 'skill:reviewed').getAttribute('aria-expanded')).toBe('false');
+});
+it('only offers Pull when behind or blocked and places blocked Pull in the notice', async () => {
+  const view = mount();
+  expect(screen.queryByRole('button', { name: 'Pull Baseline' })).toBeNull();
+  view.rerender(<Draft revision={0} status={{ ...status, report: { ...status.report, behind: true } }} changed={changed} />);
+  expect(screen.getByRole('button', { name: 'Pull Baseline' })).toBeTruthy();
+  view.rerender(<Draft revision={0} status={{ ...status, report: { ...status.report, blocked: true } }} changed={changed} />);
+  expect(screen.getAllByRole('button', { name: 'Pull Baseline' })).toHaveLength(1);
+});
+it('keeps one Push action after an unpushed commit and marks matching Draft items', async () => {
+  vi.mocked(api.commit).mockResolvedValue({ sha: 'abc', items: ['skill:reviewed'], message: 'done', pushed: false, push_error: 'Offline' });
+  render(<Draft revision={0} status={{ ...status, report: { ...status.report, unpushed: ['skill:reviewed', 'rule:committed'] } }} changed={changed} />);
+  await screen.findByText('Unpushed');
+  fireEvent.click(screen.getByRole('button', { name: 'Commit (1)' }));
+  const dialog = await screen.findByRole('dialog');
+  fireEvent.click(button(dialog, 'Commit'));
+  await screen.findByText('abc');
+  expect(screen.getAllByRole('button', { name: 'Push now' })).toHaveLength(1);
+  expect(screen.queryByRole('button', { name: 'Retry push' })).toBeNull();
+  expect(screen.getByText('2 unpushed')).toBeTruthy();
+});
+it('dismisses a successful commit notice', async () => {
+  mount();
+  fireEvent.click(await screen.findByRole('button', { name: 'Commit (1)' }));
+  fireEvent.click(button(await screen.findByRole('dialog'), 'Commit'));
+  fireEvent.click(await screen.findByRole('button', { name: 'Dismiss' }));
+  expect(screen.queryByText('Commit complete')).toBeNull();
 });
