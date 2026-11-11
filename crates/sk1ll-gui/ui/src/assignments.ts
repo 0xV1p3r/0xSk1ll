@@ -5,7 +5,12 @@ import { applyToggle, mergeAssignments } from './model';
 import { cn } from '@/lib/utils';
 import type { CachedAssignmentSnapshot as AssignmentSnapshot, ToggleChange } from './types';
 
-export const matrixCheckbox = (explicit: boolean, enabled: boolean) => cn('size-[22px] rounded-[6px]', !enabled && 'border-dashed', !explicit && 'border-dashed border-primary/55 bg-brand-soft data-checked:border-primary/55 data-checked:bg-brand-soft data-checked:text-brand-ink dark:border-primary/35 dark:data-checked:border-primary/35', !explicit && !enabled && 'bg-muted/60 border-control-border/50');
+// Explicit: solid box with a pinned corner dot. Inherited: hollow dashed outline with a ghost tick. Shape alone tells them apart.
+export const matrixCheckbox = (explicit: boolean, enabled: boolean) => cn('size-[22px] rounded-[6px]', explicit
+  ? 'before:absolute before:-top-[3px] before:-right-[3px] before:size-2 before:rounded-full before:bg-foreground before:ring-2 before:ring-card'
+  : 'border-[1.5px] border-dashed bg-transparent data-checked:bg-transparent', !explicit && (enabled
+  ? 'border-primary/70 data-checked:border-primary/70 data-checked:text-brand-ink dark:border-primary/60 dark:data-checked:border-primary/60'
+  : 'border-control-border/80'));
 
 export function useAssignmentWrites<D extends { assignments: Record<string, AssignmentSnapshot> }>(resource: { data: D | undefined; setData: Dispatch<SetStateAction<D | undefined>>; refresh: () => Promise<void> }) {
   const locks = useRef(new Set<string>());
@@ -19,8 +24,9 @@ export function useAssignmentWrites<D extends { assignments: Record<string, Assi
     setOverrides(old => Object.fromEntries(Object.entries(old).filter(([machine, override]) =>
       override.saving || !accepted[machine] || accepted[machine].revision < override.revision)));
   }, [resource.data]);
+  // Resolves true once the Server accepted the changes.
   const write = async (machine: string, changes: ToggleChange[]) => {
-    if (!changes.length || !resource.data || locks.current.has(machine)) return;
+    if (!changes.length || !resource.data || locks.current.has(machine)) return false;
     locks.current.add(machine);
     setPending(p => ({ ...p, [machine]: true })); setErrors(e => ({ ...e, [machine]: '' }));
     const before = overrides[machine] ?? resource.data.assignments[machine];
@@ -35,8 +41,10 @@ export function useAssignmentWrites<D extends { assignments: Record<string, Assi
         assignments: mergeAssignments(previous.assignments, { [machine]: response }),
       });
       setOverrides(old => ({ ...old, [machine]: response }));
+      return true;
     } catch (error) {
       clearOverride(); setErrors(old => ({ ...old, [machine]: errorMessage(error) }));
+      return false;
     } finally {
       locks.current.delete(machine); setPending(p => ({ ...p, [machine]: false }));
       // useResource surfaces refresh failures while retaining accepted Assignment snapshots.

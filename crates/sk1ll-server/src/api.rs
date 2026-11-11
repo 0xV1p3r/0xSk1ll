@@ -11,7 +11,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use sk1ll_proto::{
     Assignment, AssignmentChanges, AssignmentSnapshot, AssignmentUpdate, FleetView, ImportsView, JoinCode, JoinRequest, JoinResponse,
-    LogCause, LogEntry, LogQuery, MachineRow, REPO_PATH, headline,
+    LogCause, LogEntry, LogFacets, LogQuery, MachineRow, REPO_PATH, headline,
 };
 
 use crate::assign::{self, Change};
@@ -28,6 +28,7 @@ pub fn routes() -> Router<Arc<Server>> {
         .route("/machines/{id}", delete(remove_machine))
         .route("/machines/{id}/assignment", get(get_assignment).put(put_assignment))
         .route("/log", get(log))
+        .route("/log/facets", get(log_facets))
         .route("/log/{id}/undo", post(undo))
         .route("/imports", get(imports))
         .route("/ws", get(crate::ws::upgrade))
@@ -187,6 +188,10 @@ fn published(server: &Server, machine: &str, applied: assign::Applied) -> Assign
 
 async fn log(State(server): ServerState, _: Caller, Query(q): Query<LogQuery>) -> Result<Json<Vec<LogEntry>>> {
     Ok(Json(server.db(move |conn| db::log_entries(conn, &q)).await?))
+}
+
+async fn log_facets(State(server): ServerState, _: Caller) -> Result<Json<LogFacets>> {
+    Ok(Json(server.db(|conn| db::log_facets(conn)).await?))
 }
 
 /// Restores an entry's `before` as a new entry. A no-op (empty `entries`) if

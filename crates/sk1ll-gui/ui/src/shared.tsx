@@ -62,12 +62,25 @@ export function Details({ rows, className }: { rows: [string, ReactNode][]; clas
     {rows.map(([term, value]) => <div key={term} className="contents"><dt className="text-muted-foreground">{term}</dt>
       <dd className="break-words">{value}</dd></div>)}</dl>;
 }
-// Relative time with the full timestamp available to every user.
-export function When({ seconds }: { seconds: number | null }) {
+// Relative time with the full timestamp available to every user. Dense lists that show the
+// exact time visibly pass `focusable={false}` so each row doesn't add a tab stop.
+export function When({ seconds, focusable = true }: { seconds: number | null; focusable?: boolean }) {
   if (seconds === null) return <>Never</>;
-  return <Tooltip><TooltipTrigger render={<time dateTime={new Date(seconds * 1000).toISOString()} tabIndex={0}
-    className="rounded-sm underline decoration-dotted underline-offset-4 outline-none focus-visible:ring-2 focus-visible:ring-ring" />}>
-    {ago(seconds)}<span className="sr-only"> ({time(seconds)})</span></TooltipTrigger><TooltipContent>{time(seconds)}</TooltipContent></Tooltip>;
+  const label = <>{ago(seconds)}<span className="sr-only"> ({time(seconds)})</span></>;
+  const props = { dateTime: new Date(seconds * 1000).toISOString(), className: 'rounded-sm underline decoration-dotted underline-offset-4 outline-none focus-visible:ring-2 focus-visible:ring-ring' };
+  if (!focusable) return <time {...props} title={time(seconds)}>{label}</time>;
+  return <Tooltip><TooltipTrigger render={<time {...props} tabIndex={0} />}>{label}</TooltipTrigger><TooltipContent>{time(seconds)}</TooltipContent></Tooltip>;
+}
+// Screen sections share one heading style: sentence case, semibold, no eyebrow caps.
+export function SectionTitle({ id, children, className }: { id?: string; children: ReactNode; className?: string }) {
+  return <h2 id={id} className={cn('text-sm font-semibold text-foreground', className)}>{children}</h2>;
+}
+// A bordered surface whose toolbar sits inside it, above the content. Use for every table or list screen.
+export function Panel({ children, className, label }: { children: ReactNode; className?: string; label?: string }) {
+  return <section aria-label={label} className={cn('min-w-0 overflow-hidden rounded-xl border bg-card', className)}>{children}</section>;
+}
+export function PanelToolbar({ children, className }: { children: ReactNode; className?: string }) {
+  return <div className={cn('flex flex-wrap items-center gap-2 border-b px-3.5 py-2.5', className)}>{children}</div>;
 }
 export function Action({ label, action, onDone, disabled = false, variant = 'outline', ariaLabel, doneLabel, className, announceDone = true, toastOnDone }: {
   label: string; action: () => Promise<unknown>; onDone?: () => void; disabled?: boolean;

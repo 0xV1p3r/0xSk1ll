@@ -258,10 +258,29 @@ pub enum LogCause {
 pub struct LogQuery {
     /// Only entries for this machine.
     pub machine: Option<String>,
-    /// Only entries with an id below this (paging, newest first).
+    /// Only entries for this harness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    /// Only entries by this author.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    /// Only entries whose `<kind>:<name>` (`skill:pdf`, `new_skills_default:`)
+    /// contains this, ignoring ASCII case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<String>,
+    /// Only entries with an id below this (paging, newest first). Filters
+    /// apply before the limit, so the last id of a page is the next cursor.
     pub before: Option<i64>,
     /// Default 100, max 1000.
     pub limit: Option<u32>,
+}
+
+/// `GET /api/log/facets`: the distinct values in the whole log, sorted, for filters.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogFacets {
+    pub machines: Vec<String>,
+    pub harnesses: Vec<String>,
+    pub authors: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------

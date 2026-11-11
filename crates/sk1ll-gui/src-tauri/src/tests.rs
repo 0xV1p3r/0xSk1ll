@@ -558,9 +558,12 @@ fn mac_terminal_script_shell_quoting_round_trips_unusual_paths() {
 async fn new_commands_forward_typed_payloads() {
     let requests = Recorded::default();
     let mut replies = Replies::new();
-    for path in ["POST /items/create", "POST /imports/remove"] {
+    for path in ["POST /items/create", "POST /imports/remove", "POST /items/delete"] {
         replies.insert(path.into(), (StatusCode::NO_CONTENT, Value::Null));
     }
+    replies.insert("POST /items/rename".into(), (StatusCode::OK, json!({"item":"skill:docs","migrated":["claude"],"assignment_error":null})));
+    replies.insert("GET /log?machine=a%20b&harness=claude&author=dev&item=skill%3Apdf&before=9&limit=50".into(), (StatusCode::OK, json!([])));
+    replies.insert("GET /log/facets".into(), (StatusCode::OK, json!({"machines":["a"],"harnesses":["claude"],"authors":["dev"]})));
     replies.insert("POST /push".into(), (StatusCode::OK, json!({"pushed":true})));
     replies.insert("POST /imports/check".into(), (StatusCode::OK, json!({"imports":[],"updates":[],"errors":[],"checked_at":1})));
     replies.insert("POST /conflicts/diff".into(), (StatusCode::OK, json!({"item":"skill:pdf","diff":"+draft"})));
@@ -571,8 +574,17 @@ async fn new_commands_forward_typed_payloads() {
     bridge.remove_import("pdf".into()).await.unwrap();
     assert_eq!(bridge.check_imports().await.unwrap().checked_at, Some(1));
     assert_eq!(bridge.conflict_diff(ConflictDiffRequest { harness: None, name: None, id: Some("recovered".into()) }).await.unwrap().diff, "+draft");
+    bridge.delete_item(DeleteItemRequest { kind: "rule".into(), name: "style".into() }).await.unwrap();
+    let renamed = bridge.rename_item(RenameItemRequest { kind: "skill".into(), name: "pdf".into(), to: "docs".into() }).await.unwrap();
+    assert_eq!((renamed.item.to_string(), renamed.migrated), ("skill:docs".to_string(), vec!["claude".to_string()]));
+    let query = LogQuery { machine: Some("a b".into()), harness: Some("claude".into()), author: Some("dev".into()),
+        item: Some("skill:pdf".into()), before: Some(9), limit: Some(50) };
+    assert!(bridge.log(query).await.unwrap().is_empty());
+    assert_eq!(bridge.log_facets().await.unwrap().authors, ["dev"]);
     let requests = requests.lock().unwrap();
     assert_eq!(requests[1].2, json!({"kind":"skill","name":"pdf","description":"PDF"}));
     assert_eq!(requests[2].2, json!({"name":"pdf"}));
     assert_eq!(requests[4].2["id"], "recovered");
+    assert_eq!(requests[5].2, json!({"kind":"rule","name":"style"}));
+    assert_eq!(requests[6].2, json!({"kind":"skill","name":"pdf","to":"docs"}));
 }

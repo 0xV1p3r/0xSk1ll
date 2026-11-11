@@ -35,7 +35,11 @@ export interface LogEntry {
   id: number; at: number; author: string; machine: string; harness: string; kind: ToggleKind;
   name: string | null; before: boolean | null; after: boolean | null; cause: LogCause;
 }
-export interface LogQuery { machine?: string; before?: number; limit?: number }
+// Filters run on the Server before `limit`, so the last id of a page is the next `before`.
+// `item` matches a substring of `<kind>:<name>` ignoring ASCII case; empty strings match everything.
+export interface LogQuery { machine?: string; harness?: string; author?: string; item?: string; before?: number; limit?: number }
+// Distinct values over the whole Assignment log, sorted.
+export interface LogFacets { machines: string[]; harnesses: string[]; authors: string[] }
 // The GUI bridge adds a byte fingerprint to the Daemon's Draft entry.
 export interface DraftEntry { item: ItemRef; change: 'added' | 'modified' | 'deleted'; paths: string[]; fingerprint: string }
 export interface DiffView { item: ItemRef; diff: string }
@@ -48,6 +52,8 @@ export type PullResult = { state: 'up_to_date' } | { state: 'updated'; from: str
   | { state: 'blocked'; baseline: string; items: ItemRef[] };
 export interface ConflictView {
   kind?: string; id?: string; item?: ItemRef; path?: string; displaced_at?: number;
+  // Harness conflicts only: newest mtime of the Harness content (when it was last edited), not a first-seen time.
+  detected_at?: number | null;
   harness: string; name: string; items: ItemRef[]; dest: string; reason: string | null; adoptable: boolean;
 }
 export interface ConflictTarget { harness: string; name: string }
@@ -92,5 +98,12 @@ export interface EditorsView { editors: Editor[]; preferred_editor: string }
 
 export interface PushResult { pushed: boolean }
 export interface CreateItemRequest { kind: 'skill' | 'rule'; name: string; description?: string }
+// Personal Skills and Rules only; Imports use removeImport. Both are Draft changes.
+export interface DeleteItemRequest { kind: 'skill' | 'rule'; name: string }
+export interface RenameItemRequest { kind: 'skill' | 'rule'; name: string; to: string }
+// The rename is in the Draft either way. `migrated` lists the Harnesses whose explicit toggles on this
+// Machine were copied to the new name; `assignment_error` says why they were not (e.g. offline).
+// Other Machines are not migrated: after the push, the old name's toggles are dropped and the new name follows their defaults.
+export interface RenameItemResponse { item: ItemRef; migrated: string[]; assignment_error: string | null }
 export type ConflictDiffRequest = { harness: string; name: string; id?: never } | { id: string; harness?: never; name?: never };
 export interface ImportEntry { name: string; source: string; ref: string; path: string; locked: string | null }

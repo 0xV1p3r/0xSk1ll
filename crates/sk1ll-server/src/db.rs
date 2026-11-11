@@ -5,7 +5,7 @@ use std::path::Path;
 
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, Row, params};
-use sk1ll_proto::{Assignment, AssignmentSnapshot, LogCause, LogEntry, LogQuery, MachineReport, ToggleKind};
+use sk1ll_proto::{Assignment, AssignmentSnapshot, LogCause, LogEntry, LogFacets, LogQuery, MachineReport, ToggleKind};
 
 use crate::error::Result;
 
@@ -255,16 +255,30 @@ fn log_entry_from((id, at, author, machine, harness, kind, name, before, after, 
     })
 }
 
-/// Newest first.
+/// Newest first. Empty filters match everything; `item` is a substring of
+/// `<kind>:<name>`, ignoring ASCII case (`instr`, so `%` and `_` are literal).
 pub fn log_entries(conn: &Connection, q: &LogQuery) -> Result<Vec<LogEntry>> {
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
     let mut stmt = conn.prepare(&format!(
         "SELECT {LOG_COLS} FROM log
-         WHERE (?1 IS NULL OR machine = ?1) AND (?2 IS NULL OR id < ?2)
+         WHERE (NULLIF(?1, '') IS NULL OR machine = ?1) AND (?2 IS NULL OR id < ?2)
+           AND (NULLIF(?4, '') IS NULL OR harness = ?4) AND (NULLIF(?5, '') IS NULL OR author = ?5)
+           AND (NULLIF(?6, '') IS NULL OR instr(lower(kind || ':' || coalesce(name, '')), lower(?6)) > 0)
          ORDER BY id DESC LIMIT ?3"
     ))?;
-    let rows = stmt.query_map(params![q.machine, q.before, limit], log_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows = stmt
+        .query_map(params![q.machine, q.before, limit, q.harness, q.author, q.item], log_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     rows.into_iter().map(log_entry_from).collect()
+}
+
+/// Distinct machines, harnesses and authors over the whole log, sorted.
+pub fn log_facets(conn: &Connection) -> Result<LogFacets> {
+    let distinct = |column: &str| -> Result<Vec<String>> {
+        let mut stmt = conn.prepare(&format!("SELECT DISTINCT {column} FROM log ORDER BY {column}"))?;
+        Ok(stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?)
+    };
+    Ok(LogFacets { machines: distinct("machine")?, harnesses: distinct("harness")?, authors: distinct("author")? })
 }
 
 pub fn log_entry(conn: &Connection, id: i64) -> Result<Option<LogEntry>> {
@@ -301,6 +315,46 @@ mod tests {
         assert_eq!(log_entry(&conn, e.id).unwrap(), Some(e.clone()));
         assert_eq!(log_entries(&conn, &LogQuery { machine: Some("other".into()), ..Default::default() }).unwrap(), []);
         assert_eq!(log_entries(&conn, &LogQuery::default()).unwrap(), [e]);
+    }
+
+    #[test]
+    fn log_filters_apply_before_the_limit_and_keep_the_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("server.db")).unwrap();
+        let entry = |machine: &str, harness: &str, author: &str, kind, name: Option<&str>| {
+            let mut e = LogEntry {
+                id: 0, at: 1, author: author.into(), machine: machine.into(), harness: harness.into(), kind,
+                name: name.map(Into::into), before: None, after: Some(true), cause: LogCause::Change,
+            };
+            append_log(&conn, &mut e).unwrap();
+            e.id
+        };
+        let old = entry("m", "claude", "alice", ToggleKind::Skill, Some("PDF-tools"));
+        let rule = entry("m", "codex", "bob", ToggleKind::Rule, Some("pdf"));
+        for _ in 0..5 {
+            entry("n", "claude", "bob", ToggleKind::Skill, Some("deploy"));
+        }
+        let default = entry("m", "claude", "alice", ToggleKind::NewSkillsDefault, None);
+        let ids = |q: LogQuery| log_entries(&conn, &q).unwrap().into_iter().map(|e| e.id).collect::<Vec<_>>();
+        let page = |q: LogQuery| LogQuery { limit: Some(1), ..q };
+
+        // A match older than a page of non-matches is still found.
+        assert_eq!(ids(page(LogQuery { item: Some("pdf".into()), ..Default::default() })), [rule]);
+        assert_eq!(ids(LogQuery { item: Some("pdf".into()), before: Some(rule), ..Default::default() }), [old]);
+        assert_eq!(ids(LogQuery { item: Some("SKILL:pdf".into()), ..Default::default() }), [old]);
+        assert_eq!(ids(LogQuery { item: Some("new_skills".into()), ..Default::default() }), [default]);
+        assert_eq!(ids(LogQuery { item: Some("%".into()), ..Default::default() }), Vec::<i64>::new());
+        assert_eq!(ids(LogQuery { harness: Some("codex".into()), ..Default::default() }), [rule]);
+        assert_eq!(ids(page(LogQuery { author: Some("alice".into()), before: Some(default), ..Default::default() })), [old]);
+        let q = LogQuery { machine: Some("m".into()), harness: Some("claude".into()), author: Some("alice".into()), ..Default::default() };
+        assert_eq!(ids(q), [default, old]);
+        let empty = LogQuery { machine: Some(String::new()), harness: Some(String::new()), item: Some(String::new()), ..Default::default() };
+        assert_eq!(ids(empty).len(), 8);
+
+        let facets = log_facets(&conn).unwrap();
+        assert_eq!(facets.machines, ["m", "n"]);
+        assert_eq!(facets.harnesses, ["claude", "codex"]);
+        assert_eq!(facets.authors, ["alice", "bob"]);
     }
 
     #[test]

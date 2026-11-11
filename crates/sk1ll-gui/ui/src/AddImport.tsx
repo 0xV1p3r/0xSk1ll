@@ -1,6 +1,6 @@
 import { toast } from './toast';
 import { useEffect, useRef, useState } from 'react';
-import { ChevronRight } from 'lucide-react';
+import { Check, CircleAlert, ChevronRight } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
@@ -12,10 +12,18 @@ import { ErrorNotice } from './shared';
 import { shortSha } from './model';
 import type { ResolvedSource } from './types';
 
+function importError(error: unknown) {
+  const message = errorMessage(error);
+  return /fetch|clone|repository|remote|authentication|credentials|access denied|permission denied|could not resolve host|connection|network|https?:\/\//i.test(message)
+    ? `${message} Check this import's repository URL and access credentials.` : message;
+}
+
 export function AddImport({ changed, reviewDraft, initiallyOpen = false }: {
-  changed: () => void; reviewDraft: () => void; initiallyOpen?: boolean;
+  changed: () => void; reviewDraft: () => void; initiallyOpen?: boolean | number;
 }) {
-  const [open, setOpen] = useState(initiallyOpen);
+  const [open, setOpen] = useState(!!initiallyOpen);
+  // A new truthy request (a counter from App) reopens the dialog on a mounted screen.
+  useEffect(() => { if (initiallyOpen) setOpen(true); }, [initiallyOpen]);
   const trigger = useRef<HTMLButtonElement>(null);
   const busy = useRef(false);
   return <><Button ref={trigger} onClick={() => setOpen(true)}>Add Import</Button>
@@ -33,7 +41,7 @@ function AddImportForm({ busy, changed, reviewDraft, finalFocus }: {
   const [selected, setSelected] = useState<boolean[]>([]);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState('');
-  const [results, setResults] = useState<string[]>([]);
+  const [results, setResults] = useState<{ message: string; failed?: boolean }[]>([]);
   const [finished, setFinished] = useState(false);
   const linkInput = useRef<HTMLInputElement>(null);
   const candidates = useRef<HTMLDivElement>(null);
@@ -55,8 +63,8 @@ function AddImportForm({ busy, changed, reviewDraft, finalFocus }: {
       setTaken(inventory.filter(i => i.item.startsWith('skill:') && i.draft !== 'deleted').map(i => i.item.slice(6)));
       setResolved(source); setAnnouncement(source.candidates.length ? `${source.candidates.length} ${source.candidates.length === 1 ? 'Skill' : 'Skills'} found` : ''); setNames(source.candidates.map(c => c.default_name));
       setSelected(source.candidates.map(() => source.candidates.length === 1));
-      if (!source.candidates.length) setError('No Skills found at this source.');
-    } catch (e) { setError(`${errorMessage(e)} Check this import's repository URL and access credentials.`); }
+
+    } catch (e) { setError(importError(e)); }
     finally { busy.current = false; setPending(false); }
   };
   const problems = names.map((name, i) => !name ? 'Enter a name.'
@@ -72,25 +80,25 @@ function AddImportForm({ busy, changed, reviewDraft, finalFocus }: {
         if (!selected[i]) continue;
         current = names[i];
         await api.addImport({ name: names[i], source: resolved.source, path: resolved.candidates[i].path, ref: resolved.git_ref, commit: resolved.commit });
-        setResults(r => [...r, `${names[i]} added into Draft.`]);
+        setResults(r => [...r, { message: `${names[i]} added into Draft.` }]);
         setAnnouncement(`Added ${names[i]} into Draft.`); toast({ title: `Added ${names[i]} into Draft.` });
       }
     } catch (e) {
-      setResults(r => [...r, `${current} may not have been added; check the Draft.`]);
+      setResults(r => [...r, { message: `${current} may not have been added; check the Draft.`, failed: true }]);
       setAnnouncement('');
-      setError(`${errorMessage(e)} Check this import's repository URL and access credentials. Items listed as added stay in the Draft.`);
+      setError(`${importError(e)} Items listed as added stay in the Draft.`);
     }
     finally { busy.current = false; setPending(false); setFinished(true); changed(); }
   };
   return <DialogContent finalFocus={finalFocus} showCloseButton={!pending}>
     <DialogHeader><DialogTitle>Add Import</DialogTitle><DialogDescription>Resolve a link, then add Skills into this Machine's Draft.</DialogDescription></DialogHeader>
-    {!resolved && <FieldGroup><Field><FieldLabel htmlFor="import-link">Link</FieldLabel>
+    {!resolved && <form onSubmit={event => { event.preventDefault(); if (link.trim()) void resolve(); }}><FieldGroup><Field><FieldLabel htmlFor="import-link">Link</FieldLabel>
       <Input ref={linkInput} id="import-link" placeholder="https://github.com/owner/repo" value={link} disabled={pending} onChange={e => setLink(e.target.value)} /></Field>
       <Collapsible><CollapsibleTrigger render={<Button variant="ghost" className="group/advanced -ml-2.5" disabled={pending} />}><ChevronRight className="transition-transform group-data-panel-open/advanced:rotate-90" />Advanced</CollapsibleTrigger>
         <CollapsibleContent><Field><FieldLabel htmlFor="import-path">Path (subdirectory for other git URLs)</FieldLabel>
           <Input id="import-path" value={path} disabled={pending} onChange={e => setPath(e.target.value)} /></Field></CollapsibleContent></Collapsible>
-      <Button disabled={pending || !link.trim()} onClick={resolve}>{pending ? 'Resolving…' : 'Resolve'}</Button></FieldGroup>}
-    {resolved && <><dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2 rounded-xl border border-border bg-muted/40 p-3 text-xs break-all [&_dt]:text-muted-foreground [&_dd]:font-mono"><dt>Source</dt><dd>{resolved.source}</dd><dt>Ref</dt><dd>{resolved.git_ref}</dd><dt>Commit</dt><dd>{shortSha(resolved.commit)}</dd></dl>
+      <Button type="submit" disabled={pending || !link.trim()}>{pending ? 'Resolving…' : 'Resolve'}</Button></FieldGroup></form>}
+    {resolved && <form id="add-import" onSubmit={event => { event.preventDefault(); void add(); }}><dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2 rounded-xl border border-border bg-muted/40 p-3 text-xs break-all [&_dt]:text-muted-foreground [&_dd]:font-mono"><dt>Source</dt><dd>{resolved.source}</dd><dt>Ref</dt><dd>{resolved.git_ref}</dd><dt>Commit</dt><dd>{shortSha(resolved.commit)}</dd></dl>
       <FieldGroup className="rounded-xl border border-border bg-card p-4" ref={candidates}><h2 tabIndex={-1} className="font-medium outline-none">Resolved Skills</h2>{resolved.candidates.map((candidate, i) => <Field key={candidate.path} data-invalid={selected[i] && !!problems[i]}>
         {resolved.candidates.length > 1 && <FieldLabel><Checkbox aria-label={`Select ${candidate.path || 'root'}`} checked={selected[i]} disabled={pending || finished}
           onCheckedChange={checked => setSelected(s => s.map((v, j) => j === i ? !!checked : v))} />{candidate.path || '(root)'}</FieldLabel>}
@@ -99,11 +107,11 @@ function AddImportForm({ busy, changed, reviewDraft, finalFocus }: {
           <Input id={`import-name-${i}`} value={names[i]} disabled={pending || finished} aria-invalid={!!problems[i]} aria-describedby={problems[i] ? `import-name-error-${i}` : undefined}
             onChange={e => setNames(n => n.map((v, j) => j === i ? e.target.value : v))} />
           {problems[i] && <FieldError id={`import-name-error-${i}`}>{problems[i]}</FieldError>}</>}
-      </Field>)}</FieldGroup></>}
+      </Field>)}</FieldGroup>{!resolved.candidates.length && <p className="rounded-xl bg-muted p-4 text-sm">No Skills found at this source. Try a subdirectory under Advanced → Path using Change source.</p>}</form>}
     <div ref={errorSummary} tabIndex={-1} className="outline-none empty:hidden"><ErrorNotice error={error || undefined} /></div>
-    {results.length > 0 && <div>{results.map(result => <p key={result}>{result}</p>)}</div>}
+    {results.length > 0 && <ul aria-label="Import results" className="space-y-2 text-sm">{results.map(result => <li key={result.message} className="flex items-start gap-2">{result.failed ? <CircleAlert aria-hidden="true" className="size-4 shrink-0 text-destructive" /> : <Check aria-hidden="true" className="size-4 shrink-0 text-green-600" />}<span>{result.message}</span></li>)}</ul>}
     <p role="status" aria-live="polite" aria-atomic="true" className="sr-only">{announcement}</p>
     {(resolved || finished) && <DialogFooter>{resolved && !finished && <Button variant="outline" disabled={pending} onClick={() => { setResolved(undefined); setTaken([]); setNames([]); setSelected([]); setError(''); setResults([]); setAnnouncement(''); }}>Change source</Button>}{finished ? <Button ref={reviewButton} onClick={reviewDraft}>Review in Draft</Button>
-      : resolved && <Button disabled={pending || !selected.some(Boolean) || problems.some((p, i) => selected[i] && !!p)} onClick={add}>{pending ? 'Adding…' : 'Add into Draft'}</Button>}</DialogFooter>}
+      : resolved && <Button type="submit" form="add-import" disabled={pending || !selected.some(Boolean) || problems.some((p, i) => selected[i] && !!p)}>{pending ? 'Adding…' : 'Add into Draft'}</Button>}</DialogFooter>}
   </DialogContent>;
 }

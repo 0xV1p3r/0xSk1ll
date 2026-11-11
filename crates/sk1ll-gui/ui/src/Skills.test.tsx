@@ -6,10 +6,12 @@ import { TooltipProvider } from '@/components/ui/tooltip';
 import { Skills } from './Skills';
 import { AppSidebar } from './App';
 import { api } from './api';
+import { toast } from './toast';
+vi.mock('./toast', () => ({ toast: vi.fn() }));
 import type { ContentEntry, ContentType, StatusView } from './types';
 
 vi.mock('./api', () => ({ api: { skills: vi.fn(), skillTree: vi.fn(), skillFile: vi.fn(), editors: vi.fn(),
-  fork: vi.fn(), adoptUnmanaged: vi.fn(), openInEditor: vi.fn(), setPreferredEditor: vi.fn(), createItem: vi.fn() }, errorMessage: (error: unknown) => String(error) }));
+  fork: vi.fn(), adoptUnmanaged: vi.fn(), openInEditor: vi.fn(), setPreferredEditor: vi.fn(), createItem: vi.fn(), deleteItem: vi.fn(), renameItem: vi.fn() }, errorMessage: (error: unknown) => String(error) }));
 const entry = (name: string, type: ContentType, extra: Partial<ContentEntry> = {}): ContentEntry => ({
   name, item: type === 'unmanaged' ? null : `${type === 'rule' ? 'rule' : 'skill'}:${name}`, type,
   description: `About ${name}`, draft: null, in_baseline: type !== 'unmanaged', path: null,
@@ -86,8 +88,8 @@ it('Adopts the selected variant before opening and passes its hash to browsing',
   expect(vi.mocked(api.adoptUnmanaged).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(api.openInEditor).mock.invocationCallOrder[0]);
 });
 it('offers plain Adopt without opening an editor', async () => {
-  mount(); await select('notes', 'Unmanaged'); fireEvent.click(screen.getByRole('button', { name: 'Adopt' }));
-  fireEvent.click(screen.getByRole('button', { name: 'Adopt into Draft' }));
+  mount(); await select('notes', 'Unmanaged'); fireEvent.click(screen.getByRole('button', { name: 'Adopt into Draft' }));
+  fireEvent.click(within(screen.getByRole('dialog', { name: 'Adopt notes?' })).getByRole('button', { name: 'Adopt into Draft' }));
   await waitFor(() => expect(api.adoptUnmanaged).toHaveBeenCalledOnce()); expect(api.openInEditor).not.toHaveBeenCalled();
 });
 it('chooses a Terminal editor from the split button and refreshes preference', async () => {
@@ -139,7 +141,7 @@ it('stops after failed Adopt and blocks clashing names', async () => {
   fireEvent.click(screen.getByRole('button', { name: 'Choose editor' })); fireEvent.click(await screen.findByRole('menuitem', { name: 'Adopt and open in VS Code' })); fireEvent.click(screen.getByRole('button', { name: 'Adopt and open' }));
   await screen.findAllByText('Cannot Adopt'); expect(api.openInEditor).not.toHaveBeenCalled(); cleanup();
   mount([entry('notes', 'unmanaged', { clashes_with_repo: true })]); await select('notes', 'Unmanaged');
-  expect((screen.getByRole('button', { name: 'Adopt' }) as HTMLButtonElement).disabled).toBe(true);
+  expect((screen.getByRole('button', { name: 'Adopt into Draft' }) as HTMLButtonElement).disabled).toBe(true);
 });
 it('Harness chips navigate to the Assignment matrix', () => {
   mount(); fireEvent.click(screen.getByRole('button', { name: 'Assignment for writing in claude' })); expect(assignment).toHaveBeenCalledWith('skill:writing', 'claude'); expect(screen.queryByRole('dialog')).toBeNull();
@@ -171,7 +173,7 @@ it('does not keep another variant preview when reading the new variant fails', a
 it.each(['offline', 'connecting', 'auth_rejected', 'revoked'] as const)('disables adoption while %s and explains the connection requirement', async connection => {
   render(<TooltipProvider><Skills {...props} connection={connection} /></TooltipProvider>);
   await select('notes', 'Unmanaged');
-  for (const name of ['Adopt', 'Choose editor']) {
+  for (const name of ['Adopt into Draft', 'Choose editor']) {
     expect(screen.getByRole('button', { name }).hasAttribute('disabled')).toBe(true);
     fireEvent.click(screen.getByRole('button', { name }));
   }
@@ -181,9 +183,9 @@ it.each(['offline', 'connecting', 'auth_rejected', 'revoked'] as const)('disable
 it('disables a pending adoption confirmation when the Server disconnects', async () => {
   const view = render(<TooltipProvider><Skills {...props} /></TooltipProvider>);
   await select('notes', 'Unmanaged');
-  fireEvent.click(screen.getByRole('button', { name: 'Adopt' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Adopt into Draft' }));
   view.rerender(<TooltipProvider><Skills {...props} connection="offline" /></TooltipProvider>);
-  expect(screen.getByRole('button', { name: 'Adopt into Draft' }).hasAttribute('disabled')).toBe(true);
+  expect(within(screen.getByRole('dialog', { name: 'Adopt notes?' })).getByRole('button', { name: 'Adopt into Draft' }).hasAttribute('disabled')).toBe(true);
 });
 
 it('opens an Unmanaged Harness chip at its selected variant without navigating to Assignment', async () => {
@@ -196,17 +198,17 @@ it('opens an Unmanaged Harness chip at its selected variant without navigating t
 });
 it('offers Add Import for an empty inventory and keeps filtered empty results distinct', () => {
   const view = mount([]);
-  expect(screen.getByText('No Skills yet')).toBeTruthy();
+  expect(screen.getByText('Nothing in the Library yet')).toBeTruthy();
   fireEvent.click(screen.getByRole('button', { name: 'Add Import' })); expect(addImport).toHaveBeenCalledOnce();
   view.rerender(<TooltipProvider><Skills {...props} /></TooltipProvider>);
   fireEvent.change(screen.getByLabelText('Search by name'), { target: { value: 'missing' } });
-  expect(screen.getByText('No matching Skills')).toBeTruthy();
+  expect(screen.getByText('No matching Skills or Rules')).toBeTruthy();
   expect(screen.queryByRole('button', { name: 'Add Import' })).toBeNull();
 });
 
 it('keeps confirmation focus inside the detail dialog on Cancel and Escape and focuses Review after Adopt', async () => {
   mount(); await select('notes', 'Unmanaged');
-  const trigger = screen.getByRole('button', { name: 'Adopt' });
+  const trigger = screen.getByRole('button', { name: 'Adopt into Draft' });
   for (const close of ['Cancel', 'Escape', 'Adopt into Draft']) {
     trigger.focus(); fireEvent.click(trigger);
     const dialog = await screen.findByRole('dialog', { name: 'Adopt notes?' });
@@ -218,9 +220,9 @@ it('keeps confirmation focus inside the detail dialog on Cancel and Escape and f
   }
 });
 
-it('applies initialSearch changes', () => {
-  const view = render(<Skills {...props} initialSearch="writing" />); expect((screen.getByLabelText('Search by name') as HTMLInputElement).value).toBe('writing');
-  view.rerender(<Skills {...props} initialSearch="pdf" />); expect((screen.getByLabelText('Search by name') as HTMLInputElement).value).toBe('pdf');
+it('applies search handoffs', () => {
+  const view = render(<Skills {...props} handoff={{ search: 'writing' }} />); expect((screen.getByLabelText('Search by name') as HTMLInputElement).value).toBe('writing');
+  view.rerender(<Skills {...props} handoff={{ search: 'pdf' }} />); expect((screen.getByLabelText('Search by name') as HTMLInputElement).value).toBe('pdf');
 });
 it('validates and creates a new Skill', async () => {
   mount([]); fireEvent.click(screen.getByRole('button', { name: 'New Skill' }));
@@ -248,4 +250,90 @@ it.each(['skill', 'rule'] as const)('checks collisions only in the %s namespace'
   expect(create.hasAttribute('disabled')).toBe(false);
   fireEvent.click(create);
   await waitFor(() => expect(api.createItem).toHaveBeenCalledWith({ kind, name: kind === 'rule' ? 'writing' : 'style', description: undefined }));
+});
+
+it('shows the unmanaged handoff notice and switches between Unmanaged and all entries', () => {
+  render(<TooltipProvider><Skills {...props} handoff={{ filter: 'unmanaged' }} /></TooltipProvider>);
+  expect(screen.getByText(/1 unmanaged skill found in your Harnesses/)).toBeTruthy();
+  expect(screen.getAllByRole('row')).toHaveLength(2);
+  fireEvent.click(screen.getByRole('button', { name: 'Show all' }));
+  expect(screen.getAllByRole('row')).toHaveLength(5);
+  fireEvent.click(screen.getByRole('button', { name: 'Show Unmanaged' }));
+  expect(screen.getAllByRole('row')).toHaveLength(2);
+  expect(screen.getByPlaceholderText('Search Skills and Rules')).toBeTruthy();
+});
+it('explains an empty name and submits the creation form', async () => {
+  mount([]); fireEvent.click(screen.getByRole('button', { name: 'New Skill' }));
+  const input = screen.getByLabelText('Name');
+  fireEvent.blur(input);
+  expect(screen.getByRole('alert').textContent).toBe('Enter a name');
+  expect(input.getAttribute('aria-invalid')).toBe('true');
+  expect(screen.getByText(/New Skills follow each Harness's default/)).toBeTruthy();
+  fireEvent.change(input, { target: { value: 'keyboard-skill' } });
+  fireEvent.submit(input.closest('form')!);
+  await waitFor(() => expect(api.createItem).toHaveBeenCalledWith({ kind: 'skill', name: 'keyboard-skill', description: undefined }));
+});
+it('opens the matrix without a Harness cell target when none are enabled', async () => {
+  mount([entry('writing', 'personal', { enabled_harnesses: [] })]);
+  await select('writing', 'Personal');
+  fireEvent.click(screen.getByRole('button', { name: 'Open in Assignment matrix' }));
+  expect(assignment).toHaveBeenCalledWith('skill:writing', 'all');
+});
+
+it.each(['personal', 'rule'] as const)('confirms deletion of a %s item and closes detail on success', async type => {
+  vi.mocked(api.deleteItem).mockResolvedValue(); mount([entry('target', type)]); await select('target', type === 'rule' ? 'Rule' : 'Personal');
+  fireEvent.click(screen.getByRole('button', { name: 'Delete…' }));
+  expect(api.deleteItem).not.toHaveBeenCalled();
+  const dialog = screen.getByRole('dialog', { name: 'Delete target?' });
+  expect(dialog.textContent).toContain('Commit removes it from the Baseline and every Machine.');
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Delete' }));
+  await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+  expect(api.deleteItem).toHaveBeenCalledWith({ kind: type === 'rule' ? 'rule' : 'skill', name: 'target' });
+  expect(toast).toHaveBeenCalledWith({ title: 'target deleted in Draft' }); expect(changed).toHaveBeenCalledOnce();
+});
+it.each(['import', 'unmanaged', 'deleted'] as const)('hides rename and delete for %s entries', async type => {
+  mount([entry('target', type === 'deleted' ? 'personal' : type, type === 'deleted' ? { draft: 'deleted' } : {})]);
+  fireEvent.click(screen.getByRole('row', { name: `View ${type === 'deleted' ? 'Personal' : type === 'import' ? 'Import' : 'Unmanaged'} target` }));
+  expect(await screen.findByRole('dialog')).toBeTruthy();
+  expect(screen.queryByRole('button', { name: 'Rename…' })).toBeNull(); expect(screen.queryByRole('button', { name: 'Delete…' })).toBeNull();
+});
+it.each(['personal', 'rule'] as const)('validates and submits rename for %s, selecting its new name', async type => {
+  const kind = type === 'rule' ? 'rule' : 'skill';
+  vi.mocked(api.renameItem).mockResolvedValue({ item: `${kind}:fresh`, migrated: ['claude'], assignment_error: null });
+  mount([entry('target', type), entry('taken', type), entry('fresh', type === 'rule' ? 'personal' : 'rule')]); await select('target', type === 'rule' ? 'Rule' : 'Personal');
+  fireEvent.click(screen.getByRole('button', { name: 'Rename…' }));
+  const input = screen.getByLabelText('Name'), submit = screen.getByRole('button', { name: 'Rename' });
+  expect(screen.getByText(/Assignment toggles carry over on this Machine only/)).toBeTruthy();
+  for (const name of ['', 'target', 'TARGET', 'TAKEN', 'bad name', 'a..b', '_bad']) {
+    fireEvent.change(input, { target: { value: name } }); expect(submit.hasAttribute('disabled')).toBe(true);
+    fireEvent.submit(input.closest('form')!);
+  }
+  expect(api.renameItem).not.toHaveBeenCalled();
+  fireEvent.change(input, { target: { value: 'fresh' } }); fireEvent.submit(input.closest('form')!);
+  expect(await screen.findByRole('dialog', { name: 'fresh' })).toBeTruthy();
+  expect(api.renameItem).toHaveBeenCalledWith({ kind, name: 'target', to: 'fresh' });
+  expect(toast).toHaveBeenCalledWith({ title: 'Renamed to fresh' }); expect(changed).toHaveBeenCalledOnce();
+});
+it('reports Assignment copy failure while keeping the rename', async () => {
+  vi.mocked(api.renameItem).mockResolvedValue({ item: 'skill:fresh', migrated: [], assignment_error: 'disk full' });
+  mount(); await select('writing', 'Personal'); fireEvent.click(screen.getByRole('button', { name: 'Rename…' }));
+  const input = screen.getByLabelText('Name'); fireEvent.change(input, { target: { value: 'fresh' } }); fireEvent.submit(input.closest('form')!);
+  expect(await screen.findByRole('dialog', { name: 'fresh' })).toBeTruthy();
+  expect(toast).toHaveBeenCalledWith({ title: "Renamed, but Assignments weren't copied: disk full", tone: 'destructive' });
+});
+it('keeps failed rename and delete errors inline', async () => {
+  vi.mocked(api.renameItem).mockRejectedValue('Rename failed'); vi.mocked(api.deleteItem).mockRejectedValue('Delete failed');
+  mount(); await select('writing', 'Personal'); fireEvent.click(screen.getByRole('button', { name: 'Rename…' }));
+  const input = screen.getByLabelText('Name'); fireEvent.change(input, { target: { value: 'fresh' } }); fireEvent.submit(input.closest('form')!);
+  expect(await screen.findByText('Rename failed')).toBeTruthy(); fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Delete…' })); fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+  expect(await screen.findByText('Delete failed')).toBeTruthy(); expect(changed).not.toHaveBeenCalled();
+});
+it('applies each handoff: a content handoff clears an earlier Type filter, and a create handoff opens the form', async () => {
+  const view = render(<TooltipProvider><Skills {...props} handoff={{ filter: 'unmanaged' }} /></TooltipProvider>);
+  expect((screen.getByLabelText('Type') as HTMLSelectElement).value).toBe('unmanaged');
+  view.rerender(<TooltipProvider><Skills {...props} handoff={{ search: 'pdf' }} /></TooltipProvider>);
+  expect((screen.getByLabelText('Type') as HTMLSelectElement).value).toBe('all');
+  view.rerender(<TooltipProvider><Skills {...props} handoff={{ create: 'rule' }} /></TooltipProvider>);
+  expect(await screen.findByRole('dialog', { name: 'New Rule' })).toBeTruthy();
 });

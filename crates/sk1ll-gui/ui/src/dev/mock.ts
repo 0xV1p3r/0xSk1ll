@@ -69,7 +69,7 @@ export function installMock(scenario: string) {
   };
   const conflicts: T.ConflictView[] = empty ? [] : [
     { harness: 'codex', name: 'code-review', items: ['skill:code-review'], dest: '/home/dev/.codex/skills/code-review',
-      reason: 'SKILL.md was edited in the Harness after the last sync.', adoptable: true },
+      reason: 'SKILL.md was edited in the Harness after the last sync.', adoptable: true, detected_at: now - 60 * 25 },
   ];
   const recovered: T.ConflictView[] = empty ? [] : [
     { kind: 'displaced', id: 'd-1', harness: 'claude', name: 'notes', items: [], dest: '/home/dev/.claude/skills/notes',
@@ -113,6 +113,40 @@ export function installMock(scenario: string) {
         items.push({ item, in_baseline: false, draft: 'added', unpushed: false, description: r.description ?? null });
         draft.push({ item, change: 'added', paths: [path], fingerprint: `created-${r.name}` }); local.drafts.push(item);
         return delay(undefined);
+      }
+      case 'delete_item': case 'rename_item': {
+        const r = a.request as T.RenameItemRequest;
+        const item = `${r.kind}:${r.name}`;
+        const entry = content.find(e => e.item === item && e.type === (r.kind === 'skill' ? 'personal' : 'rule'));
+        if (!entry) return Promise.reject({ message: `No personal ${r.kind} named \`${r.name}\`` });
+        const to = cmd === 'rename_item' ? `${r.kind}:${r.to}` : null;
+        if (to && (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(r.to) || r.to.includes('..'))) return Promise.reject({ message: `invalid skill name \`${r.to}\`` });
+        if (to && content.some(e => e.item === to || (r.kind === 'skill' && e.type === 'import' && e.name === r.to))) return Promise.reject({ message: `name \`${r.to}\` is taken` });
+        const path = (name: string) => r.kind === 'skill' ? `personal/${name}/SKILL.md` : `instructions/${name}.md`;
+        const pending = draft.findIndex(d => d.item === item);
+        // Deleting a never-committed item leaves nothing in the Draft.
+        const added = pending >= 0 && draft[pending].change === 'added';
+        if (pending >= 0) draft.splice(pending, 1);
+        if (!added) draft.push({ item, change: 'deleted', paths: [path(r.name)], fingerprint: `deleted-${r.name}` });
+        local.drafts = local.drafts.filter(d => d !== item); if (!added) local.drafts.push(item);
+        const index = items.findIndex(i => i.item === item);
+        content.splice(content.indexOf(entry), 1);
+        if (!to) {
+          if (added) items.splice(index, 1); else if (index >= 0) items[index].draft = 'deleted';
+          return delay(undefined);
+        }
+        content.push({ ...entry, name: r.to, item: to, draft: 'added', in_baseline: false, path: `${status.repo}/${path(r.to).replace(/\/SKILL\.md$/, '')}` });
+        if (index >= 0) { if (added) items.splice(index, 1); else items[index].draft = 'deleted'; }
+        items.push({ item: to, in_baseline: false, draft: 'added', unpushed: false, description: entry.description });
+        draft.push({ item: to, change: 'added', paths: [path(r.to)], fingerprint: `renamed-${r.to}` }); local.drafts.push(to);
+        const migrated: string[] = [];
+        for (const [name, h] of Object.entries(assignments[status.machine_id]?.harnesses ?? {})) {
+          const toggles = r.kind === 'skill' ? h.skills : h.rules;
+          if (r.name in toggles) { toggles[r.to] = toggles[r.name]; migrated.push(name); }
+        }
+        if (migrated.length) assignments[status.machine_id].revision++;
+        const offline = status.connection !== 'connected' && migrated.length > 0;
+        return delay({ item: to, migrated: offline ? [] : migrated, assignment_error: offline ? 'offline: the Server is unreachable' : null });
       }
       case 'conflict_diff': {
         const r = a.request as T.ConflictDiffRequest;
@@ -208,7 +242,18 @@ export function installMock(scenario: string) {
         draft.push({ item: `skill:${request.name}`, change: 'added', paths: [`imported/${request.name}/SKILL.md`], fingerprint: 'new' });
         return delay({ name: request.name, old_commit: null, new_commit: 'c0ffee1234567890', changed: true });
       }
-      case 'log': return delay(log);
+      case 'log': {
+        const q = (a.query ?? {}) as T.LogQuery;
+        const term = q.item?.toLowerCase() ?? '';
+        const rows = log.filter(e => (!q.machine || e.machine === q.machine) && (!q.harness || e.harness === q.harness)
+          && (!q.author || e.author === q.author) && (q.before === undefined || e.id < q.before)
+          && `${e.kind}:${e.name ?? ''}`.toLowerCase().includes(term));
+        return delay(rows.slice(0, Math.min(Math.max(q.limit ?? 100, 1), 1000)));
+      }
+      case 'log_facets': {
+        const distinct = (key: 'machine' | 'harness' | 'author') => [...new Set(log.map(e => e[key]))].sort();
+        return delay({ machines: distinct('machine'), harnesses: distinct('harness'), authors: distinct('author') });
+      }
       case 'join_code': return delay({ code: 'sk1ll-join-7Q2M-XK9P-44RD-ZT8W' });
       case 'connection_info': return delay('/run/user/1000/sk1ll/daemon.sock', 10);
       case 'adopt': case 'overwrite': case 'adopt_displaced': case 'discard_displaced': case 'undo':

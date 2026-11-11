@@ -1254,7 +1254,7 @@ fn displaced_view(entry: sync::displaced::Entry) -> ConflictView {
         kind: Some("displaced".into()), id: Some(entry.id), item: Some(item.clone()),
         name: entry.dest.file_name().unwrap_or_default().to_string_lossy().into_owned(),
         items: vec![item], harness: entry.harness, dest: entry.dest, path: Some(entry.path),
-        displaced_at: Some(entry.displaced_at), reason: None, adoptable: true,
+        displaced_at: Some(entry.displaced_at), detected_at: None, reason: None, adoptable: true,
     }
 }
 
@@ -1275,6 +1275,7 @@ fn conflict_view(a: &Action) -> ConflictView {
     };
     ConflictView {
         kind: None, id: None, item: None, path: None, displaced_at: None,
+        detected_at: modified_at(&a.dest),
         harness: a.harness.clone(),
         name,
         items: conflict_items(a),
@@ -1282,6 +1283,26 @@ fn conflict_view(a: &Action) -> ConflictView {
         reason: a.reason.clone(),
         adoptable,
     }
+}
+
+/// Newest mtime of `path` and everything under it (directories too, so a
+/// deleted file counts), without following symlinks; the management marker
+/// and `.git` are skipped. Bounded, so a huge tree can't stall `/conflicts`.
+fn modified_at(path: &Path) -> Option<u64> {
+    let seconds = |m: &std::fs::Metadata| m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs());
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    let (mut newest, mut stack, mut budget) = (seconds(&meta), Vec::new(), 10_000usize);
+    if meta.is_dir() { stack.push(path.to_path_buf()); }
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+            budget = budget.checked_sub(1)?;
+            if entry.file_name() == sync::MARKER || entry.file_name() == ".git" { continue; }
+            let Ok(meta) = entry.metadata() else { continue };
+            newest = newest.max(seconds(&meta));
+            if meta.is_dir() { stack.push(entry.path()); }
+        }
+    }
+    newest
 }
 
 fn matches_target(a: &Action, t: &ConflictTarget) -> bool {
@@ -1458,6 +1479,51 @@ impl Daemon {
         Repo::open(Self::root(eng))?.create_item(&req.kind, &req.name, req.description.as_deref().unwrap_or(""))?;
         self.refresh(eng)?;
         Ok(())
+    }
+    /// Toggles stay until a push drops them (`item_removed`), so Restore brings the item back as it was.
+    pub(crate) fn delete_item(&self, eng: &mut Engine, req: crate::client::DeleteItemRequest) -> Result<()> {
+        self.ensure_managed(eng)?;
+        self.lock_repo(eng)?;
+        let deleted = Repo::open(Self::root(eng))?.delete_item(&req.kind, &req.name);
+        self.refresh(eng)?;
+        Ok(deleted?)
+    }
+    /// Renames in the Draft, then copies this machine's explicit toggles for the
+    /// old name to the new one. The old name's toggles stay until a push drops
+    /// them, so restoring both Draft items undoes the rename.
+    pub(crate) fn rename_item(&self, eng: &mut Engine, req: crate::client::RenameItemRequest) -> Result<crate::client::RenameItemResponse> {
+        use sk1ll_proto::{AssignmentChanges, ToggleChange, ToggleKind};
+        self.ensure_managed(eng)?;
+        self.lock_repo(eng)?;
+        let renamed = Repo::open(Self::root(eng))?.rename_item(&req.kind, &req.name, &req.to);
+        self.refresh(eng)?;
+        renamed?;
+        let (item, kind) = if req.kind == "skill" { (ItemRef::Skill(req.to.clone()), ToggleKind::Skill) } else { (ItemRef::Rule(req.to.clone()), ToggleKind::Rule) };
+        let changes: Vec<ToggleChange> = eng.snapshot.iter().flat_map(|s| &s.assignment.harnesses).filter_map(|(harness, h)| {
+            let toggles = if kind == ToggleKind::Skill { &h.skills } else { &h.rules };
+            toggles.get(&req.name).map(|&enabled| ToggleChange { harness: harness.clone(), kind, name: Some(req.to.clone()), enabled: Some(enabled) })
+        }).collect();
+        let mut response = crate::client::RenameItemResponse { item: item.clone(), migrated: Vec::new(), assignment_error: None };
+        if changes.is_empty() { return Ok(response); }
+        let changes = AssignmentChanges { changes };
+        let result = if self.is_connected() {
+            tokio::runtime::Handle::current().block_on(crate::server::assign_draft_item(self, &item, &changes, "Rename"))
+        } else {
+            Err(anyhow::anyhow!("offline: the Server is unreachable"))
+        };
+        match result {
+            Ok(update) => {
+                self.apply_assignment(eng, AssignmentSnapshot { revision: update.revision, assignment: update.assignment })?;
+                response.migrated = changes.changes.into_iter().map(|c| c.harness).collect();
+                self.event(Event::Fleet);
+            }
+            Err(error) => {
+                let message = crate::auth::redact(&format!("{error:#}"));
+                tracing::warn!("renamed {} to {item}, but its Assignment was not carried over: {message}", req.name);
+                response.assignment_error = Some(message);
+            }
+        }
+        Ok(response)
     }
     pub(crate) async fn local_imports(self: &Arc<Self>, check: bool) -> Result<crate::client::ImportsView> {
         let (root, entries) = self.blocking(|_, eng| {

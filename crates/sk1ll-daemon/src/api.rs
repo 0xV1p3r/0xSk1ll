@@ -55,6 +55,8 @@ pub(crate) fn router(d: Arc<Daemon>) -> Router {
         .route("/imports", get(imports))
         .route("/imports/check", post(check_imports))
         .route("/items/create", post(create_item))
+        .route("/items/delete", post(delete_item))
+        .route("/items/rename", post(rename_item))
         .route("/conflicts/diff", post(conflict_diff))
         .route("/imports/{name}/update", post(update_import))
         .route("/imports/resolve", post(resolve_import))
@@ -69,6 +71,7 @@ pub(crate) fn router(d: Arc<Daemon>) -> Router {
         .route("/machines/{id}", delete(pass))
         .route("/machines/{id}/assignment", get(pass).put(pass))
         .route("/log", get(pass))
+        .route("/log/facets", get(pass))
         .route("/log/{id}/undo", post(pass))
         .route("/join-codes", post(pass))
         .route("/events", get(events))
@@ -382,6 +385,13 @@ mod tests {
 async fn create_item(State(d): St, Json(req): Json<crate::client::CreateItemRequest>) -> Result<StatusCode> {
     d.blocking(move |d, eng| d.create_item(eng, req)).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+async fn delete_item(State(d): St, Json(req): Json<crate::client::DeleteItemRequest>) -> Result<StatusCode> {
+    d.blocking(move |d, eng| d.delete_item(eng, req)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+async fn rename_item(State(d): St, Json(req): Json<crate::client::RenameItemRequest>) -> Result<Json<crate::client::RenameItemResponse>> {
+    Ok(Json(d.blocking(move |d, eng| d.rename_item(eng, req)).await?))
 }
 async fn conflict_diff(State(d): St, Json(req): Json<crate::client::ConflictDiffRequest>) -> Result<Json<DiffView>> {
     Ok(Json(d.blocking(move |d, eng| d.conflict_diff(eng, req)).await?))
