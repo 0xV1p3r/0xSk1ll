@@ -49,6 +49,8 @@ const MIGRATIONS: &[&str] = &[
     );
     INSERT INTO counters (name, value) VALUES ('revision', 0);
 ",
+    "CREATE INDEX log_harness ON log (harness);
+    CREATE INDEX log_author ON log (author);",
 ];
 
 pub fn open(path: &Path) -> anyhow::Result<Connection> {
