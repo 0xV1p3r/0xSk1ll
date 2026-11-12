@@ -15,7 +15,7 @@ import { Confirm, ErrorNotice, KindBadge, Loading, Nothing, Panel, PanelToolbar,
 
 const causeLabel = (cause: LogCause) => cause.type === 'undo' ? `Restored #${cause.entry}` : ({ change: 'Changed', item_removed: 'Item removed', default_materialized: 'Default applied', machine_removed: 'Machine removed', harness_added: 'Harness added' })[cause.type];
 const toggleLabel = (value: boolean | null) => value === null ? 'Default' : value ? 'On' : 'Off';
-export function Log({ revision, changed }: { revision: number; changed: () => void }) {
+export function Log({ revision, fleetRevision = revision, changed }: { fleetRevision?: number; revision: number; changed: () => void }) {
   const log = useRef<HTMLDivElement>(null);
   const restoreFocus = useRef(false);
   const [filters, setFilters] = useState({ machine: '', harness: '', author: '', item: '' });
@@ -31,7 +31,7 @@ export function Log({ revision, changed }: { revision: number; changed: () => vo
   const load = useCallback(() => api.log({ before, limit: 50, machine, harness, author, item: search }), [before, machine, harness, author, search]);
   const facets = useResource(api.logFacets, revision);
   const { data, error, loading } = useResource(load, revision);
-  const fleet = useResource(api.fleet, revision);
+  const fleet = useResource(api.fleet, fleetRevision);
   const removed = (machine: string) => !!fleet.data && !fleet.data.machines.some(row => row.id === machine);
   useEffect(() => {
     if (restoreFocus.current && document.activeElement === document.body) {
