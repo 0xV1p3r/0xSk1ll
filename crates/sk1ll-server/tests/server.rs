@@ -13,7 +13,7 @@ use sk1ll_proto::{
     AssignmentSnapshot, AssignmentUpdate, DaemonMessage, FleetView, ServerMessage, ImportsView, ItemRef,
     JoinCode, JoinResponse, LogCause, LogEntry, MachineReport, MachineRow, MachineStatus, ToggleKind,
 };
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 
 const ADMIN: &str = "admin-secret";
 
@@ -123,7 +123,9 @@ impl TestServer {
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn ws_connect(server: &TestServer, token: &str) -> Ws {
-    let url = format!("ws://127.0.0.1:{}/api/ws?token={token}", server.port);
+    let url = format!("ws://127.0.0.1:{}/api/ws", server.port);
+    let mut url = url.into_client_request().unwrap();
+    url.headers_mut().insert("Authorization", format!("Bearer {token}").parse().unwrap());
     tokio_tungstenite::connect_async(url).await.unwrap().0
 }
 
@@ -132,7 +134,9 @@ async fn ws_connect_small(server: &TestServer, token: &str) -> Ws {
     let socket = tokio::net::TcpSocket::new_v4().unwrap();
     socket.set_recv_buffer_size(4096).unwrap();
     let tcp = socket.connect(format!("127.0.0.1:{}", server.port).parse().unwrap()).await.unwrap();
-    let url = format!("ws://127.0.0.1:{}/api/ws?token={token}", server.port);
+    let url = format!("ws://127.0.0.1:{}/api/ws", server.port);
+    let mut url = url.into_client_request().unwrap();
+    url.headers_mut().insert("Authorization", format!("Bearer {token}").parse().unwrap());
     let stream = tokio_tungstenite::MaybeTlsStream::Plain(tcp);
     tokio_tungstenite::client_async(url, stream).await.unwrap().0
 }
@@ -1527,5 +1531,33 @@ async fn defaults_and_undo_materialize_destination_drafts_and_unpushed() {
         assert_eq!(toggles.get("unpushed"), Some(&false));
         assert_eq!(toggles.get("future"), Some(&true));
         assert_eq!(undone.entries[1].cause, LogCause::Undo { entry: entry.id });
+    }
+}
+
+#[tokio::test]
+async fn expired_join_code_is_invalid() {
+    let server = start_with(|c| c.join_code_ttl = Duration::from_secs(1), false).await;
+    let code = server.join_code(ADMIN).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let expired = server.try_join(&code, "expired", &[]).await;
+    let invalid = server.try_join("invalid", "invalid", &[]).await;
+    assert_eq!(expired.status(), invalid.status());
+    assert_eq!(expired.text().await.unwrap(), invalid.text().await.unwrap());
+    server.join("fresh", &[]).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn main_rejects_rewrites_and_deletion() {
+    let server = start().await;
+    let token = server.join("writer", &[]).await;
+    let dir = clone(&server, "writer", &token).await;
+    let repo = dir.path().join("repo");
+    git(&repo, &["commit", "--allow-empty", "-m", "fast forward"]);
+    git(&repo, &["push", "origin", "HEAD:main"]);
+    git(&repo, &["reset", "--hard", "HEAD~1"]);
+    for args in [["push", "--force", "origin", "HEAD:main"], ["push", "--delete", "origin", "main"]] {
+        let out = Command::new("git").arg("-C").arg(&repo).args(args)
+            .env("GIT_TERMINAL_PROMPT", "0").output().unwrap();
+        assert!(!out.status.success());
     }
 }

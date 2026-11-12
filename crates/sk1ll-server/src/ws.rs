@@ -1,6 +1,6 @@
 //! `GET /api/ws`: one daemon session per machine. Server messages go out as JSON
 //! text frames. The server pings every `ping_every`, refreshes `last_seen` on
-//! every inbound frame, and closes a session that has been silent for
+//! inbound frames at a bounded rate, and closes a session that has been silent for
 //! [`Config::idle_limit`](crate::Config::idle_limit).
 //!
 //! Each session has an id (its generation) and a cancellation token. Being
@@ -16,12 +16,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{FromRequestParts, Query, State};
+use axum::extract::{FromRequestParts, State};
 use axum::http::request::Parts;
 use axum::response::Response;
 use futures_util::stream::SplitStream;
 use futures_util::{Sink, SinkExt, StreamExt};
-use serde::Deserialize;
 use serde_json::Value;
 use sk1ll_proto::{AssignmentSnapshot, DaemonMessage, ServerMessage, ItemRef, MachineReport};
 use tokio::sync::{mpsc, watch};
@@ -34,23 +33,17 @@ use crate::{Caller, Server, assign, db, hash, now};
 /// this far behind is disconnected.
 const QUEUE: usize = 64;
 
-#[derive(Deserialize)]
-pub struct TokenQuery {
-    token: Option<String>,
-}
-
 /// An authenticated daemon: its machine id and the hash of its token.
 pub struct WsCaller(String, String);
 
 impl FromRequestParts<Arc<Server>> for WsCaller {
     type Rejection = ApiError;
 
-    /// Token from `Authorization: Bearer` or `?token=`; machine tokens only.
+    /// Token from `Authorization: Bearer`; machine tokens only.
     async fn from_request_parts(parts: &mut Parts, server: &Arc<Server>) -> Result<Self> {
-        let query = Query::<TokenQuery>::try_from_uri(&parts.uri).ok().and_then(|q| q.0.token);
-        let token = crate::api::bearer(parts).map(str::to_string).or(query).ok_or(ApiError::Unauthorized)?;
-        match server.authenticate(&token).await? {
-            Caller::Machine(id) => Ok(Self(id, hash(&token))),
+        let token = crate::api::bearer(parts).ok_or(ApiError::Unauthorized)?;
+        match server.authenticate(token).await? {
+            Caller::Machine(id) => Ok(Self(id, hash(token))),
             Caller::Admin => Err(ApiError::Forbidden("the WebSocket is for machine daemons".into())),
         }
     }
@@ -157,6 +150,8 @@ async fn read_loop(
     cancel: &CancellationToken,
 ) {
     let idle = server.config.idle_limit();
+    let touch_every = std::time::Duration::from_secs(10).min(server.config.offline_after / 4);
+    let mut last_touch: Option<tokio::time::Instant> = None;
     loop {
         let next = tokio::select! {
             biased;
@@ -167,8 +162,11 @@ async fn read_loop(
             return tracing::info!("{machine}: nothing received for {idle:?}; closing");
         };
         let Some(Ok(msg)) = msg else { return };
-        let (m, t, now) = (machine.to_string(), token_hash.to_string(), now());
-        let _ = server.db(move |conn| db::touch(conn, &m, &t, now)).await;
+        if last_touch.is_none_or(|t| t.elapsed() >= touch_every) {
+            let (m, t, now) = (machine.to_string(), token_hash.to_string(), now());
+            let _ = server.db(move |conn| db::touch(conn, &m, &t, now)).await;
+            last_touch = Some(tokio::time::Instant::now());
+        }
         match msg {
             Message::Text(text) => {
                 match serde_json::from_str::<Value>(&text).map_err(|e| e.to_string()).and_then(parse) {

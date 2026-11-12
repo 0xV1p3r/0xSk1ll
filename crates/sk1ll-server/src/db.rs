@@ -49,6 +49,8 @@ const MIGRATIONS: &[&str] = &[
     );
     INSERT INTO counters (name, value) VALUES ('revision', 0);
 ",
+    "CREATE INDEX log_harness ON log (harness);
+    CREATE INDEX log_author ON log (author);",
 ];
 
 pub fn open(path: &Path) -> anyhow::Result<Connection> {
@@ -190,10 +192,10 @@ pub fn insert_join_code(conn: &Connection, code_hash: &str, created_by: &str, no
 }
 
 /// Marks an unused code as used by `machine`; false if it doesn't exist or was used.
-pub fn consume_join_code(conn: &Connection, code_hash: &str, machine: &str, now: i64) -> Result<bool> {
+pub fn consume_join_code(conn: &Connection, code_hash: &str, machine: &str, now: i64, ttl: i64) -> Result<bool> {
     let n = conn.execute(
-        "UPDATE join_codes SET used_by = ?2, used_at = ?3 WHERE code_hash = ?1 AND used_at IS NULL",
-        params![code_hash, machine, now],
+        "UPDATE join_codes SET used_by = ?2, used_at = ?3 WHERE code_hash = ?1 AND used_at IS NULL AND created_at >= ?4",
+        params![code_hash, machine, now, now.saturating_sub(ttl)],
     )?;
     Ok(n == 1)
 }

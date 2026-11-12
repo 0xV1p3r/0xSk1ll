@@ -29,9 +29,6 @@ use crate::Server;
 /// Creates the bare repo (default branch `main`, pushes over HTTP allowed)
 /// unless it exists.
 pub fn init_bare(repo: &Path) -> anyhow::Result<()> {
-    if repo.join("HEAD").is_file() {
-        return Ok(());
-    }
     let run = |args: &[&str]| -> anyhow::Result<()> {
         let out = setup_git().args(args).output().context("running git")?;
         if !out.status.success() {
@@ -40,8 +37,12 @@ pub fn init_bare(repo: &Path) -> anyhow::Result<()> {
         Ok(())
     };
     let path = repo.to_string_lossy();
-    run(&["init", "--quiet", "--bare", "--initial-branch=main", "--template=", &path])?;
+    if !repo.join("HEAD").is_file() {
+        run(&["init", "--quiet", "--bare", "--initial-branch=main", "--template=", &path])?;
+    }
     run(&["-C", &path, "config", "http.receivepack", "true"])?;
+    run(&["-C", &path, "config", "receive.denyNonFastForwards", "true"])?;
+    run(&["-C", &path, "config", "receive.denyDeletes", "true"])?;
     std::fs::create_dir_all(repo.join("hooks")).context("creating bare repo hooks directory")?;
     tracing::info!("created {}", repo.display());
     Ok(())
@@ -148,6 +149,7 @@ pub async fn ls_remote(url: &str, git_ref: &str) -> anyhow::Result<Option<String
         Duration::from_secs(60),
         Command::new("git")
             .args(["ls-remote", "--", url])
+            .env("GIT_ALLOW_PROTOCOL", "https:http:ssh:git")
             .env("GIT_TERMINAL_PROMPT", "0")
             .stdin(Stdio::null())
             .kill_on_drop(true)
@@ -157,7 +159,7 @@ pub async fn ls_remote(url: &str, git_ref: &str) -> anyhow::Result<Option<String
     .context("timed out")?
     .context("running git")?;
     if !out.status.success() {
-        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+        bail!("{}", String::from_utf8_lossy(&out.stderr).lines().next().unwrap_or("git failed"));
     }
     Ok(resolve_ref(&String::from_utf8_lossy(&out.stdout), git_ref))
 }
@@ -596,4 +598,24 @@ mod tests {
         assert_eq!(resolve_ref(listing, "HEAD").as_deref(), Some("c0ffee"));
         assert_eq!(resolve_ref(listing, "nope"), None);
     }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::ls_remote;
+#[tokio::test]
+async fn import_transports_are_restricted() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("executed");
+    let url = format!("ext::sh -c touch% {}", marker.display());
+    let err = ls_remote(&url, "main").await.unwrap_err();
+    assert!(err.to_string().contains("not allowed"));
+    assert!(!marker.exists());
+    assert!(std::process::Command::new("git").arg("-C").arg(dir.path()).args(["init", "--bare", "--quiet"]).status().unwrap().success());
+    for url in [dir.path().display().to_string(), format!("file://{}", dir.path().display())] {
+        let err = ls_remote(&url, "main").await.unwrap_err();
+        assert!(err.to_string().contains("transport 'file' not allowed"));
+    }
+}
+
 }
