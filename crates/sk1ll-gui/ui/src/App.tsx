@@ -27,6 +27,7 @@ import { Imports } from './Imports';
 import { Log } from './Log';
 import { Skills, type SkillsHandoff } from './Skills';
 import { useResource } from './hooks';
+import { eventTopics } from './invalidation';
 import { plural } from './model';
 import { Settings } from './Settings';
 import { ErrorNotice, Loading, Notice } from './shared';
@@ -127,12 +128,16 @@ export function App() {
   const [reachable, setReachable] = useState<boolean>();
   const [error, setError] = useState('');
   const [socket, setSocket] = useState('Default Daemon socket');
-  const [revision, setRevision] = useState(0);
-  const changed = useCallback(() => setRevision(value => value + 1), []);
+  const [revisions, setRevisions] = useState({ status: 0, content: 0, imports: 0, fleet: 0, history: 0 });
+  const invalidate = useCallback((topics: (keyof typeof revisions)[]) => setRevisions(value => {
+    const next = { ...value }; topics.forEach(topic => next[topic]++); return next;
+  }), []);
+  const changed = useCallback(() => invalidate(['status', 'content', 'imports', 'fleet', 'history']), [invalidate]);
+  const revision = revisions.content;
   const skills = useResource(api.skills, revision);
   const recovered = useResource(api.recovered, revision);
-  const imports = useResource(api.imports, revision);
-  const fleet = useResource(api.fleet, revision);
+  const imports = useResource(api.imports, revisions.imports);
+  const fleet = useResource(api.fleet, revisions.fleet);
   const [refreshPending, setRefreshPending] = useState(false);
   const refreshLock = useRef(false);
   const refreshHeader = async () => {
@@ -192,21 +197,23 @@ export function App() {
         if (alive && refreshAgain) { refreshAgain = false; void refresh(); }
       }
     };
-    const hint = () => {
+    const pending = new Set<keyof typeof revisions>();
+    const hint = (topics: (keyof typeof revisions)[]) => {
+      topics.forEach(topic => pending.add(topic));
       if (eventTimer) clearTimeout(eventTimer);
-      eventTimer = setTimeout(() => { changed(); void refresh(); }, 120);
+      eventTimer = setTimeout(() => { invalidate([...pending]); pending.clear(); }, 120);
     };
     void api.connectionInfo().then(value => { if (alive) setSocket(value); }).catch(e => { if (alive) setError(errorMessage(e)); });
     void refresh();
     const pollStatus = setInterval(() => void refresh(), 5000);
-    const pollFleet = setInterval(changed, 15000);
+    const pollFleet = setInterval(() => invalidate(['fleet']), 15000);
     const unlisteners: (() => void)[] = [];
     const subscriptions = [
-      ...['status', 'draft', 'assignment', 'imports', 'fleet'].map(name => listen(name, hint)),
+      ...['status', 'draft', 'assignment', 'imports', 'fleet'].map(name => listen(name, () => hint(eventTopics(name)))),
       listen<DaemonConnection>('daemon-connection', event => {
         if (!alive) return;
         if (!event.payload.reachable) setError(event.payload.message ?? 'Daemon is unreachable');
-        hint();
+        hint(['status', 'content', 'imports', 'fleet', 'history']);
       }),
     ];
     for (const subscription of subscriptions) {
@@ -220,13 +227,13 @@ export function App() {
       if (eventTimer) clearTimeout(eventTimer);
       unlisteners.forEach(unlisten => unlisten());
     };
-  }, [changed]);
+  }, [invalidate]);
   useEffect(() => {
-    // Mutations and polling invalidate the machine header as well as screen data.
+    // Local changes and explicit refreshes invalidate the machine header.
     let alive = true;
     void api.status().then(value => { if (alive) { setStatus(value); setReachable(true); } }).catch(() => {});
     return () => { alive = false; };
-  }, [revision]);
+  }, [revisions.status]);
   if (reachable === false) return <TooltipProvider><ConnectionPage socket={socket} error={error} /></TooltipProvider>;
   if (!status) return <main className="grid min-h-svh place-items-center bg-muted/40 p-6"><div className="flex w-full max-w-sm flex-col items-start gap-3">
     <Wordmark /><p className="flex items-center gap-2 text-sm text-muted-foreground" role="status"><LoaderCircle aria-hidden className="size-4 animate-spin" />Connecting to the Daemon…</p><ErrorNotice error={error} /></div></main>;
@@ -269,13 +276,13 @@ export function App() {
           <Button size="sm" className="ml-auto" onClick={() => navigate('Conflicts')}>Resolve</Button>
         </Alert>}
         {screen === 'Library' && <><ErrorNotice error={skills.error} />{skills.loading && !skills.data ? <Loading /> : <Skills handoff={skillsHandoff} connection={status.connection} entries={skills.data ?? []} revision={revision} changed={changed} reviewDraft={() => navigate('Draft')} assignment={(item, harness) => { navigate('Assignment matrix'); setMatrixTarget({ item, harness }); }} addImport={() => { navigate('Imports'); setOpenAdd(n => n + 1); }} />}</>}
-        {screen === 'Fleet' && <Fleet revision={revision} machineId={status.machine_id} localReport={status.report} unmanaged={skills.data?.filter(entry => entry.type === 'unmanaged')} discovery={{ loading: !skills.data && skills.loading, error: skills.error }} navigate={next => { navigate(next); if (next === 'Library') setSkillsHandoff({ filter: 'unmanaged' }); }} changed={changed} live={status.connection === 'connected'} />}
-        {screen === 'Assignment matrix' && <Matrix revision={revision} status={status} target={matrixTarget} />}
+        {screen === 'Fleet' && <Fleet revision={revision + revisions.fleet} machineId={status.machine_id} localReport={status.report} unmanaged={skills.data?.filter(entry => entry.type === 'unmanaged')} discovery={{ loading: !skills.data && skills.loading, error: skills.error }} navigate={next => { navigate(next); if (next === 'Library') setSkillsHandoff({ filter: 'unmanaged' }); }} changed={changed} live={status.connection === 'connected'} />}
+        {screen === 'Assignment matrix' && <Matrix revision={revision + revisions.fleet} status={status} target={matrixTarget} />}
         {screen === 'Draft' && <Draft revision={revision} status={status} changed={changed} />}
         {screen === 'Conflicts' && <Conflicts revision={revision} changed={changed} reviewDraft={() => navigate('Draft')} />}
-        {screen === 'Imports' && <Imports openAdd={openAdd} revision={revision} changed={changed} reviewDraft={() => navigate('Draft')} />}
-        {screen === 'Assignment log' && <Log revision={revision} changed={changed} />}
-        {screen === 'Settings' && <Settings revision={revision} status={status} socket={socket} changed={changed} />}
+        {screen === 'Imports' && <Imports openAdd={openAdd} revision={revisions.imports} changed={changed} reviewDraft={() => navigate('Draft')} />}
+        {screen === 'Assignment log' && <Log fleetRevision={revisions.fleet} revision={revision + revisions.history} changed={changed} />}
+        {screen === 'Settings' && <Settings fleetRevision={revisions.fleet} revision={revision} status={status} socket={socket} changed={changed} />}
       </main>
     </SidebarInset>
     <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} commands={[
