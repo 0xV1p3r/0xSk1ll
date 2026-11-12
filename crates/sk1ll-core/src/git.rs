@@ -48,6 +48,7 @@ impl Git {
             #[cfg(test)]
             TEST_ENV.with_borrow(|vars| cmd.envs(vars.iter().map(|(k, v)| (k, v))));
         }
+        cmd.env("LC_ALL", "C").env("LANGUAGE", "C");
         Self { cmd, args: Vec::new(), stdin: None, timeout: None }
     }
 
@@ -397,6 +398,16 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+
+    #[test]
+    fn locale_is_pinned() {
+        let _env = test_env(&[("LANG", "de_DE.UTF-8"), ("LANGUAGE", "de")]);
+        let git = Git::new(Path::new(".")).arg("not-a-git-command");
+        let env: std::collections::HashMap<_, _> = git.cmd.get_envs().collect();
+        assert_eq!(env.get(OsStr::new("LC_ALL")), Some(&Some(OsStr::new("C"))));
+        assert_eq!(env.get(OsStr::new("LANGUAGE")), Some(&Some(OsStr::new("C"))));
+        assert!(!git.output().unwrap().status.success());
+    }
 
     #[cfg(unix)]
     fn alive(pid: i32) -> bool {

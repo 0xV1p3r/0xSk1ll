@@ -266,10 +266,10 @@ pub(crate) fn fetch(source: &str, base: &Path) -> Result<PathBuf> {
     fs::create_dir_all(parent).at(parent)?;
     let _turn = lock_cache(&cache)?;
     let fetched = if cache.join(".git").is_dir() {
-        git(&cache, &["fetch", "--quiet", "--no-auto-gc", "--tags", "--force", "--prune", "origin"], &[])
+        git(&cache, &["fetch", "--quiet", "--no-auto-gc", "--tags", "--force", "--prune", "origin"], &[("GIT_ALLOW_PROTOCOL", Path::new("https:http:ssh:git:file"))])
     } else {
         let cache_str = cache.to_string_lossy();
-        git(parent, &["clone", "--quiet", "--no-checkout", "--", &url, &cache_str], &[])
+        git(parent, &["clone", "--quiet", "--no-checkout", "--", &url, &cache_str], &[("GIT_ALLOW_PROTOCOL", Path::new("https:http:ssh:git:file"))])
     };
     fetched.map_err(|e| explain_github_failure(source, e))?;
     Ok(cache)
@@ -889,5 +889,17 @@ mod tests {
             r.join().unwrap().unwrap();
         }
         assert!(resolve_commit(&cache, "feature/x").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    #[test]
+    fn ext_import_cannot_execute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("executed");
+        let source = format!("ext::sh -c 'touch {}'", marker.display());
+        assert!(super::fetch(&source, tmp.path()).is_err());
+        assert!(!marker.exists());
     }
 }
