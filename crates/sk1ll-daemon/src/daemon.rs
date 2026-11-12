@@ -700,24 +700,37 @@ impl Daemon {
         for item in gitx::unpushed_items(root)? {
             inventory.entry(item.clone()).or_insert_with(|| entry(item)).unpushed = true;
         }
+        // Descriptions of skills without a draft come from git: one
+        // `cat-file --batch` for all of them, not a process per skill.
+        let mut wanted = Vec::new();
+        for value in inventory.values().filter(|value| value.draft.is_none()) {
+            let revision = if value.unpushed { head.as_ref() } else { baseline.as_ref() };
+            let (ItemRef::Skill(name), Some(rev)) = (&value.item, revision) else { continue };
+            // The batch protocol is line-based: such a name can't be asked for.
+            if !name.contains('\n') {
+                wanted.extend(SKILL_DIRS.iter().map(|directory| format!("{rev}:{directory}/{name}/SKILL.md")));
+            }
+        }
+        let mut blobs = BTreeMap::new();
+        if !wanted.is_empty() {
+            let input = wanted.iter().flat_map(|object| [object.as_str(), "\n"]).collect::<String>().into_bytes();
+            let batch = Git::new(root).env("GIT_OPTIONAL_LOCKS", "0").args(["cat-file", "--batch"]).stdin(input).run();
+            let contents = batch.map(|out| parse_batch(&out, wanted.len(), DESCRIPTION_CAP)).unwrap_or_default();
+            blobs.extend(wanted.into_iter().zip(contents).filter_map(|(object, bytes)| Some((object, bytes?))));
+        }
         for value in inventory.values_mut() {
             let ItemRef::Skill(name) = &value.item else { continue };
-            for directory in ["personal", "imported"] {
+            for directory in SKILL_DIRS {
                 let path = format!("{directory}/{name}/SKILL.md");
                 let text = if value.draft.is_some() {
                     use std::io::Read;
                     let mut text = String::new();
                     std::fs::File::open(root.join(&path)).ok()
-                        .and_then(|file| file.take(16384).read_to_string(&mut text).ok()).map(|_| text)
+                        .and_then(|file| file.take(DESCRIPTION_CAP as u64).read_to_string(&mut text).ok()).map(|_| text)
                 } else {
                     let revision = if value.unpushed { head.as_ref() } else { baseline.as_ref() };
-                    revision.and_then(|rev| {
-                        let object = format!("{rev}:{path}");
-                        let size = read(&["cat-file", "-s", &object]).ok()?;
-                        let size = String::from_utf8_lossy(&size).trim().parse::<usize>().ok()?;
-                        (size <= 16384).then(|| read(&["show", &object]).ok()).flatten()
-                            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                    })
+                    revision.and_then(|rev| blobs.remove(&format!("{rev}:{path}")))
+                        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
                 };
                 if let Some(text) = text {
                     value.description = skill_description(&text);
@@ -1223,6 +1236,41 @@ fn import_updated(r: sk1ll_core::UpdateReport) -> ImportUpdated {
     ImportUpdated { name: r.name, old_commit: r.old_commit, new_commit: r.new_commit, changed: r.changed }
 }
 
+/// Where a skill's files live in the repo, in the order they are looked up.
+const SKILL_DIRS: [&str; 2] = ["personal", "imported"];
+
+/// A `SKILL.md` larger than this is not read for its description.
+const DESCRIPTION_CAP: usize = 16384;
+
+/// Reads `git cat-file --batch` output for `count` requested objects, in
+/// request order: the content of each blob of at most `cap` bytes, `None` for
+/// anything else (missing, not a blob, larger). Content is raw bytes, so it is
+/// taken by the size in its header, never by looking for a line end; output
+/// that ends early or doesn't parse leaves the remaining objects `None`.
+fn parse_batch(mut out: &[u8], count: usize, cap: usize) -> Vec<Option<Vec<u8>>> {
+    let mut contents = vec![None; count];
+    for content in &mut contents {
+        let Some(end) = out.iter().position(|b| *b == b'\n') else { break };
+        let header = String::from_utf8_lossy(&out[..end]);
+        out = &out[end + 1..];
+        // `<oid> <type> <size>`; anything else (`<name> missing`, where the
+        // name may itself contain spaces) has no content after it.
+        let mut fields = header.rsplitn(3, ' ');
+        let (size, kind, oid) = (fields.next(), fields.next(), fields.next());
+        let object = matches!(kind, Some("blob" | "tree" | "commit" | "tag"))
+            && oid.is_some_and(|oid| !oid.is_empty() && oid.bytes().all(|b| b.is_ascii_hexdigit()));
+        let Some(size) = size.filter(|_| object).and_then(|size| size.parse::<usize>().ok()) else { continue };
+        if out.len() <= size || out[size] != b'\n' {
+            break;
+        }
+        if kind == Some("blob") && size <= cap {
+            *content = Some(out[..size].to_vec());
+        }
+        out = &out[size + 1..];
+    }
+    contents
+}
+
 fn skill_description(text: &str) -> Option<String> {
     let mut lines = text.lines();
     if lines.next()?.trim() != "---" { return None }
@@ -1483,11 +1531,15 @@ mod tests {
         git(&["config", "user.email", "test@example.invalid"]);
         write("personal/base/SKILL.md", "---\ndescription: Baseline description\n---\nbase\n");
         write("instructions/git.md", "baseline rule\n");
+        write("imported/vendored/SKILL.md", "---\ndescription: Imported description\n---\n");
+        write("personal/my skill/SKILL.md", "---\ndescription: 'Spaced'\n---\n\x00\nbody\n");
+        write("personal/huge/SKILL.md", &format!("---\ndescription: Too big\n---\n{}", "x".repeat(DESCRIPTION_CAP)));
+        write("personal/plain/SKILL.md", "no front matter\n");
         git(&["add", "."]);
         git(&["commit", "-qm", "baseline"]);
         let baseline = String::from_utf8(git(&["rev-parse", "HEAD"])).unwrap();
         git(&["update-ref", "refs/remotes/origin/main", baseline.trim()]);
-        write("personal/queued/SKILL.md", "queued\n");
+        write("personal/queued/SKILL.md", "---\ndescription: Queued description\n---\n");
         git(&["add", "."]);
         git(&["commit", "-qm", "unpushed"]);
         write("personal/base/SKILL.md", "---\ndescription: Draft description\n---\nedited\n");
@@ -1500,6 +1552,13 @@ mod tests {
         assert!(find("skill:base").in_baseline);
         assert_eq!(find("skill:base").draft, Some(ChangeKind::Modified));
         assert_eq!(find("skill:base").description.as_deref(), Some("Draft description"));
+        // Descriptions of items without a draft are read from git, in one batch.
+        assert_eq!(find("skill:vendored").description.as_deref(), Some("Imported description"));
+        assert_eq!(find("skill:my skill").description.as_deref(), Some("Spaced"));
+        assert_eq!(find("skill:queued").description.as_deref(), Some("Queued description"));
+        assert_eq!(find("skill:huge").description, None, "over the cap: not read");
+        assert_eq!(find("skill:plain").description, None);
+        assert_eq!(find("skill:local").description, None);
         assert!(find("rule:git").in_baseline, "deleted Draft item still comes from the git tree");
         assert_eq!(find("rule:git").draft, Some(ChangeKind::Deleted));
         assert!(!find("skill:queued").in_baseline);
@@ -1520,6 +1579,28 @@ mod tests {
         let items = Daemon::items(root).unwrap();
         assert!(!items.iter().any(|entry| entry.item.to_string() == "rule:remote"));
         assert!(items.iter().find(|entry| entry.item.to_string() == "skill:base").unwrap().in_baseline);
+    }
+
+    #[test]
+    fn batch_output_is_read_by_size() {
+        let oid = "ce013625030ba8dba906f756967f9e9ca394464a";
+        let mut out = Vec::new();
+        out.extend_from_slice(format!("{oid} blob 8\n").as_bytes());
+        out.extend_from_slice(b"a\n\0 b\nc\n\n");
+        out.extend_from_slice(b"abc:personal/a b/SKILL.md missing\n");
+        out.extend_from_slice(format!("{oid} blob 0\n\n").as_bytes());
+        out.extend_from_slice(format!("{oid} tree 4\nabcd\n").as_bytes());
+        out.extend_from_slice(format!("{oid} blob 7\n").as_bytes());
+        // Content that looks like headers is still content.
+        out.extend_from_slice(b"x blob\n\n");
+        out.extend_from_slice(format!("{oid} blob 5\nlarge\n").as_bytes());
+        out.extend_from_slice(format!("{oid} blob 2\nok\n").as_bytes());
+        out.extend_from_slice(format!("{oid} blob 9\ncut").as_bytes());
+        let got = parse_batch(&out, 9, 4);
+        let want: [Option<&[u8]>; 9] = [None, None, Some(b""), None, None, None, Some(b"ok"), None, None];
+        assert_eq!(got, want.map(|content| content.map(<[u8]>::to_vec)));
+        assert_eq!(parse_batch(&out, 1, 16)[0].as_deref(), Some(&b"a\n\0 b\nc\n"[..]));
+        assert_eq!(parse_batch(b"", 2, 16), [None, None]);
     }
 
     #[test]
