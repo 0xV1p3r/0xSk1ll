@@ -94,6 +94,10 @@ fn absolute(p: &Path) -> anyhow::Result<PathBuf> {
 /// Checks the request and spends the join code. `replace` allows replacing
 /// a state that isn't revoked (the daemon decided the token is dead).
 pub(crate) async fn register(cfg: &Config, opts: &JoinOptions, replace: bool) -> anyhow::Result<Registered> {
+    register_with_timeout(cfg, opts, replace, std::time::Duration::from_secs(30)).await
+}
+
+async fn register_with_timeout(cfg: &Config, opts: &JoinOptions, replace: bool, timeout: std::time::Duration) -> anyhow::Result<Registered> {
     let server_url = opts.server_url.trim().trim_end_matches('/').to_string();
     if !(server_url.starts_with("http://") || server_url.starts_with("https://")) {
         bail!("the server URL must start with http:// or https:// (got `{}`)", crate::auth::redact(&server_url));
@@ -125,12 +129,12 @@ pub(crate) async fn register(cfg: &Config, opts: &JoinOptions, replace: bool) ->
         harnesses: harnesses.clone(),
         copy_from: opts.copy_from.clone(),
     };
-    let resp = reqwest::Client::new()
+    let resp = reqwest::Client::builder().timeout(timeout).connect_timeout(std::time::Duration::from_secs(15)).build()?
         .post(format!("{server_url}/api/join"))
         .json(&req)
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("cannot reach the server at {server_url}: {}", crate::auth::redact(&e.to_string())))?;
+        .map_err(|e| anyhow::anyhow!("join request failed (connection or total request timeout): {}", crate::auth::redact(&e.to_string())))?;
     if !resp.status().is_success() {
         let status = resp.status();
         let msg = resp.json::<ErrorBody>().await.map(|e| e.error).unwrap_or_else(|_| status.to_string());
@@ -191,4 +195,32 @@ impl Registered {
             revision: self.snapshot.revision,
         })
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stalled_join_times_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let mut cfg = Config::new().unwrap();
+        cfg.state = tmp.path().join("state");
+        cfg.machine_config = tmp.path().join("machine.toml");
+        let opts = JoinOptions { server_url: url, code: "test".into(), machine_id: Some("test".into()),
+            copy_from: None, repo: tmp.path().join("repo") };
+        let start = std::time::Instant::now();
+        let err = register_with_timeout(&cfg, &opts, false, std::time::Duration::from_millis(100))
+            .await.err().expect("must time out");
+        server.abort();
+        assert!(err.to_string().contains("timeout"), "{err:#}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    }
+
 }
