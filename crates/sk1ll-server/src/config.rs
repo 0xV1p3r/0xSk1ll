@@ -4,6 +4,9 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 
+/// Transports the import check may use (git's `GIT_ALLOW_PROTOCOL` format).
+pub const IMPORT_PROTOCOLS: &str = "https:http:ssh:git";
+
 /// Server settings, from `SK1LL_SERVER_*` environment variables.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -22,6 +25,9 @@ pub struct Config {
     /// How often to check imports for newer upstream commits
     /// (`SK1LL_SERVER_IMPORT_POLL`, default `1h`).
     pub import_poll: Duration,
+    /// Transports the import check may use for upstream sources, which come
+    /// from the pushed manifest. Not configurable from the environment.
+    pub import_protocols: String,
     /// How often the server pings each daemon (`SK1LL_SERVER_PING`, default `30s`).
     /// A connection that sends nothing, pongs included, for
     /// [`Config::idle_limit`] is closed.
@@ -47,6 +53,7 @@ impl Config {
             offline_after: Duration::from_secs(120),
             join_code_ttl: Duration::from_secs(86400),
             import_poll: Duration::from_secs(3600),
+            import_protocols: IMPORT_PROTOCOLS.into(),
             ping_every: Duration::from_secs(30),
             send_timeout: Duration::from_secs(10),
             push_idle: Duration::from_secs(30),

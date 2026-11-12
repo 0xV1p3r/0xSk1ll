@@ -682,7 +682,8 @@ async fn toggles_for_items_removed_from_baseline_are_dropped() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn imports_with_newer_upstream_are_reported() {
-    let server = start().await;
+    // The upstream is a local repo; only tests allow the `file` transport.
+    let server = start_with(|c| c.import_protocols.push_str(":file"), false).await;
     let token = server.join("ws", &[]).await;
 
     let up = tempfile::tempdir().unwrap();
@@ -1332,6 +1333,9 @@ async fn push_timeout_runs_follow_up(hook_body: &str, idle: Duration, max: Durat
     assert_eq!(ws_next(&mut ws).await, ServerMessage::Nudge { baseline: second.clone() });
 
     let bare = server._dir.path().join("data/repo.git");
+    // The rewind below stands in for any push; let it past the server's
+    // history protection, which is covered by its own test.
+    git(&bare, &["config", "receive.denyNonFastForwards", "false"]);
     let hook = bare.join("hooks/post-receive");
     std::fs::write(&hook, format!("#!/bin/sh\ntouch timeout-hook-started\n{hook_body}\n")).unwrap();
     std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
