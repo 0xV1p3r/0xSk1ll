@@ -16,12 +16,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{FromRequestParts, Query, State};
+use axum::extract::{FromRequestParts, State};
 use axum::http::request::Parts;
 use axum::response::Response;
 use futures_util::stream::SplitStream;
 use futures_util::{Sink, SinkExt, StreamExt};
-use serde::Deserialize;
 use serde_json::Value;
 use sk1ll_proto::{AssignmentSnapshot, DaemonMessage, ServerMessage, ItemRef, MachineReport};
 use tokio::sync::{mpsc, watch};
@@ -34,23 +33,17 @@ use crate::{Caller, Server, assign, db, hash, now};
 /// this far behind is disconnected.
 const QUEUE: usize = 64;
 
-#[derive(Deserialize)]
-pub struct TokenQuery {
-    token: Option<String>,
-}
-
 /// An authenticated daemon: its machine id and the hash of its token.
 pub struct WsCaller(String, String);
 
 impl FromRequestParts<Arc<Server>> for WsCaller {
     type Rejection = ApiError;
 
-    /// Token from `Authorization: Bearer` or `?token=`; machine tokens only.
+    /// Token from `Authorization: Bearer`; machine tokens only.
     async fn from_request_parts(parts: &mut Parts, server: &Arc<Server>) -> Result<Self> {
-        let query = Query::<TokenQuery>::try_from_uri(&parts.uri).ok().and_then(|q| q.0.token);
-        let token = crate::api::bearer(parts).map(str::to_string).or(query).ok_or(ApiError::Unauthorized)?;
-        match server.authenticate(&token).await? {
-            Caller::Machine(id) => Ok(Self(id, hash(&token))),
+        let token = crate::api::bearer(parts).ok_or(ApiError::Unauthorized)?;
+        match server.authenticate(token).await? {
+            Caller::Machine(id) => Ok(Self(id, hash(token))),
             Caller::Admin => Err(ApiError::Forbidden("the WebSocket is for machine daemons".into())),
         }
     }
