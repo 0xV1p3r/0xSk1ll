@@ -4,6 +4,7 @@
 //! `apply` re-checks ownership/state before touching anything, so a stale plan
 //! can never delete or overwrite something sk1ll doesn't manage.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -103,11 +104,28 @@ pub mod unmanaged;
 struct Selection {
     skills: Vec<Skill>,
     rules: Vec<Rule>,
+    /// Content hash of each repo skill a harness was compared against so
+    /// far, by skill path: see [`Selection::source_hash`].
+    source_hashes: RefCell<BTreeMap<PathBuf, String>>,
 }
 
 impl Selection {
     fn new(repo: &Repo) -> Result<Self> {
-        Ok(Self { skills: repo.skills()?, rules: repo.rules()? })
+        Ok(Self { skills: repo.skills()?, rules: repo.rules()?, source_hashes: RefCell::default() })
+    }
+
+    /// Content hash of a repo skill, taken once per plan however many
+    /// harnesses receive the skill. Every harness is thus judged against the
+    /// same observation of the source; a source edited later in the plan is
+    /// what the next plan sees, as with one edited right after it. `apply`
+    /// never relies on this hash: it hashes the source it copies.
+    fn source_hash(&self, skill: &Skill) -> Result<String> {
+        if let Some(hash) = self.source_hashes.borrow().get(&skill.path) {
+            return Ok(hash.clone());
+        }
+        let hash = hash_dir(&skill.path)?;
+        self.source_hashes.borrow_mut().insert(skill.path.clone(), hash.clone());
+        Ok(hash)
     }
 
     fn skills_for(&self, assignment: &Assignment, harness: &str) -> Vec<&Skill> {
@@ -133,9 +151,7 @@ pub fn plan(
     let sel = Selection::new(repo)?;
     let mut actions = Vec::new();
     for (hname, harness) in harnesses {
-        if let Some(dir) = harness.skills_dir() {
-            plan_skills(repo, hname, harness, &dir, &sel.skills_for(assignment, hname), opts, &mut actions)?;
-        }
+        plan_skills(repo, hname, harness, &sel, &sel.skills_for(assignment, hname), opts, &mut actions)?;
         if let Some(path) = harness.instructions_file() {
             let rules = sel.rules_for(assignment, hname);
             match harness.instructions_format {
@@ -191,11 +207,15 @@ fn plan_skills(
     repo: &Repo,
     hname: &str,
     harness: &Harness,
-    dir: &Path,
+    sel: &Selection,
     skills: &[&Skill],
     opts: PlanOptions,
     actions: &mut Vec<Action>,
 ) -> Result<()> {
+    let Some(dir) = harness.skills_dir() else {
+        return Ok(());
+    };
+    let dir = dir.as_path();
     // `seen` is the one observation of the destination that the action was
     // chosen from; it becomes the precondition `apply` checks. Observing again
     // here would accept an edit made meanwhile without ever judging it.
@@ -232,7 +252,7 @@ fn plan_skills(
                 let current = seen.copy_hash.clone().unwrap_or_default();
                 #[cfg(test)]
                 hook(Hook::PlanSource, &dest);
-                let want = hash_dir(&skill.path)?;
+                let want = sel.source_hash(skill)?;
                 let copy = harness.mode == LinkMode::Copy;
                 if copy && current == rec && rec == want {
                     None
@@ -1864,7 +1884,8 @@ pub mod displaced {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Hook {
     /// While planning a skill, after observing the destination and before
-    /// hashing the source (the slow part with a large skill).
+    /// hashing the source (the slow part with a large skill), or before
+    /// reusing the hash an earlier harness of the same plan took.
     PlanSource,
     /// While applying, right before the destination is replaced.
     BeforeSwap,
@@ -2102,6 +2123,61 @@ mod tests {
         let out = f();
         HOOK.with_borrow_mut(|h| *h = None);
         out
+    }
+
+    #[test]
+    fn a_plan_hashes_each_source_skill_once() {
+        let (tmp, repo, mut harnesses) = skill_setup(LinkMode::Copy);
+        let second = Harness {
+            skills: Some(tmp.path().join("skills2").to_string_lossy().into_owned()),
+            mode: LinkMode::Copy,
+            ..Harness::default()
+        };
+        harnesses.insert("i".to_string(), second);
+        let assignment = Assignment::default();
+        for action in plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap() {
+            apply(&repo, &action).unwrap();
+        }
+        // The source changes after the first harness was compared with it:
+        // the second is judged against the same observation, not a newer one.
+        let source = repo.personal_dir().join("pdf/SKILL.md");
+        let mut calls = 0;
+        HOOK.with_borrow_mut(|h| {
+            *h = Some(Box::new(move |at, _| {
+                calls += usize::from(at == Hook::PlanSource);
+                if calls == 2 {
+                    write(&source, "Updated source.\n");
+                }
+            }))
+        });
+        let actions = plan(&repo, &harnesses, &assignment, PlanOptions::default());
+        HOOK.with_borrow_mut(|h| *h = None);
+        assert!(actions.unwrap().is_empty());
+        // The next plan sees the edit, for both harnesses.
+        let actions = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
+        assert_eq!(actions.iter().map(|a| (a.harness.as_str(), a.kind)).collect::<Vec<_>>(), [
+            ("h", ActionKind::Update),
+            ("i", ActionKind::Update)
+        ]);
+        // A harness edit made while the reused hash is looked up is still
+        // judged by `apply` against what the plan observed.
+        let dest = tmp.path().join("skills2/pdf");
+        let mut calls = 0;
+        HOOK.with_borrow_mut(|h| {
+            *h = Some(Box::new(move |at, dest| {
+                calls += usize::from(at == Hook::PlanSource);
+                if calls == 2 {
+                    write(&dest.join("SKILL.md"), "Late harness edit.\n");
+                }
+            }))
+        });
+        let actions = plan(&repo, &harnesses, &assignment, PlanOptions::default());
+        HOOK.with_borrow_mut(|h| *h = None);
+        let actions = actions.unwrap();
+        assert_eq!(actions.len(), 2);
+        apply(&repo, &actions[0]).unwrap();
+        assert!(apply(&repo, &actions[1]).is_err());
+        assert_eq!(fs::read_to_string(dest.join("SKILL.md")).unwrap(), "Late harness edit.\n");
     }
 
     #[test]
