@@ -599,3 +599,23 @@ mod tests {
         assert_eq!(resolve_ref(listing, "nope"), None);
     }
 }
+
+#[cfg(test)]
+mod transport_tests {
+    use super::ls_remote;
+#[tokio::test]
+async fn import_transports_are_restricted() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("executed");
+    let url = format!("ext::sh -c touch% {}", marker.display());
+    let err = ls_remote(&url, "main").await.unwrap_err();
+    assert!(err.to_string().contains("not allowed"));
+    assert!(!marker.exists());
+    assert!(std::process::Command::new("git").arg("-C").arg(dir.path()).args(["init", "--bare", "--quiet"]).status().unwrap().success());
+    for url in [dir.path().display().to_string(), format!("file://{}", dir.path().display())] {
+        let err = ls_remote(&url, "main").await.unwrap_err();
+        assert!(err.to_string().contains("transport 'file' not allowed"));
+    }
+}
+
+}
