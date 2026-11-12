@@ -105,6 +105,9 @@ async fn register_with_timeout(cfg: &Config, opts: &JoinOptions, replace: bool, 
     if crate::state::has_credentials(&server_url) {
         bail!("the server URL must not contain credentials");
     }
+    if insecure_http(&server_url) {
+        tracing::warn!("joining over plain HTTP: the machine token travels in clear text");
+    }
     if let Some(s) = DaemonState::load(&cfg.state)?
         && !s.revoked
         && !replace
@@ -197,6 +200,15 @@ impl Registered {
     }
 }
 
+/// Whether joining sends credentials over HTTP to a non-loopback host.
+pub fn insecure_http(server: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(server.trim()) else { return false };
+    url.scheme() == "http" && !url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost") || host.trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,4 +235,11 @@ mod tests {
         assert!(start.elapsed() < std::time::Duration::from_secs(5));
     }
 
+    #[test]
+    fn http_loopback_is_exempt() {
+        for url in ["http://localhost", "http://127.42.0.1", "http://[::1]", "https://example.com"] {
+            assert!(!insecure_http(url), "{url}");
+        }
+        assert!(insecure_http("http://example.com"));
+    }
 }
