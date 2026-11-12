@@ -37,14 +37,18 @@ pub fn init_bare(repo: &Path) -> anyhow::Result<()> {
         Ok(())
     };
     let path = repo.to_string_lossy();
-    if !repo.join("HEAD").is_file() {
+    let created = !repo.join("HEAD").is_file();
+    if created {
         run(&["init", "--quiet", "--bare", "--initial-branch=main", "--template=", &path])?;
     }
+    // Applied on every start, so repos created by older servers get them too.
     run(&["-C", &path, "config", "http.receivepack", "true"])?;
     run(&["-C", &path, "config", "receive.denyNonFastForwards", "true"])?;
     run(&["-C", &path, "config", "receive.denyDeletes", "true"])?;
     std::fs::create_dir_all(repo.join("hooks")).context("creating bare repo hooks directory")?;
-    tracing::info!("created {}", repo.display());
+    if created {
+        tracing::info!("created {}", repo.display());
+    }
     Ok(())
 }
 
@@ -144,12 +148,15 @@ fn item_for_path(path: &str) -> Option<ItemRef> {
 }
 
 /// The commit `git_ref` points at in the remote `url`, `None` if it has no such ref.
-pub async fn ls_remote(url: &str, git_ref: &str) -> anyhow::Result<Option<String>> {
+/// Only the transports in `protocols` (git's `GIT_ALLOW_PROTOCOL` list) are
+/// used: the URL comes from a pushed manifest, so `ext::` and local paths
+/// must not reach git.
+pub async fn ls_remote(url: &str, git_ref: &str, protocols: &str) -> anyhow::Result<Option<String>> {
     let out = tokio::time::timeout(
         Duration::from_secs(60),
         Command::new("git")
             .args(["ls-remote", "--", url])
-            .env("GIT_ALLOW_PROTOCOL", "https:http:ssh:git")
+            .env("GIT_ALLOW_PROTOCOL", protocols)
             .env("GIT_TERMINAL_PROMPT", "0")
             .stdin(Stdio::null())
             .kill_on_drop(true)
@@ -603,19 +610,22 @@ mod tests {
 #[cfg(test)]
 mod transport_tests {
     use super::ls_remote;
-#[tokio::test]
-async fn import_transports_are_restricted() {
-    let dir = tempfile::tempdir().unwrap();
-    let marker = dir.path().join("executed");
-    let url = format!("ext::sh -c touch% {}", marker.display());
-    let err = ls_remote(&url, "main").await.unwrap_err();
-    assert!(err.to_string().contains("not allowed"));
-    assert!(!marker.exists());
-    assert!(std::process::Command::new("git").arg("-C").arg(dir.path()).args(["init", "--bare", "--quiet"]).status().unwrap().success());
-    for url in [dir.path().display().to_string(), format!("file://{}", dir.path().display())] {
-        let err = ls_remote(&url, "main").await.unwrap_err();
-        assert!(err.to_string().contains("transport 'file' not allowed"));
-    }
-}
+    use crate::config::IMPORT_PROTOCOLS;
 
+    #[tokio::test]
+    async fn import_transports_are_restricted() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("executed");
+        let url = format!("ext::sh -c touch% {}", marker.display());
+        let err = ls_remote(&url, "main", IMPORT_PROTOCOLS).await.unwrap_err();
+        assert!(err.to_string().contains("not allowed"), "{err}");
+        assert!(!marker.exists());
+        let mut init = std::process::Command::new("git");
+        init.arg("-C").arg(dir.path()).args(["init", "--bare", "--quiet"]);
+        assert!(init.status().unwrap().success());
+        for url in [dir.path().display().to_string(), format!("file://{}", dir.path().display())] {
+            let err = ls_remote(&url, "main", IMPORT_PROTOCOLS).await.unwrap_err();
+            assert!(err.to_string().contains("transport 'file' not allowed"), "{err}");
+        }
+    }
 }

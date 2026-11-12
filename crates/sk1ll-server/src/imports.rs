@@ -61,7 +61,7 @@ async fn check_at(server: &Server, head: &str, view: &mut ImportsView) -> anyhow
         if is_commit(&import.git_ref) {
             continue;
         }
-        match git::ls_remote(&resolve_url(&import.source), &import.git_ref).await {
+        match git::ls_remote(&resolve_url(&import.source), &import.git_ref, &server.config.import_protocols).await {
             Ok(Some(upstream)) if upstream != locked.commit => view.updates.push(ImportUpdate {
                 name,
                 source: import.source,
