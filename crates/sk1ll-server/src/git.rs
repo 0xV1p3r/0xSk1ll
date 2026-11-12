@@ -149,6 +149,7 @@ pub async fn ls_remote(url: &str, git_ref: &str) -> anyhow::Result<Option<String
         Duration::from_secs(60),
         Command::new("git")
             .args(["ls-remote", "--", url])
+            .env("GIT_ALLOW_PROTOCOL", "https:http:ssh:git")
             .env("GIT_TERMINAL_PROMPT", "0")
             .stdin(Stdio::null())
             .kill_on_drop(true)
@@ -158,7 +159,7 @@ pub async fn ls_remote(url: &str, git_ref: &str) -> anyhow::Result<Option<String
     .context("timed out")?
     .context("running git")?;
     if !out.status.success() {
-        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+        bail!("{}", String::from_utf8_lossy(&out.stderr).lines().next().unwrap_or("git failed"));
     }
     Ok(resolve_ref(&String::from_utf8_lossy(&out.stdout), git_ref))
 }
