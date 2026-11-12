@@ -1533,3 +1533,31 @@ async fn defaults_and_undo_materialize_destination_drafts_and_unpushed() {
         assert_eq!(undone.entries[1].cause, LogCause::Undo { entry: entry.id });
     }
 }
+
+#[tokio::test]
+async fn expired_join_code_is_invalid() {
+    let server = start_with(|c| c.join_code_ttl = Duration::from_secs(1), false).await;
+    let code = server.join_code(ADMIN).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let expired = server.try_join(&code, "expired", &[]).await;
+    let invalid = server.try_join("invalid", "invalid", &[]).await;
+    assert_eq!(expired.status(), invalid.status());
+    assert_eq!(expired.text().await.unwrap(), invalid.text().await.unwrap());
+    server.join("fresh", &[]).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn main_rejects_rewrites_and_deletion() {
+    let server = start().await;
+    let token = server.join("writer", &[]).await;
+    let dir = clone(&server, "writer", &token).await;
+    let repo = dir.path().join("repo");
+    git(&repo, &["commit", "--allow-empty", "-m", "fast forward"]);
+    git(&repo, &["push", "origin", "HEAD:main"]);
+    git(&repo, &["reset", "--hard", "HEAD~1"]);
+    for args in [["push", "--force", "origin", "HEAD:main"], ["push", "--delete", "origin", "main"]] {
+        let out = Command::new("git").arg("-C").arg(&repo).args(args)
+            .env("GIT_TERMINAL_PROMPT", "0").output().unwrap();
+        assert!(!out.status.success());
+    }
+}
