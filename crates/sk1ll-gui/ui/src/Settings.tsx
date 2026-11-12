@@ -33,10 +33,10 @@ export function JoinCodeButton({ label, variant = 'outline' }: { label: string; 
       </DialogContent></Dialog>
   </div>;
 }
-export function Settings({ status, socket, revision, changed }: {
-  status: StatusView; socket: string; revision: number; changed: () => void;
+export function Settings({ revision, fleetRevision = revision, status, socket, changed }: {
+  status: StatusView; socket: string; fleetRevision?: number; revision: number; changed: () => void;
 }) {
-  const fleet = useResource(api.fleet, revision);
+  const fleet = useResource(api.fleet, fleetRevision);
   const harnesses = useResource(api.harnesses, revision);
   const saveEditor = useMutation();
   const [preferred, setPreferred] = useState<string>();
