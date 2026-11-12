@@ -96,3 +96,5 @@ The local API socket is `$XDG_RUNTIME_DIR/sk1ll/daemon.sock`. Its directory must
 | In sync | Latest baseline, no draft, no conflicts. |
 
 To clear Blocked, commit or restore the clashing items, then run `sk1ll pull`.
+
+Join codes expire after `SK1LL_SERVER_JOIN_CODE_TTL` (default `24h`), using the server duration syntax.

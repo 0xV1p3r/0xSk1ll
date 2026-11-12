@@ -17,6 +17,8 @@ pub struct Config {
     /// A machine without a live connection is Offline once it hasn't been
     /// seen for this long (`SK1LL_SERVER_OFFLINE_AFTER`, default `2m`).
     pub offline_after: Duration,
+    /// Join code lifetime (SK1LL_SERVER_JOIN_CODE_TTL, default 24h).
+    pub join_code_ttl: Duration,
     /// How often to check imports for newer upstream commits
     /// (`SK1LL_SERVER_IMPORT_POLL`, default `1h`).
     pub import_poll: Duration,
@@ -43,6 +45,7 @@ impl Config {
             bind: SocketAddr::from(([0, 0, 0, 0], 7878)),
             admin_token: None,
             offline_after: Duration::from_secs(120),
+            join_code_ttl: Duration::from_secs(86400),
             import_poll: Duration::from_secs(3600),
             ping_every: Duration::from_secs(30),
             send_timeout: Duration::from_secs(10),
@@ -56,6 +59,9 @@ impl Config {
         let mut cfg = Self::new(var("SK1LL_SERVER_DATA").unwrap_or_else(|| "/data".into()));
         if let Some(bind) = var("SK1LL_SERVER_BIND") {
             cfg.bind = bind.parse().with_context(|| format!("SK1LL_SERVER_BIND: invalid address `{bind}`"))?;
+        }
+        if let Some(v) = var("SK1LL_SERVER_JOIN_CODE_TTL") {
+            cfg.join_code_ttl = parse_duration(&v).with_context(|| format!("SK1LL_SERVER_JOIN_CODE_TTL: `{v}`"))?;
         }
         cfg.admin_token = var("SK1LL_SERVER_ADMIN_TOKEN");
         if let Some(v) = var("SK1LL_SERVER_OFFLINE_AFTER") {

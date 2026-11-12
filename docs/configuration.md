@@ -86,3 +86,5 @@ sk1ll assign codex --default-rules on       # default for new rules
 Changing a default first records every existing item's current value as an explicit toggle, so existing items keep their state.
 
 A standalone repo keeps assignment in `~/.cache/sk1ll/assignment.json` (override with `--assignment` or `SK1LL_ASSIGNMENT`). A joined machine sends every change to the server, which keeps a log with per-entry undo. [ADR 0001](adr/0001-assignment-is-server-state.md) explains why assignment isn't stored in the repo.
+
+Join codes expire after `SK1LL_SERVER_JOIN_CODE_TTL` (default `24h`), using the server duration syntax.
