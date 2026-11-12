@@ -333,6 +333,48 @@ async fn events(State(d): St) -> impl IntoResponse {
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
+async fn create_item(State(d): St, Json(req): Json<crate::client::CreateItemRequest>) -> Result<StatusCode> {
+    d.blocking(move |d, eng| d.create_item(eng, req)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_item(State(d): St, Json(req): Json<crate::client::DeleteItemRequest>) -> Result<StatusCode> {
+    d.blocking(move |d, eng| d.delete_item(eng, req)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn rename_item(
+    State(d): St,
+    Json(req): Json<crate::client::RenameItemRequest>,
+) -> Result<Json<crate::client::RenameItemResponse>> {
+    Ok(Json(d.blocking(move |d, eng| d.rename_item(eng, req)).await?))
+}
+
+async fn conflict_diff(State(d): St, Json(req): Json<crate::client::ConflictDiffRequest>) -> Result<Json<DiffView>> {
+    Ok(Json(d.blocking(move |d, eng| d.conflict_diff(eng, req)).await?))
+}
+
+async fn imports(State(d): St) -> Result<Json<crate::client::ImportsView>> {
+    let mut view = d.local_imports(false).await?;
+    if let Ok(response) = server::proxy(&d, Method::GET, "/imports", Bytes::new()).await
+        && response.status().is_success()
+        && let Ok(bytes) = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024).await
+        && let Ok(remote) = serde_json::from_slice::<sk1ll_proto::ImportsView>(&bytes)
+        && remote.checked_at > view.checked_at
+    {
+        view.checked_at = remote.checked_at;
+        view.updates = remote.updates;
+        view.errors = remote.errors;
+    }
+    view.updates.retain(|u| view.imports.iter().any(|i| i.name == u.name && i.locked.as_ref() == Some(&u.locked)));
+    view.errors.retain(|e| view.imports.iter().any(|i| i.name == e.name));
+    Ok(Json(view))
+}
+
+async fn check_imports(State(d): St) -> Result<Json<crate::client::ImportsView>> {
+    Ok(Json(d.local_imports(true).await?))
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
@@ -380,33 +422,4 @@ mod tests {
         assert_eq!(stream.peer_cred().unwrap().uid(), euid());
         client.await.unwrap();
     }
-}
-
-async fn create_item(State(d): St, Json(req): Json<crate::client::CreateItemRequest>) -> Result<StatusCode> {
-    d.blocking(move |d, eng| d.create_item(eng, req)).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-async fn delete_item(State(d): St, Json(req): Json<crate::client::DeleteItemRequest>) -> Result<StatusCode> {
-    d.blocking(move |d, eng| d.delete_item(eng, req)).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-async fn rename_item(State(d): St, Json(req): Json<crate::client::RenameItemRequest>) -> Result<Json<crate::client::RenameItemResponse>> {
-    Ok(Json(d.blocking(move |d, eng| d.rename_item(eng, req)).await?))
-}
-async fn conflict_diff(State(d): St, Json(req): Json<crate::client::ConflictDiffRequest>) -> Result<Json<DiffView>> {
-    Ok(Json(d.blocking(move |d, eng| d.conflict_diff(eng, req)).await?))
-}
-async fn imports(State(d): St) -> Result<Json<crate::client::ImportsView>> {
-    let mut view = d.local_imports(false).await?;
-    if let Ok(response) = server::proxy(&d, Method::GET, "/imports", Bytes::new()).await
-        && response.status().is_success()
-            && let Ok(bytes) = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024).await
-                && let Ok(remote) = serde_json::from_slice::<sk1ll_proto::ImportsView>(&bytes)
-                    && remote.checked_at > view.checked_at { view.checked_at = remote.checked_at; view.updates = remote.updates; view.errors = remote.errors; }
-    view.updates.retain(|u| view.imports.iter().any(|i| i.name == u.name && i.locked.as_ref() == Some(&u.locked)));
-    view.errors.retain(|e| view.imports.iter().any(|i| i.name == e.name));
-    Ok(Json(view))
-}
-async fn check_imports(State(d): St) -> Result<Json<crate::client::ImportsView>> {
-    Ok(Json(d.local_imports(true).await?))
 }
