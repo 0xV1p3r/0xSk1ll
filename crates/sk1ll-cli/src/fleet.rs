@@ -163,6 +163,9 @@ fn join(cli: Cli) -> Result<()> {
         Some(r) => r,
         None => dirs::home_dir().context("cannot determine the home directory")?.join("skills"),
     };
+    if sk1ll_daemon::join::insecure_http(&server_url) {
+        eprintln!("warning: joining over plain HTTP; the machine token travels in clear text");
+    }
     let opts = sk1ll_daemon::JoinOptions { server_url, code, machine_id: id, copy_from, repo };
     let (joined, via_daemon) = runtime()?.block_on(sk1ll_daemon::join_or_rejoin(&cfg, opts))?;
     let how = match joined.setup {
