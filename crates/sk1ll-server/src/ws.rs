@@ -1,6 +1,6 @@
 //! `GET /api/ws`: one daemon session per machine. Server messages go out as JSON
 //! text frames. The server pings every `ping_every`, refreshes `last_seen` on
-//! every inbound frame, and closes a session that has been silent for
+//! inbound frames at a bounded rate, and closes a session that has been silent for
 //! [`Config::idle_limit`](crate::Config::idle_limit).
 //!
 //! Each session has an id (its generation) and a cancellation token. Being
@@ -150,6 +150,8 @@ async fn read_loop(
     cancel: &CancellationToken,
 ) {
     let idle = server.config.idle_limit();
+    let touch_every = std::time::Duration::from_secs(10).min(server.config.offline_after / 4);
+    let mut last_touch: Option<tokio::time::Instant> = None;
     loop {
         let next = tokio::select! {
             biased;
@@ -160,8 +162,11 @@ async fn read_loop(
             return tracing::info!("{machine}: nothing received for {idle:?}; closing");
         };
         let Some(Ok(msg)) = msg else { return };
-        let (m, t, now) = (machine.to_string(), token_hash.to_string(), now());
-        let _ = server.db(move |conn| db::touch(conn, &m, &t, now)).await;
+        if last_touch.is_none_or(|t| t.elapsed() >= touch_every) {
+            let (m, t, now) = (machine.to_string(), token_hash.to_string(), now());
+            let _ = server.db(move |conn| db::touch(conn, &m, &t, now)).await;
+            last_touch = Some(tokio::time::Instant::now());
+        }
         match msg {
             Message::Text(text) => {
                 match serde_json::from_str::<Value>(&text).map_err(|e| e.to_string()).and_then(parse) {
