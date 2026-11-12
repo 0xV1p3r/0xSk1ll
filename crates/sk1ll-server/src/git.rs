@@ -29,9 +29,6 @@ use crate::Server;
 /// Creates the bare repo (default branch `main`, pushes over HTTP allowed)
 /// unless it exists.
 pub fn init_bare(repo: &Path) -> anyhow::Result<()> {
-    if repo.join("HEAD").is_file() {
-        return Ok(());
-    }
     let run = |args: &[&str]| -> anyhow::Result<()> {
         let out = setup_git().args(args).output().context("running git")?;
         if !out.status.success() {
@@ -40,8 +37,12 @@ pub fn init_bare(repo: &Path) -> anyhow::Result<()> {
         Ok(())
     };
     let path = repo.to_string_lossy();
-    run(&["init", "--quiet", "--bare", "--initial-branch=main", "--template=", &path])?;
+    if !repo.join("HEAD").is_file() {
+        run(&["init", "--quiet", "--bare", "--initial-branch=main", "--template=", &path])?;
+    }
     run(&["-C", &path, "config", "http.receivepack", "true"])?;
+    run(&["-C", &path, "config", "receive.denyNonFastForwards", "true"])?;
+    run(&["-C", &path, "config", "receive.denyDeletes", "true"])?;
     std::fs::create_dir_all(repo.join("hooks")).context("creating bare repo hooks directory")?;
     tracing::info!("created {}", repo.display());
     Ok(())

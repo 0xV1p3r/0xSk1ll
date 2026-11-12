@@ -87,6 +87,7 @@ async fn join(State(server): ServerState, Json(req): Json<JoinRequest>) -> Resul
     }
     let token = crate::hex(&random_bytes::<32>());
     let token_hash = hash(&token);
+    let ttl = server.config.join_code_ttl.as_secs().min(i64::MAX as u64) as i64;
     let req2 = req.clone();
     let (assignment, revision) = server
         .db(move |conn| {
@@ -104,7 +105,7 @@ async fn join(State(server): ServerState, Json(req): Json<JoinRequest>) -> Resul
                 return Err(ApiError::Conflict(format!("machine `{}` already joined", req.machine_id)));
             }
             let now = now();
-            if !db::consume_join_code(&tx, &hash(&normalize_code(&req.code)), &req.machine_id, now)? {
+            if !db::consume_join_code(&tx, &hash(&normalize_code(&req.code)), &req.machine_id, now, ttl)? {
                 return Err(ApiError::Forbidden("invalid or already used join code".into()));
             }
             let revision = db::insert_machine(&tx, &req.machine_id, &token_hash, now, &assignment)?;
