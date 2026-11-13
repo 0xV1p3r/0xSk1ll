@@ -392,6 +392,46 @@ fn editor_detection_and_terminal_arguments() {
 }
 
 #[test]
+fn editor_icons_come_from_desktop_entries_themes_and_bundles() {
+    use crate::editors::*;
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    for name in ["code", "kitty", "nvim", "zed"] {
+        std::fs::write(bin.join(name), "not executed").unwrap();
+        std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let applications = temp.path().join("applications");
+    let theme = temp.path().join("icons/hicolor/scalable/apps");
+    std::fs::create_dir_all(&applications).unwrap();
+    std::fs::create_dir_all(&theme).unwrap();
+    std::fs::write(applications.join("code.desktop"), "[Desktop Entry]\nExec=/opt/code/code %F\nIcon=vscode\n")
+        .unwrap();
+    std::fs::write(theme.join("vscode.svg"), "<svg/>").unwrap();
+    let zed = temp.path().join("zed.png");
+    std::fs::write(&zed, "png").unwrap();
+    std::fs::write(applications.join("dev.zed.Zed.desktop"), format!("[Desktop Entry]\nIcon={}\n", zed.display()))
+        .unwrap();
+    std::fs::write(applications.join("nvim.desktop"), "[Desktop Entry]\nExec=nvim\nIcon=../escape\n").unwrap();
+    let discovery =
+        Discovery { path: vec![bin], data: vec![temp.path().into()], apps: vec![], terminal: Some("kitty".into()) };
+    let found = discovery.detect();
+    let icon = |id: &str| found.iter().find(|e| e.view.id == id).unwrap().view.icon.clone();
+    assert_eq!(icon("code").as_deref(), Some("data:image/svg+xml;base64,PHN2Zy8+"));
+    assert_eq!(icon("zed").as_deref(), Some("data:image/png;base64,cG5n"));
+    assert_eq!(icon("nvim"), None);
+    assert_eq!(icon("file-manager"), None);
+
+    let chunk = |kind: &[u8], data: &[u8]| [kind, &(data.len() as u32 + 8).to_be_bytes(), data].concat();
+    let body =
+        [chunk(b"ic10", b"\x89PNG large"), chunk(b"ic07", b"jp2 data"), chunk(b"ic08", b"\x89PNG medium")].concat();
+    let icns = [b"icns".as_slice(), &(body.len() as u32 + 8).to_be_bytes(), &body].concat();
+    assert_eq!(icns_png(&icns), Some(b"\x89PNG medium".as_slice()));
+    assert_eq!(icns_png(b"icns\0\0\0\x10ic07\xff\xff\xff\xff"), None);
+}
+
+#[test]
 fn editor_targets_reject_escapes_and_imports() {
     use crate::editors::*;
     let temp = tempfile::tempdir().unwrap();
@@ -665,7 +705,7 @@ fn every_editor_launch_keeps_unusual_paths_in_one_argument() {
                 args
             };
             let editor = Editor {
-                view: EditorView { id: "default-app".into(), name: kind.into(), kind: EditorKind::System },
+                view: EditorView { id: "default-app".into(), name: kind.into(), kind: EditorKind::System, icon: None },
                 program: stub.clone(),
                 args: args.clone(),
             };

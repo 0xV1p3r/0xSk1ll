@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
-import { ArrowDown, ArrowUp, ChevronDown, Eye, File, Folder, LayoutGrid } from 'lucide-react';
+import { ArrowDown, ArrowUp, ChevronDown, Code, Eye, File, Folder, LayoutGrid, SquareTerminal } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
@@ -15,11 +15,17 @@ import { useMutation, useResource } from './hooks';
 import { ChangeBadge, Confirm, ErrorNotice, Loading, Nothing, Notice, Panel, PanelToolbar, Pending, SectionTitle } from './shared';
 import { terms } from './model';
 import { SkillFile } from './SkillFile';
-import type { ContentEntry, ContentQuery, ContentType, StatusView } from './types';
+import type { ContentEntry, ContentQuery, ContentType, Editor, StatusView } from './types';
 
 const typeLabels: Record<ContentType, string> = { personal: 'Personal', import: 'Import', rule: 'Rule', unmanaged: 'Unmanaged' };
 const loadEditors = () => api.editors(true);
 const keyFor = (entry: ContentEntry) => entry.item ?? `unmanaged:${entry.name}`;
+// The editor's installed icon, or a generic one for its kind.
+function EditorIcon({ editor }: { editor: Editor }) {
+  if (editor.icon) return <img src={editor.icon} alt="" data-icon="inline-start" className="size-4 shrink-0" />;
+  const Icon = editor.id === 'file-manager' ? Folder : editor.kind === 'system' ? File : editor.kind === 'terminal' ? SquareTerminal : Code;
+  return <Icon data-icon="inline-start" />;
+}
 function DraftBadge({ entry }: { entry: ContentEntry }) {
   return entry.draft ? <ChangeBadge change={entry.draft} /> : <span className="text-muted-foreground">—</span>;
 }
@@ -199,6 +205,7 @@ function SkillDetail({ entry, entries, close, initialHarness, revision, changed,
           <ServerRequired needed={needsServer}><div className="flex" role="group" aria-label="Edit Skill">
             <Button size="default" className="rounded-r-none" disabled={(entry.type !== 'unmanaged' && !preferred) || mutation.pending || (entry.type === 'unmanaged' && !canAdopt)}
               onClick={event => { confirmationTrigger.current = event.currentTarget; if (entry.type === 'unmanaged') setConfirmation({}); else if (preferred) edit(preferred.id); }}><Pending pending={mutation.pending}>
+                {!mutation.pending && entry.type !== 'import' && entry.type !== 'unmanaged' && preferred && <EditorIcon editor={preferred} />}
                 {entry.type === 'import' ? 'Fork to edit' : entry.type === 'unmanaged' ? 'Adopt into Draft' : `Open in ${preferred?.name ?? 'editor'}`}
               </Pending></Button>
             <DropdownMenu><DropdownMenuTrigger render={<Button size="icon" className="rounded-l-none border-l" ref={editorTrigger} aria-label="Choose editor" disabled={!editors.data?.editors.length || mutation.pending || (entry.type === 'unmanaged' && !canAdopt)} />}><ChevronDown /></DropdownMenuTrigger>
