@@ -700,24 +700,37 @@ impl Daemon {
         for item in gitx::unpushed_items(root)? {
             inventory.entry(item.clone()).or_insert_with(|| entry(item)).unpushed = true;
         }
+        // Descriptions of skills without a draft come from git: one
+        // `cat-file --batch` for all of them, not a process per skill.
+        let mut wanted = Vec::new();
+        for value in inventory.values().filter(|value| value.draft.is_none()) {
+            let revision = if value.unpushed { head.as_ref() } else { baseline.as_ref() };
+            let (ItemRef::Skill(name), Some(rev)) = (&value.item, revision) else { continue };
+            // The batch protocol is line-based: such a name can't be asked for.
+            if !name.contains('\n') {
+                wanted.extend(SKILL_DIRS.iter().map(|directory| format!("{rev}:{directory}/{name}/SKILL.md")));
+            }
+        }
+        let mut blobs = BTreeMap::new();
+        if !wanted.is_empty() {
+            let input = wanted.iter().flat_map(|object| [object.as_str(), "\n"]).collect::<String>().into_bytes();
+            let batch = Git::new(root).env("GIT_OPTIONAL_LOCKS", "0").args(["cat-file", "--batch"]).stdin(input).run();
+            let contents = batch.map(|out| parse_batch(&out, wanted.len(), DESCRIPTION_CAP)).unwrap_or_default();
+            blobs.extend(wanted.into_iter().zip(contents).filter_map(|(object, bytes)| Some((object, bytes?))));
+        }
         for value in inventory.values_mut() {
             let ItemRef::Skill(name) = &value.item else { continue };
-            for directory in ["personal", "imported"] {
+            for directory in SKILL_DIRS {
                 let path = format!("{directory}/{name}/SKILL.md");
                 let text = if value.draft.is_some() {
                     use std::io::Read;
                     let mut text = String::new();
                     std::fs::File::open(root.join(&path)).ok()
-                        .and_then(|file| file.take(16384).read_to_string(&mut text).ok()).map(|_| text)
+                        .and_then(|file| file.take(DESCRIPTION_CAP as u64).read_to_string(&mut text).ok()).map(|_| text)
                 } else {
                     let revision = if value.unpushed { head.as_ref() } else { baseline.as_ref() };
-                    revision.and_then(|rev| {
-                        let object = format!("{rev}:{path}");
-                        let size = read(&["cat-file", "-s", &object]).ok()?;
-                        let size = String::from_utf8_lossy(&size).trim().parse::<usize>().ok()?;
-                        (size <= 16384).then(|| read(&["show", &object]).ok()).flatten()
-                            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                    })
+                    revision.and_then(|rev| blobs.remove(&format!("{rev}:{path}")))
+                        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
                 };
                 if let Some(text) = text {
                     value.description = skill_description(&text);
@@ -1223,6 +1236,41 @@ fn import_updated(r: sk1ll_core::UpdateReport) -> ImportUpdated {
     ImportUpdated { name: r.name, old_commit: r.old_commit, new_commit: r.new_commit, changed: r.changed }
 }
 
+/// Where a skill's files live in the repo, in the order they are looked up.
+const SKILL_DIRS: [&str; 2] = ["personal", "imported"];
+
+/// A `SKILL.md` larger than this is not read for its description.
+const DESCRIPTION_CAP: usize = 16384;
+
+/// Reads `git cat-file --batch` output for `count` requested objects, in
+/// request order: the content of each blob of at most `cap` bytes, `None` for
+/// anything else (missing, not a blob, larger). Content is raw bytes, so it is
+/// taken by the size in its header, never by looking for a line end; output
+/// that ends early or doesn't parse leaves the remaining objects `None`.
+fn parse_batch(mut out: &[u8], count: usize, cap: usize) -> Vec<Option<Vec<u8>>> {
+    let mut contents = vec![None; count];
+    for content in &mut contents {
+        let Some(end) = out.iter().position(|b| *b == b'\n') else { break };
+        let header = String::from_utf8_lossy(&out[..end]);
+        out = &out[end + 1..];
+        // `<oid> <type> <size>`; anything else (`<name> missing`, where the
+        // name may itself contain spaces) has no content after it.
+        let mut fields = header.rsplitn(3, ' ');
+        let (size, kind, oid) = (fields.next(), fields.next(), fields.next());
+        let object = matches!(kind, Some("blob" | "tree" | "commit" | "tag"))
+            && oid.is_some_and(|oid| !oid.is_empty() && oid.bytes().all(|b| b.is_ascii_hexdigit()));
+        let Some(size) = size.filter(|_| object).and_then(|size| size.parse::<usize>().ok()) else { continue };
+        if out.len() <= size || out[size] != b'\n' {
+            break;
+        }
+        if kind == Some("blob") && size <= cap {
+            *content = Some(out[..size].to_vec());
+        }
+        out = &out[size + 1..];
+    }
+    contents
+}
+
 fn skill_description(text: &str) -> Option<String> {
     let mut lines = text.lines();
     if lines.next()?.trim() != "---" { return None }
@@ -1316,160 +1364,6 @@ fn matches_target(a: &Action, t: &ConflictTarget) -> bool {
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn inventory_reads_applied_baseline_and_never_refreshes_the_index() {
-        use sk1ll_core::git::Git;
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let git = |args: &[&str]| Git::new(root)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1")
-            .args(["-c", "commit.gpgsign=false"]).args(args).run().unwrap();
-        let write = |path: &str, text: &str| {
-            let path = root.join(path);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, text).unwrap();
-        };
-        git(&["init", "-q", "-b", "main"]);
-        git(&["config", "user.name", "test"]);
-        git(&["config", "user.email", "test@example.invalid"]);
-        write("personal/base/SKILL.md", "---\ndescription: Baseline description\n---\nbase\n");
-        write("instructions/git.md", "baseline rule\n");
-        git(&["add", "."]);
-        git(&["commit", "-qm", "baseline"]);
-        let baseline = String::from_utf8(git(&["rev-parse", "HEAD"])).unwrap();
-        git(&["update-ref", "refs/remotes/origin/main", baseline.trim()]);
-        write("personal/queued/SKILL.md", "queued\n");
-        git(&["add", "."]);
-        git(&["commit", "-qm", "unpushed"]);
-        write("personal/base/SKILL.md", "---\ndescription: Draft description\n---\nedited\n");
-        write("personal/local/SKILL.md", "new\n");
-        std::fs::remove_file(root.join("instructions/git.md")).unwrap();
-        let index_before = std::fs::read(root.join(".git/index")).unwrap();
-        let head_before = git(&["rev-parse", "HEAD"]);
-        let items = Daemon::items(root).unwrap();
-        let find = |name: &str| items.iter().find(|entry| entry.item.to_string() == name).unwrap();
-        assert!(find("skill:base").in_baseline);
-        assert_eq!(find("skill:base").draft, Some(ChangeKind::Modified));
-        assert_eq!(find("skill:base").description.as_deref(), Some("Draft description"));
-        assert!(find("rule:git").in_baseline, "deleted Draft item still comes from the git tree");
-        assert_eq!(find("rule:git").draft, Some(ChangeKind::Deleted));
-        assert!(!find("skill:queued").in_baseline);
-        assert!(find("skill:queued").unpushed);
-        assert!(!find("skill:local").in_baseline);
-        assert_eq!(find("skill:local").draft, Some(ChangeKind::Added));
-        assert_eq!(std::fs::read(root.join(".git/index")).unwrap(), index_before);
-        assert_eq!(git(&["rev-parse", "HEAD"]), head_before);
-
-        // A fetched but clashing Baseline has not been applied locally.
-        git(&["checkout", "-qb", "remote", baseline.trim()]);
-        write("instructions/remote.md", "remote rule\n");
-        git(&["add", "instructions/remote.md"]);
-        git(&["commit", "-qm", "remote"]);
-        let remote = String::from_utf8(git(&["rev-parse", "HEAD"])).unwrap();
-        git(&["update-ref", "refs/remotes/origin/main", remote.trim()]);
-        git(&["checkout", "-q", "main"]);
-        let items = Daemon::items(root).unwrap();
-        assert!(!items.iter().any(|entry| entry.item.to_string() == "rule:remote"));
-        assert!(items.iter().find(|entry| entry.item.to_string() == "skill:base").unwrap().in_baseline);
-    }
-
-    #[test]
-    fn stale_revisions_are_ignored() {
-        assert!(newer(0, 1));
-        assert!(newer(4, 5));
-        assert!(!newer(5, 5));
-        assert!(!newer(5, 3));
-        assert!(!newer(5, 0));
-        assert!(newer(0, 0));
-    }
-
-    #[test]
-    fn only_rejected_pushes_are_retried() {
-        let git = |stderr: &str| sk1ll_core::Error::Git { args: "push".into(), stderr: stderr.into() };
-        assert!(is_rejected_push(&git(" ! [rejected]        main -> main (fetch first)")));
-        assert!(!is_rejected_push(&git("fatal: unable to access 'http://h/git/repo.git/': Failed to connect")));
-        assert!(!is_rejected_push(&git("fatal: the remote end hung up unexpectedly")));
-    }
-    #[tokio::test]
-    async fn refused_adoption_rolls_back_only_its_own_unchanged_copy_and_can_retry() {
-        use axum::{Json, Router, http::StatusCode, routing::{get, put}};
-        use sk1ll_proto::{AssignmentChanges, AssignmentUpdate};
-        for scenario in ["new", "retry", "edit_repo", "edit_source"] {
-            let dir = tempfile::tempdir().unwrap();
-            let root = dir.path().join("repo");
-            let repo = Repo::init(&root).unwrap();
-            let source = dir.path().join("h/pdf");
-            std::fs::create_dir_all(&source).unwrap();
-            std::fs::write(source.join("SKILL.md"), "original").unwrap();
-            let destination = repo.personal_dir().join("pdf");
-            if scenario == "retry" {
-                std::fs::create_dir_all(&destination).unwrap();
-                std::fs::write(destination.join("SKILL.md"), "original").unwrap();
-            }
-            let accept = Arc::new(AtomicBool::new(false));
-            let app = Router::new().route("/api/fleet", get(|| async { Json(sk1ll_proto::FleetView {
-                baseline: None, machines: vec![sk1ll_proto::MachineRow {
-                    id: "a".into(), status: sk1ll_proto::MachineStatus::Drafting, connected: true,
-                    joined_at: 0, last_seen: None,
-                    report: Some(MachineReport { drafts: vec![ItemRef::Skill("pdf".into())], ..Default::default() }),
-                }],
-            }) })).route("/api/machines/a/assignment", put({
-                let accept = accept.clone();
-                let (destination, source) = (destination.clone(), source.clone());
-                move |Json(body): Json<AssignmentChanges>| {
-                    let (accept, destination, source) = (accept.clone(), destination.clone(), source.clone());
-                    async move {
-                        assert_eq!(body.changes.len(), 1);
-                        assert_eq!(body.changes[0].enabled, Some(true));
-                        assert_eq!(body.changes[0].name.as_deref(), Some("pdf"));
-                        if !accept.load(Ordering::SeqCst) {
-                            if scenario == "edit_repo" { std::fs::write(destination.join("SKILL.md"), "later edit").unwrap(); }
-                            if scenario == "edit_source" { std::fs::write(source.join("SKILL.md"), "later edit").unwrap(); }
-                            return (StatusCode::UNPROCESSABLE_ENTITY, "Server rejected assignment".to_string());
-                        }
-                        let mut assignment = sk1ll_proto::Assignment::default();
-                        assignment.set_skill("h", "pdf", true);
-                        (StatusCode::OK, serde_json::to_string(&AssignmentUpdate { assignment, revision: 2, entries: vec![] }).unwrap())
-                    }
-                }
-            }));
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address = listener.local_addr().unwrap();
-            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-            let mut cfg = Config::new().unwrap();
-            cfg.state = dir.path().join("state/daemon.json");
-            cfg.assignment = dir.path().join("assignment.json");
-            cfg.machine_config = dir.path().join("machine.toml");
-            std::fs::write(&cfg.machine_config, format!("[harnesses.h]\nskills = {:?}\nmode = \"copy\"\n", dir.path().join("h"))).unwrap();
-            let mut snap = AssignmentSnapshot { revision: 1, ..Default::default() };
-            snap.assignment.set_new_skills_default("h", false);
-            state::save_snapshot(&cfg.snapshot_path(), &snap).unwrap();
-            let d = Daemon::new(cfg, DaemonState {
-                machine_id: "a".into(), token: "t".into(), server_url: format!("http://{address}"), repo: root, revoked: false,
-            }).unwrap();
-            d.set_connection(Connection::Connected);
-            let error = d.blocking(|d, eng| d.adopt(eng, ConflictTarget { harness: "h".into(), name: "pdf".into() })).await.unwrap_err();
-            assert!(error.to_string().contains("Server refused"), "{error}");
-            assert_eq!(std::fs::read_to_string(source.join("SKILL.md")).unwrap(), if scenario == "edit_source" { "later edit" } else { "original" });
-            assert!(!source.join(".sk1ll-managed").exists());
-            if scenario == "new" {
-                assert!(!destination.exists());
-                accept.store(true, Ordering::SeqCst);
-                d.blocking(|d, eng| d.adopt(eng, ConflictTarget { harness: "h".into(), name: "pdf".into() })).await.unwrap();
-                assert!(source.join(".sk1ll-managed").is_file());
-            } else {
-                assert_eq!(std::fs::read_to_string(destination.join("SKILL.md")).unwrap(), if scenario == "edit_repo" { "later edit" } else { "original" });
-            }
-            server.abort();
-        }
-    }
-
 }
 
 impl Daemon {
@@ -1613,4 +1507,191 @@ fn copy_authored(from: &Path, to: &Path) -> std::io::Result<()> {
         else if kind.is_file() { std::fs::copy(entry.path(), to.join(&name))?; }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inventory_reads_applied_baseline_and_never_refreshes_the_index() {
+        use sk1ll_core::git::Git;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| Git::new(root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(["-c", "commit.gpgsign=false"]).args(args).run().unwrap();
+        let write = |path: &str, text: &str| {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "test"]);
+        git(&["config", "user.email", "test@example.invalid"]);
+        write("personal/base/SKILL.md", "---\ndescription: Baseline description\n---\nbase\n");
+        write("instructions/git.md", "baseline rule\n");
+        write("imported/vendored/SKILL.md", "---\ndescription: Imported description\n---\n");
+        write("personal/my skill/SKILL.md", "---\ndescription: 'Spaced'\n---\n\x00\nbody\n");
+        write("personal/huge/SKILL.md", &format!("---\ndescription: Too big\n---\n{}", "x".repeat(DESCRIPTION_CAP)));
+        write("personal/plain/SKILL.md", "no front matter\n");
+        git(&["add", "."]);
+        git(&["commit", "-qm", "baseline"]);
+        let baseline = String::from_utf8(git(&["rev-parse", "HEAD"])).unwrap();
+        git(&["update-ref", "refs/remotes/origin/main", baseline.trim()]);
+        write("personal/queued/SKILL.md", "---\ndescription: Queued description\n---\n");
+        git(&["add", "."]);
+        git(&["commit", "-qm", "unpushed"]);
+        write("personal/base/SKILL.md", "---\ndescription: Draft description\n---\nedited\n");
+        write("personal/local/SKILL.md", "new\n");
+        std::fs::remove_file(root.join("instructions/git.md")).unwrap();
+        let index_before = std::fs::read(root.join(".git/index")).unwrap();
+        let head_before = git(&["rev-parse", "HEAD"]);
+        let items = Daemon::items(root).unwrap();
+        let find = |name: &str| items.iter().find(|entry| entry.item.to_string() == name).unwrap();
+        assert!(find("skill:base").in_baseline);
+        assert_eq!(find("skill:base").draft, Some(ChangeKind::Modified));
+        assert_eq!(find("skill:base").description.as_deref(), Some("Draft description"));
+        // Descriptions of items without a draft are read from git, in one batch.
+        assert_eq!(find("skill:vendored").description.as_deref(), Some("Imported description"));
+        assert_eq!(find("skill:my skill").description.as_deref(), Some("Spaced"));
+        assert_eq!(find("skill:queued").description.as_deref(), Some("Queued description"));
+        assert_eq!(find("skill:huge").description, None, "over the cap: not read");
+        assert_eq!(find("skill:plain").description, None);
+        assert_eq!(find("skill:local").description, None);
+        assert!(find("rule:git").in_baseline, "deleted Draft item still comes from the git tree");
+        assert_eq!(find("rule:git").draft, Some(ChangeKind::Deleted));
+        assert!(!find("skill:queued").in_baseline);
+        assert!(find("skill:queued").unpushed);
+        assert!(!find("skill:local").in_baseline);
+        assert_eq!(find("skill:local").draft, Some(ChangeKind::Added));
+        assert_eq!(std::fs::read(root.join(".git/index")).unwrap(), index_before);
+        assert_eq!(git(&["rev-parse", "HEAD"]), head_before);
+
+        // A fetched but clashing Baseline has not been applied locally.
+        git(&["checkout", "-qb", "remote", baseline.trim()]);
+        write("instructions/remote.md", "remote rule\n");
+        git(&["add", "instructions/remote.md"]);
+        git(&["commit", "-qm", "remote"]);
+        let remote = String::from_utf8(git(&["rev-parse", "HEAD"])).unwrap();
+        git(&["update-ref", "refs/remotes/origin/main", remote.trim()]);
+        git(&["checkout", "-q", "main"]);
+        let items = Daemon::items(root).unwrap();
+        assert!(!items.iter().any(|entry| entry.item.to_string() == "rule:remote"));
+        assert!(items.iter().find(|entry| entry.item.to_string() == "skill:base").unwrap().in_baseline);
+    }
+
+    #[test]
+    fn batch_output_is_read_by_size() {
+        let oid = "ce013625030ba8dba906f756967f9e9ca394464a";
+        let mut out = Vec::new();
+        out.extend_from_slice(format!("{oid} blob 8\n").as_bytes());
+        out.extend_from_slice(b"a\n\0 b\nc\n\n");
+        out.extend_from_slice(b"abc:personal/a b/SKILL.md missing\n");
+        out.extend_from_slice(format!("{oid} blob 0\n\n").as_bytes());
+        out.extend_from_slice(format!("{oid} tree 4\nabcd\n").as_bytes());
+        out.extend_from_slice(format!("{oid} blob 7\n").as_bytes());
+        // Content that looks like headers is still content.
+        out.extend_from_slice(b"x blob\n\n");
+        out.extend_from_slice(format!("{oid} blob 5\nlarge\n").as_bytes());
+        out.extend_from_slice(format!("{oid} blob 2\nok\n").as_bytes());
+        out.extend_from_slice(format!("{oid} blob 9\ncut").as_bytes());
+        let got = parse_batch(&out, 9, 4);
+        let want: [Option<&[u8]>; 9] = [None, None, Some(b""), None, None, None, Some(b"ok"), None, None];
+        assert_eq!(got, want.map(|content| content.map(<[u8]>::to_vec)));
+        assert_eq!(parse_batch(&out, 1, 16)[0].as_deref(), Some(&b"a\n\0 b\nc\n"[..]));
+        assert_eq!(parse_batch(b"", 2, 16), [None, None]);
+    }
+
+    #[test]
+    fn stale_revisions_are_ignored() {
+        assert!(newer(0, 1));
+        assert!(newer(4, 5));
+        assert!(!newer(5, 5));
+        assert!(!newer(5, 3));
+        assert!(!newer(5, 0));
+        assert!(newer(0, 0));
+    }
+
+    #[test]
+    fn only_rejected_pushes_are_retried() {
+        let git = |stderr: &str| sk1ll_core::Error::Git { args: "push".into(), stderr: stderr.into() };
+        assert!(is_rejected_push(&git(" ! [rejected]        main -> main (fetch first)")));
+        assert!(!is_rejected_push(&git("fatal: unable to access 'http://h/git/repo.git/': Failed to connect")));
+        assert!(!is_rejected_push(&git("fatal: the remote end hung up unexpectedly")));
+    }
+    #[tokio::test]
+    async fn refused_adoption_rolls_back_only_its_own_unchanged_copy_and_can_retry() {
+        use axum::{Json, Router, http::StatusCode, routing::{get, put}};
+        use sk1ll_proto::{AssignmentChanges, AssignmentUpdate};
+        for scenario in ["new", "retry", "edit_repo", "edit_source"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("repo");
+            let repo = Repo::init(&root).unwrap();
+            let source = dir.path().join("h/pdf");
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::write(source.join("SKILL.md"), "original").unwrap();
+            let destination = repo.personal_dir().join("pdf");
+            if scenario == "retry" {
+                std::fs::create_dir_all(&destination).unwrap();
+                std::fs::write(destination.join("SKILL.md"), "original").unwrap();
+            }
+            let accept = Arc::new(AtomicBool::new(false));
+            let app = Router::new().route("/api/fleet", get(|| async { Json(sk1ll_proto::FleetView {
+                baseline: None, machines: vec![sk1ll_proto::MachineRow {
+                    id: "a".into(), status: sk1ll_proto::MachineStatus::Drafting, connected: true,
+                    joined_at: 0, last_seen: None,
+                    report: Some(MachineReport { drafts: vec![ItemRef::Skill("pdf".into())], ..Default::default() }),
+                }],
+            }) })).route("/api/machines/a/assignment", put({
+                let accept = accept.clone();
+                let (destination, source) = (destination.clone(), source.clone());
+                move |Json(body): Json<AssignmentChanges>| {
+                    let (accept, destination, source) = (accept.clone(), destination.clone(), source.clone());
+                    async move {
+                        assert_eq!(body.changes.len(), 1);
+                        assert_eq!(body.changes[0].enabled, Some(true));
+                        assert_eq!(body.changes[0].name.as_deref(), Some("pdf"));
+                        if !accept.load(Ordering::SeqCst) {
+                            if scenario == "edit_repo" { std::fs::write(destination.join("SKILL.md"), "later edit").unwrap(); }
+                            if scenario == "edit_source" { std::fs::write(source.join("SKILL.md"), "later edit").unwrap(); }
+                            return (StatusCode::UNPROCESSABLE_ENTITY, "Server rejected assignment".to_string());
+                        }
+                        let mut assignment = sk1ll_proto::Assignment::default();
+                        assignment.set_skill("h", "pdf", true);
+                        (StatusCode::OK, serde_json::to_string(&AssignmentUpdate { assignment, revision: 2, entries: vec![] }).unwrap())
+                    }
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let mut cfg = Config::new().unwrap();
+            cfg.state = dir.path().join("state/daemon.json");
+            cfg.assignment = dir.path().join("assignment.json");
+            cfg.machine_config = dir.path().join("machine.toml");
+            std::fs::write(&cfg.machine_config, format!("[harnesses.h]\nskills = {:?}\nmode = \"copy\"\n", dir.path().join("h"))).unwrap();
+            let mut snap = AssignmentSnapshot { revision: 1, ..Default::default() };
+            snap.assignment.set_new_skills_default("h", false);
+            state::save_snapshot(&cfg.snapshot_path(), &snap).unwrap();
+            let d = Daemon::new(cfg, DaemonState {
+                machine_id: "a".into(), token: "t".into(), server_url: format!("http://{address}"), repo: root, revoked: false,
+            }).unwrap();
+            d.set_connection(Connection::Connected);
+            let error = d.blocking(|d, eng| d.adopt(eng, ConflictTarget { harness: "h".into(), name: "pdf".into() })).await.unwrap_err();
+            assert!(error.to_string().contains("Server refused"), "{error}");
+            assert_eq!(std::fs::read_to_string(source.join("SKILL.md")).unwrap(), if scenario == "edit_source" { "later edit" } else { "original" });
+            assert!(!source.join(".sk1ll-managed").exists());
+            if scenario == "new" {
+                assert!(!destination.exists());
+                accept.store(true, Ordering::SeqCst);
+                d.blocking(|d, eng| d.adopt(eng, ConflictTarget { harness: "h".into(), name: "pdf".into() })).await.unwrap();
+                assert!(source.join(".sk1ll-managed").is_file());
+            } else {
+                assert_eq!(std::fs::read_to_string(destination.join("SKILL.md")).unwrap(), if scenario == "edit_repo" { "later edit" } else { "original" });
+            }
+            server.abort();
+        }
+    }
+
 }
