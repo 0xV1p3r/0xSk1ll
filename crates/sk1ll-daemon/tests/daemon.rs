@@ -1317,6 +1317,60 @@ async fn a_hanging_fetch_blocks_no_other_call() {
     assert!(err.message.contains("timed out"), "{}", err.message);
 }
 
+/// A pull holds the engine mutex while its fetch waits for the server. The
+/// read-only endpoints don't take that mutex, so the GUI keeps answering.
+#[tokio::test(flavor = "multi_thread")]
+async fn reads_answer_while_a_pull_holds_the_engine_mutex() {
+    use sk1ll_daemon::client::{ConflictDiffRequest, ContentQuery, FileQuery};
+    // Never accepted: the daemon stays offline and pulls only when asked.
+    let server = FakeServer::new().await;
+    let probe = tempfile::tempdir().unwrap();
+    let pidfile = probe.path().join("ssh.pid");
+    let ssh = format!("sleep 30 & echo $! > '{}'; wait; :", pidfile.display());
+    let mut m = solo("solo", &server.url(), Some(snapshot(1, &["x"])))
+        .with_env("GIT_SSH_COMMAND", &ssh)
+        .with_env("GIT_SSH_VARIANT", "simple")
+        .with_env("SK1LL_GIT_TIMEOUT", "8s")
+        .with_env("SK1LL_RECONCILE_INTERVAL", "1h");
+    m.start().await;
+    eventually(|| async { m.harness_skill("x").map(drop) }).await;
+    // A draft change, and a conflict: a hand edit of a synced skill.
+    m.write("personal/x/SKILL.md", "x edited\n");
+    eventually(|| async { (m.harness_skill("x")? == "x edited\n").then_some(()) }).await;
+    write(&m.skills().join("x"), "SKILL.md", "edited in the harness\n");
+    eventually(|| async { (!m.status().await.report.conflicts.is_empty()).then_some(()) }).await;
+
+    git(&m.repo(), &["remote", "set-url", "origin", "ssh://sk1ll.invalid/slow.git"]);
+    let client = m.client.clone();
+    let stuck = tokio::spawn(async move { client.pull().await });
+    eventually(|| async { pidfile.exists().then_some(()) }).await;
+
+    let query = ContentQuery { item: "skill:x".into(), hash: None, harness: None };
+    let started = std::time::Instant::now();
+    let draft = m.client.draft().await.unwrap();
+    assert_eq!(draft.iter().map(|d| d.item.to_string()).collect::<Vec<_>>(), ["skill:x"]);
+    assert!(m.client.diff("skill:x").await.unwrap().diff.contains("+x edited"));
+    assert!(m.client.commit_message(&["skill:x".into()]).await.unwrap().message.contains('x'));
+    assert!(m.client.skills().await.unwrap().iter().any(|e| e.name == "x"));
+    assert!(m.client.skill_tree(&query).await.unwrap().iter().any(|f| f.path == "SKILL.md"));
+    let query = FileQuery { content: query, path: "SKILL.md".into() };
+    assert_eq!(m.client.skill_file(&query).await.unwrap().text.as_deref(), Some("x edited\n"));
+    let conflicts = m.client.conflicts().await.unwrap();
+    assert_eq!(conflicts.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["x"]);
+    m.client.recovered().await.unwrap();
+    let request = ConflictDiffRequest { harness: Some(HARNESS.into()), name: Some("x".into()), id: None };
+    assert!(m.client.conflict_diff(&request).await.unwrap().diff.contains("edited in the harness"));
+    assert_eq!(m.client.harnesses().await.unwrap().len(), 1);
+    assert!(!m.client.items().await.unwrap().is_empty());
+    m.client.status().await.unwrap();
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_secs(3), "the reads waited {elapsed:?} for the pull");
+    assert!(!stuck.is_finished(), "the pull was still holding the engine mutex");
+
+    let err = stuck.await.unwrap().unwrap_err();
+    assert!(err.message.contains("timed out"), "{}", err.message);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn skills_api_browses_content_and_adopts_only_while_connected() {
     use sk1ll_daemon::client::{ConflictTarget, ContentQuery, ContentType, FileQuery};
