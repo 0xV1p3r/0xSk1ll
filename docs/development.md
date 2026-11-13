@@ -40,6 +40,7 @@ pnpm lint
 pnpm test
 pnpm build           # needed before cargo, because the GUI embeds ui/dist
 cd ../../..
+cargo fmt --all --check
 cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
