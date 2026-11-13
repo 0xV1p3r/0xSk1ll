@@ -345,11 +345,11 @@ impl Daemon {
         self.outbox_ready.notify_one();
     }
 
-    pub(crate) fn outbox_front(&self) -> Option<outbox::Entry> {
-        lock(&self.outbox).front()
+    pub(crate) fn outbox_front(&self, sent: &std::collections::HashSet<u64>) -> Option<outbox::Entry> {
+        lock(&self.outbox).unsent(sent)
     }
 
-    /// `id` reached the server.
+    /// The server confirmed `id`, or filtering left nothing to deliver.
     pub(crate) fn outbox_delivered(&self, id: u64) {
         let pending = {
             let mut o = lock(&self.outbox);

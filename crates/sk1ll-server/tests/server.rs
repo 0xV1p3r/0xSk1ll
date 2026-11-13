@@ -1038,7 +1038,7 @@ async fn draft_discarded_preserves_unpushed_items() {
     server.reported("a", &committed).await;
     ws_send(
         &mut ws,
-        &DaemonMessage::DraftDiscarded {
+        &DaemonMessage::DraftDiscarded { id: None,
             items: vec![ItemRef::Skill("wip".into()), ItemRef::Rule("git".into()), ItemRef::Skill("gone".into())],
         },
     )
@@ -1096,7 +1096,7 @@ async fn draft_discarded_drops_and_logs_only_removed_items() {
     server.reported("ws", &restore).await;
     let before = server.get_json::<AssignmentSnapshot>(&token, "/machines/ws/assignment").await.assignment;
     assert!(before.skill_enabled("claude", "wip"), "status alone must preserve the toggle");
-    let discarded = DaemonMessage::DraftDiscarded {
+    let discarded = DaemonMessage::DraftDiscarded { id: Some(17),
         items: vec![
             ItemRef::Skill("wip".into()),
             ItemRef::Skill("wip".into()),
@@ -1108,6 +1108,7 @@ async fn draft_discarded_drops_and_logs_only_removed_items() {
     };
     ws_send(&mut ws, &discarded).await;
     let a = ws_assignment(&mut ws).await;
+    assert_eq!(ws_next(&mut ws).await, ServerMessage::DraftDiscardApplied { id: 17 });
     let claude = a.assignment.harness("claude");
     assert!(!claude.skills.contains_key("wip"));
     assert_eq!(claude.skills.get("unmentioned"), Some(&false));
@@ -1117,6 +1118,7 @@ async fn draft_discarded_drops_and_logs_only_removed_items() {
 
     // A repeat is a no-op, including the assignment revision and log.
     ws_send(&mut ws, &discarded).await;
+    assert_eq!(ws_next(&mut ws).await, ServerMessage::DraftDiscardApplied { id: 17 });
     let marker = MachineReport { behind: true, ..restore };
     ws_send(&mut ws, &DaemonMessage::Status(marker.clone())).await;
     server.reported("ws", &marker).await;
