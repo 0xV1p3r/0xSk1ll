@@ -206,7 +206,8 @@ export function App() {
     void api.connectionInfo().then(value => { if (alive) setSocket(value); }).catch(e => { if (alive) setError(errorMessage(e)); });
     void refresh();
     const pollStatus = setInterval(() => void refresh(), 5000);
-    const pollFleet = setInterval(() => invalidate(['fleet']), 15000);
+    // History too: an open Assignment log has no other fallback for a missed fleet event.
+    const pollFleet = setInterval(() => invalidate(['fleet', 'history']), 15000);
     const unlisteners: (() => void)[] = [];
     const subscriptions = [
       ...['status', 'draft', 'assignment', 'imports', 'fleet'].map(name => listen(name, () => hint(eventTopics(name)))),
