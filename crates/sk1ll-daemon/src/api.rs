@@ -152,6 +152,9 @@ impl axum::serve::Listener for PeerChecked {
     }
 }
 
+// Handlers that only read go through `Daemon::reading`, without the engine
+// mutex, so they answer while a pull or a push waits for the server.
+
 async fn status(State(d): St) -> Json<StatusView> {
     Json(d.view())
 }
@@ -165,25 +168,25 @@ async fn items(State(d): St) -> Result<Json<Vec<ItemView>>> {
 }
 
 async fn draft(State(d): St) -> Result<Json<Vec<DraftEntry>>> {
-    Ok(Json(d.blocking(|d, eng| d.draft(eng)).await?))
+    Ok(Json(d.reading(|d| d.draft()).await?))
 }
 
 async fn skills(State(d): St) -> Result<Json<Vec<sk1ll_core::content::ContentEntry>>> {
-    Ok(Json(d.blocking(|d, eng| d.skills(eng)).await?))
+    Ok(Json(d.reading(|d| d.skills()).await?))
 }
 
 async fn skill_tree(
     State(d): St,
     Query(q): Query<sk1ll_core::content::ContentQuery>,
 ) -> Result<Json<Vec<sk1ll_core::content::FileEntry>>> {
-    Ok(Json(d.blocking(move |d, eng| d.skill_tree(eng, q)).await?))
+    Ok(Json(d.reading(move |d| d.skill_tree(&q)).await?))
 }
 
 async fn skill_file(
     State(d): St,
     Query(q): Query<sk1ll_core::content::FileQuery>,
 ) -> Result<Json<sk1ll_core::content::FileContent>> {
-    Ok(Json(d.blocking(move |d, eng| d.skill_file(eng, q)).await?))
+    Ok(Json(d.reading(move |d| d.skill_file(&q)).await?))
 }
 
 #[derive(Deserialize)]
@@ -192,7 +195,7 @@ struct ItemQuery {
 }
 
 async fn diff(State(d): St, Query(q): Query<ItemQuery>) -> Result<Json<DiffView>> {
-    Ok(Json(d.blocking(move |d, eng| d.diff(eng, &q.item)).await?))
+    Ok(Json(d.reading(move |d| d.diff(&q.item)).await?))
 }
 
 #[derive(Deserialize)]
@@ -202,7 +205,7 @@ struct ItemsQuery {
 
 async fn commit_message(State(d): St, Query(q): Query<ItemsQuery>) -> Result<Json<CommitMessage>> {
     let items: Vec<String> = q.items.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
-    Ok(Json(d.blocking(move |d, eng| d.commit_message(eng, &items)).await?))
+    Ok(Json(d.reading(move |d| d.commit_message(&items)).await?))
 }
 
 async fn commit(State(d): St, Json(req): Json<CommitRequest>) -> Result<Json<CommitResponse>> {
@@ -218,11 +221,11 @@ async fn pull(State(d): St) -> Result<Json<PullResult>> {
 }
 
 async fn recovered(State(d): St) -> Result<Json<Vec<ConflictView>>> {
-    Ok(Json(d.blocking(|d, _| d.recovered()).await?))
+    Ok(Json(d.reading(|d| d.recovered()).await?))
 }
 
 async fn conflicts(State(d): St) -> Result<Json<Vec<ConflictView>>> {
-    Ok(Json(d.blocking(|d, eng| d.conflicts(eng)).await?))
+    Ok(Json(d.reading(|d| d.conflicts()).await?))
 }
 
 async fn adopt_displaced(State(d): St, UrlPath(id): UrlPath<String>) -> Result<StatusCode> {
@@ -246,7 +249,7 @@ async fn overwrite(State(d): St, Json(t): Json<ConflictTarget>) -> Result<Status
 }
 
 async fn harnesses(State(d): St) -> Result<Json<Vec<HarnessView>>> {
-    Ok(Json(d.blocking(|d, _| d.harnesses()).await?))
+    Ok(Json(d.reading(|d| d.harnesses()).await?))
 }
 
 async fn update_import(State(d): St, UrlPath(name): UrlPath<String>) -> Result<Json<ImportUpdated>> {
@@ -351,7 +354,7 @@ async fn rename_item(
 }
 
 async fn conflict_diff(State(d): St, Json(req): Json<crate::client::ConflictDiffRequest>) -> Result<Json<DiffView>> {
-    Ok(Json(d.blocking(move |d, eng| d.conflict_diff(eng, req)).await?))
+    Ok(Json(d.reading(move |d| d.conflict_diff(&req)).await?))
 }
 
 async fn imports(State(d): St) -> Result<Json<crate::client::ImportsView>> {

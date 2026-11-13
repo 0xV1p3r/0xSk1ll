@@ -1,9 +1,30 @@
 //! The daemon's shared state and its operations on the repo and harnesses.
 //!
-//! Every operation that touches git or the file system runs on a blocking
-//! thread with the engine mutex held ([`Daemon::blocking`]), so they never
-//! interleave; across processes, the daemon holds core's [`EngineLock`] on
-//! the repo for its whole lifetime, so direct CLI mutations are refused.
+//! Every operation that changes the repo, the harnesses or the daemon's state
+//! runs on a blocking thread with the engine mutex held ([`Daemon::blocking`]),
+//! so they never interleave; across processes, the daemon holds core's
+//! [`EngineLock`] on the repo for its whole lifetime, so direct CLI mutations
+//! are refused.
+//!
+//! Operations that only read (the draft, a diff, the skills browser, the
+//! conflicts, the inventory) run without the engine mutex
+//! ([`Daemon::reading`]), so the GUI keeps answering while a pull or a push
+//! waits for the server under it. They need the repo root, which is fixed
+//! for the process ([`Daemon::ident`]), and the applied assignment, which is
+//! published in [`Daemon::snapshot`]. A reader:
+//!
+//! - never writes: not the repo, not a harness, not git's index (the process
+//!   environment turns off git's opportunistic index refresh, see
+//!   [`crate::prepare_process`]), and it does not finish an interrupted
+//!   import ([`Daemon::recover_imports`] needs the engine mutex and the
+//!   [`EngineLock`]). Until the next refresh has put such an import back, a
+//!   reader shows the repo as it is, with that import missing;
+//! - may see the repo in the middle of a concurrent operation (a pull moving
+//!   the working tree). What it returns is then momentarily stale and the
+//!   event that follows the operation makes the client ask again; a read
+//!   that failed while an operation was running is retried before it is
+//!   reported as a failure.
+//!
 //! What the outside sees ([`StatusView`]) lives in a `watch` channel: the server
 //! session sends a status whenever its report changes, and the local API and
 //! its event stream read from it.
@@ -11,7 +32,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError};
 
 use anyhow::Context;
 use sk1ll_core::imports;
@@ -44,6 +65,11 @@ pub(crate) struct Daemon {
     /// rejoin restarts the process (see [`Daemon::rejoin`]).
     pub(crate) ident: DaemonState,
     engine: Mutex<Engine>,
+    /// The applied assignment. `None` when it was lost (or never stored):
+    /// harnesses are left alone until the server sends one. Replaced only
+    /// with the engine mutex held ([`Daemon::apply_assignment`]); read by
+    /// anyone, readers without the engine mutex included.
+    snapshot: RwLock<Option<Arc<AssignmentSnapshot>>>,
     view: watch::Sender<StatusView>,
     events: broadcast::Sender<Event>,
     /// `draft_discarded` messages not yet delivered, persisted.
@@ -61,9 +87,6 @@ pub(crate) struct Daemon {
 /// Mutable state, only touched with the engine mutex held.
 pub(crate) struct Engine {
     state: DaemonState,
-    /// The applied assignment. `None` when it was lost (or never stored):
-    /// harnesses are left alone until the server sends one.
-    snapshot: Option<AssignmentSnapshot>,
     /// Draft items clashing with the server's newer baseline (Blocked).
     blocked: Option<Vec<ItemRef>>,
     /// The server's baseline as last announced or fetched.
@@ -107,9 +130,9 @@ impl Daemon {
             cfg,
             ident: state.clone(),
             revoked: AtomicBool::new(state.revoked),
+            snapshot: RwLock::new(snapshot.map(Arc::new)),
             engine: Mutex::new(Engine {
                 state,
-                snapshot,
                 blocked: None,
                 server_baseline: None,
                 lock: None,
@@ -140,6 +163,52 @@ impl Daemon {
         })
         .await
         .map_err(|e| Error::Internal(anyhow::anyhow!("daemon task failed: {e}")))?
+    }
+
+    /// Runs the read-only `f` on a blocking thread without the engine mutex
+    /// (see the module docs for what a reader may do). If `f` fails while an
+    /// engine operation is running, the repo may just have been in between
+    /// two states: `f` is tried again a moment later, twice at most, so a
+    /// long operation (a hanging fetch) delays a real error only briefly.
+    pub(crate) async fn reading<T, F>(self: &Arc<Self>, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: Fn(&Daemon) -> Result<T> + Send + 'static,
+    {
+        const RETRIES: usize = 2;
+        const PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
+        let d = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut tries = 0;
+            loop {
+                match f(&d) {
+                    Err(e) if tries < RETRIES && d.engine_busy() => {
+                        tracing::debug!("retrying a read that failed during an engine operation: {e}");
+                        tries += 1;
+                        std::thread::sleep(PAUSE);
+                    }
+                    result => return result,
+                }
+            }
+        })
+        .await
+        .map_err(|e| Error::Internal(anyhow::anyhow!("daemon read task failed: {e}")))?
+    }
+
+    /// Whether an engine operation is running right now.
+    fn engine_busy(&self) -> bool {
+        matches!(self.engine.try_lock(), Err(TryLockError::WouldBlock))
+    }
+
+    /// The applied assignment, if there is one.
+    pub(crate) fn snapshot(&self) -> Option<Arc<AssignmentSnapshot>> {
+        self.snapshot.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The repo, for readers: the same path as the engine's, which never
+    /// changes while the process runs.
+    fn repo_root(&self) -> &Path {
+        &self.ident.repo
     }
 
     pub(crate) fn view(&self) -> StatusView {
@@ -335,7 +404,7 @@ impl Daemon {
             self.set_error(format!("setting up {}: {e:#}", root.display()));
         }
         self.lock_repo(eng)?;
-        if let Some(s) = &eng.snapshot
+        if let Some(s) = self.snapshot()
             && let Err(e) = s.assignment.save(&self.cfg.assignment)
         {
             tracing::warn!("writing the assignment cache {}: {e}", self.cfg.assignment.display());
@@ -361,7 +430,8 @@ impl Daemon {
         Self::recover_imports(&root)?;
         let mut errors = Vec::new();
         let mut conflicts: Vec<ConflictRef> = Vec::new();
-        if let Some(snap) = &eng.snapshot {
+        let snapshot = self.snapshot();
+        if let Some(snap) = &snapshot {
             let planned = Repo::open(&root).and_then(|repo| {
                 let actions = sync::plan(&repo, &harnesses, &snap.assignment, PlanOptions::default())?;
                 Ok((repo, actions))
@@ -411,7 +481,7 @@ impl Daemon {
             behind,
         };
         let server_baseline = eng.server_baseline.clone();
-        let awaiting = eng.snapshot.is_none();
+        let awaiting = snapshot.is_none();
         self.update(|v| {
             v.report = report;
             v.server_baseline = server_baseline;
@@ -569,11 +639,12 @@ impl Daemon {
         self.pull(eng).map(drop)
     }
 
-    pub(crate) fn commit_message(&self, eng: &Engine, items: &[String]) -> Result<CommitMessage> {
-        let repo = Repo::open_git_only(Self::root(eng))?;
+    /// A reader: no engine mutex.
+    pub(crate) fn commit_message(&self, items: &[String]) -> Result<CommitMessage> {
+        let repo = Repo::open_git_only(self.repo_root())?;
         let draft = repo.draft()?;
         let items = items.iter().map(|i| ItemRef::resolve(i, &draft)).collect::<Result<Vec<_>, _>>()?;
-        let message = default_commit_message(&items, &eng.state.machine_id);
+        let message = default_commit_message(&items, &self.ident.machine_id);
         Ok(CommitMessage { items, message })
     }
 
@@ -741,8 +812,9 @@ impl Daemon {
         Ok(inventory.into_values().collect())
     }
 
-    pub(crate) fn draft(&self, eng: &Engine) -> Result<Vec<DraftEntry>> {
-        let repo = Repo::open_git_only(Self::root(eng))?;
+    /// A reader: no engine mutex.
+    pub(crate) fn draft(&self) -> Result<Vec<DraftEntry>> {
+        let repo = Repo::open_git_only(self.repo_root())?;
         Ok(repo
             .draft()?
             .into_iter()
@@ -758,22 +830,32 @@ impl Daemon {
             .collect())
     }
 
-    pub(crate) fn diff(&self, eng: &Engine, item: &str) -> Result<DiffView> {
-        let repo = Repo::open_git_only(Self::root(eng))?;
+    /// A reader: no engine mutex.
+    pub(crate) fn diff(&self, item: &str) -> Result<DiffView> {
+        let repo = Repo::open_git_only(self.repo_root())?;
         let item = ItemRef::resolve(item, &repo.draft()?)?;
         let diff = repo.diff(&item)?;
         Ok(DiffView { item, diff })
     }
 
-    /// The current plan; `force` plans as if overwriting.
+    /// The current plan; `force` plans as if overwriting. For engine
+    /// operations: interrupted imports are put back first.
     fn plan(&self, eng: &Engine, force: bool) -> Result<(Repo, Vec<Action>)> {
-        let Some(snap) = &eng.snapshot else {
+        let Some(snap) = self.snapshot() else {
             return Err(Error::Conflict(
                 "waiting for the server's assignment; the harnesses are left alone until it arrives".into(),
             ));
         };
         Self::recover_imports(Self::root(eng))?;
-        let repo = Repo::open(Self::root(eng))?;
+        self.plan_as_is(&snap, force)
+    }
+
+    /// The plan for the repo as it is, changing nothing: what a reader may
+    /// run. An import that an interrupted update left set aside is not put
+    /// back here (that needs the engine mutex and the repo's engine lock), so
+    /// until the next refresh has done it this plan sees it as missing.
+    fn plan_as_is(&self, snap: &AssignmentSnapshot, force: bool) -> Result<(Repo, Vec<Action>)> {
+        let repo = Repo::open(self.repo_root())?;
         let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
         let actions = sync::plan(&repo, &harnesses, &snap.assignment, PlanOptions { force })?;
         Ok((repo, actions))
@@ -781,7 +863,8 @@ impl Daemon {
 
     /// Puts back imports an interrupted (or failed, unrolled-back) update
     /// left set aside, before anything plans a sync: otherwise the sync would
-    /// remove their harness entries. Failing to stops the sync.
+    /// remove their harness entries. Failing to stops the sync. It changes
+    /// the repo: only with the engine mutex and the repo's engine lock held.
     fn recover_imports(root: &Path) -> Result<()> {
         for name in sk1ll_core::source::recover_replaced(root)? {
             tracing::warn!("restored import {name}, which an interrupted update had set aside");
@@ -789,13 +872,16 @@ impl Daemon {
         Ok(())
     }
 
+    /// A reader: no engine mutex.
     pub(crate) fn recovered(&self) -> Result<Vec<ConflictView>> {
         Ok(sync::displaced::list()?.into_iter().map(displaced_view).collect())
     }
 
-    pub(crate) fn conflicts(&self, eng: &Engine) -> Result<Vec<ConflictView>> {
-        let mut result: Vec<_> = if eng.snapshot.is_some() {
-            let (_, actions) = self.plan(eng, false)?;
+    /// A reader: no engine mutex, and so no recovery of interrupted imports
+    /// (see [`Daemon::plan_as_is`]).
+    pub(crate) fn conflicts(&self) -> Result<Vec<ConflictView>> {
+        let mut result: Vec<_> = if let Some(snap) = self.snapshot() {
+            let (_, actions) = self.plan_as_is(&snap, false)?;
             actions.iter().filter(|a| a.kind == ActionKind::Conflict).map(conflict_view).collect()
         } else {
             Vec::new()
@@ -818,7 +904,7 @@ impl Daemon {
             }
         }
         self.refresh(eng)?;
-        Ok(SyncResult { conflicts: self.conflicts(eng)? })
+        Ok(SyncResult { conflicts: self.conflicts()? })
     }
 
     pub(crate) fn resolve_displaced(&self, eng: &mut Engine, id: &str, adopt: bool) -> Result<()> {
@@ -890,7 +976,8 @@ impl Daemon {
                 revision: update.revision, assignment: update.assignment,
             })?;
             let mut adoption = adoption;
-            adoption.locations.retain(|l| eng.snapshot.as_ref().is_some_and(|s| {
+            let snapshot = self.snapshot();
+            adoption.locations.retain(|l| snapshot.as_ref().is_some_and(|s| {
                 s.assignment.skill_enabled(&l.harness, &adoption.name)
             }));
             sync::unmanaged::complete(&repo, &harnesses, &adoption)?;
@@ -909,18 +996,19 @@ impl Daemon {
         Ok(())
     }
 
-    pub(crate) fn skills(&self, eng: &Engine) -> Result<Vec<sk1ll_core::content::ContentEntry>> {
-        let repo = Repo::open(Self::root(eng))?;
+    /// A reader: no engine mutex.
+    pub(crate) fn skills(&self) -> Result<Vec<sk1ll_core::content::ContentEntry>> {
+        let repo = Repo::open(self.repo_root())?;
         let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
         let baseline = gitx::baseline(repo.root())?;
-        let assignment = eng
-            .snapshot
+        let snapshot = self.snapshot();
+        let assignment = snapshot
             .as_ref()
             .map(|s| s.assignment.clone())
             .unwrap_or_default();
         let mut entries =
             sk1ll_core::content::list(&repo, &harnesses, &assignment, baseline.as_deref())?;
-        if eng.snapshot.is_none() {
+        if snapshot.is_none() {
             for entry in &mut entries {
                 entry.enabled_harnesses.clear();
             }
@@ -928,27 +1016,27 @@ impl Daemon {
         Ok(entries)
     }
 
+    /// A reader: no engine mutex.
     pub(crate) fn skill_tree(
         &self,
-        eng: &Engine,
-        q: sk1ll_core::content::ContentQuery,
+        q: &sk1ll_core::content::ContentQuery,
     ) -> Result<Vec<sk1ll_core::content::FileEntry>> {
         Ok(sk1ll_core::content::tree(
-            &Repo::open(Self::root(eng))?,
+            &Repo::open(self.repo_root())?,
             &MachineConfig::load(&self.cfg.machine_config)?.harnesses(),
-            &q,
+            q,
         )?)
     }
 
+    /// A reader: no engine mutex.
     pub(crate) fn skill_file(
         &self,
-        eng: &Engine,
-        q: sk1ll_core::content::FileQuery,
+        q: &sk1ll_core::content::FileQuery,
     ) -> Result<sk1ll_core::content::FileContent> {
         Ok(sk1ll_core::content::file(
-            &Repo::open(Self::root(eng))?,
+            &Repo::open(self.repo_root())?,
             &MachineConfig::load(&self.cfg.machine_config)?.harnesses(),
-            &q,
+            q,
         )?)
     }
 
@@ -976,6 +1064,7 @@ impl Daemon {
         self.refresh(eng)
     }
 
+    /// A reader: no engine mutex.
     pub(crate) fn harnesses(&self) -> Result<Vec<HarnessView>> {
         let machine = MachineConfig::load(&self.cfg.machine_config)?;
         Ok(machine
@@ -1105,7 +1194,7 @@ impl Daemon {
         if Self::idle(eng) {
             return Ok(false);
         }
-        if let Some(have) = &eng.snapshot
+        if let Some(have) = self.snapshot()
             && !newer(have.revision, snap.revision)
         {
             // The same revision arrives on every connect; only an older one is news.
@@ -1119,7 +1208,7 @@ impl Daemon {
             tracing::warn!("writing the assignment cache {}: {e}", self.cfg.assignment.display());
         }
         let revision = snap.revision;
-        eng.snapshot = Some(snap);
+        *self.snapshot.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(snap));
         tracing::info!("applied assignment revision {revision}");
         self.update(|v| {
             v.assignment_revision = revision;
@@ -1393,7 +1482,8 @@ impl Daemon {
         self.refresh(eng)?;
         renamed?;
         let (item, kind) = if req.kind == "skill" { (ItemRef::Skill(req.to.clone()), ToggleKind::Skill) } else { (ItemRef::Rule(req.to.clone()), ToggleKind::Rule) };
-        let changes: Vec<ToggleChange> = eng.snapshot.iter().flat_map(|s| &s.assignment.harnesses).filter_map(|(harness, h)| {
+        let snapshot = self.snapshot();
+        let changes: Vec<ToggleChange> = snapshot.iter().flat_map(|s| &s.assignment.harnesses).filter_map(|(harness, h)| {
             let toggles = if kind == ToggleKind::Skill { &h.skills } else { &h.rules };
             toggles.get(&req.name).map(|&enabled| ToggleChange { harness: harness.clone(), kind, name: Some(req.to.clone()), enabled: Some(enabled) })
         }).collect();
@@ -1420,8 +1510,8 @@ impl Daemon {
         Ok(response)
     }
     pub(crate) async fn local_imports(self: &Arc<Self>, check: bool) -> Result<crate::client::ImportsView> {
-        let (root, entries) = self.blocking(|_, eng| {
-            let repo = Repo::open(Self::root(eng))?;
+        let (root, entries) = self.reading(|d| {
+            let repo = Repo::open(d.repo_root())?;
             Ok((repo.root().to_path_buf(), repo.manifest.import.iter().map(|(name, i)| crate::client::ImportEntry {
                 name: name.clone(), source: i.source.clone(), git_ref: i.git_ref.clone(), path: i.path.clone(),
                 locked: repo.lock.skills.get(name).map(|l| l.commit.clone()),
@@ -1448,25 +1538,27 @@ impl Daemon {
             Ok(view)
         }).await.map_err(|e| Error::Internal(e.into()))?
     }
-    pub(crate) fn conflict_diff(&self, eng: &Engine, req: crate::client::ConflictDiffRequest) -> Result<DiffView> {
-        let view = if let Some(id) = req.id {
-            self.recovered()?.into_iter().find(|v| v.id.as_ref() == Some(&id))
+    /// A reader: no engine mutex.
+    pub(crate) fn conflict_diff(&self, req: &crate::client::ConflictDiffRequest) -> Result<DiffView> {
+        let view = if let Some(id) = &req.id {
+            self.recovered()?.into_iter().find(|v| v.id.as_ref() == Some(id))
         } else {
-            self.conflicts(eng)?.into_iter().find(|v| Some(&v.harness) == req.harness.as_ref() && Some(&v.name) == req.name.as_ref())
+            self.conflicts()?.into_iter().find(|v| Some(&v.harness) == req.harness.as_ref() && Some(&v.name) == req.name.as_ref())
         }.ok_or_else(|| Error::NotFound("Conflict no longer exists".into()))?;
         let item = if view.name == BLOCK_NAME { Some(ItemRef::Other(view.name.clone())) } else { None }.or(view.item.clone()).or_else(|| view.items.first().cloned()).unwrap_or(ItemRef::Other(view.name.clone()));
         match &item {
             ItemRef::Skill(name) | ItemRef::Rule(name) => imports::validate_name(name)?,
             _ => {}
         }
-        let repo = Repo::open(Self::root(eng))?;
+        let repo = Repo::open(self.repo_root())?;
+        let snapshot = self.snapshot();
         let temp = tempfile::tempdir().map_err(anyhow::Error::from)?;
         let mut right = match &item {
             ItemRef::Skill(name) => { let p = repo.root().join("personal").join(name); if p.exists() { p } else { repo.root().join("imported").join(name) } },
             ItemRef::Rule(name) => repo.root().join("instructions").join(format!("{name}.md")),
             _ => {
                 let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
-                let assignment = &eng.snapshot.as_ref().ok_or_else(|| Error::Conflict("Awaiting Assignment".into()))?.assignment;
+                let assignment = &snapshot.as_ref().ok_or_else(|| Error::Conflict("Awaiting Assignment".into()))?.assignment;
                 let files = sync::render_instructions(&repo, &harnesses, assignment, &view.harness)?;
                 let path = temp.path().join("Draft");
                 std::fs::write(&path, files.into_iter().map(|f| f.content).collect::<Vec<_>>().join("\n")).map_err(anyhow::Error::from)?;

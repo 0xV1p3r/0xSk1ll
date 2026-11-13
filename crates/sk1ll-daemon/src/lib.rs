@@ -44,8 +44,9 @@ pub use state::DaemonState;
 
 static PREPARED: AtomicBool = AtomicBool::new(false);
 
-/// Sets up the process environment for a daemon: git must never prompt, and
-/// authenticates to the server with this machine's credentials (see [`auth`]).
+/// Sets up the process environment for a daemon: git must never prompt, never
+/// writes the index for a command that only reads (the local API's readers
+/// run beside the engine, see [`auth::git_read_only_env`]), and authenticates to the server with this machine's credentials (see [`auth`]).
 ///
 /// # Safety
 ///
@@ -54,6 +55,11 @@ static PREPARED: AtomicBool = AtomicBool::new(false);
 pub unsafe fn prepare_process(cfg: &Config) -> anyhow::Result<()> {
     // SAFETY: the caller guarantees no other thread runs.
     unsafe { std::env::set_var("GIT_TERMINAL_PROMPT", "0") };
+    // Before the credentials: each merge reads what is already set.
+    for (k, v) in auth::git_read_only_env() {
+        // SAFETY: as above.
+        unsafe { std::env::set_var(k, v) };
+    }
     if let Some(state) = DaemonState::load(&cfg.state)? {
         for (k, v) in auth::git_credentials_env(&state) {
             // SAFETY: as above.

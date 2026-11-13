@@ -20,6 +20,18 @@ pub fn git_credentials_env(state: &DaemonState) -> Vec<(String, String)> {
     merge_config_env(|k| std::env::var(k).ok(), &header_key(&state.server_url), &header_value(state))
 }
 
+/// Environment that keeps git's read commands from writing the index: no
+/// opportunistic refresh by `git status` (`GIT_OPTIONAL_LOCKS`) nor by
+/// `git diff` (`diff.autoRefreshIndex`). The daemon's readers run git without
+/// the engine mutex, and a reader holding `index.lock` for that refresh
+/// would make a commit or pull running at that moment fail. Merged like
+/// [`git_credentials_env`]; apply it to the process before any thread starts.
+pub fn git_read_only_env() -> Vec<(String, String)> {
+    let mut env = merge_config_env(|k| std::env::var(k).ok(), "diff.autoRefreshIndex", "false");
+    env.push(("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string()));
+    env
+}
+
 fn header_key(server_url: &str) -> String {
     format!("http.{}/.extraHeader", server_url.trim_end_matches('/'))
 }
