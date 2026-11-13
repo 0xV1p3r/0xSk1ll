@@ -163,7 +163,7 @@ function SkillDetail({ entry, entries, close, initialHarness, revision, changed,
   const editorTrigger = useRef<HTMLButtonElement>(null);
   const preferred = editors.data?.editors.find(editor => editor.id === editors.data?.preferred_editor);
   const needsConversion = entry.type === 'import' || entry.type === 'unmanaged';
-  const needsServer = entry.type === 'unmanaged' && connection !== 'connected';
+  const needsServer = entry.type === 'unmanaged' && connection !== 'connected' && connection !== 'standalone';
   const canAdopt = !needsServer && !entry.clashes_with_repo && !!choice;
   const execute = (editorId?: string) => void mutation.run(async () => {
     let destination = entry.item;
@@ -198,7 +198,7 @@ function SkillDetail({ entry, entries, close, initialHarness, revision, changed,
       <div className="flex flex-col items-end gap-1.5"><div className="flex flex-wrap justify-end gap-2">
         {(entry.type === 'personal' || entry.type === 'rule') && entry.draft !== 'deleted' && <>
           <Button variant="outline" size="sm" onClick={() => { setRenameTo(entry.name); setRenaming(true); }}>Rename…</Button>
-          <Confirm label="Delete…" confirmLabel="Delete" triggerVariant="outline" title={`Delete ${entry.name}?`} description="This removes it from this Machine's Draft. Commit removes it from the Baseline and every Machine." action={() => api.deleteItem({ kind, name: entry.name })} onDone={() => { toast({ title: `${entry.name} deleted in Draft` }); close(); changed(); }} />
+          <Confirm label="Delete…" confirmLabel="Delete" triggerVariant="outline" title={`Delete ${entry.name}?`} description={connection === 'standalone' ? "This removes it from this Machine's Draft. Commit saves the deletion to the local repository." : "This removes it from this Machine's Draft. Commit removes it from the Baseline and every Machine."} action={() => api.deleteItem({ kind, name: entry.name })} onDone={() => { toast({ title: `${entry.name} deleted in Draft` }); close(); changed(); }} />
         </>}
         {entry.draft && <Button ref={reviewButton} variant="outline" size="default" onClick={reviewDraft}>Review in Draft</Button>}
         {entry.draft !== 'deleted' && <>

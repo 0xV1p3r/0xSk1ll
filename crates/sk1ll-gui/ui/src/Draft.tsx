@@ -49,6 +49,9 @@ function ReviewNotice({ review, disabled, accept }: { review: DraftReview; disab
     </CollapsibleTrigger><CollapsibleContent className="min-w-0 max-w-full"><Diff item={entry.item} diff={entry.diff} /></CollapsibleContent></Collapsible>)}</>;
 }
 export function Draft({ revision, status, changed }: { revision: number; status: StatusView; changed: () => void }) {
+  const standalone = status.mode === 'standalone';
+  const noOrigin = standalone && !status.has_origin;
+  const [pushAfterCommit, setPushAfterCommit] = useState(false);
   const { data, error, loading } = useResource(loadDraft, revision);
   const [selected, setSelected] = useState<string[]>([]);
   const selectionTouched = useRef(false);
@@ -78,13 +81,14 @@ export function Draft({ revision, status, changed }: { revision: number; status:
   const all = !!data?.length && items.length === data.length;
   const blocked = status.report.blocked || status.report.clashes.length > 0 || pull?.state === 'blocked';
   const allExpanded = !!data?.length && data.every(entry => expanded.includes(entry.item));
-  const pullAction = <Action label="Pull Baseline" action={async () => { const value = await api.pull(); setPull(value); toast({ title: value.state === 'blocked' ? 'Pull blocked' : 'Pull complete' }); }} onDone={changed} />;
+  const pullAction = noOrigin ? <Button variant="outline" disabled>Pull</Button> : <Action label="Pull Baseline" action={async () => { const value = await api.pull(); setPull(value); toast({ title: value.state === 'blocked' ? 'Pull blocked' : 'Pull complete' }); }} onDone={changed} />;
   const unpushed = [...new Set([...status.report.unpushed, ...(!result?.pushed ? result?.items ?? [] : [])])];
   return <>
     {blocked && <Notice title="Blocked" tone="destructive">
       The new Baseline clashes with this Draft. Commit or Restore the clashing items, then Pull.
       <p className="text-xs">{(pull?.state === 'blocked' ? pull.items : status.report.clashes).join(', ')}</p>{pullAction}</Notice>}
     <Panel label="Draft"><PanelToolbar>
+      {standalone && <><Button variant="outline" disabled={noOrigin || push.pending} onClick={pushNow}>Push</Button>{pullAction}{noOrigin && <span className="text-xs text-muted-foreground">Push and Pull require an origin git remote.</span>}</>}
       {data?.length !== 0 && <><Button ref={commitTrigger} disabled={!items.length || prefill.pending || reviewDisabled}
         onClick={() => {
           if (!data) return;
@@ -100,9 +104,9 @@ export function Draft({ revision, status, changed }: { revision: number; status:
       {status.report.behind && !blocked && <div className="ml-auto">{pullAction}</div>}
     </PanelToolbar><ErrorNotice error={error} /><ErrorNotice error={prefill.error} />
     <ErrorNotice error={push.error} />
-    {unpushed.length > 0 && <div ref={result && !result.pushed ? completion : undefined} tabIndex={-1} className="outline-none"><Alert role="status" className="border-info/30 bg-brand-soft"><ArrowUpFromLine /><AlertTitle>{unpushed.length} unpushed</AlertTitle><AlertDescription className="flex flex-wrap items-center gap-3"><div className="min-w-0 flex-1"><ul>{unpushed.map(item => <li className="font-medium" key={item}>{item.replace(/^(skill|rule):/, '')}</li>)}</ul>{result && !result.pushed && !resultHidden && <><p>Commit complete: <code className="font-mono text-xs">{result.sha}</code></p>{result.push_error && <p>{result.push_error}</p>}<Button variant="ghost" onClick={() => setResultHidden(true)}>Dismiss commit result</Button></>}</div><Button disabled={push.pending} onClick={pushNow}>Push now</Button></AlertDescription></Alert></div>}
+    {unpushed.length > 0 && <div ref={result && !result.pushed ? completion : undefined} tabIndex={-1} className="outline-none"><Alert role="status" className="border-info/30 bg-brand-soft"><ArrowUpFromLine /><AlertTitle>{unpushed.length} unpushed</AlertTitle><AlertDescription className="flex flex-wrap items-center gap-3"><div className="min-w-0 flex-1"><ul>{unpushed.map(item => <li className="font-medium" key={item}>{item.replace(/^(skill|rule):/, '')}</li>)}</ul>{result && !result.pushed && !resultHidden && <><p>Commit complete: <code className="font-mono text-xs">{result.sha}</code></p>{result.push_error && <p>{result.push_error}</p>}<Button variant="ghost" onClick={() => setResultHidden(true)}>Dismiss commit result</Button></>}</div><Button disabled={noOrigin || push.pending} onClick={pushNow}>Push now</Button></AlertDescription></Alert></div>}
     {pull && pull.state !== 'blocked' && <Notice title="Pull complete">{pull.state === 'updated' ? `Baseline ${pull.to}` : 'Already on the latest Baseline.'}</Notice>}
-    {result?.pushed && !resultHidden && <div ref={completion} tabIndex={-1} className="outline-none"><Notice title="Commit complete"><code className="font-mono text-xs">{result.sha}</code><p>Pushed to the Server.</p><Button variant="ghost" onClick={() => setResultHidden(true)}>Dismiss</Button></Notice></div>}
+    {result?.pushed && !resultHidden && <div ref={completion} tabIndex={-1} className="outline-none"><Notice title="Commit complete"><code className="font-mono text-xs">{result.sha}</code><p>{standalone ? 'Pushed to origin.' : 'Pushed to the Server.'}</p><Button variant="ghost" onClick={() => setResultHidden(true)}>Dismiss</Button></Notice></div>}
     {loading && !data && <Loading />}{data?.length === 0 && <Nothing title="Draft is clean">This Machine has no Draft changes.</Nothing>}
     {!!data?.length && <FieldSet className="min-w-0 w-full max-w-full gap-0"><FieldLegend className="sr-only">Draft items</FieldLegend>
       <div className="divide-y divide-border">
@@ -118,7 +122,7 @@ export function Draft({ revision, status, changed }: { revision: number; status:
       </div>
     </FieldSet>}</Panel>
     <Dialog open={!!commit} onOpenChange={open => { if (!open && !mutation.pending) setCommit(undefined); }}>
-      <DialogContent finalFocus={() => completion.current ?? commitTrigger.current} showCloseButton={!mutation.pending}><DialogHeader><DialogTitle>Commit to Baseline</DialogTitle>
+      <DialogContent finalFocus={() => completion.current ?? commitTrigger.current} showCloseButton={!mutation.pending}><DialogHeader><DialogTitle>{standalone ? 'Commit to local repository' : 'Commit to Baseline'}</DialogTitle>
         <DialogDescription>{commitReview?.items.length ? `${commitReview.items.length} Draft ${commitReview.items.length === 1 ? 'item' : 'items'} selected. Expand an item to review its diff.` : 'No selected items remain in Draft.'}</DialogDescription></DialogHeader>
         {commitReview && <ReviewNotice review={commitReview} disabled={reviewDisabled}
           accept={() => setCommit(value => value && { ...value, review: confirmReview(commitReview) })} />}
@@ -126,11 +130,12 @@ export function Draft({ revision, status, changed }: { revision: number; status:
         <Field><FieldLabel htmlFor="commit-message">Message</FieldLabel><Textarea id="commit-message"
           value={commit?.message ?? ''} disabled={mutation.pending}
           onChange={e => setCommit(value => value && { ...value, message: e.target.value })} /></Field>
+        {standalone && status.has_origin && <Field orientation="horizontal"><Checkbox id="push-after-commit" checked={pushAfterCommit} onCheckedChange={setPushAfterCommit} disabled={mutation.pending} /><FieldLabel htmlFor="push-after-commit">Push after commit</FieldLabel></Field>}
         <ErrorNotice error={mutation.error} /><DialogFooter>
           <Button variant="outline" disabled={mutation.pending} onClick={() => setCommit(undefined)}>Cancel</Button>
           <Button disabled={!commit?.message.trim() || !commitReview?.items.length || !!commitReview.changes.length || reviewDisabled} onClick={() => {
             if (commit && commitReview && !commitReview.changes.length && !reviewDisabled) void mutation.run(
-              () => api.commit({ items: commitReview.items, message: commit.message }), value => {
+              async () => { const value = await api.commit({ items: commitReview.items, message: commit.message }); if (standalone && status.has_origin && pushAfterCommit) { try { const pushed = await api.push(); return { ...value, pushed: pushed.pushed, push_error: pushed.pushed ? null : 'Push did not reach origin.' }; } catch (e) { return { ...value, push_error: String(e) }; } } return value; }, value => {
               toast({ title: 'Commit complete' }); setResult(value); selectionTouched.current = true; setSelected([]); setCommit(undefined);
             });
           }}><Pending pending={mutation.pending}>Commit</Pending></Button>

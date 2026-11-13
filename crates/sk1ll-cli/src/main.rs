@@ -331,6 +331,9 @@ fn run(cli: Cli) -> Result<()> {
     if matches!(cli.cmd, Cmd::Join { .. } | Cmd::Daemon | Cmd::Fleet) {
         return fleet::command(cli);
     }
+    #[cfg(unix)]
+    let repo_path = sk1ll_daemon::locate_repo(cli.repo.as_deref(), cli.cmd.git_only())?;
+    #[cfg(not(unix))]
     let repo_path = match &cli.repo {
         Some(p) => p.clone(),
         None => {

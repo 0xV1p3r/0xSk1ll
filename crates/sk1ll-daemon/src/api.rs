@@ -8,8 +8,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use axum::body::Bytes;
+use axum::extract::Request;
 use axum::extract::{OriginalUri, Path as UrlPath, Query, State};
 use axum::http::{Method, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::sse::{self, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -34,6 +36,7 @@ type St = State<Arc<Daemon>>;
 pub(crate) fn router(d: Arc<Daemon>) -> Router {
     Router::new()
         .route("/status", get(status))
+        .route("/init", post(init))
         .route("/items", get(items))
         .route("/skills", get(skills))
         .route("/skills/tree", get(skill_tree))
@@ -69,13 +72,33 @@ pub(crate) fn router(d: Arc<Daemon>) -> Router {
         .route("/join", post(join))
         .route("/fleet", get(pass))
         .route("/machines/{id}", delete(pass))
-        .route("/machines/{id}/assignment", get(pass).put(pass))
+        .route("/machines/{id}/assignment", get(assignment).put(assignment))
         .route("/log", get(pass))
         .route("/log/facets", get(pass))
         .route("/log/{id}/undo", post(pass))
         .route("/join-codes", post(pass))
         .route("/events", get(events))
+        .layer(middleware::from_fn_with_state(d.clone(), require_repo))
         .with_state(d)
+}
+
+/// Repo-dependent endpoints fail consistently while standalone awaits Init.
+async fn require_repo(State(d): St, request: Request, next: Next) -> Result<Response> {
+    let path = request.uri().path();
+    if !matches!(
+        path,
+        "/status" | "/events" | "/init" | "/join" | "/harnesses" | "/fleet" | "/log" | "/log/facets" | "/join-codes"
+    ) && !path.starts_with("/machines/")
+        && !path.starts_with("/log/")
+    {
+        d.require_repo()?;
+    }
+    Ok(next.run(request).await)
+}
+
+async fn init(State(d): St) -> Result<StatusCode> {
+    d.blocking(|d, eng| d.init(eng)).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Binds the socket with mode 0600 in a 0700 directory of ours: an existing
@@ -293,7 +316,7 @@ async fn join(State(d): St, Json(req): Json<JoinApiRequest>) -> Result<Json<Join
     if !d.can_rejoin() {
         return Err(Error::Conflict(format!(
             "this machine is in the fleet as `{}`; there is nothing to join",
-            d.ident.machine_id
+            d.ident.machine_id()
         )));
     }
     let opts = JoinOptions {
@@ -301,11 +324,25 @@ async fn join(State(d): St, Json(req): Json<JoinApiRequest>) -> Result<Json<Join
         code: req.code,
         machine_id: req.machine_id,
         copy_from: req.copy_from,
-        repo: req.repo.unwrap_or_else(|| d.ident.repo.clone()),
+        repo: req.repo.unwrap_or_else(|| d.ident.repo().to_path_buf()),
     };
-    let replace = !d.is_revoked();
-    let reg = join::register(&d.cfg, &opts, replace).await.map_err(|e| Error::BadRequest(format!("{e:#}")))?;
-    let joined = d.blocking(move |d, eng| d.rejoin(eng, reg)).await?;
+    let joined = if d.is_standalone() {
+        let repo = opts.repo.clone();
+        d.blocking(move |d, eng| d.check_standalone_join_request(eng, &repo)).await?;
+        let (reg, pending) =
+            join::register_standalone(&d.cfg, &opts).await.map_err(|e| Error::Conflict(format!("{e:#}")))?;
+        let joined = d.blocking(move |d, eng| d.join_standalone(eng, reg)).await.map_err(|e| {
+            Error::Conflict(format!("{e}; registration consumed the join code and reserved the machine id. Pending credentials are kept at {}. Fix the local obstruction and repeat the same join request to retry without a new code", pending.display()))
+        })?;
+        if let Err(e) = std::fs::remove_file(&pending) {
+            tracing::warn!("removing pending registration {}: {e}", pending.display());
+        }
+        Ok(joined)
+    } else {
+        let replace = !d.is_revoked();
+        let reg = join::register(&d.cfg, &opts, replace).await.map_err(|e| Error::BadRequest(format!("{e:#}")))?;
+        d.blocking(move |d, eng| d.rejoin(eng, reg)).await?
+    };
     let restart = d.clone();
     tokio::spawn(async move {
         // Let the response go out first.
@@ -315,9 +352,38 @@ async fn join(State(d): St, Json(req): Json<JoinApiRequest>) -> Result<Json<Join
     Ok(Json(joined?))
 }
 
+/// Assignment paths extract the decoded machine id, like the fleet API.
+async fn assignment(
+    State(d): St,
+    UrlPath(machine): UrlPath<String>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    body: Bytes,
+) -> Result<Response> {
+    if !d.is_standalone() {
+        return pass(State(d), method, OriginalUri(uri), body).await;
+    }
+    if machine != d.ident.machine_id() {
+        return Err(Error::Conflict("This Machine is standalone; join a Fleet to use this".into()));
+    }
+    if method == Method::GET {
+        // Read through the engine so an external CLI file edit is visible.
+        let snap = d
+            .blocking(|d, eng| {
+                d.refresh(eng)?;
+                Ok(d.snapshot().expect("local assignment").as_ref().clone())
+            })
+            .await?;
+        return Ok(Json(snap).into_response());
+    }
+    let changes = serde_json::from_slice(&body).map_err(|e| Error::BadRequest(e.to_string()))?;
+    let update = d.blocking(move |d, eng| d.set_local_assignment(eng, &changes)).await?;
+    Ok(Json(update).into_response())
+}
+
 /// Server pass-through: same path and query under the server's `/api`.
-/// Assignment GETs preserve the flattened assignment snapshot, including its revision.
 async fn pass(State(d): St, method: Method, OriginalUri(uri): OriginalUri, body: Bytes) -> Result<Response> {
+    d.ident.joined()?;
     let path = uri.path_and_query().map_or(uri.path(), |p| p.as_str());
     server::proxy(&d, method, path, body).await
 }
@@ -360,7 +426,8 @@ async fn conflict_diff(State(d): St, Json(req): Json<crate::client::ConflictDiff
 
 async fn imports(State(d): St) -> Result<Json<crate::client::ImportsView>> {
     let mut view = d.local_imports(false).await?;
-    if let Ok(response) = server::proxy(&d, Method::GET, "/imports", Bytes::new()).await
+    if !d.is_standalone()
+        && let Ok(response) = server::proxy(&d, Method::GET, "/imports", Bytes::new()).await
         && response.status().is_success()
         && let Ok(bytes) = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024).await
         && let Ok(remote) = serde_json::from_slice::<sk1ll_proto::ImportsView>(&bytes)

@@ -9,7 +9,7 @@
 //! | GET | `/skills` | → `Vec<ContentEntry>` |
 //! | GET | `/skills/tree?item=skill:pdf` | → `Vec<FileEntry>` |
 //! | GET | `/skills/file?item=skill:pdf&path=SKILL.md` | → `FileContent` |
-//! | POST | `/skills/adopt` | `ConflictTarget` → 204; unmanaged Adopt needs a Server connection |
+//! | POST | `/skills/adopt` | `ConflictTarget` → 204; unmanaged Adopt needs a Server connection when joined |
 //! | POST | `/items/create` | [`CreateItemRequest`] → 204 |
 //! | POST | `/items/delete` | [`DeleteItemRequest`] → 204 (a Draft deletion) |
 //! | POST | `/items/rename` | [`RenameItemRequest`] → [`RenameItemResponse`] |
@@ -31,6 +31,7 @@
 //! | POST | `/imports/remove`, `/imports/fork` | [`ImportName`] → 204 |
 //! | POST | `/sync` | [`SyncRequest`] → [`SyncResult`] |
 //! | POST | `/push` | → [`PushResult`] |
+//! | POST | `/init` | → 204; standalone without a repo only |
 //! | POST | `/join` | [`JoinApiRequest`] → [`Joined`](crate::Joined) |
 //! | GET | `/events` | → SSE stream of [`Event`] |
 //!
@@ -68,10 +69,11 @@ use tokio::net::UnixStream;
 // ---------------------------------------------------------------------------
 // Types
 
-/// The daemon's connection to the server.
+/// The daemon's connection to the server, or standalone operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Connection {
+    Standalone,
     Connecting,
     Connected,
     /// The server is unreachable; the machine keeps working from its cache.
@@ -84,13 +86,24 @@ pub enum Connection {
     Revoked,
 }
 
+/// Whether this machine manages its own repo or belongs to a fleet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonMode {
+    Joined,
+    Standalone,
+}
+
 /// `GET /status`: this machine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusView {
     pub machine_id: String,
-    pub server_url: String,
+    pub server_url: Option<String>,
+    pub mode: DaemonMode,
+    pub has_origin: bool,
+    pub repo_ready: bool,
     pub repo: PathBuf,
-    /// Computed locally: Offline while not connected to the server.
+    /// Computed locally; standalone never becomes Offline.
     pub headline: MachineStatus,
     pub connection: Connection,
     pub last_error: Option<String>,
@@ -574,6 +587,10 @@ impl Client {
     pub async fn check_imports(&self) -> Result<ImportsView> {
         self.post("/imports/check", &()).await
     }
+    pub async fn init(&self) -> Result<()> {
+        self.post_empty("/init", &()).await
+    }
+
     pub async fn status(&self) -> Result<StatusView> {
         self.get("/status").await
     }

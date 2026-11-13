@@ -51,6 +51,7 @@ macro_rules! command {
     };
 }
 
+command!(init() -> (), init());
 command!(status() -> StatusView, status());
 command!(fleet() -> FleetView, fleet());
 command!(items() -> Vec<ItemView>, items());

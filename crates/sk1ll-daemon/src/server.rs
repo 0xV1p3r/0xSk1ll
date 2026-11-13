@@ -57,6 +57,9 @@ enum ConnectError {
 }
 
 pub(crate) async fn run(d: Arc<Daemon>) {
+    let Ok(state) = d.ident.joined() else {
+        return;
+    };
     let (inbox_tx, inbox_rx) = mpsc::unbounded_channel();
     tokio::spawn(inbox(d.clone(), inbox_rx));
     let mut backoff = d.cfg.reconnect_min;
@@ -64,7 +67,7 @@ pub(crate) async fn run(d: Arc<Daemon>) {
         match connect(&d).await {
             Ok(ws) => {
                 backoff = d.cfg.reconnect_min;
-                tracing::info!("connected to {}", d.ident.server_url);
+                tracing::info!("connected to {}", state.server_url);
                 if let Err(e) = session(&d, ws, &inbox_tx).await {
                     tracing::info!("server connection lost: {}", redact(&format!("{e:#}")));
                 }
@@ -105,8 +108,9 @@ fn jitter(d: Duration) -> Duration {
 
 async fn connect(d: &Daemon) -> std::result::Result<Ws, ConnectError> {
     let other = |e: &dyn std::fmt::Display| ConnectError::Other(redact(&format!("server unreachable (offline): {e}")));
-    let mut req = d.ident.ws_url().into_client_request().map_err(|e| other(&e))?;
-    let auth = HeaderValue::from_str(&format!("Bearer {}", d.ident.token)).map_err(|_| other(&"bad token"))?;
+    let state = d.ident.joined().map_err(|e| other(&e))?;
+    let mut req = state.ws_url().into_client_request().map_err(|e| other(&e))?;
+    let auth = HeaderValue::from_str(&format!("Bearer {}", state.token)).map_err(|_| other(&"bad token"))?;
     req.headers_mut().insert(header::AUTHORIZATION, auth);
     match tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(req)).await {
         Err(_) => Err(other(&"connection timed out")),
@@ -214,7 +218,7 @@ async fn refresh_report(d: &Arc<Daemon>) -> anyhow::Result<MachineReport> {
 async fn session(d: &Arc<Daemon>, ws: Ws, inbox: &mpsc::UnboundedSender<ServerMessage>) -> anyhow::Result<()> {
     let (mut sink, mut stream) = ws.split();
     let mut view = d.subscribe_view();
-    send(&mut sink, &DaemonMessage::Hello { machine_id: d.ident.machine_id.clone() }).await?;
+    send(&mut sink, &DaemonMessage::Hello { machine_id: d.ident.machine_id().to_string() }).await?;
     // The cached report may be stale (changes while offline): recompute it
     // before the first status and before replaying any discards.
     let mut sent = refresh_report(d).await?;
@@ -294,7 +298,7 @@ pub(crate) async fn proxy(d: &Daemon, method: Method, path_and_query: &str, body
     if d.is_revoked() {
         return Err(Error::Unavailable("this machine was removed from the fleet; it can't reach the server".into()));
     }
-    let resp = request(&d.http, &d.ident, method.clone(), path_and_query, body).await?;
+    let resp = request(&d.http, d.ident.joined()?, method.clone(), path_and_query, body).await?;
     let status = resp.status();
     let content_type = resp.headers().get(header::CONTENT_TYPE).cloned();
     let bytes = resp.bytes().await.map_err(|e| Error::Unavailable(format!("reading the server's response: {e}")))?;
@@ -398,13 +402,14 @@ pub(crate) async fn assign_draft_item(
             if !report.drafts.contains(item) && !report.unpushed.contains(item) {
                 break; // An unchanged baseline item needs no new draft report.
             }
-            let fleet: sk1ll_proto::FleetView = request(&d.http, &d.ident, Method::GET, "/fleet", Bytes::new())
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
+            let fleet: sk1ll_proto::FleetView =
+                request(&d.http, d.ident.joined()?, Method::GET, "/fleet", Bytes::new())
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
             if fleet.machines.iter().any(|m| {
-                m.id == d.ident.machine_id
+                m.id == d.ident.machine_id()
                     && m.report.as_ref().is_some_and(|r| r.drafts.contains(item) || r.unpushed.contains(item))
             }) {
                 break;
@@ -415,5 +420,5 @@ pub(crate) async fn assign_draft_item(
     })
     .await
     .map_err(|_| anyhow::anyhow!("{action} timed out waiting for the Server to receive the draft; try again"))??;
-    change_assignment(&d.http, &d.ident, changes).await
+    change_assignment(&d.http, d.ident.joined()?, changes).await
 }

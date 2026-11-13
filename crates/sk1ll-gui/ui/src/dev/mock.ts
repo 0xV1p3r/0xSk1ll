@@ -11,12 +11,14 @@ const harness = (skills: Record<string, boolean> = {}, rules: Record<string, boo
   ({ new_skills_default: true, new_rules_default: false, skills, rules });
 
 export function installMock(scenario: string) {
-  const empty = scenario === 'empty';
+  let standalone = scenario.startsWith('standalone');
+  const empty = scenario === 'empty' || scenario === 'standalone-first-run';
   const local = report({ drafts: empty ? [] : ['skill:release-notes', 'rule:style'], unpushed: empty ? [] : ['skill:release-notes'],
     conflicts: empty ? [] : [{ item: 'skill:code-review', harness: 'codex' }] });
   const status: T.StatusView = {
-    machine_id: 'workstation', server_url: 'https://skills.example.com', repo: '/home/dev/.local/share/sk1ll/repo',
-    headline: empty ? 'in_sync' : 'conflict', connection: scenario === 'auth' ? 'auth_rejected' : 'connected',
+    mode: standalone ? 'standalone' : 'joined', has_origin: !standalone || scenario === 'standalone-origin', repo_ready: scenario !== 'standalone-first-run',
+    machine_id: 'workstation', server_url: standalone ? null : 'https://skills.example.com', repo: '/home/dev/.local/share/sk1ll/repo',
+    headline: empty ? 'in_sync' : 'conflict', connection: standalone ? 'standalone' : scenario === 'auth' ? 'auth_rejected' : 'connected',
     last_error: scenario === 'auth' ? 'Server returned 401 Unauthorized' : null, revoked: scenario === 'revoked',
     server_baseline: '9f3c2a17d4e1', assignment_revision: 42, awaiting_assignment: scenario === 'awaiting',
     auth_rejected_since: scenario === 'auth' ? now - 600 : null, pending_discards: 0, report: local,
@@ -94,7 +96,10 @@ export function installMock(scenario: string) {
     const a = (args ?? {}) as Record<string, unknown>;
     if (scenario === 'unreachable' && cmd !== 'connection_info' && !cmd.startsWith('plugin:'))
       return Promise.reject({ message: 'connect ECONNREFUSED /run/user/1000/sk1ll/daemon.sock', status: null, unreachable: true });
+    if (standalone && ['fleet', 'log', 'log_facets', 'undo', 'join_code', 'remove_machine'].includes(cmd)) return Promise.reject({ message: 'Unavailable in standalone mode', status: 409, unreachable: false });
+    if (standalone && !status.has_origin && ['push', 'pull'].includes(cmd)) return Promise.reject({ message: 'Repository has no origin remote', status: 409, unreachable: false });
     switch (cmd) {
+      case 'init': status.repo_ready = true; return delay(undefined);
       case 'push': {
         const pushed = local.unpushed.length > 0; local.unpushed = [];
         items.forEach(item => { item.unpushed = false; });
@@ -145,7 +150,7 @@ export function installMock(scenario: string) {
           if (r.name in toggles) { toggles[r.to] = toggles[r.name]; migrated.push(name); }
         }
         if (migrated.length) assignments[status.machine_id].revision++;
-        const offline = status.connection !== 'connected' && migrated.length > 0;
+        const offline = status.connection !== 'connected' && status.connection !== 'standalone' && migrated.length > 0;
         return delay({ item: to, migrated: offline ? [] : migrated, assignment_error: offline ? 'offline: the Server is unreachable' : null });
       }
       case 'conflict_diff': {
@@ -217,7 +222,17 @@ export function installMock(scenario: string) {
       case 'draft': return delay(draft);
       case 'diff': return delay({ item: a.item, diff: diffs[a.item as string] ?? '' }, 50);
       case 'commit_message': return delay({ items: a.items, message: `Commit ${(a.items as string[]).join(', ')}` });
-      case 'commit': return delay({ sha: '7d1e9a0b3c5f8e2d', items: [], message: '', pushed: true, push_error: null }, 600);
+      case 'commit': {
+        const request = a.request as T.CommitRequest;
+        if (standalone) {
+          for (let i = draft.length - 1; i >= 0; i--) if (request.items.includes(draft[i].item)) draft.splice(i, 1);
+          local.drafts = local.drafts.filter(item => !request.items.includes(item));
+          local.unpushed = [...new Set([...local.unpushed, ...request.items])];
+          content.filter(entry => entry.item && request.items.includes(entry.item)).forEach(entry => { entry.draft = null; entry.in_baseline = true; });
+          items.filter(entry => request.items.includes(entry.item)).forEach(entry => { entry.draft = null; entry.unpushed = true; entry.in_baseline = true; });
+        }
+        return delay({ sha: '7d1e9a0b3c5f8e2d', items: request.items, message: request.message ?? '', pushed: !standalone, push_error: null }, 600);
+      }
       case 'restore': return delay({ discarded: [] });
       case 'pull': return delay({ state: 'up_to_date' }, 500);
       case 'conflicts': return delay(conflicts);
@@ -258,7 +273,11 @@ export function installMock(scenario: string) {
       case 'connection_info': return delay('/run/user/1000/sk1ll/daemon.sock', 10);
       case 'adopt': case 'overwrite': case 'adopt_displaced': case 'discard_displaced': case 'undo':
       case 'remove_machine': return delay(undefined, 500);
-      case 'join': return delay({ machine_id: (a.request as T.JoinApiRequest).machine_id ?? 'laptop', repo: '/home/user/.local/share/sk1ll/repo', setup: 'cloned', harnesses: ['claude', 'codex'], revision: 1 }, 500);
+      case 'join':
+        if (standalone && content.length) return Promise.reject({ message: 'Cannot join a Fleet while the local repo has content.', status: 409, unreachable: false });
+        standalone = false; status.mode = 'joined'; status.connection = 'connected'; status.has_origin = true; status.repo_ready = true;
+        status.server_url = (a.request as T.JoinApiRequest).server_url;
+        return delay({ machine_id: (a.request as T.JoinApiRequest).machine_id ?? 'laptop', repo: '/home/user/.local/share/sk1ll/repo', setup: 'cloned', harnesses: ['claude', 'codex'], revision: 1 }, 500);
       default: return undefined;
     }
   }, { shouldMockEvents: true });

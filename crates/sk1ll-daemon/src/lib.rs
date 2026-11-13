@@ -1,23 +1,16 @@
-//! `sk1ll-daemon`: runs on every machine, keeps its harnesses matching the
-//! local draft and the server's assignment. The CLI and GUI talk to it over a
-//! local API ([`client`]); a direct CLI command can use the same Server client
-//! and persistent files while holding the engine lock if the daemon is stopped.
+//! `sk1ll-daemon` keeps local harnesses matching the draft and assignment.
+//! The CLI and GUI use its local API ([`client`]). Without `daemon.json`, it
+//! runs standalone against the same repo and machine-local assignment as the
+//! direct CLI. Joined machines use the fleet's repo and assignment snapshots.
 //!
-//! - The repo is a full clone whose only remote is the server. Its working tree
-//!   is the draft: live in local harnesses, never sent; only its item list
-//!   is reported.
-//! - The daemon holds core's engine lock on the repo while it runs, so no
-//!   other sk1ll process changes it behind its back.
-//! - Assignment arrives as whole snapshots over the WebSocket and is applied
-//!   only if newer. The snapshot is stored with its revision next to the
-//!   state file, so the machine works while the server is away; without one the
-//!   harnesses are left alone until the server sends one.
-//! - Commits are pushed right away, or queued while offline.
-//! - Pulls happen on nudge, on reconnect and periodically. A Blocked pull is
-//!   reported and the machine stays on its old baseline until resolved.
-//! - Conflicts are reported, never applied; the API adopts or overwrites them.
-//! - The machine token lives only in the state file; git gets it from the
-//!   environment ([`auth`]).
+//! - Core's engine lock stays held while the daemon manages a repo.
+//! - File watches and periodic reconciliation apply local changes in both modes.
+//! - Standalone commits stay local; explicit push/pull use the repo's origin.
+//! - Joined commits push immediately or queue while offline. Assignment arrives
+//!   as revisioned snapshots, and discarded drafts are delivered via an outbox.
+//! - Conflicts are reported, never overwritten without an explicit action.
+//! - Fleet credentials live in daemon.json; git gets them through the process
+//!   environment ([`auth`]). Standalone never opens a server session.
 
 mod api;
 pub mod auth;
@@ -36,7 +29,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, bail};
-pub use config::{Config, parse_duration};
+pub use config::{Config, locate_repo, parse_duration};
 use daemon::Daemon;
 pub use join::{JoinOptions, Joined, join, join_or_rejoin};
 pub use server::set_assignment_direct;
@@ -70,24 +63,22 @@ pub unsafe fn prepare_process(cfg: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Runs the daemon until Ctrl-C / SIGTERM. Fails if the machine hasn't
-/// joined, or if another process holds the repo's engine lock.
+/// Runs until Ctrl-C / SIGTERM, standalone when daemon.json is absent.
+/// Fails if another process holds the repo's engine lock.
 ///
 /// [`prepare_process`] must have been called first.
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
     if !PREPARED.load(Ordering::SeqCst) {
         bail!("sk1ll_daemon::prepare_process must run before sk1ll_daemon::run");
     }
-    let state = DaemonState::load(&cfg.state)?.with_context(|| {
-        format!(
-            "this machine hasn't joined a fleet ({} is missing); run `sk1ll join <server-url> <join-code>`",
-            cfg.state.display()
-        )
-    })?;
-    let listener = api::bind(&cfg.socket).await?;
-    tracing::info!("local API on {}", cfg.socket.display());
-    let socket = cfg.socket.clone();
-    let d = Daemon::new(cfg, state)?;
+    let state = DaemonState::load(&cfg.state)?;
+    let d = match state {
+        Some(state) => Daemon::new(cfg, state)?,
+        None => Daemon::standalone(cfg)?,
+    };
+    let listener = api::bind(&d.cfg.socket).await?;
+    tracing::info!("local API on {}", d.cfg.socket.display());
+    let socket = d.cfg.socket.clone();
     if let Err(e) = d.blocking(|d, eng| d.lock_repo(eng)).await {
         let _ = std::fs::remove_file(&socket);
         bail!("{e}; not starting");
@@ -104,8 +95,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             Ok(()) => {}
         }
         tokio::spawn(watch::run(d.clone()));
-        tokio::spawn(server::run(d.clone()));
-        tokio::spawn(periodic_pull(d.clone()));
+        if !d.is_standalone() {
+            tokio::spawn(server::run(d.clone()));
+            tokio::spawn(periodic_pull(d.clone()));
+        }
     }
     let served = tokio::select! {
         r = axum::serve(listener, api::router(d)) => r.context("serving the local API"),

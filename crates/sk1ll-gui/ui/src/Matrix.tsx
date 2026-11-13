@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { ChevronRight, Info, MoreHorizontal, RotateCcw } from 'lucide-react';
 import { Switch } from '@base-ui/react/switch';
 import { Button } from '@/components/ui/button';
@@ -18,8 +18,8 @@ import { cn } from '@/lib/utils';
 import { CheckboxSwatch, ErrorNotice, KindBadge, Loading, Nothing, Panel, PanelToolbar, Pending } from './shared';
 import type { CachedAssignmentSnapshot as AssignmentSnapshot, ItemView, StatusView, ToggleChange } from './types';
 
-const loadMatrix = async () => {
-  const [fleet, items] = await Promise.all([api.fleet(), api.items()]);
+const loadMatrix = async (status: StatusView) => {
+  const [fleet, items] = await Promise.all([status.mode === 'standalone' ? Promise.resolve({ baseline: status.report.baseline, machines: [{ id: status.machine_id, status: status.headline, connected: true, joined_at: 0, last_seen: null, report: status.report }] }) : api.fleet(), api.items()]);
   const assignments: Record<string, AssignmentSnapshot> = Object.fromEntries(await Promise.all(fleet.machines.map(async machine =>
     [machine.id, await api.assignment(machine.id)] as const)));
   return { fleet, items, assignments };
@@ -42,7 +42,13 @@ const verb = (enabled: boolean | null) => enabled === null ? 'Reset' : enabled ?
 const defaultHint = 'Changing a default for new Skills or Rules applies to items added later. Existing items keep their current value as an explicit Assignment.';
 // Sticky header cells leave the collapsed table borders behind, so they draw their own edges.
 const headEdge = 'sticky z-20 bg-muted shadow-[inset_1px_0_0_var(--color-border),inset_0_-1px_0_var(--color-border)]';
-export function Matrix({ revision, status, target }: { revision: number; status: StatusView; target?: { item: string; harness: string } }) {
+type MatrixProps = { revision: number; status: StatusView; target?: { item: string; harness: string } };
+export function Matrix(props: MatrixProps) {
+  const { mode, server_url, machine_id } = props.status;
+  // Revisions and optimistic writes belong to one assignment authority.
+  return <AuthorityMatrix key={JSON.stringify([mode, server_url, machine_id])} {...props} />;
+}
+function AuthorityMatrix({ revision, status, target }: MatrixProps) {
   const [search, setSearch] = useState('');
   const [kindFilter, setKindFilter] = useState('all');
   const [machines, setMachines] = useState<string[] | null>(() => readIds('assignment-matrix-machines'));
@@ -58,7 +64,17 @@ export function Matrix({ revision, status, target }: { revision: number; status:
   const destination = useRef<HTMLButtonElement>(null);
   const visited = useRef<typeof target>(undefined);
   const [highlighted, setHighlighted] = useState(false);
-  const resource = useResource(loadMatrix, revision, mergeMatrix);
+  const standalone = status.mode === 'standalone';
+  const latestStatus = useRef(status);
+  useEffect(() => { latestStatus.current = status; }, [status]);
+  const { mode, server_url, machine_id } = status;
+  const load = useCallback(() => loadMatrix({ ...latestStatus.current, mode, server_url, machine_id }), [mode, server_url, machine_id]);
+  const active = useRef(true);
+  useEffect(() => {
+    active.current = true;
+    return () => { active.current = false; };
+  }, []);
+  const resource = useResource(load, revision, mergeMatrix);
   const { pending, errors, write, assignment } = useAssignmentWrites(resource);
   useEffect(() => {
     if (!target || visited.current === target || !destination.current) return;
@@ -77,7 +93,7 @@ export function Matrix({ revision, status, target }: { revision: number; status:
   const items = data.items.filter(i => ['skill', 'rule'].includes(splitItem(i.item).kind)
     && (kindFilter === 'all' || splitItem(i.item).kind === kindFilter)
     && `${splitItem(i.item).name} ${i.description ?? ''}`.toLowerCase().includes(search.toLowerCase()));
-  const selected = data.fleet.machines.filter(machine => machines === null || machines.includes(machine.id));
+  const selected = data.fleet.machines.filter(machine => standalone || machines === null || machines.includes(machine.id));
   const groups = selected.map(machine => ({ machine, harnesses: [...new Set([
     ...(machine.report?.harnesses ?? []), ...Object.keys(data.assignments[machine.id].assignment.harnesses),
   ])].sort(), collapsed: collapsed.includes(machine.id), offline: !machine.connected || machine.status === 'offline' })).filter(g => g.harnesses.length);
@@ -127,10 +143,17 @@ export function Matrix({ revision, status, target }: { revision: number; status:
       });
       return await write(machine.id, changes) ? { machine: machine.id, changes: changes.length, previous } : null;
     }));
+    if (!active.current) return;
     const done = accepted.filter(result => result !== null), later = done.filter(result => offline.has(result.machine)).map(result => result.machine);
     if (done.length) toast({ title: title(done.reduce((sum, result) => sum + result.changes, 0)),
-      action: { label: 'Undo', run: () => { void (async () => {
+      action: { label: 'Undo', run: () => {
+        if (!active.current) {
+          toast({ title: 'Undo is no longer available', description: 'The Machine or Fleet changed since this bulk update.' });
+          return;
+        }
+        void (async () => {
         const results = await Promise.all(done.map(async result => ({ ...result, restored: await write(result.machine, result.previous) })));
+        if (!active.current) return;
         const restored = results.filter(result => result.restored).reduce((sum, result) => sum + result.changes, 0);
         toast({ title: `Restored ${count(restored, 'Assignment', 'Assignments')}`, tone: results.every(result => result.restored) ? 'default' : 'destructive',
           description: results.some(result => !result.restored) ? 'Some Assignments could not be restored. Check the Machine errors and retry.' : undefined });
@@ -155,17 +178,17 @@ export function Matrix({ revision, status, target }: { revision: number; status:
       <NativeSelect aria-label="Item kind" value={kindFilter} onChange={event => setKindFilter(event.target.value)}>
         <option value="all">All</option><option value="skill">Skills</option><option value="rule">Rules</option>
       </NativeSelect>
-      <DropdownMenu><DropdownMenuTrigger render={<Button variant="outline" size="sm" className="h-8 bg-card" />}>Machines ({selected.length})</DropdownMenuTrigger>
+      {!standalone && <DropdownMenu><DropdownMenuTrigger render={<Button variant="outline" size="sm" className="h-8 bg-card" />}>Machines ({selected.length})</DropdownMenuTrigger>
         <DropdownMenuContent><DropdownMenuGroup>
           <DropdownMenuItem onClick={() => setMachines(null)}>All Machines</DropdownMenuItem>
           <DropdownMenuItem onClick={() => setMachines([status.machine_id])}>Only this Machine</DropdownMenuItem>
         </DropdownMenuGroup><DropdownMenuSeparator /><DropdownMenuGroup>{data.fleet.machines.map(machine => <DropdownMenuCheckboxItem key={machine.id}
-          checked={machines === null || machines.includes(machine.id)} closeOnClick={false}
+          checked={standalone || machines === null || machines.includes(machine.id)} closeOnClick={false}
           onCheckedChange={checked => setMachines(old => {
             const current = old ?? data.fleet.machines.map(m => m.id);
             return checked ? [...current, machine.id] : current.filter(id => id !== machine.id);
           })}>{machine.id}</DropdownMenuCheckboxItem>)}</DropdownMenuGroup></DropdownMenuContent>
-      </DropdownMenu>
+      </DropdownMenu>}
       <span role="status" className="inline-flex items-center gap-1.5 text-xs">{saving.length > 0 && <Pending pending>Saving Assignment for {saving.join(', ')}…</Pending>}</span>
       <div className="ml-auto flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
         <span className="inline-flex items-center gap-1.5"><CheckboxSwatch explicit enabled /><CheckboxSwatch explicit enabled={false} />{terms.explicit}</span>

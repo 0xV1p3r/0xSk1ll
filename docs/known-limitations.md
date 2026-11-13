@@ -28,6 +28,22 @@ reject those calls, sync checks the destination and then renames. In that case
 an *empty* directory created in the gap can be replaced. A directory with
 content in it is never replaced.
 
+## First baseline and join recovery
+
+An unborn repo's first baseline publishes each missing file without replacing
+anything, using pinned, no-follow directory traversal. If a later file is
+obstructed, HEAD and the index stay unchanged. Files already published are kept
+as draft, because deleting them could lose edits made after publication. Move
+those files aside with the obstruction before retrying the first pull.
+
+Standalone join uses the same no-replace directory renames as sync. The empty
+directory placement window described above also applies to publishing its
+prepared clone and restoring its backup on platforms without that support.
+A concurrent obstruction is kept, and rollback refuses to overwrite it.
+The error identifies the backup to restore after moving the obstruction aside.
+On non-Unix platforms init and first-baseline file publication fail rather than
+use a path traversal that could follow a concurrent symlink replacement.
+
 ## Filesystems without hard links
 
 Updating a rules or block instruction file, and creating any file, relies on

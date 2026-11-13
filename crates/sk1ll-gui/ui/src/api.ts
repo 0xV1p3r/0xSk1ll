@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import type * as T from './types';
 
 export const api = {
+  init: () => invoke<void>('init'),
   push: () => invoke<T.PushResult>('push'),
   createItem: (request: T.CreateItemRequest) => invoke<void>('create_item', { request }),
   deleteItem: (request: T.DeleteItemRequest) => invoke<void>('delete_item', { request }),

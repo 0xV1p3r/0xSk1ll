@@ -218,20 +218,36 @@ impl Repo {
 
     /// Creates the repo layout and a starter manifest, and `git init`s it.
     pub fn init(root: &Path) -> Result<Self> {
-        let manifest = root.join(MANIFEST_FILE);
-        if manifest.exists() {
-            return Err(Error::Invalid(format!("{} already exists", manifest.display())));
-        }
+        let directory = crate::placement::Directory::open(root, true).at(root)?;
+        let mut files = vec![(PathBuf::from(MANIFEST_FILE), MANIFEST_TEMPLATE)];
         for sub in [PERSONAL_DIR, IMPORTED_DIR, INSTRUCTIONS_DIR] {
-            let dir = root.join(sub);
-            fs::create_dir_all(&dir).at(&dir)?;
-            let keep = dir.join(".gitkeep");
-            fs::write(&keep, "").at(&keep)?;
+            files.push((Path::new(sub).join(".gitkeep"), ""));
         }
-        fs::write(&manifest, MANIFEST_TEMPLATE).at(&manifest)?;
+        // Preserve a regular existing ignore file, but never follow a link.
         let ignore = root.join(".gitignore");
-        if !ignore.exists() {
-            fs::write(&ignore, ".sk1ll-stage-*\n").at(&ignore)?;
+        match ignore.symlink_metadata() {
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => return Err(Error::Invalid(format!("{} is not a regular file", ignore.display()))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => files.push((".gitignore".into(), ".sk1ll-stage-*\n")),
+            Err(e) => return Err(e).at(&ignore),
+        }
+        // Preserve existing empty placeholders without opening them for write.
+        // Every other existing destination is refused before any publication.
+        let mut missing = Vec::new();
+        for (path, bytes) in files {
+            match directory.check_missing(&path) {
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::AlreadyExists
+                        && path.file_name().is_some_and(|n| n == ".gitkeep")
+                        && root.join(&path).symlink_metadata().is_ok_and(|m| m.is_file() && m.len() == 0) => {}
+                result => {
+                    result.at(root.join(&path))?;
+                    missing.push((path, bytes));
+                }
+            }
+        }
+        for (path, bytes) in missing {
+            directory.create_file(&path, bytes.as_bytes(), false).at(root.join(path))?;
         }
         if !root.join(".git").exists() {
             // Always on the fleet's branch (commit and the daemon need it),
@@ -322,6 +338,36 @@ mod tests {
         commit_all(&root, "init");
         let branch = crate::git::Git::new(&root).args(["branch", "--show-current"]).text().unwrap();
         assert_eq!(branch, crate::FLEET_BRANCH);
+    }
+
+    #[test]
+    fn init_preserves_existing_destinations_and_refuses_symlink_ancestors() {
+        for scenario in ["keep", "ancestor", "manifest-link", "ignore-link"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("repo");
+            fs::create_dir(&root).unwrap();
+            let outside = tmp.path().join("outside");
+            fs::create_dir(&outside).unwrap();
+            fs::write(outside.join("notes"), "private").unwrap();
+            match scenario {
+                "keep" => {
+                    fs::create_dir(root.join("personal")).unwrap();
+                    fs::write(root.join("personal/.gitkeep"), "private").unwrap();
+                }
+                "ancestor" => std::os::unix::fs::symlink(&outside, root.join("personal")).unwrap(),
+                "manifest-link" => {
+                    std::os::unix::fs::symlink(outside.join("missing"), root.join(MANIFEST_FILE)).unwrap()
+                }
+                _ => std::os::unix::fs::symlink(outside.join("missing"), root.join(".gitignore")).unwrap(),
+            }
+            assert!(Repo::init(&root).is_err(), "{scenario}");
+            assert_eq!(fs::read(outside.join("notes")).unwrap(), b"private");
+            assert!(!outside.join("missing").exists());
+            assert!(!outside.join(".gitkeep").exists());
+            if scenario == "keep" {
+                assert_eq!(fs::read(root.join("personal/.gitkeep")).unwrap(), b"private");
+            }
+        }
     }
 
     #[test]

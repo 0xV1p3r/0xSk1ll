@@ -323,3 +323,89 @@ it('undo restores explicit and inherited values only for accepted Machines', asy
   ] });
   expect(toast).toHaveBeenLastCalledWith(expect.objectContaining({ title: 'Restored 2 Assignments', tone: 'default' }));
 });
+
+it('assigns Draft-only items locally in standalone without requesting fleet', async () => {
+  localStorage.setItem('assignment-matrix-machines', '["other"]');
+  vi.mocked(api.items).mockResolvedValue([{ item: 'skill:pdf', in_baseline: false, draft: 'added', unpushed: false, description: null }]);
+  render(<Matrix revision={0} status={{ ...status, mode: 'standalone', report: { baseline: null, harnesses: ['claude'] } } as StatusView} />);
+  fireEvent.click(await screen.findByRole('checkbox', { name: 'skill:pdf in a / claude, explicit' }));
+  await waitFor(() => expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: true }] }));
+  expect(api.fleet).not.toHaveBeenCalled();
+  expect(api.assignment).toHaveBeenCalledWith('a');
+  expect(vi.mocked(api.assignment).mock.calls.every(([machine]) => machine === 'a')).toBe(true);
+});
+
+
+it.each([
+  { mode: 'joined', server_url: 'https://fleet.example', machine_id: 'a' },
+  { mode: 'joined', server_url: 'https://other.example', machine_id: 'a' },
+  { mode: 'joined', server_url: 'https://fleet.example', machine_id: 'b' },
+] as const)('resets cached revisions and pending writes when authority becomes %j', async identity => {
+  const previous = { ...status, mode: identity.mode === 'joined' && identity.server_url === 'https://fleet.example' && identity.machine_id === 'a' ? 'standalone' : 'joined', server_url: 'https://fleet.example', report: { baseline: null, harnesses: ['claude'] } } as StatusView;
+  vi.mocked(api.assignment).mockResolvedValue(snapshot(false, 10));
+  const save = deferred<AssignmentUpdate>();
+  vi.mocked(api.setAssignment).mockReturnValue(save.promise);
+  const view = render(<Matrix revision={0} status={previous} />);
+  await screen.findByRole('checkbox', { name: 'skill:pdf in a / claude, explicit' });
+  fireEvent.click(cell('a'));
+  expect(enabled('a')).toBe(true);
+  expect(cell('a').hasAttribute('data-disabled')).toBe(true);
+  vi.mocked(api.assignment).mockResolvedValue(snapshot(false, 1));
+  view.rerender(<Matrix revision={1} status={{ ...previous, ...identity }} />);
+  await waitFor(() => expect(cell('a').hasAttribute('data-disabled')).toBe(false));
+  expect(enabled('a')).toBe(false);
+  // A response from the previous authority must not restore its optimistic edit.
+  await act(async () => { save.resolve(snapshot(true, 11)); });
+  expect(enabled('a')).toBe(false);
+  expect(cell('a').hasAttribute('data-disabled')).toBe(false);
+});
+
+it.each([
+  { field: 'mode', next: { mode: 'standalone' } },
+  { field: 'server', next: { server_url: 'https://new.example' } },
+  { field: 'machine', next: { machine_id: 'b' } },
+].flatMap(identity => ['completion', 'undo'].map(phase => ({ ...identity, phase }))))('scopes bulk $phase across a $field change', async ({ phase, next }) => {
+  const save = deferred<AssignmentUpdate>();
+  vi.mocked(api.setAssignment).mockReturnValue(save.promise);
+  const identity = { ...status, mode: 'joined', server_url: 'https://fleet.example', report: { baseline: null, harnesses: ['claude'] } } as StatusView;
+  const view = render(<Matrix revision={0} status={identity} />);
+  await screen.findByRole('checkbox', { name: 'skill:pdf in a / claude, explicit' });
+  fireEvent.click(screen.getByRole('button', { name: 'Actions for skill:pdf' }));
+  fireEvent.click(await screen.findByRole('menuitem', { name: 'Enable in all visible Harnesses' }));
+  if (phase === 'undo') await act(async () => { save.resolve(snapshot(true, 2)); });
+  const action = vi.mocked(toast).mock.calls[0]?.[0].action;
+  view.rerender(<Matrix revision={0} status={{ ...identity, ...next } as StatusView} />);
+  await screen.findByRole('checkbox', { name: 'skill:pdf in a / claude, explicit' });
+  if (phase === 'completion') {
+    await act(async () => { save.resolve(snapshot(true, 2)); });
+    expect(toast).not.toHaveBeenCalled();
+  } else {
+    expect(action).toBeDefined();
+    await act(async () => { action!.run(); });
+    expect(api.setAssignment).toHaveBeenCalledTimes(2);
+    expect(toast).toHaveBeenLastCalledWith(expect.objectContaining({
+      title: 'Undo is no longer available', description: 'The Machine or Fleet changed since this bulk update.',
+    }));
+  }
+});
+
+it('shows a six-second joined load while five-second status polling continues', async () => {
+  vi.useFakeTimers();
+  try {
+    const fleet = vi.mocked(api.fleet).getMockImplementation()!;
+    vi.mocked(api.fleet).mockImplementation(() => new Promise(resolve => {
+      setTimeout(async () => resolve(await fleet()), 6000);
+    }));
+    const identity = { ...status, mode: 'joined', server_url: 'https://fleet.example' } as StatusView;
+    const view = render(<Matrix revision={0} status={identity} />);
+    const poll = setInterval(() => view.rerender(<Matrix revision={0} status={{ ...identity }} />), 5000);
+    try {
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+      expect(cell('a')).toBeTruthy();
+      await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+      expect(cell('a')).toBeTruthy();
+      expect(api.fleet).toHaveBeenCalledTimes(1);
+    } finally { clearInterval(poll); }
+  } finally { vi.useRealTimers(); }
+});

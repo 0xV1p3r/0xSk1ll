@@ -271,7 +271,7 @@ async fn draft_bridge_adds_fingerprints_and_preserves_daemon_entries() {
         (
             StatusCode::OK,
             json!({
-                "machine_id":"alpha", "server_url":"http://server", "repo":directory.path(),
+                "machine_id":"alpha", "server_url":"http://server", "mode":"joined", "has_origin":true, "repo_ready":true, "repo":directory.path(),
                 "headline":"drafting", "connection":"connected", "last_error":null,
                 "revoked":false, "server_baseline":null, "assignment_revision":1, "report":{},
             }),
@@ -481,7 +481,7 @@ async fn editor_resolution_uses_daemon_repo_and_rejects_item_paths() {
         (
             StatusCode::OK,
             json!({
-                "machine_id":"alpha", "server_url":"http://server", "repo":directory.path(),
+                "machine_id":"alpha", "server_url":"http://server", "mode":"joined", "has_origin":true, "repo_ready":true, "repo":directory.path(),
                 "headline":"drafting", "connection":"connected", "last_error":null,
                 "revoked":false, "server_baseline":null, "assignment_revision":1, "report":{},
             }),
@@ -599,7 +599,7 @@ async fn editor_resolution_uses_inventory_path_and_refuses_inventory_imports_and
         (
             StatusCode::OK,
             json!({
-                "machine_id":"alpha", "server_url":"http://server", "repo":repo, "headline":"in_sync",
+                "machine_id":"alpha", "server_url":"http://server", "mode":"joined", "has_origin":true, "repo_ready":true, "repo":repo, "headline":"in_sync",
                 "connection":"connected", "last_error":null, "revoked":false, "server_baseline":null,
                 "assignment_revision":1, "report":{}
             }),
@@ -656,7 +656,7 @@ async fn editor_inventory_accepts_literal_unusual_names() {
         (
             StatusCode::OK,
             json!({
-                "machine_id":"a", "server_url":"http://server", "repo":directory.path(),
+                "machine_id":"a", "server_url":"http://server", "mode":"joined", "has_origin":true, "repo_ready":true, "repo":directory.path(),
                 "headline":"drafting", "connection":"connected", "last_error":null,
                 "revoked":false, "server_baseline":null, "assignment_revision":1, "report":{}
             }),

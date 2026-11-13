@@ -2,14 +2,15 @@
 // ItemRef and PathBuf serialize as strings; timestamps are Unix seconds.
 export type ItemRef = string;
 export type MachineStatus = 'offline' | 'blocked' | 'conflict' | 'behind' | 'drafting' | 'in_sync';
-export type Connection = 'connecting' | 'connected' | 'offline' | 'auth_rejected' | 'revoked';
+export type Connection = 'connecting' | 'connected' | 'offline' | 'auth_rejected' | 'revoked' | 'standalone';
 export interface MachineReport {
   baseline: string | null; drafts: ItemRef[]; unpushed: ItemRef[];
   conflicts: { item: ItemRef; harness: string }[]; harnesses: string[];
   blocked: boolean; clashes: ItemRef[]; behind: boolean;
 }
 export interface StatusView {
-  machine_id: string; server_url: string; repo: string; headline: MachineStatus; connection: Connection;
+  mode: 'joined' | 'standalone'; has_origin: boolean; repo_ready: boolean;
+  machine_id: string; server_url: string | null; repo: string; headline: MachineStatus; connection: Connection;
   last_error: string | null; revoked: boolean; server_baseline: string | null; assignment_revision: number;
   awaiting_assignment: boolean; auth_rejected_since: number | null; pending_discards: number; report: MachineReport;
 }

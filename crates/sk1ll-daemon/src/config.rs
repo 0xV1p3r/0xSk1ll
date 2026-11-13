@@ -7,14 +7,15 @@ use sk1ll_core::{Assignment, MachineConfig};
 /// Daemon settings: where its files live and how often it does things.
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Standalone repo override (SK1LL_REPO); otherwise locate the nearest repo or ~/skills.
+    pub repo: Option<PathBuf>,
     /// Machine id, server URL, token and repo path (`SK1LL_DAEMON_STATE`,
     /// default `~/.config/sk1ll/daemon.json`). Mode 0600.
     pub state: PathBuf,
     /// Harness config (`SK1LL_MACHINE_CONFIG`, default `~/.config/sk1ll/machine.toml`).
     pub machine_config: PathBuf,
     /// Assignment cache (`SK1LL_ASSIGNMENT`, default `~/.cache/sk1ll/assignment.json`).
-    /// Only a mirror for the CLI's read-only commands: the daemon's own copy
-    /// is the snapshot next to the state file ([`Config::snapshot_path`]).
+    /// Authoritative in standalone; a mirror of the server snapshot when joined.
     pub assignment: PathBuf,
     /// Local API socket (`SK1LL_DAEMON_SOCKET`, default
     /// `$XDG_RUNTIME_DIR/sk1ll/daemon.sock`, else `run/daemon.sock` in the
@@ -44,6 +45,7 @@ impl Config {
     /// Defaults from the platform's config, cache and runtime dirs.
     pub fn new() -> anyhow::Result<Self> {
         Ok(Self {
+            repo: None,
             state: config_dir()?.join("daemon.json"),
             machine_config: MachineConfig::default_path()?,
             assignment: Assignment::default_path()?,
@@ -62,6 +64,9 @@ impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
         let mut cfg = Self::new()?;
         let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+        if let Some(v) = var("SK1LL_REPO") {
+            cfg.repo = Some(v.into());
+        }
         if let Some(v) = var("SK1LL_DAEMON_STATE") {
             cfg.state = v.into();
         }
@@ -137,6 +142,21 @@ pub fn parse_duration(s: &str) -> anyhow::Result<Duration> {
         bail!("must be greater than zero");
     }
     Ok(d)
+}
+
+/// Selects the same standalone repo for the CLI and daemon. An explicit path
+/// wins, then SK1LL_REPO, then the nearest skills repo or ~/skills.
+pub fn locate_repo(explicit: Option<&std::path::Path>, git_only: bool) -> anyhow::Result<PathBuf> {
+    let env = std::env::var_os("SK1LL_REPO").filter(|v| !v.is_empty()).map(PathBuf::from);
+    let path = match explicit.map(std::path::Path::to_path_buf).or(env) {
+        Some(path) => path,
+        None => {
+            let cwd = std::env::current_dir()?;
+            if git_only { sk1ll_core::Repo::locate_git(&cwd) } else { sk1ll_core::Repo::locate(&cwd) }
+                .context("cannot determine repo location")?
+        }
+    };
+    Ok(std::path::absolute(path)?)
 }
 
 #[cfg(test)]
