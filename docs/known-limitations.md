@@ -53,3 +53,12 @@ component relative to its directory descriptor, refusing symlinks. On non-Unix
 platforms containment uses best-effort canonical-path checks. A concurrent
 ancestor-directory symlink replacement can redirect a read or listing after
 that check. Avoid browsing content being changed by an untrusted process there.
+
+## Import checks reach whatever the server can reach
+
+The server checks each import's upstream with `git ls-remote`. The source
+comes from the pushed manifest, and only the `https`, `http`, `ssh` and `git`
+transports are allowed. Any joined machine can still point a source at an
+address inside the server's own network, and the server will send git's
+discovery request there. Run the server where its outbound network access is
+limited to what imports need if that matters to you.

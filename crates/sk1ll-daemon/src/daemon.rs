@@ -859,9 +859,18 @@ impl Daemon {
             }
         }
         let mut blobs = BTreeMap::new();
+        let cat_file = |mode: &str, objects: &[String]| {
+            let input = objects.iter().flat_map(|object| [object.as_str(), "\n"]).collect::<String>().into_bytes();
+            Git::new(root).env("GIT_OPTIONAL_LOCKS", "0").args(["cat-file", mode]).stdin(input).run()
+        };
+        // Sizes first, so git never streams us a blob over the cap.
         if !wanted.is_empty() {
-            let input = wanted.iter().flat_map(|object| [object.as_str(), "\n"]).collect::<String>().into_bytes();
-            let batch = Git::new(root).env("GIT_OPTIONAL_LOCKS", "0").args(["cat-file", "--batch"]).stdin(input).run();
+            let sizes = cat_file("--batch-check", &wanted).unwrap_or_default();
+            let mut sizes = sizes.split(|b| *b == b'\n').map(|line| small_blob(line, DESCRIPTION_CAP));
+            wanted.retain(|_| sizes.next().unwrap_or(false));
+        }
+        if !wanted.is_empty() {
+            let batch = cat_file("--batch", &wanted);
             let contents = batch.map(|out| parse_batch(&out, wanted.len(), DESCRIPTION_CAP)).unwrap_or_default();
             blobs.extend(wanted.into_iter().zip(contents).filter_map(|(object, bytes)| Some((object, bytes?))));
         }
@@ -1305,7 +1314,8 @@ impl Daemon {
         self.event(Event::Fleet);
         let current = gitx::baseline(Self::root(eng)).unwrap_or(None);
         if current.as_deref() != Some(baseline.as_str()) || eng.blocked.is_some() {
-            self.pull_refreshed(eng).map(drop)
+            // Not `pull_refreshed`: the last refresh may be long ago.
+            self.pull(eng).map(drop)
         } else if eng.stale {
             self.refresh(eng)
         } else {
@@ -1409,6 +1419,15 @@ const SKILL_DIRS: [&str; 2] = ["personal", "imported"];
 
 /// A `SKILL.md` larger than this is not read for its description.
 const DESCRIPTION_CAP: usize = 16384;
+
+/// Whether a `git cat-file --batch-check` line (`<oid> <type> <size>`)
+/// describes a blob of at most `cap` bytes.
+fn small_blob(line: &[u8], cap: usize) -> bool {
+    let line = String::from_utf8_lossy(line);
+    let mut fields = line.rsplitn(3, ' ');
+    let (size, kind) = (fields.next(), fields.next());
+    kind == Some("blob") && size.and_then(|size| size.parse::<usize>().ok()).is_some_and(|size| size <= cap)
+}
 
 /// Reads `git cat-file --batch` output for `count` requested objects, in
 /// request order: the content of each blob of at most `cap` bytes, `None` for
@@ -1865,6 +1884,15 @@ mod tests {
         let items = Daemon::items(root).unwrap();
         assert!(!items.iter().any(|entry| entry.item.to_string() == "rule:remote"));
         assert!(items.iter().find(|entry| entry.item.to_string() == "skill:base").unwrap().in_baseline);
+    }
+
+    #[test]
+    fn only_small_blobs_are_fetched() {
+        assert!(small_blob(b"0123abcd blob 16", 16));
+        assert!(!small_blob(b"0123abcd blob 17", 16));
+        assert!(!small_blob(b"0123abcd tree 4", 16));
+        assert!(!small_blob(b"HEAD:personal/a b/SKILL.md missing", 16));
+        assert!(!small_blob(b"", 16));
     }
 
     #[test]
