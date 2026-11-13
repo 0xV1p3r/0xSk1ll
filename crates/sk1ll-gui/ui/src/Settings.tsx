@@ -48,6 +48,9 @@ export function Settings({ revision, fleetRevision = revision, status, socket, c
   const [code, setCode] = useState('');
   const [id, setId] = useState('');
   const [showCode, setShowCode] = useState(false);
+  // The admin token creates a join code for the first Machine of a new Fleet.
+  const [credential, setCredential] = useState<'code' | 'admin'>('code');
+  const secretLabel = credential === 'admin' ? 'Admin token' : 'Join code';
   const [copyFrom, setCopyFrom] = useState('');
   const alreadyJoined = !!status.server_url && status.connection !== 'auth_rejected' && !status.revoked;
   const [confirming, setConfirming] = useState(false);
@@ -80,8 +83,11 @@ export function Settings({ revision, fleetRevision = revision, status, socket, c
           <CollapsibleContent><form onSubmit={e => { e.preventDefault(); setConfirming(true); }}><FieldGroup>
           <Field><FieldLabel htmlFor="server-url">Server URL</FieldLabel><Input id="server-url" type="url" required aria-describedby={join.error ? 'join-error' : undefined} value={server} disabled={join.pending}
             onChange={e => setServer(e.target.value)} placeholder="https://skills.example.com" /></Field>
-          <Field><FieldLabel htmlFor="join-code">Join code</FieldLabel><div className="flex items-center gap-2"><Input id="join-code" autoComplete="off" type={showCode ? 'text' : 'password'} required aria-describedby={join.error ? 'join-error' : undefined} value={code}
-            disabled={join.pending} onChange={e => setCode(e.target.value)} /><Button type="button" variant="outline" aria-label={showCode ? 'Hide join code' : 'Show join code'} aria-pressed={showCode} onClick={() => setShowCode(value => !value)}>{showCode ? 'Hide' : 'Show'}</Button></div></Field>
+          <Field><FieldLabel htmlFor="join-with">Join with</FieldLabel><NativeSelect id="join-with" value={credential} disabled={join.pending} onChange={e => setCredential(e.target.value as 'code' | 'admin')} aria-describedby="join-with-hint">
+            <option value="code">Join code from another Machine</option><option value="admin">Server admin token</option></NativeSelect>
+            <FieldDescription id="join-with-hint">{credential === 'admin' ? 'For the first Machine of a new Fleet. The token is used once to create a join code and is not saved.' : 'Create one on a joined Machine under Settings.'}</FieldDescription></Field>
+          <Field><FieldLabel htmlFor="join-code">{secretLabel}</FieldLabel><div className="flex items-center gap-2"><Input id="join-code" autoComplete="off" type={showCode ? 'text' : 'password'} required aria-describedby={join.error ? 'join-error' : undefined} value={code}
+            disabled={join.pending} onChange={e => setCode(e.target.value)} /><Button type="button" variant="outline" aria-label={`${showCode ? 'Hide' : 'Show'} ${secretLabel.toLowerCase()}`} aria-pressed={showCode} onClick={() => setShowCode(value => !value)}>{showCode ? 'Hide' : 'Show'}</Button></div></Field>
           <Field><FieldLabel htmlFor="machine-id">Machine id</FieldLabel><Input id="machine-id" placeholder={status.machine_id} value={id} disabled={join.pending}
             onChange={e => setId(e.target.value)} aria-describedby={join.error ? 'machine-id-hint join-error' : 'machine-id-hint'} /><FieldDescription id="machine-id-hint">Optional. Defaults to the current Machine id: {status.machine_id}.</FieldDescription></Field>
           <Field><FieldLabel htmlFor="copy-from">Copy Assignment from Machine</FieldLabel>{standalone || fleet.error ? <Input id="copy-from" value={copyFrom} disabled={join.pending} onChange={e => setCopyFrom(e.target.value)} placeholder="Machine id" aria-describedby="copy-from-hint" /> : <NativeSelect id="copy-from" value={copyFrom} disabled={join.pending || fleet.loading} onChange={e => setCopyFrom(e.target.value)} aria-describedby="copy-from-hint">
@@ -94,11 +100,12 @@ export function Settings({ revision, fleetRevision = revision, status, socket, c
         <Dialog open={confirming} onOpenChange={open => { if (!join.pending) setConfirming(open); }}>
           <DialogContent showCloseButton={!join.pending}><DialogHeader><DialogTitle>Join this Machine to the Server?</DialogTitle>
             <DialogDescription>This replaces {status.machine_id}'s credentials and restarts its Daemon.</DialogDescription></DialogHeader>
-            <Details rows={[['Server', <span className="break-all">{server}</span>], ['Machine id', id || status.machine_id],
+            <Details rows={[['Server', <span className="break-all">{server}</span>], ['Machine id', id || status.machine_id], ['Credential', secretLabel],
               ['Assignment', copyFrom ? `Copied from ${copyFrom}` : 'Not copied']]} />
             <ErrorNotice error={join.error} /><DialogFooter>
               <Button variant="outline" disabled={join.pending} onClick={() => setConfirming(false)}>Cancel</Button>
-              <Button disabled={join.pending} onClick={() => void join.run(() => api.join({ server_url: server, code, machine_id: id || undefined,
+              <Button disabled={join.pending} onClick={() => void join.run(() => api.join({ server_url: server, code: credential === 'code' ? code : '',
+                admin_token: credential === 'admin' ? code : undefined, machine_id: id || undefined,
                 copy_from: copyFrom || undefined }), value => {
                 setCode(''); setConfirming(false); toast({ title: 'Join complete', description: `Joined as ${value.machine_id}. The Daemon is restarting.` });
               })}><Pending pending={join.pending}>Join / rejoin</Pending></Button>

@@ -121,6 +121,7 @@ async fn commands_use_the_unix_client_and_preserve_payloads_and_errors() {
         .join(JoinApiRequest {
             server_url: "http://server".into(),
             code: "CODE".into(),
+            admin_token: None,
             machine_id: Some("alpha".into()),
             copy_from: Some("beta".into()),
             repo: None,

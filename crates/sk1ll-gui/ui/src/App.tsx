@@ -2,9 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { ArrowDownToLine, BookOpen, FilePen, History, LayoutGrid, LoaderCircle, RefreshCw, Search, Server, Settings as SettingsIcon, TriangleAlert } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { Badge } from '@/components/ui/badge';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Separator } from '@/components/ui/separator';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import {
@@ -13,8 +11,6 @@ import {
 } from '@/components/ui/sidebar';
 import { ThemeSelector } from '@/components/theme-selector';
 import symbol from '@branding/symbol.svg';
-import wordmarkDark from '@branding/wordmark-dark.svg';
-import wordmarkLight from '@branding/wordmark-light.svg';
 import { cn } from '@/lib/utils';
 import { api, errorMessage } from './api';
 import { toast, ToastProvider } from './toast';
@@ -26,10 +22,11 @@ import { Conflicts } from './Conflicts';
 import { Imports } from './Imports';
 import { Log } from './Log';
 import { Skills, type SkillsHandoff } from './Skills';
-import { useMutation, useResource } from './hooks';
+import { useResource } from './hooks';
 import { eventTopics } from './invalidation';
 import { plural } from './model';
 import { Settings } from './Settings';
+import { ConnectionPage, GettingStarted, RestartingPage, SetupWizard, StartingAssignment, Wordmark, showGettingStarted, type SetupResult } from './Setup';
 import { ErrorNotice, Loading, Notice } from './shared';
 import type { CommandError, DaemonConnection, StatusView } from './types';
 
@@ -49,41 +46,11 @@ export const screenFromHash = (hash: string): Screen => (Object.keys(screens) as
 const visibleScreens = (status: StatusView) => (Object.keys(screens) as Screen[]).filter(name => status.mode !== 'standalone' || (name !== 'Fleet' && name !== 'Assignment log'));
 const screenLabel = (name: Screen, status: StatusView) => status.mode === 'standalone' && name === 'Assignment matrix' ? 'Assignment' : name;
 const paletteShortcut = /Mac|iPhone|iPad|iPod/i.test(navigator.platform + navigator.userAgent) ? '⌘K' : 'Ctrl K';
-function CopyCommand({ command }: { command: string }) {
-  const [copied, setCopied] = useState(false);
-  const [error, setError] = useState('');
-  useEffect(() => { if (!copied) return; const timer = setTimeout(() => setCopied(false), 2000); return () => clearTimeout(timer); }, [copied]);
-  return <div><div className="flex items-center gap-2"><pre className="min-w-0 flex-1 overflow-auto rounded-md border bg-muted px-3 py-2 font-mono text-xs">{command}</pre><Button variant="outline" size="sm" aria-label={`Copy ${command}`} onClick={() => { void (async () => { try { await navigator.clipboard.writeText(command); setCopied(true); setError(''); } catch (e) { setError(errorMessage(e)); } })(); }}>{copied ? 'Copied' : 'Copy'}</Button></div><span role="status" className="sr-only">{copied ? 'Command copied' : ''}</span><ErrorNotice error={error} /></div>;
-}
 const connectionLabel = (connection: StatusView['connection']) => { const text = connection.replaceAll('_', ' '); return text.charAt(0).toUpperCase() + text.slice(1); };
 const sidebarKey = 'sk1ll-sidebar-open';
 function storedSidebar() {
   try { const value = localStorage.getItem(sidebarKey); return value === 'true' ? true : value === 'false' ? false : null; } catch { return null; }
 }
-function Wordmark() {
-  return <div className="mb-3 w-44"><img src={wordmarkLight} alt="0xSk1ll" className="block h-auto w-full dark:hidden" /><img src={wordmarkDark} alt="0xSk1ll" className="hidden h-auto w-full dark:block" /></div>;
-}
-
-function ConnectionPage({ socket, error }: { socket: string; error: string }) {
-  return <main className="relative grid min-h-svh place-items-center bg-muted/40 p-6">
-    <div className="absolute top-4 right-4"><ThemeSelector /></div>
-    <Card className="w-full max-w-lg">
-      <CardHeader><Wordmark /><CardTitle className="text-xl">Daemon is unreachable</CardTitle>
-        <CardDescription>Start this Machine's Daemon, then leave this window open. The connection retries automatically.</CardDescription>
-      </CardHeader>
-      <CardContent className="flex flex-col gap-4 text-sm">
-        <div className="flex flex-col gap-2"><span className="text-muted-foreground">Start the service</span>
-          <CopyCommand command="systemctl --user start sk1ll-daemon" /></div>
-        <div className="flex flex-col gap-2"><span className="text-muted-foreground">Or run it in a terminal</span>
-          <CopyCommand command="sk1ll daemon" /></div>
-        <p className="text-xs text-muted-foreground">Socket <code className="font-mono break-all">{socket}</code></p>
-        <ErrorNotice error={error} />
-        <Badge variant="secondary" role="status"><LoaderCircle className="animate-spin" />Reconnecting…</Badge>
-      </CardContent>
-    </Card>
-  </main>;
-}
-
 export function AppSidebar({ screen, setScreen, status, unmanagedCount, recoveredCount = 0, importUpdates = 0, importErrors = 0 }: { screen: Screen; setScreen: (screen: Screen) => void; status: StatusView; unmanagedCount: number; recoveredCount?: number; importUpdates?: number; importErrors?: number }) {
   const { isMobile, setOpenMobile } = useSidebar();
   const counts: Partial<Record<Screen, number>> = { Library: unmanagedCount, Draft: status.report.drafts.length, Conflicts: status.report.conflicts.length + recoveredCount, Imports: importUpdates + importErrors };
@@ -139,7 +106,22 @@ export function App() {
   const standalone = status?.mode === 'standalone';
   const screen = standalone && (requestedScreen === 'Fleet' || requestedScreen === 'Assignment log') ? 'Library' : requestedScreen;
   const ready = !!status && status.repo_ready !== false;
-  const init = useMutation(changed);
+  // Set when setup joins a Fleet: the Daemon restarts, then the Machine needs a starting Assignment.
+  const [joinedAt, setJoinedAt] = useState<number>();
+  const [startingAssignment, setStartingAssignment] = useState(false);
+  const setupDone = (result: SetupResult) => {
+    showGettingStarted();
+    if (result.joined) { setJoinedAt(Date.now()); setStartingAssignment(!result.copied); }
+    else void api.status().then(setStatus).catch(() => {});
+    changed();
+  };
+  useEffect(() => {
+    if (joinedAt === undefined) return;
+    if (status?.mode === 'joined') { setJoinedAt(undefined); return; }
+    // Give up waiting so a Daemon that fails to restart gets the start screen.
+    const timer = setTimeout(() => setJoinedAt(undefined), 30000);
+    return () => clearTimeout(timer);
+  }, [joinedAt, status?.mode]);
   const skills = useResource(api.skills, revision, undefined, ready);
   const recovered = useResource(api.recovered, revision, undefined, ready);
   const imports = useResource(api.imports, revisions.imports, undefined, ready);
@@ -241,10 +223,14 @@ export function App() {
     void api.status().then(value => { if (alive) { setStatus(value); setReachable(true); } }).catch(() => {});
     return () => { alive = false; };
   }, [revisions.status]);
+  // Give the restart after a join time before offering to start the Daemon.
+  if (joinedAt !== undefined && status?.mode !== 'joined') return <TooltipProvider><RestartingPage /></TooltipProvider>;
   if (reachable === false) return <TooltipProvider><ConnectionPage socket={socket} error={error} /></TooltipProvider>;
   if (!status) return <main className="grid min-h-svh place-items-center bg-muted/40 p-6"><div className="flex w-full max-w-sm flex-col items-start gap-3">
     <Wordmark /><p className="flex items-center gap-2 text-sm text-muted-foreground" role="status"><LoaderCircle aria-hidden className="size-4 animate-spin" />Connecting to the Daemon…</p><ErrorNotice error={error} /></div></main>;
-  if (standalone && !status.repo_ready) return <TooltipProvider><main className="grid min-h-svh place-items-center bg-muted/40 p-6"><Card className="w-full max-w-lg"><CardHeader><Wordmark /><CardTitle>Create a skills repo</CardTitle><CardDescription>Set up a local repository for this Machine's Skills and Rules.</CardDescription></CardHeader><CardContent className="flex flex-col gap-4"><code className="font-mono text-xs break-all">{status.repo}</code><Button disabled={init.pending} onClick={() => void init.run(async () => { await api.init(); setStatus(await api.status()); })}>Create a skills repo</Button><ErrorNotice error={init.error} /></CardContent></Card></main></TooltipProvider>;
+  if (standalone && !status.repo_ready) return <TooltipProvider><SetupWizard status={status} onDone={setupDone} /></TooltipProvider>;
+  if (startingAssignment && status.mode === 'joined') return <TooltipProvider><StartingAssignment status={status} onDone={() => { setStartingAssignment(false); changed(); }}
+    openMatrix={() => { setStartingAssignment(false); navigate('Assignment matrix'); }} /></TooltipProvider>;
   const serverConnected = !standalone && status.connection === 'connected';
   const conflict = status.report.conflicts[0];
   const server = status.server_url?.replace(/^https?:\/\//, '').replace(/\/$/, '') || 'Server';
@@ -283,6 +269,9 @@ export function App() {
           <AlertDescription className="min-w-0 [overflow-wrap:anywhere]"><code className="font-mono">{conflict.item.replace(/^(skill|rule):/, '')}</code> was edited in {conflict.harness} after the last sync.</AlertDescription>
           <Button size="sm" className="ml-auto" onClick={() => navigate('Conflicts')}>Resolve</Button>
         </Alert>}
+        {screen === 'Library' && <GettingStarted status={status} entries={skills.data} machines={fleet.data?.machines.length}
+          addImport={() => { navigate('Imports'); setOpenAdd(n => n + 1); }} newSkill={() => setSkillsHandoff({ create: 'skill' })}
+          showUnmanaged={() => setSkillsHandoff({ filter: 'unmanaged' })} reviewDraft={() => navigate('Draft')} />}
         {screen === 'Library' && <><ErrorNotice error={skills.error} />{skills.loading && !skills.data ? <Loading /> : <Skills handoff={skillsHandoff} connection={status.connection} entries={skills.data ?? []} revision={revision} changed={changed} reviewDraft={() => navigate('Draft')} assignment={(item, harness) => { navigate('Assignment matrix'); setMatrixTarget({ item, harness }); }} addImport={() => { navigate('Imports'); setOpenAdd(n => n + 1); }} />}</>}
         {screen === 'Fleet' && <Fleet revision={revision + revisions.fleet} machineId={status.machine_id} localReport={status.report} unmanaged={skills.data?.filter(entry => entry.type === 'unmanaged')} discovery={{ loading: !skills.data && skills.loading, error: skills.error }} navigate={next => { navigate(next); if (next === 'Library') setSkillsHandoff({ filter: 'unmanaged' }); }} changed={changed} live={status.connection === 'connected'} />}
         {screen === 'Assignment matrix' && <Matrix revision={revision + revisions.fleet} status={status} target={matrixTarget} />}

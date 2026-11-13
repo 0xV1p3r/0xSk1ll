@@ -62,10 +62,15 @@ export interface HarnessView {
   name: string; origin: string;
   harness: { skills: string | null; instructions: string | null; instructions_format: 'block' | 'rules'; mode: 'symlink' | 'copy' };
 }
+export interface HarnessChoice { name: string; installed: boolean; enabled: boolean; harness: HarnessView['harness'] }
+// How the app can start the Daemon itself; not a Daemon type.
+export interface ServiceInfo { default_socket: boolean; binary: string | null; systemd: boolean; unit: string | null }
+export type DaemonStarted = 'systemd' | 'process';
 export interface ImportUpdate { name: string; source: string; ref: string; locked: string; upstream: string }
 export interface ImportsView { imports?: ImportEntry[]; checked_at: number | null; updates: ImportUpdate[]; errors: { name: string; message: string }[] }
 export interface ImportUpdated { name: string; old_commit: string | null; new_commit: string; changed: boolean }
-export interface JoinApiRequest { server_url: string; code: string; machine_id?: string; copy_from?: string; repo?: string }
+// `admin_token` replaces `code` for the first Machine of a new Fleet.
+export interface JoinApiRequest { server_url: string; code: string; admin_token?: string; machine_id?: string; copy_from?: string; repo?: string }
 export interface Joined { machine_id: string; repo: string; setup: 'cloned' | 'initialized' | 'adopted'; harnesses: string[]; revision: number }
 export interface JoinCode { code: string }
 export interface CommandError { message: string; status: number | null; unreachable: boolean }

@@ -33,7 +33,13 @@ Durations take `s`, `m`, `h` or `d`. A bare number is seconds.
 
 ## Join a machine
 
-Create a single-use join code with the admin token:
+The first machine joins with the admin token, which creates a single-use join code and spends it right away. The token isn't stored. `sk1ll setup` and the GUI's setup wizard do the same under *Start a new fleet*.
+
+```sh
+SK1LL_SERVER_ADMIN_TOKEN=... sk1ll join http://server:7878   # or --admin-token <token>
+```
+
+To create a code by hand instead:
 
 ```sh
 curl -X POST -H "Authorization: Bearer $SK1LL_SERVER_ADMIN_TOKEN" \

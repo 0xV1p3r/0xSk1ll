@@ -1957,6 +1957,32 @@ async fn standalone_commits_locally_and_pushes_and_pulls_its_own_origin() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_chooses_harnesses_only_before_the_repo_exists() {
+    let mut m = Machine::new("solo");
+    std::fs::create_dir_all(m.home.path().join(".claude")).unwrap();
+    m.start().await;
+    let enabled = |choices: &[sk1ll_daemon::client::HarnessChoice], name: &str| {
+        choices.iter().find(|c| c.name == name).map(|c| (c.installed, c.enabled))
+    };
+    let choices = m.client.setup_harnesses().await.unwrap();
+    assert_eq!(enabled(&choices, "claude"), Some((true, true)));
+    assert_eq!(enabled(&choices, HARNESS), Some((true, true)));
+    assert_eq!(enabled(&choices, "codex"), Some((false, false)));
+    let choices = m.client.set_setup_harness("claude", false).await.unwrap();
+    assert_eq!(enabled(&choices, "claude"), Some((true, false)));
+    assert!(m.client.harnesses().await.unwrap().iter().all(|h| h.name != "claude"));
+    let config = std::fs::read_to_string(m.home.path().join(".config/sk1ll/machine.toml")).unwrap();
+    assert!(config.contains("instructions_format = \"rules\""), "{config}");
+    assert_eq!(m.client.set_setup_harness("nope", false).await.unwrap_err().status, Some(404));
+
+    m.client.init().await.unwrap();
+    let error = m.client.set_setup_harness("claude", true).await.unwrap_err();
+    assert_eq!(error.status, Some(409));
+    assert!(error.message.contains("first-run setup"), "{}", error.message);
+    assert_eq!(enabled(&m.client.setup_harnesses().await.unwrap(), "claude"), Some((true, false)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn standalone_uses_the_repo_environment_override() {
     let mut m = Machine::new("solo");
     let custom = m.home.path().join("custom-skills");
@@ -1989,6 +2015,7 @@ async fn standalone_join_refuses_a_draft_before_spending_the_code() {
         .join(&sk1ll_daemon::client::JoinApiRequest {
             server_url: "http://127.0.0.1:1".into(),
             code: "unused".into(),
+            admin_token: None,
             machine_id: None,
             copy_from: None,
             repo: None,
@@ -2006,6 +2033,7 @@ async fn standalone_join_refuses_a_draft_before_spending_the_code() {
         .join(&sk1ll_daemon::client::JoinApiRequest {
             server_url: "http://127.0.0.1:1".into(),
             code: "unused".into(),
+            admin_token: None,
             machine_id: None,
             copy_from: None,
             repo: None,
@@ -2015,6 +2043,39 @@ async fn standalone_join_refuses_a_draft_before_spending_the_code() {
     assert_eq!(error.status, Some(409));
     assert!(error.message.contains("draft or local commits"), "{}", error.message);
     assert!(!m.state_path().exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standalone_joins_a_new_fleet_with_the_admin_token() {
+    use sk1ll_daemon::client::{DaemonMode, JoinApiRequest};
+    let server = Server::start().await;
+    let mut m = Machine::new("first");
+    m.start().await;
+    let request = |admin_token: &str| JoinApiRequest {
+        server_url: server.url(),
+        code: String::new(),
+        admin_token: Some(admin_token.into()),
+        machine_id: None,
+        copy_from: None,
+        repo: None,
+    };
+    let error = m.client.join(&request("wrong")).await.unwrap_err();
+    assert_eq!(error.status, Some(409));
+    assert!(error.message.contains("rejected the admin token"), "{}", error.message);
+    assert!(!m.state_path().exists());
+    let joined = m.client.join(&request(ADMIN)).await.unwrap();
+    assert_eq!(joined.machine_id, "first");
+    eventually(|| async {
+        m.client
+            .status()
+            .await
+            .ok()
+            .filter(|s| s.mode == DaemonMode::Joined && s.connection == Connection::Connected)
+            .map(drop)
+    })
+    .await;
+    assert!(server.row("first").await.is_some());
+    assert!(!std::fs::read_to_string(m.state_path()).unwrap().contains(ADMIN));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2130,6 +2191,7 @@ async fn standalone_join_revalidates_after_registration_and_keeps_local_authorit
             .join(&JoinApiRequest {
                 server_url: url,
                 code: "once".into(),
+                admin_token: None,
                 machine_id: None,
                 copy_from: None,
                 repo: None,
@@ -2213,6 +2275,7 @@ async fn standalone_join_snapshot_failure_rolls_back_and_retries_pending_registr
     let req = JoinApiRequest {
         server_url: server.url(),
         code: server.join_code().await,
+        admin_token: None,
         machine_id: Some("solo".into()),
         copy_from: None,
         repo: None,

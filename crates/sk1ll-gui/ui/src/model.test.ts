@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { applyToggle, cellState, emptyHarness, headline, itemStateLabel, mergeAssignments, statusLabels, statusOrder, statusTone } from './model';
+import { applyToggle, cellState, emptyHarness, everythingOn, headline, insecureHttp, itemStateLabel, mergeAssignments, statusLabels, statusOrder, statusTone } from './model';
 import type { Assignment, MachineReport } from './types';
 
 const report: MachineReport = { baseline: 'a', drafts: [], unpushed: [], conflicts: [], harnesses: [], blocked: false, clashes: [], behind: false };
@@ -53,5 +53,26 @@ describe('revisioned Assignment snapshots', () => {
     expect(itemStateLabel({ in_baseline: true, unpushed: true })).toBe('Unpushed');
     expect(itemStateLabel({ in_baseline: false, unpushed: false })).toBe('Draft only');
     expect(itemStateLabel({ in_baseline: true, unpushed: false })).toBeUndefined();
+  });
+});
+
+describe('first-run setup', () => {
+  it('turns on defaults first, then every Baseline item, in each Harness', () => {
+    const items = [
+      { item: 'skill:pdf', in_baseline: true, draft: null, unpushed: false, description: null },
+      { item: 'rule:git', in_baseline: true, draft: null, unpushed: false, description: null },
+      { item: 'skill:local', in_baseline: false, draft: 'added' as const, unpushed: false, description: null },
+    ];
+    expect(everythingOn(['claude'], items)).toEqual([
+      { harness: 'claude', kind: 'new_skills_default', enabled: true }, { harness: 'claude', kind: 'new_rules_default', enabled: true },
+      { harness: 'claude', kind: 'skill', name: 'pdf', enabled: true }, { harness: 'claude', kind: 'rule', name: 'git', enabled: true },
+    ]);
+    expect(everythingOn([], items)).toEqual([]);
+  });
+  it('warns about plain HTTP except to this computer', () => {
+    expect(insecureHttp('http://skills.example.com')).toBe(true);
+    expect(insecureHttp('http://10.0.0.5:7878')).toBe(true);
+    for (const url of ['https://skills.example.com', 'http://localhost:7878', 'http://127.0.0.1:7878', 'http://[::1]:7878', 'not a url', ''])
+      expect(insecureHttp(url)).toBe(false);
   });
 });

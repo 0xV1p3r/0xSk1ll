@@ -22,9 +22,9 @@ use tokio::sync::broadcast::error::RecvError;
 
 use crate::client::{
     AddImportRequest, CommitMessage, CommitRequest, CommitResponse, ConflictTarget, ConflictView, DiffView, DraftEntry,
-    Event, HarnessView, ImportName, ImportUpdated, ItemView, JoinApiRequest, PullResult, PushResult,
-    ResolveImportRequest, ResolvedSource, RestoreRequest, RestoreResponse, StatusView, SyncRequest, SyncResult,
-    UpdateImportsRequest,
+    Event, HarnessChoice, HarnessView, ImportName, ImportUpdated, ItemView, JoinApiRequest, PullResult, PushResult,
+    ResolveImportRequest, ResolvedSource, RestoreRequest, RestoreResponse, SetHarnessEnabled, StatusView, SyncRequest,
+    SyncResult, UpdateImportsRequest,
 };
 use crate::daemon::Daemon;
 use crate::error::{Error, Result};
@@ -55,6 +55,8 @@ pub(crate) fn router(d: Arc<Daemon>) -> Router {
         .route("/conflicts/adopt", post(adopt))
         .route("/conflicts/overwrite", post(overwrite))
         .route("/harnesses", get(harnesses))
+        .route("/setup/harnesses", get(setup_harnesses))
+        .route("/setup/harnesses/{name}", post(set_setup_harness))
         .route("/imports", get(imports))
         .route("/imports/check", post(check_imports))
         .route("/items/create", post(create_item))
@@ -89,6 +91,7 @@ async fn require_repo(State(d): St, request: Request, next: Next) -> Result<Resp
         path,
         "/status" | "/events" | "/init" | "/join" | "/harnesses" | "/fleet" | "/log" | "/log/facets" | "/join-codes"
     ) && !path.starts_with("/machines/")
+        && !path.starts_with("/setup/")
         && !path.starts_with("/log/")
     {
         d.require_repo()?;
@@ -276,6 +279,18 @@ async fn harnesses(State(d): St) -> Result<Json<Vec<HarnessView>>> {
     Ok(Json(d.reading(|d| d.harnesses()).await?))
 }
 
+async fn setup_harnesses(State(d): St) -> Result<Json<Vec<HarnessChoice>>> {
+    Ok(Json(d.reading(|d| d.setup_harnesses()).await?))
+}
+
+async fn set_setup_harness(
+    State(d): St,
+    UrlPath(name): UrlPath<String>,
+    Json(req): Json<SetHarnessEnabled>,
+) -> Result<Json<Vec<HarnessChoice>>> {
+    Ok(Json(d.blocking(move |d, eng| d.set_setup_harness(eng, &name, req.enabled)).await?))
+}
+
 async fn update_import(State(d): St, UrlPath(name): UrlPath<String>) -> Result<Json<ImportUpdated>> {
     Ok(Json(d.update_import(name).await?))
 }
@@ -322,6 +337,7 @@ async fn join(State(d): St, Json(req): Json<JoinApiRequest>) -> Result<Json<Join
     let opts = JoinOptions {
         server_url: req.server_url,
         code: req.code,
+        admin_token: req.admin_token,
         machine_id: req.machine_id,
         copy_from: req.copy_from,
         repo: req.repo.unwrap_or_else(|| d.ident.repo().to_path_buf()),
