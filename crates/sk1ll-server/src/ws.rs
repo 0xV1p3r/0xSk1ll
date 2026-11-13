@@ -186,7 +186,7 @@ async fn read_loop(
                         match on_draft_discarded(server, machine, id, token_hash, items, cancel).await {
                             Ok(true) => {
                                 if let Some(discard_id) = discard_id
-                                    && let Some(h) = server.conns.lock().unwrap().get(machine).filter(|h| h.id == id && !cancel.is_cancelled()) { h.send(machine, ServerMessage::DraftDiscardApplied { id: discard_id }); }
+                                    && let Some(h) = crate::lock(&server.conns).get(machine).filter(|h| h.id == id && !cancel.is_cancelled()) { h.send(machine, ServerMessage::DraftDiscardApplied { id: discard_id }); }
                             }
                             Ok(false) => {}
                             Err(e) => tracing::error!("{machine}: discarding draft toggles: {e}"),
