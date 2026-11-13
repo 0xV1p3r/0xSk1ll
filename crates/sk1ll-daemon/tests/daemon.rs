@@ -1089,8 +1089,15 @@ async fn discard_replay_skips_recreated_drafts_and_unpushed_items() {
     let DaemonMessage::Status(report) = next_message(&mut ws).await else { panic!("fresh status comes first") };
     assert!(report.drafts.contains(&ItemRef::Skill("w".into())));
     assert!(report.unpushed.contains(&ItemRef::Skill("v".into())));
-    let DaemonMessage::DraftDiscarded { items } = next_message(&mut ws).await else { panic!("expected discards") };
+    let DaemonMessage::DraftDiscarded { id, items } = next_message(&mut ws).await else { panic!("expected discards") };
     assert_eq!(items, [ItemRef::Skill("gone".into())]);
+    assert_eq!(m.status().await.pending_discards, 1);
+    ws.close(None).await.unwrap();
+    let (mut ws, _) = server.accept().await;
+    let _ = next_message(&mut ws).await;
+    let DaemonMessage::DraftDiscarded { id: replay, .. } = next_message(&mut ws).await else { panic!("expected replay") };
+    assert_eq!(replay, id);
+    ws.send(Message::text(serde_json::to_string(&ServerMessage::DraftDiscardApplied { id: id.unwrap() }).unwrap())).await.unwrap();
     eventually(|| async { (m.status().await.pending_discards == 0).then_some(()) }).await;
 }
 

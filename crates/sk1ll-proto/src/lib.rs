@@ -32,7 +32,7 @@ pub enum DaemonMessage {
     Status(MachineReport),
     /// The user Restore these draft items. Send after the updated status so
     /// the server can drop toggles for items absent from both baseline and draft.
-    DraftDiscarded { items: Vec<ItemRef> },
+    DraftDiscarded { #[serde(default, skip_serializing_if = "Option::is_none")] id: Option<u64>, items: Vec<ItemRef> },
 }
 
 /// Server → daemon.
@@ -45,6 +45,8 @@ pub enum DaemonMessage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    /// Confirms that the discard transaction committed.
+    DraftDiscardApplied { id: u64 },
     /// This machine's full assignment. Sent on connect and after every change;
     /// snapshots that were superseded before they could be sent are skipped,
     /// so only the latest is guaranteed to arrive. Apply one only if its
@@ -356,6 +358,19 @@ pub struct ErrorBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discard_ack_round_trip() {
+        for id in [None, Some(42)] {
+            let msg = DaemonMessage::DraftDiscarded { id, items: vec![] };
+            let text = serde_json::to_string(&msg).unwrap();
+            assert_eq!(serde_json::from_str::<DaemonMessage>(&text).unwrap(), msg);
+        }
+        let msg = ServerMessage::DraftDiscardApplied { id: 42 };
+        let text = serde_json::to_string(&msg).unwrap();
+        assert_eq!(text, r#"{"type":"draft_discard_applied","id":42}"#);
+        assert_eq!(serde_json::from_str::<ServerMessage>(&text).unwrap(), msg);
+    }
 
     #[test]
     fn item_refs_are_strings() {

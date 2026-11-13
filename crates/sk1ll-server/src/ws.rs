@@ -9,6 +9,9 @@
 //! reader and its writer, even a writer stuck in a send. A status report is
 //! accepted only while the session is current and its token still valid.
 //!
+//! Discards with an id are acknowledged only after a successful commit, including
+//! no-ops. Invalid or stale sessions receive no acknowledgement.
+//!
 //! Outbound state is bounded: the assignment is coalesced in a `watch` (only
 //! the newest revision is kept), and other messages go through a small queue.
 
@@ -179,9 +182,14 @@ async fn read_loop(
                             tracing::error!("{machine}: storing status: {e}");
                         }
                     }
-                    Ok(DaemonMessage::DraftDiscarded { items }) => {
-                        if let Err(e) = on_draft_discarded(server, machine, id, token_hash, items, cancel).await {
-                            tracing::error!("{machine}: discarding draft toggles: {e}");
+                    Ok(DaemonMessage::DraftDiscarded { id: discard_id, items }) => {
+                        match on_draft_discarded(server, machine, id, token_hash, items, cancel).await {
+                            Ok(true) => {
+                                if let Some(discard_id) = discard_id
+                                    && let Some(h) = server.conns.lock().unwrap().get(machine).filter(|h| h.id == id && !cancel.is_cancelled()) { h.send(machine, ServerMessage::DraftDiscardApplied { id: discard_id }); }
+                            }
+                            Ok(false) => {}
+                            Err(e) => tracing::error!("{machine}: discarding draft toggles: {e}"),
                         }
                     }
                     Err(e) => tracing::warn!("{machine}: bad message: {e}"),
@@ -329,9 +337,9 @@ async fn on_draft_discarded(
     token_hash: &str,
     discarded: Vec<ItemRef>,
     cancel: &CancellationToken,
-) -> Result<()> {
+) -> Result<bool> {
     if cancel.is_cancelled() {
-        return Ok(());
+        return Ok(false);
     }
     // Serialize with pushes so a Restore can't sweep against an old baseline.
     let _push = server.push_lock.lock().await;
@@ -345,13 +353,14 @@ async fn on_draft_discarded(
             let tx = conn.transaction()?;
             let updated = assign::sweep(&tx, &m, &items, Some(&discarded), now)?.map(|a| a.snapshot());
             tx.commit()?;
-            Ok(updated)
+            Ok(Some(updated))
         })
         .await?;
+    let Some(updated) = updated else { return Ok(false) };
     if let Some(snapshot) = updated {
         server.publish_assignment(machine, snapshot);
     }
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
