@@ -59,10 +59,13 @@ struct WatchedTarget {
 
 fn watched_targets(roots: &[WatchRoot]) -> Vec<WatchedTarget> {
     use std::os::unix::fs::MetadataExt;
-    targets(roots).into_iter().map(|target| {
-        let identity = std::fs::metadata(&target.0).ok().map(|m| (m.dev(), m.ino()));
-        WatchedTarget { target, identity }
-    }).collect()
+    targets(roots)
+        .into_iter()
+        .map(|target| {
+            let identity = std::fs::metadata(&target.0).ok().map(|m| (m.dev(), m.ino()));
+            WatchedTarget { target, identity }
+        })
+        .collect()
 }
 
 /// What to actually watch for `roots` right now. It changes when a missing
@@ -113,7 +116,10 @@ impl Dirty {
 }
 
 fn build(
-    targets: &[WatchedTarget], roots: &[WatchRoot], git_dir: PathBuf, dirty: Arc<Dirty>,
+    targets: &[WatchedTarget],
+    roots: &[WatchRoot],
+    git_dir: PathBuf,
+    dirty: Arc<Dirty>,
 ) -> Option<RecommendedWatcher> {
     if targets.is_empty() {
         return None;

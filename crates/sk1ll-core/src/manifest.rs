@@ -100,9 +100,8 @@ pub(crate) fn remove_import(root: &Path, name: &str) -> Result<()> {
 fn edit(root: &Path, f: impl FnOnce(&mut DocumentMut) -> Result<()>) -> Result<()> {
     let path = root.join(MANIFEST_FILE);
     let text = fs::read_to_string(&path).at(&path)?;
-    let mut doc: DocumentMut = text
-        .parse()
-        .map_err(|e: toml_edit::TomlError| Error::Parse { path: path.clone(), message: e.to_string() })?;
+    let mut doc: DocumentMut =
+        text.parse().map_err(|e: toml_edit::TomlError| Error::Parse { path: path.clone(), message: e.to_string() })?;
     f(&mut doc)?;
     fs::write(&path, doc.to_string()).at(&path)
 }
@@ -115,7 +114,8 @@ mod tests {
     fn old_manifest_explains_what_moved() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(MANIFEST_FILE);
-        fs::write(&path, "[targets.claude]\nskills = \"~/.claude/skills\"\n[profiles.default]\nskills = [\"*\"]\n").unwrap();
+        fs::write(&path, "[targets.claude]\nskills = \"~/.claude/skills\"\n[profiles.default]\nskills = [\"*\"]\n")
+            .unwrap();
         let Err(Error::Invalid(msg)) = Manifest::load(dir.path()) else { panic!("expected Error::Invalid") };
         assert!(msg.contains("machine.toml") && msg.contains("assignment"), "{msg}");
 

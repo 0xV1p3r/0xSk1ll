@@ -32,7 +32,11 @@ pub enum DaemonMessage {
     Status(MachineReport),
     /// The user Restore these draft items. Send after the updated status so
     /// the server can drop toggles for items absent from both baseline and draft.
-    DraftDiscarded { #[serde(default, skip_serializing_if = "Option::is_none")] id: Option<u64>, items: Vec<ItemRef> },
+    DraftDiscarded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<u64>,
+        items: Vec<ItemRef>,
+    },
 }
 
 /// Server → daemon.
@@ -433,7 +437,11 @@ mod tests {
         let mut a = Assignment::default();
         a.set_skill("claude", "pdf", false);
         let snapshot = AssignmentSnapshot { revision: 1, assignment: a };
-        for m in [ServerMessage::Assignment(snapshot), ServerMessage::Nudge { baseline: "abc".into() }, ServerMessage::Revoked] {
+        for m in [
+            ServerMessage::Assignment(snapshot),
+            ServerMessage::Nudge { baseline: "abc".into() },
+            ServerMessage::Revoked,
+        ] {
             let text = serde_json::to_string(&m).unwrap();
             assert_eq!(serde_json::from_str::<ServerMessage>(&text).unwrap(), m);
         }

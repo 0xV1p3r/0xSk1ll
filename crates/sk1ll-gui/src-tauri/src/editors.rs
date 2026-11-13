@@ -39,58 +39,16 @@ pub(crate) struct Preferences {
     pub preferred_editor: Option<String>,
 }
 
-type KnownEditor = (
-    &'static str,
-    &'static str,
-    EditorKind,
-    &'static [&'static str],
-    &'static str,
-);
+type KnownEditor = (&'static str, &'static str, EditorKind, &'static [&'static str], &'static str);
 const KNOWN: &[KnownEditor] = &[
-    (
-        "code",
-        "VS Code",
-        EditorKind::Gui,
-        &["code"],
-        "Visual Studio Code",
-    ),
+    ("code", "VS Code", EditorKind::Gui, &["code"], "Visual Studio Code"),
     ("cursor", "Cursor", EditorKind::Gui, &["cursor"], "Cursor"),
     ("zed", "Zed", EditorKind::Gui, &["zed", "zeditor"], "Zed"),
-    (
-        "subl",
-        "Sublime Text",
-        EditorKind::Gui,
-        &["subl"],
-        "Sublime Text",
-    ),
-    (
-        "idea",
-        "IntelliJ IDEA",
-        EditorKind::Gui,
-        &["idea"],
-        "IntelliJ IDEA",
-    ),
-    (
-        "pycharm",
-        "PyCharm",
-        EditorKind::Gui,
-        &["pycharm"],
-        "PyCharm",
-    ),
-    (
-        "webstorm",
-        "WebStorm",
-        EditorKind::Gui,
-        &["webstorm"],
-        "WebStorm",
-    ),
-    (
-        "rustrover",
-        "RustRover",
-        EditorKind::Gui,
-        &["rustrover"],
-        "RustRover",
-    ),
+    ("subl", "Sublime Text", EditorKind::Gui, &["subl"], "Sublime Text"),
+    ("idea", "IntelliJ IDEA", EditorKind::Gui, &["idea"], "IntelliJ IDEA"),
+    ("pycharm", "PyCharm", EditorKind::Gui, &["pycharm"], "PyCharm"),
+    ("webstorm", "WebStorm", EditorKind::Gui, &["webstorm"], "WebStorm"),
+    ("rustrover", "RustRover", EditorKind::Gui, &["rustrover"], "RustRover"),
     ("clion", "CLion", EditorKind::Gui, &["clion"], "CLion"),
     ("goland", "GoLand", EditorKind::Gui, &["goland"], "GoLand"),
     ("nvim", "Neovim", EditorKind::Terminal, &["nvim"], ""),
@@ -106,19 +64,14 @@ pub(crate) struct Discovery {
 }
 impl Discovery {
     pub fn environment() -> Self {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default();
-        let mut path: Vec<_> = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .filter(|p| p.is_absolute())
-            .collect();
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        let mut path: Vec<_> =
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).filter(|p| p.is_absolute()).collect();
         path.push(home.join(".local/share/JetBrains/Toolbox/scripts"));
-        let mut data = vec![std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".local/share"))];
+        let mut data =
+            vec![std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".local/share"))];
         data.extend(std::env::split_paths(
-            &std::env::var_os("XDG_DATA_DIRS")
-                .unwrap_or_else(|| "/usr/local/share:/usr/share".into()),
+            &std::env::var_os("XDG_DATA_DIRS").unwrap_or_else(|| "/usr/local/share:/usr/share".into()),
         ));
         Self {
             path,
@@ -137,32 +90,22 @@ impl Discovery {
         } else {
             self.path.iter().map(|p| p.join(name)).collect()
         };
-        candidates.into_iter().find(|p| {
-            p.is_file()
-                && p.metadata()
-                    .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
-        })
+        candidates.into_iter().find(|p| p.is_file() && p.metadata().is_ok_and(|m| m.permissions().mode() & 0o111 != 0))
     }
     pub fn detect(&self) -> Vec<Editor> {
         let terminal = self
             .terminal
             .as_deref()
             .into_iter()
-            .chain([
-                "ghostty",
-                "kitty",
-                "alacritty",
-                "wezterm",
-                "gnome-terminal",
-                "konsole",
-                "xterm",
-            ])
+            .chain(["ghostty", "kitty", "alacritty", "wezterm", "gnome-terminal", "konsole", "xterm"])
             .find_map(|name| {
                 let path = self.executable(name)?;
                 let kind = path.file_name()?.to_str()?.to_owned();
                 Some((path, kind))
             })
-            .or_else(|| cfg!(target_os = "macos").then(|| (PathBuf::from("/usr/bin/osascript"), "Terminal.app".to_owned())));
+            .or_else(|| {
+                cfg!(target_os = "macos").then(|| (PathBuf::from("/usr/bin/osascript"), "Terminal.app".to_owned()))
+            });
         let mut result = Vec::new();
         for &(id, name, kind, commands, bundle) in KNOWN {
             if kind == EditorKind::Terminal && terminal.is_none() {
@@ -177,30 +120,11 @@ impl Discovery {
                         .iter()
                         .map(|p| p.join(format!("{bundle}.app")))
                         .find(|p| p.is_dir())
-                        .map(|p| {
-                            (
-                                PathBuf::from("/usr/bin/open"),
-                                vec!["-a".into(), p.into_os_string()],
-                            )
-                        })
+                        .map(|p| (PathBuf::from("/usr/bin/open"), vec!["-a".into(), p.into_os_string()]))
                 })
-                .or_else(|| {
-                    if kind == EditorKind::Gui {
-                        self.desktop(commands)
-                    } else {
-                        None
-                    }
-                });
+                .or_else(|| if kind == EditorKind::Gui { self.desktop(commands) } else { None });
             if let Some((program, args)) = found {
-                let mut editor = Editor {
-                    view: EditorView {
-                        id: id.into(),
-                        name: name.into(),
-                        kind,
-                    },
-                    program,
-                    args,
-                };
+                let mut editor = Editor { view: EditorView { id: id.into(), name: name.into(), kind }, program, args };
                 if kind == EditorKind::Terminal {
                     let (program, terminal_kind) = terminal.as_ref().unwrap();
                     editor.args = terminal_prefix(terminal_kind);
@@ -210,21 +134,13 @@ impl Discovery {
                 result.push(editor);
             }
         }
-        for (id, name) in [
-            ("file-manager", "File manager"),
-            ("default-app", "Default app"),
-        ] {
+        for (id, name) in [("file-manager", "File manager"), ("default-app", "Default app")] {
             result.push(Editor {
-                view: EditorView {
-                    id: id.into(),
-                    name: name.into(),
-                    kind: EditorKind::System,
-                },
+                view: EditorView { id: id.into(), name: name.into(), kind: EditorKind::System },
                 program: if cfg!(target_os = "macos") {
                     "/usr/bin/open".into()
                 } else {
-                    self.executable("xdg-open")
-                        .unwrap_or_else(|| "xdg-open".into())
+                    self.executable("xdg-open").unwrap_or_else(|| "xdg-open".into())
                 },
                 args: vec![],
             });
@@ -243,17 +159,10 @@ impl Discovery {
                 let Ok(text) = std::fs::read_to_string(entry.path()) else {
                     continue;
                 };
-                let Some(section) = text
-                    .split("[Desktop Entry]")
-                    .nth(1)
-                    .and_then(|s| s.split("\n[").next())
-                else {
+                let Some(section) = text.split("[Desktop Entry]").nth(1).and_then(|s| s.split("\n[").next()) else {
                     continue;
                 };
-                if section
-                    .lines()
-                    .any(|l| matches!(l.trim(), "Hidden=true" | "NoDisplay=true"))
-                {
+                if section.lines().any(|l| matches!(l.trim(), "Hidden=true" | "NoDisplay=true")) {
                     continue;
                 }
                 let Some(exec) = section.lines().find_map(|l| l.strip_prefix("Exec=")) else {
@@ -266,23 +175,13 @@ impl Discovery {
                     continue;
                 }
                 let program = words.remove(0);
-                if !commands
-                    .iter()
-                    .any(|c| Path::new(&program).file_name().is_some_and(|n| n == *c))
-                {
+                if !commands.iter().any(|c| Path::new(&program).file_name().is_some_and(|n| n == *c)) {
                     continue;
                 }
                 let Some(program) = self.executable(&program) else {
                     continue;
                 };
-                return Some((
-                    program,
-                    words
-                        .into_iter()
-                        .filter(|w| !w.starts_with('%'))
-                        .map(Into::into)
-                        .collect(),
-                ));
+                return Some((program, words.into_iter().filter(|w| !w.starts_with('%')).map(Into::into).collect()));
             }
         }
         None
@@ -355,36 +254,16 @@ pub(crate) fn validate_target(repo: &Path, path: &Path, rule: bool) -> Result<Ta
     if path.starts_with(repo.join("imported")) {
         return Err("Fork this Import before opening it in an editor".into());
     }
-    let path = path
-        .canonicalize()
-        .map_err(|e| format!("Item does not exist: {e}"))?;
+    let path = path.canonicalize().map_err(|e| format!("Item does not exist: {e}"))?;
     if !path.starts_with(&repo) || path.starts_with(repo.join("imported")) {
         return Err("Item must be inside the repo and cannot be an Import".into());
     }
-    let folder = if rule {
-        path.parent().ok_or("Rule has no parent")?.to_owned()
-    } else {
-        path.clone()
-    };
-    let file = if rule {
-        path
-    } else {
-        folder.join("SKILL.md")
-    }
-    .canonicalize()
-    .map_err(|e| e.to_string())?;
-    if !folder.is_dir()
-        || !file.is_file()
-        || !file.starts_with(&repo)
-        || file.starts_with(repo.join("imported"))
-    {
+    let folder = if rule { path.parent().ok_or("Rule has no parent")?.to_owned() } else { path.clone() };
+    let file = if rule { path } else { folder.join("SKILL.md") }.canonicalize().map_err(|e| e.to_string())?;
+    if !folder.is_dir() || !file.is_file() || !file.starts_with(&repo) || file.starts_with(repo.join("imported")) {
         return Err("Item file must exist inside the repo and cannot be an Import".into());
     }
-    Ok(Target {
-        folder,
-        file,
-        rule,
-    })
+    Ok(Target { folder, file, rule })
 }
 pub(crate) fn target_path<'a>(editor: &Editor, target: &'a Target) -> &'a Path {
     match editor.view.id.as_str() {
@@ -407,9 +286,8 @@ pub(crate) fn launch_command(editor: &Editor, target: &Target) -> Command {
 }
 
 pub(crate) fn launch(editor: &Editor, target: &Target) -> Result<(), String> {
-    let mut child = launch_command(editor, target)
-        .spawn()
-        .map_err(|e| format!("Cannot open {}: {e}", editor.view.name))?;
+    let mut child =
+        launch_command(editor, target).spawn().map_err(|e| format!("Cannot open {}: {e}", editor.view.name))?;
     std::thread::spawn(move || {
         let _ = child.wait();
     });

@@ -26,8 +26,7 @@ pub use assignment::{Assignment, HarnessAssignment};
 pub use draft::{Change, DraftItem, FLEET_BRANCH, ItemRef, PullOutcome, default_commit_message, machine_author};
 pub use engine::EngineLock;
 pub use imports::{
-    FetchedLink, FetchedUpdates, ImportState, ImportStatus, ResolvedSource, SkillCandidate, UpdateReport,
-    UpdateTargets,
+    FetchedLink, FetchedUpdates, ImportState, ImportStatus, ResolvedSource, SkillCandidate, UpdateReport, UpdateTargets,
 };
 pub use instructions::Rule;
 pub use lock::{LockEntry, Lockfile};

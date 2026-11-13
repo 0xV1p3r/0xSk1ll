@@ -51,21 +51,14 @@ pub fn discover(repo: &Repo, harnesses: &BTreeMap<String, Harness>) -> Result<Ve
             }
             let canonical = path.canonicalize().at(&path)?;
             let hash = hash_dir(&canonical)?;
-            let variant = found
-                .entry(name)
-                .or_default()
-                .entry(hash.clone())
-                .or_insert_with(|| Variant {
-                    hash,
-                    description: fs::read_to_string(canonical.join("SKILL.md"))
-                        .ok()
-                        .and_then(|t| crate::skill::frontmatter_field(&t, "description")),
-                    locations: Vec::new(),
-                });
-            variant.locations.push(Location {
-                harness: harness.clone(),
-                path,
+            let variant = found.entry(name).or_default().entry(hash.clone()).or_insert_with(|| Variant {
+                hash,
+                description: fs::read_to_string(canonical.join("SKILL.md"))
+                    .ok()
+                    .and_then(|t| crate::skill::frontmatter_field(&t, "description")),
+                locations: Vec::new(),
             });
+            variant.locations.push(Location { harness: harness.clone(), path });
         }
     }
     Ok(found
@@ -100,26 +93,36 @@ pub struct Adoption {
 /// Only a skill still added in the draft qualifies, so Adopt on an ordinary
 /// in-sync skill never pins its Assignment. Hand edits to managed content
 /// still use the ordinary conflict Adopt path.
-pub fn adopted(repo: &Repo, harnesses: &BTreeMap<String, Harness>, harness: &str, name: &str) -> Result<Option<Adoption>> {
+pub fn adopted(
+    repo: &Repo,
+    harnesses: &BTreeMap<String, Harness>,
+    harness: &str,
+    name: &str,
+) -> Result<Option<Adoption>> {
     let added = crate::ItemRef::Skill(name.into());
     if !repo.draft()?.iter().any(|d| d.item == added && d.change == crate::Change::Added) {
         return Ok(None);
     }
-    let Some(skill) = repo.skills()?.into_iter().find(|s| s.name == name && s.path == repo.personal_dir().join(name)) else {
+    let Some(skill) = repo.skills()?.into_iter().find(|s| s.name == name && s.path == repo.personal_dir().join(name))
+    else {
         return Ok(None);
     };
     let Some(path) = harnesses.get(harness).and_then(|h| h.skills_dir()).map(|p| p.join(name)) else {
         return Ok(None);
     };
-    if !matches!(classify(repo.root(), &path, Some(&skill.path))?, Existing::ManagedCopy(_) | Existing::ManagedLink(_)) {
+    if !matches!(classify(repo.root(), &path, Some(&skill.path))?, Existing::ManagedCopy(_) | Existing::ManagedLink(_))
+    {
         return Ok(None);
     }
     let hash = hash_dir(&skill.path)?;
-    let locations: Vec<_> = harnesses.iter().filter_map(|(harness, h)| {
-        let path = h.skills_dir()?.join(name);
-        let canonical = path.canonicalize().ok()?;
-        (hash_dir(&canonical).ok()? == hash).then(|| Location { harness: harness.clone(), path })
-    }).collect();
+    let locations: Vec<_> = harnesses
+        .iter()
+        .filter_map(|(harness, h)| {
+            let path = h.skills_dir()?.join(name);
+            let canonical = path.canonicalize().ok()?;
+            (hash_dir(&canonical).ok()? == hash).then(|| Location { harness: harness.clone(), path })
+        })
+        .collect();
     Ok(locations.iter().any(|l| l.harness == harness).then(|| Adoption { name: name.into(), hash, locations }))
 }
 
@@ -143,8 +146,7 @@ pub fn select(repo: &Repo, harnesses: &BTreeMap<String, Harness>, harness: &str,
         .find(|v| v.locations.iter().any(|l| l.harness == harness))
         .ok_or_else(|| Error::Invalid(format!("no unmanaged skill `{name}` in `{harness}`")))?;
     let dest = repo.personal_dir().join(name);
-    let identical = dest.symlink_metadata().is_ok_and(|m| m.is_dir())
-        && hash_dir(&dest)? == variant.hash;
+    let identical = dest.symlink_metadata().is_ok_and(|m| m.is_dir()) && hash_dir(&dest)? == variant.hash;
     if repo.imported_dir().join(name).symlink_metadata().is_ok()
         || repo.manifest.import.contains_key(name)
         || (dest.symlink_metadata().is_ok() && !identical)
@@ -164,10 +166,14 @@ pub fn publish(repo: &Repo, adoption: &Adoption) -> Result<()> {
         }
         return Err(Error::Invalid("adoption destination changed; leaving its content alone".into()));
     }
-    let canonical = adoption.locations.iter().find_map(|l| {
-        let path = l.path.canonicalize().ok()?;
-        (hash_dir(&path).ok()? == adoption.hash).then_some(path)
-    }).ok_or_else(|| Error::Invalid("adoption source changed; retry Adopt".into()))?;
+    let canonical = adoption
+        .locations
+        .iter()
+        .find_map(|l| {
+            let path = l.path.canonicalize().ok()?;
+            (hash_dir(&path).ok()? == adoption.hash).then_some(path)
+        })
+        .ok_or_else(|| Error::Invalid("adoption source changed; retry Adopt".into()))?;
     let parent = repo.personal_dir();
     fs::create_dir_all(&parent).at(&parent)?;
     let stage = crate::source::unique(&parent);
@@ -186,7 +192,9 @@ pub fn publish(repo: &Repo, adoption: &Adoption) -> Result<()> {
         fs::File::open(&parent).at(&parent)?.sync_all().at(&parent)?;
         Ok(())
     })();
-    if stage.exists() { fs::remove_dir_all(&stage).at(&stage)?; }
+    if stage.exists() {
+        fs::remove_dir_all(&stage).at(&stage)?;
+    }
     copied
 }
 
@@ -197,19 +205,24 @@ pub fn rollback(repo: &Repo, adoption: &Adoption) -> Result<bool> {
     if !dest.symlink_metadata().is_ok_and(|m| m.is_dir()) {
         return Ok(false);
     }
-    if walkdir::WalkDir::new(&dest).into_iter().any(|entry| {
-        entry.map_or(true, |e| e.file_name() == ".git" || e.file_name() == MARKER)
-    }) || hash_dir(&dest)? != adoption.hash {
+    if walkdir::WalkDir::new(&dest)
+        .into_iter()
+        .any(|entry| entry.map_or(true, |e| e.file_name() == ".git" || e.file_name() == MARKER))
+        || hash_dir(&dest)? != adoption.hash
+    {
         return Ok(false);
     }
-    let unchanged_source = adoption.locations.iter().any(|l| {
-        l.path.canonicalize().ok().and_then(|p| hash_dir(&p).ok()).as_ref() == Some(&adoption.hash)
-    });
+    let unchanged_source = adoption
+        .locations
+        .iter()
+        .any(|l| l.path.canonicalize().ok().and_then(|p| hash_dir(&p).ok()).as_ref() == Some(&adoption.hash));
     if unchanged_source {
         // Use the existing displacement check so a concurrent save, including
         // one through an open descriptor, remains recoverable after rollback.
         let expected = observe_skill(&dest)?.state;
-        if hash_dir(&dest)? != adoption.hash { return Ok(false); }
+        if hash_dir(&dest)? != adoption.hash {
+            return Ok(false);
+        }
         if let Some(error) = remove_displacing(displaced::Kind::Skill, "adopt", &dest, expected.as_deref())? {
             return Err(error);
         }
@@ -275,15 +288,7 @@ pub fn complete(repo: &Repo, harnesses: &BTreeMap<String, Harness>, adoption: &A
             },
             reason: None,
         };
-        apply_skill(
-            repo,
-            &action,
-            &adoption.name,
-            config.mode,
-            Some(&source),
-            expected.as_deref(),
-            true,
-        )?;
+        apply_skill(repo, &action, &adoption.name, config.mode, Some(&source), expected.as_deref(), true)?;
     }
     Ok(())
 }
@@ -319,10 +324,7 @@ mod tests {
     fn groups_identical_copies_and_excludes_managed_skills_and_rules() {
         let (tmp, repo, hs) = setup();
         for name in ["a", "b"] {
-            write(
-                &tmp.path().join(name).join("pdf/SKILL.md"),
-                "---\ndescription: PDFs\n---\none",
-            );
+            write(&tmp.path().join(name).join("pdf/SKILL.md"), "---\ndescription: PDFs\n---\none");
         }
         write(&tmp.path().join("c/pdf/SKILL.md"), "two");
         write(&tmp.path().join("a/rule.md"), "not a skill");
@@ -335,12 +337,7 @@ mod tests {
         assert_eq!(identical.description.as_deref(), Some("PDFs"));
         write(&repo.personal_dir().join("pdf/SKILL.md"), "repo");
         assert!(discover(&repo, &hs).unwrap()[0].clashes_with_repo);
-        assert!(
-            prepare(&repo, &hs, "a", "pdf")
-                .unwrap_err()
-                .to_string()
-                .contains("already exists")
-        );
+        assert!(prepare(&repo, &hs, "a", "pdf").unwrap_err().to_string().contains("already exists"));
     }
 
     #[test]
@@ -368,10 +365,7 @@ mod tests {
         }
         assert!(tmp.path().join("a/pdf/.sk1ll-managed").is_file());
         assert!(tmp.path().join("b/pdf/.sk1ll-managed").is_file());
-        assert_eq!(
-            fs::read_to_string(tmp.path().join("c/pdf/SKILL.md")).unwrap(),
-            "different"
-        );
+        assert_eq!(fs::read_to_string(tmp.path().join("c/pdf/SKILL.md")).unwrap(), "different");
         assert!(!tmp.path().join("d/pdf").exists());
         let recovery = displaced::list().unwrap();
         assert_eq!(recovery.len(), 2);
@@ -409,10 +403,7 @@ mod tests {
         write(&tmp.path().join("a/pdf/SKILL.md"), "edited meanwhile");
         complete(&repo, &hs, &adoption).unwrap();
         assert!(!tmp.path().join("a/pdf/.sk1ll-managed").exists());
-        assert_eq!(
-            fs::read_to_string(tmp.path().join("a/pdf/SKILL.md")).unwrap(),
-            "edited meanwhile"
-        );
+        assert_eq!(fs::read_to_string(tmp.path().join("a/pdf/SKILL.md")).unwrap(), "edited meanwhile");
     }
 
     #[test]
@@ -420,11 +411,13 @@ mod tests {
         let (tmp, repo, hs) = setup();
         write(&tmp.path().join("a/pdf/SKILL.md"), "unmanaged");
         let dest = repo.personal_dir().join("pdf");
-        HOOK.with_borrow_mut(|hook| *hook = Some(Box::new(move |point, at| {
-            if point == Hook::BeforeSwap && at == dest {
-                write(&at.join("SKILL.md"), "created meanwhile");
-            }
-        })));
+        HOOK.with_borrow_mut(|hook| {
+            *hook = Some(Box::new(move |point, at| {
+                if point == Hook::BeforeSwap && at == dest {
+                    write(&at.join("SKILL.md"), "created meanwhile");
+                }
+            }))
+        });
         assert!(prepare(&repo, &hs, "a", "pdf").is_err());
         assert_eq!(fs::read_to_string(repo.personal_dir().join("pdf/SKILL.md")).unwrap(), "created meanwhile");
         assert_eq!(fs::read_to_string(tmp.path().join("a/pdf/SKILL.md")).unwrap(), "unmanaged");
@@ -443,10 +436,7 @@ mod tests {
         assert_eq!(items[0].variants.len(), 1);
         let adoption = prepare(&repo, &hs, "a", "pdf").unwrap();
         complete(&repo, &hs, &adoption).unwrap();
-        assert_eq!(
-            fs::read_to_string(tmp.path().join("external/SKILL.md")).unwrap(),
-            "linked"
-        );
+        assert_eq!(fs::read_to_string(tmp.path().join("external/SKILL.md")).unwrap(), "linked");
         assert!(tmp.path().join("a/pdf/.sk1ll-managed").is_file());
         assert_eq!(displaced::list().unwrap().len(), 2);
     }

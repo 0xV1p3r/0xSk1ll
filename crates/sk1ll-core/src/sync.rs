@@ -333,13 +333,7 @@ fn plan_instructions(
     Ok(())
 }
 
-fn plan_rules(
-    hname: &str,
-    dir: &Path,
-    rules: &[&Rule],
-    opts: PlanOptions,
-    actions: &mut Vec<Action>,
-) -> Result<()> {
+fn plan_rules(hname: &str, dir: &Path, rules: &[&Rule], opts: PlanOptions, actions: &mut Vec<Action>) -> Result<()> {
     let index = instructions::load_rules_index(dir)?;
     let action = |file: &str, kind, content: Option<String>, expected: Option<String>, reason: Option<String>| Action {
         harness: hname.to_string(),
@@ -1036,15 +1030,8 @@ pub fn adopt(repo: &Repo, action: &Action) -> Result<()> {
 }
 
 fn adopt_skill(repo: &Repo, src: &Path, name: &str) -> Result<()> {
-    let source = repo
-        .skills()?
-        .into_iter()
-        .find(|s| s.name == name)
-        .map(|s| s.path);
-    if matches!(
-        classify(repo.root(), src, source.as_deref())?,
-        Existing::Unmanaged(_)
-    ) {
+    let source = repo.skills()?.into_iter().find(|s| s.name == name).map(|s| s.path);
+    if matches!(classify(repo.root(), src, source.as_deref())?, Existing::Unmanaged(_)) {
         return Err(Error::Invalid(format!(
             "`{name}` is an unmanaged skill and cannot replace an existing repo skill"
         )));
@@ -2155,10 +2142,10 @@ mod tests {
         assert!(actions.unwrap().is_empty());
         // The next plan sees the edit, for both harnesses.
         let actions = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
-        assert_eq!(actions.iter().map(|a| (a.harness.as_str(), a.kind)).collect::<Vec<_>>(), [
-            ("h", ActionKind::Update),
-            ("i", ActionKind::Update)
-        ]);
+        assert_eq!(
+            actions.iter().map(|a| (a.harness.as_str(), a.kind)).collect::<Vec<_>>(),
+            [("h", ActionKind::Update), ("i", ActionKind::Update)]
+        );
         // A harness edit made while the reused hash is looked up is still
         // judged by `apply` against what the plan observed.
         let dest = tmp.path().join("skills2/pdf");
@@ -2619,8 +2606,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn writes_to_instruction_files_during_the_swap_are_never_lost() {
-        use std::io::Write;
         use InstructionsFormat::{Block, Rules};
+        use std::io::Write;
         let formats = [(Rules, false), (Block, false), (Block, true)];
         for (format, linked) in formats {
             for point in [Hook::AfterAside, Hook::AfterSwap] {

@@ -141,10 +141,12 @@ pub fn apply(
     baseline: Option<&BTreeSet<ItemRef>>,
 ) -> Result<Applied> {
     let snapshot = db::snapshot(tx, machine)?.ok_or_else(|| ApiError::NotFound(format!("no machine `{machine}`")))?;
-    let existing = baseline.map(|baseline| -> Result<BTreeSet<ItemRef>> {
-        let report = db::machine(tx, machine)?.and_then(|m| m.report).unwrap_or_default();
-        Ok(baseline.iter().cloned().chain(report.drafts).chain(report.unpushed).collect())
-    }).transpose()?;
+    let existing = baseline
+        .map(|baseline| -> Result<BTreeSet<ItemRef>> {
+            let report = db::machine(tx, machine)?.and_then(|m| m.report).unwrap_or_default();
+            Ok(baseline.iter().cloned().chain(report.drafts).chain(report.unpushed).collect())
+        })
+        .transpose()?;
     let mut a = snapshot.assignment;
     let mut entries = Vec::new();
     let mut log = |a: &mut Assignment, c: Change, before: Option<bool>| -> Result<()> {

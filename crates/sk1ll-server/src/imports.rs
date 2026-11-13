@@ -6,7 +6,7 @@ use sk1ll_core::lock::LOCK_FILE;
 use sk1ll_core::manifest::MANIFEST_FILE;
 use sk1ll_core::source::resolve_url;
 use sk1ll_core::{Lockfile, Manifest};
-use sk1ll_proto::{ServerMessage, ImportError, ImportUpdate, ImportsView};
+use sk1ll_proto::{ImportError, ImportUpdate, ImportsView, ServerMessage};
 
 use crate::{Server, git, lock, now};
 

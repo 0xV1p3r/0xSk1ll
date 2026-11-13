@@ -31,8 +31,7 @@ const END: &str = "<!-- 0xSk1ll:end -->";
 /// Rule frontmatter keys restricting which harnesses get it; `targets` is
 /// the deprecated spelling.
 const FRONTMATTER_KEYS: [&str; 2] = ["harnesses", "targets"];
-const NOTE: &str =
-    "<!-- Managed by 0xSk1ll: edit instructions/ in your skills repo, then run `sk1ll sync`. -->";
+const NOTE: &str = "<!-- Managed by 0xSk1ll: edit instructions/ in your skills repo, then run `sk1ll sync`. -->";
 
 /// One `instructions/<name>.md` file. Rules are rendered in file-name
 /// order, so numeric prefixes (`10-git.md`) control ordering.
@@ -172,8 +171,7 @@ fn split_harnesses_key(frontmatter: &str, path: &Path) -> Result<(String, String
     }
     let unsafe_extent = || Error::Parse {
         path: path.to_path_buf(),
-        message: "cannot safely strip harnesses/targets source ranges; use single-line keys in a block mapping"
-            .into(),
+        message: "cannot safely strip harnesses/targets source ranges; use single-line keys in a block mapping".into(),
     };
     let mut entries = Vec::new();
     let mut offset = 0;

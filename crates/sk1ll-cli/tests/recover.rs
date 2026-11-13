@@ -4,7 +4,9 @@ fn recover_list_shows_displaced_content() {
     std::fs::create_dir_all(&root).unwrap();
     struct Cleanup(std::path::PathBuf);
     impl Drop for Cleanup {
-        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
     let _cleanup = Cleanup(root.clone());
     let repo = root.join("repo");
@@ -12,15 +14,28 @@ fn recover_list_shows_displaced_content() {
     let entry = root.join("state/sk1ll/displaced/test-entry");
     std::fs::create_dir_all(&entry).unwrap();
     std::fs::write(entry.join("content"), "edited rule").unwrap();
-    std::fs::write(entry.join("entry.json"), format!(
-        r#"{{"harness":"agent","kind":"rule","dest":"{}","expected":"","displaced_at":0}}"#,
-        root.join("rule.md").display()
-    )).unwrap();
+    std::fs::write(
+        entry.join("entry.json"),
+        format!(
+            r#"{{"harness":"agent","kind":"rule","dest":"{}","expected":"","displaced_at":0}}"#,
+            root.join("rule.md").display()
+        ),
+    )
+    .unwrap();
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_sk1ll"))
-        .args(["--repo", repo.to_str().unwrap(), "--daemon-socket", root.join("absent.sock").to_str().unwrap(),
-            "--daemon-state", root.join("absent.json").to_str().unwrap(), "recover", "list"])
+        .args([
+            "--repo",
+            repo.to_str().unwrap(),
+            "--daemon-socket",
+            root.join("absent.sock").to_str().unwrap(),
+            "--daemon-state",
+            root.join("absent.json").to_str().unwrap(),
+            "recover",
+            "list",
+        ])
         .env("XDG_STATE_HOME", root.join("state"))
-        .output().unwrap();
+        .output()
+        .unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("test-entry") && text.contains("agent") && text.contains("(changed)"), "{text}");

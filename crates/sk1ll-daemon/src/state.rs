@@ -95,10 +95,10 @@ pub fn save_snapshot(path: &Path, snap: &AssignmentSnapshot) -> anyhow::Result<(
 /// snapshot; an absent mirror must never turn their disabled items back on.
 pub fn load_assignment(cfg: &crate::Config) -> anyhow::Result<sk1ll_proto::Assignment> {
     if DaemonState::load(&cfg.state)?.is_some_and(|s| !s.revoked) {
-        return load_snapshot(&cfg.snapshot_path())?
-            .map(|s| s.assignment)
-            .context("no authoritative assignment is stored; start the daemon and connect to the server \
-                      before changing harnesses");
+        return load_snapshot(&cfg.snapshot_path())?.map(|s| s.assignment).context(
+            "no authoritative assignment is stored; start the daemon and connect to the server \
+                      before changing harnesses",
+        );
     }
     Ok(sk1ll_proto::Assignment::load(&cfg.assignment)?)
 }
@@ -107,7 +107,9 @@ pub fn load_assignment(cfg: &crate::Config) -> anyhow::Result<sk1ll_proto::Assig
 /// The caller must hold the joined repo's engine lock while restoring and
 /// appending, so the daemon cannot load the outbox between those operations.
 pub fn queue_discards(
-    cfg: &crate::Config, _lock: &sk1ll_core::EngineLock, items: Vec<sk1ll_proto::ItemRef>,
+    cfg: &crate::Config,
+    _lock: &sk1ll_core::EngineLock,
+    items: Vec<sk1ll_proto::ItemRef>,
 ) -> anyhow::Result<()> {
     if items.is_empty() {
         return Ok(());

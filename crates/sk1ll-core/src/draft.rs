@@ -165,11 +165,17 @@ pub struct DraftItem {
 pub enum PullOutcome {
     UpToDate,
     /// `HEAD` moved; the draft was carried on top.
-    Updated { from: String, to: String },
+    Updated {
+        from: String,
+        to: String,
+    },
     /// The new baseline clashes with the draft (or with committed, unpushed
     /// commits, or with local files the draft leaves out, such as ignored
     /// ones). Nothing was changed; `baseline` is the remote commit.
-    Blocked { baseline: String, items: Vec<ItemRef> },
+    Blocked {
+        baseline: String,
+        items: Vec<ItemRef>,
+    },
 }
 
 /// `"<id> <sk1ll@<id>>"`: the commit identity for a machine without a git identity.
@@ -541,9 +547,11 @@ impl Repo {
         let mut items = BTreeSet::new();
         for rel in split_paths(&out) {
             // The path itself, or a file where the new baseline needs a directory.
-            let file_in_the_way = rel.ancestors().skip(1).filter(|a| !a.as_os_str().is_empty()).any(|a| {
-                fs::symlink_metadata(root.join(a)).is_ok_and(|m| !m.is_dir()) && !head_paths.contains(a)
-            });
+            let file_in_the_way = rel
+                .ancestors()
+                .skip(1)
+                .filter(|a| !a.as_os_str().is_empty())
+                .any(|a| fs::symlink_metadata(root.join(a)).is_ok_and(|m| !m.is_dir()) && !head_paths.contains(a));
             if file_in_the_way || untracked_at(&rel) {
                 items.insert(ItemRef::for_path(&rel));
             }
@@ -553,7 +561,8 @@ impl Repo {
 
     /// Ignored, untracked files under the repo root, relative to it.
     fn ignored_paths(&self) -> Result<Vec<PathBuf>> {
-        let out = self.git().args(["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--", "."]).run()?;
+        let out =
+            self.git().args(["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--", "."]).run()?;
         Ok(split_paths(&out).collect())
     }
 

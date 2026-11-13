@@ -10,8 +10,8 @@ use axum::http::request::Parts;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use sk1ll_proto::{
-    Assignment, AssignmentChanges, AssignmentSnapshot, AssignmentUpdate, FleetView, ImportsView, JoinCode, JoinRequest, JoinResponse,
-    LogCause, LogEntry, LogFacets, LogQuery, MachineRow, REPO_PATH, headline,
+    Assignment, AssignmentChanges, AssignmentSnapshot, AssignmentUpdate, FleetView, ImportsView, JoinCode, JoinRequest,
+    JoinResponse, LogCause, LogEntry, LogFacets, LogQuery, MachineRow, REPO_PATH, headline,
 };
 
 use crate::assign::{self, Change};
@@ -144,9 +144,14 @@ async fn fleet(State(server): ServerState, _: Caller) -> Result<Json<FleetView>>
     Ok(Json(FleetView { baseline, machines }))
 }
 
-async fn get_assignment(State(server): ServerState, _: Caller, Path(id): Path<String>) -> Result<Json<AssignmentSnapshot>> {
+async fn get_assignment(
+    State(server): ServerState,
+    _: Caller,
+    Path(id): Path<String>,
+) -> Result<Json<AssignmentSnapshot>> {
     let machine = id.clone();
-    server.db(move |conn| db::snapshot(conn, &machine))
+    server
+        .db(move |conn| db::snapshot(conn, &machine))
         .await?
         .map(Json)
         .ok_or_else(|| ApiError::NotFound(format!("no machine `{id}`")))

@@ -148,23 +148,14 @@ pub(crate) fn split_ref(cache: &Path, link: &Link) -> Result<(String, String)> {
             return Ok((git_ref, link.rest[n..].join("/")));
         }
     }
-    Err(Error::Invalid(format!(
-        "no branch, tag or commit of {} matches `{}`",
-        link.source,
-        link.rest.join("/")
-    )))
+    Err(Error::Invalid(format!("no branch, tag or commit of {} matches `{}`", link.source, link.rest.join("/"))))
 }
 
 /// The ref and path to import from `link`, with the user's explicit
 /// `git_ref` and `path` taking precedence. An explicit ref must agree with
 /// the ref in the link (or the link must name none) unless `path` is
 /// explicit too, in which case the link's ref and path are both ignored.
-pub(crate) fn locate(
-    cache: &Path,
-    link: &Link,
-    git_ref: Option<&str>,
-    path: Option<&str>,
-) -> Result<(String, String)> {
+pub(crate) fn locate(cache: &Path, link: &Link, git_ref: Option<&str>, path: Option<&str>) -> Result<(String, String)> {
     let path = path.map(check_path).transpose()?;
     let Some(git_ref) = git_ref else {
         let (git_ref, link_path) = split_ref(cache, link)?;
@@ -266,10 +257,18 @@ pub(crate) fn fetch(source: &str, base: &Path) -> Result<PathBuf> {
     fs::create_dir_all(parent).at(parent)?;
     let _turn = lock_cache(&cache)?;
     let fetched = if cache.join(".git").is_dir() {
-        git(&cache, &["fetch", "--quiet", "--no-auto-gc", "--tags", "--force", "--prune", "origin"], &[("GIT_ALLOW_PROTOCOL", Path::new("https:http:ssh:git:file"))])
+        git(
+            &cache,
+            &["fetch", "--quiet", "--no-auto-gc", "--tags", "--force", "--prune", "origin"],
+            &[("GIT_ALLOW_PROTOCOL", Path::new("https:http:ssh:git:file"))],
+        )
     } else {
         let cache_str = cache.to_string_lossy();
-        git(parent, &["clone", "--quiet", "--no-checkout", "--", &url, &cache_str], &[("GIT_ALLOW_PROTOCOL", Path::new("https:http:ssh:git:file"))])
+        git(
+            parent,
+            &["clone", "--quiet", "--no-checkout", "--", &url, &cache_str],
+            &[("GIT_ALLOW_PROTOCOL", Path::new("https:http:ssh:git:file"))],
+        )
     };
     fetched.map_err(|e| explain_github_failure(source, e))?;
     Ok(cache)
@@ -363,7 +362,8 @@ pub(crate) fn exclude_stages(root: &Path) {
         return;
     }
     // Concurrent stages take turns, so the line is only ever added once.
-    let Ok(lock) = fs::OpenOptions::new().create(true).truncate(false).write(true).open(info.join("exclude.sk1ll-lock"))
+    let Ok(lock) =
+        fs::OpenOptions::new().create(true).truncate(false).write(true).open(info.join("exclude.sk1ll-lock"))
     else {
         return;
     };
@@ -619,11 +619,7 @@ fn cache_dir_for(url: &str) -> PathBuf {
     if let Some(root) = TEST_CACHE.with_borrow(Clone::clone) {
         return root.join(&digest[..16]);
     }
-    dirs::cache_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("sk1ll")
-        .join("git")
-        .join(&digest[..16])
+    dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("sk1ll").join("git").join(&digest[..16])
 }
 
 fn git(dir: &Path, args: &[&str], env: &[(&str, &Path)]) -> Result<String> {

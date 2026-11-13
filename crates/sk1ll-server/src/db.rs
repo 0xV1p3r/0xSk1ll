@@ -325,8 +325,16 @@ mod tests {
         let conn = open(&dir.path().join("server.db")).unwrap();
         let entry = |machine: &str, harness: &str, author: &str, kind, name: Option<&str>| {
             let mut e = LogEntry {
-                id: 0, at: 1, author: author.into(), machine: machine.into(), harness: harness.into(), kind,
-                name: name.map(Into::into), before: None, after: Some(true), cause: LogCause::Change,
+                id: 0,
+                at: 1,
+                author: author.into(),
+                machine: machine.into(),
+                harness: harness.into(),
+                kind,
+                name: name.map(Into::into),
+                before: None,
+                after: Some(true),
+                cause: LogCause::Change,
             };
             append_log(&conn, &mut e).unwrap();
             e.id
@@ -347,10 +355,23 @@ mod tests {
         assert_eq!(ids(LogQuery { item: Some("new_skills".into()), ..Default::default() }), [default]);
         assert_eq!(ids(LogQuery { item: Some("%".into()), ..Default::default() }), Vec::<i64>::new());
         assert_eq!(ids(LogQuery { harness: Some("codex".into()), ..Default::default() }), [rule]);
-        assert_eq!(ids(page(LogQuery { author: Some("alice".into()), before: Some(default), ..Default::default() })), [old]);
-        let q = LogQuery { machine: Some("m".into()), harness: Some("claude".into()), author: Some("alice".into()), ..Default::default() };
+        assert_eq!(
+            ids(page(LogQuery { author: Some("alice".into()), before: Some(default), ..Default::default() })),
+            [old]
+        );
+        let q = LogQuery {
+            machine: Some("m".into()),
+            harness: Some("claude".into()),
+            author: Some("alice".into()),
+            ..Default::default()
+        };
         assert_eq!(ids(q), [default, old]);
-        let empty = LogQuery { machine: Some(String::new()), harness: Some(String::new()), item: Some(String::new()), ..Default::default() };
+        let empty = LogQuery {
+            machine: Some(String::new()),
+            harness: Some(String::new()),
+            item: Some(String::new()),
+            ..Default::default()
+        };
         assert_eq!(ids(empty).len(), 8);
 
         let facets = log_facets(&conn).unwrap();

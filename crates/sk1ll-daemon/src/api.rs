@@ -19,9 +19,9 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::client::{
-    AddImportRequest, ConflictTarget, ConflictView, DiffView, DraftEntry, Event, HarnessView, ImportName,
-    ImportUpdated, ItemView, JoinApiRequest, CommitMessage, CommitRequest, CommitResponse, PullResult, PushResult,
-    RestoreRequest, RestoreResponse, ResolveImportRequest, ResolvedSource, StatusView, SyncRequest, SyncResult,
+    AddImportRequest, CommitMessage, CommitRequest, CommitResponse, ConflictTarget, ConflictView, DiffView, DraftEntry,
+    Event, HarnessView, ImportName, ImportUpdated, ItemView, JoinApiRequest, PullResult, PushResult,
+    ResolveImportRequest, ResolvedSource, RestoreRequest, RestoreResponse, StatusView, SyncRequest, SyncResult,
     UpdateImportsRequest,
 };
 use crate::daemon::Daemon;
@@ -163,7 +163,8 @@ async fn items(State(d): St) -> Result<Json<Vec<ItemView>>> {
     // No mutable engine guard: inventory only reads git and the working tree.
     let root = d.view().repo;
     let inventory = tokio::task::spawn_blocking(move || Daemon::items(&root))
-        .await.map_err(|e| Error::Internal(anyhow::anyhow!("inventory task failed: {e}")))??;
+        .await
+        .map_err(|e| Error::Internal(anyhow::anyhow!("inventory task failed: {e}")))??;
     Ok(Json(inventory))
 }
 

@@ -38,16 +38,16 @@ use anyhow::Context;
 use sk1ll_core::imports;
 use sk1ll_core::sync::{self, Action, ActionKind, Item, PlanOptions};
 use sk1ll_core::{
-    EngineLock, HarnessOrigin, ItemRef, MachineConfig, PullOutcome, Repo, default_commit_message,
-    machine_author,
+    EngineLock, HarnessOrigin, ItemRef, MachineConfig, PullOutcome, Repo, default_commit_message, machine_author,
 };
 use sk1ll_proto::{AssignmentSnapshot, ConflictRef, MachineReport, headline};
 use tokio::sync::{Notify, broadcast, watch};
 
 use crate::client::{
-    AddImportRequest, ChangeKind, ConflictTarget, ConflictView, Connection, DiffView, DraftEntry, Event, HarnessView,
-    ImportUpdated, ItemView, CommitMessage, CommitRequest, CommitResponse, PullResult, PushResult, RestoreRequest,
-    RestoreResponse, ResolveImportRequest, ResolvedSource, SkillCandidate, StatusView, SyncResult, UpdateImportsRequest,
+    AddImportRequest, ChangeKind, CommitMessage, CommitRequest, CommitResponse, ConflictTarget, ConflictView,
+    Connection, DiffView, DraftEntry, Event, HarnessView, ImportUpdated, ItemView, PullResult, PushResult,
+    ResolveImportRequest, ResolvedSource, RestoreRequest, RestoreResponse, SkillCandidate, StatusView, SyncResult,
+    UpdateImportsRequest,
 };
 use crate::error::{Error, Result};
 use crate::join::{Joined, Registered};
@@ -545,7 +545,8 @@ impl Daemon {
         let server_baseline = eng.server_baseline.clone();
         let blocked = eng.blocked.is_some();
         self.update(|v| {
-            v.report.behind = blocked || server_baseline.as_ref().is_some_and(|h| v.report.baseline.as_ref() != Some(h));
+            v.report.behind =
+                blocked || server_baseline.as_ref().is_some_and(|h| v.report.baseline.as_ref() != Some(h));
             v.server_baseline = server_baseline;
         });
     }
@@ -791,31 +792,39 @@ impl Daemon {
     /// the index, and no engine mutex or EngineLock is acquired here.
     pub(crate) fn items(root: &Path) -> Result<Vec<ItemView>> {
         use sk1ll_core::git::Git;
-        let read = |args: &[&str]| {
-            Git::new(root).env("GIT_OPTIONAL_LOCKS", "0").args(args).run()
-        };
+        let read = |args: &[&str]| Git::new(root).env("GIT_OPTIONAL_LOCKS", "0").args(args).run();
         let paths = |revision: Option<&str>| -> Result<Vec<String>> {
             let Some(revision) = revision else { return Ok(Vec::new()) };
             let bytes = read(&["ls-tree", "-r", "-z", "--name-only", revision])?;
-            Ok(bytes.split(|b| *b == 0).filter(|p| !p.is_empty())
-                .map(|p| String::from_utf8_lossy(p).into_owned()).collect())
+            Ok(bytes
+                .split(|b| *b == 0)
+                .filter(|p| !p.is_empty())
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .collect())
         };
         let baseline = gitx::baseline(root)?;
         let head = gitx::rev(root, "HEAD")?;
         let baseline_paths = paths(baseline.as_deref())?;
         let head_paths = paths(head.as_deref())?;
         let mut inventory = BTreeMap::<ItemRef, ItemView>::new();
-        let entry = |item: ItemRef| ItemView {
-            item, in_baseline: false, draft: None, unpushed: false, description: None,
-        };
+        let entry =
+            |item: ItemRef| ItemView { item, in_baseline: false, draft: None, unpushed: false, description: None };
         for path in &baseline_paths {
             let item = ItemRef::for_path(Path::new(path));
             if matches!(item, ItemRef::Skill(_) | ItemRef::Rule(_)) {
                 inventory.entry(item.clone()).or_insert_with(|| entry(item)).in_baseline = true;
             }
         }
-        let status = read(&["-c", "core.fsmonitor=false", "status", "--porcelain=v1", "-z",
-            "--untracked-files=all", "--no-renames", "--ignore-submodules=all"])?;
+        let status = read(&[
+            "-c",
+            "core.fsmonitor=false",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--no-renames",
+            "--ignore-submodules=all",
+        ])?;
         let mut changed = BTreeMap::<ItemRef, Vec<String>>::new();
         for raw in status.split(|b| *b == 0).filter(|p| p.len() >= 4) {
             let path = String::from_utf8_lossy(&raw[3..]).into_owned();
@@ -863,11 +872,14 @@ impl Daemon {
                 let text = if value.draft.is_some() {
                     use std::io::Read;
                     let mut text = String::new();
-                    std::fs::File::open(root.join(&path)).ok()
-                        .and_then(|file| file.take(DESCRIPTION_CAP as u64).read_to_string(&mut text).ok()).map(|_| text)
+                    std::fs::File::open(root.join(&path))
+                        .ok()
+                        .and_then(|file| file.take(DESCRIPTION_CAP as u64).read_to_string(&mut text).ok())
+                        .map(|_| text)
                 } else {
                     let revision = if value.unpushed { head.as_ref() } else { baseline.as_ref() };
-                    revision.and_then(|rev| blobs.remove(&format!("{rev}:{path}")))
+                    revision
+                        .and_then(|rev| blobs.remove(&format!("{rev}:{path}")))
                         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
                 };
                 if let Some(text) = text {
@@ -1003,9 +1015,9 @@ impl Daemon {
         self.lock_repo(eng)?;
         let repo = Repo::open(Self::root(eng))?;
         let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
-        let unmanaged = sync::unmanaged::discover(&repo, &harnesses)?.iter().any(|s| {
-            s.name == t.name && s.variants.iter().any(|v| v.locations.iter().any(|l| l.harness == t.harness))
-        });
+        let unmanaged = sync::unmanaged::discover(&repo, &harnesses)?
+            .iter()
+            .any(|s| s.name == t.name && s.variants.iter().any(|v| v.locations.iter().any(|l| l.harness == t.harness)));
         let adopted = if unmanaged { None } else { sync::unmanaged::adopted(&repo, &harnesses, &t.harness, &t.name)? };
         if unmanaged || adopted.is_some() {
             if !self.is_connected() {
@@ -1025,7 +1037,8 @@ impl Daemon {
             sync::unmanaged::publish(&repo, &adoption)?;
             let result = (|| {
                 self.refresh(eng)?;
-                tokio::runtime::Handle::current().block_on(crate::server::assign_adoption(self, &adoption))
+                tokio::runtime::Handle::current()
+                    .block_on(crate::server::assign_adoption(self, &adoption))
                     .map_err(Error::Internal)
             })();
             let update = match result {
@@ -1039,14 +1052,15 @@ impl Daemon {
                     return Err(error);
                 }
             };
-            self.apply_assignment(eng, AssignmentSnapshot {
-                revision: update.revision, assignment: update.assignment,
-            })?;
+            self.apply_assignment(
+                eng,
+                AssignmentSnapshot { revision: update.revision, assignment: update.assignment },
+            )?;
             let mut adoption = adoption;
             let snapshot = self.snapshot();
-            adoption.locations.retain(|l| snapshot.as_ref().is_some_and(|s| {
-                s.assignment.skill_enabled(&l.harness, &adoption.name)
-            }));
+            adoption
+                .locations
+                .retain(|l| snapshot.as_ref().is_some_and(|s| s.assignment.skill_enabled(&l.harness, &adoption.name)));
             sync::unmanaged::complete(&repo, &harnesses, &adoption)?;
             self.refresh(eng)?;
             self.event(Event::Draft);
@@ -1069,12 +1083,8 @@ impl Daemon {
         let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
         let baseline = gitx::baseline(repo.root())?;
         let snapshot = self.snapshot();
-        let assignment = snapshot
-            .as_ref()
-            .map(|s| s.assignment.clone())
-            .unwrap_or_default();
-        let mut entries =
-            sk1ll_core::content::list(&repo, &harnesses, &assignment, baseline.as_deref())?;
+        let assignment = snapshot.as_ref().map(|s| s.assignment.clone()).unwrap_or_default();
+        let mut entries = sk1ll_core::content::list(&repo, &harnesses, &assignment, baseline.as_deref())?;
         if snapshot.is_none() {
             for entry in &mut entries {
                 entry.enabled_harnesses.clear();
@@ -1096,10 +1106,7 @@ impl Daemon {
     }
 
     /// A reader: no engine mutex.
-    pub(crate) fn skill_file(
-        &self,
-        q: &sk1ll_core::content::FileQuery,
-    ) -> Result<sk1ll_core::content::FileContent> {
+    pub(crate) fn skill_file(&self, q: &sk1ll_core::content::FileQuery) -> Result<sk1ll_core::content::FileContent> {
         Ok(sk1ll_core::content::file(
             &Repo::open(self.repo_root())?,
             &MachineConfig::load(&self.cfg.machine_config)?.harnesses(),
@@ -1434,8 +1441,11 @@ fn parse_batch(mut out: &[u8], count: usize, cap: usize) -> Vec<Option<Vec<u8>>>
 
 fn skill_description(text: &str) -> Option<String> {
     let mut lines = text.lines();
-    if lines.next()?.trim() != "---" { return None }
-    lines.take_while(|line| line.trim() != "---")
+    if lines.next()?.trim() != "---" {
+        return None;
+    }
+    lines
+        .take_while(|line| line.trim() != "---")
         .find_map(|line| line.strip_prefix("description:").map(str::trim))
         .filter(|description| !description.is_empty() && !matches!(*description, "|" | ">"))
         .map(|description| description.trim_matches(['\"', '\'']).to_string())
@@ -1460,10 +1470,18 @@ fn conflict_items(a: &Action) -> Vec<ItemRef> {
 fn displaced_view(entry: sync::displaced::Entry) -> ConflictView {
     let item = displaced_item(&entry);
     ConflictView {
-        kind: Some("displaced".into()), id: Some(entry.id), item: Some(item.clone()),
+        kind: Some("displaced".into()),
+        id: Some(entry.id),
+        item: Some(item.clone()),
         name: entry.dest.file_name().unwrap_or_default().to_string_lossy().into_owned(),
-        items: vec![item], harness: entry.harness, dest: entry.dest, path: Some(entry.path),
-        displaced_at: Some(entry.displaced_at), detected_at: None, reason: None, adoptable: true,
+        items: vec![item],
+        harness: entry.harness,
+        dest: entry.dest,
+        path: Some(entry.path),
+        displaced_at: Some(entry.displaced_at),
+        detected_at: None,
+        reason: None,
+        adoptable: true,
     }
 }
 
@@ -1483,7 +1501,11 @@ fn conflict_view(a: &Action) -> ConflictView {
         Item::Instructions { .. } => (BLOCK_NAME.to_string(), false),
     };
     ConflictView {
-        kind: None, id: None, item: None, path: None, displaced_at: None,
+        kind: None,
+        id: None,
+        item: None,
+        path: None,
+        displaced_at: None,
         detected_at: modified_at(&a.dest),
         harness: a.harness.clone(),
         name,
@@ -1498,17 +1520,24 @@ fn conflict_view(a: &Action) -> ConflictView {
 /// deleted file counts), without following symlinks; the management marker
 /// and `.git` are skipped. Bounded, so a huge tree can't stall `/conflicts`.
 fn modified_at(path: &Path) -> Option<u64> {
-    let seconds = |m: &std::fs::Metadata| m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs());
+    let seconds =
+        |m: &std::fs::Metadata| m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs());
     let meta = std::fs::symlink_metadata(path).ok()?;
     let (mut newest, mut stack, mut budget) = (seconds(&meta), Vec::new(), 10_000usize);
-    if meta.is_dir() { stack.push(path.to_path_buf()); }
+    if meta.is_dir() {
+        stack.push(path.to_path_buf());
+    }
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir).ok()?.flatten() {
             budget = budget.checked_sub(1)?;
-            if entry.file_name() == sync::MARKER || entry.file_name() == ".git" { continue; }
+            if entry.file_name() == sync::MARKER || entry.file_name() == ".git" {
+                continue;
+            }
             let Ok(meta) = entry.metadata() else { continue };
             newest = newest.max(seconds(&meta));
-            if meta.is_dir() { stack.push(entry.path()); }
+            if meta.is_dir() {
+                stack.push(entry.path());
+            }
         }
     }
     newest
@@ -1546,30 +1575,54 @@ impl Daemon {
     /// Renames in the Draft, then copies this machine's explicit toggles for the
     /// old name to the new one. The old name's toggles stay until a push drops
     /// them, so restoring both Draft items undoes the rename.
-    pub(crate) fn rename_item(&self, eng: &mut Engine, req: crate::client::RenameItemRequest) -> Result<crate::client::RenameItemResponse> {
+    pub(crate) fn rename_item(
+        &self,
+        eng: &mut Engine,
+        req: crate::client::RenameItemRequest,
+    ) -> Result<crate::client::RenameItemResponse> {
         use sk1ll_proto::{AssignmentChanges, ToggleChange, ToggleKind};
         self.ensure_managed(eng)?;
         self.lock_repo(eng)?;
         let renamed = Repo::open(Self::root(eng))?.rename_item(&req.kind, &req.name, &req.to);
         self.refresh(eng)?;
         renamed?;
-        let (item, kind) = if req.kind == "skill" { (ItemRef::Skill(req.to.clone()), ToggleKind::Skill) } else { (ItemRef::Rule(req.to.clone()), ToggleKind::Rule) };
+        let (item, kind) = if req.kind == "skill" {
+            (ItemRef::Skill(req.to.clone()), ToggleKind::Skill)
+        } else {
+            (ItemRef::Rule(req.to.clone()), ToggleKind::Rule)
+        };
         let snapshot = self.snapshot();
-        let changes: Vec<ToggleChange> = snapshot.iter().flat_map(|s| &s.assignment.harnesses).filter_map(|(harness, h)| {
-            let toggles = if kind == ToggleKind::Skill { &h.skills } else { &h.rules };
-            toggles.get(&req.name).map(|&enabled| ToggleChange { harness: harness.clone(), kind, name: Some(req.to.clone()), enabled: Some(enabled) })
-        }).collect();
-        let mut response = crate::client::RenameItemResponse { item: item.clone(), migrated: Vec::new(), assignment_error: None };
-        if changes.is_empty() { return Ok(response); }
+        let changes: Vec<ToggleChange> = snapshot
+            .iter()
+            .flat_map(|s| &s.assignment.harnesses)
+            .filter_map(|(harness, h)| {
+                let toggles = if kind == ToggleKind::Skill { &h.skills } else { &h.rules };
+                toggles.get(&req.name).map(|&enabled| ToggleChange {
+                    harness: harness.clone(),
+                    kind,
+                    name: Some(req.to.clone()),
+                    enabled: Some(enabled),
+                })
+            })
+            .collect();
+        let mut response =
+            crate::client::RenameItemResponse { item: item.clone(), migrated: Vec::new(), assignment_error: None };
+        if changes.is_empty() {
+            return Ok(response);
+        }
         let changes = AssignmentChanges { changes };
         let result = if self.is_connected() {
-            tokio::runtime::Handle::current().block_on(crate::server::assign_draft_item(self, &item, &changes, "Rename"))
+            tokio::runtime::Handle::current()
+                .block_on(crate::server::assign_draft_item(self, &item, &changes, "Rename"))
         } else {
             Err(anyhow::anyhow!("offline: the Server is unreachable"))
         };
         match result {
             Ok(update) => {
-                self.apply_assignment(eng, AssignmentSnapshot { revision: update.revision, assignment: update.assignment })?;
+                self.apply_assignment(
+                    eng,
+                    AssignmentSnapshot { revision: update.revision, assignment: update.assignment },
+                )?;
                 response.migrated = changes.changes.into_iter().map(|c| c.harness).collect();
                 self.event(Event::Fleet);
             }
@@ -1582,42 +1635,85 @@ impl Daemon {
         Ok(response)
     }
     pub(crate) async fn local_imports(self: &Arc<Self>, check: bool) -> Result<crate::client::ImportsView> {
-        let (root, entries) = self.reading(|d| {
-            let repo = Repo::open(d.repo_root())?;
-            Ok((repo.root().to_path_buf(), repo.manifest.import.iter().map(|(name, i)| crate::client::ImportEntry {
-                name: name.clone(), source: i.source.clone(), git_ref: i.git_ref.clone(), path: i.path.clone(),
-                locked: repo.lock.skills.get(name).map(|l| l.commit.clone()),
-            }).collect::<Vec<_>>()))
-        }).await?;
+        let (root, entries) = self
+            .reading(|d| {
+                let repo = Repo::open(d.repo_root())?;
+                Ok((
+                    repo.root().to_path_buf(),
+                    repo.manifest
+                        .import
+                        .iter()
+                        .map(|(name, i)| crate::client::ImportEntry {
+                            name: name.clone(),
+                            source: i.source.clone(),
+                            git_ref: i.git_ref.clone(),
+                            path: i.path.clone(),
+                            locked: repo.lock.skills.get(name).map(|l| l.commit.clone()),
+                        })
+                        .collect::<Vec<_>>(),
+                ))
+            })
+            .await?;
         tokio::task::spawn_blocking(move || {
-            static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeMap<PathBuf, crate::client::ImportsView>>> = std::sync::OnceLock::new();
+            static CACHE: std::sync::OnceLock<
+                std::sync::Mutex<std::collections::BTreeMap<PathBuf, crate::client::ImportsView>>,
+            > = std::sync::OnceLock::new();
             let cache = CACHE.get_or_init(Default::default);
             let previous = cache.lock().unwrap().get(&root).cloned().unwrap_or_default();
             let mut view = crate::client::ImportsView { imports: entries, ..previous };
-            if check { view.updates.clear(); view.errors.clear(); }
+            if check {
+                view.updates.clear();
+                view.errors.clear();
+            }
             if check {
                 for i in &view.imports {
                     match sk1ll_core::imports::fetch_link(&root, &i.source, Some(&i.path), Some(&i.git_ref), None) {
-                        Ok(f) => if let Some(locked) = &i.locked && locked != &f.resolved.commit { view.updates.push(sk1ll_proto::ImportUpdate { name: i.name.clone(), source: i.source.clone(), git_ref: i.git_ref.clone(), locked: locked.clone(), upstream: f.resolved.commit }); },
-                        Err(e) => view.errors.push(sk1ll_proto::ImportError { name: i.name.clone(), message: e.to_string() }),
+                        Ok(f) => {
+                            if let Some(locked) = &i.locked
+                                && locked != &f.resolved.commit
+                            {
+                                view.updates.push(sk1ll_proto::ImportUpdate {
+                                    name: i.name.clone(),
+                                    source: i.source.clone(),
+                                    git_ref: i.git_ref.clone(),
+                                    locked: locked.clone(),
+                                    upstream: f.resolved.commit,
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            view.errors.push(sk1ll_proto::ImportError { name: i.name.clone(), message: e.to_string() })
+                        }
                     }
                 }
-                view.checked_at = Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64);
+                view.checked_at = Some(
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+                        as i64,
+                );
             }
-            view.updates.retain(|u| view.imports.iter().any(|i| i.name == u.name && i.locked.as_ref() == Some(&u.locked)));
+            view.updates
+                .retain(|u| view.imports.iter().any(|i| i.name == u.name && i.locked.as_ref() == Some(&u.locked)));
             view.errors.retain(|e| view.imports.iter().any(|i| i.name == e.name));
             cache.lock().unwrap().insert(root, view.clone());
             Ok(view)
-        }).await.map_err(|e| Error::Internal(e.into()))?
+        })
+        .await
+        .map_err(|e| Error::Internal(e.into()))?
     }
     /// A reader: no engine mutex.
     pub(crate) fn conflict_diff(&self, req: &crate::client::ConflictDiffRequest) -> Result<DiffView> {
         let view = if let Some(id) = &req.id {
             self.recovered()?.into_iter().find(|v| v.id.as_ref() == Some(id))
         } else {
-            self.conflicts()?.into_iter().find(|v| Some(&v.harness) == req.harness.as_ref() && Some(&v.name) == req.name.as_ref())
-        }.ok_or_else(|| Error::NotFound("Conflict no longer exists".into()))?;
-        let item = if view.name == BLOCK_NAME { Some(ItemRef::Other(view.name.clone())) } else { None }.or(view.item.clone()).or_else(|| view.items.first().cloned()).unwrap_or(ItemRef::Other(view.name.clone()));
+            self.conflicts()?
+                .into_iter()
+                .find(|v| Some(&v.harness) == req.harness.as_ref() && Some(&v.name) == req.name.as_ref())
+        }
+        .ok_or_else(|| Error::NotFound("Conflict no longer exists".into()))?;
+        let item = if view.name == BLOCK_NAME { Some(ItemRef::Other(view.name.clone())) } else { None }
+            .or(view.item.clone())
+            .or_else(|| view.items.first().cloned())
+            .unwrap_or(ItemRef::Other(view.name.clone()));
         match &item {
             ItemRef::Skill(name) | ItemRef::Rule(name) => imports::validate_name(name)?,
             _ => {}
@@ -1626,16 +1722,21 @@ impl Daemon {
         let snapshot = self.snapshot();
         let temp = tempfile::tempdir().map_err(anyhow::Error::from)?;
         let mut right = match &item {
-            ItemRef::Skill(name) => { let p = repo.root().join("personal").join(name); if p.exists() { p } else { repo.root().join("imported").join(name) } },
+            ItemRef::Skill(name) => {
+                let p = repo.root().join("personal").join(name);
+                if p.exists() { p } else { repo.root().join("imported").join(name) }
+            }
             ItemRef::Rule(name) => repo.root().join("instructions").join(format!("{name}.md")),
             _ => {
                 let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
-                let assignment = &snapshot.as_ref().ok_or_else(|| Error::Conflict("Awaiting Assignment".into()))?.assignment;
+                let assignment =
+                    &snapshot.as_ref().ok_or_else(|| Error::Conflict("Awaiting Assignment".into()))?.assignment;
                 let files = sync::render_instructions(&repo, &harnesses, assignment, &view.harness)?;
                 let path = temp.path().join("Draft");
-                std::fs::write(&path, files.into_iter().map(|f| f.content).collect::<Vec<_>>().join("\n")).map_err(anyhow::Error::from)?;
+                std::fs::write(&path, files.into_iter().map(|f| f.content).collect::<Vec<_>>().join("\n"))
+                    .map_err(anyhow::Error::from)?;
                 path
-            },
+            }
         };
         let mut left = view.path.unwrap_or(view.dest);
         if view.name == BLOCK_NAME && matches!(item, ItemRef::Other(_)) {
@@ -1651,11 +1752,21 @@ impl Daemon {
         }
         if !right.exists() {
             right = temp.path().join("Draft");
-            if left.is_dir() { std::fs::create_dir(&right).map_err(anyhow::Error::from)?; }
-            else { std::fs::write(&right, "").map_err(anyhow::Error::from)?; }
+            if left.is_dir() {
+                std::fs::create_dir(&right).map_err(anyhow::Error::from)?;
+            } else {
+                std::fs::write(&right, "").map_err(anyhow::Error::from)?;
+            }
         }
-        let output = std::process::Command::new("git").args(["diff", "--no-index", "--no-ext-diff", "--no-textconv", "--"]).arg(&left).arg(&right).output().map_err(anyhow::Error::from)?;
-        if !matches!(output.status.code(), Some(0 | 1)) { return Err(Error::BadRequest(String::from_utf8_lossy(&output.stderr).into_owned())); }
+        let output = std::process::Command::new("git")
+            .args(["diff", "--no-index", "--no-ext-diff", "--no-textconv", "--"])
+            .arg(&left)
+            .arg(&right)
+            .output()
+            .map_err(anyhow::Error::from)?;
+        if !matches!(output.status.code(), Some(0 | 1)) {
+            return Err(Error::BadRequest(String::from_utf8_lossy(&output.stderr).into_owned()));
+        }
         Ok(DiffView { item, diff: String::from_utf8_lossy(&output.stdout).into_owned() })
     }
 }
@@ -1665,10 +1776,15 @@ fn copy_authored(from: &Path, to: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
         let name = entry.file_name();
-        if name == sync::MARKER || name == ".git" { continue; }
+        if name == sync::MARKER || name == ".git" {
+            continue;
+        }
         let kind = entry.file_type()?;
-        if kind.is_dir() { copy_authored(&entry.path(), &to.join(&name))?; }
-        else if kind.is_file() { std::fs::copy(entry.path(), to.join(&name))?; }
+        if kind.is_dir() {
+            copy_authored(&entry.path(), &to.join(&name))?;
+        } else if kind.is_file() {
+            std::fs::copy(entry.path(), to.join(&name))?;
+        }
     }
     Ok(())
 }
@@ -1682,9 +1798,15 @@ mod tests {
         use sk1ll_core::git::Git;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let git = |args: &[&str]| Git::new(root)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1")
-            .args(["-c", "commit.gpgsign=false"]).args(args).run().unwrap();
+        let git = |args: &[&str]| {
+            Git::new(root)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .run()
+                .unwrap()
+        };
         let write = |path: &str, text: &str| {
             let path = root.join(path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1786,7 +1908,11 @@ mod tests {
     }
     #[tokio::test]
     async fn refused_adoption_rolls_back_only_its_own_unchanged_copy_and_can_retry() {
-        use axum::{Json, Router, http::StatusCode, routing::{get, put}};
+        use axum::{
+            Json, Router,
+            http::StatusCode,
+            routing::{get, put},
+        };
         use sk1ll_proto::{AssignmentChanges, AssignmentUpdate};
         for scenario in ["new", "retry", "edit_repo", "edit_source"] {
             let dir = tempfile::tempdir().unwrap();
@@ -1801,32 +1927,64 @@ mod tests {
                 std::fs::write(destination.join("SKILL.md"), "original").unwrap();
             }
             let accept = Arc::new(AtomicBool::new(false));
-            let app = Router::new().route("/api/fleet", get(|| async { Json(sk1ll_proto::FleetView {
-                baseline: None, machines: vec![sk1ll_proto::MachineRow {
-                    id: "a".into(), status: sk1ll_proto::MachineStatus::Drafting, connected: true,
-                    joined_at: 0, last_seen: None,
-                    report: Some(MachineReport { drafts: vec![ItemRef::Skill("pdf".into())], ..Default::default() }),
-                }],
-            }) })).route("/api/machines/a/assignment", put({
-                let accept = accept.clone();
-                let (destination, source) = (destination.clone(), source.clone());
-                move |Json(body): Json<AssignmentChanges>| {
-                    let (accept, destination, source) = (accept.clone(), destination.clone(), source.clone());
-                    async move {
-                        assert_eq!(body.changes.len(), 1);
-                        assert_eq!(body.changes[0].enabled, Some(true));
-                        assert_eq!(body.changes[0].name.as_deref(), Some("pdf"));
-                        if !accept.load(Ordering::SeqCst) {
-                            if scenario == "edit_repo" { std::fs::write(destination.join("SKILL.md"), "later edit").unwrap(); }
-                            if scenario == "edit_source" { std::fs::write(source.join("SKILL.md"), "later edit").unwrap(); }
-                            return (StatusCode::UNPROCESSABLE_ENTITY, "Server rejected assignment".to_string());
+            let app = Router::new()
+                .route(
+                    "/api/fleet",
+                    get(|| async {
+                        Json(sk1ll_proto::FleetView {
+                            baseline: None,
+                            machines: vec![sk1ll_proto::MachineRow {
+                                id: "a".into(),
+                                status: sk1ll_proto::MachineStatus::Drafting,
+                                connected: true,
+                                joined_at: 0,
+                                last_seen: None,
+                                report: Some(MachineReport {
+                                    drafts: vec![ItemRef::Skill("pdf".into())],
+                                    ..Default::default()
+                                }),
+                            }],
+                        })
+                    }),
+                )
+                .route(
+                    "/api/machines/a/assignment",
+                    put({
+                        let accept = accept.clone();
+                        let (destination, source) = (destination.clone(), source.clone());
+                        move |Json(body): Json<AssignmentChanges>| {
+                            let (accept, destination, source) = (accept.clone(), destination.clone(), source.clone());
+                            async move {
+                                assert_eq!(body.changes.len(), 1);
+                                assert_eq!(body.changes[0].enabled, Some(true));
+                                assert_eq!(body.changes[0].name.as_deref(), Some("pdf"));
+                                if !accept.load(Ordering::SeqCst) {
+                                    if scenario == "edit_repo" {
+                                        std::fs::write(destination.join("SKILL.md"), "later edit").unwrap();
+                                    }
+                                    if scenario == "edit_source" {
+                                        std::fs::write(source.join("SKILL.md"), "later edit").unwrap();
+                                    }
+                                    return (
+                                        StatusCode::UNPROCESSABLE_ENTITY,
+                                        "Server rejected assignment".to_string(),
+                                    );
+                                }
+                                let mut assignment = sk1ll_proto::Assignment::default();
+                                assignment.set_skill("h", "pdf", true);
+                                (
+                                    StatusCode::OK,
+                                    serde_json::to_string(&AssignmentUpdate {
+                                        assignment,
+                                        revision: 2,
+                                        entries: vec![],
+                                    })
+                                    .unwrap(),
+                                )
+                            }
                         }
-                        let mut assignment = sk1ll_proto::Assignment::default();
-                        assignment.set_skill("h", "pdf", true);
-                        (StatusCode::OK, serde_json::to_string(&AssignmentUpdate { assignment, revision: 2, entries: vec![] }).unwrap())
-                    }
-                }
-            }));
+                    }),
+                );
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -1834,28 +1992,50 @@ mod tests {
             cfg.state = dir.path().join("state/daemon.json");
             cfg.assignment = dir.path().join("assignment.json");
             cfg.machine_config = dir.path().join("machine.toml");
-            std::fs::write(&cfg.machine_config, format!("[harnesses.h]\nskills = {:?}\nmode = \"copy\"\n", dir.path().join("h"))).unwrap();
+            std::fs::write(
+                &cfg.machine_config,
+                format!("[harnesses.h]\nskills = {:?}\nmode = \"copy\"\n", dir.path().join("h")),
+            )
+            .unwrap();
             let mut snap = AssignmentSnapshot { revision: 1, ..Default::default() };
             snap.assignment.set_new_skills_default("h", false);
             state::save_snapshot(&cfg.snapshot_path(), &snap).unwrap();
-            let d = Daemon::new(cfg, DaemonState {
-                machine_id: "a".into(), token: "t".into(), server_url: format!("http://{address}"), repo: root, revoked: false,
-            }).unwrap();
+            let d = Daemon::new(
+                cfg,
+                DaemonState {
+                    machine_id: "a".into(),
+                    token: "t".into(),
+                    server_url: format!("http://{address}"),
+                    repo: root,
+                    revoked: false,
+                },
+            )
+            .unwrap();
             d.set_connection(Connection::Connected);
-            let error = d.blocking(|d, eng| d.adopt(eng, ConflictTarget { harness: "h".into(), name: "pdf".into() })).await.unwrap_err();
+            let error = d
+                .blocking(|d, eng| d.adopt(eng, ConflictTarget { harness: "h".into(), name: "pdf".into() }))
+                .await
+                .unwrap_err();
             assert!(error.to_string().contains("Server refused"), "{error}");
-            assert_eq!(std::fs::read_to_string(source.join("SKILL.md")).unwrap(), if scenario == "edit_source" { "later edit" } else { "original" });
+            assert_eq!(
+                std::fs::read_to_string(source.join("SKILL.md")).unwrap(),
+                if scenario == "edit_source" { "later edit" } else { "original" }
+            );
             assert!(!source.join(".sk1ll-managed").exists());
             if scenario == "new" {
                 assert!(!destination.exists());
                 accept.store(true, Ordering::SeqCst);
-                d.blocking(|d, eng| d.adopt(eng, ConflictTarget { harness: "h".into(), name: "pdf".into() })).await.unwrap();
+                d.blocking(|d, eng| d.adopt(eng, ConflictTarget { harness: "h".into(), name: "pdf".into() }))
+                    .await
+                    .unwrap();
                 assert!(source.join(".sk1ll-managed").is_file());
             } else {
-                assert_eq!(std::fs::read_to_string(destination.join("SKILL.md")).unwrap(), if scenario == "edit_repo" { "later edit" } else { "original" });
+                assert_eq!(
+                    std::fs::read_to_string(destination.join("SKILL.md")).unwrap(),
+                    if scenario == "edit_repo" { "later edit" } else { "original" }
+                );
             }
             server.abort();
         }
     }
-
 }

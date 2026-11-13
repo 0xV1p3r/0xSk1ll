@@ -30,7 +30,9 @@ use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::Response;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use sk1ll_proto::{AssignmentChanges, AssignmentSnapshot, AssignmentUpdate, DaemonMessage, ServerMessage, MachineReport};
+use sk1ll_proto::{
+    AssignmentChanges, AssignmentSnapshot, AssignmentUpdate, DaemonMessage, MachineReport, ServerMessage,
+};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::{self, Message, client::IntoClientRequest};
 
@@ -90,7 +92,8 @@ fn jitter(d: Duration) -> Duration {
     #[cfg(test)]
     {
         for duration in [Duration::ZERO, Duration::from_nanos(1), Duration::from_secs(60)] {
-            let micros = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |t| t.subsec_micros());
+            let micros =
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |t| t.subsec_micros());
             let value = duration / 2 + duration.mul_f64(f64::from(micros % 1000) / 2000.0);
             assert!(value >= duration / 2 && value <= duration);
         }
@@ -130,7 +133,11 @@ async fn send(ws: &mut Sink, msg: &DaemonMessage) -> anyhow::Result<()> {
 /// refreshes: there is nothing to filter, and the report published last goes
 /// out as it is.
 async fn flush_outbox(
-    d: &Arc<Daemon>, sink: &mut Sink, sent: &mut MachineReport, mut fresh: bool, pending: &mut std::collections::HashSet<u64>,
+    d: &Arc<Daemon>,
+    sink: &mut Sink,
+    sent: &mut MachineReport,
+    mut fresh: bool,
+    pending: &mut std::collections::HashSet<u64>,
 ) -> anyhow::Result<()> {
     loop {
         // Capture the entry and the state used to filter it under the same
@@ -171,7 +178,9 @@ async fn flush_outbox(
             *sent = report.clone();
         }
         let Some(entry) = entry else { return Ok(()) };
-        let items = entry.items.into_iter()
+        let items = entry
+            .items
+            .into_iter()
             .filter(|item| !report.drafts.contains(item) && !report.unpushed.contains(item))
             .collect::<Vec<_>>();
         if !items.is_empty() {
@@ -187,10 +196,13 @@ async fn flush_outbox(
 
 /// No cached report or discard is safe to send after a failed refresh.
 async fn refresh_report(d: &Arc<Daemon>) -> anyhow::Result<MachineReport> {
-    match d.blocking(|d, eng| {
-        d.refresh(eng)?;
-        Ok(d.view().report)
-    }).await {
+    match d
+        .blocking(|d, eng| {
+            d.refresh(eng)?;
+            Ok(d.view().report)
+        })
+        .await
+    {
         Ok(report) => Ok(report),
         Err(e) => {
             d.set_error(format!("refreshing before reporting to the Server: {e}"));
@@ -298,7 +310,11 @@ pub(crate) async fn proxy(d: &Daemon, method: Method, path_and_query: &str, body
 
 /// The authenticated Server transport shared by the daemon and direct CLI.
 async fn request(
-    http: &reqwest::Client, state: &DaemonState, method: Method, path_and_query: &str, body: Bytes,
+    http: &reqwest::Client,
+    state: &DaemonState,
+    method: Method,
+    path_and_query: &str,
+    body: Bytes,
 ) -> Result<reqwest::Response> {
     if state.revoked {
         return Err(Error::Unavailable("this machine was removed from the fleet; it can't reach the server".into()));
@@ -308,17 +324,16 @@ async fn request(
     if !body.is_empty() {
         req = req.header(header::CONTENT_TYPE, "application/json").body(body);
     }
-    req
-        .send()
-        .await
-        .map_err(|e| Error::Unavailable(redact(&format!("offline: the server is unreachable ({e})"))))
+    req.send().await.map_err(|e| Error::Unavailable(redact(&format!("offline: the server is unreachable ({e})"))))
 }
 
 /// Changes this machine's assignment at the Server while the daemon is stopped,
 /// then stores the returned authoritative snapshot. Hold the repo's engine
 /// lock across this call so a daemon cannot apply an older snapshot meanwhile.
 pub async fn set_assignment_direct(
-    cfg: &Config, _lock: &sk1ll_core::EngineLock, changes: &AssignmentChanges,
+    cfg: &Config,
+    _lock: &sk1ll_core::EngineLock,
+    changes: &AssignmentChanges,
 ) -> anyhow::Result<AssignmentUpdate> {
     use anyhow::Context;
     let state = DaemonState::load(&cfg.state)?.context("this machine hasn't joined a fleet")?;
@@ -329,7 +344,11 @@ pub async fn set_assignment_direct(
     Ok(update)
 }
 
-async fn change_assignment(http: &reqwest::Client, state: &DaemonState, changes: &AssignmentChanges) -> anyhow::Result<AssignmentUpdate> {
+async fn change_assignment(
+    http: &reqwest::Client,
+    state: &DaemonState,
+    changes: &AssignmentChanges,
+) -> anyhow::Result<AssignmentUpdate> {
     use anyhow::Context;
     let path = format!("/machines/{}/assignment", state.machine_id);
     let resp = request(http, state, Method::PUT, &path, serde_json::to_vec(changes)?.into()).await?;
@@ -346,17 +365,31 @@ async fn change_assignment(http: &reqwest::Client, state: &DaemonState, changes:
 
 /// Wait for the existing status protocol to report this local draft before PUT.
 /// HTTP and WebSocket requests have no ordering guarantee across transports.
-pub(crate) async fn assign_adoption(d: &Daemon, adoption: &sk1ll_core::sync::unmanaged::Adoption) -> anyhow::Result<AssignmentUpdate> {
-    let changes = AssignmentChanges { changes: adoption.locations.iter().map(|l| sk1ll_proto::ToggleChange {
-        harness: l.harness.clone(), kind: sk1ll_proto::ToggleKind::Skill,
-        name: Some(adoption.name.clone()), enabled: Some(true),
-    }).collect() };
+pub(crate) async fn assign_adoption(
+    d: &Daemon,
+    adoption: &sk1ll_core::sync::unmanaged::Adoption,
+) -> anyhow::Result<AssignmentUpdate> {
+    let changes = AssignmentChanges {
+        changes: adoption
+            .locations
+            .iter()
+            .map(|l| sk1ll_proto::ToggleChange {
+                harness: l.harness.clone(),
+                kind: sk1ll_proto::ToggleKind::Skill,
+                name: Some(adoption.name.clone()),
+                enabled: Some(true),
+            })
+            .collect(),
+    };
     assign_draft_item(d, &sk1ll_proto::ItemRef::Skill(adoption.name.clone()), &changes, "Adopt").await
 }
 
 /// Changes this machine's toggles for `item` once the Server has its draft report.
 pub(crate) async fn assign_draft_item(
-    d: &Daemon, item: &sk1ll_proto::ItemRef, changes: &AssignmentChanges, action: &str,
+    d: &Daemon,
+    item: &sk1ll_proto::ItemRef,
+    changes: &AssignmentChanges,
+    action: &str,
 ) -> anyhow::Result<AssignmentUpdate> {
     tokio::time::timeout(SEND_TIMEOUT, async {
         loop {
@@ -366,13 +399,21 @@ pub(crate) async fn assign_draft_item(
                 break; // An unchanged baseline item needs no new draft report.
             }
             let fleet: sk1ll_proto::FleetView = request(&d.http, &d.ident, Method::GET, "/fleet", Bytes::new())
-                .await?.error_for_status()?.json().await?;
-            if fleet.machines.iter().any(|m| m.id == d.ident.machine_id && m.report.as_ref().is_some_and(|r| {
-                r.drafts.contains(item) || r.unpushed.contains(item)
-            })) { break; }
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            if fleet.machines.iter().any(|m| {
+                m.id == d.ident.machine_id
+                    && m.report.as_ref().is_some_and(|r| r.drafts.contains(item) || r.unpushed.contains(item))
+            }) {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         Ok::<_, anyhow::Error>(())
-    }).await.map_err(|_| anyhow::anyhow!("{action} timed out waiting for the Server to receive the draft; try again"))??;
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("{action} timed out waiting for the Server to receive the draft; try again"))??;
     change_assignment(&d.http, &d.ident, changes).await
 }

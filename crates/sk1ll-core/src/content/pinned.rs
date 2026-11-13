@@ -1,13 +1,12 @@
 //! All traversal uses directory descriptors. A rename can detach a pinned
 //! directory, but cannot redirect subsequent access through a replacement link.
 use super::*;
+use rustix::fs::{self as fd, AtFlags, Dir, FileType, Mode, OFlags};
 use std::ffi::OsString;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
-use rustix::fs::{self as fd, AtFlags, Dir, FileType, Mode, OFlags};
 
-const DIRECTORY: OFlags = OFlags::RDONLY.union(OFlags::DIRECTORY)
-    .union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
+const DIRECTORY: OFlags = OFlags::RDONLY.union(OFlags::DIRECTORY).union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
 
 pub(super) struct Item {
     directory: OwnedFd,
@@ -22,8 +21,7 @@ fn open_at(dir: &OwnedFd, name: &std::ffi::OsStr, flags: OFlags, path: &Path) ->
 impl Item {
     pub(super) fn open(path: &Path, rule: bool) -> Result<Self> {
         let base = if rule { path.parent().unwrap() } else { path };
-        let mut directory = fd::open("/", DIRECTORY, Mode::empty())
-            .map_err(std::io::Error::from).at(path)?;
+        let mut directory = fd::open("/", DIRECTORY, Mode::empty()).map_err(std::io::Error::from).at(path)?;
         for component in base.components() {
             match component {
                 Component::RootDir => {}
@@ -44,9 +42,13 @@ impl Item {
         let mut components = relative.components().peekable();
         while let Some(Component::Normal(name)) = components.next() {
             if components.peek().is_none() {
-                return Ok(open_at(&directory, name,
+                return Ok(open_at(
+                    &directory,
+                    name,
                     OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-                    &self.path)?.into());
+                    &self.path,
+                )?
+                .into());
             }
             directory = open_at(&directory, name, DIRECTORY, &self.path)?;
         }
@@ -81,13 +83,26 @@ impl Item {
         Ok(())
     }
 
-    fn entry(&self, directory: &OwnedFd, name: &std::ffi::OsStr, relative: &Path, result: &mut Vec<FileEntry>) -> Result<()> {
-        let meta = fd::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(std::io::Error::from).at(&self.path)?;
+    fn entry(
+        &self,
+        directory: &OwnedFd,
+        name: &std::ffi::OsStr,
+        relative: &Path,
+        result: &mut Vec<FileEntry>,
+    ) -> Result<()> {
+        let meta =
+            fd::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW).map_err(std::io::Error::from).at(&self.path)?;
         let kind = FileType::from_raw_mode(meta.st_mode);
         result.push(FileEntry {
             path: relative.to_string_lossy().into_owned(),
-            kind: if kind == FileType::Symlink { "symlink" } else if kind == FileType::Directory { "directory" } else { "file" }.into(),
+            kind: if kind == FileType::Symlink {
+                "symlink"
+            } else if kind == FileType::Directory {
+                "directory"
+            } else {
+                "file"
+            }
+            .into(),
             size: if kind == FileType::Directory { 0 } else { meta.st_size.max(0) as u64 },
         });
         if kind == FileType::Directory {
