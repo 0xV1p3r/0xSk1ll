@@ -8,11 +8,11 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
-use sk1ll_server::Config;
 use sk1ll_proto::{
-    AssignmentSnapshot, AssignmentUpdate, DaemonMessage, FleetView, ServerMessage, ImportsView, ItemRef,
-    JoinCode, JoinResponse, LogCause, LogEntry, MachineReport, MachineRow, MachineStatus, ToggleKind,
+    AssignmentSnapshot, AssignmentUpdate, DaemonMessage, FleetView, ImportsView, ItemRef, JoinCode, JoinResponse,
+    LogCause, LogEntry, MachineReport, MachineRow, MachineStatus, ServerMessage, ToggleKind,
 };
+use sk1ll_server::Config;
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 
 const ADMIN: &str = "admin-secret";
@@ -211,7 +211,8 @@ async fn commit_push(server: &TestServer, repo: &Path, msg: &str) -> String {
     eventually(|| async {
         let fleet: FleetView = server.get_json(ADMIN, "/fleet").await;
         (fleet.baseline.as_deref() == Some(head.as_str())).then_some(())
-    }).await;
+    })
+    .await;
     head
 }
 
@@ -545,7 +546,8 @@ async fn websocket_gets_assignment_nudge_and_status() {
     let head = commit_push(&server, &repo, "add pdf").await;
     assert_eq!(ws_next(&mut ws).await, ServerMessage::Nudge { baseline: head.clone() });
 
-    server.put_assignment(&token, "ws", json!([{"harness": "claude", "kind": "skill", "name": "pdf", "enabled": true}]))
+    server
+        .put_assignment(&token, "ws", json!([{"harness": "claude", "kind": "skill", "name": "pdf", "enabled": true}]))
         .await;
     let ServerMessage::Assignment(a) = ws_next(&mut ws).await else { panic!("expected assignment") };
     assert!(a.assignment.skill_enabled("claude", "pdf"));
@@ -582,7 +584,8 @@ async fn removing_a_machine_revokes_it() {
     let a_token = server.join("a", &["claude"]).await;
     let b_token = server.join("b", &["claude"]).await;
     seed(&server, "b", &b_token, &["personal/pdf/SKILL.md"]).await;
-    server.put_assignment(&a_token, "a", json!([{"harness": "claude", "kind": "skill", "name": "pdf", "enabled": true}]))
+    server
+        .put_assignment(&a_token, "a", json!([{"harness": "claude", "kind": "skill", "name": "pdf", "enabled": true}]))
         .await;
     let mut ws = ws_connect(&server, &a_token).await;
     assert!(matches!(ws_next(&mut ws).await, ServerMessage::Assignment(_)));
@@ -826,7 +829,8 @@ async fn each_push_is_announced_and_cleaned_up() {
     let token = server.join("ws", &["claude"]).await;
     let (dir, c0) = seed(&server, "ws", &token, &["personal/pdf/SKILL.md"]).await;
     let repo = dir.path().join("repo");
-    server.put_assignment(&token, "ws", json!([{"harness": "claude", "kind": "skill", "name": "pdf", "enabled": true}]))
+    server
+        .put_assignment(&token, "ws", json!([{"harness": "claude", "kind": "skill", "name": "pdf", "enabled": true}]))
         .await;
     let mut ws = ws_connect(&server, &token).await;
     ws_assignment(&mut ws).await;
@@ -958,8 +962,13 @@ async fn assignments_accept_only_the_destination_machines_unpushed_items() {
     let disabled = server
         .put_assignment(&b, "a", json!([{"harness": "claude", "kind": "skill", "name": "wip", "enabled": false}]))
         .await;
-    let undo =
-        server.http.post(server.url(&format!("/log/{}/undo", disabled.entries[0].id))).bearer_auth(&b).send().await.unwrap();
+    let undo = server
+        .http
+        .post(server.url(&format!("/log/{}/undo", disabled.entries[0].id)))
+        .bearer_auth(&b)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(undo.status(), StatusCode::OK);
     assert!(undo.json::<AssignmentUpdate>().await.unwrap().assignment.skill_enabled("claude", "wip"));
 }
@@ -982,16 +991,17 @@ async fn unrelated_push_preserves_unpushed_commit_toggles() {
     };
     ws_send(&mut ws, &DaemonMessage::Status(drafting.clone())).await;
     server.reported("a", &drafting).await;
-    server.put_assignment(
-        &a,
-        "a",
-        json!([
-            {"harness": "claude", "kind": "skill", "name": "wip", "enabled": true},
-            {"harness": "claude", "kind": "rule", "name": "git", "enabled": true},
-            {"harness": "claude", "kind": "skill", "name": "stale", "enabled": false},
-        ]),
-    )
-    .await;
+    server
+        .put_assignment(
+            &a,
+            "a",
+            json!([
+                {"harness": "claude", "kind": "skill", "name": "wip", "enabled": true},
+                {"harness": "claude", "kind": "rule", "name": "git", "enabled": true},
+                {"harness": "claude", "kind": "skill", "name": "stale", "enabled": false},
+            ]),
+        )
+        .await;
     git_async(repo_a.clone(), vec!["add".into(), "-A".into()]).await;
     git_async(repo_a, vec!["commit".into(), "--quiet".into(), "-m".into(), "commit locally".into()]).await;
     let committed = MachineReport { unpushed: drafting.drafts.clone(), drafts: vec![], ..drafting };
@@ -1017,28 +1027,28 @@ async fn draft_discarded_preserves_unpushed_items() {
     let server = start().await;
     let token = server.join("a", &["claude"]).await;
     let mut ws = ws_connect(&server, &token).await;
-    let drafting = MachineReport {
-        drafts: vec![ItemRef::Skill("wip".into()), ItemRef::Rule("git".into())],
-        ..Default::default()
-    };
+    let drafting =
+        MachineReport { drafts: vec![ItemRef::Skill("wip".into()), ItemRef::Rule("git".into())], ..Default::default() };
     ws_send(&mut ws, &DaemonMessage::Status(drafting.clone())).await;
     server.reported("a", &drafting).await;
-    server.put_assignment(
-        &token,
-        "a",
-        json!([
-            {"harness": "claude", "kind": "skill", "name": "wip", "enabled": true},
-            {"harness": "claude", "kind": "rule", "name": "git", "enabled": true},
-            {"harness": "claude", "kind": "skill", "name": "gone", "enabled": false},
-        ]),
-    )
-    .await;
+    server
+        .put_assignment(
+            &token,
+            "a",
+            json!([
+                {"harness": "claude", "kind": "skill", "name": "wip", "enabled": true},
+                {"harness": "claude", "kind": "rule", "name": "git", "enabled": true},
+                {"harness": "claude", "kind": "skill", "name": "gone", "enabled": false},
+            ]),
+        )
+        .await;
     let committed = MachineReport { unpushed: drafting.drafts, ..Default::default() };
     ws_send(&mut ws, &DaemonMessage::Status(committed.clone())).await;
     server.reported("a", &committed).await;
     ws_send(
         &mut ws,
-        &DaemonMessage::DraftDiscarded { id: None,
+        &DaemonMessage::DraftDiscarded {
+            id: None,
             items: vec![ItemRef::Skill("wip".into()), ItemRef::Rule("git".into()), ItemRef::Skill("gone".into())],
         },
     )
@@ -1068,23 +1078,25 @@ async fn draft_discarded_drops_and_logs_only_removed_items() {
     };
     ws_send(&mut ws, &DaemonMessage::Status(drafting.clone())).await;
     server.reported("ws", &drafting).await;
-    server.put_assignment(
-        &token,
-        "ws",
-        json!([
-            {"harness": "claude", "kind": "skill", "name": "wip", "enabled": true},
-            {"harness": "claude", "kind": "rule", "name": "keep", "enabled": true},
-            {"harness": "claude", "kind": "skill", "name": "pdf", "enabled": true},
-            {"harness": "claude", "kind": "skill", "name": "unmentioned", "enabled": false}
-        ]),
-    )
-    .await;
-    server.put_assignment(
-        &other,
-        "other",
-        json!([{"harness": "claude", "kind": "skill", "name": "wip", "enabled": false}]),
-    )
-    .await;
+    server
+        .put_assignment(
+            &token,
+            "ws",
+            json!([
+                {"harness": "claude", "kind": "skill", "name": "wip", "enabled": true},
+                {"harness": "claude", "kind": "rule", "name": "keep", "enabled": true},
+                {"harness": "claude", "kind": "skill", "name": "pdf", "enabled": true},
+                {"harness": "claude", "kind": "skill", "name": "unmentioned", "enabled": false}
+            ]),
+        )
+        .await;
+    server
+        .put_assignment(
+            &other,
+            "other",
+            json!([{"harness": "claude", "kind": "skill", "name": "wip", "enabled": false}]),
+        )
+        .await;
     while !ws_assignment(&mut ws).await.assignment.skill_enabled("claude", "wip") {}
 
     let restore = MachineReport {
@@ -1096,7 +1108,8 @@ async fn draft_discarded_drops_and_logs_only_removed_items() {
     server.reported("ws", &restore).await;
     let before = server.get_json::<AssignmentSnapshot>(&token, "/machines/ws/assignment").await.assignment;
     assert!(before.skill_enabled("claude", "wip"), "status alone must preserve the toggle");
-    let discarded = DaemonMessage::DraftDiscarded { id: Some(17),
+    let discarded = DaemonMessage::DraftDiscarded {
+        id: Some(17),
         items: vec![
             ItemRef::Skill("wip".into()),
             ItemRef::Skill("wip".into()),
@@ -1169,8 +1182,10 @@ async fn silent_connections_go_offline() {
 async fn changing_a_default_keeps_existing_items() {
     let server = start().await;
     let token = server.join("ws", &["claude"]).await;
-    let (dir, _) = seed(&server, "ws", &token, &["personal/a/SKILL.md", "personal/b/SKILL.md", "instructions/f.md"]).await;
-    server.put_assignment(&token, "ws", json!([{"harness": "claude", "kind": "skill", "name": "a", "enabled": true}]))
+    let (dir, _) =
+        seed(&server, "ws", &token, &["personal/a/SKILL.md", "personal/b/SKILL.md", "instructions/f.md"]).await;
+    server
+        .put_assignment(&token, "ws", json!([{"harness": "claude", "kind": "skill", "name": "a", "enabled": true}]))
         .await;
 
     let update = server
@@ -1210,7 +1225,8 @@ async fn draft_toggle_survives_transient_absence() {
     };
     ws_send(&mut ws, &DaemonMessage::Status(drafting.clone())).await;
     server.reported("ws", &drafting).await;
-    server.put_assignment(&token, "ws", json!([{"harness": "claude", "kind": "skill", "name": "wip", "enabled": true}]))
+    server
+        .put_assignment(&token, "ws", json!([{"harness": "claude", "kind": "skill", "name": "wip", "enabled": true}]))
         .await;
     let empty = MachineReport { harnesses: vec!["claude".into()], ..Default::default() };
     ws_send(&mut ws, &DaemonMessage::Status(empty.clone())).await;
@@ -1324,12 +1340,13 @@ async fn push_timeout_runs_follow_up(hook_body: &str, idle: Duration, max: Durat
     let repo = dir.path().join("repo");
     write(&repo, "personal/removed/SKILL.md", "removed\n");
     let second = commit_push(&server, &repo, "add removed").await;
-    server.put_assignment(
-        &token,
-        "ws",
-        json!([{"harness": "claude", "kind": "skill", "name": "removed", "enabled": true}]),
-    )
-    .await;
+    server
+        .put_assignment(
+            &token,
+            "ws",
+            json!([{"harness": "claude", "kind": "skill", "name": "removed", "enabled": true}]),
+        )
+        .await;
     let mut ws = ws_connect(&server, &token).await;
     ws_assignment(&mut ws).await;
     assert_eq!(ws_next(&mut ws).await, ServerMessage::Nudge { baseline: second.clone() });
@@ -1476,9 +1493,12 @@ async fn defaults_and_undo_materialize_destination_drafts_and_unpushed() {
         harnesses: vec!["claude".into()],
         drafts: vec![ItemRef::Skill("draft".into()), ItemRef::Rule("draft".into())],
         unpushed: vec![
-            ItemRef::Skill("unpushed".into()), ItemRef::Rule("unpushed".into()),
-            ItemRef::Skill("draft".into()), ItemRef::Rule("draft".into()),
-            ItemRef::Skill("explicit".into()), ItemRef::Rule("explicit".into()),
+            ItemRef::Skill("unpushed".into()),
+            ItemRef::Rule("unpushed".into()),
+            ItemRef::Skill("draft".into()),
+            ItemRef::Rule("draft".into()),
+            ItemRef::Skill("explicit".into()),
+            ItemRef::Rule("explicit".into()),
         ],
         ..Default::default()
     };
@@ -1487,16 +1507,27 @@ async fn defaults_and_undo_materialize_destination_drafts_and_unpushed() {
     let other = MachineReport { drafts: vec![ItemRef::Skill("other".into())], ..Default::default() };
     ws_send(&mut other_ws, &DaemonMessage::Status(other.clone())).await;
     server.reported("beta", &other).await;
-    for (kind, default, item_kind) in [
-        ("skill", "new_skills_default", ToggleKind::Skill),
-        ("rule", "new_rules_default", ToggleKind::Rule),
-    ] {
-        server.put_assignment(&beta, "alpha", json!([
-            {"harness": "claude", "kind": kind, "name": "explicit", "enabled": true}
-        ])).await;
-        let update = server.put_assignment(&beta, "alpha", json!([
-            {"harness": "claude", "kind": default, "enabled": true}
-        ])).await;
+    for (kind, default, item_kind) in
+        [("skill", "new_skills_default", ToggleKind::Skill), ("rule", "new_rules_default", ToggleKind::Rule)]
+    {
+        server
+            .put_assignment(
+                &beta,
+                "alpha",
+                json!([
+                    {"harness": "claude", "kind": kind, "name": "explicit", "enabled": true}
+                ]),
+            )
+            .await;
+        let update = server
+            .put_assignment(
+                &beta,
+                "alpha",
+                json!([
+                    {"harness": "claude", "kind": default, "enabled": true}
+                ]),
+            )
+            .await;
         let read: AssignmentSnapshot = server.get_json(&beta, "/machines/alpha/assignment").await;
         assert_eq!(read.assignment, update.assignment);
         assert_eq!(read.revision, update.revision);
@@ -1521,8 +1552,8 @@ async fn defaults_and_undo_materialize_destination_drafts_and_unpushed() {
         ws_send(&mut ws, &DaemonMessage::Status(report.clone())).await;
         server.reported("alpha", &report).await;
         let entry = update.entries.last().unwrap();
-        let response = server.http.post(server.url(&format!("/log/{}/undo", entry.id)))
-            .bearer_auth(&beta).send().await.unwrap();
+        let response =
+            server.http.post(server.url(&format!("/log/{}/undo", entry.id))).bearer_auth(&beta).send().await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let undone: AssignmentUpdate = response.json().await.unwrap();
         assert_eq!(undone.entries.len(), 2);
@@ -1562,8 +1593,7 @@ async fn main_rejects_rewrites_and_deletion() {
     git(&repo, &["push", "origin", "HEAD:main"]);
     git(&repo, &["reset", "--hard", "HEAD~1"]);
     for args in [["push", "--force", "origin", "HEAD:main"], ["push", "--delete", "origin", "main"]] {
-        let out = Command::new("git").arg("-C").arg(&repo).args(args)
-            .env("GIT_TERMINAL_PROMPT", "0").output().unwrap();
+        let out = Command::new("git").arg("-C").arg(&repo).args(args).env("GIT_TERMINAL_PROMPT", "0").output().unwrap();
         assert!(!out.status.success());
     }
 }

@@ -46,8 +46,7 @@ pub fn discover(root: &Path) -> Result<Vec<Skill>> {
             let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
                 continue;
             };
-            let description =
-                fs::read_to_string(&skill_md).ok().and_then(|t| frontmatter_field(&t, "description"));
+            let description = fs::read_to_string(&skill_md).ok().and_then(|t| frontmatter_field(&t, "description"));
             let shadows_import = origin == Origin::Personal && skills.contains_key(&name);
             skills.insert(name.clone(), Skill { name, origin, path, description, shadows_import });
         }
@@ -63,16 +62,11 @@ pub fn frontmatter_field(text: &str, key: &str) -> Option<String> {
         return None;
     }
     let body: Vec<&str> = lines.take_while(|l| l.trim() != "---").collect();
-    let (i, rest) = body
-        .iter()
-        .enumerate()
-        .find_map(|(i, l)| Some((i, l.strip_prefix(key)?.strip_prefix(':')?.trim())))?;
+    let (i, rest) =
+        body.iter().enumerate().find_map(|(i, l)| Some((i, l.strip_prefix(key)?.strip_prefix(':')?.trim())))?;
     if rest.starts_with('>') || rest.starts_with('|') {
-        let block: Vec<&str> = body[i + 1..]
-            .iter()
-            .take_while(|l| l.starts_with([' ', '\t']) || l.is_empty())
-            .map(|l| l.trim())
-            .collect();
+        let block: Vec<&str> =
+            body[i + 1..].iter().take_while(|l| l.starts_with([' ', '\t']) || l.is_empty()).map(|l| l.trim()).collect();
         let joined = block.join(if rest.starts_with('>') { " " } else { "\n" });
         return Some(joined.trim().to_string()).filter(|s| !s.is_empty());
     }

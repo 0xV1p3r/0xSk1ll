@@ -25,7 +25,7 @@ use axum::response::Response;
 use futures_util::stream::SplitStream;
 use futures_util::{Sink, SinkExt, StreamExt};
 use serde_json::Value;
-use sk1ll_proto::{AssignmentSnapshot, DaemonMessage, ServerMessage, ItemRef, MachineReport};
+use sk1ll_proto::{AssignmentSnapshot, DaemonMessage, ItemRef, MachineReport, ServerMessage};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -186,7 +186,12 @@ async fn read_loop(
                         match on_draft_discarded(server, machine, id, token_hash, items, cancel).await {
                             Ok(true) => {
                                 if let Some(discard_id) = discard_id
-                                    && let Some(h) = crate::lock(&server.conns).get(machine).filter(|h| h.id == id && !cancel.is_cancelled()) { h.send(machine, ServerMessage::DraftDiscardApplied { id: discard_id }); }
+                                    && let Some(h) = crate::lock(&server.conns)
+                                        .get(machine)
+                                        .filter(|h| h.id == id && !cancel.is_cancelled())
+                                {
+                                    h.send(machine, ServerMessage::DraftDiscardApplied { id: discard_id });
+                                }
                             }
                             Ok(false) => {}
                             Err(e) => tracing::error!("{machine}: discarding draft toggles: {e}"),
@@ -429,7 +434,8 @@ mod tests {
         type Error = std::convert::Infallible;
 
         fn poll_ready(
-            mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
             if !self.interrupted {
                 self.interrupted = true;
@@ -447,13 +453,15 @@ mod tests {
         }
 
         fn poll_flush(
-            self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>,
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
         ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
             std::task::Poll::Ready(Ok(()))
         }
 
         fn poll_close(
-            self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
             self.poll_flush(cx)
         }
@@ -465,15 +473,21 @@ mod tests {
         let revoked = Arc::new(AtomicBool::new(false));
         let frames = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = RevokeDuringSend {
-            cancel: cancel.clone(), revoked: revoked.clone(), frames: frames.clone(), interrupted: false,
+            cancel: cancel.clone(),
+            revoked: revoked.clone(),
+            frames: frames.clone(),
+            interrupted: false,
         };
         let (queue_tx, queue_rx) = mpsc::channel(1);
         let (_assignment_tx, assignment_rx) = watch::channel(None);
         queue_tx.send(ServerMessage::Nudge { baseline: "abc".into() }).await.unwrap();
         write_loop(sink, queue_rx, assignment_rx, cancel, revoked, crate::Config::new("/unused")).await;
         let frames = frames.lock().unwrap();
-        assert!(frames.iter().any(|frame| matches!(frame, Message::Text(text)
-            if serde_json::from_str::<ServerMessage>(text).ok() == Some(ServerMessage::Revoked))), "{frames:?}");
+        assert!(
+            frames.iter().any(|frame| matches!(frame, Message::Text(text)
+            if serde_json::from_str::<ServerMessage>(text).ok() == Some(ServerMessage::Revoked))),
+            "{frames:?}"
+        );
         assert!(matches!(frames.last(), Some(Message::Close(_))), "{frames:?}");
     }
 

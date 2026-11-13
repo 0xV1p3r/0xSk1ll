@@ -12,12 +12,12 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use sk1ll_daemon::DaemonState;
 use sk1ll_daemon::client::{
-    AddImportRequest, Client, Connection, Event, CommitRequest, CommitResponse, RestoreRequest, ResolveImportRequest,
+    AddImportRequest, Client, CommitRequest, CommitResponse, Connection, Event, ResolveImportRequest, RestoreRequest,
     StatusView,
 };
 use sk1ll_proto::{
-    Assignment, AssignmentChanges, AssignmentSnapshot, DaemonMessage, FleetView, HarnessAssignment, ServerMessage,
-    ItemRef, LogCause, LogEntry, MachineStatus, ToggleChange, ToggleKind,
+    Assignment, AssignmentChanges, AssignmentSnapshot, DaemonMessage, FleetView, HarnessAssignment, ItemRef, LogCause,
+    LogEntry, MachineStatus, ServerMessage, ToggleChange, ToggleKind,
 };
 use tokio_tungstenite::tungstenite::Message;
 
@@ -230,11 +230,8 @@ impl Machine {
     }
 
     fn spawn(&mut self) {
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.home.path().join("daemon.log"))
-            .unwrap();
+        let log =
+            std::fs::OpenOptions::new().create(true).append(true).open(self.home.path().join("daemon.log")).unwrap();
         let child = self.command().stdout(Stdio::null()).stderr(log).spawn().unwrap();
         self.child = Some(child);
     }
@@ -472,7 +469,8 @@ async fn fleet_of_two(server: &Server) -> (Machine, Machine, String) {
     eventually(|| async {
         let row = server.row("beta").await?;
         (row.connected && row.report?.baseline.as_deref() == Some(p.sha.as_str())).then_some(())
-    }).await;
+    })
+    .await;
     (a, b, p.sha)
 }
 
@@ -585,8 +583,10 @@ async fn blocked_pull_reports_clashes_and_keeps_files() {
     let (a, b, base) = fleet_of_two(&server).await;
 
     b.write("personal/x/SKILL.md", "x by beta\n");
-    eventually(|| async { server.row("beta").await?.report?.drafts.contains(&ItemRef::Skill("x".into())).then_some(()) })
-        .await;
+    eventually(|| async {
+        server.row("beta").await?.report?.drafts.contains(&ItemRef::Skill("x".into())).then_some(())
+    })
+    .await;
     a.write("personal/x/SKILL.md", "x by alpha\n");
     let p = a.commit(&["x"]).await;
     assert!(p.pushed);
@@ -619,8 +619,10 @@ async fn restore_sends_draft_discarded() {
     let (a, b, _) = fleet_of_two(&server).await;
 
     b.write("personal/w/SKILL.md", "work in progress\n");
-    eventually(|| async { server.row("beta").await?.report?.drafts.contains(&ItemRef::Skill("w".into())).then_some(()) })
-        .await;
+    eventually(|| async {
+        server.row("beta").await?.report?.drafts.contains(&ItemRef::Skill("w".into())).then_some(())
+    })
+    .await;
     // A draft-only skill can be assigned on its own machine, and is live there.
     assign(&a, "beta", vec![toggle("w", true)]).await;
     eventually(|| async { b.harness_skill("w").map(drop) }).await;
@@ -716,7 +718,9 @@ async fn stale_assignment_revision_is_ignored() {
                 other => panic!("event stream ended: {other:?}"),
             }
         }
-    }).await.expect("the inbox barrier");
+    })
+    .await
+    .expect("the inbox barrier");
     assert_eq!(m.status().await.assignment_revision, 5);
     assert!(m.harness_skill("x").is_some() && m.harness_skill("y").is_none());
     assert_eq!(m.snapshot().unwrap(), snapshot(5, &["x"]), "stored with its revision");
@@ -751,9 +755,8 @@ async fn repo_edits_before_the_first_server_connection_reach_the_harness() {
     let mut m = solo("solo", &server.url(), Some(snapshot(1, &["x"])));
     m.start().await;
     m.write("personal/x/SKILL.md", "edited before connecting\n");
-    eventually(|| async {
-        (m.harness_skill("x").as_deref() == Some("edited before connecting\n")).then_some(())
-    }).await;
+    eventually(|| async { (m.harness_skill("x").as_deref() == Some("edited before connecting\n")).then_some(()) })
+        .await;
     assert_ne!(m.status().await.connection, Connection::Connected);
 }
 
@@ -990,8 +993,10 @@ async fn discarded_drafts_are_reported_after_a_restart() {
     let mut server = Server::start().await;
     let (a, mut b, _) = fleet_of_two(&server).await;
     b.write("personal/w/SKILL.md", "work in progress\n");
-    eventually(|| async { server.row("beta").await?.report?.drafts.contains(&ItemRef::Skill("w".into())).then_some(()) })
-        .await;
+    eventually(|| async {
+        server.row("beta").await?.report?.drafts.contains(&ItemRef::Skill("w".into())).then_some(())
+    })
+    .await;
     assign(&a, "beta", vec![toggle("w", true)]).await;
     eventually(|| async { b.harness_skill("w").map(drop) }).await;
 
@@ -1048,8 +1053,7 @@ async fn joining_again_while_the_daemon_runs_resumes_management() {
 #[tokio::test(flavor = "multi_thread")]
 async fn failed_refresh_sends_no_status_or_discards() {
     let server = FakeServer::new().await;
-    let mut m = solo("solo", &server.url(), Some(snapshot(1, &[])))
-        .with_env("SK1LL_RECONCILE_INTERVAL", "1h");
+    let mut m = solo("solo", &server.url(), Some(snapshot(1, &[]))).with_env("SK1LL_RECONCILE_INTERVAL", "1h");
     write(m.outbox_path().parent().unwrap(), "daemon-outbox.json", r#"[{"id":1,"items":["skill:w"]}]"#);
     m.write("personal/w/SKILL.md", "recreated\n");
     let config = m.home.path().join(".config/sk1ll/machine.toml");
@@ -1082,8 +1086,11 @@ async fn discard_replay_skips_recreated_drafts_and_unpushed_items() {
     git(&m.repo(), &["add", "personal/v"]);
     git(&m.repo(), &["commit", "-qm", "commit v again"]);
     m.write("personal/w/SKILL.md", "recreated draft\n");
-    write(m.outbox_path().parent().unwrap(), "daemon-outbox.json",
-        r#"[{"id":1,"items":["skill:w","skill:v","skill:gone"]}]"#);
+    write(
+        m.outbox_path().parent().unwrap(),
+        "daemon-outbox.json",
+        r#"[{"id":1,"items":["skill:w","skill:v","skill:gone"]}]"#,
+    );
     m.start().await;
     let (mut ws, _) = server.accept().await;
     let DaemonMessage::Status(report) = next_message(&mut ws).await else { panic!("fresh status comes first") };
@@ -1095,17 +1102,20 @@ async fn discard_replay_skips_recreated_drafts_and_unpushed_items() {
     ws.close(None).await.unwrap();
     let (mut ws, _) = server.accept().await;
     let _ = next_message(&mut ws).await;
-    let DaemonMessage::DraftDiscarded { id: replay, .. } = next_message(&mut ws).await else { panic!("expected replay") };
+    let DaemonMessage::DraftDiscarded { id: replay, .. } = next_message(&mut ws).await else {
+        panic!("expected replay")
+    };
     assert_eq!(replay, id);
-    ws.send(Message::text(serde_json::to_string(&ServerMessage::DraftDiscardApplied { id: id.unwrap() }).unwrap())).await.unwrap();
+    ws.send(Message::text(serde_json::to_string(&ServerMessage::DraftDiscardApplied { id: id.unwrap() }).unwrap()))
+        .await
+        .unwrap();
     eventually(|| async { (m.status().await.pending_discards == 0).then_some(()) }).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn replacing_a_watched_skills_directory_rearms_the_watch() {
     let server = FakeServer::new().await;
-    let mut m = solo("solo", &server.url(), Some(snapshot(1, &["x"])))
-        .with_env("SK1LL_RECONCILE_INTERVAL", "1h");
+    let mut m = solo("solo", &server.url(), Some(snapshot(1, &["x"]))).with_env("SK1LL_RECONCILE_INTERVAL", "1h");
     m.start().await;
     eventually(|| async { (m.harness_skill("x").as_deref() == Some("x\n")).then_some(()) }).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1114,9 +1124,14 @@ async fn replacing_a_watched_skills_directory_rearms_the_watch() {
     eventually(|| async { (m.harness_skill("x").as_deref() == Some("x\n")).then_some(()) }).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     std::fs::write(m.skills().join("x/SKILL.md"), "edited in the replacement directory\n").unwrap();
-    tokio::time::timeout(Duration::from_secs(5), eventually(|| async {
-        m.status().await.report.conflicts.iter().any(|c| c.item == ItemRef::Skill("x".into())).then_some(())
-    })).await.expect("edits in the new inode must be watched without waiting for reconciliation");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        eventually(|| async {
+            m.status().await.report.conflicts.iter().any(|c| c.item == ItemRef::Skill("x".into())).then_some(())
+        }),
+    )
+    .await
+    .expect("edits in the new inode must be watched without waiting for reconciliation");
 }
 
 // ---------------------------------------------------------------------------
@@ -1232,10 +1247,15 @@ async fn displaced_conflicts_report_to_server_and_resolve() {
     for (id, dir) in [("adopt-me", &recovery), ("discard-me", &recovery), ("found-again", &area)] {
         let dir = dir.join(id);
         write(&dir.join("content"), "SKILL.md", "recovered edit\n");
-        write(&dir, "entry.json", &serde_json::json!({
-            "harness": HARNESS, "kind": "skill", "dest": m.skills().join("x"),
-            "expected": "", "displaced_at": 0
-        }).to_string());
+        write(
+            &dir,
+            "entry.json",
+            &serde_json::json!({
+                "harness": HARNESS, "kind": "skill", "dest": m.skills().join("x"),
+                "expected": "", "displaced_at": 0
+            })
+            .to_string(),
+        );
     }
     m.start().await;
     let (mut ws, _) = server.accept().await;
@@ -1277,7 +1297,11 @@ async fn imports_resolve_links_and_add_one_skill() {
     assert!(m.client.draft().await.unwrap().is_empty(), "resolving leaves the repo alone");
 
     let add = |path: Option<&str>| AddImportRequest {
-        name: String::new(), source: link.clone(), path: path.map(Into::into), git_ref: None, commit: None,
+        name: String::new(),
+        source: link.clone(),
+        path: path.map(Into::into),
+        git_ref: None,
+        commit: None,
     };
     let err = m.client.add_import(&add(None)).await.unwrap_err();
     assert_eq!(err.status, Some(400));
@@ -1285,15 +1309,19 @@ async fn imports_resolve_links_and_add_one_skill() {
     // Upstream moves on after the preview; the previewed commit is what's added.
     write(&source.join("skills/pdf"), "SKILL.md", "---\ndescription: v2\n---\n");
     git(&source, &["commit", "--quiet", "-am", "v2"]);
-    let added = m.client.add_import(&AddImportRequest { commit: Some(r.commit.clone()), ..add(Some("skills/pdf")) })
-        .await.unwrap();
+    let added = m
+        .client
+        .add_import(&AddImportRequest { commit: Some(r.commit.clone()), ..add(Some("skills/pdf")) })
+        .await
+        .unwrap();
     assert_eq!((added.name.as_str(), added.new_commit.as_str()), ("pdf", r.commit.as_str()));
     let vendored = std::fs::read_to_string(m.repo().join("imported/pdf/SKILL.md")).unwrap();
     assert!(vendored.contains("Work with PDFs"), "{vendored}");
     let draft = eventually(|| async {
         let d = m.client.draft().await.unwrap();
         (!d.is_empty()).then_some(d)
-    }).await;
+    })
+    .await;
     assert!(draft.iter().any(|d| d.item == ItemRef::Skill("pdf".into())), "{draft:?}");
 }
 
@@ -1324,7 +1352,8 @@ async fn an_explicit_root_path_overrides_a_folder_link() {
 
     let req: AddImportRequest = serde_json::from_value(serde_json::json!({
         "name": "", "source": link, "path": "", "ref": "HEAD",
-    })).unwrap();
+    }))
+    .unwrap();
     let added = m.client.add_import(&req).await.unwrap();
     assert_eq!((added.name.as_str(), added.new_commit.as_str()), ("r", r.commit.as_str()));
     let vendored = std::fs::read_to_string(m.repo().join("imported/r/SKILL.md")).unwrap();
@@ -1438,19 +1467,10 @@ async fn skills_api_browses_content_and_adopts_only_while_connected() {
     std::fs::write(config, text).unwrap();
     m.join(&server).await;
     m.start_connected().await;
-    m.write(
-        "personal/baseline/SKILL.md",
-        "---\ndescription: baseline\n---\nold",
-    );
-    m.write(
-        "instructions/git.md",
-        "---\ndescription: Git\n---\nrule baseline",
-    );
+    m.write("personal/baseline/SKILL.md", "---\ndescription: baseline\n---\nold");
+    m.write("instructions/git.md", "---\ndescription: Git\n---\nrule baseline");
     assert!(m.commit_all().await.pushed);
-    m.write(
-        "personal/baseline/SKILL.md",
-        "---\ndescription: draft\n---\nnew",
-    );
+    m.write("personal/baseline/SKILL.md", "---\ndescription: draft\n---\nnew");
     std::fs::remove_file(m.repo().join("instructions/git.md")).unwrap();
     let items = m.client.skills().await.unwrap();
     let baseline = items.iter().find(|s| s.name == "baseline").unwrap();
@@ -1460,89 +1480,28 @@ async fn skills_api_browses_content_and_adopts_only_while_connected() {
     let rule = items.iter().find(|s| s.name == "git").unwrap();
     assert_eq!(rule.kind, ContentType::Rule);
     assert_eq!(rule.draft, Some(sk1ll_core::Change::Deleted));
-    let q = |item: &str| ContentQuery {
-        item: item.into(),
-        hash: None,
-        harness: None,
-    };
-    let file = |item: &str, path: &str| FileQuery {
-        content: q(item),
-        path: path.into(),
-    };
-    assert!(
-        m.client
-            .skill_file(&file("skill:baseline", "SKILL.md"))
-            .await
-            .unwrap()
-            .text
-            .unwrap()
-            .ends_with("new")
-    );
-    assert!(
-        m.client
-            .skill_file(&file("rule:git", "git.md"))
-            .await
-            .unwrap()
-            .text
-            .unwrap()
-            .ends_with("rule baseline")
-    );
-    assert_eq!(
-        m.client.skill_tree(&q("rule:git")).await.unwrap()[0].path,
-        "git.md"
-    );
-    assert!(
-        m.client
-            .skill_file(&file("skill:baseline", "../sk1ll.toml"))
-            .await
-            .is_err()
-    );
+    let q = |item: &str| ContentQuery { item: item.into(), hash: None, harness: None };
+    let file = |item: &str, path: &str| FileQuery { content: q(item), path: path.into() };
+    assert!(m.client.skill_file(&file("skill:baseline", "SKILL.md")).await.unwrap().text.unwrap().ends_with("new"));
+    assert!(m.client.skill_file(&file("rule:git", "git.md")).await.unwrap().text.unwrap().ends_with("rule baseline"));
+    assert_eq!(m.client.skill_tree(&q("rule:git")).await.unwrap()[0].path, "git.md");
+    assert!(m.client.skill_file(&file("skill:baseline", "../sk1ll.toml")).await.is_err());
     std::fs::write(m.repo().join("personal/baseline/binary"), b"\x00\xff").unwrap();
-    assert!(
-        m.client
-            .skill_file(&file("skill:baseline", "binary"))
-            .await
-            .unwrap()
-            .binary
-    );
+    assert!(m.client.skill_file(&file("skill:baseline", "binary")).await.unwrap().binary);
     for path in [m.skills(), m.home.path().join("second")] {
-        write(
-            &path.join("pdf"),
-            "SKILL.md",
-            "---\ndescription: PDFs\n---\nsame",
-        );
+        write(&path.join("pdf"), "SKILL.md", "---\ndescription: PDFs\n---\nsame");
     }
-    write(
-        &m.home.path().join("different/pdf"),
-        "SKILL.md",
-        "different",
-    );
+    write(&m.home.path().join("different/pdf"), "SKILL.md", "different");
     let skills = m.client.skills().await.unwrap();
-    let unmanaged = skills
-        .iter()
-        .find(|s| s.kind == ContentType::Unmanaged && s.name == "pdf")
-        .unwrap();
+    let unmanaged = skills.iter().find(|s| s.kind == ContentType::Unmanaged && s.name == "pdf").unwrap();
     assert_eq!(unmanaged.variants.len(), 2);
     assert!(!unmanaged.clashes_with_repo);
-    let variant = unmanaged
-        .variants
-        .iter()
-        .find(|v| v.locations.len() == 2)
-        .unwrap();
-    let selected = ContentQuery {
-        hash: Some(variant.hash.clone()),
-        ..q("unmanaged:pdf")
-    };
-    assert_eq!(
-        m.client.skill_tree(&selected).await.unwrap()[0].path,
-        "SKILL.md"
-    );
+    let variant = unmanaged.variants.iter().find(|v| v.locations.len() == 2).unwrap();
+    let selected = ContentQuery { hash: Some(variant.hash.clone()), ..q("unmanaged:pdf") };
+    assert_eq!(m.client.skill_tree(&selected).await.unwrap()[0].path, "SKILL.md");
     assert!(
         m.client
-            .skill_file(&FileQuery {
-                content: selected,
-                path: "SKILL.md".into()
-            })
+            .skill_file(&FileQuery { content: selected, path: "SKILL.md".into() })
             .await
             .unwrap()
             .text
@@ -1551,8 +1510,7 @@ async fn skills_api_browses_content_and_adopts_only_while_connected() {
     );
     assert!(m.client.skill_tree(&q("unmanaged:pdf")).await.is_err());
     server.stop();
-    eventually(|| async { (m.status().await.connection == Connection::Offline).then_some(()) })
-        .await;
+    eventually(|| async { (m.status().await.connection == Connection::Offline).then_some(()) }).await;
     let target = ConflictTarget { harness: HARNESS.into(), name: "pdf".into() };
     for result in [m.client.adopt_unmanaged(&target).await, m.client.adopt(&target).await] {
         assert!(result.unwrap_err().message.contains("Adopt needs a connection to the Server"));
@@ -1576,44 +1534,38 @@ async fn skills_api_browses_content_and_adopts_only_while_connected() {
     assert!(!snap.assignment.skill_enabled("different", "pdf"));
     assert!(!snap.assignment.skill_enabled("empty", "pdf"));
     assert!(!m.home.path().join("empty/pdf").exists());
-    assert_eq!(
-        std::fs::read_to_string(m.home.path().join("different/pdf/SKILL.md")).unwrap(),
-        "different"
-    );
+    assert_eq!(std::fs::read_to_string(m.home.path().join("different/pdf/SKILL.md")).unwrap(), "different");
     assert!(m.skills().join(".sk1ll-tmp/displaced").is_dir());
     let recovered = m.client.recovered().await.unwrap();
-    let originals = recovered.iter().filter(|entry| entry.name == "pdf" && entry.path.as_ref().is_some_and(|path| {
-        std::fs::read_to_string(path.join("SKILL.md")).is_ok_and(|text| text.ends_with("same"))
-    })).count();
+    let originals = recovered
+        .iter()
+        .filter(|entry| {
+            entry.name == "pdf"
+                && entry.path.as_ref().is_some_and(|path| {
+                    std::fs::read_to_string(path.join("SKILL.md")).is_ok_and(|text| text.ends_with("same"))
+                })
+        })
+        .count();
     assert_eq!(originals, 2);
 
     let skills = m.client.skills().await.unwrap();
-    let adopted = skills
-        .iter()
-        .find(|s| s.name == "pdf" && s.kind == ContentType::Personal)
-        .unwrap();
+    let adopted = skills.iter().find(|s| s.name == "pdf" && s.kind == ContentType::Personal).unwrap();
     assert_eq!(adopted.enabled_harnesses, [HARNESS, "second"]);
     assert_eq!(adopted.draft, Some(sk1ll_core::Change::Added));
-    let unmanaged = skills
-        .iter()
-        .find(|s| s.kind == ContentType::Unmanaged && s.name == "pdf")
-        .unwrap();
+    let unmanaged = skills.iter().find(|s| s.kind == ContentType::Unmanaged && s.name == "pdf").unwrap();
     assert!(unmanaged.clashes_with_repo);
     assert!(
         m.client
-            .adopt_unmanaged(&ConflictTarget {
-                harness: "different".into(),
-                name: "pdf".into()
-            })
+            .adopt_unmanaged(&ConflictTarget { harness: "different".into(), name: "pdf".into() })
             .await
             .unwrap_err()
             .message
             .contains("already exists")
     );
     let log: Vec<LogEntry> = server.get("/log").await;
-    assert!(log.iter().any(|e| e.kind == ToggleKind::Skill
-        && e.name.as_deref() == Some("pdf")
-        && e.after == Some(true)));
+    assert!(
+        log.iter().any(|e| e.kind == ToggleKind::Skill && e.name.as_deref() == Some("pdf") && e.after == Some(true))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1642,18 +1594,39 @@ async fn unmanaged_adoption_retries_after_crash_between_publication_and_assignme
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gui_creation_import_inventory_check_and_conflict_diff() {
-    use sk1ll_daemon::client::{CreateItemRequest, ConflictDiffRequest};
+    use sk1ll_daemon::client::{ConflictDiffRequest, CreateItemRequest};
     let mut m = solo("gui", "http://127.0.0.1:1", Some(snapshot(1, &["x"])));
     m.start().await;
-    m.client.create_item(&CreateItemRequest { kind: "rule".into(), name: "style".into(), description: Some("House style".into()) }).await.unwrap();
+    m.client
+        .create_item(&CreateItemRequest {
+            kind: "rule".into(),
+            name: "style".into(),
+            description: Some("House style".into()),
+        })
+        .await
+        .unwrap();
     assert!(m.repo().join("instructions/style.md").exists());
-    assert!(m.client.create_item(&CreateItemRequest { kind: "rule".into(), name: "style".into(), description: None }).await.is_err());
+    assert!(
+        m.client
+            .create_item(&CreateItemRequest { kind: "rule".into(), name: "style".into(), description: None })
+            .await
+            .is_err()
+    );
     let upstream = tempfile::tempdir().unwrap();
     git(upstream.path(), &["init", "-q", "-b", "main"]);
     write(upstream.path(), "SKILL.md", "upstream v1\n");
     git(upstream.path(), &["add", "."]);
     git(upstream.path(), &["commit", "-qm", "first"]);
-    m.client.add_import(&AddImportRequest { name: "external".into(), source: upstream.path().display().to_string(), path: Some("".into()), git_ref: Some("main".into()), commit: None }).await.unwrap();
+    m.client
+        .add_import(&AddImportRequest {
+            name: "external".into(),
+            source: upstream.path().display().to_string(),
+            path: Some("".into()),
+            git_ref: Some("main".into()),
+            commit: None,
+        })
+        .await
+        .unwrap();
     let inventory = m.client.imports().await.unwrap();
     assert_eq!(inventory.imports.len(), 1);
     assert_eq!(inventory.imports[0].name, "external");
@@ -1667,11 +1640,20 @@ async fn gui_creation_import_inventory_check_and_conflict_diff() {
     eventually(|| async { m.harness_skill("x").filter(|s| s == "x\n") }).await;
     write(&m.skills().join("x"), "SKILL.md", "Harness edit\n");
     eventually(|| async { m.client.conflicts().await.ok().filter(|v| v.iter().any(|v| v.name == "x")) }).await;
-    let edited = std::fs::metadata(m.skills().join("x/SKILL.md")).unwrap().modified().unwrap()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let edited = std::fs::metadata(m.skills().join("x/SKILL.md"))
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let conflict = m.client.conflicts().await.unwrap().into_iter().find(|v| v.name == "x").unwrap();
     assert!(conflict.detected_at.is_some_and(|at| at >= edited), "{conflict:?}");
-    let diff = m.client.conflict_diff(&ConflictDiffRequest { harness: Some(HARNESS.into()), name: Some("x".into()), id: None }).await.unwrap();
+    let diff = m
+        .client
+        .conflict_diff(&ConflictDiffRequest { harness: Some(HARNESS.into()), name: Some("x".into()), id: None })
+        .await
+        .unwrap();
     assert!(diff.diff.contains("-Harness edit"), "{}", diff.diff);
     assert!(diff.diff.contains("+x"), "{}", diff.diff);
     assert!(!diff.diff.contains(".sk1ll-managed"), "{}", diff.diff);
@@ -1689,7 +1671,8 @@ async fn deleting_and_renaming_are_draft_changes_and_report_unmigrated_toggles_o
     git(&m.repo(), &["commit", "-qm", "rule"]);
     m.start().await;
     let delete = |kind: &str, name: &str| DeleteItemRequest { kind: kind.into(), name: name.into() };
-    let rename = |kind: &str, name: &str, to: &str| RenameItemRequest { kind: kind.into(), name: name.into(), to: to.into() };
+    let rename =
+        |kind: &str, name: &str, to: &str| RenameItemRequest { kind: kind.into(), name: name.into(), to: to.into() };
 
     m.client.delete_item(&delete("skill", "y")).await.unwrap();
     m.client.delete_item(&delete("rule", "style")).await.unwrap();
@@ -1701,17 +1684,29 @@ async fn deleting_and_renaming_are_draft_changes_and_report_unmigrated_toggles_o
     assert!(renamed.migrated.is_empty());
     assert!(renamed.assignment_error.as_deref().is_some_and(|e| e.contains("offline")), "{renamed:?}");
     // An item without explicit toggles has nothing to carry over.
-    m.client.create_item(&sk1ll_daemon::client::CreateItemRequest { kind: "rule".into(), name: "fresh".into(), description: None }).await.unwrap();
+    m.client
+        .create_item(&sk1ll_daemon::client::CreateItemRequest {
+            kind: "rule".into(),
+            name: "fresh".into(),
+            description: None,
+        })
+        .await
+        .unwrap();
     let plain = m.client.rename_item(&rename("rule", "fresh", "newer")).await.unwrap();
     assert_eq!((plain.migrated.len(), plain.assignment_error), (0, None));
 
     let draft: BTreeMap<String, ChangeKind> =
         m.client.draft().await.unwrap().into_iter().map(|d| (d.item.to_string(), d.change)).collect();
-    assert_eq!(draft, BTreeMap::from([
-        ("rule:newer".to_string(), ChangeKind::Added), ("rule:style".to_string(), ChangeKind::Deleted),
-        ("skill:x".to_string(), ChangeKind::Deleted), ("skill:x2".to_string(), ChangeKind::Added),
-        ("skill:y".to_string(), ChangeKind::Deleted),
-    ]));
+    assert_eq!(
+        draft,
+        BTreeMap::from([
+            ("rule:newer".to_string(), ChangeKind::Added),
+            ("rule:style".to_string(), ChangeKind::Deleted),
+            ("skill:x".to_string(), ChangeKind::Deleted),
+            ("skill:x2".to_string(), ChangeKind::Added),
+            ("skill:y".to_string(), ChangeKind::Deleted),
+        ])
+    );
     assert_eq!(std::fs::read_to_string(m.repo().join("personal/x2/SKILL.md")).unwrap(), "x\n");
     eventually(|| async { (!m.skills().join("x").exists()).then_some(()) }).await;
 }
@@ -1728,8 +1723,15 @@ async fn renaming_carries_this_machines_toggles_over() {
     assign(&a, "alpha", vec![toggle("x", true)]).await;
     eventually(|| async { a.harness_skill("x").map(drop) }).await;
 
-    let renamed = a.client.rename_item(&RenameItemRequest { kind: "skill".into(), name: "x".into(), to: "renamed".into() }).await.unwrap();
-    assert_eq!((renamed.migrated.as_slice(), renamed.assignment_error.as_deref()), ([HARNESS.to_string()].as_slice(), None));
+    let renamed = a
+        .client
+        .rename_item(&RenameItemRequest { kind: "skill".into(), name: "x".into(), to: "renamed".into() })
+        .await
+        .unwrap();
+    assert_eq!(
+        (renamed.migrated.as_slice(), renamed.assignment_error.as_deref()),
+        ([HARNESS.to_string()].as_slice(), None)
+    );
     let snapshot = a.client.assignment("alpha").await.unwrap();
     assert_eq!(snapshot.assignment.harness(HARNESS).skills.get("renamed"), Some(&true));
     let text = eventually(|| async { a.harness_skill("renamed") }).await;
@@ -1737,14 +1739,21 @@ async fn renaming_carries_this_machines_toggles_over() {
     eventually(|| async { (!a.skills().join("x").exists()).then_some(()) }).await;
 
     // The copy is an ordinary logged change, found through the log filters.
-    let query = sk1ll_proto::LogQuery { item: Some("SKILL:renamed".into()), author: Some("alpha".into()), ..Default::default() };
+    let query = sk1ll_proto::LogQuery {
+        item: Some("SKILL:renamed".into()),
+        author: Some("alpha".into()),
+        ..Default::default()
+    };
     let log = a.client.log(&query).await.unwrap();
     assert_eq!(log.len(), 1, "{log:?}");
     assert_eq!((log[0].cause.clone(), log[0].after), (LogCause::Change, Some(true)));
     let facets = a.client.log_facets().await.unwrap();
     assert!(facets.harnesses.contains(&HARNESS.to_string()) && facets.machines == ["alpha"], "{facets:?}");
     assert!(a.commit_all().await.pushed);
-    assert_eq!(a.client.assignment("alpha").await.unwrap().assignment.harness(HARNESS).skills.get("renamed"), Some(&true));
+    assert_eq!(
+        a.client.assignment("alpha").await.unwrap().assignment.harness(HARNESS).skills.get("renamed"),
+        Some(&true)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1754,17 +1763,33 @@ async fn block_conflict_diff_preserves_surrounding_notes() {
     snap.assignment.harnesses.get_mut(HARNESS).unwrap().new_rules_default = true;
     let mut m = solo("block-diff", "http://127.0.0.1:1", Some(snap));
     let config = m.home.path().join(".config/sk1ll/machine.toml");
-    let cfg = std::fs::read_to_string(&config).unwrap().replace("instructions_format = \"rules\"", "instructions_format = \"block\"");
+    let cfg = std::fs::read_to_string(&config)
+        .unwrap()
+        .replace("instructions_format = \"rules\"", "instructions_format = \"block\"");
     std::fs::write(config, cfg).unwrap();
     m.write("instructions/style.md", "---\ndescription: Style\n---\nExpected rule\n");
     git(&m.repo(), &["add", "."]);
     git(&m.repo(), &["commit", "-qm", "rule"]);
     m.start().await;
     let path = m.home.path().join("agent/rules");
-    let original = eventually(|| async { std::fs::read_to_string(&path).ok().filter(|s| s.contains("Expected rule")) }).await;
-    std::fs::write(&path, format!("My private notes\n{}\nMore notes\n", original.replace("Expected rule", "Edited rule"))).unwrap();
-    eventually(|| async { m.client.conflicts().await.ok().filter(|v| v.iter().any(|v| v.name == "instructions")) }).await;
-    let diff = m.client.conflict_diff(&ConflictDiffRequest { harness: Some(HARNESS.into()), name: Some("instructions".into()), id: None }).await.unwrap();
+    let original =
+        eventually(|| async { std::fs::read_to_string(&path).ok().filter(|s| s.contains("Expected rule")) }).await;
+    std::fs::write(
+        &path,
+        format!("My private notes\n{}\nMore notes\n", original.replace("Expected rule", "Edited rule")),
+    )
+    .unwrap();
+    eventually(|| async { m.client.conflicts().await.ok().filter(|v| v.iter().any(|v| v.name == "instructions")) })
+        .await;
+    let diff = m
+        .client
+        .conflict_diff(&ConflictDiffRequest {
+            harness: Some(HARNESS.into()),
+            name: Some("instructions".into()),
+            id: None,
+        })
+        .await
+        .unwrap();
     assert!(diff.diff.contains("-Edited rule"), "{}", diff.diff);
     assert!(diff.diff.contains("+Expected rule"), "{}", diff.diff);
     assert!(!diff.diff.contains("private notes"), "{}", diff.diff);

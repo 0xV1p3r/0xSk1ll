@@ -20,7 +20,11 @@ thread_local! {
 }
 #[cfg(test)]
 fn before_access() {
-    BEFORE_ACCESS.with_borrow_mut(|h| { if let Some(h) = h.take() { h(); } });
+    BEFORE_ACCESS.with_borrow_mut(|h| {
+        if let Some(h) = h.take() {
+            h();
+        }
+    });
 }
 
 pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
@@ -89,22 +93,15 @@ fn git(root: &Path) -> Git {
 }
 
 fn tracked(root: &Path, revision: &str) -> Result<Vec<(String, String, String)>> {
-    if !git(root)
-        .args(["rev-parse", "--verify", "--quiet", revision])
-        .succeeds()?
-    {
+    if !git(root).args(["rev-parse", "--verify", "--quiet", revision]).succeeds()? {
         return Ok(Vec::new());
     }
-    let raw = git(root)
-        .args(["ls-tree", "-r", "-t", "-z", "--full-tree", revision])
-        .run()?;
+    let raw = git(root).args(["ls-tree", "-r", "-t", "-z", "--full-tree", revision]).run()?;
     raw.split(|b| *b == 0)
         .filter(|b| !b.is_empty())
         .map(|row| {
             let text = std::str::from_utf8(row).map_err(|_| Error::Invalid("content path is not UTF-8".into()))?;
-            let (meta, path) = text
-                .split_once('\t')
-                .ok_or_else(|| Error::Invalid("invalid git tree".into()))?;
+            let (meta, path) = text.split_once('\t').ok_or_else(|| Error::Invalid("invalid git tree".into()))?;
             let mut fields = meta.split_whitespace();
             let mode = fields.next().unwrap_or_default().to_string();
             fields.next();
@@ -124,15 +121,9 @@ pub fn list(
 ) -> Result<Vec<ContentEntry>> {
     let mut head = tracked(repo.root(), "HEAD")?;
     head.sort_by_key(|(path, _, _)| !path.starts_with("personal/"));
-    let baseline = baseline
-        .map(|rev| tracked(repo.root(), rev))
-        .transpose()?
-        .unwrap_or_default();
-    let baseline: BTreeSet<_> = baseline
-        .iter()
-        .filter(|(p, _, _)| is_item(p))
-        .map(|(p, _, _)| ItemRef::for_path(Path::new(p)))
-        .collect();
+    let baseline = baseline.map(|rev| tracked(repo.root(), rev)).transpose()?.unwrap_or_default();
+    let baseline: BTreeSet<_> =
+        baseline.iter().filter(|(p, _, _)| is_item(p)).map(|(p, _, _)| ItemRef::for_path(Path::new(p))).collect();
     let drafts: BTreeMap<_, _> = repo.draft()?.into_iter().map(|d| (d.item, d.change)).collect();
     let rules = repo.rules()?;
     let mut entries = BTreeMap::new();
@@ -157,23 +148,13 @@ pub fn list(
         insert(
             s.name.clone(),
             ItemRef::Skill(s.name),
-            if s.origin == Origin::Personal {
-                ContentType::Personal
-            } else {
-                ContentType::Import
-            },
+            if s.origin == Origin::Personal { ContentType::Personal } else { ContentType::Import },
             s.path,
             s.description,
         );
     }
     for f in &rules {
-        insert(
-            f.name.clone(),
-            ItemRef::Rule(f.name.clone()),
-            ContentType::Rule,
-            f.path.clone(),
-            f.description.clone(),
-        );
+        insert(f.name.clone(), ItemRef::Rule(f.name.clone()), ContentType::Rule, f.path.clone(), f.description.clone());
     }
     for (path, _, oid) in &head {
         if !is_item(path) {
@@ -190,27 +171,17 @@ pub fn list(
         } else {
             ContentType::Rule
         };
-        let content = git(repo.root())
-            .args(["cat-file", "-s", oid])
-            .text()?
-            .parse::<u64>()
-            .unwrap_or(u64::MAX);
+        let content = git(repo.root()).args(["cat-file", "-s", oid]).text()?.parse::<u64>().unwrap_or(u64::MAX);
         let description = if drafts.get(&item).is_some_and(|c| *c != Change::Deleted) {
             None
         } else if content <= MAX_FILE_BYTES {
             let bytes = git(repo.root()).args(["cat-file", "blob", oid]).run()?;
-            std::str::from_utf8(&bytes)
-                .ok()
-                .and_then(|t| crate::skill::frontmatter_field(t, "description"))
+            std::str::from_utf8(&bytes).ok().and_then(|t| crate::skill::frontmatter_field(t, "description"))
         } else {
             None
         };
         let absolute = repo.root().join(path);
-        let absolute = if kind == ContentType::Rule {
-            absolute
-        } else {
-            absolute.parent().unwrap().to_path_buf()
-        };
+        let absolute = if kind == ContentType::Rule { absolute } else { absolute.parent().unwrap().to_path_buf() };
         entries.insert(
             item.clone(),
             ContentEntry {
@@ -299,9 +270,7 @@ fn source(repo: &Repo, harnesses: &BTreeMap<String, Harness>, query: &ContentQue
         ItemRef::Skill(name) => repo.skills()?.into_iter().find(|s| s.name == *name).map(|s| s.path),
         ItemRef::Rule(name) => repo.rules()?.into_iter().find(|f| f.name == *name).map(|f| f.path),
         _ => {
-            return Err(Error::Invalid(
-                "only Skills and Rules have browsable content".into(),
-            ));
+            return Err(Error::Invalid("only Skills and Rules have browsable content".into()));
         }
     };
     if let Some(path) = path {
@@ -319,11 +288,7 @@ fn source(repo: &Repo, harnesses: &BTreeMap<String, Harness>, query: &ContentQue
         .ok_or_else(|| Error::Invalid(format!("no item `{item}`")))?;
     // Removing SKILL.md alone leaves a modified Skill whose other Draft files
     // must still come from disk. Only a fully deleted item falls back to HEAD.
-    if matches!(item, ItemRef::Skill(_))
-        && !repo
-            .draft()?
-            .iter()
-            .any(|d| d.item == item && d.change == Change::Deleted)
+    if matches!(item, ItemRef::Skill(_)) && !repo.draft()?.iter().any(|d| d.item == item && d.change == Change::Deleted)
     {
         let directory = repo.root().join(Path::new(path).parent().unwrap());
         if directory.is_dir() {
@@ -384,11 +349,7 @@ pub fn tree(repo: &Repo, harnesses: &BTreeMap<String, Harness>, query: &ContentQ
             Ok(files)
         }
         Source::Head(root) => {
-            let base = if query.item.starts_with("rule:") {
-                root.parent().unwrap()
-            } else {
-                &root
-            };
+            let base = if query.item.starts_with("rule:") { root.parent().unwrap() } else { &root };
             let mut files = Vec::new();
             for (path, mode, oid) in tracked(repo.root(), "HEAD")? {
                 let path = Path::new(&path);
@@ -398,11 +359,7 @@ pub fn tree(repo: &Repo, harnesses: &BTreeMap<String, Harness>, query: &ContentQ
                 let size = if mode == "040000" {
                     0
                 } else {
-                    git(repo.root())
-                        .args(["cat-file", "-s", &oid])
-                        .text()?
-                        .parse()
-                        .unwrap_or(0)
+                    git(repo.root()).args(["cat-file", "-s", &oid]).text()?.parse().unwrap_or(0)
                 };
                 files.push(FileEntry {
                     path: path.strip_prefix(base).unwrap().to_string_lossy().into_owned(),
@@ -497,11 +454,7 @@ pub fn file(repo: &Repo, harnesses: &BTreeMap<String, Harness>, query: &FileQuer
             if mode != "100644" && mode != "100755" {
                 return Err(Error::Invalid("path is not a regular file".into()));
             }
-            let size = git(repo.root())
-                .args(["cat-file", "-s", oid])
-                .text()?
-                .parse()
-                .unwrap_or(u64::MAX);
+            let size = git(repo.root()).args(["cat-file", "-s", oid]).text()?.parse().unwrap_or(u64::MAX);
             (
                 if size <= MAX_FILE_BYTES {
                     git(repo.root()).args(["cat-file", "blob", oid]).run()?
@@ -513,55 +466,32 @@ pub fn file(repo: &Repo, harnesses: &BTreeMap<String, Harness>, query: &FileQuer
         }
     };
     let too_large = size > MAX_FILE_BYTES;
-    let text = if too_large {
-        None
-    } else {
-        String::from_utf8(bytes).ok().filter(|s| !s.contains('\0'))
-    };
+    let text = if too_large { None } else { String::from_utf8(bytes).ok().filter(|s| !s.contains('\0')) };
     let binary = !too_large && text.is_none();
-    Ok(FileContent {
-        path: query.path.clone(),
-        text,
-        binary,
-        too_large,
-        size,
-    })
+    Ok(FileContent { path: query.path.clone(), text, binary, too_large, size })
 }
 
 /// The editor destination for a personal Skill or Rule. Imports must be
 /// forked, and unmanaged skills adopted, before editing repo content.
 pub fn editable_path(repo: &Repo, harnesses: &BTreeMap<String, Harness>, input: &str) -> Result<PathBuf> {
-    let requested = if input.contains(':') {
-        Some(input.parse::<ItemRef>()?)
-    } else {
-        None
-    };
+    let requested = if input.contains(':') { Some(input.parse::<ItemRef>()?) } else { None };
     let mut matches = Vec::new();
     for skill in repo.skills()? {
-        if requested
-            .as_ref()
-            .map_or(skill.name == input, |r| *r == ItemRef::Skill(skill.name.clone()))
-        {
+        if requested.as_ref().map_or(skill.name == input, |r| *r == ItemRef::Skill(skill.name.clone())) {
             matches.push((skill.path.join("SKILL.md"), Some((skill.name, skill.origin))));
         }
     }
     for rule in repo.rules()? {
-        if requested.as_ref().map_or(rule.name == input, |r| {
-            *r == ItemRef::Rule(rule.name.clone())
-        }) {
+        if requested.as_ref().map_or(rule.name == input, |r| *r == ItemRef::Rule(rule.name.clone())) {
             matches.push((rule.path, None));
         }
     }
     if matches.len() > 1 {
-        return Err(Error::Invalid(format!(
-            "`{input}` is ambiguous; use skill:<name> or rule:<name>"
-        )));
+        return Err(Error::Invalid(format!("`{input}` is ambiguous; use skill:<name> or rule:<name>")));
     }
     if let Some((path, origin)) = matches.pop() {
         if let Some((name, Origin::Imported)) = origin {
-            return Err(Error::Invalid(format!(
-                "`{name}` is an Import; run `sk1ll fork {name}` before editing"
-            )));
+            return Err(Error::Invalid(format!("`{name}` is an Import; run `sk1ll fork {name}` before editing")));
         }
         let canonical = path.canonicalize().at(&path)?;
         if !canonical.starts_with(repo.root()) {
@@ -571,9 +501,7 @@ pub fn editable_path(repo: &Repo, harnesses: &BTreeMap<String, Harness>, input: 
     }
     let name = requested.as_ref().map_or(input, ItemRef::name);
     if !matches!(requested, Some(ItemRef::Rule(_)))
-        && let Some(skill) = unmanaged::discover(repo, harnesses)?
-            .into_iter()
-            .find(|s| s.name == name)
+        && let Some(skill) = unmanaged::discover(repo, harnesses)?.into_iter().find(|s| s.name == name)
     {
         let harness = &skill.variants[0].locations[0].harness;
         return Err(Error::Invalid(format!(
@@ -591,34 +519,15 @@ mod tests {
         fs::write(path, bytes).unwrap();
     }
     fn query(item: &str) -> ContentQuery {
-        ContentQuery {
-            item: item.into(),
-            hash: None,
-            harness: None,
-        }
+        ContentQuery { item: item.into(), hash: None, harness: None }
     }
     fn read(repo: &Repo, item: &str, path: &str) -> Result<FileContent> {
-        file(
-            repo,
-            &BTreeMap::new(),
-            &FileQuery {
-                content: query(item),
-                path: path.into(),
-            },
-        )
+        file(repo, &BTreeMap::new(), &FileQuery { content: query(item), path: path.into() })
     }
     fn commit(repo: &Repo) {
         Git::new(repo.root()).args(["add", "-A"]).run().unwrap();
         Git::new(repo.root())
-            .args([
-                "-c",
-                "user.name=Test",
-                "-c",
-                "user.email=test@example.com",
-                "commit",
-                "-qm",
-                "baseline",
-            ])
+            .args(["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "baseline"])
             .run()
             .unwrap();
     }
@@ -627,20 +536,11 @@ mod tests {
     fn listing_and_browsing_use_draft_and_fall_back_to_head_for_deleted_items() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = Repo::init(tmp.path()).unwrap();
-        write(
-            &repo.personal_dir().join("pdf/SKILL.md"),
-            "---\ndescription: baseline\n---\nold",
-        );
+        write(&repo.personal_dir().join("pdf/SKILL.md"), "---\ndescription: baseline\n---\nold");
         write(&repo.imported_dir().join("remote/SKILL.md"), "import");
-        write(
-            &repo.root().join("instructions/git.md"),
-            "---\ndescription: Git conventions\n---\nold rule",
-        );
+        write(&repo.root().join("instructions/git.md"), "---\ndescription: Git conventions\n---\nold rule");
         commit(&repo);
-        write(
-            &repo.personal_dir().join("pdf/SKILL.md"),
-            "---\ndescription: draft\n---\nnew",
-        );
+        write(&repo.personal_dir().join("pdf/SKILL.md"), "---\ndescription: draft\n---\nnew");
         write(&repo.personal_dir().join("new/SKILL.md"), "added");
         fs::remove_file(repo.root().join("instructions/git.md")).unwrap();
         let items = list(&repo, &BTreeMap::new(), &Assignment::default(), Some("HEAD")).unwrap();
@@ -654,35 +554,14 @@ mod tests {
         let rule = items.iter().find(|s| s.name == "git").unwrap();
         assert_eq!(rule.draft, Some(Change::Deleted));
         assert_eq!(rule.description.as_deref(), Some("Git conventions"));
-        assert!(
-            read(&repo, "skill:pdf", "SKILL.md")
-                .unwrap()
-                .text
-                .unwrap()
-                .ends_with("new")
-        );
-        assert!(
-            read(&repo, "rule:git", "git.md")
-                .unwrap()
-                .text
-                .unwrap()
-                .ends_with("old rule")
-        );
+        assert!(read(&repo, "skill:pdf", "SKILL.md").unwrap().text.unwrap().ends_with("new"));
+        assert!(read(&repo, "rule:git", "git.md").unwrap().text.unwrap().ends_with("old rule"));
         fs::remove_dir_all(repo.personal_dir().join("pdf")).unwrap();
-        assert!(
-            read(&repo, "skill:pdf", "SKILL.md")
-                .unwrap()
-                .text
-                .unwrap()
-                .ends_with("old")
-        );
+        assert!(read(&repo, "skill:pdf", "SKILL.md").unwrap().text.unwrap().ends_with("old"));
         let tree = tree(&repo, &BTreeMap::new(), &query("skill:pdf")).unwrap();
         assert_eq!(tree[0].path, "SKILL.md");
         assert!(
-            editable_path(&repo, &BTreeMap::new(), "remote")
-                .unwrap_err()
-                .to_string()
-                .contains("sk1ll fork remote")
+            editable_path(&repo, &BTreeMap::new(), "remote").unwrap_err().to_string().contains("sk1ll fork remote")
         );
     }
 
@@ -692,10 +571,7 @@ mod tests {
         let repo = Repo::init(tmp.path()).unwrap();
         write(&repo.personal_dir().join("pdf/SKILL.md"), "skill");
         write(&repo.personal_dir().join("pdf/binary"), b"\x00\xff");
-        write(
-            &repo.personal_dir().join("pdf/huge"),
-            vec![b'x'; MAX_FILE_BYTES as usize + 1],
-        );
+        write(&repo.personal_dir().join("pdf/huge"), vec![b'x'; MAX_FILE_BYTES as usize + 1]);
         for path in ["../sk1ll.toml", "/etc/passwd", "a/../../sk1ll.toml", ""] {
             assert!(read(&repo, "skill:pdf", path).is_err(), "{path}");
         }
@@ -726,39 +602,16 @@ mod tests {
                 write(&tmp.path().join(h).join("pdf/SKILL.md"), h);
                 (
                     h.into(),
-                    Harness {
-                        skills: Some(tmp.path().join(h).to_string_lossy().into_owned()),
-                        ..Default::default()
-                    },
+                    Harness { skills: Some(tmp.path().join(h).to_string_lossy().into_owned()), ..Default::default() },
                 )
             })
             .collect();
         assert!(tree(&repo, &hs, &query("unmanaged:pdf")).is_err());
         let hash = unmanaged::discover(&repo, &hs).unwrap()[0].variants[0].hash.clone();
-        let q = ContentQuery {
-            hash: Some(hash),
-            ..query("unmanaged:pdf")
-        };
+        let q = ContentQuery { hash: Some(hash), ..query("unmanaged:pdf") };
         assert_eq!(tree(&repo, &hs, &q).unwrap()[0].path, "SKILL.md");
-        assert!(
-            file(
-                &repo,
-                &hs,
-                &FileQuery {
-                    content: q,
-                    path: "SKILL.md".into()
-                }
-            )
-            .unwrap()
-            .text
-            .is_some()
-        );
-        assert!(
-            editable_path(&repo, &hs, "pdf")
-                .unwrap_err()
-                .to_string()
-                .contains("sk1ll adopt")
-        );
+        assert!(file(&repo, &hs, &FileQuery { content: q, path: "SKILL.md".into() }).unwrap().text.is_some());
+        assert!(editable_path(&repo, &hs, "pdf").unwrap_err().to_string().contains("sk1ll adopt"));
     }
 
     #[test]
@@ -787,10 +640,12 @@ mod tests {
             write(&outside.join("docs/data"), "secret");
             write(&outside.join("secret"), "secret");
             let swap = root.clone();
-            BEFORE_ACCESS.with_borrow_mut(|h| *h = Some(Box::new(move || {
-                fs::rename(&swap, swap.with_file_name("old-pdf")).unwrap();
-                std::os::unix::fs::symlink(outside, swap).unwrap();
-            })));
+            BEFORE_ACCESS.with_borrow_mut(|h| {
+                *h = Some(Box::new(move || {
+                    fs::rename(&swap, swap.with_file_name("old-pdf")).unwrap();
+                    std::os::unix::fs::symlink(outside, swap).unwrap();
+                }))
+            });
             if listing {
                 let result = tree(&repo, &BTreeMap::new(), &query("skill:pdf"));
                 if let Ok(entries) = result {
@@ -804,5 +659,4 @@ mod tests {
             }
         }
     }
-
 }

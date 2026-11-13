@@ -27,7 +27,9 @@ impl From<sk1ll_core::Error> for Error {
     fn from(e: sk1ll_core::Error) -> Self {
         match e {
             sk1ll_core::Error::Displaced { dest, kept, id } => Self::Conflict(format!(
-                "{} was swapped; concurrent edits recovered at {} (recovery id {id})", dest.display(), kept.display()
+                "{} was swapped; concurrent edits recovered at {} (recovery id {id})",
+                dest.display(),
+                kept.display()
             )),
             sk1ll_core::Error::Invalid(m) => Self::BadRequest(m),
             e => Self::Internal(e.into()),
@@ -62,7 +64,9 @@ mod tests {
     #[test]
     fn displaced_is_a_conflict_with_recovery_path() {
         let error = Error::from(sk1ll_core::Error::Displaced {
-            dest: "/harness/x".into(), kept: "/recovery/entry/content".into(), id: "entry".into(),
+            dest: "/harness/x".into(),
+            kept: "/recovery/entry/content".into(),
+            id: "entry".into(),
         });
         assert!(error.to_string().contains("/recovery/entry/content"));
         assert_eq!(error.into_response().status(), StatusCode::CONFLICT);

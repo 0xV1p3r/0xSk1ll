@@ -63,8 +63,11 @@ pub async fn forward(client: Client, emit: impl Fn(&str, Value) + Send + 'static
 }
 
 fn emit_connection(emit: &impl Fn(&str, Value), reachable: bool, message: Option<String>, delay: Duration) {
-    eprintln!("sk1ll-gui: Daemon {}{}", if reachable { "connected" } else { "unreachable" },
-        message.as_ref().map(|m| format!(": {m}")).unwrap_or_default());
+    eprintln!(
+        "sk1ll-gui: Daemon {}{}",
+        if reachable { "connected" } else { "unreachable" },
+        message.as_ref().map(|m| format!(": {m}")).unwrap_or_default()
+    );
     let event = ConnectionEvent { reachable, message, retry_in_ms: delay.as_millis() as u64 };
     emit("daemon-connection", serde_json::to_value(event).expect("serializing connection state"));
 }

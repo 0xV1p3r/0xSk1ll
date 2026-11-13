@@ -43,12 +43,8 @@ fn yes() -> bool {
 static ALL_ENABLED: HarnessAssignment = HarnessAssignment::ALL_ENABLED;
 
 impl HarnessAssignment {
-    const ALL_ENABLED: Self = Self {
-        new_skills_default: true,
-        new_rules_default: true,
-        skills: BTreeMap::new(),
-        rules: BTreeMap::new(),
-    };
+    const ALL_ENABLED: Self =
+        Self { new_skills_default: true, new_rules_default: true, skills: BTreeMap::new(), rules: BTreeMap::new() };
 
     pub fn skill_enabled(&self, name: &str) -> bool {
         self.skills.get(name).copied().unwrap_or(self.new_skills_default)
@@ -76,9 +72,8 @@ impl Assignment {
     /// Loads `path`; a missing file is the all-enabled default.
     pub fn load(path: &Path) -> Result<Self> {
         match fs::read_to_string(path) {
-            Ok(text) => {
-                serde_json::from_str(&text).map_err(|e| Error::Parse { path: path.to_path_buf(), message: e.to_string() })
-            }
+            Ok(text) => serde_json::from_str(&text)
+                .map_err(|e| Error::Parse { path: path.to_path_buf(), message: e.to_string() }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).at(path),
         }

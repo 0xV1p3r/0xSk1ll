@@ -505,9 +505,10 @@ mod tests {
     fn remove_rejects_unsafe_paths_before_mutating() {
         let src = Source::new();
         let mut repo = src.repo();
-        repo.manifest.import.insert("../personal".into(), Import {
-            source: "unused".into(), path: String::new(), git_ref: "HEAD".into(),
-        });
+        repo.manifest.import.insert(
+            "../personal".into(),
+            Import { source: "unused".into(), path: String::new(), git_ref: "HEAD".into() },
+        );
         fs::write(repo.root().join("sk1ll.toml"), toml::to_string(&repo.manifest).unwrap()).unwrap();
         fs::write(repo.personal_dir().join("keep.txt"), "personal content").unwrap();
         let before = fs::read(repo.root().join("sk1ll.toml")).unwrap();
@@ -556,8 +557,11 @@ mod tests {
             let skills = [("skills/pdf", "Work with PDFs"), ("skills/web", "Browse"), ("skills/web/nested", "")];
             for (dir, description) in skills {
                 fs::create_dir_all(origin.join(dir)).unwrap();
-                fs::write(origin.join(dir).join("SKILL.md"), format!("---\nname: x\ndescription: {description}\n---\n"))
-                    .unwrap();
+                fs::write(
+                    origin.join(dir).join("SKILL.md"),
+                    format!("---\nname: x\ndescription: {description}\n---\n"),
+                )
+                .unwrap();
             }
             fs::write(origin.join("README.md"), "skills\n").unwrap();
             git(&origin, &["init", "--quiet", "-b", "main"]);

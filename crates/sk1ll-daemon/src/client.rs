@@ -422,21 +422,40 @@ pub struct ImportEntry {
     pub locked: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateItemRequest { pub kind: String, pub name: String, pub description: Option<String> }
+pub struct CreateItemRequest {
+    pub kind: String,
+    pub name: String,
+    pub description: Option<String>,
+}
 /// A personal Skill or Rule (`kind` is `skill` or `rule`); Imports use `/imports/remove`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeleteItemRequest { pub kind: String, pub name: String }
+pub struct DeleteItemRequest {
+    pub kind: String,
+    pub name: String,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RenameItemRequest { pub kind: String, pub name: String, pub to: String }
+pub struct RenameItemRequest {
+    pub kind: String,
+    pub name: String,
+    pub to: String,
+}
 /// The rename is in the Draft either way. This machine's explicit toggles for
 /// the old name are copied to the new one in `migrated` harnesses; when that
 /// fails (offline, Server refused), `assignment_error` says why. Other
 /// machines' toggles are not copied: once the rename is pushed, the old
 /// name's are dropped (`item_removed`) and the new name follows their defaults.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RenameItemResponse { pub item: ItemRef, pub migrated: Vec<String>, pub assignment_error: Option<String> }
+pub struct RenameItemResponse {
+    pub item: ItemRef,
+    pub migrated: Vec<String>,
+    pub assignment_error: Option<String>,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConflictDiffRequest { pub harness: Option<String>, pub name: Option<String>, pub id: Option<String> }
+pub struct ConflictDiffRequest {
+    pub harness: Option<String>,
+    pub name: Option<String>,
+    pub id: Option<String>,
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
@@ -489,8 +508,7 @@ impl Client {
 
     async fn send(&self, method: Method, path: &str, body: Option<Vec<u8>>) -> Result<hyper::Response<Incoming>> {
         let stream = UnixStream::connect(&self.socket).await.map_err(|e| {
-            let not_running =
-                matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused);
+            let not_running = matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused);
             let message = format!("cannot reach the daemon at {}: {e}", self.socket.display());
             ClientError { status: None, message, not_running }
         })?;
@@ -541,11 +559,21 @@ impl Client {
         self.raw(Method::POST, path, Some(body)).await.map(drop)
     }
 
-    pub async fn create_item(&self, request: &CreateItemRequest) -> Result<()> { self.post_empty("/items/create", request).await }
-    pub async fn delete_item(&self, request: &DeleteItemRequest) -> Result<()> { self.post_empty("/items/delete", request).await }
-    pub async fn rename_item(&self, request: &RenameItemRequest) -> Result<RenameItemResponse> { self.post("/items/rename", request).await }
-    pub async fn conflict_diff(&self, request: &ConflictDiffRequest) -> Result<DiffView> { self.post("/conflicts/diff", request).await }
-    pub async fn check_imports(&self) -> Result<ImportsView> { self.post("/imports/check", &()).await }
+    pub async fn create_item(&self, request: &CreateItemRequest) -> Result<()> {
+        self.post_empty("/items/create", request).await
+    }
+    pub async fn delete_item(&self, request: &DeleteItemRequest) -> Result<()> {
+        self.post_empty("/items/delete", request).await
+    }
+    pub async fn rename_item(&self, request: &RenameItemRequest) -> Result<RenameItemResponse> {
+        self.post("/items/rename", request).await
+    }
+    pub async fn conflict_diff(&self, request: &ConflictDiffRequest) -> Result<DiffView> {
+        self.post("/conflicts/diff", request).await
+    }
+    pub async fn check_imports(&self) -> Result<ImportsView> {
+        self.post("/imports/check", &()).await
+    }
     pub async fn status(&self) -> Result<StatusView> {
         self.get("/status").await
     }
@@ -559,17 +587,11 @@ impl Client {
     }
 
     pub async fn skill_tree(&self, query: &ContentQuery) -> Result<Vec<FileEntry>> {
-        self.get(&format!("/skills/tree?{}", content_query(query)))
-            .await
+        self.get(&format!("/skills/tree?{}", content_query(query))).await
     }
 
     pub async fn skill_file(&self, query: &FileQuery) -> Result<FileContent> {
-        self.get(&format!(
-            "/skills/file?{}&path={}",
-            content_query(&query.content),
-            encode(&query.path)
-        ))
-        .await
+        self.get(&format!("/skills/file?{}&path={}", content_query(&query.content), encode(&query.path))).await
     }
 
     pub async fn adopt_unmanaged(&self, target: &ConflictTarget) -> Result<()> {
@@ -684,7 +706,9 @@ impl Client {
 
     pub async fn log(&self, query: &LogQuery) -> Result<Vec<LogEntry>> {
         let mut params = Vec::new();
-        for (key, value) in [("machine", &query.machine), ("harness", &query.harness), ("author", &query.author), ("item", &query.item)] {
+        for (key, value) in
+            [("machine", &query.machine), ("harness", &query.harness), ("author", &query.author), ("item", &query.item)]
+        {
             if let Some(v) = value {
                 params.push(format!("{key}={}", encode(v)));
             }

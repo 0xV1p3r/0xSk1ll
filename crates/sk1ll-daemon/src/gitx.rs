@@ -90,7 +90,10 @@ fn fetch_all(dir: &Path, env: Env) -> anyhow::Result<()> {
 }
 
 fn no_fleet_branch(others: &[String]) -> anyhow::Error {
-    anyhow::anyhow!("the server has no `{FLEET_BRANCH}` branch (it has {}); its baseline must be on it", others.join(", "))
+    anyhow::anyhow!(
+        "the server has no `{FLEET_BRANCH}` branch (it has {}); its baseline must be on it",
+        others.join(", ")
+    )
 }
 
 /// The branches origin had at the last [`fetch_all`].

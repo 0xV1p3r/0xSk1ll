@@ -134,11 +134,8 @@ fn relative_sources_mean_the_cwd_on_the_command_line_and_the_repo_root_in_the_ma
     let manifest = std::fs::read_to_string(env.root.join("repo/sk1ll.toml")).unwrap();
     assert!(manifest.contains(&format!("source = \"{}\"", env.origin())), "recorded absolute: {manifest}");
 
-    std::fs::write(
-        env.root.join("repo/sk1ll.toml"),
-        "[import.web]\nsource = \"../origin\"\npath = \"skills/web\"\n",
-    )
-    .unwrap();
+    std::fs::write(env.root.join("repo/sk1ll.toml"), "[import.web]\nsource = \"../origin\"\npath = \"skills/web\"\n")
+        .unwrap();
     // Scheme-less GitHub links and invalid sources are not treated as paths.
     let link = env.sk1ll_in(&cwd, &["add", "--list", "github.com/o/r"]);
     assert!(link.status.success() && text(&link).contains("github:o/r @ HEAD"), "{}", text(&link));

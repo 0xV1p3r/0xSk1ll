@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::instructions::{self, Rule, INSTRUCTIONS_DIR};
+use crate::instructions::{self, INSTRUCTIONS_DIR, Rule};
 use crate::lock::Lockfile;
 use crate::manifest::{MANIFEST_FILE, Manifest};
 use crate::skill::{self, IMPORTED_DIR, PERSONAL_DIR, Skill};
@@ -38,7 +38,9 @@ impl Repo {
         crate::imports::validate_name(name)?;
         let path = match kind {
             "skill" => {
-                if self.manifest.import.contains_key(name) || self.root.join("imported").join(name).symlink_metadata().is_ok() {
+                if self.manifest.import.contains_key(name)
+                    || self.root.join("imported").join(name).symlink_metadata().is_ok()
+                {
                     return Err(Error::Invalid(format!("name `{name}` is taken")));
                 }
                 self.root.join("personal").join(name)
@@ -46,11 +48,20 @@ impl Repo {
             "rule" => self.root.join(INSTRUCTIONS_DIR).join(format!("{name}.md")),
             _ => return Err(Error::Invalid("expected skill or rule".into())),
         };
-        if path.symlink_metadata().is_ok() { return Err(Error::Invalid(format!("name `{name}` is taken"))); }
+        if path.symlink_metadata().is_ok() {
+            return Err(Error::Invalid(format!("name `{name}` is taken")));
+        }
         let parent = path.parent().unwrap();
-        if parent.symlink_metadata().is_ok_and(|m| m.is_symlink()) { return Err(Error::Invalid("content directory is a symlink".into())); }
+        if parent.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+            return Err(Error::Invalid("content directory is a symlink".into()));
+        }
         fs::create_dir_all(parent).at(&path)?;
-        let file = if kind == "skill" { fs::create_dir(&path).at(&path)?; path.join("SKILL.md") } else { path };
+        let file = if kind == "skill" {
+            fs::create_dir(&path).at(&path)?;
+            path.join("SKILL.md")
+        } else {
+            path
+        };
         let quoted = serde_json::to_string(description).expect("string");
         let body = format!("---\nname: {name}\ndescription: {quoted}\n---\n\n");
         use std::io::Write;
@@ -67,9 +78,13 @@ impl Repo {
             "rule" => (self.root.join(INSTRUCTIONS_DIR), self.root.join(INSTRUCTIONS_DIR).join(format!("{name}.md"))),
             _ => return Err(Error::Invalid("expected skill or rule".into())),
         };
-        if parent.symlink_metadata().is_ok_and(|m| m.is_symlink()) { return Err(Error::Invalid("content directory is a symlink".into())); }
+        if parent.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+            return Err(Error::Invalid("content directory is a symlink".into()));
+        }
         let found = path.symlink_metadata().is_ok_and(|m| if kind == "skill" { m.is_dir() } else { m.is_file() });
-        if !found { return Err(Error::Invalid(format!("no personal {kind} named `{name}`"))); }
+        if !found {
+            return Err(Error::Invalid(format!("no personal {kind} named `{name}`")));
+        }
         Ok(path)
     }
 
@@ -84,7 +99,9 @@ impl Repo {
     pub fn rename_item(&self, kind: &str, name: &str, to: &str) -> Result<()> {
         let from = self.personal_item(kind, name)?;
         crate::imports::validate_name(to)?;
-        if name == to { return Err(Error::Invalid("the new name is the current name".into())); }
+        if name == to {
+            return Err(Error::Invalid("the new name is the current name".into()));
+        }
         let (dest, file) = match kind {
             "skill" => {
                 if self.manifest.import.contains_key(to) || self.imported_dir().join(to).symlink_metadata().is_ok() {
@@ -93,16 +110,31 @@ impl Repo {
                 let dest = self.personal_dir().join(to);
                 (dest.clone(), dest.join("SKILL.md"))
             }
-            _ => { let dest = self.root.join(INSTRUCTIONS_DIR).join(format!("{to}.md")); (dest.clone(), dest) }
+            _ => {
+                let dest = self.root.join(INSTRUCTIONS_DIR).join(format!("{to}.md"));
+                (dest.clone(), dest)
+            }
         };
-        if dest.symlink_metadata().is_ok() { return Err(Error::Invalid(format!("name `{to}` is taken"))); }
-        crate::sync::rename_noreplace(&from, &dest).map_err(|e| if e.kind() == std::io::ErrorKind::AlreadyExists {
-            Error::Invalid(format!("name `{to}` is taken"))
-        } else { Error::Io { path: dest.clone(), source: e } })?;
+        if dest.symlink_metadata().is_ok() {
+            return Err(Error::Invalid(format!("name `{to}` is taken")));
+        }
+        crate::sync::rename_noreplace(&from, &dest).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                Error::Invalid(format!("name `{to}` is taken"))
+            } else {
+                Error::Io { path: dest.clone(), source: e }
+            }
+        })?;
         // Only a regular file is rewritten: a symlinked SKILL.md points elsewhere.
         let Ok(meta) = file.symlink_metadata() else { return Ok(()) };
-        let Some(renamed) = meta.is_file().then(|| fs::read_to_string(&file).ok()).flatten()
-            .and_then(|text| rename_frontmatter(&text, name, to)) else { return Ok(()) };
+        let Some(renamed) = meta
+            .is_file()
+            .then(|| fs::read_to_string(&file).ok())
+            .flatten()
+            .and_then(|text| rename_frontmatter(&text, name, to))
+        else {
+            return Ok(());
+        };
         // A fresh, exclusively created name: a planted file or symlink at a
         // predictable path must never be followed or overwritten.
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
@@ -114,17 +146,16 @@ impl Repo {
             out.set_permissions(meta.permissions()).at(&tmp)?;
             fs::rename(&tmp, &file).at(&file)
         })();
-        if staged.is_err() { let _ = fs::remove_file(&tmp); }
+        if staged.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
         staged
     }
 
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         if !root.join(MANIFEST_FILE).is_file() {
-            return Err(Error::Invalid(format!(
-                "no {MANIFEST_FILE} in {} (run `sk1ll init`?)",
-                root.display()
-            )));
+            return Err(Error::Invalid(format!("no {MANIFEST_FILE} in {} (run `sk1ll init`?)", root.display())));
         }
         let root = root.canonicalize().at(root)?;
         Ok(Self { manifest: Manifest::load(&root)?, lock: Lockfile::load(&root)?, root })
@@ -243,9 +274,16 @@ fn rename_frontmatter(text: &str, from: &str, to: &str) -> Option<String> {
     for line in frontmatter.split_inclusive('\n') {
         let value = line.strip_prefix("name:").map(|v| v.trim().trim_matches(|c| c == '"' || c == '\''));
         if value == Some(from) {
-            let ending = if line.ends_with("\r\n") { "\r\n" } else if line.ends_with('\n') { "\n" } else { "" };
+            let ending = if line.ends_with("\r\n") {
+                "\r\n"
+            } else if line.ends_with('\n') {
+                "\n"
+            } else {
+                ""
+            };
             // Quote names YAML would read as another type (`true`, `null`, `123`).
-            let plain = matches!(serde_yaml_ng::from_str::<serde_yaml_ng::Value>(to), Ok(serde_yaml_ng::Value::String(_)));
+            let plain =
+                matches!(serde_yaml_ng::from_str::<serde_yaml_ng::Value>(to), Ok(serde_yaml_ng::Value::String(_)));
             let value = if plain { to.to_string() } else { format!("\"{to}\"") };
             return Some(format!("{}name: {value}{ending}{}", &text[..at], &text[at + line.len()..]));
         }
@@ -360,7 +398,9 @@ mod create_tests {
         repo.create_item("skill", "new-skill", "quotes: \" and\nnewlines").unwrap();
         assert!(dir.path().join("personal/new-skill/SKILL.md").exists());
         assert!(repo.create_item("skill", "new-skill", "").is_err());
-        for name in ["", "..", "../escape", ".hidden", "a/b", "with space"] { assert!(repo.create_item("rule", name, "").is_err()); }
+        for name in ["", "..", "../escape", ".hidden", "a/b", "with space"] {
+            assert!(repo.create_item("rule", name, "").is_err());
+        }
         repo.create_item("rule", "style", "House style").unwrap();
         assert!(dir.path().join("instructions/style.md").exists());
         assert!(repo.create_item("rule", "style", "").is_err());
@@ -395,11 +435,19 @@ mod create_tests {
         fs::write(dir.path().join("imported/vendored/SKILL.md"), "---\nname: vendored\n---\n").unwrap();
 
         // Imports, missing items and escapes are refused.
-        for (kind, name) in [("skill", "vendored"), ("skill", "missing"), ("rule", "missing"), ("skill", "../imported"), ("other", "pdf")] {
+        for (kind, name) in [
+            ("skill", "vendored"),
+            ("skill", "missing"),
+            ("rule", "missing"),
+            ("skill", "../imported"),
+            ("other", "pdf"),
+        ] {
             assert!(repo.delete_item(kind, name).is_err(), "{kind}:{name}");
             assert!(repo.rename_item(kind, name, "fresh").is_err(), "{kind}:{name}");
         }
-        for to in ["vendored", "pdf", "../x", ""] { assert!(repo.rename_item("skill", "pdf", to).is_err(), "{to}"); }
+        for to in ["vendored", "pdf", "../x", ""] {
+            assert!(repo.rename_item("skill", "pdf", to).is_err(), "{to}");
+        }
         repo.create_item("skill", "other", "").unwrap();
         assert!(repo.rename_item("skill", "pdf", "other").is_err());
 
@@ -408,12 +456,21 @@ mod create_tests {
         let text = fs::read_to_string(dir.path().join("personal/documents/SKILL.md")).unwrap();
         assert_eq!(text, "---\nname: documents\ndescription: \"PDF\"\n---\n\n");
         assert_eq!(fs::read_to_string(dir.path().join("personal/documents/notes.md")).unwrap(), "kept");
-        assert!(fs::read_dir(dir.path().join("personal/documents")).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().starts_with(".sk1ll")));
+        assert!(
+            fs::read_dir(dir.path().join("personal/documents")).unwrap().all(|e| !e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".sk1ll"))
+        );
 
         // A `name:` that doesn't match the old name is left alone.
         fs::write(dir.path().join("instructions/style.md"), "---\nname: House\n---\nbody\n").unwrap();
         repo.rename_item("rule", "style", "house-style").unwrap();
-        assert_eq!(fs::read_to_string(dir.path().join("instructions/house-style.md")).unwrap(), "---\nname: House\n---\nbody\n");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("instructions/house-style.md")).unwrap(),
+            "---\nname: House\n---\nbody\n"
+        );
 
         repo.delete_item("skill", "documents").unwrap();
         repo.delete_item("rule", "house-style").unwrap();
@@ -424,8 +481,10 @@ mod create_tests {
 
     #[test]
     fn frontmatter_rename_keeps_everything_else() {
-        assert_eq!(rename_frontmatter("---\r\nname: 'a'\r\nx: a\r\n---\r\nname: a\r\n", "a", "b").as_deref(),
-            Some("---\r\nname: b\r\nx: a\r\n---\r\nname: a\r\n"));
+        assert_eq!(
+            rename_frontmatter("---\r\nname: 'a'\r\nx: a\r\n---\r\nname: a\r\n", "a", "b").as_deref(),
+            Some("---\r\nname: b\r\nx: a\r\n---\r\nname: a\r\n")
+        );
         assert_eq!(rename_frontmatter("name: a\n", "a", "b"), None);
         assert_eq!(rename_frontmatter("---\nname: c\n---\n", "a", "b"), None);
         for to in ["true", "null", "123", "1.5"] {

@@ -24,7 +24,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
-use sk1ll_proto::{AssignmentSnapshot, ServerMessage, ImportsView, ItemRef};
+use sk1ll_proto::{AssignmentSnapshot, ImportsView, ItemRef, ServerMessage};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 

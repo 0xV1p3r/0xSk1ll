@@ -26,9 +26,9 @@ mod config;
 mod daemon;
 mod error;
 pub mod gitx;
-mod server;
 pub mod join;
 mod outbox;
+mod server;
 pub mod state;
 mod watch;
 
@@ -37,9 +37,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, bail};
 pub use config::{Config, parse_duration};
-pub use server::set_assignment_direct;
 use daemon::Daemon;
 pub use join::{JoinOptions, Joined, join, join_or_rejoin};
+pub use server::set_assignment_direct;
 pub use state::DaemonState;
 
 static PREPARED: AtomicBool = AtomicBool::new(false);

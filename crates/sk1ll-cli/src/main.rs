@@ -4,9 +4,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use sk1ll_core::{
-    Action, ActionKind, Assignment, Change, EngineLock, HarnessOrigin, ImportState, InstructionsFormat, Item,
-    ItemRef, LinkMode, MachineConfig, Origin, PlanOptions, PullOutcome, Repo, default_commit_message, machine_author,
-    sync,
+    Action, ActionKind, Assignment, Change, EngineLock, HarnessOrigin, ImportState, InstructionsFormat, Item, ItemRef,
+    LinkMode, MachineConfig, Origin, PlanOptions, PullOutcome, Repo, default_commit_message, machine_author, sync,
 };
 
 #[cfg(unix)]
@@ -38,7 +37,9 @@ mod fleet {
     }
 
     pub(crate) fn queue_discarded(
-        _state: Option<&Path>, _lock: Option<&sk1ll_core::EngineLock>, _items: Vec<sk1ll_core::ItemRef>,
+        _state: Option<&Path>,
+        _lock: Option<&sk1ll_core::EngineLock>,
+        _items: Vec<sk1ll_core::ItemRef>,
     ) -> Result<()> {
         Ok(())
     }
@@ -236,8 +237,15 @@ enum RecoverCmd {
 
 fn print_recovered(entries: Vec<sync::displaced::Entry>) {
     for e in entries {
-        println!("{} {} {:?} {} {}{}", e.id, e.harness, e.kind, e.dest.display(), e.path.display(),
-            if e.changed { " (changed)" } else { "" });
+        println!(
+            "{} {} {:?} {} {}{}",
+            e.id,
+            e.harness,
+            e.kind,
+            e.dest.display(),
+            e.path.display(),
+            if e.changed { " (changed)" } else { "" }
+        );
     }
 }
 
@@ -251,7 +259,8 @@ impl Cmd {
     /// engine lock while they run.
     fn mutates(&self) -> bool {
         match self {
-            Self::Recover { .. } | Self::Conflicts
+            Self::Recover { .. }
+            | Self::Conflicts
             | Self::Update { .. }
             | Self::Remove { .. }
             | Self::Fork { .. }
@@ -407,20 +416,13 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Init { .. } | Cmd::Join { .. } | Cmd::Daemon | Cmd::Fleet => unreachable!(),
         Cmd::List { unmanaged: true } => {
             for skill in sync::unmanaged::discover(&repo, &machine()?.harnesses())? {
-                let harnesses: std::collections::BTreeSet<_> = skill
-                    .variants
-                    .iter()
-                    .flat_map(|v| v.locations.iter().map(|l| l.harness.as_str()))
-                    .collect();
+                let harnesses: std::collections::BTreeSet<_> =
+                    skill.variants.iter().flat_map(|v| v.locations.iter().map(|l| l.harness.as_str())).collect();
                 println!(
                     "{:<24} {:<24} {}",
                     skill.name,
                     harnesses.into_iter().collect::<Vec<_>>().join(", "),
-                    if skill.variants.len() > 1 {
-                        "differs"
-                    } else {
-                        ""
-                    }
+                    if skill.variants.len() > 1 { "differs" } else { "" }
                 );
             }
         }
@@ -429,11 +431,7 @@ fn run(cli: Cli) -> Result<()> {
             let editor = std::env::var("VISUAL")
                 .ok()
                 .filter(|e| !e.trim().is_empty())
-                .or_else(|| {
-                    std::env::var("EDITOR")
-                        .ok()
-                        .filter(|e| !e.trim().is_empty())
-                })
+                .or_else(|| std::env::var("EDITOR").ok().filter(|e| !e.trim().is_empty()))
                 .context("set $VISUAL or $EDITOR to edit a Skill or Rule")?;
             #[cfg(unix)]
             let status = std::process::Command::new("sh")
@@ -623,12 +621,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             let unmanaged = sync::unmanaged::discover(&repo, &harnesses)?
                 .iter()
-                .any(|s| {
-                    s.name == name
-                        && s.variants
-                            .iter()
-                            .any(|v| v.locations.iter().any(|l| l.harness == harness))
-                });
+                .any(|s| s.name == name && s.variants.iter().any(|v| v.locations.iter().any(|l| l.harness == harness)));
             let adopted = if unmanaged { None } else { sync::unmanaged::adopted(&repo, &harnesses, &harness, &name)? };
             if unmanaged || adopted.is_some() {
                 fleet::require_standalone_adoption(daemon_state.as_deref(), &repo)?;
@@ -643,14 +636,10 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 assignments.save(&assignment_path)?;
                 sync::unmanaged::complete(&repo, &harnesses, &adoption)?;
-                for action in
-                    sync::plan(&repo, &harnesses, &assignments, PlanOptions::default())?
-                {
+                for action in sync::plan(&repo, &harnesses, &assignments, PlanOptions::default())? {
                     sync::apply(&repo, &action)?;
                 }
-                println!(
-                    "adopted {name} from {harness} into the draft; review with `sk1ll diff {name}`"
-                );
+                println!("adopted {name} from {harness} into the draft; review with `sk1ll diff {name}`");
                 return Ok(());
             }
             let actions = sync::plan(&repo, &harnesses, &assignment()?, PlanOptions::default())?;
@@ -705,11 +694,8 @@ fn run(cli: Cli) -> Result<()> {
 fn lock_direct(repo: &Path) -> Result<Option<EngineLock>> {
     let absolute = std::path::absolute(repo)?;
     let existing = absolute.ancestors().find(|p| p.is_dir()).context("repo has no existing ancestor")?;
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(existing)
-        .args(["rev-parse", "--show-toplevel"])
-        .output()?;
+    let out =
+        std::process::Command::new("git").arg("-C").arg(existing).args(["rev-parse", "--show-toplevel"]).output()?;
     if !out.status.success() {
         return Ok(None);
     }
@@ -880,9 +866,14 @@ mod tests {
         #[cfg(unix)]
         fn joined(&self, server_url: &str) {
             sk1ll_daemon::DaemonState {
-                machine_id: "test".into(), server_url: server_url.into(), token: "tok".into(),
-                repo: self.0.clone(), revoked: false,
-            }.save(&self.0.join(".git/daemon.json")).unwrap();
+                machine_id: "test".into(),
+                server_url: server_url.into(),
+                token: "tok".into(),
+                repo: self.0.clone(),
+                revoked: false,
+            }
+            .save(&self.0.join(".git/daemon.json"))
+            .unwrap();
         }
     }
 
@@ -932,20 +923,29 @@ mod tests {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
                 headers.push_str(&line);
-                if line == "\r\n" { break; }
+                if line == "\r\n" {
+                    break;
+                }
             }
-            let len: usize = headers.lines().find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().unwrap())
-            }).unwrap();
+            let len: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().unwrap())
+                })
+                .unwrap();
             let mut body = vec![0; len];
             reader.read_exact(&mut body).unwrap();
             assert!(EngineLock::try_acquire(&root).unwrap().is_none(), "held across the Server request");
             let response = r#"{"revision":9,"assignment":{"harnesses":{
                 "h":{"new_skills_default":false,"skills":{"pdf":false}}}},"entries":[]}"#;
-            write!(stream,
+            write!(
+                stream,
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
-                 connection: close\r\n\r\n{response}", response.len()).unwrap();
+                 connection: close\r\n\r\n{response}",
+                response.len()
+            )
+            .unwrap();
             (headers, String::from_utf8(body).unwrap())
         });
         let result = repo.run(&["assign", "h", "skill", "pdf", "off", "--default-skills", "off"]);
@@ -969,13 +969,18 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
         repo.joined(&url);
-        sk1ll_daemon::state::save_snapshot(&repo.0.join(".git/daemon-assignment.json"),
-            &sk1ll_proto::AssignmentSnapshot::default()).unwrap();
+        sk1ll_daemon::state::save_snapshot(
+            &repo.0.join(".git/daemon-assignment.json"),
+            &sk1ll_proto::AssignmentSnapshot::default(),
+        )
+        .unwrap();
         let err = repo.run(&["assign", "h", "skill", "pdf", "on"]).expect_err("fleet assignment must reach the server");
         assert!(err.to_string().contains("server is unreachable"), "{err}");
         assert!(!repo.0.join("assignment.json").exists(), "the mirror cannot record an unaccepted change");
-        assert_eq!(sk1ll_daemon::state::load_snapshot(&repo.0.join(".git/daemon-assignment.json"))
-            .unwrap().unwrap().revision, 0);
+        assert_eq!(
+            sk1ll_daemon::state::load_snapshot(&repo.0.join(".git/daemon-assignment.json")).unwrap().unwrap().revision,
+            0
+        );
     }
 
     #[test]
@@ -998,19 +1003,32 @@ mod tests {
     fn direct_sync_uses_the_authoritative_assignment_and_requires_a_snapshot() {
         let repo = TestRepo::new().with_skill();
         let skills = repo.0.join(".git/harness/skills");
-        fs::write(repo.0.join("machine.toml"), format!(
-            "id = 'test'\n[harnesses.h]\nskills = '{}'\nmode = 'copy'\n\
+        fs::write(
+            repo.0.join("machine.toml"),
+            format!(
+                "id = 'test'\n[harnesses.h]\nskills = '{}'\nmode = 'copy'\n\
              [harnesses.claude]\nenabled = false\n[harnesses.codex]\nenabled = false\n\
-             [harnesses.opencode]\nenabled = false\n[harnesses.cursor]\nenabled = false\n", skills.display()
-        )).unwrap();
+             [harnesses.opencode]\nenabled = false\n[harnesses.cursor]\nenabled = false\n",
+                skills.display()
+            ),
+        )
+        .unwrap();
         sk1ll_daemon::DaemonState {
-            machine_id: "test".into(), server_url: "http://127.0.0.1:1".into(), token: "tok".into(),
-            repo: repo.0.clone(), revoked: false,
-        }.save(&repo.0.join(".git/daemon.json")).unwrap();
+            machine_id: "test".into(),
+            server_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            repo: repo.0.clone(),
+            revoked: false,
+        }
+        .save(&repo.0.join(".git/daemon.json"))
+        .unwrap();
         let mut assignment = Assignment::default();
         assignment.set_skill("h", "pdf", false);
-        sk1ll_daemon::state::save_snapshot(&repo.0.join(".git/daemon-assignment.json"),
-            &sk1ll_proto::AssignmentSnapshot { revision: 7, assignment }).unwrap();
+        sk1ll_daemon::state::save_snapshot(
+            &repo.0.join(".git/daemon-assignment.json"),
+            &sk1ll_proto::AssignmentSnapshot { revision: 7, assignment },
+        )
+        .unwrap();
         repo.run(&["sync"]).unwrap();
         assert!(!skills.join("pdf").exists(), "a missing mirror must not enable a disabled skill");
         Assignment::default().save(&repo.0.join("assignment.json")).unwrap();
@@ -1105,11 +1123,16 @@ mod tests {
     fn dry_run_leaves_another_syncs_work_in_progress_alone() {
         let repo = TestRepo::new().with_skill();
         let skills = repo.0.join(".git/harness/skills");
-        fs::write(repo.0.join("machine.toml"), format!(
-            "id = 'test'\n[harnesses.h]\nskills = '{}'\nmode = 'copy'\n\
+        fs::write(
+            repo.0.join("machine.toml"),
+            format!(
+                "id = 'test'\n[harnesses.h]\nskills = '{}'\nmode = 'copy'\n\
              [harnesses.claude]\nenabled = false\n[harnesses.codex]\nenabled = false\n\
-             [harnesses.opencode]\nenabled = false\n[harnesses.cursor]\nenabled = false\n", skills.display()
-        )).unwrap();
+             [harnesses.opencode]\nenabled = false\n[harnesses.cursor]\nenabled = false\n",
+                skills.display()
+            ),
+        )
+        .unwrap();
         let stage = skills.join(".sk1ll-tmp/stage-pdf");
         fs::create_dir_all(&stage).unwrap();
         fs::write(stage.join("SKILL.md"), "being staged by the lock holder").unwrap();

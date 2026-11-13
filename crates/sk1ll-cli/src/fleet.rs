@@ -5,7 +5,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use sk1ll_daemon::client::{
-    AddImportRequest, ChangeKind, Client, ConflictTarget, CommitRequest, PullResult, RestoreRequest, StatusView,
+    AddImportRequest, ChangeKind, Client, CommitRequest, ConflictTarget, PullResult, RestoreRequest, StatusView,
     SyncRequest, UpdateImportsRequest,
 };
 use sk1ll_daemon::{Config, DaemonState};
@@ -61,13 +61,14 @@ pub(crate) fn assign_direct(cli: &Cli, repo: &Path, lock: Option<&sk1ll_core::En
         bail!("unknown harness `{harness}` on this machine (see `sk1ll harnesses`)");
     }
     let mut changes = Vec::new();
-    let toggle = |kind, name, on: bool| ToggleChange {
-        harness: harness.clone(), kind, name, enabled: Some(on),
-    };
+    let toggle = |kind, name, on: bool| ToggleChange { harness: harness.clone(), kind, name, enabled: Some(on) };
     let target = assign_target(*kind, name.clone(), *enabled, *default_skills, *default_rules)?;
     if let Some((kind, name, enabled)) = target {
         check_exists(&sk1ll_core::Repo::open(repo)?, kind, &name)?;
-        let kind = match kind { Kind::Skill => ToggleKind::Skill, Kind::Rule => ToggleKind::Rule };
+        let kind = match kind {
+            Kind::Skill => ToggleKind::Skill,
+            Kind::Rule => ToggleKind::Rule,
+        };
         changes.push(toggle(kind, Some(name), enabled.on()));
     }
     if let Some(s) = default_skills {
@@ -77,7 +78,8 @@ pub(crate) fn assign_direct(cli: &Cli, repo: &Path, lock: Option<&sk1ll_core::En
         changes.push(toggle(ToggleKind::NewRulesDefault, None, s.on()));
     }
     let lock = lock.context("a fleet assignment change requires the engine lock")?;
-    let update = runtime()?.block_on(sk1ll_daemon::set_assignment_direct(&cfg, lock, &AssignmentChanges { changes }))?;
+    let update =
+        runtime()?.block_on(sk1ll_daemon::set_assignment_direct(&cfg, lock, &AssignmentChanges { changes }))?;
     println!("fleet assignment of {} is now revision {}; run `sk1ll sync` to apply", state.machine_id, update.revision);
     Ok(true)
 }
@@ -110,7 +112,9 @@ pub(crate) fn assignment(state: Option<&Path>, cache: &Path) -> Result<sk1ll_cor
 }
 
 pub(crate) fn queue_discarded(
-    state: Option<&Path>, lock: Option<&sk1ll_core::EngineLock>, items: Vec<sk1ll_core::ItemRef>,
+    state: Option<&Path>,
+    lock: Option<&sk1ll_core::EngineLock>,
+    items: Vec<sk1ll_core::ItemRef>,
 ) -> Result<()> {
     let mut cfg = Config::from_env()?;
     if let Some(p) = state {
@@ -124,13 +128,20 @@ pub(crate) fn queue_discarded(
 
 pub(crate) fn require_standalone_adoption(state: Option<&Path>, repo: &sk1ll_core::Repo) -> Result<()> {
     let mut cfg = Config::from_env()?;
-    if let Some(p) = state { cfg.state = p.to_path_buf(); }
+    if let Some(p) = state {
+        cfg.state = p.to_path_buf();
+    }
     if let Some(state) = DaemonState::load(&cfg.state)?.filter(|s| !s.revoked) {
         let joined = state.repo.canonicalize()?;
-        anyhow::ensure!(repo.root() == joined,
+        anyhow::ensure!(
+            repo.root() == joined,
             "selected repo {} differs from the joined repo {}; select the joined repo to change fleet content",
-            repo.root().display(), joined.display());
-        bail!("Adopt needs a connection to the Server; start the daemon with `sk1ll daemon` and wait for it to connect");
+            repo.root().display(),
+            joined.display()
+        );
+        bail!(
+            "Adopt needs a connection to the Server; start the daemon with `sk1ll daemon` and wait for it to connect"
+        );
     }
     Ok(())
 }
@@ -291,15 +302,17 @@ impl Daemon {
         let c = &self.client;
         match cmd {
             Cmd::Conflicts | Cmd::Recover { command: crate::RecoverCmd::List } => {
-                let entries = if matches!(cmd, Cmd::Conflicts) {
-                    self.block(c.conflicts())?
-                } else {
-                    self.block(c.recovered())?
-                };
+                let entries =
+                    if matches!(cmd, Cmd::Conflicts) { self.block(c.conflicts())? } else { self.block(c.recovered())? };
                 for e in entries {
                     if e.kind.as_deref() == Some("displaced") {
-                        println!("{} {} {} {}", e.id.unwrap_or_default(), e.harness, e.name,
-                            e.path.unwrap_or_default().display());
+                        println!(
+                            "{} {} {} {}",
+                            e.id.unwrap_or_default(),
+                            e.harness,
+                            e.name,
+                            e.path.unwrap_or_default().display()
+                        );
                     } else if matches!(cmd, Cmd::Conflicts) {
                         println!("! {} {} {}", e.harness, e.name, e.dest.display());
                     }
@@ -397,12 +410,8 @@ impl Daemon {
                     bail!("unknown harness `{harness}` on this machine (see `sk1ll harnesses`)");
                 }
                 let mut changes = Vec::new();
-                let toggle = |kind, name, on: bool| ToggleChange {
-                    harness: harness.clone(),
-                    kind,
-                    name,
-                    enabled: Some(on),
-                };
+                let toggle =
+                    |kind, name, on: bool| ToggleChange { harness: harness.clone(), kind, name, enabled: Some(on) };
                 let target = assign_target(kind, name, state, default_skills, default_rules)?;
                 if let Some((kind, name, state)) = target {
                     check_exists(&sk1ll_core::Repo::open(repo)?, kind, &name)?;
