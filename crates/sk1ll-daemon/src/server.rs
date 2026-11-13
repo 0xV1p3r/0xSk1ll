@@ -4,7 +4,7 @@
 //!
 //! On connect: `hello`; then the local state is recomputed (with the engine
 //! mutex) and sent as the first status; then the outbox of `draft_discarded`
-//! is delivered, each entry removed only once sent; then commits queued
+//! is delivered, each entry removed only once acknowledged as applied; then commits queued
 //! while offline are pushed and the baseline is pulled. That is one refresh
 //! per connect when nothing changed: the outbox is filtered against the
 //! report just computed, the pull syncs again only if it moved something, and
@@ -14,6 +14,9 @@
 //! `draft_discarded`. The socket is read continuously so pings are answered;
 //! server messages are handled in order by a separate worker so slow work (a
 //! pull) never stalls reading.
+//!
+//! Servers without acknowledgement support leave entries pending; they are
+//! replayed once per connection until an upgraded server confirms them.
 //!
 //! An HTTP 401 on connecting is not a revocation (a proxy may send it too):
 //! the machine is marked auth-rejected, keeps being managed, and the
@@ -127,7 +130,7 @@ async fn send(ws: &mut Sink, msg: &DaemonMessage) -> anyhow::Result<()> {
 /// refreshes: there is nothing to filter, and the report published last goes
 /// out as it is.
 async fn flush_outbox(
-    d: &Arc<Daemon>, sink: &mut Sink, sent: &mut MachineReport, mut fresh: bool,
+    d: &Arc<Daemon>, sink: &mut Sink, sent: &mut MachineReport, mut fresh: bool, pending: &mut std::collections::HashSet<u64>,
 ) -> anyhow::Result<()> {
     loop {
         // Capture the entry and the state used to filter it under the same
@@ -138,8 +141,9 @@ async fn flush_outbox(
         // draft to reach the Server. Keep sending fresh reports even if an outbox
         // refresh is waiting for that mutex.
         let mut view = d.subscribe_view();
+        let already_sent = pending.clone();
         let refresh = d.blocking(move |d, eng| {
-            let entry = d.outbox_front();
+            let entry = d.outbox_front(&already_sent);
             if entry.is_some() && (!fresh || Daemon::report_is_stale(eng)) {
                 d.refresh(eng)?;
             }
@@ -171,9 +175,11 @@ async fn flush_outbox(
             .filter(|item| !report.drafts.contains(item) && !report.unpushed.contains(item))
             .collect::<Vec<_>>();
         if !items.is_empty() {
-            send(sink, &DaemonMessage::DraftDiscarded { items }).await?;
+            send(sink, &DaemonMessage::DraftDiscarded { id: Some(entry.id), items }).await?;
+            pending.insert(entry.id);
+        } else {
+            d.outbox_delivered(entry.id);
         }
-        d.outbox_delivered(entry.id);
         // One refresh serves every entry of this flush.
         fresh = true;
     }
@@ -201,7 +207,8 @@ async fn session(d: &Arc<Daemon>, ws: Ws, inbox: &mpsc::UnboundedSender<ServerMe
     // before the first status and before replaying any discards.
     let mut sent = refresh_report(d).await?;
     send(&mut sink, &DaemonMessage::Status(sent.clone())).await?;
-    flush_outbox(d, &mut sink, &mut sent, true).await?;
+    let mut pending = std::collections::HashSet::new();
+    flush_outbox(d, &mut sink, &mut sent, true, &mut pending).await?;
     d.set_connection(Connection::Connected);
     let catch_up = d.clone();
     tokio::spawn(async move {
@@ -214,6 +221,9 @@ async fn session(d: &Arc<Daemon>, ws: Ws, inbox: &mpsc::UnboundedSender<ServerMe
         tokio::select! {
             msg = stream.next() => match msg {
                 Some(Ok(Message::Text(text))) => match serde_json::from_str::<ServerMessage>(&text) {
+                    Ok(ServerMessage::DraftDiscardApplied { id }) => {
+                        if pending.remove(&id) { d.outbox_delivered(id); }
+                    }
                     Ok(ServerMessage::Revoked) => {
                         d.blocking(|d, eng| d.revoke(eng, "removed from the fleet")).await?;
                         return Ok(());
@@ -242,7 +252,7 @@ async fn session(d: &Arc<Daemon>, ws: Ws, inbox: &mpsc::UnboundedSender<ServerMe
             }
             () = d.outbox_ready.notified() => {
                 // The status that led to it goes first (e.g. the draft after a Restore).
-                flush_outbox(d, &mut sink, &mut sent, false).await?;
+                flush_outbox(d, &mut sink, &mut sent, false, &mut pending).await?;
             }
         }
     }
@@ -252,6 +262,7 @@ async fn session(d: &Arc<Daemon>, ws: Ws, inbox: &mpsc::UnboundedSender<ServerMe
 async fn inbox(d: Arc<Daemon>, mut rx: mpsc::UnboundedReceiver<ServerMessage>) {
     while let Some(m) = rx.recv().await {
         let result = match m {
+            ServerMessage::DraftDiscardApplied { .. } => Ok(()),
             ServerMessage::Assignment(snap) => d.blocking(move |d, eng| d.apply_assignment(eng, snap).map(drop)).await,
             ServerMessage::Nudge { baseline } => d.blocking(move |d, eng| d.nudge(eng, baseline)).await,
             ServerMessage::ImportsChanged { updates } => {

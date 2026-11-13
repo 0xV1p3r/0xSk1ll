@@ -1,6 +1,6 @@
 //! `draft_discarded` messages not yet delivered to the server, kept in a small
 //! private file next to the state file so a restart doesn't lose them. An
-//! entry is removed only after it was sent; sending one twice is harmless
+//! entry is removed only after the server confirms it was applied; sending one twice is harmless
 //! because the server handles them idempotently.
 
 use std::path::PathBuf;
@@ -51,6 +51,11 @@ impl Outbox {
         self.save()
     }
 
+    pub(crate) fn unsent(&self, sent: &std::collections::HashSet<u64>) -> Option<Entry> {
+        self.entries.iter().find(|e| !sent.contains(&e.id)).cloned()
+    }
+
+    #[cfg(test)]
     pub(crate) fn front(&self) -> Option<Entry> {
         self.entries.first().cloned()
     }
