@@ -25,6 +25,23 @@ export function splitItem(item: ItemRef): { kind: string; name: string } {
   const at = item.indexOf(':');
   return at < 0 ? { kind: item, name: item } : { kind: item.slice(0, at), name: item.slice(at + 1) };
 }
+// A joined Machine starts with everything off; this turns on every Harness default and Baseline item.
+export function everythingOn(harnesses: string[], items: ItemView[]): ToggleChange[] {
+  return harnesses.flatMap((harness): ToggleChange[] => [
+    { harness, kind: 'new_skills_default', enabled: true }, { harness, kind: 'new_rules_default', enabled: true },
+    ...items.filter(item => item.in_baseline).map((item): ToggleChange => {
+      const { kind, name } = splitItem(item.item);
+      return { harness, kind: kind === 'rule' ? 'rule' : 'skill', name, enabled: true };
+    }),
+  ]);
+}
+// Mirrors the Daemon's warning: plain HTTP sends the Machine token in clear text, except to this computer.
+export function insecureHttp(server: string): boolean {
+  let url: URL;
+  try { url = new URL(server.trim()); } catch { return false; }
+  const host = url.hostname.replace(/^\[|\]$/g, '');
+  return url.protocol === 'http:' && !(host.toLowerCase() === 'localhost' || host === '::1' || /^127\.\d+\.\d+\.\d+$/.test(host));
+}
 export function cellState(assignment: Assignment, harness: string, item: ItemRef) {
   const h = assignment.harnesses[harness] ?? emptyHarness();
   const { kind, name } = splitItem(item);

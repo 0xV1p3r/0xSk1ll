@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use sk1ll_core::MachineConfig;
-use sk1ll_proto::{AssignmentSnapshot, ErrorBody, JoinRequest, JoinResponse, REPO_PATH};
+use sk1ll_proto::{AssignmentSnapshot, ErrorBody, JoinCode, JoinRequest, JoinResponse, REPO_PATH};
 
 use crate::Config;
 use crate::client::{Client, JoinApiRequest};
@@ -16,7 +16,11 @@ use crate::state::{self, DaemonState};
 pub struct JoinOptions {
     /// The server's base URL, e.g. `https://server.example`.
     pub server_url: String,
+    /// Empty to create one with `admin_token`.
     pub code: String,
+    /// The server's admin token, used once to create a join code for the
+    /// first machine of a new fleet. Never stored.
+    pub admin_token: Option<String>,
     /// Default: `machine.toml`'s `id`, else the hostname.
     pub machine_id: Option<String>,
     /// Start from this machine's assignment instead of everything off.
@@ -30,6 +34,7 @@ impl std::fmt::Debug for JoinOptions {
         f.debug_struct("JoinOptions")
             .field("server_url", &crate::auth::redact(&self.server_url))
             .field("code", &"<redacted>")
+            .field("admin_token", &self.admin_token.as_ref().map(|_| "<redacted>"))
             .field("machine_id", &self.machine_id)
             .field("copy_from", &self.copy_from)
             .field("repo", &self.repo)
@@ -76,6 +81,7 @@ pub async fn join_or_rejoin(cfg: &Config, mut opts: JoinOptions) -> anyhow::Resu
             let req = JoinApiRequest {
                 server_url: opts.server_url,
                 code: opts.code,
+                admin_token: opts.admin_token,
                 machine_id: opts.machine_id,
                 copy_from: opts.copy_from,
                 repo: Some(opts.repo),
@@ -90,6 +96,25 @@ pub async fn join_or_rejoin(cfg: &Config, mut opts: JoinOptions) -> anyhow::Resu
 
 fn absolute(p: &Path) -> anyhow::Result<PathBuf> {
     Ok(if p.is_absolute() { p.to_path_buf() } else { std::env::current_dir()?.join(p) })
+}
+
+/// Asks the server for a single-use join code with its admin token.
+async fn create_join_code(http: &reqwest::Client, server_url: &str, admin_token: &str) -> anyhow::Result<String> {
+    let resp = http
+        .post(format!("{server_url}/api/join-codes"))
+        .bearer_auth(admin_token)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("join code request failed: {}", crate::auth::redact(&e.to_string())))?;
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED || resp.status() == reqwest::StatusCode::FORBIDDEN {
+        bail!("the server rejected the admin token");
+    }
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let msg = resp.json::<ErrorBody>().await.map(|e| e.error).unwrap_or_else(|_| status.to_string());
+        bail!("the server refused to create a join code: {msg}");
+    }
+    Ok(resp.json::<JoinCode>().await.context("reading the server's join code")?.code)
 }
 
 /// Checks the request and spends the join code. `replace` allows replacing
@@ -179,26 +204,23 @@ async fn register_inner(
     let machine = MachineConfig::load(&cfg.machine_config)?;
     let machine_id = opts.machine_id.clone().unwrap_or_else(|| machine.id.clone());
     let harnesses: Vec<String> = machine.harnesses().into_keys().collect();
-    let req = JoinRequest {
-        code: opts.code.clone(),
-        machine_id,
-        harnesses: harnesses.clone(),
-        copy_from: opts.copy_from.clone(),
+    let http =
+        reqwest::Client::builder().timeout(timeout).connect_timeout(std::time::Duration::from_secs(15)).build()?;
+    // Created only now, after the local checks, so a refused join doesn't
+    // leave an unused code behind.
+    // A given code wins, so an exported SK1LL_SERVER_ADMIN_TOKEN doesn't get in the way.
+    let code = match (opts.code.trim(), opts.admin_token.as_deref().map(str::trim)) {
+        ("", Some(token)) if !token.is_empty() => create_join_code(&http, &server_url, token).await?,
+        ("", _) => bail!("a join code or the server's admin token is needed"),
+        (code, _) => code.to_string(),
     };
-    let resp = reqwest::Client::builder()
-        .timeout(timeout)
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .build()?
-        .post(format!("{server_url}/api/join"))
-        .json(&req)
-        .send()
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "join request failed (connection or total request timeout): {}",
-                crate::auth::redact(&e.to_string())
-            )
-        })?;
+    let req = JoinRequest { code, machine_id, harnesses: harnesses.clone(), copy_from: opts.copy_from.clone() };
+    let resp = http.post(format!("{server_url}/api/join")).json(&req).send().await.map_err(|e| {
+        anyhow::anyhow!(
+            "join request failed (connection or total request timeout): {}",
+            crate::auth::redact(&e.to_string())
+        )
+    })?;
     if !resp.status().is_success() {
         let status = resp.status();
         let msg = resp.json::<ErrorBody>().await.map(|e| e.error).unwrap_or_else(|_| status.to_string());
@@ -566,6 +588,7 @@ mod tests {
         let opts = JoinOptions {
             server_url: url,
             code: "test".into(),
+            admin_token: None,
             machine_id: Some("test".into()),
             copy_from: None,
             repo: tmp.path().join("repo"),

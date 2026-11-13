@@ -19,7 +19,11 @@ enum Cmd {
     /// Join a fleet (same as `sk1ll join`)
     Join {
         server_url: String,
-        code: String,
+        #[arg(required_unless_present = "admin_token")]
+        code: Option<String>,
+        /// The server's admin token: creates a join code for the first machine of a new fleet (a given code wins)
+        #[arg(long, env = "SK1LL_SERVER_ADMIN_TOKEN", hide_env_values = true)]
+        admin_token: Option<String>,
         #[arg(long)]
         id: Option<String>,
         #[arg(long)]
@@ -41,9 +45,16 @@ fn main() -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     match cli.cmd.unwrap_or(Cmd::Run) {
         Cmd::Run => rt.block_on(sk1ll_daemon::run(cfg)),
-        Cmd::Join { server_url, code, id, copy_from, repo } => {
+        Cmd::Join { server_url, code, admin_token, id, copy_from, repo } => {
             let repo = sk1ll_daemon::locate_repo(repo.as_deref(), false)?;
-            let opts = JoinOptions { server_url, code, machine_id: id, copy_from, repo };
+            let opts = JoinOptions {
+                server_url,
+                code: code.unwrap_or_default(),
+                admin_token,
+                machine_id: id,
+                copy_from,
+                repo,
+            };
             let (joined, via_daemon) = rt.block_on(sk1ll_daemon::join_or_rejoin(&cfg, opts))?;
             println!("joined as {} with repo {}", joined.machine_id, joined.repo.display());
             if via_daemon {

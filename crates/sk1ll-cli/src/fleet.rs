@@ -23,7 +23,7 @@ pub(crate) fn prepare(cli: &Cli) -> Result<()> {
         // SAFETY: called from `main` before any runtime or thread starts.
         return unsafe { sk1ll_daemon::prepare_process(&cfg) };
     }
-    if matches!(cli.cmd, Cmd::Join { .. }) {
+    if matches!(cli.cmd, Cmd::Join { .. } | Cmd::Setup) {
         // SAFETY: as above. Git must fail instead of prompting.
         unsafe { std::env::set_var("GIT_TERMINAL_PROMPT", "0") };
     }
@@ -46,7 +46,7 @@ pub(crate) fn is_joined(cli: &Cli) -> bool {
     joined_state(cli).is_some()
 }
 
-fn runtime() -> Result<tokio::runtime::Runtime> {
+pub(crate) fn runtime() -> Result<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Builder::new_current_thread().enable_all().build()?)
 }
 
@@ -85,7 +85,7 @@ pub(crate) fn assign_direct(cli: &Cli, repo: &Path, lock: Option<&sk1ll_core::En
 }
 
 /// The daemon's config, with the CLI's `--machine-config` / `--assignment`.
-fn daemon_config(cli: &Cli) -> Result<Config> {
+pub(crate) fn daemon_config(cli: &Cli) -> Result<Config> {
     let mut cfg = Config::from_env()?;
     cfg.repo = cli.repo.clone();
     if let Some(p) = &cli.daemon_state {
@@ -147,7 +147,7 @@ pub(crate) fn require_standalone_adoption(state: Option<&Path>, repo: &sk1ll_cor
     Ok(())
 }
 
-fn client(cli: &Cli) -> Result<Client> {
+pub(crate) fn client(cli: &Cli) -> Result<Client> {
     Ok(match &cli.daemon_socket {
         Some(p) => Client::new(p),
         None => Client::default_socket()?,
@@ -164,18 +164,26 @@ pub(crate) fn command(cli: Cli) -> Result<()> {
             tokio::runtime::Runtime::new()?.block_on(sk1ll_daemon::run(cfg))
         }
         Cmd::Join { .. } => join(cli),
+        Cmd::Setup => crate::setup::run(&cli),
         _ => unreachable!(),
     }
 }
 
 fn join(cli: Cli) -> Result<()> {
     let cfg = daemon_config(&cli)?;
-    let Cmd::Join { server_url, code, id, copy_from } = cli.cmd else { unreachable!() };
+    let Cmd::Join { server_url, code, admin_token, id, copy_from } = cli.cmd else { unreachable!() };
     let repo = sk1ll_daemon::locate_repo(cli.repo.as_deref(), false)?;
     if sk1ll_daemon::join::insecure_http(&server_url) {
         eprintln!("warning: joining over plain HTTP; the machine token travels in clear text");
     }
-    let opts = sk1ll_daemon::JoinOptions { server_url, code, machine_id: id, copy_from, repo };
+    let opts = sk1ll_daemon::JoinOptions {
+        server_url,
+        code: code.unwrap_or_default(),
+        admin_token,
+        machine_id: id,
+        copy_from,
+        repo,
+    };
     let (joined, via_daemon) = runtime()?.block_on(sk1ll_daemon::join_or_rejoin(&cfg, opts))?;
     let how = match joined.setup {
         sk1ll_daemon::gitx::Setup::Cloned => "cloned the fleet repo into",

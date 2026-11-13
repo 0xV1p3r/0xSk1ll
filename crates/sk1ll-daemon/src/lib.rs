@@ -22,6 +22,7 @@ pub mod gitx;
 pub mod join;
 mod outbox;
 mod server;
+pub mod service;
 pub mod state;
 mod watch;
 

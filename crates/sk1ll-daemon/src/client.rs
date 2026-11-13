@@ -24,6 +24,8 @@
 //! | POST | `/conflicts/displaced/{id}/adopt`, `/conflicts/displaced/{id}/discard` | → 204 |
 //! | POST | `/conflicts/adopt`, `/conflicts/overwrite` | [`ConflictTarget`] → 204 |
 //! | GET | `/harnesses` | → `Vec<`[`HarnessView`]`>` |
+//! | GET | `/setup/harnesses` | → `Vec<`[`HarnessChoice`]`>` |
+//! | POST | `/setup/harnesses/{name}` | [`SetHarnessEnabled`] → `Vec<`[`HarnessChoice`]`>`; standalone without a repo only |
 //! | POST | `/imports/{name}/update` | → [`ImportUpdated`] |
 //! | POST | `/imports/resolve` | [`ResolveImportRequest`] → [`ResolvedSource`] |
 //! | POST | `/imports/add` | [`AddImportRequest`] → [`ImportUpdated`] |
@@ -59,6 +61,7 @@ use hyper_util::rt::TokioIo;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+pub use sk1ll_core::HarnessChoice;
 pub use sk1ll_core::content::{ContentEntry, ContentQuery, ContentType, FileContent, FileEntry, FileQuery};
 pub use sk1ll_proto::{
     Assignment, AssignmentChanges, AssignmentSnapshot, AssignmentUpdate, ErrorBody, FleetView, ImportUpdate, ItemRef,
@@ -264,6 +267,12 @@ pub struct HarnessView {
     pub origin: String,
 }
 
+/// `POST /setup/harnesses/{name}` body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetHarnessEnabled {
+    pub enabled: bool,
+}
+
 /// `POST /imports/{name}/update`: the import was re-vendored into the draft.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportUpdated {
@@ -371,10 +380,16 @@ pub struct PushResult {
 }
 
 /// `POST /join`: like `sk1ll join`, done by the running daemon.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinApiRequest {
     pub server_url: String,
+    /// Empty when `admin_token` is set.
+    #[serde(default)]
     pub code: String,
+    /// The server's admin token, used once to create a join code for the
+    /// first machine of a new fleet. Never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_token: Option<String>,
     #[serde(default)]
     pub machine_id: Option<String>,
     #[serde(default)]
@@ -382,6 +397,19 @@ pub struct JoinApiRequest {
     /// Absolute path of the clone; default: the daemon's current repo.
     #[serde(default)]
     pub repo: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for JoinApiRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JoinApiRequest")
+            .field("server_url", &crate::auth::redact(&self.server_url))
+            .field("code", &"<redacted>")
+            .field("admin_token", &self.admin_token.as_ref().map(|_| "<redacted>"))
+            .field("machine_id", &self.machine_id)
+            .field("copy_from", &self.copy_from)
+            .field("repo", &self.repo)
+            .finish()
+    }
 }
 
 /// One `GET /events` notification; the SSE event name is its `type`.
@@ -665,6 +693,14 @@ impl Client {
 
     pub async fn harnesses(&self) -> Result<Vec<HarnessView>> {
         self.get("/harnesses").await
+    }
+
+    pub async fn setup_harnesses(&self) -> Result<Vec<HarnessChoice>> {
+        self.get("/setup/harnesses").await
+    }
+
+    pub async fn set_setup_harness(&self, name: &str, enabled: bool) -> Result<Vec<HarnessChoice>> {
+        self.post(&format!("/setup/harnesses/{}", encode(name)), &SetHarnessEnabled { enabled }).await
     }
 
     pub async fn update_import(&self, name: &str) -> Result<ImportUpdated> {

@@ -90,11 +90,19 @@ export function installMock(scenario: string) {
   ];
   const imports: T.ImportsView & { imports: T.ImportEntry[] } = { imports: empty ? [] : [{ name: 'pdf', source: 'github:example/skills', ref: 'main', path: 'skills/pdf', locked: '4e5f6a7b8c9d' }, { name: 'anthropic-skills', source: 'https://github.com/anthropics/skills', ref: 'main', path: '', locked: '4e5f6a7b8c9d' }, { name: 'internal-skills', source: 'github:example/internal-skills', ref: 'main', path: '', locked: '123456789abc' }], checked_at: now - 900, errors: empty ? [] : [{ name: 'internal-skills', message: 'git fetch failed: repository not found' }],
     updates: empty ? [] : [{ name: 'anthropic-skills', source: 'https://github.com/anthropics/skills', ref: 'main', locked: '4e5f6a7b8c9d', upstream: 'c0ffee123456' }] };
+  const setupHarnesses: T.HarnessChoice[] = [
+    { name: 'claude', installed: true, enabled: true, harness: harnesses[0].harness },
+    { name: 'codex', installed: true, enabled: true, harness: harnesses[1].harness },
+    { name: 'gemini', installed: false, enabled: false, harness: { skills: null, instructions: '~/.gemini/GEMINI.md', instructions_format: 'block', mode: 'symlink' } },
+  ];
+  let running = scenario !== 'unreachable';
   const delay = <V,>(value: V, ms = 250) => new Promise<V>(resolve => setTimeout(() => resolve(value), ms));
 
   mockIPC((cmd, args) => {
     const a = (args ?? {}) as Record<string, unknown>;
-    if (scenario === 'unreachable' && cmd !== 'connection_info' && !cmd.startsWith('plugin:'))
+    if (cmd === 'daemon_service') return delay({ default_socket: true, binary: '/home/dev/.cargo/bin/sk1ll', systemd: true, unit: null });
+    if (cmd === 'start_daemon') { setTimeout(() => { running = true; }, 1500); return delay('systemd', 600); }
+    if (!running && cmd !== 'connection_info' && !cmd.startsWith('plugin:'))
       return Promise.reject({ message: 'connect ECONNREFUSED /run/user/1000/sk1ll/daemon.sock', status: null, unreachable: true });
     if (standalone && ['fleet', 'log', 'log_facets', 'undo', 'join_code', 'remove_machine'].includes(cmd)) return Promise.reject({ message: 'Unavailable in standalone mode', status: 409, unreachable: false });
     if (standalone && !status.has_origin && ['push', 'pull'].includes(cmd)) return Promise.reject({ message: 'Repository has no origin remote', status: 409, unreachable: false });
@@ -238,6 +246,12 @@ export function installMock(scenario: string) {
       case 'conflicts': return delay(conflicts);
       case 'recovered': return delay(recovered);
       case 'harnesses': return delay(harnesses);
+      case 'setup_harnesses': return delay(setupHarnesses);
+      case 'set_setup_harness': {
+        const choice = setupHarnesses.find(h => h.name === a.name);
+        if (choice) choice.enabled = a.enabled as boolean;
+        return delay(setupHarnesses);
+      }
       case 'imports': return delay(imports);
       // A tree/blob link resolves one Skill; a repository link resolves several.
       case 'resolve_import': {

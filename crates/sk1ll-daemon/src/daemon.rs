@@ -45,9 +45,9 @@ use tokio::sync::{Notify, broadcast, watch};
 
 use crate::client::{
     AddImportRequest, ChangeKind, CommitMessage, CommitRequest, CommitResponse, ConflictTarget, ConflictView,
-    Connection, DaemonMode, DiffView, DraftEntry, Event, HarnessView, ImportUpdated, ItemView, PullResult, PushResult,
-    ResolveImportRequest, ResolvedSource, RestoreRequest, RestoreResponse, SkillCandidate, StatusView, SyncResult,
-    UpdateImportsRequest,
+    Connection, DaemonMode, DiffView, DraftEntry, Event, HarnessChoice, HarnessView, ImportUpdated, ItemView,
+    PullResult, PushResult, ResolveImportRequest, ResolvedSource, RestoreRequest, RestoreResponse, SkillCandidate,
+    StatusView, SyncResult, UpdateImportsRequest,
 };
 use crate::error::{Error, Result};
 use crate::join::{Joined, Registered};
@@ -1408,6 +1408,29 @@ impl Daemon {
     }
 
     /// A reader: no engine mutex.
+    /// Every harness first-run setup can switch on or off.
+    pub(crate) fn setup_harnesses(&self) -> Result<Vec<HarnessChoice>> {
+        Ok(MachineConfig::load(&self.cfg.machine_config)?.choices())
+    }
+
+    /// Only before setup ends: dropping a harness later would strand what
+    /// sync already placed there, and a joined machine registered its
+    /// harnesses with the server. Takes the engine so it can't race Init or
+    /// a join.
+    pub(crate) fn set_setup_harness(&self, _eng: &mut Engine, name: &str, enabled: bool) -> Result<Vec<HarnessChoice>> {
+        if !self.is_standalone() || self.repo_root().join(".git").exists() {
+            return Err(Error::Conflict(format!(
+                "harnesses can be chosen here only during first-run setup; edit {} instead",
+                self.cfg.machine_config.display()
+            )));
+        }
+        if !self.setup_harnesses()?.iter().any(|c| c.name == name) {
+            return Err(Error::NotFound(format!("no harness `{name}`")));
+        }
+        MachineConfig::set_enabled(&self.cfg.machine_config, name, enabled)?;
+        self.setup_harnesses()
+    }
+
     pub(crate) fn harnesses(&self) -> Result<Vec<HarnessView>> {
         let machine = MachineConfig::load(&self.cfg.machine_config)?;
         Ok(machine

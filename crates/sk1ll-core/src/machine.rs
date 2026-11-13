@@ -93,6 +93,18 @@ pub struct EffectiveHarness {
     pub origin: HarnessOrigin,
 }
 
+/// A harness the user can switch on or off, including detected presets that
+/// `machine.toml` currently disables.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessChoice {
+    pub name: String,
+    /// A preset whose home directory exists, or an entry `machine.toml` defines.
+    pub installed: bool,
+    /// Whether sync writes into it.
+    pub enabled: bool,
+    pub harness: Harness,
+}
+
 /// `machine.toml`: this machine's identity and harness overrides.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -197,6 +209,97 @@ impl MachineConfig {
             Some(home) => self.effective_in(&home),
             None => self.effective_in(Path::new("/nonexistent")),
         }
+    }
+
+    /// Every preset and every `machine.toml` entry, with what it would sync to.
+    pub fn choices(&self) -> Vec<HarnessChoice> {
+        match dirs::home_dir() {
+            Some(home) => self.choices_in(&home),
+            None => self.choices_in(Path::new("/nonexistent")),
+        }
+    }
+
+    fn choices_in(&self, home: &Path) -> Vec<HarnessChoice> {
+        let effective = self.effective_in(home);
+        let mut out: Vec<HarnessChoice> = PRESETS
+            .iter()
+            .map(|preset| {
+                let harness = match self.harnesses.get(preset.name) {
+                    Some(entry) => merge(preset.harness(), entry),
+                    None => preset.harness(),
+                };
+                HarnessChoice {
+                    name: preset.name.to_string(),
+                    installed: home.join(preset.home).is_dir(),
+                    enabled: effective.contains_key(preset.name),
+                    harness,
+                }
+            })
+            .collect();
+        for (name, entry) in &self.harnesses {
+            if !PRESETS.iter().any(|p| p.name == name) {
+                out.push(HarnessChoice {
+                    name: name.clone(),
+                    installed: true,
+                    enabled: effective.contains_key(name),
+                    harness: merge(Harness::default(), entry),
+                });
+            }
+        }
+        out
+    }
+
+    /// Switches harness `name` on or off in the `machine.toml` at `path`,
+    /// keeping the rest of the file as written. On means dropping `enabled`,
+    /// so a preset is synced again only while its home directory exists.
+    pub fn set_enabled(path: &Path, name: &str, enabled: bool) -> Result<()> {
+        use toml_edit::{DocumentMut, Item, Table, value};
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e).at(path),
+        };
+        let mut doc: DocumentMut = text
+            .parse()
+            .map_err(|e: toml_edit::TomlError| Error::Parse { path: path.to_path_buf(), message: e.to_string() })?;
+        let invalid = || Error::Invalid(format!("{}: `harnesses` must be a table of tables", path.display()));
+        if enabled {
+            let Some(harnesses) = doc.get_mut("harnesses") else { return Ok(()) };
+            let harnesses = harnesses.as_table_mut().ok_or_else(invalid)?;
+            if let Some(entry) = harnesses.get_mut(name) {
+                let entry = entry.as_table_mut().ok_or_else(invalid)?;
+                entry.remove("enabled");
+                if entry.is_empty() {
+                    harnesses.remove(name);
+                }
+            }
+        } else {
+            let harnesses = doc
+                .entry("harnesses")
+                .or_insert_with(|| {
+                    let mut t = Table::new();
+                    t.set_implicit(true);
+                    Item::Table(t)
+                })
+                .as_table_mut()
+                .ok_or_else(invalid)?;
+            let entry = harnesses
+                .entry(name)
+                .or_insert_with(|| Item::Table(Table::new()))
+                .as_table_mut()
+                .ok_or_else(invalid)?;
+            entry["enabled"] = value(false);
+        }
+        let text = doc.to_string();
+        // Parse what we are about to write so a bad edit never reaches the daemon.
+        toml::from_str::<MachineConfig>(&text)
+            .map_err(|e| Error::Parse { path: path.to_path_buf(), message: e.to_string() })?;
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).at(dir)?;
+        }
+        let tmp = path.with_extension("toml.tmp");
+        fs::write(&tmp, text).at(&tmp)?;
+        fs::rename(&tmp, path).at(path)
     }
 
     fn effective_in(&self, home: &Path) -> BTreeMap<String, EffectiveHarness> {
@@ -307,6 +410,38 @@ mod tests {
         assert_eq!(eff["cursor"].origin, HarnessOrigin::Local);
         assert_eq!(eff["cursor"].harness.skills.as_deref(), Some("/opt/cursor/skills"));
         assert_eq!(eff["gemini"].origin, HarnessOrigin::Detected);
+    }
+
+    #[test]
+    fn choices_list_disabled_presets_and_set_enabled_keeps_comments() {
+        let home = tempfile::tempdir().unwrap();
+        for d in [".claude", ".codex"] {
+            fs::create_dir_all(home.path().join(d)).unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sk1ll").join(MACHINE_FILE);
+        MachineConfig::set_enabled(&path, "codex", false).unwrap();
+        fs::write(&path, format!("# mine\nid = \"box\"\n{}", fs::read_to_string(&path).unwrap())).unwrap();
+        let choices = MachineConfig::load(&path).unwrap().choices_in(home.path());
+        let get = |name: &str| choices.iter().find(|c| c.name == name).unwrap().clone();
+        assert!(get("claude").installed && get("claude").enabled);
+        assert!(get("codex").installed && !get("codex").enabled);
+        assert!(!get("gemini").installed && !get("gemini").enabled);
+        assert_eq!(get("codex").harness.skills.as_deref(), Some("~/.codex/skills"));
+
+        MachineConfig::set_enabled(&path, "codex", true).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# mine\nid = \"box\"\n"), "{text}");
+        assert!(!text.contains("codex"), "{text}");
+        assert!(MachineConfig::load(&path).unwrap().effective_in(home.path()).contains_key("codex"));
+        assert!(!path.with_extension("toml.tmp").exists());
+
+        fs::write(&path, "[harnesses.cursor]\nskills = \"/opt/s\"\n").unwrap();
+        MachineConfig::set_enabled(&path, "cursor", false).unwrap();
+        MachineConfig::set_enabled(&path, "cursor", true).unwrap();
+        let cfg = MachineConfig::load(&path).unwrap();
+        assert_eq!(cfg.harnesses["cursor"].skills.as_deref(), Some("/opt/s"));
+        assert_eq!(cfg.harnesses["cursor"].enabled, None);
     }
 
     #[test]

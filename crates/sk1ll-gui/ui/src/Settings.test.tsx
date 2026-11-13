@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { Settings } from './Settings';
 import { api } from './api';
 import type { StatusView } from './types';
@@ -48,6 +48,19 @@ it('reveals the join code and confirms the effective default Machine id', async 
   await screen.findByRole('option', { name: 'desktop' }); fireEvent.change(select, { target: { value: 'desktop' } });
   fireEvent.submit(code.closest('form')!);
   const dialog = await screen.findByRole('dialog'); expect(dialog.textContent).toContain('laptop'); expect(dialog.textContent).toContain('Copied from desktop');
+});
+it('joins with the admin token instead of a join code', async () => {
+  vi.mocked(api.join).mockResolvedValue({ machine_id: 'laptop', repo: '/skills', setup: 'initialized', harnesses: [], revision: 1 });
+  mount(true);
+  fireEvent.change(screen.getByLabelText('Join with'), { target: { value: 'admin' } });
+  fireEvent.change(screen.getByLabelText('Server URL'), { target: { value: 'https://skills.example.com' } });
+  const token = screen.getByLabelText('Admin token') as HTMLInputElement;
+  expect(screen.getByRole('button', { name: 'Show admin token' })).toBeTruthy();
+  fireEvent.change(token, { target: { value: 'adm' } });
+  fireEvent.submit(token.closest('form')!);
+  const dialog = await screen.findByRole('dialog'); expect(dialog.textContent).toContain('Admin token');
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Join / rejoin' }));
+  await waitFor(() => expect(api.join).toHaveBeenCalledWith({ server_url: 'https://skills.example.com', code: '', admin_token: 'adm', machine_id: undefined, copy_from: undefined }));
 });
 it('falls back to a text field when Fleet loading fails', async () => {
   vi.mocked(api.fleet).mockRejectedValue(new Error('Unavailable')); mount(true);

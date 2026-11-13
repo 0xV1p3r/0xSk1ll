@@ -3,6 +3,7 @@
 pub mod commands;
 pub mod editors;
 pub mod events;
+pub mod service;
 
 use sk1ll_daemon::client::Client;
 use tauri::{Emitter, Manager};
@@ -52,6 +53,10 @@ pub fn run() {
             commands::adopt_displaced,
             commands::discard_displaced,
             commands::harnesses,
+            commands::setup_harnesses,
+            commands::set_setup_harness,
+            commands::daemon_service,
+            commands::start_daemon,
             commands::imports,
             commands::resolve_import,
             commands::add_import,

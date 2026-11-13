@@ -32,7 +32,7 @@ pub use imports::{
 pub use instructions::Rule;
 pub use lock::{LockEntry, Lockfile};
 pub use machine::{
-    EffectiveHarness, Harness, HarnessEntry, HarnessOrigin, InstructionsFormat, LinkMode, MachineConfig,
+    EffectiveHarness, Harness, HarnessChoice, HarnessEntry, HarnessOrigin, InstructionsFormat, LinkMode, MachineConfig,
 };
 pub use manifest::{Import, Manifest};
 pub use repo::Repo;

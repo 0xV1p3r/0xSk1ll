@@ -30,6 +30,8 @@ The CLI works on any platform in standalone mode. The daemon, `join` and `fleet`
 
 ## Quick start
 
+`sk1ll setup` walks you through the first run, and the desktop app shows the same steps on first open. To do it by hand:
+
 ```sh
 sk1ll init                                                           # creates ~/skills
 sk1ll add https://github.com/0xV1p3r/0xSk1ll/tree/main/skills/sk1ll  # lets agents add skills for you
@@ -70,6 +72,7 @@ Commands take a bare skill or rule name, or `skill:<name>`, `rule:<name>`, `mani
 
 | Command | What it does |
 |---|---|
+| `setup` | Set up this machine step by step: a standalone repo, joining a fleet or starting one, harnesses and the daemon service |
 | `init [path]` | Create a skills repo |
 | `add <link>` | Import a skill (`--path`, `--ref`, `--name`, `--list`) |
 | `update [name] [--force]` | Re-fetch imports; refuses to overwrite local edits unless forced |
@@ -87,7 +90,7 @@ Commands take a bare skill or rule name, or `skill:<name>`, `rule:<name>`, `mani
 | `adopt <harness> <name>` | Copy a hand edit or an unmanaged skill into the draft |
 | `recover list\|adopt\|discard` | Inspect content that sync moved aside |
 | `draft`, `diff`, `commit`, `push`, `restore`, `pull` | Draft workflow, see above |
-| `join <server-url> <code>` | Join a fleet and clone its repo |
+| `join <server-url> <code>` | Join a fleet and clone its repo; `--admin-token` instead of a code for the first machine |
 | `daemon` | Run the daemon in the foreground |
 | `fleet` | Show every machine in the fleet |
 

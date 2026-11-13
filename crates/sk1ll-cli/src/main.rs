@@ -10,6 +10,8 @@ use sk1ll_core::{
 
 #[cfg(unix)]
 mod fleet;
+#[cfg(unix)]
+mod setup;
 
 /// Without Unix there is no daemon: every command works directly.
 #[cfg(not(unix))]
@@ -60,6 +62,7 @@ mod fleet {
     pub(crate) fn command(cli: Cli) -> Result<()> {
         let name = match cli.cmd {
             Cmd::Join { .. } => "join",
+            Cmd::Setup => "setup",
             Cmd::Daemon => "daemon",
             _ => "fleet",
         };
@@ -209,12 +212,18 @@ enum Cmd {
         #[arg(long, value_name = "on|off")]
         default_rules: Option<Switch>,
     },
+    /// Set up this machine step by step: a standalone repo, joining a fleet or starting one
+    Setup,
     /// Join a fleet: register with the server and clone its repo into --repo (default ~/skills)
     Join {
         /// The server's base URL, e.g. https://server.example
         server_url: String,
-        /// Single-use join code from `POST /api/join-codes`
-        code: String,
+        /// Single-use join code from another machine or `POST /api/join-codes`
+        #[arg(required_unless_present = "admin_token")]
+        code: Option<String>,
+        /// The server's admin token: creates a join code for the first machine of a new fleet (a given code wins)
+        #[arg(long, env = "SK1LL_SERVER_ADMIN_TOKEN", hide_env_values = true)]
+        admin_token: Option<String>,
         /// Machine id (default: machine.toml's id, else the hostname)
         #[arg(long)]
         id: Option<String>,
@@ -281,6 +290,7 @@ impl Cmd {
             | Self::Render { .. }
             | Self::Harnesses
             | Self::Join { .. }
+            | Self::Setup
             | Self::Daemon
             | Self::Fleet => false,
         }
@@ -328,7 +338,7 @@ fn main() -> Result<()> {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    if matches!(cli.cmd, Cmd::Join { .. } | Cmd::Daemon | Cmd::Fleet) {
+    if matches!(cli.cmd, Cmd::Join { .. } | Cmd::Setup | Cmd::Daemon | Cmd::Fleet) {
         return fleet::command(cli);
     }
     #[cfg(unix)]
@@ -416,7 +426,7 @@ fn run(cli: Cli) -> Result<()> {
             print_plan(&actions.into_iter().filter(|a| a.kind == ActionKind::Conflict).collect::<Vec<_>>());
             print_recovered(sync::displaced::changed()?);
         }
-        Cmd::Init { .. } | Cmd::Join { .. } | Cmd::Daemon | Cmd::Fleet => unreachable!(),
+        Cmd::Init { .. } | Cmd::Join { .. } | Cmd::Setup | Cmd::Daemon | Cmd::Fleet => unreachable!(),
         Cmd::List { unmanaged: true } => {
             for skill in sync::unmanaged::discover(&repo, &machine()?.harnesses())? {
                 let harnesses: std::collections::BTreeSet<_> =
