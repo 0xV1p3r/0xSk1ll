@@ -941,6 +941,48 @@ async fn reconnecting_reports_fresh_local_state_first() {
     assert_eq!(report.drafts, [ItemRef::Skill("new".into())]);
 }
 
+/// Connecting costs one refresh (the one before the first status) when
+/// nothing changed: not one more for an empty outbox, for a catch-up pull
+/// that moved nothing, or for the server's nudge for the baseline in use.
+#[tokio::test(flavor = "multi_thread")]
+async fn connecting_refreshes_once_when_nothing_changed() {
+    let server = FakeServer::new().await;
+    // Neither the watcher nor the reconciliation refreshes during the test.
+    let mut m = solo("solo", &server.url(), Some(snapshot(1, &[])))
+        .with_env("SK1LL_DEBOUNCE", "60s")
+        .with_env("SK1LL_DEBOUNCE_MAX", "60s")
+        .with_env("SK1LL_RECONCILE_INTERVAL", "1h")
+        .with_env("RUST_LOG", "info,sk1ll_daemon=debug");
+    let baseline = git(&m.repo(), &["rev-parse", "HEAD"]);
+    let refreshes = |m: &Machine| m.log().matches("refreshing the local state").count();
+    m.start().await;
+    for connection in 0..2 {
+        let (mut ws, _) = server.accept().await;
+        let DaemonMessage::Status(first) = next_message(&mut ws).await else { panic!("expected a status") };
+        assert_eq!(first.baseline.as_deref(), Some(baseline.as_str()));
+        let before = refreshes(&m);
+        let nudge = ServerMessage::Nudge { baseline: baseline.clone() };
+        ws.send(Message::text(serde_json::to_string(&nudge).unwrap())).await.unwrap();
+        eventually(|| async {
+            let s = m.status().await;
+            (s.connection == Connection::Connected && s.server_baseline.as_deref() == Some(baseline.as_str()))
+                .then_some(())
+        })
+        .await;
+        // Let the catch-up pull and the nudge finish.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(refreshes(&m), before, "connection {connection}: nothing changed after the first status");
+        assert_eq!(m.status().await.headline, MachineStatus::InSync);
+        drop(ws);
+        eventually(|| async { (m.status().await.connection == Connection::Offline).then_some(()) }).await;
+        if connection == 0 {
+            assert_eq!(refreshes(&m), 2, "one at startup, one on connecting");
+        } else {
+            assert_eq!(refreshes(&m), 3, "one more for the second connection");
+        }
+    }
+}
+
 /// #8: a Restore made while offline is reported to the server even if the daemon
 /// restarts before it reconnects.
 #[tokio::test(flavor = "multi_thread")]
