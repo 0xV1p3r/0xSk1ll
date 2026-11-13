@@ -84,6 +84,14 @@ pub(crate) struct Daemon {
     pub(crate) http: reqwest::Client,
 }
 
+/// See [`Daemon::pull_state`].
+#[derive(PartialEq)]
+struct PullState {
+    head: Option<String>,
+    remote: Option<String>,
+    blocked: Option<Vec<ItemRef>>,
+}
+
 /// Mutable state, only touched with the engine mutex held.
 pub(crate) struct Engine {
     state: DaemonState,
@@ -95,6 +103,9 @@ pub(crate) struct Engine {
     lock: Option<EngineLock>,
     /// Joined again and about to restart: do nothing more.
     frozen: bool,
+    /// The published report is not the result of a successful refresh: the
+    /// last one failed, or none ran yet. Nothing may be derived from it.
+    stale: bool,
 }
 
 impl Daemon {
@@ -137,6 +148,7 @@ impl Daemon {
                 server_baseline: None,
                 lock: None,
                 frozen: false,
+                stale: true,
             }),
             view: watch::channel(view).0,
             events: broadcast::channel(256).0,
@@ -414,10 +426,17 @@ impl Daemon {
 
     /// Plans and applies the sync, then recomputes the report. Conflicts are
     /// reported, never applied. Without an assignment, harnesses are left alone.
+    ///
+    /// This is the expensive operation (a full plan and a dozen git
+    /// processes), so callers that know nothing it reads has changed since
+    /// the last one skip it: see [`Daemon::pull_refreshed`], [`Daemon::nudge`]
+    /// and [`Daemon::report_is_stale`].
     pub(crate) fn refresh(&self, eng: &mut Engine) -> Result<()> {
         if Self::idle(eng) {
             return Ok(());
         }
+        tracing::debug!("refreshing the local state");
+        eng.stale = true;
         let root = eng.state.repo.clone();
         if !root.join(".git").exists() {
             return Err(Error::Conflict(format!("{} is not set up yet (the server was unreachable)", root.display())));
@@ -509,7 +528,35 @@ impl Daemon {
             *r = roots;
             changed
         });
+        eng.stale = false;
         Ok(())
+    }
+
+    /// Whether the published report can't be relied on (the last refresh
+    /// failed): whoever is about to act on it has to refresh first.
+    pub(crate) fn report_is_stale(eng: &Engine) -> bool {
+        eng.stale
+    }
+
+    /// Publishes the server's baseline and the one thing in the report that
+    /// follows from it alone (`behind`), for when it is all that changed
+    /// since the last successful refresh.
+    fn publish_server_baseline(&self, eng: &Engine) {
+        let server_baseline = eng.server_baseline.clone();
+        let blocked = eng.blocked.is_some();
+        self.update(|v| {
+            v.report.behind = blocked || server_baseline.as_ref().is_some_and(|h| v.report.baseline.as_ref() != Some(h));
+            v.server_baseline = server_baseline;
+        });
+    }
+
+    /// What a pull or push can change among the things the report is made
+    /// from: where `HEAD` and origin's branch are (the baseline, the unpushed
+    /// items and the working tree a pull moves all follow from them) and
+    /// whether the machine is Blocked.
+    fn pull_state(eng: &Engine) -> Result<PullState> {
+        let root = Self::root(eng);
+        Ok(PullState { head: gitx::rev(root, "HEAD")?, remote: gitx::remote_head(root)?, blocked: eng.blocked.clone() })
     }
 
     /// After file changes (or the periodic reconciliation): refresh, and if
@@ -522,7 +569,7 @@ impl Daemon {
         let before = self.view.borrow().report.drafts.clone();
         self.refresh(eng)?;
         if eng.blocked.is_some() && self.view.borrow().report.drafts != before && self.is_connected() {
-            self.pull(eng)?;
+            self.pull_refreshed(eng)?;
         }
         Ok(())
     }
@@ -530,19 +577,38 @@ impl Daemon {
     /// Fetches the server's baseline and moves onto it (draft carried along),
     /// pushes queued commits, and syncs.
     pub(crate) fn pull(&self, eng: &mut Engine) -> Result<PullResult> {
+        self.pull_with(eng, false)
+    }
+
+    /// A pull where the local state was refreshed just before (by the caller,
+    /// or by the session on connecting): the sync after it is skipped if the
+    /// pull moved nothing, since it would recompute the same report from the
+    /// same inputs.
+    fn pull_refreshed(&self, eng: &mut Engine) -> Result<PullResult> {
+        self.pull_with(eng, true)
+    }
+
+    fn pull_with(&self, eng: &mut Engine, refreshed: bool) -> Result<PullResult> {
         self.ensure_managed(eng)?;
         let root = eng.state.repo.clone();
         if !root.join(".git").exists() {
             gitx::ensure_clone(&root, &eng.state.repo_url(), &[])?;
         }
         self.lock_repo(eng)?;
+        // `None`: refresh whatever happens.
+        let before = if refreshed && !eng.stale { Self::pull_state(eng).ok() } else { None };
         let result = self.pull_inner(eng).and_then(|r| {
             if !matches!(r, PullResult::Blocked { .. }) {
                 self.push_pending(eng)?;
             }
             Ok(r)
         });
-        self.refresh(eng)?;
+        // A failed pull may have stopped half-way: that always refreshes.
+        if result.is_ok() && before.is_some() && before == Self::pull_state(eng).ok() {
+            self.publish_server_baseline(eng);
+        } else {
+            self.refresh(eng)?;
+        }
         match &result {
             Ok(r) => {
                 if let PullResult::Updated { to, .. } = r {
@@ -636,7 +702,8 @@ impl Daemon {
         if Self::idle(eng) {
             return Ok(());
         }
-        self.pull(eng).map(drop)
+        // The session refreshed before its first status, moments ago.
+        self.pull_refreshed(eng).map(drop)
     }
 
     /// A reader: no engine mutex.
@@ -681,7 +748,7 @@ impl Daemon {
             self.set_error(format!("push: {e}"));
         }
         if eng.blocked.is_some() && self.is_connected() {
-            let _ = self.pull(eng);
+            let _ = self.pull_refreshed(eng);
         }
         Ok(CommitResponse { sha, items, message, pushed, push_error })
     }
@@ -715,7 +782,7 @@ impl Daemon {
         }
         refreshed?;
         if eng.blocked.is_some() && self.is_connected() {
-            let _ = self.pull(eng);
+            let _ = self.pull_refreshed(eng);
         }
         Ok(RestoreResponse { discarded })
     }
@@ -991,7 +1058,7 @@ impl Daemon {
         tracing::info!("adopted {} from {} into the draft", t.name, t.harness);
         self.refresh(eng)?;
         if eng.blocked.is_some() && self.is_connected() {
-            let _ = self.pull(eng);
+            let _ = self.pull_refreshed(eng);
         }
         Ok(())
     }
@@ -1219,7 +1286,9 @@ impl Daemon {
         Ok(true)
     }
 
-    /// The server's baseline is now `baseline`: pull unless already on it.
+    /// The server's baseline is now `baseline`: pull unless already on it. A
+    /// nudge for the baseline the machine is on (the server sends one on every
+    /// connect) says nothing about the local state, so it costs no refresh.
     pub(crate) fn nudge(&self, eng: &mut Engine, baseline: String) -> Result<()> {
         if Self::idle(eng) {
             return Ok(());
@@ -1229,9 +1298,12 @@ impl Daemon {
         self.event(Event::Fleet);
         let current = gitx::baseline(Self::root(eng)).unwrap_or(None);
         if current.as_deref() != Some(baseline.as_str()) || eng.blocked.is_some() {
-            self.pull(eng).map(drop)
-        } else {
+            self.pull_refreshed(eng).map(drop)
+        } else if eng.stale {
             self.refresh(eng)
+        } else {
+            self.publish_server_baseline(eng);
+            Ok(())
         }
     }
 
