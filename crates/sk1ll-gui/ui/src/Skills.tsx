@@ -20,9 +20,14 @@ import type { ContentEntry, ContentQuery, ContentType, Editor, StatusView } from
 const typeLabels: Record<ContentType, string> = { personal: 'Personal', import: 'Import', rule: 'Rule', unmanaged: 'Unmanaged' };
 const loadEditors = () => api.editors(true);
 const keyFor = (entry: ContentEntry) => entry.item ?? `unmanaged:${entry.name}`;
-// The editor's installed icon, or a generic one for its kind.
+// Bundled brand icons for the known editors; anything else gets a generic icon for its kind.
+const editorIcons = import.meta.glob<string>('./assets/editors/*.svg', { eager: true, import: 'default', query: '?url' });
+// Monochrome marks are masked so they take the text colour in both themes.
+const monochromeIcons = new Set(['cursor']);
 function EditorIcon({ editor }: { editor: Editor }) {
-  if (editor.icon) return <img src={editor.icon} alt="" data-icon="inline-start" className="size-4 shrink-0" />;
+  const src = editorIcons[`./assets/editors/${editor.id}.svg`];
+  if (src && monochromeIcons.has(editor.id)) return <span aria-hidden data-icon="inline-start" className="size-4 shrink-0 bg-current" style={{ mask: `url("${src}") center / contain no-repeat` }} />;
+  if (src) return <img src={src} alt="" data-icon="inline-start" className="size-4 shrink-0" />;
   const Icon = editor.id === 'file-manager' ? Folder : editor.kind === 'system' ? File : editor.kind === 'terminal' ? SquareTerminal : Code;
   return <Icon data-icon="inline-start" />;
 }
@@ -203,16 +208,16 @@ function SkillDetail({ entry, entries, close, initialHarness, revision, changed,
         {entry.draft && <Button ref={reviewButton} variant="outline" size="default" onClick={reviewDraft}>Review in Draft</Button>}
         {entry.draft !== 'deleted' && <>
           <ServerRequired needed={needsServer}><div className="flex" role="group" aria-label="Edit Skill">
-            <Button size="default" className="rounded-r-none" disabled={(entry.type !== 'unmanaged' && !preferred) || mutation.pending || (entry.type === 'unmanaged' && !canAdopt)}
+            <Button variant="outline" size="default" className="rounded-r-none" disabled={(entry.type !== 'unmanaged' && !preferred) || mutation.pending || (entry.type === 'unmanaged' && !canAdopt)}
               onClick={event => { confirmationTrigger.current = event.currentTarget; if (entry.type === 'unmanaged') setConfirmation({}); else if (preferred) edit(preferred.id); }}><Pending pending={mutation.pending}>
                 {!mutation.pending && entry.type !== 'import' && entry.type !== 'unmanaged' && preferred && <EditorIcon editor={preferred} />}
                 {entry.type === 'import' ? 'Fork to edit' : entry.type === 'unmanaged' ? 'Adopt into Draft' : `Open in ${preferred?.name ?? 'editor'}`}
               </Pending></Button>
-            <DropdownMenu><DropdownMenuTrigger render={<Button size="icon" className="rounded-l-none border-l" ref={editorTrigger} aria-label="Choose editor" disabled={!editors.data?.editors.length || mutation.pending || (entry.type === 'unmanaged' && !canAdopt)} />}><ChevronDown /></DropdownMenuTrigger>
+            <DropdownMenu><DropdownMenuTrigger render={<Button variant="outline" size="icon" className="-ml-px rounded-l-none" ref={editorTrigger} aria-label="Choose editor" disabled={!editors.data?.editors.length || mutation.pending || (entry.type === 'unmanaged' && !canAdopt)} />}><ChevronDown /></DropdownMenuTrigger>
               <DropdownMenuContent align="end">{(['gui', 'terminal', 'system'] as const).map(kind => {
                 const choices = editors.data?.editors.filter(editor => editor.kind === kind) ?? [];
                 return choices.length > 0 && <DropdownMenuGroup key={kind}><DropdownMenuLabel>{kind === 'gui' ? 'GUI' : kind === 'terminal' ? 'Terminal' : 'System'}</DropdownMenuLabel>
-                  {choices.map(editor => <DropdownMenuItem key={editor.id} onClick={() => { confirmationTrigger.current = editorTrigger.current; edit(editor.id); }}>{entry.type === 'unmanaged' ? `Adopt and open in ${editor.name}` : editor.name}</DropdownMenuItem>)}
+                  {choices.map(editor => <DropdownMenuItem key={editor.id} onClick={() => { confirmationTrigger.current = editorTrigger.current; edit(editor.id); }}><EditorIcon editor={editor} />{entry.type === 'unmanaged' ? `Adopt and open in ${editor.name}` : editor.name}</DropdownMenuItem>)}
                 </DropdownMenuGroup>;
               })}<DropdownMenuSeparator /><DropdownMenuGroup><DropdownMenuItem onClick={() => void editors.refresh()}>Refresh editors</DropdownMenuItem></DropdownMenuGroup></DropdownMenuContent>
             </DropdownMenu>

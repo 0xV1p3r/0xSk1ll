@@ -143,8 +143,13 @@ printf '\nAdd a second pass for error handling.\n' >> "$fleet_dir/alpha/skills/p
 mkdir -p "$fleet_dir/alpha/skills/personal/local-only"
 printf '%s\n' '---' 'name: local-only' 'description: A Skill private to this Machine until Commit' '---' 'Draft work.' \
   > "$fleet_dir/alpha/skills/personal/local-only/SKILL.md"
+# Editors opened from the GUI get the real HOME and XDG dirs back so they keep the user's settings.
+editor_env=()
+for var in HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME; do
+  editor_env+=("SK1LL_EDITOR_$var=${!var:-}")
+done
 gui_env() {
-  env HOME="$fleet_dir/gui" XDG_CONFIG_HOME="$fleet_dir/gui/config" \
+  env "${editor_env[@]}" HOME="$fleet_dir/gui" XDG_CONFIG_HOME="$fleet_dir/gui/config" \
     XDG_CACHE_HOME="$fleet_dir/gui/cache" XDG_DATA_HOME="$fleet_dir/gui/data" \
     CARGO_HOME="$toolchain_cargo_home" RUSTUP_HOME="$toolchain_rustup_home" "$@"
 }
@@ -154,7 +159,7 @@ printf '\nDevelopment Fleet ready\nServer: %s\nFiles and logs: %s\n\n' "$server_
 printf 'In another terminal:\n  cd %q\n  SK1LL_DAEMON_SOCKET=%q pnpm tauri dev\n\n' "$project_root/crates/sk1ll-gui/ui" "$alpha_socket"
 printf 'Or pass --gui to this script to launch the GUI now. Ctrl-C removes the temporary Fleet.\n'
 if [[ ${1:-} == --gui ]]; then
-  (cd "$project_root/crates/sk1ll-gui/ui" && exec setsid env HOME="$fleet_dir/gui" XDG_CONFIG_HOME="$fleet_dir/gui/config" \
+  (cd "$project_root/crates/sk1ll-gui/ui" && exec setsid env "${editor_env[@]}" HOME="$fleet_dir/gui" XDG_CONFIG_HOME="$fleet_dir/gui/config" \
     XDG_CACHE_HOME="$fleet_dir/gui/cache" XDG_DATA_HOME="$fleet_dir/gui/data" \
     CARGO_HOME="$toolchain_cargo_home" RUSTUP_HOME="$toolchain_rustup_home" pnpm tauri dev) &
   pids+=("$!")

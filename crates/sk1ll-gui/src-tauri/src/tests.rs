@@ -393,46 +393,6 @@ fn editor_detection_and_terminal_arguments() {
 }
 
 #[test]
-fn editor_icons_come_from_desktop_entries_themes_and_bundles() {
-    use crate::editors::*;
-    use std::os::unix::fs::PermissionsExt;
-    let temp = tempfile::tempdir().unwrap();
-    let bin = temp.path().join("bin");
-    std::fs::create_dir(&bin).unwrap();
-    for name in ["code", "kitty", "nvim", "zed"] {
-        std::fs::write(bin.join(name), "not executed").unwrap();
-        std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    let applications = temp.path().join("applications");
-    let theme = temp.path().join("icons/hicolor/scalable/apps");
-    std::fs::create_dir_all(&applications).unwrap();
-    std::fs::create_dir_all(&theme).unwrap();
-    std::fs::write(applications.join("code.desktop"), "[Desktop Entry]\nExec=/opt/code/code %F\nIcon=vscode\n")
-        .unwrap();
-    std::fs::write(theme.join("vscode.svg"), "<svg/>").unwrap();
-    let zed = temp.path().join("zed.png");
-    std::fs::write(&zed, "png").unwrap();
-    std::fs::write(applications.join("dev.zed.Zed.desktop"), format!("[Desktop Entry]\nIcon={}\n", zed.display()))
-        .unwrap();
-    std::fs::write(applications.join("nvim.desktop"), "[Desktop Entry]\nExec=nvim\nIcon=../escape\n").unwrap();
-    let discovery =
-        Discovery { path: vec![bin], data: vec![temp.path().into()], apps: vec![], terminal: Some("kitty".into()) };
-    let found = discovery.detect();
-    let icon = |id: &str| found.iter().find(|e| e.view.id == id).unwrap().view.icon.clone();
-    assert_eq!(icon("code").as_deref(), Some("data:image/svg+xml;base64,PHN2Zy8+"));
-    assert_eq!(icon("zed").as_deref(), Some("data:image/png;base64,cG5n"));
-    assert_eq!(icon("nvim"), None);
-    assert_eq!(icon("file-manager"), None);
-
-    let chunk = |kind: &[u8], data: &[u8]| [kind, &(data.len() as u32 + 8).to_be_bytes(), data].concat();
-    let body =
-        [chunk(b"ic10", b"\x89PNG large"), chunk(b"ic07", b"jp2 data"), chunk(b"ic08", b"\x89PNG medium")].concat();
-    let icns = [b"icns".as_slice(), &(body.len() as u32 + 8).to_be_bytes(), &body].concat();
-    assert_eq!(icns_png(&icns), Some(b"\x89PNG medium".as_slice()));
-    assert_eq!(icns_png(b"icns\0\0\0\x10ic07\xff\xff\xff\xff"), None);
-}
-
-#[test]
 fn editor_targets_reject_escapes_and_imports() {
     use crate::editors::*;
     let temp = tempfile::tempdir().unwrap();
@@ -706,7 +666,7 @@ fn every_editor_launch_keeps_unusual_paths_in_one_argument() {
                 args
             };
             let editor = Editor {
-                view: EditorView { id: "default-app".into(), name: kind.into(), kind: EditorKind::System, icon: None },
+                view: EditorView { id: "default-app".into(), name: kind.into(), kind: EditorKind::System },
                 program: stub.clone(),
                 args: args.clone(),
             };
@@ -811,4 +771,22 @@ async fn new_commands_forward_typed_payloads() {
     assert_eq!(requests[4].2["id"], "recovered");
     assert_eq!(requests[5].2, json!({"kind":"rule","name":"style"}));
     assert_eq!(requests[6].2, json!({"kind":"skill","name":"pdf","to":"docs"}));
+}
+
+#[test]
+fn editors_get_the_user_environment_back_from_a_sandboxed_gui() {
+    use crate::editors::user_env;
+    use std::ffi::OsString;
+    assert_eq!(user_env(|_| None), None);
+    let vars = [
+        ("SK1LL_EDITOR_HOME", "/home/me"),
+        ("SK1LL_EDITOR_XDG_CONFIG_HOME", "/home/me/cfg"),
+        ("SK1LL_EDITOR_XDG_DATA_HOME", ""),
+    ];
+    let env = user_env(|name| vars.iter().find(|(n, _)| *n == name).map(|(_, v)| OsString::from(v))).unwrap();
+    let value = |name: &str| env.iter().find(|(n, _)| *n == name).unwrap().1.clone();
+    assert_eq!(value("HOME"), Some("/home/me".into()));
+    assert_eq!(value("XDG_CONFIG_HOME"), Some("/home/me/cfg".into()));
+    assert_eq!(value("XDG_DATA_HOME"), None);
+    assert_eq!(value("XDG_CACHE_HOME"), None);
 }
