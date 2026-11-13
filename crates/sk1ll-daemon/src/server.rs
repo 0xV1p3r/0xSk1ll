@@ -5,7 +5,11 @@
 //! On connect: `hello`; then the local state is recomputed (with the engine
 //! mutex) and sent as the first status; then the outbox of `draft_discarded`
 //! is delivered, each entry removed only once sent; then commits queued
-//! while offline are pushed and the baseline is pulled. Afterwards a status
+//! while offline are pushed and the baseline is pulled. That is one refresh
+//! per connect when nothing changed: the outbox is filtered against the
+//! report just computed, the pull syncs again only if it moved something, and
+//! the server's initial nudge for the baseline the machine is on is only
+//! noted. Afterwards a status
 //! goes out whenever the report changes, always before newly queued
 //! `draft_discarded`. The socket is read continuously so pings are answered;
 //! server messages are handled in order by a separate worker so slow work (a
@@ -117,17 +121,29 @@ async fn send(ws: &mut Sink, msg: &DaemonMessage) -> anyhow::Result<()> {
 }
 
 /// Delivers the outbox in order after a fresh status, skipping recreated items.
-async fn flush_outbox(d: &Arc<Daemon>, sink: &mut Sink, sent: &mut MachineReport) -> anyhow::Result<()> {
+///
+/// `fresh`: the caller refreshed just before (on connecting), so an entry
+/// already queued then needs no second refresh. An empty outbox never
+/// refreshes: there is nothing to filter, and the report published last goes
+/// out as it is.
+async fn flush_outbox(
+    d: &Arc<Daemon>, sink: &mut Sink, sent: &mut MachineReport, mut fresh: bool,
+) -> anyhow::Result<()> {
     loop {
         // Capture the entry and the state used to filter it under the same
         // engine mutex, so a concurrent Restore cannot queue against an older report.
+        // (A Restore refreshes before it queues; if that refresh failed, the
+        // report is stale and is recomputed here whatever `fresh` says.)
         // Adoption holds the engine mutex while waiting for its published
         // draft to reach the Server. Keep sending fresh reports even if an outbox
         // refresh is waiting for that mutex.
         let mut view = d.subscribe_view();
-        let refresh = d.blocking(|d, eng| {
-            d.refresh(eng)?;
-            Ok((d.view().report, d.outbox_front()))
+        let refresh = d.blocking(move |d, eng| {
+            let entry = d.outbox_front();
+            if entry.is_some() && (!fresh || Daemon::report_is_stale(eng)) {
+                d.refresh(eng)?;
+            }
+            Ok((d.view().report, entry))
         });
         tokio::pin!(refresh);
         let (report, entry) = loop {
@@ -158,6 +174,8 @@ async fn flush_outbox(d: &Arc<Daemon>, sink: &mut Sink, sent: &mut MachineReport
             send(sink, &DaemonMessage::DraftDiscarded { items }).await?;
         }
         d.outbox_delivered(entry.id);
+        // One refresh serves every entry of this flush.
+        fresh = true;
     }
 }
 
@@ -183,7 +201,7 @@ async fn session(d: &Arc<Daemon>, ws: Ws, inbox: &mpsc::UnboundedSender<ServerMe
     // before the first status and before replaying any discards.
     let mut sent = refresh_report(d).await?;
     send(&mut sink, &DaemonMessage::Status(sent.clone())).await?;
-    flush_outbox(d, &mut sink, &mut sent).await?;
+    flush_outbox(d, &mut sink, &mut sent, true).await?;
     d.set_connection(Connection::Connected);
     let catch_up = d.clone();
     tokio::spawn(async move {
@@ -224,7 +242,7 @@ async fn session(d: &Arc<Daemon>, ws: Ws, inbox: &mpsc::UnboundedSender<ServerMe
             }
             () = d.outbox_ready.notified() => {
                 // The status that led to it goes first (e.g. the draft after a Restore).
-                flush_outbox(d, &mut sink, &mut sent).await?;
+                flush_outbox(d, &mut sink, &mut sent, false).await?;
             }
         }
     }
