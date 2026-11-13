@@ -154,31 +154,109 @@ pub(crate) fn unpushed_items(dir: &Path) -> anyhow::Result<Vec<ItemRef>> {
     Ok(items.into_iter().collect())
 }
 
-/// A repo whose `HEAD` has no commit yet (cloned from an empty server) takes
-/// the server's baseline once it has one: `HEAD` moves to it without touching
-/// the working tree, and files the baseline has that the machine lacks are
-/// checked out. Local files that differ stay as draft. Returns the commit,
-/// `None` if the server is still empty.
-pub(crate) fn adopt_first_baseline(dir: &Path) -> anyhow::Result<Option<String>> {
+/// The first baseline can clash with files even though HEAD is unborn.
+pub(crate) enum FirstBaseline {
+    Empty,
+    Adopted(String),
+    Blocked { baseline: String, items: Vec<ItemRef> },
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_BASELINE_PUBLICATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
+}
+
+/// Adopts an empty clone's first baseline, keeping the generated init files
+/// as draft. Every checkout destination is checked before HEAD or the index
+/// moves. Ignored files and symlinks are checked directly on disk too.
+pub(crate) fn adopt_first_baseline(dir: &Path) -> anyhow::Result<FirstBaseline> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
     fetch_all(dir, &[])?;
     let Some(remote) = remote_head(dir)? else {
         let others = remote_branches(dir)?;
         if others.is_empty() {
-            return Ok(None);
+            return Ok(FirstBaseline::Empty);
         }
         return Err(no_fleet_branch(&others));
     };
-    // The baseline always lives on the fleet branch, whatever the unborn HEAD was called.
+    let args = ["ls-tree", "-rz", &remote];
+    let tree = output(dir, &args, &[])?;
+    if !tree.status.success() {
+        return Err(failed(&args, &tree));
+    }
+    // An empty server clone and /init already contain core's starter files.
+    // Keep those untouched; any other existing target belongs to the user.
+    let template = tempfile::tempdir()?;
+    Repo::init(template.path())?;
+    let mut missing = Vec::new();
+    let mut blocked = BTreeSet::new();
+    for entry in tree.stdout.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+        let tab = entry.iter().position(|b| *b == b'\t').context("invalid ls-tree entry")?;
+        let fields = std::str::from_utf8(&entry[..tab])?.split_whitespace().collect::<Vec<_>>();
+        let path = Path::new(OsStr::from_bytes(&entry[tab + 1..]));
+        let mut destination = dir.to_path_buf();
+        let mut obstructed = false;
+        for component in path.components() {
+            destination.push(component);
+            match destination.symlink_metadata() {
+                Ok(meta) if destination != dir.join(path) => {
+                    if !meta.is_dir() {
+                        obstructed = true;
+                        break;
+                    }
+                }
+                Ok(meta) => {
+                    let starter = template.path().join(path);
+                    if !meta.is_file() || !starter.is_file() || std::fs::read(&destination)? != std::fs::read(starter)?
+                    {
+                        obstructed = true;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("checking {}", destination.display())),
+            }
+        }
+        if obstructed {
+            blocked.insert(ItemRef::for_path(path));
+        } else if destination.symlink_metadata().is_err() {
+            missing.push((path.to_path_buf(), fields[0].to_string(), fields[2].to_string()));
+        }
+    }
+    if !blocked.is_empty() {
+        return Ok(FirstBaseline::Blocked { baseline: remote, items: blocked.into_iter().collect() });
+    }
+    #[cfg(test)]
+    BEFORE_BASELINE_PUBLICATION.with_borrow_mut(|hook| {
+        if let Some(hook) = hook.take() {
+            hook();
+        }
+    });
+    let directory = sk1ll_core::placement::Directory::open(dir, false)?;
+    for (path, mode, oid) in missing {
+        let blob = output(dir, &["cat-file", "blob", &oid], &[])?;
+        if !blob.status.success() {
+            return Err(failed(&["cat-file", "blob", &oid], &blob));
+        }
+        let published = match mode.as_str() {
+            "100644" | "100755" => directory.create_file(&path, &blob.stdout, mode == "100755"),
+            "120000" => directory.create_symlink(&path, OsStr::from_bytes(&blob.stdout)),
+            _ => Err(std::io::Error::other("unsupported baseline file mode")),
+        };
+        if published.is_err() {
+            blocked.insert(ItemRef::for_path(&path));
+        }
+    }
+    if !blocked.is_empty() {
+        // Keep earlier, exclusively published files. Removing them could lose
+        // an edit made after publication. HEAD and index remain unborn.
+        return Ok(FirstBaseline::Blocked { baseline: remote, items: blocked.into_iter().collect() });
+    }
+    // Git only writes metadata, after every working-tree publication succeeds.
     run(dir, &["symbolic-ref", "HEAD", &format!("refs/heads/{FLEET_BRANCH}")])?;
     run(dir, &["reset", "--quiet", "--mixed", &remote])?;
-    let missing = run(dir, &["ls-files", "--deleted"])?;
-    let missing: Vec<&str> = missing.lines().filter(|l| !l.is_empty()).collect();
-    if !missing.is_empty() {
-        let mut args = vec!["checkout", "--quiet", "--"];
-        args.extend(missing);
-        run(dir, &args)?;
-    }
-    Ok(Some(remote))
+    Ok(FirstBaseline::Adopted(remote))
 }
 
 /// What [`ensure_clone`] found at the repo path.
@@ -320,6 +398,79 @@ fn private_config(dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether this repo defines its own origin remote.
+pub(crate) fn has_origin(dir: &Path) -> anyhow::Result<bool> {
+    Ok(try_run(dir, &["remote", "get-url", "origin"])?.is_some())
+}
+
+/// A standalone repo may join only when it is an untouched init, or an
+/// unchanged clone of this server without any local commits to preserve.
+pub(crate) fn check_standalone_join(dir: &Path, remote: &str) -> anyhow::Result<()> {
+    if is_pristine_init(dir)? {
+        return Ok(());
+    }
+    // Git status hides ignored content. An unborn repo that is not the
+    // complete pristine init may only be adopted when it has no worktree entries.
+    if dir.join(".git").exists()
+        && rev(dir, "HEAD")?.is_none()
+        && std::fs::read_dir(dir)?.any(|entry| entry.map_or(true, |e| e.file_name() != ".git"))
+    {
+        bail!(
+            "the standalone repo has a draft or local commits, or other content outside a pristine init; move it aside before joining a Fleet"
+        );
+    }
+    if dir.join(".git").exists()
+        && (!run(dir, &["status", "--porcelain", "--untracked-files=all"])?.is_empty() || has_unpushed(dir)?)
+    {
+        bail!(
+            "the standalone repo has a draft or local commits; move it aside or choose another repo before joining a Fleet"
+        );
+    }
+    check_repo_path(dir, remote)?;
+    Ok(())
+}
+
+/// Compare every non-git entry with core's init output, including ignored
+/// files and symlinks. No user content is removed when this directory moves.
+pub(crate) fn is_pristine_init(dir: &Path) -> anyhow::Result<bool> {
+    if dir.symlink_metadata().is_ok_and(|m| m.is_symlink()) || !dir.join(".git").is_dir() || rev(dir, "HEAD")?.is_some()
+    {
+        return Ok(false);
+    }
+    fn files(
+        root: &Path,
+        dir: &Path,
+        out: &mut std::collections::BTreeMap<PathBuf, Option<Vec<u8>>>,
+    ) -> anyhow::Result<bool> {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            let rel = path.strip_prefix(root)?;
+            if rel == Path::new(".git") {
+                continue;
+            }
+            let meta = path.symlink_metadata()?;
+            if meta.is_symlink() {
+                return Ok(false);
+            }
+            if meta.is_dir() {
+                out.insert(rel.to_path_buf(), None);
+                if !files(root, &path, out)? {
+                    return Ok(false);
+                }
+            } else if meta.is_file() {
+                out.insert(rel.to_path_buf(), Some(std::fs::read(path)?));
+            } else {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    let template = tempfile::tempdir()?;
+    Repo::init(template.path())?;
+    let (mut expected, mut actual) = (Default::default(), Default::default());
+    Ok(files(template.path(), template.path(), &mut expected)? && files(dir, dir, &mut actual)? && expected == actual)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,6 +510,190 @@ mod tests {
         git(&dir, &["commit", "--quiet", "-m", "my own root"]);
         git(&dir, &["remote", "add", REMOTE, remote]);
         dir
+    }
+
+    #[test]
+    fn empty_server_clone_blocks_every_first_baseline_obstruction() {
+        use std::os::unix::fs::symlink;
+        for scenario in [
+            "ancestor-file",
+            "ancestor-symlink",
+            "target-file",
+            "target-directory",
+            "target-symlink",
+            "dangling-symlink",
+        ] {
+            for ignored in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                let remote = tmp.path().join("empty.git");
+                git(tmp.path(), &["init", "--quiet", "--bare", "-b", "main", remote.to_str().unwrap()]);
+                let clone = tmp.path().join("clone");
+                assert_eq!(ensure_clone(&clone, remote.to_str().unwrap(), &[]).unwrap(), Setup::Initialized);
+                let seed = tmp.path().join("seed");
+                Repo::init(&seed).unwrap();
+                std::fs::create_dir_all(seed.join("personal/pdf")).unwrap();
+                std::fs::write(seed.join("personal/pdf/SKILL.md"), "remote skill").unwrap();
+                git(&seed, &["add", "-A"]);
+                git(&seed, &["commit", "--quiet", "-m", "first baseline"]);
+                git(&seed, &["push", "--quiet", remote.to_str().unwrap(), "main"]);
+                let outside = tmp.path().join("outside");
+                std::fs::create_dir(&outside).unwrap();
+                std::fs::write(outside.join("notes"), "outside notes").unwrap();
+                let ancestor = clone.join("personal/pdf");
+                let target = ancestor.join("SKILL.md");
+                if scenario.starts_with("target") || scenario == "dangling-symlink" {
+                    std::fs::create_dir(&ancestor).unwrap();
+                }
+                match scenario {
+                    "ancestor-file" => std::fs::write(&ancestor, "private notes").unwrap(),
+                    "ancestor-symlink" => symlink(&outside, &ancestor).unwrap(),
+                    "target-file" => std::fs::write(&target, "private notes").unwrap(),
+                    "target-directory" => {
+                        std::fs::create_dir(&target).unwrap();
+                        std::fs::write(target.join("notes"), "private notes").unwrap();
+                    }
+                    "target-symlink" => symlink(outside.join("notes"), &target).unwrap(),
+                    "dangling-symlink" => symlink(outside.join("missing"), &target).unwrap(),
+                    _ => unreachable!(),
+                }
+                if ignored {
+                    std::fs::write(clone.join(".git/info/exclude"), "personal/pdf\n").unwrap();
+                }
+                // Keep an index too, so this catches a reset that rewrites it.
+                git(&clone, &["add", "sk1ll.toml"]);
+                let head = std::fs::read(clone.join(".git/HEAD")).unwrap();
+                let index = std::fs::read(clone.join(".git/index")).unwrap();
+                assert!(
+                    matches!(adopt_first_baseline(&clone).unwrap(), FirstBaseline::Blocked { items, .. }
+                    if items == vec![ItemRef::Skill("pdf".into())]),
+                    "{scenario}, ignored={ignored}"
+                );
+                assert_eq!(std::fs::read(clone.join(".git/HEAD")).unwrap(), head);
+                assert_eq!(std::fs::read(clone.join(".git/index")).unwrap(), index);
+                assert_eq!(rev(&clone, "HEAD").unwrap(), None);
+                assert_eq!(std::fs::read_to_string(outside.join("notes")).unwrap(), "outside notes");
+                match scenario {
+                    "ancestor-file" => assert_eq!(std::fs::read_to_string(ancestor).unwrap(), "private notes"),
+                    "ancestor-symlink" => assert_eq!(std::fs::read_link(ancestor).unwrap(), outside),
+                    "target-file" => assert_eq!(std::fs::read_to_string(target).unwrap(), "private notes"),
+                    "target-directory" => {
+                        assert_eq!(std::fs::read_to_string(target.join("notes")).unwrap(), "private notes")
+                    }
+                    _ => assert!(std::fs::symlink_metadata(target).unwrap().is_symlink()),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn first_baseline_preserves_content_created_after_preflight() {
+        for scenario in ["ancestor-file", "ancestor-symlink", "target-file", "target-directory", "target-symlink"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let remote = server(tmp.path());
+            let seed = tmp.path().join("seed");
+            std::fs::create_dir_all(seed.join("personal/pdf")).unwrap();
+            std::fs::create_dir_all(seed.join("instructions")).unwrap();
+            std::fs::write(seed.join("instructions/first.md"), "published before the obstruction").unwrap();
+            std::fs::write(seed.join("personal/pdf/SKILL.md"), "remote").unwrap();
+            git(&seed, &["add", "-A"]);
+            git(&seed, &["commit", "-qm", "skill"]);
+            git(&seed, &["push", "--quiet", &remote, "main"]);
+            let clone = tmp.path().join("clone");
+            Repo::init(&clone).unwrap();
+            git(&clone, &["remote", "add", "origin", &remote]);
+            git(&clone, &["add", "sk1ll.toml"]);
+            std::fs::write(clone.join(".git/info/exclude"), "personal/pdf\n").unwrap();
+            let head = std::fs::read(clone.join(".git/HEAD")).unwrap();
+            let index = std::fs::read(clone.join(".git/index")).unwrap();
+            let outside = tmp.path().join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            std::fs::write(outside.join("SKILL.md"), "private").unwrap();
+            let ancestor = clone.join("personal/pdf");
+            let target = ancestor.join("SKILL.md");
+            let (a, t, o) = (ancestor.clone(), target.clone(), outside.clone());
+            BEFORE_BASELINE_PUBLICATION.with_borrow_mut(|hook| {
+                *hook = Some(Box::new(move || {
+                    if scenario.starts_with("target") {
+                        std::fs::create_dir(&a).unwrap();
+                    }
+                    match scenario {
+                        "ancestor-file" => std::fs::write(a, "private").unwrap(),
+                        "ancestor-symlink" => std::os::unix::fs::symlink(o, a).unwrap(),
+                        "target-file" => std::fs::write(t, "private").unwrap(),
+                        "target-directory" => {
+                            std::fs::create_dir(&t).unwrap();
+                            std::fs::write(t.join("notes"), "private").unwrap();
+                        }
+                        _ => std::os::unix::fs::symlink(o.join("SKILL.md"), t).unwrap(),
+                    }
+                }))
+            });
+            assert!(
+                matches!(adopt_first_baseline(&clone).unwrap(), FirstBaseline::Blocked { items, .. }
+                if items == vec![ItemRef::Skill("pdf".into())]),
+                "{scenario}"
+            );
+            assert_eq!(std::fs::read(clone.join(".git/HEAD")).unwrap(), head);
+            assert_eq!(std::fs::read(clone.join(".git/index")).unwrap(), index);
+            assert_eq!(rev(&clone, "HEAD").unwrap(), None);
+            assert_eq!(
+                std::fs::read(clone.join("instructions/first.md")).unwrap(),
+                b"published before the obstruction"
+            );
+            assert_eq!(std::fs::read(outside.join("SKILL.md")).unwrap(), b"private");
+            match scenario {
+                "ancestor-file" => assert_eq!(std::fs::read(ancestor).unwrap(), b"private"),
+                "ancestor-symlink" => assert_eq!(std::fs::read_link(ancestor).unwrap(), outside),
+                "target-file" => assert_eq!(std::fs::read(target).unwrap(), b"private"),
+                "target-directory" => assert_eq!(std::fs::read(target.join("notes")).unwrap(), b"private"),
+                _ => assert!(target.symlink_metadata().unwrap().is_symlink()),
+            }
+        }
+    }
+
+    #[test]
+    fn standalone_join_refuses_ignored_content_in_unborn_clone() {
+        for symlink in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let remote = server(tmp.path());
+            let repo = tmp.path().join("local");
+            git(tmp.path(), &["init", "-q", repo.to_str().unwrap()]);
+            git(&repo, &["remote", "add", "origin", &remote]);
+            std::fs::write(repo.join(".git/info/exclude"), "*\n").unwrap();
+            let outside = tmp.path().join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            if symlink {
+                std::os::unix::fs::symlink(&outside, repo.join("personal")).unwrap();
+            } else {
+                std::fs::create_dir(repo.join("personal")).unwrap();
+                std::fs::write(repo.join("personal/.gitkeep"), "private").unwrap();
+            }
+            assert!(check_standalone_join(&repo, &remote).is_err());
+            assert!(!outside.join(".gitkeep").exists());
+        }
+    }
+
+    #[test]
+    fn empty_server_clone_adopts_an_unobstructed_baseline_and_keeps_unrelated_drafts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("empty.git");
+        git(tmp.path(), &["init", "--quiet", "--bare", "-b", "main", remote.to_str().unwrap()]);
+        let clone = tmp.path().join("clone");
+        assert_eq!(ensure_clone(&clone, remote.to_str().unwrap(), &[]).unwrap(), Setup::Initialized);
+        let seed = tmp.path().join("seed");
+        Repo::init(&seed).unwrap();
+        std::fs::create_dir_all(seed.join("personal/pdf")).unwrap();
+        // NUL-delimited paths must survive whitespace, including newlines.
+        std::fs::write(seed.join("personal/pdf/SKILL.md"), "remote skill").unwrap();
+        std::fs::write(seed.join("personal/pdf/a\nb"), "attachment").unwrap();
+        git(&seed, &["add", "-A"]);
+        git(&seed, &["commit", "--quiet", "-m", "first baseline"]);
+        git(&seed, &["push", "--quiet", remote.to_str().unwrap(), "main"]);
+        std::fs::write(clone.join("notes"), "private notes").unwrap();
+        assert!(matches!(adopt_first_baseline(&clone).unwrap(), FirstBaseline::Adopted(_)));
+        assert_eq!(std::fs::read_to_string(clone.join("personal/pdf/SKILL.md")).unwrap(), "remote skill");
+        assert_eq!(std::fs::read_to_string(clone.join("personal/pdf/a\nb")).unwrap(), "attachment");
+        assert_eq!(std::fs::read_to_string(clone.join("notes")).unwrap(), "private notes");
     }
 
     #[test]

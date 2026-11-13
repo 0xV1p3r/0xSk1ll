@@ -26,7 +26,7 @@ import { Conflicts } from './Conflicts';
 import { Imports } from './Imports';
 import { Log } from './Log';
 import { Skills, type SkillsHandoff } from './Skills';
-import { useResource } from './hooks';
+import { useMutation, useResource } from './hooks';
 import { eventTopics } from './invalidation';
 import { plural } from './model';
 import { Settings } from './Settings';
@@ -46,6 +46,8 @@ const screens = {
 type Screen = keyof typeof screens;
 const screenHash = (screen: Screen) => `#/${screen.toLowerCase().replaceAll(' ', '-')}`;
 export const screenFromHash = (hash: string): Screen => (Object.keys(screens) as Screen[]).find(screen => screenHash(screen) === hash) ?? 'Fleet';
+const visibleScreens = (status: StatusView) => (Object.keys(screens) as Screen[]).filter(name => status.mode !== 'standalone' || (name !== 'Fleet' && name !== 'Assignment log'));
+const screenLabel = (name: Screen, status: StatusView) => status.mode === 'standalone' && name === 'Assignment matrix' ? 'Assignment' : name;
 const paletteShortcut = /Mac|iPhone|iPad|iPod/i.test(navigator.platform + navigator.userAgent) ? '⌘K' : 'Ctrl K';
 function CopyCommand({ command }: { command: string }) {
   const [copied, setCopied] = useState(false);
@@ -88,13 +90,13 @@ export function AppSidebar({ screen, setScreen, status, unmanagedCount, recovere
   const item = (name: Screen) => {
     const Icon = screens[name].icon;
     return <SidebarMenuItem key={name}>
-      <SidebarMenuButton isActive={screen === name} tooltip={name} aria-current={screen === name ? 'page' : undefined}
-        onClick={() => { if (isMobile) setOpenMobile(false); setScreen(name); }}><Icon /><span>{name}</span></SidebarMenuButton>
+      <SidebarMenuButton isActive={screen === name} tooltip={screenLabel(name, status)} aria-current={screen === name ? 'page' : undefined}
+        onClick={() => { if (isMobile) setOpenMobile(false); setScreen(name); }}><Icon /><span>{screenLabel(name, status)}</span></SidebarMenuButton>
       {!!counts[name] && <span aria-hidden className={cn('pointer-events-none absolute top-1 right-1 hidden size-2 rounded-full group-data-[collapsible=icon]:block', name === 'Conflicts' || (name === 'Imports' && importErrors > 0) ? 'bg-warning' : 'bg-brand-ink')} />}
       {!!counts[name] && <SidebarMenuBadge className={cn(name === 'Conflicts' || (name === 'Imports' && importErrors > 0) ? 'bg-warning/13 text-warning-foreground' : 'bg-brand-soft text-brand-ink')} aria-label={name === 'Library' ? `${counts[name]} Unmanaged skill${counts[name] === 1 ? '' : 's'} to adopt` : name === 'Conflicts' ? [status.report.conflicts.length && `${plural(status.report.conflicts.length, 'Conflict')} to resolve`, recoveredCount && `${plural(recoveredCount, 'recovered item')} to review`].filter(Boolean).join(', ') : name === 'Imports' ? [importUpdates && plural(importUpdates, 'Import update'), importErrors && plural(importErrors, 'failed check')].filter(Boolean).join(', ') : plural(counts[name] ?? 0, 'Draft item')}>{counts[name]}</SidebarMenuBadge>}
     </SidebarMenuItem>;
   };
-  const group = (label: string) => (Object.keys(screens) as Screen[]).filter(name => screens[name].group === label);
+  const group = (label: string) => visibleScreens(status).filter(name => (status.mode === 'standalone' && name === 'Assignment matrix' ? 'This Machine' : screens[name].group) === label);
   return <Sidebar collapsible="icon">
     <SidebarHeader><div className="flex h-12 items-center gap-2 overflow-hidden rounded-md p-2 group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:p-0!">
       <img src={symbol} alt="0xSk1ll" className="size-8 shrink-0 object-contain" />
@@ -102,7 +104,7 @@ export function AppSidebar({ screen, setScreen, status, unmanagedCount, recovere
         <span className="truncate font-mono text-[11px] text-muted-foreground">{status.machine_id}</span></div>
     </div></SidebarHeader>
     <SidebarContent><nav aria-label="Main navigation" className="contents">
-      {['Fleet', 'This Machine'].map(label => <SidebarGroup key={label}><SidebarGroupLabel className="group-data-[collapsible=icon]:pointer-events-none">{label}</SidebarGroupLabel>
+      {(status.mode === 'standalone' ? ['This Machine'] : ['Fleet', 'This Machine']).map(label => <SidebarGroup key={label}><SidebarGroupLabel className="group-data-[collapsible=icon]:pointer-events-none">{label}</SidebarGroupLabel>
         <SidebarGroupContent><SidebarMenu>{group(label).map(item)}</SidebarMenu></SidebarGroupContent></SidebarGroup>)}
       <SidebarGroup className="mt-auto"><SidebarGroupContent><SidebarMenu>{item('Settings')}</SidebarMenu></SidebarGroupContent></SidebarGroup>
     </nav></SidebarContent>
@@ -112,7 +114,7 @@ export function AppSidebar({ screen, setScreen, status, unmanagedCount, recovere
 }
 
 export function App() {
-  const [screen, setScreen] = useState<Screen>(() => screenFromHash(window.location.hash));
+  const [requestedScreen, setScreen] = useState<Screen>(() => screenFromHash(window.location.hash));
   const [paletteOpen, setPaletteOpen] = useState(false);
   const sidebarPreference = useRef(storedSidebar());
   const [sidebarOpen, setSidebarOpen] = useState(() => sidebarPreference.current ?? window.innerWidth >= 1000);
@@ -134,10 +136,14 @@ export function App() {
   }), []);
   const changed = useCallback(() => invalidate(['status', 'content', 'imports', 'fleet', 'history']), [invalidate]);
   const revision = revisions.content;
-  const skills = useResource(api.skills, revision);
-  const recovered = useResource(api.recovered, revision);
-  const imports = useResource(api.imports, revisions.imports);
-  const fleet = useResource(api.fleet, revisions.fleet);
+  const standalone = status?.mode === 'standalone';
+  const screen = standalone && (requestedScreen === 'Fleet' || requestedScreen === 'Assignment log') ? 'Library' : requestedScreen;
+  const ready = !!status && status.repo_ready !== false;
+  const init = useMutation(changed);
+  const skills = useResource(api.skills, revision, undefined, ready);
+  const recovered = useResource(api.recovered, revision, undefined, ready);
+  const imports = useResource(api.imports, revisions.imports, undefined, ready);
+  const fleet = useResource(api.fleet, revisions.fleet, undefined, !!status && !standalone);
   const [refreshPending, setRefreshPending] = useState(false);
   const refreshLock = useRef(false);
   const refreshHeader = async () => {
@@ -238,7 +244,8 @@ export function App() {
   if (reachable === false) return <TooltipProvider><ConnectionPage socket={socket} error={error} /></TooltipProvider>;
   if (!status) return <main className="grid min-h-svh place-items-center bg-muted/40 p-6"><div className="flex w-full max-w-sm flex-col items-start gap-3">
     <Wordmark /><p className="flex items-center gap-2 text-sm text-muted-foreground" role="status"><LoaderCircle aria-hidden className="size-4 animate-spin" />Connecting to the Daemon…</p><ErrorNotice error={error} /></div></main>;
-  const serverConnected = status.connection === 'connected';
+  if (standalone && !status.repo_ready) return <TooltipProvider><main className="grid min-h-svh place-items-center bg-muted/40 p-6"><Card className="w-full max-w-lg"><CardHeader><Wordmark /><CardTitle>Create a skills repo</CardTitle><CardDescription>Set up a local repository for this Machine's Skills and Rules.</CardDescription></CardHeader><CardContent className="flex flex-col gap-4"><code className="font-mono text-xs break-all">{status.repo}</code><Button disabled={init.pending} onClick={() => void init.run(async () => { await api.init(); setStatus(await api.status()); })}>Create a skills repo</Button><ErrorNotice error={init.error} /></CardContent></Card></main></TooltipProvider>;
+  const serverConnected = !standalone && status.connection === 'connected';
   const conflict = status.report.conflicts[0];
   const server = status.server_url?.replace(/^https?:\/\//, '').replace(/\/$/, '') || 'Server';
   return <ToastProvider><TooltipProvider><SidebarProvider open={sidebarOpen} onOpenChange={changeSidebar}>
@@ -248,21 +255,21 @@ export function App() {
       <header className="sticky top-0 z-10 flex h-12 shrink-0 items-center gap-2 border-b bg-background px-4 md:gap-3 md:px-[18px]">
         <SidebarTrigger className="-ml-1 size-8" />
         <Separator orientation="vertical" className="data-vertical:h-4 data-vertical:self-auto" />
-        <span className="hidden min-w-0 truncate text-xs text-muted-foreground md:block">{status.machine_id} → {server}</span>
+        <span className="hidden min-w-0 truncate text-xs text-muted-foreground md:block">{status.machine_id}{!standalone && ` → ${server}`}</span>
         <Button variant="search" className="ml-auto h-8 min-w-0 gap-2 lg:w-full lg:max-w-72" aria-label="Open command palette" onClick={() => setPaletteOpen(true)}>
           <Search data-icon="inline-start" /><span className="hidden truncate lg:inline">Jump to machine, skill, action…</span><kbd className="ml-auto rounded border px-1 font-mono text-[10px]">{paletteShortcut}</kbd>
         </Button>
-        <span className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground" role="status" aria-label={`Server ${connectionLabel(status.connection)}`}>
-          <span className={cn('size-2 shrink-0 rounded-full', serverConnected ? 'bg-success' : 'bg-warning')} aria-hidden />
-          <span className="hidden sm:inline">{serverConnected ? 'Connected' : connectionLabel(status.connection)}{serverConnected && status.assignment_revision != null && ` · rev ${status.assignment_revision}`}</span>
+        <span className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground" role="status" aria-label={`${standalone ? '' : 'Server '}${connectionLabel(standalone ? 'standalone' : status.connection)}`}>
+          <span className={cn('size-2 shrink-0 rounded-full', standalone || serverConnected ? 'bg-success' : 'bg-warning')} aria-hidden />
+          <span className="hidden sm:inline">{serverConnected ? 'Connected' : connectionLabel(standalone ? 'standalone' : status.connection)}{serverConnected && status.assignment_revision != null && ` · rev ${status.assignment_revision}`}</span>
         </span>
         <Tooltip><TooltipTrigger render={<Button variant="ghost" size="icon" aria-label="Refresh" aria-busy={refreshPending} onClick={() => void refreshHeader()} />}>
           <RefreshCw className={cn(refreshPending && 'animate-spin')} /></TooltipTrigger><TooltipContent>Refresh</TooltipContent></Tooltip>
         <ThemeSelector />
       </header>
       <main data-library-search={skillsHandoff.search} id="main" tabIndex={-1} className="mx-auto flex w-full max-w-6xl min-w-0 flex-col gap-5 p-4 md:px-[18px] md:py-4">
-        <div className="flex flex-col gap-1"><div className="flex items-center gap-2"><h1 ref={heading} tabIndex={-1} className="rounded-sm text-2xl font-semibold tracking-tight outline-none focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-ring">{screen}</h1></div>
-          <p className="text-sm text-muted-foreground">{screen === 'Draft' && status.revoked ? "This Machine's Draft is private. The Daemon has stopped managing its Harnesses until this Machine rejoins." : screen === 'Draft' && status.awaiting_assignment ? "This Machine's Draft is private. Harnesses stay unchanged until the Server sends an Assignment." : screens[screen].description}</p></div>
+        <div className="flex flex-col gap-1"><div className="flex items-center gap-2"><h1 ref={heading} tabIndex={-1} className="rounded-sm text-2xl font-semibold tracking-tight outline-none focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-ring">{screenLabel(screen, status)}</h1></div>
+          <p className="text-sm text-muted-foreground">{screen === 'Draft' && status.revoked ? "This Machine's Draft is private. The Daemon has stopped managing its Harnesses until this Machine rejoins." : screen === 'Draft' && status.awaiting_assignment ? "This Machine's Draft is private. Harnesses stay unchanged until the Server sends an Assignment." : standalone && screen === 'Draft' ? 'Commit saves selected Draft items to the local repository.' : standalone && screen === 'Settings' ? 'Harnesses, local repository, and Fleet membership for this Machine.' : screens[screen].description}</p></div>
         {status.revoked && <Notice title="Machine revoked" tone="destructive">This Machine was removed from the Fleet. The Daemon has stopped managing its Harnesses.
           <div><Button variant="outline" size="sm" className="mt-2" onClick={() => navigate('Settings')}>Rejoin in Settings</Button></div></Notice>}
         {status.awaiting_assignment && <Notice title="Awaiting Assignment">The Daemon has no Assignment snapshot. Harnesses are left alone until the Server sends one.</Notice>}
@@ -287,10 +294,11 @@ export function App() {
       </main>
     </SidebarInset>
     <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} commands={[
-      ...(Object.keys(screens) as Screen[]).map(name => ({ id: `screen-${name.replaceAll(' ', '-')}`, label: `Go to: ${name}`, select: () => navigate(name) })),
-      ...(fleet.data?.machines ?? []).map(machine => ({ id: `machine-${machine.id}`, label: `Machine: ${machine.id}`, select: () => navigate('Fleet') })),
-      { id: 'action-pull', background: true, label: 'Action: Pull Baseline', select: () => void runAction(async () => { const result = await api.pull(); return { title: result.state === 'blocked' ? 'Pull blocked' : result.state === 'up_to_date' ? 'Baseline is up to date' : 'Pull complete' }; }) },
+      ...visibleScreens(status).map(name => ({ id: `screen-${name.replaceAll(' ', '-')}`, label: `Go to: ${screenLabel(name, status)}`, select: () => navigate(name) })),
+      ...(!standalone ? fleet.data?.machines ?? [] : []).map(machine => ({ id: `machine-${machine.id}`, label: `Machine: ${machine.id}`, select: () => navigate('Fleet') })),
+      ...(!standalone || status.has_origin ? [{ id: 'action-pull', background: true, label: 'Action: Pull Baseline', select: () => void runAction(async () => { const result = await api.pull(); return { title: result.state === 'blocked' ? 'Pull blocked' : result.state === 'up_to_date' ? 'Baseline is up to date' : 'Pull complete' }; }) },
       { id: 'action-push', background: true, label: 'Action: Push', select: () => void runAction(async () => { const result = await api.push(); return { title: result.pushed ? 'Push complete' : 'Push did not reach the Server', tone: result.pushed ? undefined : 'destructive' }; }) },
+      ] : []),
       { id: 'action-check-imports', background: true, label: 'Action: Check Imports', select: () => void runAction(async () => { const result = await api.checkImports(); return { title: 'Import check complete', description: `${plural(result.updates.length, 'update')}, ${plural(result.errors.length, 'failed check')}`, tone: result.errors.length ? 'destructive' : undefined }; }) },
       { id: 'action-add-import', label: 'Action: Add Import', select: () => { navigate('Imports'); setOpenAdd(n => n + 1); } },
       ...(['Skill', 'Rule'] as const).map(type => ({ id: `action-new-${type.toLowerCase()}`, label: `Action: New ${type}`, select: () => { navigate('Library'); setSkillsHandoff({ create: type === 'Skill' ? 'skill' : 'rule' }); } })),

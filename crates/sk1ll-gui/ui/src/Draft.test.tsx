@@ -222,3 +222,22 @@ it('dismisses a successful commit notice', async () => {
   fireEvent.click(await screen.findByRole('button', { name: 'Dismiss' }));
   expect(screen.queryByText('Commit complete')).toBeNull();
 });
+
+it('disables Push and Pull without an origin in standalone', async () => {
+  render(<Draft revision={0} status={{ ...status, mode: 'standalone', has_origin: false }} changed={changed} />);
+  expect((await screen.findByRole('button', { name: 'Push' }) as HTMLButtonElement).disabled).toBe(true);
+  expect((screen.getByRole('button', { name: 'Pull' }) as HTMLButtonElement).disabled).toBe(true);
+  expect(screen.getByText('Push and Pull require an origin git remote.')).toBeTruthy();
+  expect(screen.queryByRole('checkbox', { name: 'Push after commit' })).toBeNull();
+});
+it('pushes separately after a standalone commit when selected', async () => {
+  vi.mocked(api.commit).mockResolvedValue({ sha: 'abc', items: ['skill:reviewed'], message: 'done', pushed: false, push_error: null });
+  vi.mocked(api.push).mockResolvedValue({ pushed: true });
+  render(<Draft revision={0} status={{ ...status, mode: 'standalone', has_origin: true }} changed={changed} />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Commit (1)' }));
+  const dialog = await screen.findByRole('dialog');
+  fireEvent.click(within(dialog).getByRole('checkbox', { name: 'Push after commit' }));
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Commit' }));
+  await waitFor(() => expect(api.push).toHaveBeenCalledOnce());
+  expect(vi.mocked(api.commit).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(api.push).mock.invocationCallOrder[0]);
+});

@@ -53,6 +53,12 @@ A new machine starts with everything off unless you pass `--copy-from`. `--id` s
 
 ## Run the daemon
 
+The daemon also runs without a fleet. When `daemon.json` is absent, it uses `SK1LL_REPO`, the nearest skills repo above its working directory, or `~/skills`. Assignment is local in `~/.cache/sk1ll/assignment.json`. It watches the repo, assignment and harnesses, and reconciles them periodically. Commits stay local; Push and Pull use the repo's own `origin`. No origin means no Push or Pull.
+
+If the repo does not exist, the daemon still starts and the GUI offers Init. Fleet operations and the assignment log are unavailable until joining. `sk1ll join` can go through a running standalone daemon and restart it with the fleet credentials. A standalone draft or local commits must be moved aside before joining. An untouched `sk1ll init` directory is kept in a `sk1ll-before-join-*` backup beside the repo when the prepared fleet clone is activated. The replacement clone is locked before it becomes live. Snapshot and assignment files are prepared first; `daemon.json` is the final activation marker. If activation fails, the original repo and its engine lock stay active, and any replacement repo is preserved as `unactivated-repo` inside the backup directory. Earlier snapshot and assignment files are retained in private `daemon-activation-*` directories beside those files. Rollback uses no-replace renames and refuses to overwrite concurrent content; if restoration is obstructed, the error names the retained backup and mutations are frozen until recovery and a daemon restart.
+
+A refusal **after registration** consumes the single-use join code and reserves the machine id on the server. Credentials remain in a private `daemon-pending-join-*.json` file next to `daemon.json`, without activating joined mode. Correct the local problem, then repeat the original join command or POST `/join` request with the same server URL, machine id and repo. The daemon reuses those pending credentials, so the consumed code can be supplied again and no new code is needed. Keep that pending file private. If you abandon the registration, remove the reserved machine on the server before registering that id again. If the pending file is lost, remove the reserved machine and obtain a new join code.
+
 On Linux, install the systemd user unit:
 
 ```sh
@@ -74,7 +80,8 @@ The local API socket is `$XDG_RUNTIME_DIR/sk1ll/daemon.sock`. Its directory must
 | `SK1LL_DAEMON_STATE` | `~/.config/sk1ll/daemon.json` | Machine id, server URL, token and repo path |
 | `SK1LL_DAEMON_SOCKET` | `$XDG_RUNTIME_DIR/sk1ll/daemon.sock` | Local API socket |
 | `SK1LL_MACHINE_CONFIG` | `~/.config/sk1ll/machine.toml` | Harness configuration |
-| `SK1LL_ASSIGNMENT` | `~/.cache/sk1ll/assignment.json` | Assignment cache |
+| `SK1LL_ASSIGNMENT` | `~/.cache/sk1ll/assignment.json` | Local assignment in standalone; server mirror when joined |
+| `SK1LL_REPO` | nearest skills repo, else `~/skills` | Standalone repo path; joined machines use `daemon.json` |
 | `SK1LL_PULL_INTERVAL` | `5m` | Fallback pull interval while connected |
 | `SK1LL_DEBOUNCE` | `300ms` | Quiet time before reacting to file changes |
 | `SK1LL_DEBOUNCE_MAX` | `2s` | Longest a stream of file changes can postpone a sync |

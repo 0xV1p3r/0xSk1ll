@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 
-const DIRECTORY: OFlags = OFlags::RDONLY.union(OFlags::DIRECTORY).union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
+use crate::placement::{DIRECTORY, open_directory};
 
 pub(super) struct Item {
     directory: OwnedFd,
@@ -21,14 +21,7 @@ fn open_at(dir: &OwnedFd, name: &std::ffi::OsStr, flags: OFlags, path: &Path) ->
 impl Item {
     pub(super) fn open(path: &Path, rule: bool) -> Result<Self> {
         let base = if rule { path.parent().unwrap() } else { path };
-        let mut directory = fd::open("/", DIRECTORY, Mode::empty()).map_err(std::io::Error::from).at(path)?;
-        for component in base.components() {
-            match component {
-                Component::RootDir => {}
-                Component::Normal(name) => directory = open_at(&directory, name, DIRECTORY, path)?,
-                _ => return Err(Error::Invalid("item path must be absolute and normalized".into())),
-            }
-        }
+        let directory = open_directory(base, false).at(path)?;
         Ok(Self { directory, rule: rule.then(|| path.file_name().unwrap().to_owned()), path: path.into() })
     }
 

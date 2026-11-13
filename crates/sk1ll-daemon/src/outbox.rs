@@ -23,6 +23,10 @@ pub(crate) struct Outbox {
 }
 
 impl Outbox {
+    pub(crate) fn empty(path: PathBuf) -> Self {
+        Self { path, entries: Vec::new() }
+    }
+
     /// Loads `path`; a missing file is an empty outbox, an unreadable one is
     /// logged and replaced.
     pub(crate) fn load(path: PathBuf) -> Self {

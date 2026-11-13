@@ -5,8 +5,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use sk1ll_daemon::client::{
-    AddImportRequest, ChangeKind, Client, CommitRequest, ConflictTarget, PullResult, RestoreRequest, StatusView,
-    SyncRequest, UpdateImportsRequest,
+    AddImportRequest, ChangeKind, Client, CommitRequest, ConflictTarget, DaemonMode, PullResult, RestoreRequest,
+    StatusView, SyncRequest, UpdateImportsRequest,
 };
 use sk1ll_daemon::{Config, DaemonState};
 use sk1ll_proto::{AssignmentChanges, ToggleChange, ToggleKind};
@@ -87,6 +87,7 @@ pub(crate) fn assign_direct(cli: &Cli, repo: &Path, lock: Option<&sk1ll_core::En
 /// The daemon's config, with the CLI's `--machine-config` / `--assignment`.
 fn daemon_config(cli: &Cli) -> Result<Config> {
     let mut cfg = Config::from_env()?;
+    cfg.repo = cli.repo.clone();
     if let Some(p) = &cli.daemon_state {
         cfg.state = p.clone();
     }
@@ -170,10 +171,7 @@ pub(crate) fn command(cli: Cli) -> Result<()> {
 fn join(cli: Cli) -> Result<()> {
     let cfg = daemon_config(&cli)?;
     let Cmd::Join { server_url, code, id, copy_from } = cli.cmd else { unreachable!() };
-    let repo = match cli.repo {
-        Some(r) => r,
-        None => dirs::home_dir().context("cannot determine the home directory")?.join("skills"),
-    };
+    let repo = sk1ll_daemon::locate_repo(cli.repo.as_deref(), false)?;
     if sk1ll_daemon::join::insecure_http(&server_url) {
         eprintln!("warning: joining over plain HTTP; the machine token travels in clear text");
     }
@@ -320,9 +318,16 @@ impl Daemon {
             }
             Cmd::Recover { command: crate::RecoverCmd::Adopt { id } } => self.block(c.adopt_displaced(&id))?,
             Cmd::Recover { command: crate::RecoverCmd::Discard { id } } => self.block(c.discard_displaced(&id))?,
-            Cmd::Commit { items, message, author, push: _ } => {
+            Cmd::Commit { items, message, author, push } => {
                 let resp = self.block(c.commit(&CommitRequest { items, message, author }))?;
                 println!("committed {} as {}", names(&resp.items), short(&resp.sha));
+                if self.status.mode == DaemonMode::Standalone {
+                    if push {
+                        self.block(c.push())?;
+                        println!("pushed to origin");
+                    }
+                    return Ok(());
+                }
                 match (resp.pushed, resp.push_error) {
                     (true, _) => println!("pushed to the server"),
                     (false, Some(e)) => println!("not pushed yet ({e}); the daemon pushes it when it can"),
@@ -330,7 +335,10 @@ impl Daemon {
                 }
             }
             Cmd::Push => match self.block(c.push())?.pushed {
-                true => println!("pushed to the server"),
+                true => println!(
+                    "pushed to {}",
+                    if self.status.mode == DaemonMode::Standalone { "origin" } else { "the server" }
+                ),
                 false => println!("nothing to push"),
             },
             Cmd::Restore { items, all, yes } => {
@@ -429,6 +437,13 @@ impl Daemon {
                 }
                 let machine = self.status.machine_id.clone();
                 let update = self.block(c.set_assignment(&machine, &AssignmentChanges { changes }))?;
+                if self.status.mode == DaemonMode::Standalone {
+                    println!(
+                        "local assignment of {machine} is now revision {}; the daemon applies it",
+                        update.revision
+                    );
+                    return Ok(());
+                }
                 if update.entries.is_empty() {
                     println!("{harness}: already so on {machine}");
                 }

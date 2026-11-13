@@ -15,6 +15,7 @@ pub mod instructions;
 pub mod lock;
 pub mod machine;
 pub mod manifest;
+pub mod placement;
 pub mod repo;
 pub mod skill;
 pub mod source;

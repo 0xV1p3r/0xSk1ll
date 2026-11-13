@@ -35,6 +35,7 @@ pub fn run() {
             commands::skill_file,
             commands::adopt_unmanaged,
             commands::fork,
+            commands::init,
             commands::status,
             commands::fleet,
             commands::items,

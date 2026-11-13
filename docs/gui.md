@@ -1,10 +1,10 @@
 # Desktop GUI
 
-`sk1ll-gui` is a Tauri v2 app for Unix desktops. It talks only to the local daemon over its socket, so the machine must have joined a fleet and the daemon must be running. It supports light, dark and system appearance.
+`sk1ll-gui` is a Tauri v2 app for Unix desktops. It talks only to the local daemon over its socket, so the daemon must be running. Without a fleet, it manages a standalone repo. It supports light, dark and system appearance.
 
 ## Screens
 
-The header shows this machine's id, its headline status and whether the daemon and server are connected. If the daemon stops, the app shows a reconnecting screen with start instructions. Revoked machines and machines waiting for assignment get a banner. Fleet data refreshes on daemon events and every 15 seconds.
+The header shows this machine's id, its headline status and whether the daemon and server are connected. If the daemon stops, the app shows a reconnecting screen with start instructions. Revoked machines and machines waiting for assignment get a banner. Fleet data refreshes on daemon events and every 15 seconds. Standalone machines hide Fleet and the assignment log. Their assignment belongs to this machine and is saved in `assignment.json`, with no log or undo.
 
 | Screen | What you can do |
 |---|---|
@@ -16,13 +16,15 @@ The header shows this machine's id, its headline status and whether the daemon a
 | Log | Browse assignment changes, newest first, and undo any entry |
 | Settings | List harnesses, join or rejoin, create one-time join codes, remove machines (typed confirmation) and see connection details |
 
+In standalone mode, commits stay local. Push and Pull use the repo's own `origin`; without an origin those actions are unavailable. If there is no repo yet, an Init card creates it. The repo comes from `SK1LL_REPO`, the nearest `sk1ll.toml` above the daemon's working directory, or `~/skills`.
+
 Items that aren't in the applied baseline carry an `Unpushed` or `Draft only` badge, and you can only assign them on this machine.
 
 Assignment toggles update the screen before the daemon replies and roll back if it reports an error. Draft actions record the selected items and their content fingerprints, so if a selected item changes before you confirm, the app asks you to review it again. The GUI never retries a mutation on its own.
 
 ## Run it
 
-Install Rust, pnpm and the Tauri v2 prerequisites. On Linux that includes GTK3 and WebKitGTK 4.1. Then start a joined daemon and the app:
+Install Rust, pnpm and the Tauri v2 prerequisites. On Linux that includes GTK3 and WebKitGTK 4.1. Then start the daemon and the app:
 
 ```sh
 systemctl --user start sk1ll-daemon    # or: sk1ll daemon

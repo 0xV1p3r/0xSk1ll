@@ -36,14 +36,15 @@ export function JoinCodeButton({ label, variant = 'outline' }: { label: string; 
 export function Settings({ revision, fleetRevision = revision, status, socket, changed }: {
   status: StatusView; socket: string; fleetRevision?: number; revision: number; changed: () => void;
 }) {
-  const fleet = useResource(api.fleet, fleetRevision);
+  const standalone = status.mode === 'standalone';
+  const fleet = useResource(api.fleet, fleetRevision, undefined, !standalone);
   const harnesses = useResource(api.harnesses, revision);
   const saveEditor = useMutation();
   const [preferred, setPreferred] = useState<string>();
   const [refresh, setRefresh] = useState(0);
   const loadEditors = useCallback(() => api.editors(refresh > 0), [refresh]);
   const editorData = useResource(loadEditors, revision);
-  const [server, setServer] = useState(status.server_url);
+  const [server, setServer] = useState(status.server_url ?? '');
   const [code, setCode] = useState('');
   const [id, setId] = useState('');
   const [showCode, setShowCode] = useState(false);
@@ -72,8 +73,8 @@ export function Settings({ revision, fleetRevision = revision, status, socket, c
 
     </Panel>
     <Panel label="Fleet membership"><PanelToolbar><SectionTitle>Fleet membership</SectionTitle></PanelToolbar>
-      <div className="border-b p-3.5"><h3 className="mb-1 text-sm font-medium">Join code for another Machine</h3><p className="mb-3 text-sm text-muted-foreground">Create a single-use code for another Machine. The code is shown once. Remove Machines from the Fleet screen.</p><JoinCodeButton label="Create join code" /></div>
-      <div className="px-3.5 pt-3.5"><h3 className="text-sm font-medium">Join / rejoin this Machine</h3><p className="text-sm text-muted-foreground">Join uses a single-use join code. Rejoin replaces this Machine's credentials and restarts its Daemon.</p></div>
+      {!standalone && <div className="border-b p-3.5"><h3 className="mb-1 text-sm font-medium">Join code for another Machine</h3><p className="mb-3 text-sm text-muted-foreground">Create a single-use code for another Machine. The code is shown once. Remove Machines from the Fleet screen.</p><JoinCodeButton label="Create join code" /></div>}
+      <div className="px-3.5 pt-3.5"><h3 className="text-sm font-medium">{standalone ? 'Join a Fleet' : 'Join / rejoin this Machine'}</h3><p className="text-sm text-muted-foreground">Join uses a single-use join code. Rejoin replaces this Machine's credentials and restarts its Daemon.</p></div>
       <div className="p-3.5"><Collapsible key={String(alreadyJoined)} defaultOpen={!alreadyJoined}>
           {alreadyJoined && <><p className="mb-3 text-sm text-muted-foreground">This Machine is joined. Rejoin to replace its credentials.</p><CollapsibleTrigger render={<Button variant="outline" />}>Rejoin this Machine…</CollapsibleTrigger></>}
           <CollapsibleContent><form onSubmit={e => { e.preventDefault(); setConfirming(true); }}><FieldGroup>
@@ -83,7 +84,7 @@ export function Settings({ revision, fleetRevision = revision, status, socket, c
             disabled={join.pending} onChange={e => setCode(e.target.value)} /><Button type="button" variant="outline" aria-label={showCode ? 'Hide join code' : 'Show join code'} aria-pressed={showCode} onClick={() => setShowCode(value => !value)}>{showCode ? 'Hide' : 'Show'}</Button></div></Field>
           <Field><FieldLabel htmlFor="machine-id">Machine id</FieldLabel><Input id="machine-id" placeholder={status.machine_id} value={id} disabled={join.pending}
             onChange={e => setId(e.target.value)} aria-describedby={join.error ? 'machine-id-hint join-error' : 'machine-id-hint'} /><FieldDescription id="machine-id-hint">Optional. Defaults to the current Machine id: {status.machine_id}.</FieldDescription></Field>
-          <Field><FieldLabel htmlFor="copy-from">Copy Assignment from Machine</FieldLabel>{fleet.error ? <Input id="copy-from" value={copyFrom} disabled={join.pending} onChange={e => setCopyFrom(e.target.value)} placeholder="Machine id" aria-describedby="copy-from-hint" /> : <NativeSelect id="copy-from" value={copyFrom} disabled={join.pending || fleet.loading} onChange={e => setCopyFrom(e.target.value)} aria-describedby="copy-from-hint">
+          <Field><FieldLabel htmlFor="copy-from">Copy Assignment from Machine</FieldLabel>{standalone || fleet.error ? <Input id="copy-from" value={copyFrom} disabled={join.pending} onChange={e => setCopyFrom(e.target.value)} placeholder="Machine id" aria-describedby="copy-from-hint" /> : <NativeSelect id="copy-from" value={copyFrom} disabled={join.pending || fleet.loading} onChange={e => setCopyFrom(e.target.value)} aria-describedby="copy-from-hint">
             <option value="">Don't copy</option>{fleet.data?.machines.map(machine => <option key={machine.id} value={machine.id}>{machine.id}</option>)}
           </NativeSelect>}
             <FieldDescription id="copy-from-hint">Optional. Starts with another Machine's Assignment.{fleet.error && ' Fleet could not be loaded. Enter a Machine id, or leave empty.'}</FieldDescription></Field>
@@ -119,6 +120,7 @@ export function Settings({ revision, fleetRevision = revision, status, socket, c
 
     </Panel>
     <Panel label="Diagnostics"><PanelToolbar><SectionTitle>Diagnostics</SectionTitle></PanelToolbar><div className="p-3.5"><Details rows={[
+      ['Mode', standalone ? 'Standalone' : 'Joined'], ['Repository', status.repo], ['Origin', status.has_origin ? 'Configured' : 'None'],
       ['Socket', <code className="font-mono text-xs break-all">{socket}</code>], ['Assignment revision', status.assignment_revision],
       ...(status.pending_discards > 0 ? [['Pending Restore reports', status.pending_discards] as [string, number]] : []),
       ...(status.auth_rejected_since !== null ? [['Auth rejected since', <When seconds={status.auth_rejected_since} />] as [string, React.ReactNode]] : []),

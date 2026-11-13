@@ -857,6 +857,11 @@ pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
             return Err(e);
         }
     }
+    // Files and symlinks must keep their no-replace guarantee even when the
+    // filesystem rejects the rename flag. place uses link/symlink creation.
+    if !fs::symlink_metadata(from)?.is_dir() {
+        return place(from, to);
+    }
     if fs::symlink_metadata(to).is_ok() {
         return Err(std::io::ErrorKind::AlreadyExists.into());
     }

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { errorMessage } from './api';
 
 const replace = <T,>(_previous: T | undefined, next: T) => next;
-export function useResource<T>(load: () => Promise<T>, revision: number, merge = replace<T>) {
+export function useResource<T>(load: () => Promise<T>, revision: number, merge = replace<T>, enabled = true) {
   const [data, setData] = useState<T>();
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
@@ -19,9 +19,9 @@ export function useResource<T>(load: () => Promise<T>, revision: number, merge =
   }, [load, merge]);
   useEffect(() => {
     const counter = generation;
-    void refresh();
+    if (enabled) void refresh();
     return () => { counter.current++; };
-  }, [refresh, revision]);
+  }, [refresh, revision, enabled]);
   return { data, setData, error, loading, refresh, updatedAt };
 }
 export function useMutation(onSuccess?: () => void) {
