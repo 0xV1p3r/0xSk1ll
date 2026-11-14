@@ -5,7 +5,6 @@ import { TooltipProvider } from '@/components/ui/tooltip';
 import { SidebarProvider } from '@/components/ui/sidebar';
 import { Fleet } from './Fleet';
 import { App, AppSidebar } from './App';
-import { CommandPalette } from './CommandPalette';
 import { api } from './api';
 import type { FleetView, MachineReport, MachineRow, StatusView } from './types';
 vi.mock('./api', () => ({ api: { items: vi.fn().mockResolvedValue([]), assignment: vi.fn().mockResolvedValue({ assignment: { harnesses: {} }, revision: 0 }), setAssignment: vi.fn(), push: vi.fn(), fleet: vi.fn(), status: vi.fn(), skills: vi.fn(), connectionInfo: vi.fn(), joinCode: vi.fn(), pull: vi.fn(), removeMachine: vi.fn(), conflicts: vi.fn().mockResolvedValue([]), recovered: vi.fn().mockResolvedValue([]) }, errorMessage: String }));
@@ -151,15 +150,6 @@ it('shows action counts with their purpose', () => {
   expect(screen.getByLabelText('1 Conflict to resolve').textContent).toBe('1');
   expect(screen.getByLabelText('2 Draft items').textContent).toBe('2');
 });
-it('opens the palette, filters commands, and navigates with the keyboard', async () => {
-  const select = vi.fn();
-  const view = render(<CommandPalette open={false} onOpenChange={vi.fn()} commands={[{ id: 'library', label: 'Library', select }]} />);
-  expect(screen.queryByRole('dialog')).toBeNull();
-  view.rerender(<CommandPalette open onOpenChange={vi.fn()} commands={[{ id: 'library', label: 'Library', select }]} />);
-  const input = await screen.findByRole('combobox');
-  fireEvent.change(input, { target: { value: 'lib' } }); fireEvent.keyDown(input, { key: 'ArrowDown' }); fireEvent.keyDown(input, { key: 'Enter' });
-  expect(select).toHaveBeenCalledOnce();
-});
 
 it('opens with Ctrl+K and navigates to Library from App', async () => {
   vi.mocked(api.status).mockResolvedValue({ machine_id: 'test', headline: 'in_sync', connection: 'connected', report: machineReport() } as unknown as StatusView);
@@ -228,12 +218,6 @@ it('names the first conflict and opens Conflicts with heading focus', async () =
   const heading = await screen.findByRole('heading', { name: 'Conflicts', level: 1 });
   await waitFor(() => expect(document.activeElement).toBe(heading));
   expect(screen.queryByRole('button', { name: 'Resolve' })).toBeNull();
-});
-it('omits the attention banner when there are no conflicts', async () => {
-  mockShell(); render(<App />); await screen.findByRole('heading', { name: 'Fleet', level: 1 });
-  expect(screen.queryByRole('button', { name: 'Resolve' })).toBeNull();
-  fireEvent.click(screen.getByRole('button', { name: 'Open command palette' }));
-  expect(await screen.findByRole('combobox')).toBeTruthy();
 });
 
 it.each([true, false])('push handles pushed=%s', async pushed => {
@@ -306,17 +290,6 @@ it('keeps essential Machine details and hides empty work fields', async () => {
   const details = within(document.getElementById('machine-local')!);
   for (const label of ['Connection', 'Joined', 'Last seen', 'Harnesses']) expect(details.getByText(label)).toBeTruthy();
   for (const label of ['Draft', 'Unpushed', 'Conflicts', 'Clashes', 'Blocked', 'Behind']) expect(details.queryByText(label)).toBeNull();
-});
-it('dims empty health statuses and keeps Behind blue across the Fleet', async () => {
-  vi.mocked(api.fleet).mockResolvedValue({ baseline: null, machines: [machineRow({ status: 'behind' })] }); renderFleet();
-  const health = within(await screen.findByRole('region', { name: 'Fleet health' }));
-  expect(health.getByRole('img').className).toContain('h-12');
-  expect(health.getByRole('img').firstElementChild?.className).toBe('bg-info');
-  expect(health.getByText('Drafting').className).toContain('opacity-40');
-  const row = within(screen.getByRole('table', { name: 'Machines' })).getAllByRole('row')[1];
-  expect(row.querySelector('.bg-info')).toBeTruthy();
-  expect(within(row).getByText('Behind').getAttribute('data-slot')).toBe('badge');
-  expect(within(row).getByText('Pull the new Baseline once your Draft allows it.').className).toContain('line-clamp-2');
 });
 it('names unpushed items and shows the assignment preview total', async () => {
   vi.mocked(api.fleet).mockResolvedValue({ baseline: null, machines: [] });

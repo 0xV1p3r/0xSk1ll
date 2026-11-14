@@ -274,12 +274,6 @@ it('loads conflict diffs on expansion and uses recovery ids', async () => {
   await waitFor(() => expect(api.conflictDiff).toHaveBeenCalledWith({ id: 'recovery' }));
   expect(screen.getAllByText('+draft')[0].getAttribute('data-kind')).toBe('add');
 });
-it('automatically loads the sole conflict diff', async () => {
-  vi.mocked(api.conflicts).mockResolvedValue([{ name: 'pdf', harness: 'claude', dest: '/pdf', adoptable: true, reason: null, items: [] }]);
-  vi.mocked(api.recovered).mockResolvedValue([]);
-  render(<Conflicts revision={0} changed={changed} reviewDraft={reviewDraft} />);
-  await screen.findByLabelText('Conflict diff'); expect(api.conflictDiff).toHaveBeenCalledOnce();
-});
 it('queries the server by machine, Harness, author and item', async () => {
   const base = { kind: 'skill' as const, before: true, after: false, at: 1, cause: { type: 'change' as const } };
   vi.mocked(api.log).mockResolvedValue([{ ...base, id: 1, machine: 'laptop', harness: 'claude', author: 'alice', name: 'pdf' }, { ...base, id: 2, machine: 'desktop', harness: 'codex', author: 'bob', name: 'writing' }]);

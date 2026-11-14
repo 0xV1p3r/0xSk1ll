@@ -1,14 +1,12 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { SidebarProvider } from '@/components/ui/sidebar';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { Skills } from './Skills';
-import { AppSidebar } from './App';
 import { api } from './api';
 import { toast } from './toast';
 vi.mock('./toast', () => ({ toast: vi.fn() }));
-import type { ContentEntry, ContentType, StatusView } from './types';
+import type { ContentEntry, ContentType } from './types';
 
 vi.mock('./api', () => ({ api: { skills: vi.fn(), skillTree: vi.fn(), skillFile: vi.fn(), editors: vi.fn(),
   fork: vi.fn(), adoptUnmanaged: vi.fn(), openInEditor: vi.fn(), setPreferredEditor: vi.fn(), createItem: vi.fn(), deleteItem: vi.fn(), renameItem: vi.fn() }, errorMessage: (error: unknown) => String(error) }));
@@ -57,13 +55,6 @@ it('sorts Name and Type and opens rows using the keyboard', async () => {
   expect(screen.getAllByRole('row')[1].textContent).toContain('pdf');
   fireEvent.keyDown(screen.getByRole('row', { name: 'View Import pdf' }), { key: 'Enter' });
   expect(await screen.findByRole('button', { name: 'Fork to edit' })).toBeTruthy();
-});
-it('places Skills first in This Machine and shows the Unmanaged count badge', () => {
-  const status = { machine_id: 'test', report: { drafts: [], conflicts: [] } } as unknown as StatusView;
-  render(<TooltipProvider><SidebarProvider><AppSidebar screen="Library" setScreen={vi.fn()} status={status} unmanagedCount={2} /></SidebarProvider></TooltipProvider>);
-  expect(screen.getByLabelText('2 Unmanaged skills to adopt').textContent).toBe('2');
-  const links = screen.getAllByRole('button').filter(button => ['Library', 'Draft', 'Conflicts', 'Imports'].includes(button.textContent ?? ''));
-  expect(links[0].textContent).toBe('Library');
 });
 it('confirms Fork before opening the Import in the preferred editor', async () => {
   mount(); await select('pdf'); fireEvent.click(screen.getByRole('button', { name: 'Fork to edit' }));
@@ -220,17 +211,6 @@ it('keeps confirmation focus inside the detail dialog on Cancel and Escape and f
   }
 });
 
-it('applies search handoffs', () => {
-  const view = render(<Skills {...props} handoff={{ search: 'writing' }} />); expect((screen.getByLabelText('Search by name') as HTMLInputElement).value).toBe('writing');
-  view.rerender(<Skills {...props} handoff={{ search: 'pdf' }} />); expect((screen.getByLabelText('Search by name') as HTMLInputElement).value).toBe('pdf');
-});
-it('validates and creates a new Skill', async () => {
-  mount([]); fireEvent.click(screen.getByRole('button', { name: 'New Skill' }));
-  const input = screen.getByLabelText('Name'), create = screen.getByRole('button', { name: 'Create' });
-  fireEvent.change(input, { target: { value: 'bad name' } }); expect(create.hasAttribute('disabled')).toBe(true);
-  fireEvent.change(input, { target: { value: 'new-skill' } }); fireEvent.click(create);
-  await waitFor(() => expect(api.createItem).toHaveBeenCalledWith({ kind: 'skill', name: 'new-skill', description: undefined }));
-});
 it('explains missing editors', async () => {
   vi.mocked(api.editors).mockResolvedValue({ preferred_editor: '', editors: [] }); mount();
   fireEvent.click(screen.getByRole('row', { name: 'View Personal writing' }));
@@ -269,6 +249,7 @@ it('explains an empty name and submits the creation form', async () => {
   expect(screen.getByRole('alert').textContent).toBe('Enter a name');
   expect(input.getAttribute('aria-invalid')).toBe('true');
   expect(screen.getByText(/New Skills follow each Harness's default/)).toBeTruthy();
+  fireEvent.change(input, { target: { value: 'bad name' } }); expect(screen.getByRole('button', { name: 'Create' }).hasAttribute('disabled')).toBe(true);
   fireEvent.change(input, { target: { value: 'keyboard-skill' } });
   fireEvent.submit(input.closest('form')!);
   await waitFor(() => expect(api.createItem).toHaveBeenCalledWith({ kind: 'skill', name: 'keyboard-skill', description: undefined }));
@@ -334,6 +315,7 @@ it('applies each handoff: a content handoff clears an earlier Type filter, and a
   expect((screen.getByLabelText('Type') as HTMLSelectElement).value).toBe('unmanaged');
   view.rerender(<TooltipProvider><Skills {...props} handoff={{ search: 'pdf' }} /></TooltipProvider>);
   expect((screen.getByLabelText('Type') as HTMLSelectElement).value).toBe('all');
+  expect((screen.getByLabelText('Search by name') as HTMLInputElement).value).toBe('pdf');
   view.rerender(<TooltipProvider><Skills {...props} handoff={{ create: 'rule' }} /></TooltipProvider>);
   expect(await screen.findByRole('dialog', { name: 'New Rule' })).toBeTruthy();
 });

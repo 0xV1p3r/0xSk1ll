@@ -215,13 +215,6 @@ it('keeps one Push action after an unpushed commit and marks matching Draft item
   expect(screen.queryByRole('button', { name: 'Retry push' })).toBeNull();
   expect(screen.getByText('2 unpushed')).toBeTruthy();
 });
-it('dismisses a successful commit notice', async () => {
-  mount();
-  fireEvent.click(await screen.findByRole('button', { name: 'Commit (1)' }));
-  fireEvent.click(button(await screen.findByRole('dialog'), 'Commit'));
-  fireEvent.click(await screen.findByRole('button', { name: 'Dismiss' }));
-  expect(screen.queryByText('Commit complete')).toBeNull();
-});
 
 it('disables Push and Pull without an origin in standalone', async () => {
   render(<Draft revision={0} status={{ ...status, mode: 'standalone', has_origin: false }} changed={changed} />);

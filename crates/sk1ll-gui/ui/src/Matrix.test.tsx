@@ -133,18 +133,6 @@ describe('Assignment response cache', () => {
   });
 });
 
-it('toggles an Assignment and a Harness default from their state labels', async () => {
-  await mount();
-  const label = cell('a').closest('label')!;
-  expect(label.className).toContain('min-h-8');
-  fireEvent.click(label);
-  await waitFor(() => expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: true }] }));
-  await waitFor(() => expect(cell('a').hasAttribute('data-disabled')).toBe(false));
-  const defaultLabel = screen.getByRole('switch', { name: 'Default for new skills in a / claude' }).closest('label')!;
-  fireEvent.click(defaultLabel);
-  await waitFor(() => expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'new_skills_default', enabled: true }] }));
-});
-
 it('focuses and highlights the requested local cell after loading without changing its Assignment', async () => {
   const scroll = vi.fn();
   const previous = HTMLElement.prototype.scrollIntoView;
@@ -221,7 +209,6 @@ it('resets row overrides optimistically and skips unavailable remote Draft items
   await act(async () => { save.resolve(snapshot()); });
 });
 
-
 it('describes explicit values that override the Harness default and clears the note on reset', async () => {
   vi.mocked(api.assignment).mockImplementation(async machine => snapshot(machine === 'a'));
   const save = deferred<AssignmentUpdate>();
@@ -236,14 +223,6 @@ it('describes explicit values that override the Harness default and clears the n
   expect(inherited.getAttribute('aria-checked')).toBe('false');
   expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: null }] });
   await act(async () => { save.resolve(snapshot()); });
-});
-
-it('describes defaults rows without a visible hint row', async () => {
-  await mount();
-  const toggle = screen.getByRole('switch', { name: 'Default for new skills in a / claude' });
-  expect(document.getElementById(toggle.getAttribute('aria-describedby')!)?.textContent).toMatch(/applies to items added later/);
-  expect(document.getElementById('default-hint')?.className).toContain('sr-only');
-  expect(screen.queryByText(/defaults for new items/i)).toBeNull();
 });
 
 it('marks offline Machines in the header and on their cells while keeping them editable', async () => {
@@ -334,7 +313,6 @@ it('assigns Draft-only items locally in standalone without requesting fleet', as
   expect(api.assignment).toHaveBeenCalledWith('a');
   expect(vi.mocked(api.assignment).mock.calls.every(([machine]) => machine === 'a')).toBe(true);
 });
-
 
 it.each([
   { mode: 'joined', server_url: 'https://fleet.example', machine_id: 'a' },

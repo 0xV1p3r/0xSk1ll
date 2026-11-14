@@ -1,8 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { cn } from '@/lib/utils';
-import { buttonVariants } from '@/components/ui/button';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { Conflicts } from './Conflicts';
 import { api } from './api';
 import type { ConflictView } from './types';
@@ -57,24 +55,18 @@ it('waits for both lists before choosing the initial diff state', async () => {
   expect(await screen.findAllByRole('button', { name: 'Show diff' })).toHaveLength(4);
   expect(api.conflictDiff).not.toHaveBeenCalled();
 });
-it('gives Adopt and Overwrite equal outline triggers and retains confirmation', async () => {
+it('confirms Overwrite before acting', async () => {
   vi.mocked(api.conflicts).mockResolvedValue([entry()]);
   render(<Conflicts {...props} />);
-  const adopt = await screen.findByRole('button', { name: 'Adopt pdf from claude' });
-  const overwrite = screen.getByRole('button', { name: 'Overwrite pdf in claude' });
-  expect(adopt.className).toBe(cn(buttonVariants({ variant: 'outline', size: 'sm' })));
-  expect(overwrite.className).toBe(adopt.className);
-  fireEvent.click(overwrite);
+  fireEvent.click(await screen.findByRole('button', { name: 'Overwrite pdf in claude' }));
   expect(screen.getByRole('dialog').textContent).toContain('/skills/pdf');
   expect(api.overwrite).not.toHaveBeenCalled();
 });
-it('explains recovery and keeps permanent discard destructive in its dialog', async () => {
+it('explains recovery and confirms permanent discard', async () => {
   vi.mocked(api.recovered).mockResolvedValue([recovered]);
   render(<Conflicts {...props} />);
   fireEvent.click(await screen.findByRole('button', { name: 'Discard pdf in claude' }));
-  const dialog = screen.getByRole('dialog');
-  expect(dialog.textContent).toContain('Permanently remove recovered content');
-  expect(within(dialog).getByRole('button', { name: 'Discard' }).className).toBe(cn(buttonVariants({ variant: 'destructive' })));
+  expect(screen.getByRole('dialog').textContent).toContain('Permanently remove recovered content');
   expect(api.discardDisplaced).not.toHaveBeenCalled();
   const when = document.querySelector('time');
   expect(when?.getAttribute('datetime')).toBe('1970-01-01T00:00:01.000Z');

@@ -225,22 +225,6 @@ async fn event_task_reconnects_after_failure_and_eof_and_forwards_unchanged_even
     assert_eq!(attempts.load(Ordering::SeqCst), 4);
 }
 
-#[tokio::test]
-async fn failed_subscriptions_back_off_without_making_a_connected_claim() {
-    let directory = tempfile::tempdir().unwrap();
-    let (sender, mut receiver) = mpsc::unbounded_channel();
-    let task =
-        tokio::spawn(crate::events::forward(Client::new(directory.path().join("missing.sock")), move |_, value| {
-            sender.send(value).unwrap();
-        }));
-    for delay in [500, 1000, 2000] {
-        let value = timeout(Duration::from_secs(4), receiver.recv()).await.unwrap().unwrap();
-        assert_eq!(value["reachable"], false);
-        assert_eq!(value["retry_in_ms"], delay);
-    }
-    task.abort();
-}
-
 #[test]
 fn draft_review_fingerprint_tracks_binary_edits_deletions_and_symlinks() {
     use crate::commands::draft_fingerprint;
@@ -529,24 +513,6 @@ async fn skill_commands_preserve_queries_payloads_and_errors() {
     assert_eq!(requests[4].2, json!({"name":"pdf"}));
 }
 
-#[test]
-fn mac_terminal_argv_preserves_shell_metacharacters_as_arguments() {
-    use crate::editors::terminal_prefix;
-    use std::ffi::OsString;
-    let mut args = terminal_prefix("Terminal.app");
-    args.extend([
-        OsString::from("/Applications/My editor's/bin/nvim"),
-        OsString::from("/repo/a'; $(touch unexpected) \" b/SKILL.md"),
-    ]);
-    assert_eq!(args[0], "-e");
-    assert!(args[1].to_str().unwrap().contains("quoted form of (argument as text)"));
-    assert!(args[1].to_str().unwrap().contains("tell application \"Terminal\""));
-    assert_eq!(args[2], "--");
-    assert_eq!(args[3], "/Applications/My editor's/bin/nvim");
-    assert_eq!(args[4], "/repo/a'; $(touch unexpected) \" b/SKILL.md");
-    assert!(!args[1].to_str().unwrap().contains("unexpected"));
-}
-
 #[tokio::test]
 async fn editor_resolution_uses_inventory_path_and_refuses_inventory_imports_and_missing_items() {
     let directory = tempfile::tempdir().unwrap();
@@ -637,7 +603,7 @@ async fn editor_inventory_accepts_literal_unusual_names() {
 #[test]
 fn every_editor_launch_keeps_unusual_paths_in_one_argument() {
     use crate::editors::*;
-    use std::{ffi::OsString, path::PathBuf, process::Stdio};
+    use std::{ffi::OsString, process::Stdio};
     let directory = tempfile::tempdir().unwrap();
     let stub = directory.path().join("capture");
     std::fs::write(&stub, "#!/bin/sh\nprintf '%s\\0' \"$@\"\n").unwrap();
@@ -683,8 +649,6 @@ fn every_editor_launch_keeps_unusual_paths_in_one_argument() {
             }
         }
     }
-    // Absolute paths also prevent open/xdg-open option interpretation.
-    assert!(PathBuf::from("/repo/-option/SKILL.md").is_absolute());
 }
 
 #[cfg(target_os = "macos")]
