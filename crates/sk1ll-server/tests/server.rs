@@ -288,7 +288,40 @@ async fn fresh_server_has_one_root_commit_with_standard_skeleton() {
     assert!(imports.errors.is_empty() && imports.updates.is_empty());
     let health = server.http.get(format!("{}/healthz", server.base)).send().await.unwrap();
     assert_eq!(health.status(), StatusCode::OK);
-    assert_eq!(health.json::<Value>().await.unwrap(), json!({"status": "ok", "push_degraded": false}));
+    let health = health.json::<Value>().await.unwrap();
+    assert_eq!((&health["status"], &health["push_degraded"]), (&json!("ok"), &json!(false)));
+    assert_eq!(health["protocol"], json!(sk1ll_proto::PROTOCOL_VERSION));
+}
+
+#[tokio::test]
+async fn requests_from_another_protocol_version_are_refused() {
+    let server = start().await;
+    let header = sk1ll_proto::PROTOCOL_HEADER;
+    let fleet = |version: Option<&str>| {
+        let req = server.http.get(server.url("/fleet")).bearer_auth(ADMIN);
+        let req = if let Some(v) = version { req.header(header, v) } else { req };
+        async move { req.send().await.unwrap() }
+    };
+    for version in [None, Some("1")] {
+        let resp = fleet(version).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{version:?}");
+        assert_eq!(resp.headers()[header], sk1ll_proto::PROTOCOL_VERSION.to_string());
+    }
+    let refused = fleet(Some("2")).await;
+    assert_eq!(refused.status(), StatusCode::UPGRADE_REQUIRED);
+    assert_eq!(refused.headers()[header], "1");
+    let body: Value = refused.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("speaks version 1, this machine speaks 2"), "{body}");
+
+    let mut ws = format!("ws://127.0.0.1:{}/api/ws", server.port).into_client_request().unwrap();
+    ws.headers_mut().insert("Authorization", format!("Bearer {ADMIN}").parse().unwrap());
+    ws.headers_mut().insert(header, "2".parse().unwrap());
+    match tokio_tungstenite::connect_async(ws).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+            assert_eq!(resp.status(), StatusCode::UPGRADE_REQUIRED.as_u16());
+        }
+        other => panic!("expected a refused upgrade, got {:?}", other.map(|_| ())),
+    }
 }
 
 #[tokio::test]

@@ -4,6 +4,8 @@ description = "Per-machine 0xSk1ll daemon: keeps harnesses in step and talks to 
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+publish.workspace = true
 
 [[bin]]
 name = "sk1ll-daemon"

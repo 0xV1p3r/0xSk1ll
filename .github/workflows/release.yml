@@ -1,0 +1,132 @@
+name: Release
+
+# Push a tag like v0.1.0. This builds the Linux binaries, the .deb and the
+# server image, then opens a draft GitHub release to review and publish.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Versions agree with the tag
+        run: scripts/check-version.sh "$GITHUB_REF_NAME"
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev libxdo-dev libssl-dev
+      - name: Install the Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: crates/sk1ll-gui/ui/package.json
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: crates/sk1ll-gui/ui/pnpm-lock.yaml
+      - name: Build
+        env:
+          SK1LL_COMMIT: ${{ github.sha }}
+        run: |
+          export SK1LL_COMMIT="${SK1LL_COMMIT::10}"
+          (cd crates/sk1ll-gui/ui && pnpm install --frozen-lockfile)
+          cargo build --release --locked -p sk1ll-cli -p sk1ll-server
+          # The .deb ships the CLI next to the app, so the app starts a daemon of its own version.
+          mkdir -p crates/sk1ll-gui/src-tauri/binaries
+          cp target/release/sk1ll crates/sk1ll-gui/src-tauri/binaries/sk1ll-x86_64-unknown-linux-gnu
+          (cd crates/sk1ll-gui/ui && pnpm tauri build --config src-tauri/tauri.release.conf.json)
+      - name: Package
+        run: scripts/package-release.sh x86_64 target/release/sk1ll target/release/sk1ll-server target/release/sk1ll-gui
+      - name: Add the .deb
+        run: cp target/release/bundle/deb/*.deb dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: dist/*
+          if-no-files-found: error
+
+  linux-aarch64:
+    # CLI and server only. Needs GitHub's arm64 Linux runners on this plan.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install the Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Build
+        env:
+          SK1LL_COMMIT: ${{ github.sha }}
+        run: |
+          export SK1LL_COMMIT="${SK1LL_COMMIT::10}"
+          cargo build --release --locked -p sk1ll-cli -p sk1ll-server
+      - name: Package
+        run: scripts/package-release.sh aarch64 target/release/sk1ll target/release/sk1ll-server
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-aarch64
+          path: dist/*
+          if-no-files-found: error
+
+  server-image:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tags
+        id: tags
+        run: |
+          image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/sk1ll-server
+          echo "tags=$image:${GITHUB_REF_NAME#v},$image:latest" >> "$GITHUB_OUTPUT"
+          echo "commit=${GITHUB_SHA::10}" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.server
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: SK1LL_COMMIT=${{ steps.tags.outputs.commit }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    needs: [linux-x86_64, linux-aarch64, server-image]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum -- * > SHA256SUMS
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # The changelog section for this version, without its heading.
+          awk -v v="$version" '/^## \[/ { if (found) exit; if (index($0, "## [" v "]") == 1) { found = 1; next } } found' \
+            CHANGELOG.md > notes.md
+          gh release create "$GITHUB_REF_NAME" dist/* --draft --verify-tag \
+            --title "0xSk1ll $version" --notes-file notes.md

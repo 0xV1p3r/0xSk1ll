@@ -161,8 +161,11 @@ it('returns focus to Commit after Cancel and Escape and to its completion notice
 });
 
 it('counts added and removed lines without headers and shows friendly names', async () => {
+  entries.push(entry('manifest'), entry('other:.gitignore'));
   diffs['skill:reviewed'] = '+++ b/file\n--- a/file\n+one\n+two\n-old'; mount();
   expect(await screen.findByLabelText('+2 / −1')).toBeTruthy(); expect(screen.getByText('reviewed')).toBeTruthy();
+  expect(screen.getByText('.gitignore')).toBeTruthy();
+  for (const kind of ['Skill', 'Manifest', 'File']) expect(screen.getAllByText(kind)).toHaveLength(1);
 });
 it('pushes unpushed items', async () => {
   vi.mocked(api.push).mockResolvedValue({ pushed: true });

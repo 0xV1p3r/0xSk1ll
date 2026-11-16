@@ -127,7 +127,7 @@ export function Settings({ revision, fleetRevision = revision, status, socket, c
 
     </Panel>
     <Panel label="Diagnostics"><PanelToolbar><SectionTitle>Diagnostics</SectionTitle></PanelToolbar><div className="p-3.5"><Details rows={[
-      ['Mode', standalone ? 'Standalone' : 'Joined'], ['Repository', status.repo], ['Origin', status.has_origin ? 'Configured' : 'None'],
+      ['Mode', standalone ? 'Standalone' : 'Joined'], ...(status.version ? [['Daemon version', status.version] as [string, string]] : []), ['Repository', status.repo], ['Origin', status.has_origin ? 'Configured' : 'None'],
       ['Socket', <code className="font-mono text-xs break-all">{socket}</code>], ['Assignment revision', status.assignment_revision],
       ...(status.pending_discards > 0 ? [['Pending Restore reports', status.pending_discards] as [string, number]] : []),
       ...(status.auth_rejected_since !== null ? [['Auth rejected since', <When seconds={status.auth_rejected_since} />] as [string, React.ReactNode]] : []),

@@ -259,6 +259,36 @@ pub(crate) fn adopt_first_baseline(dir: &Path) -> anyhow::Result<FirstBaseline> 
     Ok(FirstBaseline::Adopted(remote))
 }
 
+/// A repo holding only the commit `init_committed` makes takes a first
+/// baseline of unrelated history as an unborn init would: that commit is
+/// dropped, so the starter files are draft again, and the baseline adopted.
+/// Unless it is adopted, the commit is restored. `None` when this doesn't apply.
+pub(crate) fn adopt_first_baseline_over_init(dir: &Path) -> anyhow::Result<Option<FirstBaseline>> {
+    let Some(head) = rev(dir, "HEAD")? else { return Ok(None) };
+    if branch(dir)?.as_deref() != Some(FLEET_BRANCH) || rev(dir, "HEAD^")?.is_some() {
+        return Ok(None);
+    }
+    let template = tempfile::tempdir()?;
+    Repo::init(template.path())?;
+    run(template.path(), &["add", "--all"])?;
+    if run(template.path(), &["write-tree"])? != run(dir, &["rev-parse", "HEAD^{tree}"])? {
+        return Ok(None);
+    }
+    fetch_all(dir, &[])?;
+    match remote_head(dir)? {
+        Some(remote) if try_run(dir, &["merge-base", &head, &remote])?.is_none() => {}
+        _ => return Ok(None),
+    }
+    let branch = format!("refs/heads/{FLEET_BRANCH}");
+    run(dir, &["update-ref", "-d", &branch, &head])?;
+    let adopted = adopt_first_baseline(dir);
+    if !matches!(adopted, Ok(FirstBaseline::Adopted(_))) {
+        // Files published before a block stay as draft, as for an unborn init.
+        run(dir, &["update-ref", &branch, &head, ""])?;
+    }
+    adopted.map(Some)
+}
+
 /// What [`ensure_clone`] found at the repo path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -432,8 +462,17 @@ pub(crate) fn check_standalone_join(dir: &Path, remote: &str) -> anyhow::Result<
 
 /// Compare every non-git entry with core's init output, including ignored
 /// files and symlinks. No user content is removed when this directory moves.
+/// The repo may be unborn, or hold only the commit of those files that
+/// `init_committed` makes: one root commit on the fleet branch, no other
+/// refs, nothing staged or changed.
 pub(crate) fn is_pristine_init(dir: &Path) -> anyhow::Result<bool> {
-    if dir.symlink_metadata().is_ok_and(|m| m.is_symlink()) || !dir.join(".git").is_dir() || rev(dir, "HEAD")?.is_some()
+    if dir.symlink_metadata().is_ok_and(|m| m.is_symlink()) || !dir.join(".git").is_dir() {
+        return Ok(false);
+    }
+    if rev(dir, "HEAD")?.is_some()
+        && (rev(dir, "HEAD^")?.is_some()
+            || run(dir, &["for-each-ref", "--format=%(refname)"])? != format!("refs/heads/{FLEET_BRANCH}")
+            || !run(dir, &["status", "--porcelain", "--untracked-files=all", "--ignored"])?.is_empty())
     {
         return Ok(false);
     }
@@ -649,6 +688,63 @@ mod tests {
                 _ => assert!(target.symlink_metadata().unwrap().is_symlink()),
             }
         }
+    }
+
+    #[test]
+    fn a_committed_init_is_pristine_until_anything_else_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = server(tmp.path());
+        let fresh = || {
+            let repo = tempfile::tempdir_in(tmp.path()).unwrap().keep().join("repo");
+            Repo::init_committed(&repo).unwrap();
+            repo
+        };
+        let repo = fresh();
+        assert!(is_pristine_init(&repo).unwrap());
+        check_standalone_join(&repo, &remote).unwrap();
+
+        let draft = fresh();
+        std::fs::write(draft.join("instructions/git.md"), "draft").unwrap();
+        let second = fresh();
+        git(&second, &["commit", "--quiet", "--allow-empty", "-m", "more"]);
+        let branch = fresh();
+        git(&branch, &["branch", "kept"]);
+        let removed = fresh();
+        git(&removed, &["rm", "--quiet", "personal/.gitkeep"]);
+        let ignored = fresh();
+        std::fs::write(ignored.join(".sk1ll-stage-x"), "private").unwrap();
+        for repo in [draft, second, branch, removed, ignored] {
+            assert!(!is_pristine_init(&repo).unwrap(), "{}", repo.display());
+            assert!(check_standalone_join(&repo, &remote).is_err(), "{}", repo.display());
+        }
+    }
+
+    #[test]
+    fn a_lone_init_commit_gives_way_to_an_unrelated_first_baseline_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = server(tmp.path());
+        let repo = tmp.path().join("repo");
+        Repo::init_committed(&repo).unwrap();
+        git(&repo, &["remote", "add", "origin", &remote]);
+        let baseline = git(&repo, &["ls-remote", &remote, "refs/heads/main"]);
+        assert!(matches!(adopt_first_baseline_over_init(&repo).unwrap(), Some(FirstBaseline::Adopted(b))
+            if baseline.starts_with(&b)));
+        assert_eq!(rev(&repo, "HEAD").unwrap(), rev(&repo, "origin/main").unwrap());
+        assert!(rev(&repo, "HEAD^").unwrap().is_none());
+
+        // Sharing history with the remote, or holding more than the starter
+        // files, is an ordinary pull.
+        let shared = tmp.path().join("shared");
+        git(tmp.path(), &["clone", "--quiet", repo.to_str().unwrap(), shared.to_str().unwrap()]);
+        assert!(adopt_first_baseline_over_init(&shared).unwrap().is_none());
+        let other = tmp.path().join("other");
+        Repo::init_committed(&other).unwrap();
+        std::fs::write(other.join("instructions/git.md"), "mine").unwrap();
+        git(&other, &["add", "-A"]);
+        git(&other, &["commit", "--quiet", "--amend", "-m", "mine"]);
+        git(&other, &["remote", "add", "origin", &remote]);
+        assert!(adopt_first_baseline_over_init(&other).unwrap().is_none());
+        assert!(rev(&other, "HEAD").unwrap().is_some());
     }
 
     #[test]

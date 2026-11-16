@@ -1,0 +1,11 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "active": true,
+    "targets": ["deb"],
+    "category": "DeveloperTool",
+    "shortDescription": "Agent skills and instructions, synced into every harness",
+    "externalBin": ["binaries/sk1ll"],
+    "linux": { "deb": { "depends": ["git"] } }
+  }
+}

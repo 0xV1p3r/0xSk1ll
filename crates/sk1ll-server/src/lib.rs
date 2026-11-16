@@ -18,13 +18,16 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::Context;
 use axum::Router;
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{Request, State};
+use axum::http::{HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
-use sk1ll_proto::{AssignmentSnapshot, ImportsView, ItemRef, ServerMessage};
+use sk1ll_proto::{
+    AssignmentSnapshot, ErrorBody, ImportsView, ItemRef, PROTOCOL_HEADER, PROTOCOL_VERSION, ServerMessage,
+};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 
@@ -114,9 +117,10 @@ impl Server {
 
     pub fn router(self: &Arc<Self>) -> Router {
         Router::new()
-            .nest("/api", api::routes())
+            .nest("/api", api::routes().layer(middleware::from_fn(check_protocol)))
             .route("/git/{*path}", any(git::http))
             .route("/healthz", get(healthz))
+            .layer(middleware::from_fn(announce_protocol))
             .with_state(self.clone())
     }
 
@@ -256,6 +260,27 @@ impl Server {
     }
 }
 
+/// Refuses an `/api` request from a peer that speaks another protocol version
+/// (426, with the reason). Requests without the header are let through.
+async fn check_protocol(request: Request, next: Next) -> Response {
+    let theirs = request.headers().get(PROTOCOL_HEADER).map(|v| v.to_str().unwrap_or("?").trim().to_string());
+    match theirs {
+        Some(v) if v != PROTOCOL_VERSION.to_string() => {
+            let error = sk1ll_proto::protocol_mismatch(&v);
+            tracing::warn!("{error}");
+            (StatusCode::UPGRADE_REQUIRED, axum::Json(ErrorBody { error })).into_response()
+        }
+        _ => next.run(request).await,
+    }
+}
+
+/// Tags every response with the server's protocol version.
+async fn announce_protocol(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(PROTOCOL_HEADER, HeaderValue::from(PROTOCOL_VERSION));
+    response
+}
+
 async fn healthz(State(server): State<Arc<Server>>) -> Response {
     let degraded = server.push_degraded.load(Ordering::SeqCst);
     let status = if degraded { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::OK };
@@ -264,6 +289,8 @@ async fn healthz(State(server): State<Arc<Server>>) -> Response {
         axum::Json(serde_json::json!({
             "status": if degraded { "degraded" } else { "ok" },
             "push_degraded": degraded,
+            "version": sk1ll_core::VERSION,
+            "protocol": PROTOCOL_VERSION,
         })),
     )
         .into_response()
@@ -279,7 +306,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 pub async fn serve(config: Config, listener: TcpListener) -> anyhow::Result<()> {
     let server = Server::open(config).await?;
     tokio::spawn(imports::poll(server.clone()));
-    tracing::info!("listening on {}", listener.local_addr()?);
+    tracing::info!("sk1ll-server {} listening on {}", sk1ll_core::VERSION, listener.local_addr()?);
     axum::serve(listener, server.router()).with_graceful_shutdown(shutdown()).await?;
     Ok(())
 }

@@ -5,6 +5,7 @@
 //! IPC boundary (e.g. Tauri commands) unchanged.
 
 pub mod assignment;
+pub mod bundled;
 pub mod content;
 pub mod draft;
 pub mod engine;
@@ -22,6 +23,9 @@ pub mod source;
 pub mod sync;
 
 use std::path::{Path, PathBuf};
+
+/// This build's version and commit, e.g. `0.1.0 (1a2b3c4d5e)`.
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("SK1LL_COMMIT"), ")");
 
 pub use assignment::{Assignment, HarnessAssignment};
 pub use draft::{Change, DraftItem, FLEET_BRANCH, ItemRef, PullOutcome, default_commit_message, machine_author};

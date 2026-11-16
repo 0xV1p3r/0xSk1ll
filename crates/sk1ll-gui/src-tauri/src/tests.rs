@@ -700,7 +700,12 @@ async fn new_commands_forward_typed_payloads() {
     let bridge = Bridge::new(daemon.client.clone());
     assert!(bridge.push().await.unwrap().pushed);
     bridge
-        .create_item(CreateItemRequest { kind: "skill".into(), name: "pdf".into(), description: Some("PDF".into()) })
+        .create_item(CreateItemRequest {
+            kind: "skill".into(),
+            name: "pdf".into(),
+            description: Some("PDF".into()),
+            bundled: None,
+        })
         .await
         .unwrap();
     bridge.remove_import("pdf".into()).await.unwrap();

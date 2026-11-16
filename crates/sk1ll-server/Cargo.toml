@@ -4,6 +4,8 @@ description = "Self-hosted server for a 0xSk1ll fleet: git remote, assignment, s
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+publish.workspace = true
 
 [[bin]]
 name = "sk1ll-server"

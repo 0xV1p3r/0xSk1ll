@@ -6,7 +6,7 @@ use sk1ll_daemon::{Config, JoinOptions};
 
 /// The 0xSk1ll daemon. `sk1ll daemon` runs the same thing.
 #[derive(Parser)]
-#[command(name = "sk1ll-daemon", version)]
+#[command(name = "sk1ll-daemon", version = sk1ll_core::VERSION)]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -28,7 +28,7 @@ enum Cmd {
         id: Option<String>,
         #[arg(long)]
         copy_from: Option<String>,
-        /// Local clone (SK1LL_REPO, nearest skills repo, else ~/skills)
+        /// Local clone (SK1LL_REPO, nearest skills repo, else ~/.local/share/sk1ll/repo)
         #[arg(long)]
         repo: Option<PathBuf>,
     },

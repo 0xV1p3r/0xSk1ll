@@ -49,6 +49,9 @@
 //! `DELETE /machines/{id}`, `GET /log`, `GET /log/facets`, `POST /log/{id}/undo`,
 //! `GET /imports`, `POST /join-codes`. Bodies are the server's (`sk1ll-proto`).
 //!
+//! Every request carries [`API_HEADER`]; a daemon of another [`API_VERSION`]
+//! answers 426 and says to restart it.
+//!
 //! Errors are [`ErrorBody`] with a 4xx/5xx status.
 
 use std::path::{Path, PathBuf};
@@ -68,6 +71,14 @@ pub use sk1ll_proto::{
     JoinCode, LogEntry, LogFacets, LogQuery, MachineReport, MachineStatus,
 };
 use tokio::net::UnixStream;
+
+/// The version of this local API. Bump it on any change an older daemon or
+/// client would misread; additive fields with serde defaults don't need one.
+pub const API_VERSION: u32 = 1;
+
+/// Request header carrying the client's [`API_VERSION`]. A daemon refuses a
+/// request that names another version (426); one without it is accepted.
+pub const API_HEADER: &str = "sk1ll-api";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -127,6 +138,9 @@ pub struct StatusView {
     pub pending_discards: usize,
     /// What the daemon reports to the server.
     pub report: MachineReport,
+    /// The daemon's build ([`sk1ll_core::VERSION`]).
+    #[serde(default)]
+    pub version: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -467,6 +481,10 @@ pub struct CreateItemRequest {
     pub kind: String,
     pub name: String,
     pub description: Option<String>,
+    /// A skill shipped with sk1ll ([`sk1ll_core::bundled`]) to copy instead
+    /// of starting empty; `description` is then ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundled: Option<String>,
 }
 /// A personal Skill or Rule (`kind` is `skill` or `rule`); Imports use `/imports/remove`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -558,7 +576,11 @@ impl Client {
         tokio::spawn(async move {
             let _ = conn.await;
         });
-        let mut req = Request::builder().method(method).uri(path).header(hyper::header::HOST, "localhost");
+        let mut req = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(hyper::header::HOST, "localhost")
+            .header(API_HEADER, API_VERSION);
         if body.is_some() {
             req = req.header(hyper::header::CONTENT_TYPE, "application/json");
         }

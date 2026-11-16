@@ -1,0 +1,4 @@
+# The toolchain CI, release builds and the server image use.
+[toolchain]
+channel = "1.100"
+components = ["rustfmt", "clippy"]

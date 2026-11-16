@@ -25,7 +25,7 @@ pub struct JoinOptions {
     pub machine_id: Option<String>,
     /// Start from this machine's assignment instead of everything off.
     pub copy_from: Option<String>,
-    /// Where the local clone goes (e.g. `~/skills`).
+    /// Where the local clone goes (e.g. `~/.local/share/sk1ll/repo`).
     pub repo: PathBuf,
 }
 
@@ -205,7 +205,7 @@ async fn register_inner(
     let machine_id = opts.machine_id.clone().unwrap_or_else(|| machine.id.clone());
     let harnesses: Vec<String> = machine.harnesses().into_keys().collect();
     let http =
-        reqwest::Client::builder().timeout(timeout).connect_timeout(std::time::Duration::from_secs(15)).build()?;
+        crate::server::http_client().timeout(timeout).connect_timeout(std::time::Duration::from_secs(15)).build()?;
     // Created only now, after the local checks, so a refused join doesn't
     // leave an unused code behind.
     // A given code wins, so an exported SK1LL_SERVER_ADMIN_TOKEN doesn't get in the way.
