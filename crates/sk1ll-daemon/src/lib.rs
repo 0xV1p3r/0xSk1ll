@@ -78,7 +78,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         None => Daemon::standalone(cfg)?,
     };
     let listener = api::bind(&d.cfg.socket).await?;
-    tracing::info!("local API on {}", d.cfg.socket.display());
+    tracing::info!("sk1ll daemon {}: local API on {}", sk1ll_core::VERSION, d.cfg.socket.display());
     let socket = d.cfg.socket.clone();
     if let Err(e) = d.blocking(|d, eng| d.lock_repo(eng)).await {
         let _ = std::fs::remove_file(&socket);

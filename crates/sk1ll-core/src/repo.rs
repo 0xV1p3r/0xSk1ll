@@ -7,6 +7,9 @@ use crate::manifest::{MANIFEST_FILE, Manifest};
 use crate::skill::{self, IMPORTED_DIR, PERSONAL_DIR, Skill};
 use crate::{Error, IoExt, Result};
 
+/// The message of the commit [`Repo::init_committed`] makes.
+const INIT_COMMIT_MESSAGE: &str = "Initialize skills repo";
+
 const MANIFEST_TEMPLATE: &str = r#"# 0xSk1ll manifest. The repo holds content only.
 # Personal skills live in personal/<name>/SKILL.md.
 # Imports are vendored into imported/<name> and pinned in sk1ll.lock.
@@ -35,6 +38,12 @@ pub struct Repo {
 impl Repo {
     /// Creates a new personal Skill or Rule in the Draft.
     pub fn create_item(&self, kind: &str, name: &str, description: &str) -> Result<()> {
+        let quoted = serde_json::to_string(description).expect("string");
+        self.create_item_with(kind, name, &format!("---\nname: {name}\ndescription: {quoted}\n---\n\n"))
+    }
+
+    /// Creates a new personal Skill (its `SKILL.md`) or Rule with `body`.
+    pub(crate) fn create_item_with(&self, kind: &str, name: &str, body: &str) -> Result<()> {
         crate::imports::validate_name(name)?;
         let path = match kind {
             "skill" => {
@@ -62,8 +71,6 @@ impl Repo {
         } else {
             path
         };
-        let quoted = serde_json::to_string(description).expect("string");
-        let body = format!("---\nname: {name}\ndescription: {quoted}\n---\n\n");
         use std::io::Write;
         let mut out = fs::OpenOptions::new().write(true).create_new(true).open(&file).at(&file)?;
         out.write_all(body.as_bytes()).at(&file)
@@ -176,13 +183,21 @@ impl Repo {
     /// Locates a recovery repo even when its manifest has been deleted: the
     /// nearest ancestor of `cwd` with `sk1ll.toml`, or one that git identifies
     /// as a skills repo (see [`is_skills_repo`](Self::is_skills_repo)), else
-    /// `~/skills`. Any other git repo is never picked, so recovery commands
-    /// can't discard an unrelated project's changes.
+    /// the [default location](Self::default_location). Any other git repo is
+    /// never picked, so recovery commands can't discard an unrelated
+    /// project's changes.
     pub fn locate_git(cwd: &Path) -> Option<PathBuf> {
         cwd.ancestors()
             .find(|d| d.join(MANIFEST_FILE).is_file() || Self::is_skills_repo(d))
             .map(Path::to_path_buf)
-            .or_else(|| dirs::home_dir().map(|h| h.join("skills")))
+            .or_else(Self::default_location)
+    }
+
+    /// Where the repo lives unless one is picked: `$XDG_DATA_HOME/sk1ll/repo`,
+    /// usually `~/.local/share/sk1ll/repo`. sk1ll manages it, so it stays out
+    /// of sight like its config and cache.
+    pub fn default_location() -> Option<PathBuf> {
+        dirs::data_dir().map(|d| d.join("sk1ll").join("repo"))
     }
 
     /// Whether `dir`, which has no `sk1ll.toml` on disk, is the root of a
@@ -208,16 +223,35 @@ impl Repo {
                 .is_ok_and(|h| !h.is_empty())
     }
 
-    /// Nearest ancestor of `cwd` containing `sk1ll.toml`, else `~/skills`.
+    /// Nearest ancestor of `cwd` containing `sk1ll.toml`, else the
+    /// [default location](Self::default_location).
     pub fn locate(cwd: &Path) -> Option<PathBuf> {
-        cwd.ancestors()
-            .find(|d| d.join(MANIFEST_FILE).is_file())
-            .map(Path::to_path_buf)
-            .or_else(|| dirs::home_dir().map(|h| h.join("skills")))
+        cwd.ancestors().find(|d| d.join(MANIFEST_FILE).is_file()).map(Path::to_path_buf).or_else(Self::default_location)
     }
 
     /// Creates the repo layout and a starter manifest, and `git init`s it.
+    /// The starter files stay uncommitted; see [`init_committed`](Self::init_committed).
     pub fn init(root: &Path) -> Result<Self> {
+        Self::init_with(root).map(|(repo, _)| repo)
+    }
+
+    /// Like [`init`](Self::init), and when it creates the git repo, commits
+    /// the starter files it wrote, so a new repo starts with an empty Draft.
+    /// An existing git repo gets the files as Draft, as with `init`.
+    pub fn init_committed(root: &Path) -> Result<Self> {
+        let (repo, created) = Self::init_with(root)?;
+        if let Some(written) = created {
+            let mut items: Vec<crate::draft::ItemRef> =
+                written.iter().map(|p| crate::draft::ItemRef::for_path(p)).collect();
+            items.sort();
+            items.dedup();
+            repo.commit(&items, INIT_COMMIT_MESSAGE, None)?;
+        }
+        Ok(repo)
+    }
+
+    /// The starter files it wrote, when it also created the git repo.
+    fn init_with(root: &Path) -> Result<(Self, Option<Vec<PathBuf>>)> {
         let directory = crate::placement::Directory::open(root, true).at(root)?;
         let mut files = vec![(PathBuf::from(MANIFEST_FILE), MANIFEST_TEMPLATE)];
         for sub in [PERSONAL_DIR, IMPORTED_DIR, INSTRUCTIONS_DIR] {
@@ -246,9 +280,11 @@ impl Repo {
                 }
             }
         }
+        let written: Vec<PathBuf> = missing.iter().map(|(path, _)| path.clone()).collect();
         for (path, bytes) in missing {
             directory.create_file(&path, bytes.as_bytes(), false).at(root.join(path))?;
         }
+        let mut created = None;
         if !root.join(".git").exists() {
             // Always on the fleet's branch (commit and the daemon need it),
             // whatever git defaults to (`master` without `init.defaultBranch`).
@@ -256,9 +292,10 @@ impl Repo {
             let git = || crate::git::Git::new(root);
             if git().args(["init", "--quiet"]).run().is_ok() {
                 git().args(["symbolic-ref", "HEAD", &format!("refs/heads/{}", crate::FLEET_BRANCH)]).run()?;
+                created = Some(written);
             }
         }
-        Self::open(root)
+        Ok((Self::open(root)?, created))
     }
 
     pub fn root(&self) -> &Path {
@@ -321,10 +358,6 @@ mod tests {
         git(dir, &["-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "--quiet", "-m", message]);
     }
 
-    fn default_location() -> Option<PathBuf> {
-        dirs::home_dir().map(|h| h.join("skills"))
-    }
-
     /// Commit and the daemon only work on the fleet's branch, so a fresh
     /// repo starts on it even where git's own default is still `master`
     /// (unit tests run git without the developer's config).
@@ -338,6 +371,24 @@ mod tests {
         commit_all(&root, "init");
         let branch = crate::git::Git::new(&root).args(["branch", "--show-current"]).text().unwrap();
         assert_eq!(branch, crate::FLEET_BRANCH);
+    }
+
+    #[test]
+    fn a_committed_init_starts_with_an_empty_draft_but_leaves_an_existing_repo_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let repo = Repo::init_committed(&root).unwrap();
+        assert!(repo.draft().unwrap().is_empty());
+        let log = crate::git::Git::new(&root).args(["log", "--format=%s"]).text().unwrap();
+        assert_eq!(log, INIT_COMMIT_MESSAGE);
+
+        // An existing git repo keeps the starter files as Draft.
+        let existing = tmp.path().join("existing");
+        fs::create_dir_all(&existing).unwrap();
+        git(&existing, &["init", "--quiet", "-b", crate::FLEET_BRANCH]);
+        let repo = Repo::init_committed(&existing).unwrap();
+        assert!(!repo.draft().unwrap().is_empty());
+        assert!(crate::git::Git::new(&existing).args(["rev-parse", "--verify", "--quiet", "HEAD"]).text().is_err());
     }
 
     #[test]
@@ -395,21 +446,21 @@ mod tests {
         commit_all(&project, "code");
         fs::write(project.join("src/main.rs"), "unsaved edits\n").unwrap();
         for cwd in [project.clone(), project.join("src/deep")] {
-            assert_eq!(Repo::locate_git(&cwd), default_location(), "{}", cwd.display());
+            assert_eq!(Repo::locate_git(&cwd), Repo::default_location(), "{}", cwd.display());
         }
         for sub in [PERSONAL_DIR, IMPORTED_DIR, INSTRUCTIONS_DIR] {
             fs::create_dir_all(project.join(sub)).unwrap();
         }
-        assert_eq!(Repo::locate_git(&project), default_location());
+        assert_eq!(Repo::locate_git(&project), Repo::default_location());
         // Not in a git repo at all.
         let plain = tmp.path().join("plain");
         fs::create_dir_all(&plain).unwrap();
-        assert_eq!(Repo::locate_git(&plain), default_location());
+        assert_eq!(Repo::locate_git(&plain), Repo::default_location());
         // A skills repo that was never committed can't be told apart either.
         let fresh = tmp.path().join("fresh");
         Repo::init(&fresh).unwrap();
         fs::remove_file(fresh.join(MANIFEST_FILE)).unwrap();
-        assert_eq!(Repo::locate_git(&fresh), default_location());
+        assert_eq!(Repo::locate_git(&fresh), Repo::default_location());
     }
 
     #[test]
@@ -425,12 +476,12 @@ mod tests {
         Repo::init(&root).unwrap();
         fs::remove_dir_all(root.join(".git")).unwrap();
         commit_all(&top, "skills");
-        assert_eq!(Repo::locate_git(&top), default_location());
+        assert_eq!(Repo::locate_git(&top), Repo::default_location());
         fs::remove_file(root.join(MANIFEST_FILE)).unwrap();
         assert_eq!(Repo::locate_git(&root.join(PERSONAL_DIR)), Some(root.clone()));
         commit_all(&top, "drop manifest");
         assert_eq!(Repo::locate_git(&root.join(PERSONAL_DIR)), Some(root.clone()));
-        assert_eq!(Repo::locate_git(&top), default_location());
+        assert_eq!(Repo::locate_git(&top), Repo::default_location());
     }
 }
 

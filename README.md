@@ -22,18 +22,28 @@ For several machines, a self-hosted server acts as the git remote and holds the 
 
 ## Install
 
+Releases ship Linux builds. Each [release](https://github.com/0xV1p3r/0xSk1ll/releases) has:
+
+- `sk1ll-<version>-x86_64-linux.tar.gz` with `sk1ll`, the desktop app `sk1ll-gui`, `sk1ll-server` and the systemd unit, and an `aarch64` archive without the app,
+- a `.deb` for the desktop app that also installs `sk1ll` to `/usr/bin`,
+- `SHA256SUMS`, and the server image `ghcr.io/0xv1p3r/sk1ll-server`.
+
 ```sh
-cargo install --path crates/sk1ll-cli    # installs the `sk1ll` binary
+sha256sum --check --ignore-missing SHA256SUMS
+tar -xzf sk1ll-0.1.0-x86_64-linux.tar.gz
+install -Dm755 sk1ll-0.1.0-x86_64-linux/sk1ll -t ~/.local/bin        # and sk1ll-gui for the app
 ```
 
-The CLI works on any platform in standalone mode. The daemon, `join` and `fleet` need Unix.
+Or install the `.deb` with `sudo apt install ./0xSk1ll_0.1.0_amd64.deb`. `sk1ll` needs `git` on `PATH`; the app needs GTK 3 and WebKitGTK 4.1.
+
+To build from source instead, run `cargo install --path crates/sk1ll-cli`, which installs `sk1ll` to `~/.cargo/bin`. The CLI builds on any platform in standalone mode. The daemon, `join` and `fleet` need Unix.
 
 ## Quick start
 
 `sk1ll setup` walks you through the first run, and the desktop app shows the same steps on first open. To do it by hand:
 
 ```sh
-sk1ll init                                                           # creates ~/skills
+sk1ll init                                                           # creates ~/.local/share/sk1ll/repo
 sk1ll add https://github.com/0xV1p3r/0xSk1ll/tree/main/skills/sk1ll  # lets agents add skills for you
 sk1ll add https://github.com/owner/repo/tree/main/skills/pdf         # import one skill
 sk1ll list                                                           # skills and rules in the repo
@@ -41,10 +51,10 @@ sk1ll sync --dry-run                                                 # show what
 sk1ll sync                                                           # place them in every harness
 ```
 
-The repo looks like this:
+The repo lives in `~/.local/share/sk1ll/repo` (`$XDG_DATA_HOME/sk1ll/repo`) unless you pass `--repo` or set `SK1LL_REPO`. `sk1ll` commands run inside another skills repo use that one. A new repo starts with one commit holding its starter files, so Draft starts empty. If you later add an `origin` with its own history, the first Pull through the daemon replaces that commit with the remote's baseline. It looks like this:
 
 ```
-~/skills/
+~/.local/share/sk1ll/repo/
   sk1ll.toml                 # import sources
   sk1ll.lock                 # pinned commit and content hash per import
   personal/<name>/SKILL.md   # your skills
@@ -52,7 +62,7 @@ The repo looks like this:
   instructions/<name>.md     # one rule per file, rendered in file-name order
 ```
 
-`sk1ll add` accepts a GitHub repo, folder or `SKILL.md` link, `github:owner/repo`, a git URL or a local path. If the link holds several skills, `sk1ll add --list <link>` prints them and `--path` picks one. The [sk1ll skill](skills/sk1ll/SKILL.md), added in the quick start, teaches an agent to run these commands.
+`sk1ll add` accepts a GitHub repo, folder or `SKILL.md` link, `github:owner/repo`, a git URL or a local path. If the link holds several skills, `sk1ll add --list <link>` prints them and `--path` picks one. The [sk1ll skill](skills/sk1ll/SKILL.md), added in the quick start, teaches an agent to run these commands. `sk1ll` carries a copy of it: if the link can't be fetched (no network, or no access to this repo), `sk1ll add` installs that copy as the personal skill `sk1ll` instead. The copy doesn't follow upstream. To import the real one later, delete `personal/sk1ll` and run the same `sk1ll add` again.
 
 ## Draft and baseline
 
@@ -108,4 +118,4 @@ Commands take a bare skill or rule name, or `skill:<name>`, `rule:<name>`, `mani
 
 ## License
 
-MIT or Apache-2.0, at your option.
+[MIT](LICENSE).

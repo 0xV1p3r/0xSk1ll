@@ -21,10 +21,10 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::client::{
-    AddImportRequest, CommitMessage, CommitRequest, CommitResponse, ConflictTarget, ConflictView, DiffView, DraftEntry,
-    Event, HarnessChoice, HarnessView, ImportName, ImportUpdated, ItemView, JoinApiRequest, PullResult, PushResult,
-    ResolveImportRequest, ResolvedSource, RestoreRequest, RestoreResponse, SetHarnessEnabled, StatusView, SyncRequest,
-    SyncResult, UpdateImportsRequest,
+    API_HEADER, API_VERSION, AddImportRequest, CommitMessage, CommitRequest, CommitResponse, ConflictTarget,
+    ConflictView, DiffView, DraftEntry, Event, HarnessChoice, HarnessView, ImportName, ImportUpdated, ItemView,
+    JoinApiRequest, PullResult, PushResult, ResolveImportRequest, ResolvedSource, RestoreRequest, RestoreResponse,
+    SetHarnessEnabled, StatusView, SyncRequest, SyncResult, UpdateImportsRequest,
 };
 use crate::daemon::Daemon;
 use crate::error::{Error, Result};
@@ -81,7 +81,25 @@ pub(crate) fn router(d: Arc<Daemon>) -> Router {
         .route("/join-codes", post(pass))
         .route("/events", get(events))
         .layer(middleware::from_fn_with_state(d.clone(), require_repo))
+        .layer(middleware::from_fn(check_api_version))
         .with_state(d)
+}
+
+/// Refuses a client built for another local API version, typically a newer
+/// `sk1ll` or GUI talking to a daemon started before the upgrade.
+async fn check_api_version(request: Request, next: Next) -> Response {
+    let theirs = request.headers().get(API_HEADER).map(|v| v.to_str().unwrap_or("?").trim().to_string());
+    match theirs {
+        Some(v) if v != API_VERSION.to_string() => {
+            let error = format!(
+                "the running daemon (sk1ll {}) speaks local API version {API_VERSION}, this client speaks {v}; \
+                 restart the daemon so it runs the installed sk1ll (systemctl --user restart sk1ll-daemon)",
+                sk1ll_core::VERSION
+            );
+            (StatusCode::UPGRADE_REQUIRED, Json(sk1ll_proto::ErrorBody { error })).into_response()
+        }
+        _ => next.run(request).await,
+    }
 }
 
 /// Repo-dependent endpoints fail consistently while standalone awaits Init.

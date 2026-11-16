@@ -4,6 +4,8 @@ description = "Wire types shared by the 0xSk1ll server, daemon and GUI"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+publish.workspace = true
 
 [dependencies]
 sk1ll-core.workspace = true

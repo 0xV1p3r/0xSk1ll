@@ -194,7 +194,8 @@ pub async fn http(State(server): State<Arc<Server>>, req: Request) -> Response {
             .into_response();
     };
     let path_info = req.uri().path().strip_prefix("/git").unwrap_or_default().to_string();
-    if !path_info.starts_with("/repo.git/") {
+    // git http-backend refuses `..` too; the data dir also holds server.db.
+    if !path_info.starts_with("/repo.git/") || path_info.split('/').any(|s| s == ".." || s == ".") {
         return (StatusCode::NOT_FOUND, "only /git/repo.git is served\n").into_response();
     }
     match cgi(server, caller.author().to_string(), path_info, req).await {
@@ -521,6 +522,7 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
             serde_json::json!({
                 "status": "degraded", "push_degraded": true,
+                "version": sk1ll_core::VERSION, "protocol": sk1ll_proto::PROTOCOL_VERSION,
             })
         );
         // A real clone exercises both upload-pack discovery and its POST.

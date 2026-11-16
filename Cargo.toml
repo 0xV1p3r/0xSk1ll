@@ -12,7 +12,10 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "MIT"
+repository = "https://github.com/0xV1p3r/0xSk1ll"
+# Distributed as release binaries, not on crates.io.
+publish = false
 
 [workspace.dependencies]
 sk1ll-core = { path = "crates/sk1ll-core" }

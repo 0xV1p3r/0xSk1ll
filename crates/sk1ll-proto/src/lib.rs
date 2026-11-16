@@ -12,6 +12,27 @@ pub use sk1ll_core::assignment::{Assignment, HarnessAssignment};
 pub const REPO_PATH: &str = "/git/repo.git";
 
 // ---------------------------------------------------------------------------
+// Protocol version
+
+/// The version of the server ↔ daemon protocol: the REST API, the WebSocket
+/// messages and what they mean. Bump it on any change an older peer would
+/// misread; additive fields with serde defaults don't need a bump.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Request header carrying the sender's [`PROTOCOL_VERSION`]. The daemon sends
+/// it on every `/api` request; the server sends it on every response. A
+/// request without it (e.g. `curl` with the admin token) is accepted.
+pub const PROTOCOL_HEADER: &str = "sk1ll-protocol";
+
+/// Why a peer speaking `theirs` can't talk to one speaking [`PROTOCOL_VERSION`].
+pub fn protocol_mismatch(theirs: &str) -> String {
+    format!(
+        "sk1ll protocol mismatch: the server speaks version {PROTOCOL_VERSION}, this machine speaks {theirs}; \
+         upgrade the older side so the server and every daemon run the same sk1ll release"
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Items
 
 /// A skill, rule, the manifest or another repo path, as core names it in

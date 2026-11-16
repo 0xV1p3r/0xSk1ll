@@ -5,13 +5,16 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use sk1ll_daemon::client::{
-    AddImportRequest, ChangeKind, Client, CommitRequest, ConflictTarget, DaemonMode, PullResult, RestoreRequest,
-    StatusView, SyncRequest, UpdateImportsRequest,
+    AddImportRequest, ChangeKind, Client, CommitRequest, ConflictTarget, CreateItemRequest, DaemonMode, PullResult,
+    RestoreRequest, StatusView, SyncRequest, UpdateImportsRequest,
 };
 use sk1ll_daemon::{Config, DaemonState};
 use sk1ll_proto::{AssignmentChanges, ToggleChange, ToggleKind};
 
-use crate::{Cli, Cmd, Kind, assign_target, check_exists, confirm, fetch_hint, names, print_update, short};
+use crate::{
+    Cli, Cmd, Kind, assign_target, bundled_fallback, check_exists, confirm, fetch_hint, names, print_bundled,
+    print_update, short,
+};
 
 /// Sets up this process's environment, before any thread starts: the
 /// daemon's (`sk1ll daemon`), or for direct mode the machine's git
@@ -402,9 +405,24 @@ impl Daemon {
             }
             Cmd::Add { source, path, git_ref, name, list: false } => {
                 // An empty name is the skill's default name, decided by the daemon.
-                let req = AddImportRequest { name: name.unwrap_or_default(), source, path, git_ref, commit: None };
-                let r = self.block(c.add_import(&req)).map_err(fetch_hint)?;
-                println!("added {} @ {}", r.name, short(&r.new_commit));
+                let narrowed = path.is_some() || git_ref.is_some();
+                let req =
+                    AddImportRequest { name: name.clone().unwrap_or_default(), source, path, git_ref, commit: None };
+                match self.block(c.add_import(&req)).map_err(fetch_hint) {
+                    Ok(r) => println!("added {} @ {}", r.name, short(&r.new_commit)),
+                    Err(e) => {
+                        let (bundled, e) = bundled_fallback(&req.source, narrowed, e)?;
+                        let name = name.unwrap_or_else(|| bundled.to_string());
+                        let create = CreateItemRequest {
+                            kind: "skill".into(),
+                            name: name.clone(),
+                            description: None,
+                            bundled: Some(bundled.into()),
+                        };
+                        self.block(c.create_item(&create))?;
+                        print_bundled(&e, &name);
+                    }
+                }
             }
             Cmd::Update { name, force } => {
                 for r in self.block(c.update_imports(&UpdateImportsRequest { name, force }))? {

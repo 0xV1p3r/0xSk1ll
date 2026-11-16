@@ -198,6 +198,7 @@ impl Daemon {
             revoked: state.revoked(),
             server_baseline: None,
             assignment_revision: snapshot.as_ref().map_or(0, |s| s.revision),
+            version: sk1ll_core::VERSION.to_string(),
             awaiting_assignment: snapshot.is_none(),
             auth_rejected_since: None,
             pending_discards: outbox.len(),
@@ -223,7 +224,7 @@ impl Daemon {
             connected: AtomicBool::new(false),
             auth_rejected: Mutex::new(None),
             roots: watch::channel(Vec::new()).0,
-            http: reqwest::Client::builder().build().context("building the HTTP client")?,
+            http: crate::server::http_client().build().context("building the HTTP client")?,
         }))
     }
 
@@ -249,7 +250,7 @@ impl Daemon {
             )));
         }
         std::fs::create_dir_all(root).context("creating repo directory")?;
-        Repo::init(root)?;
+        Repo::init_committed(root)?;
         self.lock_repo(eng)?;
         self.refresh(eng)
     }
@@ -852,9 +853,13 @@ impl Daemon {
 
     fn pull_inner(&self, eng: &mut Engine) -> Result<PullResult> {
         let root = eng.state.repo().to_path_buf();
-        let result = if gitx::rev(&root, "HEAD")?.is_none() {
+        let first = match gitx::rev(&root, "HEAD")? {
+            None => Some(gitx::adopt_first_baseline(&root)?),
+            Some(_) => gitx::adopt_first_baseline_over_init(&root)?,
+        };
+        let result = if let Some(first) = first {
             eng.blocked = None;
-            match gitx::adopt_first_baseline(&root)? {
+            match first {
                 gitx::FirstBaseline::Adopted(to) => PullResult::Updated { from: None, to },
                 gitx::FirstBaseline::Empty => PullResult::UpToDate,
                 gitx::FirstBaseline::Blocked { baseline, items } => {
@@ -1906,7 +1911,12 @@ impl Daemon {
     pub(crate) fn create_item(&self, eng: &mut Engine, req: crate::client::CreateItemRequest) -> Result<()> {
         self.ensure_managed(eng)?;
         self.lock_repo(eng)?;
-        Repo::open(Self::root(eng))?.create_item(&req.kind, &req.name, req.description.as_deref().unwrap_or(""))?;
+        let repo = Repo::open(Self::root(eng))?;
+        match (&req.bundled, req.kind.as_str()) {
+            (Some(bundled), "skill") => repo.add_bundled(bundled, &req.name)?,
+            (Some(_), _) => return Err(Error::BadRequest("only skills are bundled".into())),
+            (None, _) => repo.create_item(&req.kind, &req.name, req.description.as_deref().unwrap_or(""))?,
+        }
         self.refresh(eng)?;
         Ok(())
     }
@@ -2353,7 +2363,13 @@ mod tests {
             cfg.machine_config = dir.path().join("machine.toml");
             std::fs::write(
                 &cfg.machine_config,
-                format!("[harnesses.h]\nskills = {:?}\nmode = \"copy\"\n", dir.path().join("h")),
+                // The presets would find the developer's real harnesses.
+                format!(
+                    "[harnesses.h]\nskills = {:?}\nmode = \"copy\"\n\
+                     [harnesses.claude]\nenabled = false\n[harnesses.codex]\nenabled = false\n\
+                     [harnesses.opencode]\nenabled = false\n[harnesses.gemini]\nenabled = false\n",
+                    dir.path().join("h")
+                ),
             )
             .unwrap();
             let mut snap = AssignmentSnapshot { revision: 1, ..Default::default() };

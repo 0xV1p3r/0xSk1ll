@@ -22,8 +22,9 @@ const changeLabels = { added: 'Added', modified: 'Modified', deleted: 'Deleted' 
 export function ChangeBadge({ change }: { change: keyof typeof changeTone }) {
   return <Badge variant={changeTone[change]}>{changeLabels[change]}</Badge>;
 }
+const kindLabels: Record<string, string> = { rule: 'Rule', manifest: 'Manifest', other: 'File' };
 export function KindBadge({ kind }: { kind: string }) {
-  return <Badge variant="secondary" className="font-sans">{kind === 'rule' ? 'Rule' : 'Skill'}</Badge>;
+  return <Badge variant="secondary" className="font-sans">{kindLabels[kind] ?? 'Skill'}</Badge>;
 }
 // Inert copy of an Assignment checkbox, for legends.
 export function CheckboxSwatch({ explicit, enabled }: { explicit: boolean; enabled: boolean }) {

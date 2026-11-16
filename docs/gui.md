@@ -4,7 +4,7 @@
 
 ## First run
 
-1. **Start the daemon.** If the daemon isn't running, the app offers to start it. With a systemd user manager, it installs `deploy/sk1ll-daemon.service` with `ExecStart` pointing at the `sk1ll` it found, then enables and starts it. An existing unit is used as it is. Without systemd, it runs `sk1ll daemon` in the background until you log out, logging to `~/.cache/sk1ll/daemon.log`. It looks for `sk1ll` next to the app, then on `PATH`, then in `~/.cargo/bin`. With a custom `SK1LL_DAEMON_SOCKET`, it only shows the commands.
+1. **Start the daemon.** If the daemon isn't running, the app offers to start it. With a systemd user manager, it installs `deploy/sk1ll-daemon.service` with `ExecStart` pointing at the `sk1ll` it found, then enables and starts it. An existing unit is used as it is. Without systemd, it runs `sk1ll daemon` in the background until you log out, logging to `~/.cache/sk1ll/daemon.log`. It looks for `sk1ll` next to the app, then on `PATH`, then in `~/.local/bin` and `~/.cargo/bin`. With a custom `SK1LL_DAEMON_SOCKET`, it only shows the commands.
 2. **Choose how to use this machine.** While the machine has no repo, a setup wizard replaces the app:
    - *Only this machine* creates a standalone repo.
    - *Join a fleet* takes the server URL and a join code from another machine.
@@ -30,7 +30,7 @@ The header shows this machine's id, its headline status and whether the daemon a
 | Log | Browse assignment changes, newest first, and undo any entry |
 | Settings | List harnesses, join or rejoin (with a join code, or the admin token for a new fleet), create one-time join codes, remove machines (typed confirmation) and see connection details |
 
-In standalone mode, commits stay local. Push and Pull use the repo's own `origin`; without an origin those actions are unavailable. If there is no repo yet, the setup wizard creates it. The repo comes from `SK1LL_REPO`, the nearest `sk1ll.toml` above the daemon's working directory, or `~/skills`.
+In standalone mode, commits stay local. Push and Pull use the repo's own `origin`; without an origin those actions are unavailable. If there is no repo yet, the setup wizard creates it. The repo comes from `SK1LL_REPO`, the nearest `sk1ll.toml` above the daemon's working directory, or `~/.local/share/sk1ll/repo`.
 
 Items that aren't in the applied baseline carry an `Unpushed` or `Draft only` badge, and you can only assign them on this machine.
 
@@ -57,6 +57,15 @@ To try it against a throwaway fleet, use `scripts/dev-fleet.sh --gui` (see [Deve
 cd crates/sk1ll-gui/ui
 pnpm build                      # the app embeds ui/dist, so build this first
 pnpm tauri build --no-bundle    # produces target/release/sk1ll-gui
+```
+
+The release `.deb` adds `src-tauri/tauri.release.conf.json`, which bundles the `sk1ll` CLI next to the app. Copy a release `sk1ll` to `src-tauri/binaries/sk1ll-<target triple>` first:
+
+```sh
+cargo build --release -p sk1ll-cli
+mkdir -p ../src-tauri/binaries
+cp ../../../target/release/sk1ll ../src-tauri/binaries/sk1ll-$(rustc --print host-tuple)
+pnpm tauri build --config src-tauri/tauri.release.conf.json   # target/release/bundle/deb/
 ```
 
 ## Layout

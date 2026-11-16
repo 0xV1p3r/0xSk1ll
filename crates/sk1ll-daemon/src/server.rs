@@ -31,7 +31,8 @@ use axum::response::Response;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use sk1ll_proto::{
-    AssignmentChanges, AssignmentSnapshot, AssignmentUpdate, DaemonMessage, MachineReport, ServerMessage,
+    AssignmentChanges, AssignmentSnapshot, AssignmentUpdate, DaemonMessage, ErrorBody, MachineReport, PROTOCOL_HEADER,
+    PROTOCOL_VERSION, ServerMessage,
 };
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::{self, Message, client::IntoClientRequest};
@@ -112,10 +113,16 @@ async fn connect(d: &Daemon) -> std::result::Result<Ws, ConnectError> {
     let mut req = state.ws_url().into_client_request().map_err(|e| other(&e))?;
     let auth = HeaderValue::from_str(&format!("Bearer {}", state.token)).map_err(|_| other(&"bad token"))?;
     req.headers_mut().insert(header::AUTHORIZATION, auth);
+    req.headers_mut().insert(PROTOCOL_HEADER, HeaderValue::from(PROTOCOL_VERSION));
     match tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(req)).await {
         Err(_) => Err(other(&"connection timed out")),
         Ok(Err(tungstenite::Error::Http(resp))) if resp.status() == StatusCode::UNAUTHORIZED => {
             Err(ConnectError::Unauthorized)
+        }
+        Ok(Err(tungstenite::Error::Http(resp))) if resp.status() == StatusCode::UPGRADE_REQUIRED => {
+            let body = resp.body().as_deref().and_then(|b| serde_json::from_slice::<ErrorBody>(b).ok());
+            let fallback = || sk1ll_proto::protocol_mismatch(&PROTOCOL_VERSION.to_string());
+            Err(ConnectError::Other(body.map_or_else(fallback, |b| b.error)))
         }
         Ok(Err(e)) => Err(other(&e)),
         Ok(Ok((ws, _))) => Ok(ws),
@@ -293,6 +300,14 @@ async fn inbox(d: Arc<Daemon>, mut rx: mpsc::UnboundedReceiver<ServerMessage>) {
     }
 }
 
+/// An HTTP client for the server: every request carries this daemon's
+/// [`PROTOCOL_VERSION`], so a server that speaks another one refuses it.
+pub(crate) fn http_client() -> reqwest::ClientBuilder {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(PROTOCOL_HEADER, HeaderValue::from(PROTOCOL_VERSION));
+    reqwest::Client::builder().default_headers(headers)
+}
+
 /// Forwards a local API call to the server's `/api` with the machine token.
 pub(crate) async fn proxy(d: &Daemon, method: Method, path_and_query: &str, body: Bytes) -> Result<Response> {
     if d.is_revoked() {
@@ -341,7 +356,8 @@ pub async fn set_assignment_direct(
 ) -> anyhow::Result<AssignmentUpdate> {
     use anyhow::Context;
     let state = DaemonState::load(&cfg.state)?.context("this machine hasn't joined a fleet")?;
-    let update = change_assignment(&reqwest::Client::new(), &state, changes).await?;
+    let http = http_client().build().context("building the HTTP client")?;
+    let update = change_assignment(&http, &state, changes).await?;
     let snap = AssignmentSnapshot { revision: update.revision, assignment: update.assignment.clone() };
     crate::state::save_snapshot(&cfg.snapshot_path(), &snap)
         .context("Server accepted the assignment, but saving its authoritative snapshot failed")?;

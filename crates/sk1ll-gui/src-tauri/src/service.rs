@@ -34,7 +34,7 @@ pub fn start() -> Result<Started, String> {
         return Err("This app uses a custom Daemon socket (SK1LL_DAEMON_SOCKET). Start that Daemon yourself.".into());
     }
     let binary = Environment::current().find_binary().ok_or(
-        "The sk1ll command wasn't found next to this app, on PATH or in ~/.cargo/bin. Install it, then try again.",
+        "The sk1ll command wasn't found next to this app, on PATH, in ~/.local/bin or in ~/.cargo/bin. Install it, then try again.",
     )?;
     service::start(&binary).map_err(|e| format!("{e:#}"))
 }

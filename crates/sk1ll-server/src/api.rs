@@ -93,6 +93,12 @@ async fn join(State(server): ServerState, Json(req): Json<JoinRequest>) -> Resul
         .db(move |conn| {
             let req = req2;
             let tx = conn.transaction()?;
+            // The code first, so callers without one learn nothing about machine ids;
+            // any later refusal rolls its consumption back.
+            let now = now();
+            if !db::consume_join_code(&tx, &hash(&normalize_code(&req.code)), &req.machine_id, now, ttl)? {
+                return Err(ApiError::Forbidden("invalid or already used join code".into()));
+            }
             let mut assignment = match &req.copy_from {
                 Some(src) => db::assignment(&tx, src)?
                     .ok_or_else(|| ApiError::BadRequest(format!("copy_from: no machine `{src}`")))?,
@@ -103,10 +109,6 @@ async fn join(State(server): ServerState, Json(req): Json<JoinRequest>) -> Resul
             }
             if db::machine(&tx, &req.machine_id)?.is_some() {
                 return Err(ApiError::Conflict(format!("machine `{}` already joined", req.machine_id)));
-            }
-            let now = now();
-            if !db::consume_join_code(&tx, &hash(&normalize_code(&req.code)), &req.machine_id, now, ttl)? {
-                return Err(ApiError::Forbidden("invalid or already used join code".into()));
             }
             let revision = db::insert_machine(&tx, &req.machine_id, &token_hash, now, &assignment)?;
             tx.commit()?;

@@ -183,7 +183,7 @@ impl Machine {
     }
 
     fn repo(&self) -> PathBuf {
-        self.home.path().join("skills")
+        self.home.path().join(".local/share/sk1ll/repo")
     }
 
     fn skills(&self) -> PathBuf {
@@ -1602,13 +1602,19 @@ async fn gui_creation_import_inventory_check_and_conflict_diff() {
             kind: "rule".into(),
             name: "style".into(),
             description: Some("House style".into()),
+            bundled: None,
         })
         .await
         .unwrap();
     assert!(m.repo().join("instructions/style.md").exists());
     assert!(
         m.client
-            .create_item(&CreateItemRequest { kind: "rule".into(), name: "style".into(), description: None })
+            .create_item(&CreateItemRequest {
+                kind: "rule".into(),
+                name: "style".into(),
+                description: None,
+                bundled: None
+            })
             .await
             .is_err()
     );
@@ -1689,6 +1695,7 @@ async fn deleting_and_renaming_are_draft_changes_and_report_unmigrated_toggles_o
             kind: "rule".into(),
             name: "fresh".into(),
             description: None,
+            bundled: None,
         })
         .await
         .unwrap();
@@ -2097,7 +2104,7 @@ async fn standalone_joins_and_restarts_from_an_untouched_init() {
     })
     .await;
     assert!(m.state_path().exists());
-    let backup = std::fs::read_dir(m.home.path())
+    let backup = std::fs::read_dir(m.repo().parent().unwrap())
         .unwrap()
         .map(|e| e.unwrap().path())
         .find(|p| p.file_name().unwrap().to_string_lossy().starts_with("sk1ll-before-join-"))
@@ -2294,4 +2301,45 @@ async fn standalone_join_snapshot_failure_rolls_back_and_retries_pending_registr
     m.client.join(&req).await.unwrap();
     eventually(|| async { m.client.status().await.ok().filter(|s| s.mode == DaemonMode::Joined).map(drop) }).await;
     assert!(sk1ll_core::EngineLock::try_acquire(&m.repo()).unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn clients_of_another_local_api_version_are_told_to_restart_the_daemon() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut m = solo("solo", "http://127.0.0.1:1", None);
+    m.start().await;
+    assert_eq!(m.status().await.version, sk1ll_core::VERSION);
+    let request = |version: &str| {
+        format!("GET /status HTTP/1.1\r\nHost: localhost\r\nsk1ll-api: {version}\r\nConnection: close\r\n\r\n")
+    };
+    for (version, expected) in [("1", "HTTP/1.1 200"), ("2", "HTTP/1.1 426")] {
+        let mut stream = tokio::net::UnixStream::connect(m.client.socket()).await.unwrap();
+        stream.write_all(request(version).as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with(expected), "{version}: {response}");
+        if version == "2" {
+            assert!(response.contains("restart the daemon"), "{response}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bundled_skill_is_created_as_a_personal_draft_skill() {
+    use sk1ll_daemon::client::CreateItemRequest;
+    let mut m = solo("solo", "http://127.0.0.1:1", None);
+    m.start().await;
+    let bundled = |kind: &str, name: &str, bundled: &str| CreateItemRequest {
+        kind: kind.into(),
+        name: name.into(),
+        description: None,
+        bundled: Some(bundled.into()),
+    };
+    m.client.create_item(&bundled("skill", "sk1ll", "sk1ll")).await.unwrap();
+    let written = std::fs::read_to_string(m.repo().join("personal/sk1ll/SKILL.md")).unwrap();
+    assert_eq!(Some(written.as_str()), sk1ll_core::bundled::skill("sk1ll"));
+    for (kind, name, from) in [("skill", "other", "pdf"), ("rule", "rule", "sk1ll"), ("skill", "sk1ll", "sk1ll")] {
+        let err = m.client.create_item(&bundled(kind, name, from)).await.unwrap_err();
+        assert_eq!(err.status, Some(400), "{kind} {name} from {from}: {err:?}");
+    }
 }

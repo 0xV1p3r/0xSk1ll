@@ -21,8 +21,9 @@ After=network-online.target
 
 [Service]
 Type=simple
-# Adjust if sk1ll isn't installed with `cargo install`.
-ExecStart=%h/.cargo/bin/sk1ll daemon
+# Adjust if sk1ll isn't in ~/.local/bin (the release archive's location):
+# %h/.cargo/bin/sk1ll after `cargo install`, /usr/bin/sk1ll from the .deb.
+ExecStart=%h/.local/bin/sk1ll daemon
 Restart=on-failure
 RestartSec=5
 Environment=RUST_LOG=info

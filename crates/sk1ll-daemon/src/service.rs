@@ -41,11 +41,16 @@ impl Environment {
     }
 
     /// Next to the running executable first, so a bundled CLI matches its
-    /// version. A desktop launcher's PATH often lacks `~/.cargo/bin`, so that
-    /// comes last.
+    /// version. A desktop launcher's PATH often lacks `~/.local/bin` (where
+    /// the release archive installs) and `~/.cargo/bin`, so those come last.
     pub fn find_binary(&self) -> Option<PathBuf> {
-        let cargo = self.home.as_ref().map(|h| h.join(".cargo/bin"));
-        self.exe_dir.iter().chain(&self.path).chain(&cargo).map(|dir| dir.join("sk1ll")).find(|p| executable(p))
+        let user = [".local/bin", ".cargo/bin"].map(|d| self.home.as_ref().map(|h| h.join(d)));
+        self.exe_dir
+            .iter()
+            .chain(&self.path)
+            .chain(user.iter().flatten())
+            .map(|dir| dir.join("sk1ll"))
+            .find(|p| executable(p))
     }
 }
 
@@ -91,7 +96,7 @@ pub fn render_unit(binary: &Path) -> String {
         binary.display().to_string().replace('\\', "\\\\").replace('"', "\\\"").replace('%', "%%").replace('$', "$$");
     TEMPLATE
         .lines()
-        .filter(|line| !line.starts_with("# Adjust if sk1ll"))
+        .filter(|line| !line.starts_with("# Adjust if sk1ll") && !line.starts_with("# %h/.cargo/bin"))
         .map(|line| if line.starts_with("ExecStart=") { format!("ExecStart=\"{quoted}\" daemon") } else { line.into() })
         .collect::<Vec<_>>()
         .join("\n")
@@ -143,12 +148,12 @@ mod tests {
         let unit = render_unit(Path::new("/opt/my apps/100%/sk1ll"));
         assert!(unit.contains("\nExecStart=\"/opt/my apps/100%%/sk1ll\" daemon\n"), "{unit}");
         assert_eq!(unit.matches("ExecStart=").count(), 1);
-        assert!(!unit.contains(".cargo/bin"), "{unit}");
+        assert!(!unit.contains(".local/bin"), "{unit}");
         assert!(unit.contains("[Install]\nWantedBy=default.target\n"), "{unit}");
     }
 
     #[test]
-    fn binary_is_found_next_to_the_executable_then_on_path_then_in_cargo() {
+    fn binary_is_found_next_to_the_executable_then_on_path_then_in_the_user_dirs() {
         let dir = tempfile::tempdir().unwrap();
         let make = |sub: &str| {
             let path = dir.path().join(sub).join("sk1ll");
@@ -165,6 +170,8 @@ mod tests {
         assert_eq!(env().find_binary(), None);
         let cargo = make("home/.cargo/bin");
         assert_eq!(env().find_binary(), Some(cargo));
+        let local = make("home/.local/bin");
+        assert_eq!(env().find_binary(), Some(local));
         let on_path = make("bin");
         assert_eq!(env().find_binary(), Some(on_path.clone()));
         let bundled = make("app");

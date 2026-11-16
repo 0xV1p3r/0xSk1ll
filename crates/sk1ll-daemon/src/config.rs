@@ -7,7 +7,7 @@ use sk1ll_core::{Assignment, MachineConfig};
 /// Daemon settings: where its files live and how often it does things.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Standalone repo override (SK1LL_REPO); otherwise locate the nearest repo or ~/skills.
+    /// Standalone repo override (SK1LL_REPO); otherwise locate the nearest repo or ~/.local/share/sk1ll/repo.
     pub repo: Option<PathBuf>,
     /// Machine id, server URL, token and repo path (`SK1LL_DAEMON_STATE`,
     /// default `~/.config/sk1ll/daemon.json`). Mode 0600.
@@ -145,7 +145,7 @@ pub fn parse_duration(s: &str) -> anyhow::Result<Duration> {
 }
 
 /// Selects the same standalone repo for the CLI and daemon. An explicit path
-/// wins, then SK1LL_REPO, then the nearest skills repo or ~/skills.
+/// wins, then SK1LL_REPO, then the nearest skills repo or ~/.local/share/sk1ll/repo.
 pub fn locate_repo(explicit: Option<&std::path::Path>, git_only: bool) -> anyhow::Result<PathBuf> {
     let env = std::env::var_os("SK1LL_REPO").filter(|v| !v.is_empty()).map(PathBuf::from);
     let path = match explicit.map(std::path::Path::to_path_buf).or(env) {

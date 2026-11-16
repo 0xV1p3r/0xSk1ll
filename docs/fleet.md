@@ -11,11 +11,14 @@ The daemon and fleet commands need Unix.
 ## Deploy the server
 
 ```sh
+docker login ghcr.io                                      # the image is private for now
 export SK1LL_SERVER_ADMIN_TOKEN=$(openssl rand -hex 32)   # or put it in deploy/.env
 docker compose -f deploy/docker-compose.server.yml up -d
 ```
 
-The server listens on port 7878 and keeps `repo.git` and `server.db` in the `server-data` volume. It serves plain HTTP. The daemon accepts `https://` URLs, so put a TLS proxy in front when machines connect over an untrusted network. `GET /healthz` reports whether it is up.
+Compose pulls `ghcr.io/0xv1p3r/sk1ll-server` at the release in `SK1LL_SERVER_VERSION`, which defaults to the version the file shipped with. Add `--build` to build the image from this checkout instead.
+
+The server listens on port 7878 and keeps `repo.git` and `server.db` in the `server-data` volume. It serves plain HTTP. The daemon accepts `https://` URLs, so put a TLS proxy in front when machines connect over an untrusted network. `GET /healthz` reports whether it is up. `sk1ll-server --healthcheck` asks it from inside the container and is the image's healthcheck. The image is Alpine with a static binary and git, about 25 MB. It has no ssh client, so the server can't check `ssh` import sources for updates.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -51,7 +54,7 @@ Once one machine has joined, any joined machine can create more codes, from the 
 On the new machine:
 
 ```sh
-sk1ll join http://server:7878 <code>                  # clones the repo into ~/skills
+sk1ll join http://server:7878 <code>                  # clones the repo into ~/.local/share/sk1ll/repo
 sk1ll join http://server:7878 <code> --copy-from laptop   # start from laptop's assignment
 ```
 
@@ -59,7 +62,7 @@ A new machine starts with everything off unless you pass `--copy-from`. `--id` s
 
 ## Run the daemon
 
-The daemon also runs without a fleet. When `daemon.json` is absent, it uses `SK1LL_REPO`, the nearest skills repo above its working directory, or `~/skills`. Assignment is local in `~/.cache/sk1ll/assignment.json`. It watches the repo, assignment and harnesses, and reconciles them periodically. Commits stay local; Push and Pull use the repo's own `origin`. No origin means no Push or Pull.
+The daemon also runs without a fleet. When `daemon.json` is absent, it uses `SK1LL_REPO`, the nearest skills repo above its working directory, or `~/.local/share/sk1ll/repo`. Assignment is local in `~/.cache/sk1ll/assignment.json`. It watches the repo, assignment and harnesses, and reconciles them periodically. Commits stay local; Push and Pull use the repo's own `origin`. No origin means no Push or Pull.
 
 If the repo does not exist, the daemon still starts and the GUI offers Init. Fleet operations and the assignment log are unavailable until joining. `sk1ll join` can go through a running standalone daemon and restart it with the fleet credentials. A standalone draft or local commits must be moved aside before joining. An untouched `sk1ll init` directory is kept in a `sk1ll-before-join-*` backup beside the repo when the prepared fleet clone is activated. The replacement clone is locked before it becomes live. Snapshot and assignment files are prepared first; `daemon.json` is the final activation marker. If activation fails, the original repo and its engine lock stay active, and any replacement repo is preserved as `unactivated-repo` inside the backup directory. Earlier snapshot and assignment files are retained in private `daemon-activation-*` directories beside those files. Rollback uses no-replace renames and refuses to overwrite concurrent content; if restoration is obstructed, the error names the retained backup and mutations are frozen until recovery and a daemon restart.
 
@@ -75,7 +78,7 @@ loginctl enable-linger "$USER"     # optional: keep it running while logged out
 journalctl --user -u sk1ll-daemon  # logs; set RUST_LOG=debug for more
 ```
 
-The unit runs `~/.cargo/bin/sk1ll daemon`. Edit `ExecStart` if you installed `sk1ll` elsewhere. On other systems, run `sk1ll daemon` under your service manager.
+The unit runs `~/.local/bin/sk1ll daemon`, where the release archive installs it. Edit `ExecStart` for `~/.cargo/bin/sk1ll` after `cargo install`, or `/usr/bin/sk1ll` from the `.deb`. `sk1ll setup` and the app write the unit with the path of the `sk1ll` they found, so they need no edit. On other systems, run `sk1ll daemon` under your service manager.
 
 While it runs, the daemon holds the repo's engine lock. CLI commands that change the repo go through the daemon, and the daemon refuses to start while another sk1ll process holds the lock. Running `sk1ll join` again after the machine was removed also goes through the daemon, which then restarts itself with the new credentials.
 
@@ -87,7 +90,7 @@ The local API socket is `$XDG_RUNTIME_DIR/sk1ll/daemon.sock`. Its directory must
 | `SK1LL_DAEMON_SOCKET` | `$XDG_RUNTIME_DIR/sk1ll/daemon.sock` | Local API socket |
 | `SK1LL_MACHINE_CONFIG` | `~/.config/sk1ll/machine.toml` | Harness configuration |
 | `SK1LL_ASSIGNMENT` | `~/.cache/sk1ll/assignment.json` | Local assignment in standalone; server mirror when joined |
-| `SK1LL_REPO` | nearest skills repo, else `~/skills` | Standalone repo path; joined machines use `daemon.json` |
+| `SK1LL_REPO` | nearest skills repo, else `~/.local/share/sk1ll/repo` | Standalone repo path; joined machines use `daemon.json` |
 | `SK1LL_PULL_INTERVAL` | `5m` | Fallback pull interval while connected |
 | `SK1LL_DEBOUNCE` | `300ms` | Quiet time before reacting to file changes |
 | `SK1LL_DEBOUNCE_MAX` | `2s` | Longest a stream of file changes can postpone a sync |
@@ -111,3 +114,9 @@ The local API socket is `$XDG_RUNTIME_DIR/sk1ll/daemon.sock`. Its directory must
 To clear Blocked, commit or restore the clashing items, then run `sk1ll pull`.
 
 Join codes expire after `SK1LL_SERVER_JOIN_CODE_TTL` (default `24h`), using the server duration syntax.
+
+## Upgrade
+
+Upgrade the server and every machine to the same release. The server and the daemons exchange a protocol version on every request. A daemon whose version the server doesn't speak is refused, and its status shows the reason as the last error. It keeps working offline from its cache until it is upgraded. The same check runs between the daemon and the CLI or app: after installing a new `sk1ll`, restart the daemon with `systemctl --user restart sk1ll-daemon`. Until then, commands that go through it say so.
+
+`sk1ll --version`, `sk1ll-server --version`, the server's `/healthz` and the app's Settings → Diagnostics show the release and the commit it was built from. The server upgrades its database in place on start.

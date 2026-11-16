@@ -73,11 +73,11 @@ mod fleet {
 #[derive(Parser)]
 #[command(
     name = "sk1ll",
-    version,
+    version = sk1ll_core::VERSION,
     about = "0xSk1ll manages agent skills and instructions and syncs them across machines and harnesses"
 )]
 struct Cli {
-    /// Skills repo (default: nearest sk1ll.toml above cwd, else ~/skills)
+    /// Skills repo (default: nearest sk1ll.toml above cwd, else ~/.local/share/sk1ll/repo)
     #[arg(long, global = true, env = "SK1LL_REPO")]
     repo: Option<PathBuf>,
     /// Machine-local harness config (default: ~/.config/sk1ll/machine.toml)
@@ -214,7 +214,7 @@ enum Cmd {
     },
     /// Set up this machine step by step: a standalone repo, joining a fleet or starting one
     Setup,
-    /// Join a fleet: register with the server and clone its repo into --repo (default ~/skills)
+    /// Join a fleet: register with the server and clone its repo into --repo (default ~/.local/share/sk1ll/repo)
     Join {
         /// The server's base URL, e.g. https://server.example
         server_url: String,
@@ -357,7 +357,7 @@ fn run(cli: Cli) -> Result<()> {
         let root = path.clone().unwrap_or(repo_path);
         let _lock = lock_direct(&root)?;
         std::fs::create_dir_all(&root)?;
-        let repo = Repo::init(&root)?;
+        let repo = Repo::init_committed(&root)?;
         println!("initialized skills repo at {}", repo.root().display());
         println!("To let agents add skills: sk1ll add https://github.com/0xV1p3r/0xSk1ll/tree/main/skills/sk1ll");
         return Ok(());
@@ -484,10 +484,16 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Cmd::Add { source, path, git_ref, name, list: false } => {
-            let r = repo
-                .add_link(name.as_deref(), &source, path.as_deref(), git_ref.as_deref(), None)
-                .map_err(fetch_hint)?;
-            println!("added {} @ {}", r.name, short(&r.new_commit));
+            match repo.add_link(name.as_deref(), &source, path.as_deref(), git_ref.as_deref(), None).map_err(fetch_hint)
+            {
+                Ok(r) => println!("added {} @ {}", r.name, short(&r.new_commit)),
+                Err(e) => {
+                    let (bundled, e) = bundled_fallback(&source, path.is_some() || git_ref.is_some(), e)?;
+                    let name = name.unwrap_or_else(|| bundled.to_string());
+                    repo.add_bundled(bundled, &name)?;
+                    print_bundled(&e, &name);
+                }
+            }
         }
         Cmd::Update { name, force } => {
             for r in repo.update(name.as_deref(), force)? {
@@ -800,6 +806,27 @@ fn label(a: &Action) -> String {
 }
 
 /// Fetching a source failed: keep git's message and say what to check.
+/// `sk1ll add` of a link to a skill bundled with sk1ll whose fetch failed:
+/// the bundled skill to add instead, and the fetch error to report. Any other
+/// failure, or a link narrowed with `--path` or `--ref`, is returned as is.
+fn bundled_fallback(link: &str, narrowed: bool, e: anyhow::Error) -> Result<(&'static str, anyhow::Error)> {
+    let msg = e.to_string();
+    let fetch_failed = msg.contains("`git clone ") || msg.contains("`git fetch ");
+    match sk1ll_core::bundled::for_link(link) {
+        Some(bundled) if fetch_failed && !narrowed => Ok((bundled, e)),
+        _ => Err(e),
+    }
+}
+
+fn print_bundled(fetch_error: &anyhow::Error, name: &str) {
+    let reason = fetch_error.to_string();
+    eprintln!("could not fetch the link: {}", reason.lines().next().unwrap_or_default());
+    println!("added the copy bundled with sk1ll {} as the personal skill {name}", sk1ll_core::VERSION);
+    println!(
+        "it won't follow upstream; to import it instead, delete personal/{name} and run `sk1ll add` again once the link works"
+    );
+}
+
 fn fetch_hint(e: impl Into<anyhow::Error>) -> anyhow::Error {
     const HINT: &str = "Check the repository URL and your git credentials (SSH agent / credential helper).";
     let e = e.into();
@@ -1054,6 +1081,16 @@ mod tests {
     }
 
     /// The daemon's message may already carry the hint; it's added once.
+    #[test]
+    fn only_a_failed_fetch_of_the_bundled_link_falls_back() {
+        let link = sk1ll_core::bundled::SK1LL_SKILL_LINK;
+        let fetch = || anyhow::anyhow!("`git clone --quiet -- {link} /c` failed: Repository not found");
+        assert_eq!(bundled_fallback(link, false, fetch()).unwrap().0, "sk1ll");
+        assert!(bundled_fallback(link, true, fetch()).is_err(), "--path or --ref asks for that exact source");
+        assert!(bundled_fallback(link, false, anyhow::anyhow!("import `sk1ll` already exists")).is_err());
+        assert!(bundled_fallback("https://github.com/o/r", false, fetch()).is_err());
+    }
+
     #[test]
     fn fetch_hint_is_added_once_and_only_to_fetch_failures() {
         let failed = "`git clone --quiet -- https://x.invalid/r.git /c` failed: could not resolve host";

@@ -64,7 +64,7 @@ pub(crate) fn run(cli: &Cli) -> Result<()> {
             None => {
                 let _lock = crate::lock_direct(&repo)?;
                 std::fs::create_dir_all(&repo)?;
-                Repo::init(&repo)?;
+                Repo::init_committed(&repo)?;
             }
         }
         println!("created the skills repo at {}", repo.display());

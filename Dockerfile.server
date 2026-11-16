@@ -1,19 +1,36 @@
 # The 0xSk1ll server: the fleet's git remote, assignment and status server.
-#   docker build -f Dockerfile.server -t sk1ll-server .
-FROM rust:1-bookworm AS build
+#   docker build -f Dockerfile.server --build-arg SK1LL_COMMIT=$(git rev-parse --short=10 HEAD) -t sk1ll-server .
+# A static musl binary on Alpine: the image holds little more than git.
+FROM rust:1.100-alpine AS build
+RUN apk add --no-cache musl-dev
 WORKDIR /src
-COPY Cargo.toml Cargo.lock ./
+# The build context has no .git; pass the commit for `--version` and /healthz.
+ARG SK1LL_COMMIT=unknown
+ENV SK1LL_COMMIT=$SK1LL_COMMIT \
+    CARGO_PROFILE_RELEASE_LTO=true \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
+    CARGO_PROFILE_RELEASE_STRIP=true
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
+# sk1ll-core bundles skills/sk1ll.
+COPY skills ./skills
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked -p sk1ll-server \
     && cp target/release/sk1ll-server /usr/local/bin/sk1ll-server
 
-FROM debian:bookworm-slim
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates curl \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10001 --home-dir /data sk1ll \
+FROM alpine:3.22
+LABEL org.opencontainers.image.source="https://github.com/0xV1p3r/0xSk1ll" \
+      org.opencontainers.image.description="0xSk1ll fleet server: git remote, assignment and status" \
+      org.opencontainers.image.licenses="MIT"
+# git serves the repo (http-backend, from git-daemon) and checks imports
+# (ls-remote over http(s)). The helpers the server never runs are dropped: the
+# git daemon and shell, dumb-HTTP transport and shell-script support.
+RUN apk add --no-cache git git-daemon \
+    && cd /usr/libexec/git-core \
+    && rm git-daemon git-shell git-http-fetch git-http-push git-sh-i18n--envsubst /usr/bin/git-shell \
+    && rm -r /usr/share/git-core/templates \
+    && adduser -S -D -H -u 10001 -h /data sk1ll \
     && mkdir -p /data && chown sk1ll /data
 COPY --from=build /usr/local/bin/sk1ll-server /usr/local/bin/sk1ll-server
 USER sk1ll
@@ -21,4 +38,5 @@ ENV SK1LL_SERVER_DATA=/data \
     SK1LL_SERVER_BIND=0.0.0.0:7878
 VOLUME /data
 EXPOSE 7878
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD ["sk1ll-server", "--healthcheck"]
 ENTRYPOINT ["sk1ll-server"]

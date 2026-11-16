@@ -13,6 +13,7 @@ export interface StatusView {
   machine_id: string; server_url: string | null; repo: string; headline: MachineStatus; connection: Connection;
   last_error: string | null; revoked: boolean; server_baseline: string | null; assignment_revision: number;
   awaiting_assignment: boolean; auth_rejected_since: number | null; pending_discards: number; report: MachineReport;
+  version?: string;
 }
 export interface MachineRow {
   id: string; status: MachineStatus; connected: boolean; joined_at: number; last_seen: number | null;
