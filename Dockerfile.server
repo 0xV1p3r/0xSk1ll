@@ -1,7 +1,7 @@
 # The 0xSk1ll server: the fleet's git remote, assignment and status server.
 #   docker build -f Dockerfile.server --build-arg SK1LL_COMMIT=$(git rev-parse --short=10 HEAD) -t sk1ll-server .
 # A static musl binary on Alpine: the image holds little more than git.
-FROM rust:1.100-alpine AS build
+FROM rust:1.100-alpine@sha256:de1e0058543a81ed7b046629167db587c67a94bdf37cce14eb27f0ec83baaffb AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 # The build context has no .git; pass the commit for `--version` and /healthz.
@@ -19,7 +19,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked -p sk1ll-server \
     && cp target/release/sk1ll-server /usr/local/bin/sk1ll-server
 
-FROM alpine:3.22
+FROM alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f
 LABEL org.opencontainers.image.source="https://github.com/0xV1p3r/0xSk1ll" \
       org.opencontainers.image.description="0xSk1ll fleet server: git remote, assignment and status" \
       org.opencontainers.image.licenses="MIT"

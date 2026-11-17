@@ -1,0 +1,47 @@
+# Updates wait out a cooldown, so a compromised release has time to be caught
+# before it's proposed. gh actions-lock also reads the github-actions cooldown
+# as its policy for fresh releases, and Dependabot relocks
+# .github/workflows/actions.lock in its action update PRs.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      cargo-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: npm
+    directory: /crates/sk1ll-gui/ui
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      ui-minor-and-patch:
+        update-types: [minor, patch]
+
+  # Dockerfile.server's base images, pinned by digest.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    ignore:
+      # The Rust version follows rust-toolchain.toml, bumped by hand.
+      - dependency-name: rust
+        update-types: [version-update:semver-major, version-update:semver-minor]
