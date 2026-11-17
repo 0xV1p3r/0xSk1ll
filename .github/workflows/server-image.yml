@@ -30,7 +30,7 @@ jobs:
           persist-credentials: false
       - name: Versions agree with the tag
         run: scripts/check-version.sh "$GITHUB_REF_NAME"
-      - uses: docker/setup-buildx-action@v3.12.0
+      - uses: docker/setup-buildx-action@v4.4.1
       - uses: docker/login-action@v3.7.0
         with:
           registry: ghcr.io
