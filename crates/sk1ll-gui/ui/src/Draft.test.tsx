@@ -170,7 +170,7 @@ it('counts added and removed lines without headers and shows friendly names', as
 it('pushes unpushed items', async () => {
   vi.mocked(api.push).mockResolvedValue({ pushed: true });
   render(<Draft revision={0} status={{ ...status, report: { ...status.report, unpushed: ['skill:reviewed'] } }} changed={changed} />);
-  expect(screen.getByText('1 unpushed')).toBeTruthy(); fireEvent.click(screen.getByRole('button', { name: 'Push now' }));
+  expect(screen.getByText('1 unpushed item')).toBeTruthy(); fireEvent.click(screen.getByRole('button', { name: 'Push now' }));
   await waitFor(() => expect(api.push).toHaveBeenCalledOnce()); await waitFor(() => expect(changed).toHaveBeenCalledOnce());
 });
 
@@ -216,7 +216,7 @@ it('keeps one Push action after an unpushed commit and marks matching Draft item
   await screen.findByText('abc');
   expect(screen.getAllByRole('button', { name: 'Push now' })).toHaveLength(1);
   expect(screen.queryByRole('button', { name: 'Retry push' })).toBeNull();
-  expect(screen.getByText('2 unpushed')).toBeTruthy();
+  expect(screen.getByText('2 unpushed items')).toBeTruthy();
 });
 
 it('disables Push and Pull without an origin in standalone', async () => {

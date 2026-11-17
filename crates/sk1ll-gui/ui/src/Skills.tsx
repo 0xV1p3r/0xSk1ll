@@ -12,10 +12,11 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { toast } from './toast';
 import { api } from './api';
 import { useMutation, useResource } from './hooks';
-import { ChangeBadge, Confirm, ErrorNotice, Loading, Nothing, Notice, Panel, PanelToolbar, Pending, SectionTitle } from './shared';
+import { ChangeBadge, Confirm, DiffLines, ErrorNotice, Loading, Nothing, Notice, Panel, PanelToolbar, Pending, SectionTitle } from './shared';
 import { terms } from './model';
 import { SkillFile } from './SkillFile';
-import type { ContentEntry, ContentQuery, ContentType, Editor, StatusView } from './types';
+import { unifiedDiff } from './textDiff';
+import type { ContentEntry, ContentQuery, ContentType, ContentVariant, Editor, StatusView } from './types';
 
 const typeLabels: Record<ContentType, string> = { personal: 'Personal', import: 'Import', rule: 'Rule', unmanaged: 'Unmanaged' };
 const loadEditors = () => api.editors(true);
@@ -90,7 +91,7 @@ export function Skills({ entries, revision, changed, reviewDraft, assignment, ad
           <TableCell><div className="flex max-w-sm flex-wrap gap-1">
             {harnesses.map(name => <Badge key={name} variant="outline" className="cursor-pointer underline decoration-dotted underline-offset-2 hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring" title={value.type === 'unmanaged' ? `View in ${name}` : 'Open in Assignment matrix'} render={<button type="button" aria-label={`${value.type === 'unmanaged' ? 'View' : 'Assignment for'} ${value.name} in ${name}`}
               onClick={event => { event.stopPropagation(); if (value.type === 'unmanaged') setSelected({ key: keyFor(value), harness: name }); else if (value.item) assignment(value.item, name); }} />}>{value.type === 'unmanaged' ? `View in ${name}` : name}{value.type === 'unmanaged' ? <Eye className="size-3" /> : <LayoutGrid className="size-3" />}</Badge>)}
-            {value.variants.length > 1 && <Badge variant="warning">Differs</Badge>}
+            {value.variants.length > 1 && <DiffersBadge count={value.variants.length} />}
             {value.clashes_with_repo && <Badge variant="warning">Clashes with repo</Badge>}
           </div></TableCell>
         </TableRow>;
@@ -139,6 +140,47 @@ function SkillBrowser({ query, revision }: { query: () => ContentQuery; revision
   </>;
 }
 
+function DiffersBadge({ count }: { count: number }) {
+  return <Tooltip><TooltipTrigger render={<Badge variant="warning" tabIndex={0} className="cursor-help" />}>Differs</TooltipTrigger>
+    <TooltipContent>Your Harnesses hold {count} different versions of this skill. Open it and choose Compare variants to see what differs.</TooltipContent></Tooltip>;
+}
+
+const variantLabel = (variant: ContentVariant) => variant.locations.map(location => location.harness).join(', ');
+
+async function loadVariant(item: string, hash: string, harness: string) {
+  const query = { item, hash, harness };
+  const files = (await api.skillTree(query)).filter(file => file.kind !== 'directory');
+  return new Map(await Promise.all(files.map(async file => {
+    if (file.kind === 'symlink') return [file.path, `symlink (${file.size} bytes)`] as const;
+    const content = await api.skillFile({ ...query, path: file.path });
+    return [file.path, content.binary ? `binary file (${content.size} bytes)` : content.too_large ? `file too large to compare (${content.size} bytes)` : content.text ?? ''] as const;
+  })));
+}
+
+function VariantCompare({ item, base, variants, revision }: { item: string; base: { hash: string; harness: string }; variants: ContentVariant[]; revision: number }) {
+  const others = variants.filter(variant => variant.hash !== base.hash);
+  const [otherHash, setOtherHash] = useState(others[0]?.hash ?? '');
+  const other = others.find(variant => variant.hash === otherHash) ?? others[0];
+  const otherHarness = other?.locations[0]?.harness;
+  const diff = useResource(useCallback(async () => {
+    if (!other || !otherHarness) return '';
+    const [left, right] = await Promise.all([loadVariant(item, base.hash, base.harness), loadVariant(item, other.hash, otherHarness)]);
+    const paths = [...new Set([...left.keys(), ...right.keys()])].sort();
+    return paths.map(path => unifiedDiff(path, left.get(path) ?? null, right.get(path) ?? null)).filter(Boolean).join('\n');
+  }, [item, base.hash, base.harness, other, otherHarness]), revision);
+  const baseLabel = variantLabel(variants.find(variant => variant.hash === base.hash)!);
+  return <div className="flex min-w-0 flex-col gap-3">
+    <Field><FieldLabel htmlFor="compare-variant">Compare {baseLabel} with</FieldLabel>
+      <NativeSelect className="w-full max-w-full" id="compare-variant" value={other?.hash ?? ''} onChange={event => setOtherHash(event.target.value)}>
+        {others.map(variant => <NativeSelectOption key={variant.hash} value={variant.hash}>{variantLabel(variant)}: {variant.locations[0]?.path}</NativeSelectOption>)}
+      </NativeSelect></Field>
+    <p className="text-xs text-muted-foreground"><span className="text-destructive-foreground">−</span> lines are only in {baseLabel}; <span className="text-success-foreground">+</span> lines are only in {other ? variantLabel(other) : 'the other variant'}.</p>
+    <ErrorNotice error={diff.error} />
+    {diff.loading && diff.data === undefined ? <Loading rows={2} /> : diff.data !== undefined && <pre tabIndex={0} aria-label="Variant diff" className="diff min-w-0 max-w-full overflow-auto rounded-md border bg-muted/40 p-3 font-mono text-xs leading-relaxed outline-none [tab-size:4] focus-visible:ring-3 focus-visible:ring-ring">
+      {diff.data ? <DiffLines diff={diff.data} /> : <span className="text-muted-foreground">No textual differences.</span>}</pre>}
+  </div>;
+}
+
 function ServerRequired({ needed, children }: { needed: boolean; children: ReactNode }) {
   return needed ? <Tooltip><TooltipTrigger render={<span tabIndex={0} className="inline-flex" />}>{children}</TooltipTrigger>
     <TooltipContent>Needs a connection to the Server</TooltipContent></Tooltip> : children;
@@ -158,6 +200,7 @@ function SkillDetail({ entry, entries, close, initialHarness, revision, changed,
   const query = useCallback(() => ({ item, ...(hash ? { hash, harness } : {}) }), [item, hash, harness]);
   const editors = useResource(loadEditors, revision);
   const mutation = useMutation();
+  const [comparing, setComparing] = useState(false);
   const [renaming, setRenaming] = useState(false), [renameTo, setRenameTo] = useState(entry.name);
   const rename = useMutation();
   const kind = entry.type === 'rule' ? 'rule' : 'skill';
@@ -197,7 +240,7 @@ function SkillDetail({ entry, entries, close, initialHarness, revision, changed,
       <DialogHeader className="min-w-0 flex-1 gap-1.5"><DialogTitle className="text-lg">{entry.name}</DialogTitle>
         <DialogDescription>{choice?.description ?? entry.description ?? `${typeLabels[entry.type]} ${entry.type === 'rule' ? '' : 'Skill'}`}</DialogDescription>
         <div className="mt-1 flex flex-wrap items-center gap-2 text-xs"><Badge variant="secondary">{typeLabels[entry.type]}</Badge>{entry.draft && <ChangeBadge change={entry.draft} />}
-          {entry.variants.length > 1 && <Badge variant="warning">Differs</Badge>}{entry.clashes_with_repo && <Badge variant="warning">Clashes with repo</Badge>}
+          {entry.variants.length > 1 && <DiffersBadge count={entry.variants.length} />}{entry.clashes_with_repo && <Badge variant="warning">Clashes with repo</Badge>}
           {entry.type !== 'unmanaged' && <><span className="text-muted-foreground">Harnesses: {entry.enabled_harnesses.join(', ') || 'None'}</span><Button variant="link" size="default" className="h-auto p-0 text-xs" onClick={() => assignment(item, entry.enabled_harnesses[0] ?? 'all')}>Open in Assignment matrix</Button></>}</div>
       </DialogHeader>
       <div className="flex flex-col items-end gap-1.5"><div className="flex flex-wrap justify-end gap-2">
@@ -234,7 +277,12 @@ function SkillDetail({ entry, entries, close, initialHarness, revision, changed,
         <NativeSelect className="w-full max-w-full" id="skill-variant" value={choice ? `${choice.hash}:${choice.harness}` : ''} onChange={event => setLocation(event.target.value)}>
           {choices.map(value => <NativeSelectOption key={`${value.hash}:${value.harness}`} value={`${value.hash}:${value.harness}`}>{value.harness}: {value.path}</NativeSelectOption>)}
         </NativeSelect></Field>}
-      <SkillBrowser key={`${item}:${hash}:${harness}`} query={query} revision={revision} />
+      {entry.variants.length > 1 && <div className="flex flex-wrap items-center gap-1" role="group" aria-label="View">
+        <Button size="default" variant={comparing ? 'ghost' : 'secondary'} aria-pressed={!comparing} onClick={() => setComparing(false)}>Files</Button>
+        <Button size="default" variant={comparing ? 'secondary' : 'ghost'} aria-pressed={comparing} onClick={() => setComparing(true)}>Compare variants</Button>
+      </div>}
+      {comparing && hash && harness ? <VariantCompare item={item} base={{ hash, harness }} variants={entry.variants} revision={revision} />
+        : <SkillBrowser key={`${item}:${hash}:${harness}`} query={query} revision={revision} />}
     </div>
     <Dialog open={renaming} onOpenChange={open => { if (!rename.pending) setRenaming(open); }}><DialogContent showCloseButton={!rename.pending}><DialogHeader><DialogTitle>Rename {entry.name}</DialogTitle><DialogDescription>Rename this item in Draft.</DialogDescription></DialogHeader>
       <form className="flex flex-col gap-4" onSubmit={event => { event.preventDefault(); if (!renameError && !rename.pending) void rename.run(() => api.renameItem({ kind, name: entry.name, to: renameTo }), result => { toast({ title: `Renamed to ${renameTo}` }); if (result.assignment_error) toast({ title: `Renamed, but Assignments weren't copied: ${result.assignment_error}`, tone: 'destructive' }); setRenaming(false); converted({ ...entry, name: renameTo, item: result.item, draft: 'added', in_baseline: false, enabled_harnesses: result.assignment_error ? [] : entry.enabled_harnesses }); changed(); }); }}>
