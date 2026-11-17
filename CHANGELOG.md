@@ -5,7 +5,7 @@ All notable changes to 0xSk1ll are listed here. The format follows
 [Semantic Versioning](https://semver.org/). Before 1.0, a minor version may
 break compatibility.
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-11-17
 
 The first release, for private testing. Linux only for the desktop app, the
 daemon and fleets; the CLI also builds elsewhere in standalone mode.
