@@ -49,14 +49,21 @@ python3 crates/sk1ll-gui/tests/test_dev_fleet.py
 
 The automated tests don't drive the desktop app. Test interactive GUI flows by hand against the dev fleet.
 
-CI (`.github/workflows/ci.yml`) runs the same checks on Linux, plus `scripts/check-version.sh`.
+CI (`.github/workflows/ci.yml`) runs the same checks on Linux, plus `scripts/check-version.sh` and `gh actions-lock --verify`.
+
+## Workflow actions
+
+Workflows name actions by version tag, and `.github/workflows/actions.lock` pins each one, transitive ones included, to the commit that runs. After changing a workflow's `uses:`, regenerate the lockfile with the [`gh actions-lock`](https://github.com/github/gh-actions-lock) extension (`gh extension install github/gh-actions-lock`, then `gh actions-lock`) and commit both. Dependabot's action updates relock it themselves. `Dockerfile.server` pins its base images by digest.
 
 ## Release
 
 1. Set the version in `Cargo.toml`, `crates/sk1ll-gui/src-tauri/tauri.conf.json`, `crates/sk1ll-gui/ui/package.json` and the `SK1LL_SERVER_VERSION` default in `deploy/docker-compose.server.yml`. Then run `cargo build` so `Cargo.lock` follows.
 2. Date the version's section in `CHANGELOG.md`. Bump `PROTOCOL_VERSION` in `sk1ll-proto` or `API_VERSION` in `sk1ll-daemon`'s client if the server protocol or the local API changed incompatibly.
 3. Run `scripts/check-version.sh vX.Y.Z` and the checks above, then tag and push: `git tag vX.Y.Z && git push origin vX.Y.Z`.
-4. `.github/workflows/release.yml` builds the x86_64 and aarch64 archives, the `.deb` and the server image, and opens a draft release with `SHA256SUMS` and the changelog section. Review it and publish it.
+4. `.github/workflows/release.yml` builds the x86_64 and aarch64 archives and the `.deb`, and opens a draft release with `SHA256SUMS` and the changelog section. A tag that isn't `vX.Y.Z` opens a pre-release. Review it and publish it.
+5. Publishing it runs `.github/workflows/server-image.yml`, which pushes the server image for the tag, and `:latest` unless it's a pre-release.
+
+Once the repository is public, both workflows attest the build provenance of what they ship: `gh attestation verify <file> --repo 0xV1p3r/0xSk1ll`.
 
 Builds read the commit for `--version` from git, or from `SK1LL_COMMIT` where there is no `.git` (the server image takes it as a build argument). The toolchain is pinned in `rust-toolchain.toml`.
 

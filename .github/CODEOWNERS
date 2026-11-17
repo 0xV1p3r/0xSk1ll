@@ -1,0 +1,5 @@
+# What runs in CI and the release, and with which permissions.
+/.github/ @0xV1p3r
+/scripts/ @0xV1p3r
+/Dockerfile.server @0xV1p3r
+/rust-toolchain.toml @0xV1p3r

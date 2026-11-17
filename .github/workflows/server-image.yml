@@ -1,0 +1,68 @@
+name: Server image
+
+# Publishing a release (release.yml opens it as a draft) pushes the server
+# image for its tag, so nothing reaches GHCR before the release is reviewed.
+# Pre-releases don't move :latest.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: server-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  server-image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write # push the image to GHCR
+      id-token: write # sign the provenance attestation
+      attestations: write # store it
+      artifact-metadata: write # record the image the attestation is for
+    steps:
+      - uses: actions/checkout@v5.1.0
+        with:
+          persist-credentials: false
+      - name: Versions agree with the tag
+        run: scripts/check-version.sh "$GITHUB_REF_NAME"
+      - uses: docker/setup-buildx-action@v3.12.0
+      - uses: docker/login-action@v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tags
+        id: tags
+        env:
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/sk1ll-server
+          tags="$image:${GITHUB_REF_NAME#v}"
+          [[ "$PRERELEASE" == true ]] || tags="$tags,$image:latest"
+          {
+            echo "image=$image"
+            echo "tags=$tags"
+            echo "commit=${GITHUB_SHA::10}"
+          } >> "$GITHUB_OUTPUT"
+      # No build cache, for the reason in release.yml.
+      - uses: docker/build-push-action@v6.19.2
+        id: build
+        with:
+          context: .
+          file: Dockerfile.server
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: SK1LL_COMMIT=${{ steps.tags.outputs.commit }}
+      # Checked with `gh attestation verify oci://<image>:<tag> --repo 0xV1p3r/0xSk1ll`.
+      - uses: actions/attest@v4.2.2
+        if: ${{ !github.event.repository.private }}
+        with:
+          subject-name: ${{ steps.tags.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
