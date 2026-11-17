@@ -56,6 +56,10 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo build --workspace --locked
       - run: cargo test --workspace --locked
+      # dev-fleet.sh builds only server + daemon, which unifies features
+      # differently from --workspace; prebuild so the test's startup deadline
+      # does not absorb a cold compile.
+      - run: cargo build -p sk1ll-server -p sk1ll-daemon --locked
       - name: Dev fleet
         run: python3 crates/sk1ll-gui/tests/test_dev_fleet.py
 
