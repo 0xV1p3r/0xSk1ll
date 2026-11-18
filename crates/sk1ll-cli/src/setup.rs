@@ -44,7 +44,7 @@ pub(crate) fn run(cli: &Cli) -> Result<()> {
     println!("How will this machine use 0xSk1ll?");
     println!("  1) Only this machine: a local skills repo; you can join a fleet later");
     println!("  2) Join a fleet: you have a join code from another machine");
-    println!("  3) Start a new fleet: you have the server's admin token");
+    println!("  3) Join as the first machine: you have the deployed server's admin token");
     let path = loop {
         match input.line("Choose [1]: ")?.as_str() {
             "" | "1" => break 1,
@@ -88,12 +88,43 @@ pub(crate) fn run(cli: &Cli) -> Result<()> {
 
     if daemon.is_none() {
         println!();
-        start_daemon(&mut input, cli)?;
+        if !start_daemon(&mut input, cli)? {
+            let overrides = path_overrides(cli, &repo);
+            println!("Preview and apply changes to your harnesses manually:");
+            println!("  sk1ll{overrides} sync --dry-run");
+            println!("  sk1ll{overrides} sync");
+        }
     }
     println!();
     println!("Next, let agents add skills for you:");
     println!("  sk1ll add https://github.com/0xV1p3r/0xSk1ll/tree/main/skills/sk1ll");
     Ok(())
+}
+
+/// The path flags this run was given, so the printed commands act on the same repo and
+/// harnesses from any directory.
+fn path_overrides(cli: &Cli, repo: &Path) -> String {
+    let mut flags = String::new();
+    let mut push = |flag: &str, path: &Path| flags.push_str(&format!(" {flag} {}", shell_quote(path)));
+    if cli.repo.is_some() {
+        push("--repo", repo);
+    }
+    if let Some(path) = &cli.machine_config {
+        push("--machine-config", path);
+    }
+    if let Some(path) = &cli.assignment {
+        push("--assignment", path);
+    }
+    flags
+}
+
+fn shell_quote(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if !text.is_empty() && text.chars().all(|c| c.is_ascii_alphanumeric() || "/._-+=:@%,".contains(c)) {
+        text.into_owned()
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
 }
 
 fn choose_harnesses(
@@ -138,6 +169,9 @@ fn join(
     repo: &Path,
     rt: &tokio::runtime::Runtime,
 ) -> Result<(String, bool, bool)> {
+    if create {
+        println!("Deploy the server first. See the deployment section in docs/fleet.md.");
+    }
     let server_url = loop {
         let url = input.line("Server URL: ")?;
         if url.starts_with("http://") || url.starts_with("https://") {
@@ -227,11 +261,11 @@ fn everything_on(harnesses: &[String], skills: &[String], rules: &[String]) -> V
         .collect()
 }
 
-fn start_daemon(input: &mut Input, cli: &Cli) -> Result<()> {
+fn start_daemon(input: &mut Input, cli: &Cli) -> Result<bool> {
     let custom = cli.daemon_socket.is_some() || std::env::var_os("SK1LL_DAEMON_SOCKET").is_some_and(|v| !v.is_empty());
     if custom {
         println!("This uses a custom daemon socket; start that daemon with `sk1ll daemon`.");
-        return Ok(());
+        return Ok(false);
     }
     let question = if !service::systemd() {
         "Start the daemon in the background now (until you log out)?"
@@ -242,7 +276,7 @@ fn start_daemon(input: &mut Input, cli: &Cli) -> Result<()> {
     };
     if !input.yes(question, true)? {
         println!("The daemon keeps your harnesses in step; start it with `sk1ll daemon`.");
-        return Ok(());
+        return Ok(false);
     }
     let binary: PathBuf = std::env::current_exe().context("locating this sk1ll executable")?;
     match service::start(&binary)? {
@@ -252,7 +286,7 @@ fn start_daemon(input: &mut Input, cli: &Cli) -> Result<()> {
             println!("started the daemon in the background (log: {log})");
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Answers come from standard input, so setup can also be scripted.
@@ -323,5 +357,12 @@ mod tests {
             ]
         );
         assert!(changes.iter().all(|c| c.harness == "claude" && c.enabled == Some(true)));
+    }
+
+    #[test]
+    fn shell_quote_leaves_plain_paths_and_quotes_the_rest() {
+        assert_eq!(shell_quote(Path::new("/home/me/skills")), "/home/me/skills");
+        assert_eq!(shell_quote(Path::new("/home/me/my skills")), "'/home/me/my skills'");
+        assert_eq!(shell_quote(Path::new("/tmp/it's")), "'/tmp/it'\\''s'");
     }
 }

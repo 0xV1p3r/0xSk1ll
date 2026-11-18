@@ -2,7 +2,7 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use sk1ll_core::{
     Action, ActionKind, Assignment, Change, EngineLock, HarnessOrigin, ImportState, InstructionsFormat, Item, ItemRef,
     LinkMode, MachineConfig, Origin, PlanOptions, PullOutcome, Repo, default_commit_message, machine_author, sync,
@@ -153,7 +153,7 @@ enum Cmd {
     Sync {
         #[arg(long)]
         dry_run: bool,
-        /// Overwrite hand edits inside managed instruction blocks
+        /// Overwrite or remove hand-edited managed instruction blocks, skill copies, and rule files
         #[arg(long)]
         force: bool,
     },
@@ -218,7 +218,7 @@ enum Cmd {
     Join {
         /// The server's base URL, e.g. https://server.example
         server_url: String,
-        /// Single-use join code from another machine or `POST /api/join-codes`
+        /// Single-use join code from `sk1ll fleet invite` on a joined machine
         #[arg(required_unless_present = "admin_token")]
         code: Option<String>,
         /// The server's admin token: creates a join code for the first machine of a new fleet (a given code wins)
@@ -233,8 +233,47 @@ enum Cmd {
     },
     /// Run the daemon in the foreground (what systemd or launchd runs)
     Daemon,
-    /// Show every machine in the fleet (through the daemon)
-    Fleet,
+    /// Show every machine in the fleet or administer it through the daemon
+    Fleet {
+        #[command(subcommand)]
+        command: Option<FleetCmd>,
+    },
+    /// Generate shell completions
+    Completions { shell: clap_complete::Shell },
+}
+
+#[derive(Subcommand)]
+enum FleetCmd {
+    /// Create a single-use join code
+    Invite,
+    /// Remove a machine from the fleet
+    Remove {
+        /// Machine id (put `--` before an id that starts with `-`)
+        machine: String,
+        /// Remove without asking for confirmation
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Show the Assignment log, newest first
+    Log {
+        #[arg(long)]
+        machine: Option<String>,
+        #[arg(long)]
+        harness: Option<String>,
+        #[arg(long)]
+        author: Option<String>,
+        /// Match part of the item key, such as skill:pdf (case-insensitive)
+        #[arg(long)]
+        item: Option<String>,
+        /// Show entries below this entry id
+        #[arg(long)]
+        before: Option<i64>,
+        /// Maximum entries to show (server default 100, maximum 1000)
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Undo an Assignment log entry
+    Undo { entry_id: i64 },
 }
 
 #[derive(Subcommand)]
@@ -292,7 +331,8 @@ impl Cmd {
             | Self::Join { .. }
             | Self::Setup
             | Self::Daemon
-            | Self::Fleet => false,
+            | Self::Fleet { .. }
+            | Self::Completions { .. } => false,
         }
     }
 }
@@ -321,6 +361,10 @@ impl Switch {
 
 fn main() -> Result<()> {
     let mut cli = Cli::parse();
+    if let Cmd::Completions { shell } = cli.cmd {
+        clap_complete::generate(shell, &mut Cli::command(), "sk1ll", &mut std::io::stdout());
+        return Ok(());
+    }
     // A relative local source means the user's cwd, which the daemon doesn't
     // share. Links and invalid sources are left for `parse_link` to handle.
     if let Cmd::Add { source, .. } = &mut cli.cmd
@@ -338,7 +382,7 @@ fn main() -> Result<()> {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    if matches!(cli.cmd, Cmd::Join { .. } | Cmd::Setup | Cmd::Daemon | Cmd::Fleet) {
+    if matches!(cli.cmd, Cmd::Join { .. } | Cmd::Setup | Cmd::Daemon | Cmd::Fleet { .. }) {
         return fleet::command(cli);
     }
     #[cfg(unix)]
@@ -426,7 +470,12 @@ fn run(cli: Cli) -> Result<()> {
             print_plan(&actions.into_iter().filter(|a| a.kind == ActionKind::Conflict).collect::<Vec<_>>());
             print_recovered(sync::displaced::changed()?);
         }
-        Cmd::Init { .. } | Cmd::Join { .. } | Cmd::Setup | Cmd::Daemon | Cmd::Fleet => unreachable!(),
+        Cmd::Init { .. }
+        | Cmd::Join { .. }
+        | Cmd::Setup
+        | Cmd::Daemon
+        | Cmd::Fleet { .. }
+        | Cmd::Completions { .. } => unreachable!(),
         Cmd::List { unmanaged: true } => {
             for skill in sync::unmanaged::discover(&repo, &machine()?.harnesses())? {
                 let harnesses: std::collections::BTreeSet<_> =

@@ -36,7 +36,7 @@ Durations take `s`, `m`, `h` or `d`. A bare number is seconds.
 
 ## Join a machine
 
-The first machine joins with the admin token, which creates a single-use join code and spends it right away. The token isn't stored. `sk1ll setup` and the GUI's setup wizard do the same under *Start a new fleet*.
+The first machine joins with the admin token, which creates a single-use join code and spends it right away. The token isn't stored. In `sk1ll setup`, choose *Join as the first machine*. In the GUI's setup wizard, choose *Start a new fleet*.
 
 ```sh
 SK1LL_SERVER_ADMIN_TOKEN=... sk1ll join http://server:7878   # or --admin-token <token>
@@ -49,7 +49,7 @@ curl -X POST -H "Authorization: Bearer $SK1LL_SERVER_ADMIN_TOKEN" \
   http://server:7878/api/join-codes
 ```
 
-Once one machine has joined, any joined machine can create more codes, from the GUI's Settings screen or with its own token.
+On a joined machine with a running daemon, run `sk1ll fleet invite` to create a single-use join code. It prints the code and a ready-to-paste join command for the new machine. You can also create a code from the GUI's Settings screen.
 
 On the new machine:
 
@@ -59,6 +59,12 @@ sk1ll join http://server:7878 <code> --copy-from laptop   # start from laptop's 
 ```
 
 A new machine starts with everything off unless you pass `--copy-from`. `--id` sets the machine id, which otherwise comes from `machine.toml` or the hostname. The machine token is stored only in `~/.config/sk1ll/daemon.json` with mode 0600, and the server can revoke it per machine.
+
+## Remove a machine
+
+Run `sk1ll fleet` to find the machine id. Run `sk1ll fleet remove <machine>` and type that id at the confirmation prompt. In a script, pass `--yes` to confirm removal. For an id that starts with `-`, put `--` before it: `sk1ll fleet remove --yes -- -lab`. The daemon must be running. Removal revokes the machine's credential.
+
+Use `sk1ll fleet log` to see recent Assignment changes, newest first. Filter with `--machine`, `--harness`, `--author`, or `--item`. Use `--limit` to set the page size and `--before <entry-id>` to page back. To undo a change, run `sk1ll fleet undo <entry-id>`.
 
 ## Run the daemon
 

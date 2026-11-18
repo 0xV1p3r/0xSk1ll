@@ -1,6 +1,7 @@
 //! Everything that needs the daemon (Unix only): `join`, `daemon`, `fleet`,
 //! and routing mutating commands through a running daemon.
 
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -9,10 +10,10 @@ use sk1ll_daemon::client::{
     RestoreRequest, StatusView, SyncRequest, UpdateImportsRequest,
 };
 use sk1ll_daemon::{Config, DaemonState};
-use sk1ll_proto::{AssignmentChanges, ToggleChange, ToggleKind};
+use sk1ll_proto::{AssignmentChanges, LogQuery, ToggleChange, ToggleKind};
 
 use crate::{
-    Cli, Cmd, Kind, assign_target, bundled_fallback, check_exists, confirm, fetch_hint, names, print_bundled,
+    Cli, Cmd, FleetCmd, Kind, assign_target, bundled_fallback, check_exists, confirm, fetch_hint, names, print_bundled,
     print_update, short,
 };
 
@@ -160,7 +161,7 @@ pub(crate) fn client(cli: &Cli) -> Result<Client> {
 /// `join`, `daemon` and `fleet`.
 pub(crate) fn command(cli: Cli) -> Result<()> {
     match &cli.cmd {
-        Cmd::Fleet => fleet(&cli),
+        Cmd::Fleet { command } => fleet(&cli, command.as_ref()),
         Cmd::Daemon => {
             let cfg = daemon_config(&cli)?;
             sk1ll_daemon::init_logging();
@@ -210,16 +211,101 @@ fn join(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-fn fleet(cli: &Cli) -> Result<()> {
+fn fleet(cli: &Cli, command: Option<&FleetCmd>) -> Result<()> {
     let client = client(cli)?;
     let rt = runtime()?;
-    let fleet = rt.block_on(client.fleet()).map_err(|e| {
-        if e.is_not_running() {
-            anyhow::anyhow!("the sk1ll daemon isn't running (start it with `sk1ll daemon`)")
-        } else {
-            e.into()
+    match command {
+        Some(FleetCmd::Invite) => {
+            let status = rt.block_on(client.status()).map_err(fleet_error)?;
+            let url = status.server_url.context("this machine hasn't joined a fleet")?;
+            let code = rt.block_on(client.join_code()).map_err(fleet_error)?.code;
+            println!("{code}");
+            println!("sk1ll join {} {}", shell_arg(&url), shell_arg(&code));
         }
-    })?;
+        Some(FleetCmd::Remove { machine, yes }) => {
+            if !yes {
+                let stdin = std::io::stdin();
+                if !stdin.is_terminal() {
+                    bail!("removing a machine requires terminal confirmation or `--yes`");
+                }
+                eprint!("Type the machine id `{machine}` to confirm removal: ");
+                std::io::stderr().flush()?;
+                let mut answer = String::new();
+                stdin.read_line(&mut answer)?;
+                if answer.trim_end_matches(['\r', '\n']) != machine {
+                    bail!("machine id did not match; removal aborted");
+                }
+            }
+            rt.block_on(client.remove_machine(machine)).map_err(fleet_error)?;
+            println!("removed {machine} from the fleet");
+        }
+        Some(FleetCmd::Log { machine, harness, author, item, before, limit }) => {
+            let query = LogQuery {
+                machine: machine.clone(),
+                harness: harness.clone(),
+                author: author.clone(),
+                item: item.clone(),
+                before: *before,
+                limit: *limit,
+            };
+            let entries = rt.block_on(client.log(&query)).map_err(fleet_error)?;
+            for entry in entries {
+                let kind = match entry.kind {
+                    ToggleKind::Skill => "skill",
+                    ToggleKind::Rule => "rule",
+                    ToggleKind::NewSkillsDefault => "new_skills_default",
+                    ToggleKind::NewRulesDefault => "new_rules_default",
+                };
+                let item = entry.name.map_or_else(|| kind.to_string(), |name| format!("{kind}:{name}"));
+                let state = |value| match value {
+                    Some(true) => "on",
+                    Some(false) => "off",
+                    None => "unset",
+                };
+                println!(
+                    "{}  {}  {} / {}  {}  {} -> {}  by {} ({:?})",
+                    entry.id,
+                    entry.at,
+                    entry.machine,
+                    entry.harness,
+                    item,
+                    state(entry.before),
+                    state(entry.after),
+                    entry.author,
+                    entry.cause
+                );
+            }
+        }
+        Some(FleetCmd::Undo { entry_id }) => {
+            let update = rt.block_on(client.undo(*entry_id)).map_err(fleet_error)?;
+            if update.entries.is_empty() {
+                println!("Assignment log entry {entry_id}'s previous value is already set; nothing changed");
+            } else {
+                println!("undid Assignment log entry {entry_id} at revision {}", update.revision);
+            }
+        }
+        None => print_fleet(rt.block_on(client.fleet()).map_err(fleet_error)?),
+    }
+    Ok(())
+}
+
+fn fleet_error(e: sk1ll_daemon::client::ClientError) -> anyhow::Error {
+    if e.is_not_running() {
+        anyhow::anyhow!("the sk1ll daemon isn't running (start it with `sk1ll daemon`)")
+    } else {
+        e.into()
+    }
+}
+
+fn shell_arg(arg: &str) -> String {
+    if !arg.is_empty() && arg.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~:/%+=@".contains(&b)) {
+        arg.into()
+    } else {
+        format!("'{}'", arg.replace('\'', "'\\''"))
+    }
+}
+
+fn print_fleet(fleet: sk1ll_proto::FleetView) {
     println!("baseline {}", fleet.baseline.as_deref().map_or("(none yet)", short));
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
     for m in fleet.machines {
@@ -253,7 +339,6 @@ fn fleet(cli: &Cli) -> Result<()> {
         }
         println!("{:<20} {:<9} seen {:<10} {}", m.id, status, seen, notes.join(", "));
     }
-    Ok(())
 }
 
 fn ago(secs: i64) -> String {
