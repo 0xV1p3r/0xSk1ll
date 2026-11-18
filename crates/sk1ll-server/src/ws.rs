@@ -178,8 +178,10 @@ async fn read_loop(
                     }
                     Ok(DaemonMessage::Hello { .. }) => {}
                     Ok(DaemonMessage::Status(report)) => {
+                        // A later discard must not sweep against an older report,
+                        // so drop the session; reconnecting sends a fresh one first.
                         if let Err(e) = on_status(server, machine, id, token_hash, report, cancel).await {
-                            tracing::error!("{machine}: storing status: {e}");
+                            return tracing::error!("{machine}: storing status: {e}; closing");
                         }
                     }
                     Ok(DaemonMessage::DraftDiscarded { id: discard_id, items }) => {
@@ -194,7 +196,8 @@ async fn read_loop(
                                 }
                             }
                             Ok(false) => {}
-                            Err(e) => tracing::error!("{machine}: discarding draft toggles: {e}"),
+                            // The daemon only replays unacknowledged discards on reconnect.
+                            Err(e) => return tracing::error!("{machine}: discarding draft toggles: {e}; closing"),
                         }
                     }
                     Err(e) => tracing::warn!("{machine}: bad message: {e}"),

@@ -250,9 +250,10 @@ it('lists all Imports, checks now and removes into Draft', async () => {
   vi.mocked(api.removeImport).mockResolvedValue(undefined);
   render(<Imports revision={0} changed={changed} reviewDraft={reviewDraft} />);
   await screen.findByRole('table', { name: 'Imports' });
-  expect(screen.getAllByText('Up to date')).toHaveLength(2);
+  expect(screen.getAllByText('Not checked')).toHaveLength(2); expect(screen.queryByText('Up to date')).toBeNull();
   fireEvent.click(screen.getByRole('button', { name: 'Check now' }));
   await screen.findByText(/Update available/); await screen.findByText(/Check failed/);
+  expect(screen.queryByText('Not checked')).toBeNull();
   fireEvent.click(screen.getByRole('button', { name: 'Remove pdf' }));
   fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Remove' }));
   await screen.findByText('pdf removal is in the Draft');

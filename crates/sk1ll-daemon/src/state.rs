@@ -114,7 +114,8 @@ pub fn queue_discards(
     if items.is_empty() {
         return Ok(());
     }
-    crate::outbox::Outbox::load(cfg.outbox_path()).push(items)
+    let state = DaemonState::load(&cfg.state)?.context("not joined to a fleet")?;
+    crate::outbox::Outbox::load(cfg.outbox_path(), &state).push(items)
 }
 
 /// `url` without `user:password@`, for comparing remotes.

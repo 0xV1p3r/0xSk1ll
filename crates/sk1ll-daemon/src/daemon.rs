@@ -178,7 +178,10 @@ impl Daemon {
         if standalone && let Some(snap) = &snapshot {
             state::save_snapshot(&cfg.state.with_file_name("standalone-assignment.json"), snap)?;
         }
-        let outbox = if standalone { Outbox::empty(cfg.outbox_path()) } else { Outbox::load(cfg.outbox_path()) };
+        let outbox = match &state {
+            Mode::Joined(joined) => Outbox::load(cfg.outbox_path(), joined),
+            Mode::Standalone { .. } => Outbox::empty(cfg.outbox_path()),
+        };
         let view = StatusView {
             machine_id: state.machine_id().to_string(),
             server_url: state.joined().ok().map(|s| s.server_url.clone()),
