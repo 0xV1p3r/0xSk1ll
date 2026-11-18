@@ -15,6 +15,13 @@ break compatibility.
   Join code entry points explain Fleet permissions and the dialog shows the
   default expiry.
 - Restart a systemd user Daemon from the desktop app after a local API mismatch.
+- CLI commands to create join codes, remove machines, and view or undo Assignment log entries.
+- Shell completion generation with `sk1ll completions <shell>`.
+
+### Changed
+
+- CLI setup explains how to join as the first machine and shows manual sync commands when the daemon is skipped.
+- `sk1ll sync --force` help lists managed instruction blocks, skill copies, and rule files.
 
 ### Fixed
 

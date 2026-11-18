@@ -52,6 +52,10 @@ fn setup_creates_a_standalone_repo_with_the_chosen_harnesses() {
     assert!(fixture.0.path().join("repo/sk1ll.toml").is_file());
     assert!(stdout.contains("Sync a ("), "{stdout}");
     assert!(stdout.contains("custom daemon socket"), "{stdout}");
+    // The printed commands keep this run's path flags, so they act on the same repo from anywhere.
+    let root = fixture.0.path().display();
+    let flags = format!("--repo {root}/repo --machine-config {root}/machine.toml --assignment {root}/assignment.json");
+    assert!(stdout.contains(&format!("  sk1ll {flags} sync --dry-run\n  sk1ll {flags} sync\n")), "{stdout}");
     let config = std::fs::read_to_string(fixture.0.path().join("machine.toml")).unwrap();
     assert!(config.starts_with("# my machine\n"), "{config}");
     let machine = sk1ll_core::MachineConfig::load(&fixture.0.path().join("machine.toml")).unwrap();
@@ -82,4 +86,13 @@ fn setup_requires_a_join_code() {
     assert!(stdout.contains("must start with http:// or https://"), "{stdout}");
     assert!(String::from_utf8_lossy(&out.stderr).contains("join code is required"));
     assert!(!fixture.0.path().join("repo").exists());
+}
+
+#[test]
+fn setup_explains_first_machine_deployment() {
+    let out = Fixture::new().setup("3\n\n\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Join as the first machine"), "{stdout}");
+    assert!(stdout.contains("deployment section in docs/fleet.md"), "{stdout}");
+    assert!(!out.status.success());
 }

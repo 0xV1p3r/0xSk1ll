@@ -103,6 +103,10 @@ Commands take a bare skill or rule name, or `skill:<name>`, `rule:<name>`, `mani
 | `join <server-url> <code>` | Join a fleet and clone its repo; `--admin-token` instead of a code for the first machine |
 | `daemon` | Run the daemon in the foreground |
 | `fleet` | Show every machine in the fleet |
+| `fleet invite` | Create a single-use join code and print the join command |
+| `fleet remove <machine>` | Remove a machine after confirming its id. Use `--yes` in scripts |
+| `fleet log`, `fleet undo <entry-id>` | Filter the Assignment log or undo an entry |
+| `completions <shell>` | Generate shell completions |
 
 `sk1ll <command> --help` lists every flag.
 
