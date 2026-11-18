@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use sk1ll_core::{HarnessChoice, MachineConfig, Repo};
 use sk1ll_daemon::client::{Client, Connection, DaemonMode};
-use sk1ll_daemon::service::{self, Started};
+use sk1ll_daemon::service::{self, Manager, Started};
 use sk1ll_daemon::{DaemonState, JoinOptions};
 use sk1ll_proto::{AssignmentChanges, ToggleChange, ToggleKind};
 
@@ -267,12 +267,18 @@ fn start_daemon(input: &mut Input, cli: &Cli) -> Result<bool> {
         println!("This uses a custom daemon socket; start that daemon with `sk1ll daemon`.");
         return Ok(false);
     }
-    let question = if !service::systemd() {
-        "Start the daemon in the background now (until you log out)?"
-    } else if service::unit_path().is_some_and(|p| p.is_file()) {
-        "Enable and start the sk1ll-daemon user service?"
-    } else {
-        "Install and start the sk1ll-daemon user service (it starts again when you log in)?"
+    let manager = Manager::running();
+    let installed = manager.and_then(Manager::path).is_some_and(|p| p.is_file());
+    let question = match (manager, installed) {
+        (None, _) => "Start the daemon in the background now (until you log out)?",
+        (Some(Manager::Systemd), true) => "Enable and start the sk1ll-daemon user service?",
+        (Some(Manager::Systemd), false) => {
+            "Install and start the sk1ll-daemon user service (it starts again when you log in)?"
+        }
+        (Some(Manager::Launchd), true) => "Load and start the app.v1p3r.sk1ll.daemon launch agent?",
+        (Some(Manager::Launchd), false) => {
+            "Install and start the app.v1p3r.sk1ll.daemon launch agent (it starts again when you log in)?"
+        }
     };
     if !input.yes(question, true)? {
         println!("The daemon keeps your harnesses in step; start it with `sk1ll daemon`.");
@@ -281,6 +287,10 @@ fn start_daemon(input: &mut Input, cli: &Cli) -> Result<bool> {
     let binary: PathBuf = std::env::current_exe().context("locating this sk1ll executable")?;
     match service::start(&binary)? {
         Started::Systemd => println!("started the sk1ll-daemon user service (logs: journalctl --user -u sk1ll-daemon)"),
+        Started::Launchd => {
+            let log = service::agent_log_path().map(|p| p.display().to_string()).unwrap_or_default();
+            println!("started the {} launch agent (log: {log})", service::LABEL);
+        }
         Started::Process => {
             let log = service::log_path().map(|p| p.display().to_string()).unwrap_or_default();
             println!("started the daemon in the background (log: {log})");

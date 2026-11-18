@@ -128,6 +128,12 @@ async fn init(State(d): St) -> Result<StatusCode> {
 /// means another daemon is running.
 pub(crate) async fn bind(path: &Path) -> anyhow::Result<PeerChecked> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    if !fits_sun_path(path) {
+        bail!(
+            "the socket path {} is too long for a Unix socket here; set SK1LL_DAEMON_SOCKET to a shorter one",
+            path.display()
+        );
+    }
     let dir = path.parent().context("socket path has no parent")?;
     if !dir.exists() {
         std::fs::DirBuilder::new()
@@ -149,6 +155,13 @@ pub(crate) async fn bind(path: &Path) -> anyhow::Result<PeerChecked> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("chmod {}", path.display()))?;
     Ok(PeerChecked(listener))
+}
+
+/// `sockaddr_un.sun_path` holds the path and its NUL: 108 bytes on Linux, 104 on macOS.
+fn fits_sun_path(path: &Path) -> bool {
+    // SAFETY: sockaddr_un is plain data, for which all zeroes is valid.
+    let addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    path.as_os_str().len() < addr.sun_path.len()
 }
 
 /// `dir` is a real directory (not a symlink) owned by us with mode 0700.
@@ -509,6 +522,16 @@ mod tests {
         assert_eq!(mode(&sock), 0o600);
         // A second daemon finds it live.
         assert!(bind(&sock).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_socket_path_too_long_for_sun_path_is_refused_before_creating_its_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir.path().join("d".repeat(120));
+        let err = bind(&deep.join("daemon.sock")).await.err().expect("a 120-byte directory name is too long");
+        assert!(err.to_string().contains("SK1LL_DAEMON_SOCKET"), "{err}");
+        assert!(!deep.exists());
+        assert!(fits_sun_path(Path::new("/Users/someone/Library/Application Support/sk1ll/run/daemon.sock")));
     }
 
     #[tokio::test]

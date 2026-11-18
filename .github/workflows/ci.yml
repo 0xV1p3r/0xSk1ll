@@ -63,6 +63,38 @@ jobs:
       - name: Dev fleet
         run: python3 crates/sk1ll-gui/tests/test_dev_fleet.py
 
+  macos-arm64:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      TMPDIR: /tmp
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2.9.3
+      - uses: pnpm/action-setup@v4.3.0
+        with:
+          package_json_file: crates/sk1ll-gui/ui/package.json
+      - uses: actions/setup-node@v5.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: crates/sk1ll-gui/ui/pnpm-lock.yaml
+
+      - name: Verify arm64 runner
+        run: test "$(uname -m)" = arm64
+      - name: Build UI
+        working-directory: crates/sk1ll-gui/ui
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+      - run: cargo build --workspace --locked
+      - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
   actions-lock:
     # Fails when .github/workflows/actions.lock is out of sync with the
     # workflows or a locked commit no longer verifies upstream.

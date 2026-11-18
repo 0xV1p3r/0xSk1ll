@@ -9,6 +9,9 @@ break compatibility.
 
 ### Added
 
+- macOS arm64 builds in CI and release archives with the unsigned desktop app,
+  CLI and server. Setup and the desktop app can start the daemon through launchd.
+
 - Create a Rule from the desktop getting-started checklist and reopen the
   checklist from the command palette.
 - Copy diagnostics and ready-to-paste join commands from the desktop app.
@@ -24,6 +27,10 @@ break compatibility.
 - `sk1ll sync --force` help lists managed instruction blocks, skill copies, and rule files.
 
 ### Fixed
+
+- Starting the macOS daemon recreates its log directory and repairs generated
+  LaunchAgents after the app moves. New agents include the Git directory found
+  on PATH, and the desktop app shows start commands for the detected manager.
 
 - Machine entries in the desktop command palette open the selected Machine.
 - Desktop messages identify origin for standalone pushes, explain when Fleet

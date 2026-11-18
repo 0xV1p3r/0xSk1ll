@@ -84,11 +84,26 @@ loginctl enable-linger "$USER"     # optional: keep it running while logged out
 journalctl --user -u sk1ll-daemon  # logs; set RUST_LOG=debug for more
 ```
 
-The unit runs `~/.local/bin/sk1ll daemon`, where the release archive installs it. Edit `ExecStart` for `~/.cargo/bin/sk1ll` after `cargo install`, or `/usr/bin/sk1ll` from the `.deb`. `sk1ll setup` and the app write the unit with the path of the `sk1ll` they found, so they need no edit. On other systems, run `sk1ll daemon` under your service manager.
+The unit runs `~/.local/bin/sk1ll daemon`, where the release archive installs it. Edit `ExecStart` for `~/.cargo/bin/sk1ll` after `cargo install`, or `/usr/bin/sk1ll` from the `.deb`. `sk1ll setup` and the app write the unit with the path of the `sk1ll` they found, so they need no edit.
+
+On macOS, run `sk1ll setup` or start the daemon in the app while logged in to the desktop. Either creates `~/Library/LaunchAgents/app.v1p3r.sk1ll.daemon.plist` if needed, loads it into your GUI login session and starts it. If you move the app, starting the daemon again updates the binary path in a generated plist and reloads the agent. If you customized the plist, follow the startup error to update it by hand. The shipped agent starts at login, keeps the daemon running and logs to `~/Library/Logs/sk1ll/daemon.log`. If you install the plist by hand, create the log directory and set `ProgramArguments` to the absolute path of your `sk1ll` binary followed by `daemon`.
+
+```sh
+mkdir -p ~/Library/Logs/sk1ll
+launchctl enable "gui/$(id -u)/app.v1p3r.sk1ll.daemon" &&
+  (launchctl print "gui/$(id -u)/app.v1p3r.sk1ll.daemon" >/dev/null 2>&1 ||
+    launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/app.v1p3r.sk1ll.daemon.plist) &&
+  launchctl kickstart "gui/$(id -u)/app.v1p3r.sk1ll.daemon"
+tail -n 50 ~/Library/Logs/sk1ll/daemon.log
+```
+
+The LaunchAgent has its own `PATH`. When setup or the app creates the plist, it looks up `git` on its current `PATH` and prepends Git's directory if the agent's default list lacks it. To change the agent's search path, edit `EnvironmentVariables` → `PATH` in the plist. Run `launchctl bootout "gui/$(id -u)/app.v1p3r.sk1ll.daemon"` if the agent is loaded, then run the start commands above to load the change.
 
 While it runs, the daemon holds the repo's engine lock. CLI commands that change the repo go through the daemon, and the daemon refuses to start while another sk1ll process holds the lock. Running `sk1ll join` again after the machine was removed also goes through the daemon, which then restarts itself with the new credentials.
 
-The local API socket is `$XDG_RUNTIME_DIR/sk1ll/daemon.sock`. Its directory must belong to the user and have mode 0700, or the daemon won't start.
+On Linux, the local API socket is `$XDG_RUNTIME_DIR/sk1ll/daemon.sock`, with a fallback to `~/.config/sk1ll/run/daemon.sock` when there is no runtime directory. On macOS it is `~/Library/Application Support/sk1ll/run/daemon.sock`. The socket has mode 0600 and its directory must belong to the user and have mode 0700. On macOS the socket path can be at most 103 bytes. If it is too long, set `SK1LL_DAEMON_SOCKET` to a shorter path in a private directory for the daemon and its clients.
+
+The table lists Linux paths. On macOS, config and data use `~/Library/Application Support/sk1ll/` and cache uses `~/Library/Caches/sk1ll/`. This also applies to the repo, machine token and assignment paths above.
 
 | Variable | Default | Meaning |
 |---|---|---|
