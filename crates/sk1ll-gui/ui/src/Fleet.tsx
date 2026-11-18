@@ -56,12 +56,13 @@ function MachineDetails({ machine }: { machine: MachineRow }) {
     ...(report.behind ? [['Behind', 'Yes'] as [string, ReactNode]] : []),
   ]} />;
 }
-export function Fleet({ revision, machineId, localReport, unmanaged = [], discovery, navigate, changed, live }: {
-  revision: number; machineId: string; localReport?: MachineReport; unmanaged?: { name: string }[]; discovery?: { loading: boolean; error: string }; navigate: (screen: 'Draft' | 'Conflicts' | 'Library' | 'Assignment matrix') => void; changed: () => void; live: boolean;
+export function Fleet({ revision, machineId, initialMachine, serverUrl = null, localReport, unmanaged = [], discovery, navigate, changed, live }: {
+  revision: number; machineId: string; initialMachine?: string; serverUrl?: string | null; localReport?: MachineReport; unmanaged?: { name: string }[]; discovery?: { loading: boolean; error: string }; navigate: (screen: 'Draft' | 'Conflicts' | 'Library' | 'Assignment matrix') => void; changed: () => void; live: boolean;
 }) {
   const { data, error, loading, updatedAt } = useResource(api.fleet, revision);
   const [filter, setFilter] = useState<'attention' | 'connected' | null>(null);
-  const [open, setOpen] = useState<string[]>([]);
+  const [selectedMachine, setSelectedMachine] = useState(initialMachine);
+  const [open, setOpen] = useState<string[]>(initialMachine ? [initialMachine] : []);
   const table = useRef<HTMLTableElement>(null);
   const [columns, setColumns] = useState(7);
   const toggle = (id: string) => setOpen(value => value.includes(id) ? value.filter(v => v !== id) : [...value, id]);
@@ -76,7 +77,9 @@ export function Fleet({ revision, machineId, localReport, unmanaged = [], discov
   const queue = Number(conflicts.length > 0) + Number(drafts > 0) + Number(unpushed > 0) + Number(unmanaged.length > 0);
   const push = useMutation(changed);
   const pushNow = () => void push.run(api.push, value => { if (!value.pushed) throw new Error('Push did not reach the Server.'); toast({ title: 'Push complete' }); });
-  const visible = machines.filter(machine => filter === 'attention' ? ['offline', 'blocked', 'conflict'].includes(machine.status) : filter === 'connected' ? machine.connected : true);
+  // A selected Machine that was removed falls back to every Machine.
+  useEffect(() => { if (data && selectedMachine && !data.machines.some(machine => machine.id === selectedMachine)) setSelectedMachine(undefined); }, [data, selectedMachine]);
+  const visible = machines.filter(machine => selectedMachine ? machine.id === selectedMachine : filter === 'attention' ? ['offline', 'blocked', 'conflict'].includes(machine.status) : filter === 'connected' ? machine.connected : true);
   useEffect(() => {
     const node = table.current;
     if (!node) return;
@@ -106,10 +109,11 @@ export function Fleet({ revision, machineId, localReport, unmanaged = [], discov
           </Panel>
           <Panel label="Machines" className="@container/machines min-w-0 gap-0 border py-0 ring-0">
             <PanelToolbar><SectionTitle id="fleet-machines-title">Machines</SectionTitle>
-              <ToggleGroup aria-label="Machine filter" value={[filter ?? 'all']} onValueChange={value => { if (value.length) setFilter(value[0] === 'all' ? null : value[0] as 'attention' | 'connected'); }} className="flex rounded-lg border bg-background p-0.5">
+              <ToggleGroup aria-label="Machine filter" value={selectedMachine ? [] : [filter ?? 'all']} onValueChange={value => { setSelectedMachine(undefined); if (value.length) setFilter(value[0] === 'all' ? null : value[0] as 'attention' | 'connected'); }} className="flex rounded-lg border bg-background p-0.5">
                 {([{ value: 'all', label: 'All', count: machines.length }, { value: 'attention', label: 'Attention', count: attention }, { value: 'connected', label: 'Connected', count: connected }] as const).map(option =>
                   <Toggle key={option.value} value={option.value} aria-label={`Filter: ${option.label}`} className="flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring aria-pressed:bg-muted aria-pressed:text-foreground"><span>{option.label}</span><span className="text-[11px] text-muted-foreground tabular-nums">{option.count}</span></Toggle>)}
-              </ToggleGroup><div className="ml-auto"><JoinCodeButton label="Add Machine" /></div></PanelToolbar>
+              </ToggleGroup></PanelToolbar>
+            <div className="border-b px-3.5 py-2.5"><JoinCodeButton label="Add Machine" serverUrl={serverUrl} /></div>
             <div className="min-w-0 p-0">
       {visible.length > 0 ? <Table ref={table} aria-label="Machines" className="table-fixed">
         <TableHeader><TableRow className="hover:bg-transparent [&_th]:h-8 [&_th]:text-[11px] [&_th]:text-muted-foreground">

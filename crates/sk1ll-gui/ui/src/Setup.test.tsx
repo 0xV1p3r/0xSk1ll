@@ -3,12 +3,12 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { App } from './App';
 import { api } from './api';
-import { showGettingStarted } from './Setup';
-import type { HarnessChoice, StatusView } from './types';
+import { GettingStarted, showGettingStarted } from './Setup';
+import type { ContentEntry, HarnessChoice, StatusView } from './types';
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(async () => () => {}) }));
 vi.mock('./api', () => ({ api: { status: vi.fn(), connectionInfo: vi.fn(), skills: vi.fn(), recovered: vi.fn(), imports: vi.fn(), fleet: vi.fn(), log: vi.fn(), logFacets: vi.fn(), init: vi.fn(),
-  setupHarnesses: vi.fn(), setSetupHarness: vi.fn(), daemonService: vi.fn(), startDaemon: vi.fn(), join: vi.fn(), harnesses: vi.fn(), items: vi.fn(), setAssignment: vi.fn(), joinCode: vi.fn() }, errorMessage: String }));
-vi.mock('./Skills', () => ({ Skills: () => <div>Local library</div> }));
+  setupHarnesses: vi.fn(), setSetupHarness: vi.fn(), daemonService: vi.fn(), restartDaemon: vi.fn(), push: vi.fn(), startDaemon: vi.fn(), join: vi.fn(), harnesses: vi.fn(), items: vi.fn(), setAssignment: vi.fn(), joinCode: vi.fn() }, errorMessage: String }));
+vi.mock('./Skills', () => ({ Skills: ({ handoff }: { handoff: { create?: string } }) => <div data-create={handoff.create}>Local library</div> }));
 vi.mock('./Matrix', () => ({ Matrix: () => <div>Matrix</div> }));
 
 const firstRun: StatusView = { mode: 'standalone', has_origin: false, repo_ready: false, machine_id: 'box', server_url: null, repo: '/home/me/skills', headline: 'in_sync', connection: 'standalone', last_error: null, revoked: false, server_baseline: null, assignment_revision: 0, awaiting_assignment: false, auth_rejected_since: null, pending_discards: 0, report: { baseline: null, drafts: [], unpushed: [], conflicts: [], harnesses: [], blocked: false, clashes: [], behind: false } };
@@ -74,13 +74,13 @@ it('joins a Fleet, waits for the restart and turns everything on', async () => {
 it('starts a new Fleet with the admin token and skips straight to the matrix', async () => {
   vi.mocked(api.join).mockImplementation(async () => { current = joined; return { machine_id: 'first', repo: '/home/me/skills', setup: 'initialized', harnesses: [], revision: 1 }; });
   render(<App />);
-  await continueTo('Start a new Fleet');
+  await continueTo('Join as the first Machine');
   fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
   fireEvent.change(await screen.findByLabelText('Server URL'), { target: { value: 'https://skills.example.com' } });
   fireEvent.change(screen.getByLabelText('Admin token'), { target: { value: 'secret' } });
   fireEvent.change(screen.getByLabelText('Machine id'), { target: { value: 'first' } });
   expect(screen.queryByLabelText('Copy Assignment from Machine')).toBeNull();
-  fireEvent.click(screen.getByRole('button', { name: 'Start Fleet' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Join Fleet' }));
   await waitFor(() => expect(api.join).toHaveBeenCalledWith({ server_url: 'https://skills.example.com', code: '', admin_token: 'secret', machine_id: 'first', copy_from: undefined }));
   fireEvent.click(await screen.findByRole('button', { name: 'Choose in the Assignment matrix' }));
   expect(await screen.findByRole('heading', { name: 'Assignment matrix' })).toBeTruthy();
@@ -103,18 +103,18 @@ it('skips the starting Assignment when it was copied from another Machine', asyn
 it('keeps the wizard and shows the error when joining fails', async () => {
   vi.mocked(api.join).mockRejectedValue('the server rejected the admin token');
   render(<App />);
-  await continueTo('Start a new Fleet');
+  await continueTo('Join as the first Machine');
   fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
   fireEvent.change(await screen.findByLabelText('Server URL'), { target: { value: 'https://skills.example.com' } });
   fireEvent.change(screen.getByLabelText('Admin token'), { target: { value: 'wrong' } });
-  fireEvent.click(screen.getByRole('button', { name: 'Start Fleet' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Join Fleet' }));
   expect(await screen.findByText('the server rejected the admin token')).toBeTruthy();
-  expect(screen.getByRole('button', { name: 'Start Fleet' })).toBeTruthy();
+  expect(screen.getByRole('button', { name: 'Join Fleet' })).toBeTruthy();
 });
 
 it('starts the Daemon from the connection screen', async () => {
   vi.mocked(api.status).mockRejectedValue({ message: 'cannot reach the daemon', status: null, unreachable: true });
-  vi.mocked(api.daemonService).mockResolvedValue({ default_socket: true, binary: '/home/me/.cargo/bin/sk1ll', systemd: true, unit: null });
+  vi.mocked(api.daemonService).mockResolvedValue({ default_socket: true, binary: '/home/me/.cargo/bin/sk1ll', systemd: true, active: false, restartable: false, unit: null });
   vi.mocked(api.startDaemon).mockResolvedValue('systemd');
   render(<App />);
   expect(await screen.findByText(/Installs the sk1ll-daemon user service/)).toBeTruthy();
@@ -125,7 +125,7 @@ it('starts the Daemon from the connection screen', async () => {
 
 it('explains a missing sk1ll command instead of offering to start the Daemon', async () => {
   vi.mocked(api.status).mockRejectedValue({ message: 'cannot reach the daemon', status: null, unreachable: true });
-  vi.mocked(api.daemonService).mockResolvedValue({ default_socket: true, binary: null, systemd: true, unit: null });
+  vi.mocked(api.daemonService).mockResolvedValue({ default_socket: true, binary: null, systemd: true, active: false, restartable: false, unit: null });
   render(<App />);
   expect(await screen.findByText('The sk1ll command is not installed')).toBeTruthy();
   expect(screen.queryByRole('button', { name: 'Start the Daemon' })).toBeNull();
@@ -140,16 +140,77 @@ it('shows the getting-started checklist after setup until it is dismissed', asyn
   render(<App />);
   const panel = await screen.findByRole('region', { name: 'Getting started' });
   expect(within(panel).getByText('0 of 3 done')).toBeTruthy();
+  fireEvent.click(within(panel).getByRole('button', { name: 'New Rule' }));
+  expect(screen.getByText('Local library').getAttribute('data-create')).toBe('rule');
   expect(within(panel).getByRole('button', { name: 'Create join code' })).toBeTruthy();
   fireEvent.click(within(panel).getByRole('button', { name: 'Dismiss' }));
   expect(screen.queryByRole('region', { name: 'Getting started' })).toBeNull();
   expect(localStorage.getItem('sk1ll-getting-started')).toBeNull();
 });
 
-it('does not show the checklist to Machines set up before', async () => {
+it('reopens the checklist for Machines set up before', async () => {
   current = joined;
   window.location.hash = '#/library';
   render(<App />);
   await screen.findByText('Local library');
   expect(screen.queryByRole('region', { name: 'Getting started' })).toBeNull();
+  fireEvent.click(screen.getByRole('button', { name: 'Open command palette' }));
+  fireEvent.click(await screen.findByRole('option', { name: 'Action: Show getting started' }));
+  expect(await screen.findByRole('region', { name: 'Getting started' })).toBeTruthy();
+});
+
+
+it.each([true, false])('offers restart guidance on an API mismatch (active service: %s)', async active => {
+  vi.mocked(api.status).mockRejectedValue({ message: 'local API mismatch', status: 426, unreachable: false });
+  vi.mocked(api.daemonService).mockResolvedValue({ default_socket: true, binary: null, systemd: true, active, restartable: active, unit: '/user/sk1ll-daemon.service' });
+  render(<App />);
+  if (active) {
+    fireEvent.click(await screen.findByRole('button', { name: 'Restart daemon' }));
+    await waitFor(() => expect(api.restartDaemon).toHaveBeenCalledOnce());
+  } else {
+    expect(await screen.findByRole('button', { name: 'Copy systemctl --user restart sk1ll-daemon' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Restart daemon' })).toBeNull();
+  }
+});
+
+it('opens the selected Machine from the command palette', async () => {
+  current = joined;
+  vi.mocked(api.fleet).mockResolvedValue({ baseline: null, machines: ['desktop', 'laptop'].map(id => ({
+    id, status: 'offline', connected: false, joined_at: 0, last_seen: null, report: null,
+  })) });
+  window.location.hash = '#/library';
+  render(<App />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Open command palette' }));
+  fireEvent.click(await screen.findByRole('option', { name: 'Machine: laptop' }));
+  expect(await screen.findByRole('button', { name: 'Hide details for laptop' })).toBeTruthy();
+  expect(screen.queryByRole('button', { name: 'Show details for desktop' })).toBeNull();
+});
+
+it('names origin when a standalone push fails', async () => {
+  current = { ...firstRun, has_origin: true, repo_ready: true };
+  vi.mocked(api.push).mockResolvedValue({ pushed: false });
+  window.location.hash = '#/library';
+  render(<App />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Open command palette' }));
+  fireEvent.click(await screen.findByRole('option', { name: 'Action: Push' }));
+  expect(await screen.findByText('Push did not reach origin')).toBeTruthy();
+});
+
+it('leaves the restart screen when the Daemon becomes unreachable after a mismatch', async () => {
+  vi.mocked(api.status).mockRejectedValueOnce({ message: 'local API mismatch', status: 426, unreachable: false })
+    .mockRejectedValue({ message: 'connection refused', unreachable: true });
+  vi.mocked(api.daemonService).mockResolvedValue({ default_socket: true, binary: '/home/me/.cargo/bin/sk1ll', systemd: true, active: false, restartable: false, unit: null });
+  render(<App />);
+  expect(await screen.findByText('Daemon is not running')).toBeTruthy();
+  expect(screen.queryByRole('button', { name: 'Restart daemon' })).toBeNull();
+});
+
+it('closes a reopened checklist once its last step is done', async () => {
+  const ready = { ...firstRun, repo_ready: true, report: { ...firstRun.report, baseline: 'abc' } };
+  const props = { status: ready, machines: undefined, reopened: true, onDismiss: vi.fn(), addImport: vi.fn(), newSkill: vi.fn(), newRule: vi.fn(), showUnmanaged: vi.fn(), reviewDraft: vi.fn() };
+  const { rerender } = render(<GettingStarted {...props} entries={[]} />);
+  expect(await screen.findByRole('region', { name: 'Getting started' })).toBeTruthy();
+  rerender(<GettingStarted {...props} entries={[{ type: 'personal', name: 'pdf' } as ContentEntry]} />);
+  await waitFor(() => expect(screen.queryByRole('region', { name: 'Getting started' })).toBeNull());
+  expect(props.onDismiss).toHaveBeenCalled();
 });

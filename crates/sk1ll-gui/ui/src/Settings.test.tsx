@@ -83,3 +83,17 @@ it('keeps active diagnostic details with a keyboard-reachable timestamp', async 
   expect(screen.getByText('Pending Restore reports')).toBeTruthy(); expect(screen.getByText('Auth rejected since')).toBeTruthy();
   expect(screen.getByText('Credentials expired')).toBeTruthy(); expect(document.querySelector('time')?.getAttribute('tabindex')).toBe('0');
 });
+
+it('copies diagnostics as plain text', async () => {
+  const writeText = vi.fn().mockResolvedValue(undefined);
+  const original = Object.getOwnPropertyDescriptor(navigator, 'clipboard');
+  Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
+  try {
+    mount();
+    fireEvent.click(screen.getByRole('button', { name: 'Copy diagnostics' }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(expect.stringContaining('Socket: /daemon.sock\nAssignment revision: 4')));
+  } finally {
+    if (original) Object.defineProperty(navigator, 'clipboard', original);
+    else Reflect.deleteProperty(navigator, 'clipboard');
+  }
+});

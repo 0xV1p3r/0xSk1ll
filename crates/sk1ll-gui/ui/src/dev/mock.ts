@@ -100,7 +100,7 @@ export function installMock(scenario: string) {
 
   mockIPC((cmd, args) => {
     const a = (args ?? {}) as Record<string, unknown>;
-    if (cmd === 'daemon_service') return delay({ default_socket: true, binary: '/home/dev/.cargo/bin/sk1ll', systemd: true, unit: null });
+    if (cmd === 'daemon_service') return delay({ default_socket: true, binary: '/home/dev/.cargo/bin/sk1ll', systemd: true, active: false, restartable: false, unit: null });
     if (cmd === 'start_daemon') { setTimeout(() => { running = true; }, 1500); return delay('systemd', 600); }
     if (!running && cmd !== 'connection_info' && !cmd.startsWith('plugin:'))
       return Promise.reject({ message: 'connect ECONNREFUSED /run/user/1000/sk1ll/daemon.sock', status: null, unreachable: true });

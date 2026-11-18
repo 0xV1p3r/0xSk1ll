@@ -300,3 +300,10 @@ it('names unpushed items and shows the assignment preview total', async () => {
   expect(await assignments.findByText('6 of 7')).toBeTruthy(); expect(assignments.getByText('Inherited')).toBeTruthy();
   expect(assignments.getByRole('button', { name: 'Open matrix' })).toBeTruthy();
 });
+
+it('shows every Machine again when the selected Machine was removed', async () => {
+  vi.mocked(api.fleet).mockResolvedValue({ baseline: null, machines: [{ id: 'desktop', status: 'offline', connected: false, joined_at: 0, last_seen: null, report: null }] });
+  renderFleet({ initialMachine: 'laptop' });
+  expect(await screen.findByRole('button', { name: 'Show details for desktop' })).toBeTruthy();
+  expect(screen.queryByText('No Machines')).toBeNull();
+});

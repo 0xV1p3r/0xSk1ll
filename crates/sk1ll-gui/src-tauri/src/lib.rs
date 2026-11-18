@@ -57,6 +57,8 @@ pub fn run() {
             commands::set_setup_harness,
             commands::daemon_service,
             commands::start_daemon,
+            commands::restart_daemon,
+            commands::open_fleet_deployment_docs,
             commands::imports,
             commands::resolve_import,
             commands::add_import,

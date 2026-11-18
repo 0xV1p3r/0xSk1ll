@@ -5,6 +5,23 @@ All notable changes to 0xSk1ll are listed here. The format follows
 [Semantic Versioning](https://semver.org/). Before 1.0, a minor version may
 break compatibility.
 
+## [Unreleased]
+
+### Added
+
+- Create a Rule from the desktop getting-started checklist and reopen the
+  checklist from the command palette.
+- Copy diagnostics and ready-to-paste join commands from the desktop app.
+  Join code entry points explain Fleet permissions and the dialog shows the
+  default expiry.
+- Restart a systemd user Daemon from the desktop app after a local API mismatch.
+
+### Fixed
+
+- Machine entries in the desktop command palette open the selected Machine.
+- Desktop messages identify origin for standalone pushes, explain when Fleet
+  deletions reach other Machines, and clarify how to join as the first Machine.
+
 ## [0.1.0] - 2026-11-17
 
 The first release, for private testing. Linux only for the desktop app, the
