@@ -180,6 +180,33 @@ pub async fn start_daemon() -> Result<sk1ll_daemon::service::Started> {
         .map_err(local_error)
 }
 
+/// Restarts the local systemd user service after a local API mismatch.
+#[tauri::command]
+pub async fn restart_daemon() -> Result<()> {
+    tauri::async_runtime::spawn_blocking(crate::service::restart)
+        .await
+        .map_err(|e| local_error(e.to_string()))?
+        .map_err(local_error)
+}
+
+/// Opens the fleet deployment guide in the system browser.
+#[tauri::command]
+pub async fn open_fleet_deployment_docs() -> Result<()> {
+    let output = tauri::async_runtime::spawn_blocking(|| {
+        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        std::process::Command::new(opener)
+            .arg("https://github.com/0xV1p3r/0xSk1ll/blob/main/docs/fleet.md#deploy-the-server")
+            .output()
+    })
+    .await
+    .map_err(|e| local_error(e.to_string()))?
+    .map_err(|e| local_error(e.to_string()))?;
+    if !output.status.success() {
+        return Err(local_error(String::from_utf8_lossy(&output.stderr).trim()));
+    }
+    Ok(())
+}
+
 fn local_error(message: impl Into<String>) -> CommandError {
     CommandError { message: message.into(), status: None, unreachable: false }
 }

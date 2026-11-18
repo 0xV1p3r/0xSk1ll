@@ -1,3 +1,4 @@
+import { version as appVersion } from '../package.json';
 import { useCallback, useRef, useState } from 'react';
 import { LoaderCircle, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -8,6 +9,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, Di
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Collapsible, CollapsibleTrigger, CollapsibleContent } from '@/components/ui/collapsible';
 import { NativeSelect } from '@/components/ui/native-select';
+import { time } from './model';
 import { toast } from './toast';
 import { api } from './api';
 import { useMutation, useResource } from './hooks';
@@ -15,8 +17,10 @@ import { Action, Details, ErrorNotice, Loading, Pending, Panel, PanelToolbar, Se
 import type { StatusView } from './types';
 
 // Creates a single-use join code and shows it once.
-export function JoinCodeButton({ label, variant = 'outline' }: { label: string; variant?: 'outline' | 'default' }) {
+export function JoinCodeButton({ label, serverUrl, variant = 'outline' }: { label: string; serverUrl: string | null; variant?: 'outline' | 'default' }) {
   const [joinCode, setJoinCode] = useState<string>();
+  const quote = (arg: string) => /^[a-zA-Z0-9_:/.-]+$/.test(arg) ? arg : "'" + arg.replaceAll("'", "'\\''") + "'";
+  const command = serverUrl && joinCode ? `sk1ll join ${quote(serverUrl)} ${quote(joinCode)}` : null;
   const createCode = useMutation();
   const trigger = useRef<HTMLButtonElement>(null);
   return <div className="flex flex-col items-start gap-3">
@@ -24,12 +28,15 @@ export function JoinCodeButton({ label, variant = 'outline' }: { label: string; 
       {/* Keep the label's width while pending so the header doesn't reflow. */}
       <span className={createCode.pending ? 'invisible' : undefined}>{label}</span>
       {createCode.pending && <LoaderCircle aria-hidden className="absolute inset-0 m-auto animate-spin" />}</Button><ErrorNotice error={createCode.error} />
+    <p className="text-xs text-muted-foreground">Any joined Machine can create join codes, change any Machine's Assignment, undo log entries, and remove Machines.</p>
     <Dialog open={joinCode !== undefined} onOpenChange={open => { if (!open) setJoinCode(undefined); }}>
       <DialogContent finalFocus={trigger}><DialogHeader><DialogTitle>Join code</DialogTitle>
-        <DialogDescription>Copy this code now. It cannot be shown again. On the new Machine, enter it under Settings → Join / rejoin this Machine,
-          or run <code className="font-mono">sk1ll join</code>.</DialogDescription></DialogHeader>
+        <DialogDescription>Copy this single-use code now. It cannot be shown again and expires after 24 hours by default. The Server operator can change the expiry with SK1LL_SERVER_JOIN_CODE_TTL.
+          On the new Machine, enter the code under Settings → Join / rejoin this Machine{command ? ', or run the command below.' : '.'}</DialogDescription></DialogHeader>
         <code className="rounded-md border bg-muted px-3 py-2 font-mono text-base break-all select-all">{joinCode}</code>
         <Action className="h-8" label="Copy code" doneLabel="Copied" action={() => navigator.clipboard.writeText(joinCode ?? '')} />
+        {command && <><code className="rounded-md border bg-muted px-3 py-2 font-mono text-sm break-all select-all">{command}</code>
+          <Action className="h-8" label="Copy command" doneLabel="Copied" action={() => navigator.clipboard.writeText(command)} /></>}
       </DialogContent></Dialog>
   </div>;
 }
@@ -37,6 +44,14 @@ export function Settings({ revision, fleetRevision = revision, status, socket, c
   status: StatusView; socket: string; fleetRevision?: number; revision: number; changed: () => void;
 }) {
   const standalone = status.mode === 'standalone';
+  const diagnostics: [string, string | number][] = [
+    ['Mode', standalone ? 'Standalone' : 'Joined'], ['App version', appVersion],
+    ...(status.version ? [['Daemon version', status.version] as [string, string]] : []),
+    ['Repository', status.repo], ['Origin', status.has_origin ? 'Configured' : 'None'],
+    ['Socket', socket], ['Assignment revision', status.assignment_revision],
+  ];
+  if (status.pending_discards > 0) diagnostics.push(['Pending Restore reports', status.pending_discards]);
+  if (status.auth_rejected_since !== null) diagnostics.push(['Auth rejected since', time(status.auth_rejected_since)]);
   const fleet = useResource(api.fleet, fleetRevision, undefined, !standalone);
   const harnesses = useResource(api.harnesses, revision);
   const saveEditor = useMutation();
@@ -76,7 +91,7 @@ export function Settings({ revision, fleetRevision = revision, status, socket, c
 
     </Panel>
     <Panel label="Fleet membership"><PanelToolbar><SectionTitle>Fleet membership</SectionTitle></PanelToolbar>
-      {!standalone && <div className="border-b p-3.5"><h3 className="mb-1 text-sm font-medium">Join code for another Machine</h3><p className="mb-3 text-sm text-muted-foreground">Create a single-use code for another Machine. The code is shown once. Remove Machines from the Fleet screen.</p><JoinCodeButton label="Create join code" /></div>}
+      {!standalone && <div className="border-b p-3.5"><h3 className="mb-1 text-sm font-medium">Join code for another Machine</h3><p className="mb-3 text-sm text-muted-foreground">Create a single-use code for another Machine. The code is shown once. Remove Machines from the Fleet screen.</p><JoinCodeButton label="Create join code" serverUrl={status.server_url} /></div>}
       <div className="px-3.5 pt-3.5"><h3 className="text-sm font-medium">{standalone ? 'Join a Fleet' : 'Join / rejoin this Machine'}</h3><p className="text-sm text-muted-foreground">Join uses a single-use join code. Rejoin replaces this Machine's credentials and restarts its Daemon.</p></div>
       <div className="p-3.5"><Collapsible key={String(alreadyJoined)} defaultOpen={!alreadyJoined}>
           {alreadyJoined && <><p className="mb-3 text-sm text-muted-foreground">This Machine is joined. Rejoin to replace its credentials.</p><CollapsibleTrigger render={<Button variant="outline" />}>Rejoin this Machine…</CollapsibleTrigger></>}
@@ -126,12 +141,13 @@ export function Settings({ revision, fleetRevision = revision, status, socket, c
       </div>
 
     </Panel>
-    <Panel label="Diagnostics"><PanelToolbar><SectionTitle>Diagnostics</SectionTitle></PanelToolbar><div className="p-3.5"><Details rows={[
-      ['Mode', standalone ? 'Standalone' : 'Joined'], ...(status.version ? [['Daemon version', status.version] as [string, string]] : []), ['Repository', status.repo], ['Origin', status.has_origin ? 'Configured' : 'None'],
-      ['Socket', <code className="font-mono text-xs break-all">{socket}</code>], ['Assignment revision', status.assignment_revision],
-      ...(status.pending_discards > 0 ? [['Pending Restore reports', status.pending_discards] as [string, number]] : []),
-      ...(status.auth_rejected_since !== null ? [['Auth rejected since', <When seconds={status.auth_rejected_since} />] as [string, React.ReactNode]] : []),
-    ]} />{status.last_error && <div className="mt-3"><ErrorNotice error={status.last_error} /></div>}</div></Panel>
+    <Panel label="Diagnostics"><PanelToolbar><SectionTitle>Diagnostics</SectionTitle>
+      <Action className="ml-auto" label="Copy diagnostics" doneLabel="Copied" action={() => navigator.clipboard.writeText(
+        [...diagnostics, ...(status.last_error ? [['Last error', status.last_error]] : [])].map(([label, value]) => `${label}: ${value}`).join('\n')
+      )} /></PanelToolbar><div className="p-3.5"><Details rows={diagnostics.map(([label, value]) => [label,
+        label === 'Socket' ? <code className="font-mono text-xs break-all">{value}</code>
+          : label === 'Auth rejected since' ? <When seconds={status.auth_rejected_since} /> : value,
+      ])} />{status.last_error && <div className="mt-3"><ErrorNotice error={status.last_error} /></div>}</div></Panel>
 
   </>;
 }

@@ -94,6 +94,11 @@ export function App() {
   const [openAdd, setOpenAdd] = useState(0);
   const [matrixTarget, setMatrixTarget] = useState<{ item: string; harness: string }>();
   const [status, setStatus] = useState<StatusView>();
+  const [checklist, setChecklist] = useState(0);
+  const [checklistReopened, setChecklistReopened] = useState(false);
+  const [fleetTarget, setFleetTarget] = useState<{ id: string; visit: number }>();
+  const [apiMismatch, setApiMismatch] = useState('');
+  const closeChecklist = useCallback(() => setChecklistReopened(false), []);
   const [reachable, setReachable] = useState<boolean>();
   const [error, setError] = useState('');
   const [socket, setSocket] = useState('Default Daemon socket');
@@ -131,7 +136,7 @@ export function App() {
   const refreshHeader = async () => {
     if (refreshLock.current) return;
     refreshLock.current = true; setRefreshPending(true); changed();
-    try { const [next] = await Promise.all([api.status(), new Promise(resolve => setTimeout(resolve, 350))]); setStatus(next); setReachable(true); setError(''); }
+    try { const [next] = await Promise.all([api.status(), new Promise(resolve => setTimeout(resolve, 350))]); setStatus(next); setReachable(true); setApiMismatch(''); setError(''); }
     catch (e) { setError(errorMessage(e)); }
     finally { refreshLock.current = false; setRefreshPending(false); }
   };
@@ -140,7 +145,7 @@ export function App() {
   };
   const heading = useRef<HTMLHeadingElement>(null);
   const navigated = useRef(false);
-  const navigate = useCallback((next: Screen) => { navigated.current = true; setMatrixTarget(undefined); setOpenAdd(0); setSkillsHandoff({}); setScreen(next); window.location.hash = screenHash(next); }, []);
+  const navigate = useCallback((next: Screen, machine?: string) => { navigated.current = true; setMatrixTarget(undefined); setFleetTarget(previous => machine ? { id: machine, visit: (previous?.visit ?? 0) + 1 } : undefined); setOpenAdd(0); setSkillsHandoff({}); setScreen(next); window.location.hash = screenHash(next); }, []);
   useEffect(() => {
     const hashchange = () => { const next = screenFromHash(window.location.hash); if (next !== screen) navigate(next); };
     window.addEventListener('hashchange', hashchange);
@@ -177,9 +182,9 @@ export function App() {
       refreshing = true;
       try {
         const next = await api.status();
-        if (alive) { setStatus(next); setReachable(true); setError(''); }
+        if (alive) { setStatus(next); setReachable(true); setApiMismatch(''); setError(''); }
       } catch (e) {
-        if (alive) { if ((e as CommandError)?.unreachable) setReachable(false); setError(errorMessage(e)); }
+        if (alive) { const failure = e as CommandError; if (failure?.status === 426) setApiMismatch(errorMessage(e)); if (failure?.unreachable) { setReachable(false); setApiMismatch(''); } setError(errorMessage(e)); }
       } finally {
         refreshing = false;
         if (alive && refreshAgain) { refreshAgain = false; void refresh(); }
@@ -223,6 +228,7 @@ export function App() {
     void api.status().then(value => { if (alive) { setStatus(value); setReachable(true); } }).catch(() => {});
     return () => { alive = false; };
   }, [revisions.status]);
+  if (apiMismatch) return <TooltipProvider><ConnectionPage socket={socket} error={apiMismatch} apiMismatch /></TooltipProvider>;
   // Give the restart after a join time before offering to start the Daemon.
   if (joinedAt !== undefined && status?.mode !== 'joined') return <TooltipProvider><RestartingPage /></TooltipProvider>;
   if (reachable === false) return <TooltipProvider><ConnectionPage socket={socket} error={error} /></TooltipProvider>;
@@ -269,11 +275,11 @@ export function App() {
           <AlertDescription className="min-w-0 [overflow-wrap:anywhere]"><code className="font-mono">{conflict.item.replace(/^(skill|rule):/, '')}</code> was edited in {conflict.harness} after the last sync.</AlertDescription>
           <Button size="sm" className="ml-auto" onClick={() => navigate('Conflicts')}>Resolve</Button>
         </Alert>}
-        {screen === 'Library' && <GettingStarted status={status} entries={skills.data} machines={fleet.data?.machines.length}
+        {screen === 'Library' && <GettingStarted key={checklist} reopened={checklistReopened} onDismiss={closeChecklist} status={status} entries={skills.data} machines={fleet.data?.machines.length}
           addImport={() => { navigate('Imports'); setOpenAdd(n => n + 1); }} newSkill={() => setSkillsHandoff({ create: 'skill' })}
-          showUnmanaged={() => setSkillsHandoff({ filter: 'unmanaged' })} reviewDraft={() => navigate('Draft')} />}
+          newRule={() => setSkillsHandoff({ create: 'rule' })} showUnmanaged={() => setSkillsHandoff({ filter: 'unmanaged' })} reviewDraft={() => navigate('Draft')} />}
         {screen === 'Library' && <><ErrorNotice error={skills.error} />{skills.loading && !skills.data ? <Loading /> : <Skills handoff={skillsHandoff} connection={status.connection} entries={skills.data ?? []} revision={revision} changed={changed} reviewDraft={() => navigate('Draft')} assignment={(item, harness) => { navigate('Assignment matrix'); setMatrixTarget({ item, harness }); }} addImport={() => { navigate('Imports'); setOpenAdd(n => n + 1); }} />}</>}
-        {screen === 'Fleet' && <Fleet revision={revision + revisions.fleet} machineId={status.machine_id} localReport={status.report} unmanaged={skills.data?.filter(entry => entry.type === 'unmanaged')} discovery={{ loading: !skills.data && skills.loading, error: skills.error }} navigate={next => { navigate(next); if (next === 'Library') setSkillsHandoff({ filter: 'unmanaged' }); }} changed={changed} live={status.connection === 'connected'} />}
+        {screen === 'Fleet' && <Fleet key={fleetTarget?.visit} initialMachine={fleetTarget?.id} serverUrl={status.server_url} revision={revision + revisions.fleet} machineId={status.machine_id} localReport={status.report} unmanaged={skills.data?.filter(entry => entry.type === 'unmanaged')} discovery={{ loading: !skills.data && skills.loading, error: skills.error }} navigate={next => { navigate(next); if (next === 'Library') setSkillsHandoff({ filter: 'unmanaged' }); }} changed={changed} live={status.connection === 'connected'} />}
         {screen === 'Assignment matrix' && <Matrix revision={revision + revisions.fleet} status={status} target={matrixTarget} />}
         {screen === 'Draft' && <Draft revision={revision} status={status} changed={changed} />}
         {screen === 'Conflicts' && <Conflicts revision={revision} changed={changed} reviewDraft={() => navigate('Draft')} />}
@@ -284,11 +290,12 @@ export function App() {
     </SidebarInset>
     <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} commands={[
       ...visibleScreens(status).map(name => ({ id: `screen-${name.replaceAll(' ', '-')}`, label: `Go to: ${screenLabel(name, status)}`, select: () => navigate(name) })),
-      ...(!standalone ? fleet.data?.machines ?? [] : []).map(machine => ({ id: `machine-${machine.id}`, label: `Machine: ${machine.id}`, select: () => navigate('Fleet') })),
+      ...(!standalone ? fleet.data?.machines ?? [] : []).map(machine => ({ id: `machine-${machine.id}`, label: `Machine: ${machine.id}`, select: () => navigate('Fleet', machine.id) })),
       ...(!standalone || status.has_origin ? [{ id: 'action-pull', background: true, label: 'Action: Pull Baseline', select: () => void runAction(async () => { const result = await api.pull(); return { title: result.state === 'blocked' ? 'Pull blocked' : result.state === 'up_to_date' ? 'Baseline is up to date' : 'Pull complete' }; }) },
-      { id: 'action-push', background: true, label: 'Action: Push', select: () => void runAction(async () => { const result = await api.push(); return { title: result.pushed ? 'Push complete' : 'Push did not reach the Server', tone: result.pushed ? undefined : 'destructive' }; }) },
+      { id: 'action-push', background: true, label: 'Action: Push', select: () => void runAction(async () => { const result = await api.push(); return { title: result.pushed ? 'Push complete' : standalone ? 'Push did not reach origin' : 'Push did not reach the Server', tone: result.pushed ? undefined : 'destructive' }; }) },
       ] : []),
       { id: 'action-check-imports', background: true, label: 'Action: Check Imports', select: () => void runAction(async () => { const result = await api.checkImports(); return { title: 'Import check complete', description: `${plural(result.updates.length, 'update')}, ${plural(result.errors.length, 'failed check')}`, tone: result.errors.length ? 'destructive' : undefined }; }) },
+      { id: 'action-getting-started', label: 'Action: Show getting started', select: () => { navigate('Library'); showGettingStarted(); setChecklistReopened(true); setChecklist(value => value + 1); } },
       { id: 'action-add-import', label: 'Action: Add Import', select: () => { navigate('Imports'); setOpenAdd(n => n + 1); } },
       ...(['Skill', 'Rule'] as const).map(type => ({ id: `action-new-${type.toLowerCase()}`, label: `Action: New ${type}`, select: () => { navigate('Library'); setSkillsHandoff({ create: type === 'Skill' ? 'skill' : 'rule' }); } })),
       ...(skills.data ?? []).map((entry, index) => ({ id: `content-${index}`, label: `${entry.type === 'rule' ? 'Rule' : 'Skill'}: ${entry.name}`, select: () => { navigate('Library'); setSkillsHandoff({ search: entry.name }); } })),

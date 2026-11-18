@@ -246,7 +246,7 @@ function SkillDetail({ entry, entries, close, initialHarness, revision, changed,
       <div className="flex flex-col items-end gap-1.5"><div className="flex flex-wrap justify-end gap-2">
         {(entry.type === 'personal' || entry.type === 'rule') && entry.draft !== 'deleted' && <>
           <Button variant="outline" size="sm" onClick={() => { setRenameTo(entry.name); setRenaming(true); }}>Rename…</Button>
-          <Confirm label="Delete…" confirmLabel="Delete" triggerVariant="outline" title={`Delete ${entry.name}?`} description={connection === 'standalone' ? "This removes it from this Machine's Draft. Commit saves the deletion to the local repository." : "This removes it from this Machine's Draft. Commit removes it from the Baseline and every Machine."} action={() => api.deleteItem({ kind, name: entry.name })} onDone={() => { toast({ title: `${entry.name} deleted in Draft` }); close(); changed(); }} />
+          <Confirm label="Delete…" confirmLabel="Delete" triggerVariant="outline" title={`Delete ${entry.name}?`} description={connection === 'standalone' ? "This removes it from this Machine's Draft. Commit saves the deletion to the local repository." : "This removes it from this Machine's Draft. The deletion reaches other Machines after you commit and push it and they sync."} action={() => api.deleteItem({ kind, name: entry.name })} onDone={() => { toast({ title: `${entry.name} deleted in Draft` }); close(); changed(); }} />
         </>}
         {entry.draft && <Button ref={reviewButton} variant="outline" size="default" onClick={reviewDraft}>Review in Draft</Button>}
         {entry.draft !== 'deleted' && <>

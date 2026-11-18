@@ -65,7 +65,7 @@ export interface HarnessView {
 }
 export interface HarnessChoice { name: string; installed: boolean; enabled: boolean; harness: HarnessView['harness'] }
 // How the app can start the Daemon itself; not a Daemon type.
-export interface ServiceInfo { default_socket: boolean; binary: string | null; systemd: boolean; unit: string | null }
+export interface ServiceInfo { default_socket: boolean; binary: string | null; systemd: boolean; active: boolean; restartable: boolean; unit: string | null }
 export type DaemonStarted = 'systemd' | 'process';
 export interface ImportUpdate { name: string; source: string; ref: string; locked: string; upstream: string }
 export interface ImportsView { imports?: ImportEntry[]; checked_at: number | null; updates: ImportUpdate[]; errors: { name: string; message: string }[] }

@@ -1,6 +1,6 @@
 # Desktop GUI
 
-`sk1ll-gui` is a Tauri v2 app for Unix desktops. It talks only to the local daemon over its socket, so the daemon must be running. Without a fleet, it manages a standalone repo. It supports light, dark and system appearance.
+`sk1ll-gui` is a Tauri v2 desktop app. Release builds ship for Linux. It talks only to the local daemon over its socket, so the daemon must be running. Without a fleet, it manages a standalone repo. It supports light, dark and system appearance.
 
 ## First run
 
@@ -8,13 +8,13 @@
 2. **Choose how to use this machine.** While the machine has no repo, a setup wizard replaces the app:
    - *Only this machine* creates a standalone repo.
    - *Join a fleet* takes the server URL and a join code from another machine.
-   - *Start a new fleet* takes the server URL and the server's admin token. The daemon uses the token once to create a join code, joins with it, and doesn't store the token.
+   - *Join as the first Machine* takes the URL and admin token of a [deployed Server](fleet.md#deploy-the-server). The daemon uses the token once to create a join code, joins with it, and doesn't store the token.
 3. **Choose harnesses.** The wizard lists the detected harnesses and saves the ones you turn off as `enabled = false` in `machine.toml`. This works only before the repo exists, so nothing has been synced or registered with the server yet. Afterwards, edit `machine.toml`.
 4. **Pick a starting assignment.** A machine that joins without copying another machine's assignment starts with everything off. The app then offers to turn on everything, including the defaults for items added later, or to open the assignment matrix.
 
 `sk1ll setup` asks the same questions on the command line. It goes through the daemon if one is running, otherwise it works directly, and at the end it offers to install and start the service. Answers come from standard input, so it can be scripted.
 
-After the wizard, the Library shows a getting-started checklist: add a skill or rule, adopt unmanaged skills, commit the draft and, on a fleet, add another machine. It goes away when every step is done or you dismiss it. Machines set up before this checklist existed don't show it.
+After the wizard, the Library shows a getting-started checklist: add a skill or rule, adopt unmanaged skills, commit the draft and, on a fleet, add another machine. It goes away when every step is done or you dismiss it. Choose **Show getting started** in the command palette to bring it back, including on Machines set up before the checklist existed.
 
 ## Screens
 
@@ -22,19 +22,26 @@ The header shows this machine's id, its headline status and whether the daemon a
 
 | Screen | What you can do |
 |---|---|
-| Fleet | See every machine and its status |
+| Fleet | See every Machine and its status. Choose a Machine in the command palette to open its details. |
+| Library | Browse Personal Skills, Imports, Rules and Unmanaged skills. Create Skills and Rules, adopt Unmanaged skills, and compare variants. |
 | Assignment | Toggle items per harness, grouped by machine, and set the defaults for new skills and rules. Explicit and inherited values look different. |
 | Draft | Pick items, read unified diffs, edit the prefilled commit message, push, restore, and pull when Blocked |
 | Conflicts | Adopt or overwrite harness edits, and adopt or discard recovered copies |
 | Imports | Paste a link to add skills (it previews every skill the repo holds) and update imports. Both land in the draft. |
 | Log | Browse assignment changes, newest first, and undo any entry |
-| Settings | List harnesses, join or rejoin (with a join code, or the admin token for a new fleet), create one-time join codes, remove machines (typed confirmation) and see connection details |
+| Settings | List harnesses, join or rejoin (with a join code, or the admin token for a new fleet), create single-use join codes, and copy connection and version details with **Copy diagnostics** |
 
 In standalone mode, commits stay local. Push and Pull use the repo's own `origin`; without an origin those actions are unavailable. If there is no repo yet, the setup wizard creates it. The repo comes from `SK1LL_REPO`, the nearest `sk1ll.toml` above the daemon's working directory, or `~/.local/share/sk1ll/repo`.
 
 Items that aren't in the applied baseline carry an `Unpushed` or `Draft only` badge, and you can only assign them on this machine.
 
 Assignment toggles update the screen before the daemon replies and roll back if it reports an error. Draft actions record the selected items and their content fingerprints, so if a selected item changes before you confirm, the app asks you to review it again. The GUI never retries a mutation on its own.
+
+In the Library, a deletion affects this Machine's Draft immediately. Other Machines pick up the deletion after you commit and push it and they sync.
+
+In a Fleet, create a join code from Fleet, Settings or the getting-started checklist. Copy the code or the ready-to-paste `sk1ll join <server-url> <code>` command. The code works once and expires after 24 hours by default. The Server operator can change [`SK1LL_SERVER_JOIN_CODE_TTL`](fleet.md#machine-status). Any joined Machine can create join codes, change any Machine's Assignment, undo log entries, and remove Machines.
+
+When an upgrade leaves the app and Daemon on different local API versions, the connection screen offers **Restart daemon** for a running systemd user service on the default socket. It shows terminal instructions for other setups.
 
 ## Run it
 

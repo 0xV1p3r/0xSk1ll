@@ -1,3 +1,4 @@
+import { isTauri } from '@tauri-apps/api/core';
 import { useEffect, useState, type ReactNode } from 'react';
 import { ArrowLeft, Check, LoaderCircle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -39,8 +40,10 @@ function Frame({ title, description, step, children, wide = false }: { title: st
   </main>;
 }
 
-export function ConnectionPage({ socket, error }: { socket: string; error: string }) {
-  const service = useResource(api.daemonService, 0);
+export function ConnectionPage({ socket, error, apiMismatch = false }: { socket: string; error: string; apiMismatch?: boolean }) {
+  // Re-read after a failed restart: the unit may have stopped.
+  const [serviceRevision, setServiceRevision] = useState(0);
+  const service = useResource(api.daemonService, serviceRevision);
   const start = useMutation();
   const [started, setStarted] = useState<DaemonStarted>();
   const [slow, setSlow] = useState(false);
@@ -50,6 +53,13 @@ export function ConnectionPage({ socket, error }: { socket: string; error: strin
     : 'Installs the sk1ll-daemon user service and starts it. It starts again whenever you log in.'
     : 'Runs the Daemon in the background until you log out.';
   const log = started === 'systemd' ? 'journalctl --user -u sk1ll-daemon -n 50' : 'tail -n 50 ~/.cache/sk1ll/daemon.log';
+  if (apiMismatch) return <Frame title="Restart the Daemon" description="The app and the running Daemon use different local API versions. The connection retries automatically.">
+    {info?.restartable
+      ? <Button className="self-start" disabled={start.pending} onClick={() => void start.run(() => api.restartDaemon().finally(() => setServiceRevision(n => n + 1)))}><Pending pending={start.pending}>Restart daemon</Pending></Button>
+      : !service.loading && <><p>If you started the Daemon in a terminal, stop it there and run:</p><CopyCommand command="sk1ll daemon" />
+        <p>For a systemd user service, run:</p><CopyCommand command="systemctl --user restart sk1ll-daemon" /></>}
+    <ErrorNotice error={start.error || service.error || error} />
+  </Frame>;
   return <Frame title="Daemon is not running" description="The Daemon keeps this Machine's Harnesses in step and serves this window. The connection retries automatically.">
     {info?.default_socket && info.binary && <div className="flex flex-col items-start gap-2">
       <Button disabled={start.pending || !!started} onClick={() => void start.run(api.startDaemon, setStarted)}>
@@ -83,13 +93,14 @@ type SetupPath = 'local' | 'join' | 'create';
 const setupPaths: { value: SetupPath; title: string; description: string }[] = [
   { value: 'local', title: 'Only this Machine', description: 'Keep Skills and Rules in a local repo. You can join a Fleet later in Settings.' },
   { value: 'join', title: 'Join a Fleet', description: 'Another Machine already syncs with a Server. Create a join code on it in Settings.' },
-  { value: 'create', title: 'Start a new Fleet', description: 'This is the first Machine on a new Server. You need the Server\'s admin token.' },
+  { value: 'create', title: 'Join as the first Machine', description: 'Requires a deployed Server and its admin token.' },
 ];
 export type SetupResult = { joined: false } | { joined: true; copied: boolean };
 
 // First run: there is no skills repo yet, so the Daemon runs standalone.
 export function SetupWizard({ status, onDone }: { status: StatusView; onDone: (result: SetupResult) => void }) {
   const [step, setStep] = useState<'path' | 'harnesses' | 'details'>('path');
+  const docs = useMutation();
   const [path, setPath] = useState<SetupPath>('local');
   if (step === 'path') return <Frame wide step="Step 1 of 3" title="Set up this Machine" description="0xSk1ll keeps your agent Skills and Rules in one git repo and syncs them into every Harness.">
     <fieldset className="flex flex-col gap-2"><legend className="sr-only">How this Machine is used</legend>
@@ -98,6 +109,9 @@ export function SetupWizard({ status, onDone }: { status: StatusView; onDone: (r
         <span className="flex flex-col gap-0.5"><span className="font-medium">{option.title}</span><span className="text-muted-foreground">{option.description}</span></span>
       </label>)}
     </fieldset>
+    <a className="self-start text-sm underline underline-offset-4" href="https://github.com/0xV1p3r/0xSk1ll/blob/main/docs/fleet.md#deploy-the-server" target="_blank" rel="noreferrer"
+      onClick={event => { if (isTauri()) { event.preventDefault(); void docs.run(api.openFleetDeploymentDocs); } }}>Deploy the Server</a>
+    <ErrorNotice error={docs.error} />
     <div><Button onClick={() => setStep('harnesses')}>Continue</Button></div>
   </Frame>;
   if (step === 'harnesses') return <Frame wide step="Step 2 of 3" title="Choose Harnesses" description="Sync places Skills and Rules into each Harness you keep on. Harnesses are saved in this Machine's machine.toml.">
@@ -144,7 +158,7 @@ function DetailsStep({ path, status, back, onDone }: { path: SetupPath; status: 
   </Frame>;
   const create = path === 'create';
   const secretLabel = create ? 'Admin token' : 'Join code';
-  return <Frame wide step="Step 3 of 3" title={create ? 'Start a new Fleet' : 'Join a Fleet'} description={create
+  return <Frame wide step="Step 3 of 3" title={create ? 'Join as the first Machine' : 'Join a Fleet'} description={create
     ? 'Registers this Machine as the first one on the Server. The admin token is used once to create a join code and is not saved.'
     : 'Registers this Machine with the Server and clones the Fleet\'s repo. The join code works once.'}>
     <form onSubmit={e => { e.preventDefault(); void run.run(() => api.join({
@@ -163,7 +177,7 @@ function DetailsStep({ path, status, back, onDone }: { path: SetupPath; status: 
       {!create && <Field><FieldLabel htmlFor="setup-copy-from">Copy Assignment from Machine</FieldLabel><Input id="setup-copy-from" value={copyFrom} placeholder="Machine id" disabled={run.pending} onChange={e => setCopyFrom(e.target.value)} aria-describedby="setup-copy-from-hint" />
         <FieldDescription id="setup-copy-from-hint">Optional. Otherwise this Machine starts with everything off, and the next step offers to turn it on.</FieldDescription></Field>}
       <FieldError>{run.error}</FieldError>
-      <div className="flex gap-2">{backButton}<Button type="submit" disabled={run.pending}><Pending pending={run.pending}>{create ? 'Start Fleet' : 'Join Fleet'}</Pending></Button></div>
+      <div className="flex gap-2">{backButton}<Button type="submit" disabled={run.pending}><Pending pending={run.pending}>Join Fleet</Pending></Button></div>
     </FieldGroup></form>
   </Frame>;
 }
@@ -193,28 +207,33 @@ export const gettingStartedShown = () => { try { return localStorage.getItem(get
 const hideGettingStarted = () => { try { localStorage.removeItem(gettingStartedKey); } catch { /* Storage may be unavailable. */ } };
 
 // Shown in the Library after the setup wizard until every step is done or it is dismissed.
-export function GettingStarted({ status, entries, machines, addImport, newSkill, showUnmanaged, reviewDraft }: {
+export function GettingStarted({ status, entries, machines, addImport, newSkill, newRule, showUnmanaged, reviewDraft, reopened, onDismiss }: {
   status: StatusView; entries: ContentEntry[] | undefined; machines: number | undefined;
-  addImport: () => void; newSkill: () => void; showUnmanaged: () => void; reviewDraft: () => void;
+  reopened: boolean; onDismiss: () => void; addImport: () => void; newSkill: () => void; newRule: () => void; showUnmanaged: () => void; reviewDraft: () => void;
 }) {
-  const [visible, setVisible] = useState(gettingStartedShown);
+  const [visible, setVisible] = useState(() => reopened || gettingStartedShown());
   const standalone = status.mode === 'standalone';
   const unmanaged = entries?.filter(entry => entry.type === 'unmanaged').length ?? 0;
   const steps: { title: string; done: boolean; action?: ReactNode }[] = [
     { title: 'Add a Skill or Rule', done: !!entries?.some(entry => entry.type !== 'unmanaged'),
-      action: <><Button size="sm" onClick={addImport}>Add Import</Button><Button size="sm" variant="outline" onClick={newSkill}>New Skill</Button></> },
+      action: <><Button size="sm" onClick={addImport}>Add Import</Button><Button size="sm" variant="outline" onClick={newSkill}>New Skill</Button><Button size="sm" variant="outline" onClick={newRule}>New Rule</Button></> },
     ...(unmanaged ? [{ title: `Adopt ${plural(unmanaged, 'Unmanaged skill')} already in your Harnesses`, done: false,
       action: <Button size="sm" variant="outline" onClick={showUnmanaged}>Show</Button> }] : []),
     { title: standalone ? 'Commit your Draft' : 'Commit your Draft to the Fleet', done: status.report.baseline !== null && status.report.drafts.length === 0,
       action: <Button size="sm" variant="outline" onClick={reviewDraft}>Review Draft</Button> },
-    ...(standalone ? [] : [{ title: 'Add another Machine', done: (machines ?? 0) > 1, action: <JoinCodeButton label="Create join code" /> }]),
+    ...(standalone ? [] : [{ title: 'Add another Machine', done: (machines ?? 0) > 1, action: <JoinCodeButton label="Create join code" serverUrl={status.server_url} /> }]),
   ];
-  const finished = !!entries && (standalone || machines !== undefined) && steps.every(step => step.done);
-  useEffect(() => { if (visible && finished) { hideGettingStarted(); setVisible(false); } }, [visible, finished]);
-  if (!visible || finished) return null;
+  const known = !!entries && (standalone || machines !== undefined);
+  const finished = known && steps.every(step => step.done);
+  // Reopening a finished checklist keeps it open; one with steps left still closes when they're done.
+  const [sawUnfinished, setSawUnfinished] = useState(false);
+  useEffect(() => { if (known && !finished) setSawUnfinished(true); }, [known, finished]);
+  const keepOpen = reopened && !sawUnfinished;
+  useEffect(() => { if (visible && finished && !keepOpen) { hideGettingStarted(); setVisible(false); onDismiss(); } }, [visible, finished, keepOpen, onDismiss]);
+  if (!visible || (finished && !keepOpen)) return null;
   return <Panel label="Getting started"><PanelToolbar><SectionTitle>Getting started</SectionTitle>
     <span className="text-xs text-muted-foreground tabular-nums">{steps.filter(step => step.done).length} of {steps.length} done</span>
-    <Button variant="ghost" size="sm" className="ml-auto" onClick={() => { hideGettingStarted(); setVisible(false); }}>Dismiss</Button></PanelToolbar>
+    <Button variant="ghost" size="sm" className="ml-auto" onClick={() => { hideGettingStarted(); setVisible(false); onDismiss(); }}>Dismiss</Button></PanelToolbar>
     <ol className="divide-y">{steps.map(step => <li key={step.title} className="flex flex-wrap items-center gap-3 px-3.5 py-2.5">
       <span aria-hidden className={cn('grid size-5 shrink-0 place-items-center rounded-full border', step.done && 'border-success bg-success text-background')}>{step.done && <Check className="size-3" />}</span>
       <span className={cn('min-w-0 flex-1 text-sm', step.done && 'text-muted-foreground line-through')}>{step.title}<span className="sr-only">{step.done ? ', done' : ', to do'}</span></span>

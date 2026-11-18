@@ -266,7 +266,7 @@ it.each(['personal', 'rule'] as const)('confirms deletion of a %s item and close
   fireEvent.click(screen.getByRole('button', { name: 'Delete…' }));
   expect(api.deleteItem).not.toHaveBeenCalled();
   const dialog = screen.getByRole('dialog', { name: 'Delete target?' });
-  expect(dialog.textContent).toContain('Commit removes it from the Baseline and every Machine.');
+  expect(dialog.textContent).toContain('The deletion reaches other Machines after you commit and push it and they sync.');
   fireEvent.click(within(dialog).getByRole('button', { name: 'Delete' }));
   await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
   expect(api.deleteItem).toHaveBeenCalledWith({ kind: type === 'rule' ? 'rule' : 'skill', name: 'target' });

@@ -207,10 +207,12 @@ it('opens Add Import directly when requested from Skills', async () => {
 });
 it('returns focus to Create join code on close', async () => {
   vi.mocked(api.joinCode).mockResolvedValue({ code: 'single-use' });
-  render(<JoinCodeButton label="Create join code" />);
+  render(<JoinCodeButton label="Create join code" serverUrl="https://example.com" />);
   const trigger = screen.getByRole('button', { name: 'Create join code' });
   trigger.focus(); fireEvent.click(trigger);
   const dialog = await screen.findByRole('dialog');
+  expect(within(dialog).getByText('sk1ll join https://example.com single-use')).toBeTruthy();
+  expect(within(dialog).getByText(/expires after 24 hours by default/)).toBeTruthy();
   fireEvent.keyDown(dialog, { key: 'Escape' });
   await waitFor(() => expect(document.activeElement).toBe(trigger));
 });
