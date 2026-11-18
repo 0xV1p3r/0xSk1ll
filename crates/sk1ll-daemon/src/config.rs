@@ -19,7 +19,7 @@ pub struct Config {
     pub assignment: PathBuf,
     /// Local API socket (`SK1LL_DAEMON_SOCKET`, default
     /// `$XDG_RUNTIME_DIR/sk1ll/daemon.sock`, else `run/daemon.sock` in the
-    /// config dir). Its directory must be ours and mode 0700.
+    /// config dir, as on macOS). Its directory must be ours and mode 0700.
     pub socket: PathBuf,
     /// Fallback pull while connected (`SK1LL_PULL_INTERVAL`, default `5m`).
     pub pull_every: Duration,
@@ -109,7 +109,8 @@ impl Config {
 
     /// `SK1LL_DAEMON_SOCKET`, else `$XDG_RUNTIME_DIR/sk1ll/daemon.sock`, else
     /// `run/daemon.sock` in the config dir (a directory of its own, since the
-    /// socket's directory must be private).
+    /// socket's directory must be private). macOS has no runtime dir, so it is
+    /// `~/Library/Application Support/sk1ll/run/daemon.sock` there.
     pub fn default_socket() -> anyhow::Result<PathBuf> {
         if let Some(v) = std::env::var_os("SK1LL_DAEMON_SOCKET").filter(|v| !v.is_empty()) {
             return Ok(v.into());
@@ -162,6 +163,15 @@ pub fn locate_repo(explicit: Option<&std::path::Path>, git_only: bool) -> anyhow
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn macos_default_socket_fits_sun_path() {
+        // macOS's sun_path holds 104 bytes with the NUL; a 32-character
+        // account name leaves room to spare.
+        let home = format!("/Users/{}", "u".repeat(32));
+        let socket = std::path::Path::new(&home).join("Library/Application Support/sk1ll/run/daemon.sock");
+        assert!(socket.as_os_str().len() < 104, "{}", socket.display());
+    }
 
     #[test]
     fn durations() {

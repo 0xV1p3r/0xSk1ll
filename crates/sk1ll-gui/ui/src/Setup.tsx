@@ -17,7 +17,7 @@ import { useMutation, useResource } from './hooks';
 import { everythingOn, insecureHttp, plural } from './model';
 import { JoinCodeButton } from './Settings';
 import { Details, ErrorNotice, Loading, Notice, Panel, PanelToolbar, Pending, SectionTitle } from './shared';
-import type { ContentEntry, DaemonStarted, HarnessChoice, StatusView } from './types';
+import type { ContentEntry, DaemonStarted, HarnessChoice, ServiceManager, StatusView } from './types';
 
 export function Wordmark() {
   return <div className="mb-3 w-44"><img src={wordmarkLight} alt="0xSk1ll" className="block h-auto w-full dark:hidden" /><img src={wordmarkDark} alt="0xSk1ll" className="hidden h-auto w-full dark:block" /></div>;
@@ -40,6 +40,16 @@ function Frame({ title, description, step, children, wide = false }: { title: st
   </main>;
 }
 
+const agent = 'gui/$(id -u)/app.v1p3r.sk1ll.daemon';
+const bootstrap = 'launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/app.v1p3r.sk1ll.daemon.plist';
+// What to run by hand for each platform's user service; the background process logs to the cache dir.
+const serviceCommands: Record<ServiceManager, { name: string; start: string; restart: string; log: string; processLog: string }> = {
+  systemd: { name: 'systemd user service', start: 'systemctl --user start sk1ll-daemon', restart: 'systemctl --user restart sk1ll-daemon',
+    log: 'journalctl --user -u sk1ll-daemon -n 50', processLog: 'tail -n 50 ~/.cache/sk1ll/daemon.log' },
+  launchd: { name: 'launchd agent', start: `mkdir -p ~/Library/Logs/sk1ll && launchctl enable ${agent} && (launchctl print ${agent} >/dev/null 2>&1 || ${bootstrap}) && launchctl kickstart ${agent}`, restart: `launchctl kickstart -k ${agent}`,
+    log: 'tail -n 50 ~/Library/Logs/sk1ll/daemon.log', processLog: 'tail -n 50 ~/Library/Caches/sk1ll/daemon.log' },
+};
+
 export function ConnectionPage({ socket, error, apiMismatch = false }: { socket: string; error: string; apiMismatch?: boolean }) {
   // Re-read after a failed restart: the unit may have stopped.
   const [serviceRevision, setServiceRevision] = useState(0);
@@ -49,15 +59,17 @@ export function ConnectionPage({ socket, error, apiMismatch = false }: { socket:
   const [slow, setSlow] = useState(false);
   useEffect(() => { if (!started) return; const timer = setTimeout(() => setSlow(true), 15000); return () => clearTimeout(timer); }, [started]);
   const info = service.data;
-  const how = !info?.binary ? '' : info.systemd ? info.unit ? 'Enables and starts the sk1ll-daemon user service.'
-    : 'Installs the sk1ll-daemon user service and starts it. It starts again whenever you log in.'
+  const commands = info && serviceCommands[info.manager];
+  const serviceName = info?.manager === 'launchd' ? 'app.v1p3r.sk1ll.daemon launch agent' : 'sk1ll-daemon user service';
+  const how = !info?.binary ? '' : info.available ? info.unit ? `${info.manager === 'launchd' ? 'Loads' : 'Enables'} and starts the ${serviceName}.`
+    : `Installs the ${serviceName} and starts it. It starts again whenever you log in.`
     : 'Runs the Daemon in the background until you log out.';
-  const log = started === 'systemd' ? 'journalctl --user -u sk1ll-daemon -n 50' : 'tail -n 50 ~/.cache/sk1ll/daemon.log';
+  const log = started === 'process' ? commands?.processLog : commands?.log;
   if (apiMismatch) return <Frame title="Restart the Daemon" description="The app and the running Daemon use different local API versions. The connection retries automatically.">
     {info?.restartable
       ? <Button className="self-start" disabled={start.pending} onClick={() => void start.run(() => api.restartDaemon().finally(() => setServiceRevision(n => n + 1)))}><Pending pending={start.pending}>Restart daemon</Pending></Button>
       : !service.loading && <><p>If you started the Daemon in a terminal, stop it there and run:</p><CopyCommand command="sk1ll daemon" />
-        <p>For a systemd user service, run:</p><CopyCommand command="systemctl --user restart sk1ll-daemon" /></>}
+        {commands && <><p>For a {commands.name}, run:</p><CopyCommand command={commands.restart} /></>}</>}
     <ErrorNotice error={start.error || service.error || error} />
   </Frame>;
   return <Frame title="Daemon is not running" description="The Daemon keeps this Machine's Harnesses in step and serves this window. The connection retries automatically.">
@@ -65,14 +77,14 @@ export function ConnectionPage({ socket, error, apiMismatch = false }: { socket:
       <Button disabled={start.pending || !!started} onClick={() => void start.run(api.startDaemon, setStarted)}>
         <Pending pending={start.pending}>{started ? <><Check data-icon="inline-start" />Daemon started</> : 'Start the Daemon'}</Pending></Button>
       <p className="text-xs text-muted-foreground">{how} <span className="font-mono break-all">{info.binary}</span></p>
-      <ErrorNotice error={start.error} title="Could not start the Daemon" /></div>}
+      <div className="whitespace-pre-line"><ErrorNotice error={start.error} title="Could not start the Daemon" /></div></div>}
     {info?.default_socket && !info.binary && <Notice title="The sk1ll command is not installed">Install it, for example with <code className="font-mono">cargo install --path crates/sk1ll-cli</code> in the 0xSk1ll source, then start the Daemon here.</Notice>}
-    {slow && <Notice title="The Daemon has not answered yet">Check its log for the reason:<div className="mt-2"><CopyCommand command={log} /></div></Notice>}
-    <Collapsible defaultOpen={!!info && (!info.default_socket || !info.binary)} key={String(!!info)}>
+    {slow && log && <Notice title="The Daemon has not answered yet">Check its log for the reason:<div className="mt-2"><CopyCommand command={log} /></div></Notice>}
+    <Collapsible defaultOpen={!info || !info.default_socket || !info.binary} key={String(!!info)}>
       <CollapsibleTrigger render={<Button variant="ghost" size="sm" className="-ml-2" />}>Start it yourself</CollapsibleTrigger>
       <CollapsibleContent className="flex flex-col gap-3 pt-2">
-        <div className="flex flex-col gap-2"><span className="text-muted-foreground">Start the service</span>
-          <CopyCommand command="systemctl --user start sk1ll-daemon" /></div>
+        {info && commands && (info.manager !== 'launchd' || info.unit) && <div className="flex flex-col gap-2"><span className="text-muted-foreground">Start the service</span>
+          <CopyCommand command={commands.start} /></div>}
         <div className="flex flex-col gap-2"><span className="text-muted-foreground">Or run it in a terminal</span>
           <CopyCommand command="sk1ll daemon" /></div>
       </CollapsibleContent>

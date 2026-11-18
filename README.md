@@ -22,9 +22,10 @@ For several machines, a self-hosted server acts as the git remote and holds the 
 
 ## Install
 
-Releases ship Linux builds. Each [release](https://github.com/0xV1p3r/0xSk1ll/releases) has:
+Releases ship Linux and Apple silicon macOS builds. Each [release](https://github.com/0xV1p3r/0xSk1ll/releases) has:
 
 - `sk1ll-<version>-x86_64-linux.tar.gz` with `sk1ll`, the desktop app `sk1ll-gui`, `sk1ll-server` and the systemd unit, and an `aarch64` archive without the app,
+- `sk1ll-<version>-aarch64-macos.tar.gz` with `sk1ll`, `sk1ll-server`, `0xSk1ll.app` and the launchd plist,
 - a `.deb` for the desktop app that also installs `sk1ll` to `/usr/bin`,
 - `SHA256SUMS`, and the server image `ghcr.io/0xv1p3r/sk1ll-server`.
 
@@ -35,6 +36,8 @@ install -Dm755 sk1ll-0.1.0-x86_64-linux/sk1ll -t ~/.local/bin        # and sk1ll
 ```
 
 Or install the `.deb` with `sudo apt install ./0xSk1ll_0.1.0_amd64.deb`. `sk1ll` needs `git` on `PATH`; the app needs GTK 3 and WebKitGTK 4.1.
+
+On macOS, verify the download with `shasum -a 256 -c SHA256SUMS --ignore-missing`. Extract the archive, copy `0xSk1ll.app` to Applications and put the CLI binaries on your `PATH` if you use them from a terminal. Git must be on `PATH`. The app is unsigned and unnotarized. If Gatekeeper blocks a copy you verified, try opening it once and then use Open Anyway in System Settings → Privacy & Security. macOS builds run in CI and have had no manual testing.
 
 To build from source instead, run `cargo install --path crates/sk1ll-cli`, which installs `sk1ll` to `~/.cargo/bin`. The CLI builds on any platform in standalone mode. The daemon, `join` and `fleet` need Unix.
 
@@ -51,7 +54,7 @@ sk1ll sync --dry-run                                                 # show what
 sk1ll sync                                                           # place them in every harness
 ```
 
-The repo lives in `~/.local/share/sk1ll/repo` (`$XDG_DATA_HOME/sk1ll/repo`) unless you pass `--repo` or set `SK1LL_REPO`. `sk1ll` commands run inside another skills repo use that one. A new repo starts with one commit holding its starter files, so Draft starts empty. If you later add an `origin` with its own history, the first Pull through the daemon replaces that commit with the remote's baseline. It looks like this:
+The repo lives in `~/.local/share/sk1ll/repo` (`$XDG_DATA_HOME/sk1ll/repo`) on Linux and in `~/Library/Application Support/sk1ll/repo` on macOS unless you pass `--repo` or set `SK1LL_REPO`. `sk1ll` commands run inside another skills repo use that one. A new repo starts with one commit holding its starter files, so Draft starts empty. If you later add an `origin` with its own history, the first Pull through the daemon replaces that commit with the remote's baseline. It looks like this:
 
 ```
 ~/.local/share/sk1ll/repo/

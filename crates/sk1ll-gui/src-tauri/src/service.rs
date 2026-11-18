@@ -1,8 +1,7 @@
 //! Starts or restarts this Machine's Daemon when the app can't connect to its local API.
 use serde::Serialize;
-use sk1ll_daemon::service::{self, Environment, Started};
+use sk1ll_daemon::service::{self, Environment, Manager, Started};
 use std::path::PathBuf;
-use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ServiceInfo {
@@ -10,34 +9,38 @@ pub struct ServiceInfo {
     pub default_socket: bool,
     /// The `sk1ll` executable that runs the Daemon.
     pub binary: Option<PathBuf>,
-    /// A systemd user manager is running.
-    pub systemd: bool,
+    /// This platform's user service manager: launchd on macOS, systemd elsewhere.
+    pub manager: Manager,
+    /// That manager is running for this user, so starting installs the user service.
+    pub available: bool,
     /// The user service is currently running.
     pub active: bool,
     /// The Daemon on the app's socket is the user service's main process, so restarting the
     /// service restarts the Daemon the app talks to.
     pub restartable: bool,
-    /// The user unit, if it is installed.
+    /// The systemd user unit or launchd agent, if it is installed.
     pub unit: Option<PathBuf>,
 }
 
 pub fn info() -> ServiceInfo {
-    let systemd = service::systemd();
-    let active = systemd && service_command("is-active").is_ok();
+    let manager = Manager::platform();
+    let available = Manager::running().is_some();
+    let active = available && manager.active();
     ServiceInfo {
         default_socket: default_socket(),
         binary: Environment::current().find_binary(),
-        systemd,
+        manager,
+        available,
         active,
-        restartable: active && default_socket() && socket_served_by_unit(),
-        unit: service::unit_path().filter(|p| p.is_file()),
+        restartable: active && default_socket() && socket_served_by_unit(manager),
+        unit: manager.path().filter(|p| p.is_file()),
     }
 }
 
 /// Compares the process serving the default socket with the user service's main process. A
 /// unit with its own socket override and a Daemon started in a terminal can both be running.
-fn socket_served_by_unit() -> bool {
-    match (socket_peer_pid(), unit_main_pid()) {
+fn socket_served_by_unit(manager: Manager) -> bool {
+    match (socket_peer_pid(), manager.main_pid()) {
         (Some(peer), Some(main)) => peer == main,
         _ => false,
     }
@@ -60,50 +63,38 @@ fn peer_pid(fd: std::os::fd::RawFd) -> Option<u32> {
     (rc == 0 && cred.pid > 0).then_some(cred.pid as u32)
 }
 
-// Without SO_PEERCRED the owner can't be established, so the app shows the commands instead.
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn peer_pid(fd: std::os::fd::RawFd) -> Option<u32> {
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    // SAFETY: `pid` and `len` are valid for writes and describe a `pid_t`, which is what
+    // LOCAL_PEERPID fills in.
+    let rc = unsafe { libc::getsockopt(fd, libc::SOL_LOCAL, libc::LOCAL_PEERPID, (&raw mut pid).cast(), &mut len) };
+    (rc == 0 && pid > 0).then_some(pid as u32)
+}
+
+// Without the peer's pid the owner can't be established, so the app shows the commands instead.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn peer_pid(_fd: std::os::fd::RawFd) -> Option<u32> {
     None
-}
-
-fn unit_main_pid() -> Option<u32> {
-    let output = Command::new("systemctl")
-        .args(["--user", "show", "--property=MainPID", "--value", service::UNIT])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&output.stdout).trim().parse().ok().filter(|&pid| pid > 0)
-}
-
-fn service_command(action: &str) -> Result<(), String> {
-    let output = Command::new("systemctl")
-        .args(["--user", action, service::UNIT])
-        .output()
-        .map_err(|error| error.to_string())?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "systemctl --user {action} sk1ll-daemon failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
 }
 
 pub fn restart() -> Result<(), String> {
     if !default_socket() {
         return Err("This app uses a custom Daemon socket (SK1LL_DAEMON_SOCKET). Restart that Daemon yourself.".into());
     }
-    service_command("is-active")?;
-    if !socket_served_by_unit() {
-        return Err(
-            "The Daemon on this app's socket isn't the sk1ll-daemon user service. Restart it where you started it."
-                .into(),
-        );
+    let manager = Manager::platform();
+    let name = match manager {
+        Manager::Systemd => "the sk1ll-daemon user service",
+        Manager::Launchd => "the app.v1p3r.sk1ll.daemon launch agent",
+    };
+    if Manager::running().is_none() || !manager.active() {
+        return Err(format!("{name} isn't running."));
     }
-    service_command("restart")
+    if !socket_served_by_unit(manager) {
+        return Err(format!("The Daemon on this app's socket isn't {name}. Restart it where you started it."));
+    }
+    manager.restart().map_err(|e| format!("{e:#}"))
 }
 
 fn default_socket() -> bool {

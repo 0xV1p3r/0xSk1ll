@@ -171,7 +171,7 @@ pub async fn daemon_service() -> Result<crate::service::ServiceInfo> {
     tauri::async_runtime::spawn_blocking(crate::service::info).await.map_err(|e| local_error(e.to_string()))
 }
 
-/// Not a Daemon call: starts it as the systemd user unit or a background process.
+/// Not a Daemon call: starts it as a user service or a background process.
 #[tauri::command]
 pub async fn start_daemon() -> Result<sk1ll_daemon::service::Started> {
     tauri::async_runtime::spawn_blocking(crate::service::start)
@@ -180,7 +180,7 @@ pub async fn start_daemon() -> Result<sk1ll_daemon::service::Started> {
         .map_err(local_error)
 }
 
-/// Restarts the local systemd user service after a local API mismatch.
+/// Restarts the local user service after a local API mismatch.
 #[tauri::command]
 pub async fn restart_daemon() -> Result<()> {
     tauri::async_runtime::spawn_blocking(crate::service::restart)

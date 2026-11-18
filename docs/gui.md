@@ -1,10 +1,10 @@
 # Desktop GUI
 
-`sk1ll-gui` is a Tauri v2 desktop app. Release builds ship for Linux. It talks only to the local daemon over its socket, so the daemon must be running. Without a fleet, it manages a standalone repo. It supports light, dark and system appearance.
+`sk1ll-gui` is a Tauri v2 desktop app. Release builds ship for x86_64 Linux and Apple silicon macOS. The macOS build runs in CI and has had no manual testing. It talks only to the local daemon over its socket, so the daemon must be running. Without a fleet, it manages a standalone repo. It supports light, dark and system appearance.
 
 ## First run
 
-1. **Start the daemon.** If the daemon isn't running, the app offers to start it. With a systemd user manager, it installs `deploy/sk1ll-daemon.service` with `ExecStart` pointing at the `sk1ll` it found, then enables and starts it. An existing unit is used as it is. Without systemd, it runs `sk1ll daemon` in the background until you log out, logging to `~/.cache/sk1ll/daemon.log`. It looks for `sk1ll` next to the app, then on `PATH`, then in `~/.local/bin` and `~/.cargo/bin`. With a custom `SK1LL_DAEMON_SOCKET`, it only shows the commands.
+1. **Start the daemon.** If the daemon isn't running, the app offers to start it. With a systemd user manager, it installs `deploy/sk1ll-daemon.service` with `ExecStart` pointing at the `sk1ll` it found, then enables and starts it. On macOS it installs and starts the per-user launchd agent in your GUI login session. An existing systemd unit is used as it is. On macOS, starting the daemon after moving the app updates the path in a generated plist. Without a user service manager, it runs `sk1ll daemon` in the background until you log out. The background process logs to `~/.cache/sk1ll/daemon.log` on Linux or `~/Library/Caches/sk1ll/daemon.log` on macOS. See [Run the daemon](fleet.md#run-the-daemon) for service logs and commands. It looks for `sk1ll` next to the app, then on `PATH`, then in `~/.local/bin` and `~/.cargo/bin`. With a custom `SK1LL_DAEMON_SOCKET`, it only shows the commands.
 2. **Choose how to use this machine.** While the machine has no repo, a setup wizard replaces the app:
    - *Only this machine* creates a standalone repo.
    - *Join a fleet* takes the server URL and a join code from another machine.
@@ -31,7 +31,7 @@ The header shows this machine's id, its headline status and whether the daemon a
 | Log | Browse assignment changes, newest first, and undo any entry |
 | Settings | List harnesses, join or rejoin (with a join code, or the admin token for a new fleet), create single-use join codes, and copy connection and version details with **Copy diagnostics** |
 
-In standalone mode, commits stay local. Push and Pull use the repo's own `origin`; without an origin those actions are unavailable. If there is no repo yet, the setup wizard creates it. The repo comes from `SK1LL_REPO`, the nearest `sk1ll.toml` above the daemon's working directory, or `~/.local/share/sk1ll/repo`.
+In standalone mode, commits stay local. Push and Pull use the repo's own `origin`; without an origin those actions are unavailable. If there is no repo yet, the setup wizard creates it. The repo comes from `SK1LL_REPO`, the nearest `sk1ll.toml` above the daemon's working directory, or the default repo location, `~/.local/share/sk1ll/repo` on Linux and `~/Library/Application Support/sk1ll/repo` on macOS.
 
 Items that aren't in the applied baseline carry an `Unpushed` or `Draft only` badge, and you can only assign them on this machine.
 
@@ -45,7 +45,7 @@ When an upgrade leaves the app and Daemon on different local API versions, the c
 
 ## Run it
 
-Install Rust, pnpm and the Tauri v2 prerequisites. On Linux that includes GTK3 and WebKitGTK 4.1. Then start the daemon (or let the app start it) and the app:
+Install Rust, pnpm and the Tauri v2 prerequisites. On Linux that includes GTK3 and WebKitGTK 4.1. On macOS install the Xcode Command Line Tools with `xcode-select --install`. The app uses the system WebKit. Then start the daemon (or let the app start it) and the app:
 
 ```sh
 systemctl --user start sk1ll-daemon    # or: sk1ll daemon

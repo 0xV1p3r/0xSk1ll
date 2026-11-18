@@ -126,6 +126,15 @@ impl Drop for Server {
 // ---------------------------------------------------------------------------
 // Machines
 
+const CONFIG_DIR: &str = if cfg!(target_os = "macos") { "Library/Application Support" } else { ".config" };
+const DATA_DIR: &str = if cfg!(target_os = "macos") { CONFIG_DIR } else { ".local/share" };
+const CACHE_DIR: &str = if cfg!(target_os = "macos") { "Library/Caches" } else { ".cache" };
+const SOCKET_PATH: &str = if cfg!(target_os = "macos") {
+    "Library/Application Support/sk1ll/run/daemon.sock"
+} else {
+    "run/sk1ll/daemon.sock"
+};
+
 struct Machine {
     id: String,
     home: tempfile::TempDir,
@@ -147,8 +156,8 @@ impl Machine {
             h.join("agent/skills").display(),
             h.join("agent/rules").display()
         );
-        write(&h.join(".config/sk1ll"), "machine.toml", &cfg);
-        let client = Client::new(h.join("run/sk1ll/daemon.sock"));
+        write(&h.join(CONFIG_DIR).join("sk1ll"), "machine.toml", &cfg);
+        let client = Client::new(h.join(SOCKET_PATH));
         Self { id: id.into(), home, child: None, client, env: Vec::new() }
     }
 
@@ -183,7 +192,7 @@ impl Machine {
     }
 
     fn repo(&self) -> PathBuf {
-        self.home.path().join(".local/share/sk1ll/repo")
+        self.home.path().join(DATA_DIR).join("sk1ll/repo")
     }
 
     fn skills(&self) -> PathBuf {
@@ -191,7 +200,7 @@ impl Machine {
     }
 
     fn state_path(&self) -> PathBuf {
-        self.home.path().join(".config/sk1ll/daemon.json")
+        self.home.path().join(CONFIG_DIR).join("sk1ll/daemon.json")
     }
 
     fn state(&self) -> DaemonState {
@@ -199,15 +208,15 @@ impl Machine {
     }
 
     fn snapshot_path(&self) -> PathBuf {
-        self.home.path().join(".config/sk1ll/daemon-assignment.json")
+        self.home.path().join(CONFIG_DIR).join("sk1ll/daemon-assignment.json")
     }
 
     fn outbox_path(&self) -> PathBuf {
-        self.home.path().join(".config/sk1ll/daemon-outbox.json")
+        self.home.path().join(CONFIG_DIR).join("sk1ll/daemon-outbox.json")
     }
 
     fn cache_path(&self) -> PathBuf {
-        self.home.path().join(".cache/sk1ll/assignment.json")
+        self.home.path().join(CACHE_DIR).join("sk1ll/assignment.json")
     }
 
     fn snapshot(&self) -> Option<AssignmentSnapshot> {
@@ -541,7 +550,7 @@ async fn assignment_change_reaches_another_harness_without_git() {
     assert!(!snapshot.assignment.skill_enabled(HARNESS, "x"));
     assert_eq!(b.head(), base);
     assert_eq!(git(&b.repo(), &["reflog"]), reflog, "no git operation moved anything");
-    let cached = Assignment::load(&b.home.path().join(".cache/sk1ll/assignment.json")).unwrap();
+    let cached = Assignment::load(&b.home.path().join(CACHE_DIR).join("sk1ll/assignment.json")).unwrap();
     assert_eq!(cached.harness(HARNESS).skills.get("x"), Some(&false), "the assignment is cached");
 }
 
@@ -872,7 +881,7 @@ async fn losing_the_assignment_cache_keeps_disabled_skills_off() {
     assert_eq!(b.snapshot().unwrap().revision, revision);
 
     b.stop();
-    std::fs::remove_dir_all(b.home.path().join(".cache")).unwrap();
+    std::fs::remove_dir_all(b.home.path().join(CACHE_DIR)).unwrap();
     b.start().await;
     eventually(|| async { (b.status().await.connection == Connection::Connected).then_some(()) }).await;
     assert_eq!(b.harness_skill("x"), None, "the disabled skill stays off");
@@ -881,7 +890,7 @@ async fn losing_the_assignment_cache_keeps_disabled_skills_off() {
     b.stop();
     server.stop();
     std::fs::remove_file(b.snapshot_path()).unwrap();
-    std::fs::remove_dir_all(b.home.path().join(".cache")).unwrap();
+    std::fs::remove_dir_all(b.home.path().join(CACHE_DIR)).unwrap();
     b.start().await;
     let s = b.status().await;
     assert!(s.awaiting_assignment, "{s:?}");
@@ -1056,7 +1065,7 @@ async fn failed_refresh_sends_no_status_or_discards() {
     let mut m = solo("solo", &server.url(), Some(snapshot(1, &[]))).with_env("SK1LL_RECONCILE_INTERVAL", "1h");
     write(m.outbox_path().parent().unwrap(), "daemon-outbox.json", r#"[{"id":1,"items":["skill:w"]}]"#);
     m.write("personal/w/SKILL.md", "recreated\n");
-    let config = m.home.path().join(".config/sk1ll/machine.toml");
+    let config = m.home.path().join(CONFIG_DIR).join("sk1ll/machine.toml");
     let good = std::fs::read_to_string(&config).unwrap();
     std::fs::write(&config, "[broken").unwrap();
     m.start().await;
@@ -1237,7 +1246,7 @@ async fn the_startup_clone_gives_up_at_the_git_deadline() {
 async fn displaced_conflicts_report_to_server_and_resolve() {
     let server = FakeServer::new().await;
     let mut m = solo("solo", &server.url(), Some(snapshot(1, &["x"])));
-    let state = m.home.path().join("state");
+    let state = m.home.path().join(if cfg!(target_os = "macos") { DATA_DIR } else { "state" });
     m = m.with_env("XDG_STATE_HOME", state.to_str().unwrap());
     // Two entries kept in the state directory by an older version, and one in
     // the skills dir's own recovery area that the state directory's index
@@ -1456,7 +1465,7 @@ async fn skills_api_browses_content_and_adopts_only_while_connected() {
     let mut m = Machine::new("skills");
     // Identical copies in two Harnesses, a differing third, and an empty
     // fourth whose new-skills default remains off.
-    let config = m.home.path().join(".config/sk1ll/machine.toml");
+    let config = m.home.path().join(CONFIG_DIR).join("sk1ll/machine.toml");
     let mut text = std::fs::read_to_string(&config).unwrap();
     for h in ["second", "different", "empty"] {
         text.push_str(&format!(
@@ -1578,7 +1587,9 @@ async fn unmanaged_adoption_retries_after_crash_between_publication_and_assignme
     m.stop();
     write(&m.skills().join("pdf"), "SKILL.md", "original user content");
     let repo = sk1ll_core::Repo::open(m.repo()).unwrap();
-    let hs = sk1ll_core::MachineConfig::load(&m.home.path().join(".config/sk1ll/machine.toml")).unwrap().harnesses();
+    let hs = sk1ll_core::MachineConfig::load(&m.home.path().join(CONFIG_DIR).join("sk1ll/machine.toml"))
+        .unwrap()
+        .harnesses();
     // Simulate a process dying just after atomic draft publication. There is
     // no intent or startup reconciliation; the original is still unmanaged.
     sk1ll_core::sync::unmanaged::prepare(&repo, &hs, HARNESS, "pdf").unwrap();
@@ -1769,7 +1780,7 @@ async fn block_conflict_diff_preserves_surrounding_notes() {
     let mut snap = snapshot(1, &[]);
     snap.assignment.harnesses.get_mut(HARNESS).unwrap().new_rules_default = true;
     let mut m = solo("block-diff", "http://127.0.0.1:1", Some(snap));
-    let config = m.home.path().join(".config/sk1ll/machine.toml");
+    let config = m.home.path().join(CONFIG_DIR).join("sk1ll/machine.toml");
     let cfg = std::fs::read_to_string(&config)
         .unwrap()
         .replace("instructions_format = \"rules\"", "instructions_format = \"block\"");
@@ -1978,7 +1989,7 @@ async fn setup_chooses_harnesses_only_before_the_repo_exists() {
     let choices = m.client.set_setup_harness("claude", false).await.unwrap();
     assert_eq!(enabled(&choices, "claude"), Some((true, false)));
     assert!(m.client.harnesses().await.unwrap().iter().all(|h| h.name != "claude"));
-    let config = std::fs::read_to_string(m.home.path().join(".config/sk1ll/machine.toml")).unwrap();
+    let config = std::fs::read_to_string(m.home.path().join(CONFIG_DIR).join("sk1ll/machine.toml")).unwrap();
     assert!(config.contains("instructions_format = \"rules\""), "{config}");
     assert_eq!(m.client.set_setup_harness("nope", false).await.unwrap_err().status, Some(404));
 
@@ -2192,7 +2203,7 @@ async fn standalone_join_revalidates_after_registration_and_keeps_local_authorit
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    let client = Client::new(m.home.path().join("run/sk1ll/daemon.sock"));
+    let client = Client::new(m.home.path().join(SOCKET_PATH));
     let joining = tokio::spawn(async move {
         client
             .join(&JoinApiRequest {
