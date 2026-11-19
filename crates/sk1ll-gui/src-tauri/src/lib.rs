@@ -56,6 +56,8 @@ pub fn run() {
             commands::harnesses,
             commands::setup_harnesses,
             commands::set_setup_harness,
+            commands::notifications_enabled,
+            commands::set_notifications,
             commands::harness_settings,
             commands::render_instructions,
             commands::preview_sync,

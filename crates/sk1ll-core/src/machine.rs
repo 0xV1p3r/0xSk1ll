@@ -163,6 +163,20 @@ pub struct MachineConfig {
     /// effective set (presets + entries).
     #[serde(default)]
     pub harnesses: BTreeMap<String, HarnessEntry>,
+    #[serde(default)]
+    pub notifications: Notifications,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Notifications {
+    pub enabled: bool,
+}
+
+impl Default for Notifications {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 struct Preset {
@@ -329,6 +343,19 @@ impl ConfigEdit {
 }
 
 impl MachineConfig {
+    /// Changes the desktop notification preference, preserving the rest of the file.
+    pub fn set_notifications(path: &Path, enabled: bool) -> Result<()> {
+        let snapshot = Snapshot::take(path)?;
+        let text = snapshot.text()?;
+        Self::parse(&text, path)?;
+        let mut config = ConfigDoc::parse(&text, path)?;
+        if !config.doc.contains_key("notifications") {
+            config.doc["notifications"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        config.doc["notifications"]["enabled"] = toml_edit::value(enabled);
+        snapshot.replace(&config.doc.to_string())
+    }
+
     /// `$XDG_CONFIG_HOME/sk1ll/machine.toml` (or the platform equivalent).
     pub fn default_path() -> Result<PathBuf> {
         dirs::config_dir()
@@ -946,6 +973,20 @@ pub(crate) fn hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notification_preference_defaults_on_and_preserves_other_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("machine.toml");
+        assert!(MachineConfig::load(&path).unwrap().notifications.enabled);
+        std::fs::write(&path, "# keep this\nid = 'box'\n").unwrap();
+        MachineConfig::set_notifications(&path, false).unwrap();
+        assert!(!MachineConfig::load(&path).unwrap().notifications.enabled);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.starts_with("# keep this\nid = 'box'"));
+        MachineConfig::set_notifications(&path, true).unwrap();
+        assert!(MachineConfig::load(&path).unwrap().notifications.enabled);
+    }
 
     fn config(toml: &str) -> MachineConfig {
         let dir = tempfile::tempdir().unwrap();

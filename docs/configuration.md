@@ -66,6 +66,26 @@ mode = "copy"
 
 A custom harness name uses lowercase letters, digits, `-` and `_`. Paths are absolute or start with `~/`, contain no `..`, and aren't the home directory or `/`, however a symlink spells them. Each location is compared where it resolves: no location may be inside another or equal to it, in the same harness or across harnesses, and none overlaps the skills repo. sk1ll checks this whenever a change turns a harness on (enable, add, edit, or resetting a preset). Turning a harness off or removing it is always allowed, so a bad entry can still be fixed.
 
+### Desktop notifications
+
+The Daemon shows desktop notifications when a pull becomes Blocked, Conflicts
+increase, the Machine is revoked, authentication is rejected for two minutes,
+or Import checks report new failures. This works with the desktop app closed.
+Repeated alerts of the same kind wait ten minutes unless the affected list
+grows. The Daemon keeps notification history next to its state file.
+
+Desktop notifications are enabled by default. To turn them off in
+`machine.toml`, set:
+
+```toml
+[notifications]
+enabled = false
+```
+
+Set `SK1LL_NOTIFICATIONS=0` in the Daemon's environment to disable alerts on
+headless Machines or in CI. On Linux, install `notify-send` and run the Daemon
+in a user session with a desktop notification service.
+
 ### Paths with `..`
 
 sk1ll refuses a path with `..` when a change turns a harness on, because after a symlink `..` means the target's parent, not the parent as written. An entry written before keeps working until you change it. To change it, use the destination the path resolves to in the filesystem: `realpath -m <path>` prints it (on macOS, `realpath` without `-m` for a path that exists). For example, if `~/tools` is a symlink to `/opt/tools`, `~/tools/../agents/skills` resolves to `/opt/agents/skills`, not `~/agents/skills`. Write that resolved path in `machine.toml`, or pass it to `sk1ll harnesses add <name> --skills /opt/agents/skills`.

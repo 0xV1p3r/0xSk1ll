@@ -27,6 +27,7 @@
 //! | GET | `/harnesses` | → `Vec<`[`HarnessView`]`>` |
 //! | GET | `/setup/harnesses` | → `Vec<`[`HarnessChoice`]`>` |
 //! | POST | `/setup/harnesses/{name}` | [`SetHarnessEnabled`] → `Vec<`[`HarnessChoice`]`>`; standalone without a repo only |
+//! | GET / POST | `/notifications` | read or set the desktop notification preference as a JSON boolean |
 //! | GET | `/harnesses/config` | → [`HarnessSettings`] |
 //! | POST | `/harnesses/preview` | [`HarnessChangeRequest`] → [`HarnessPreview`]; changes nothing |
 //! | POST | `/harnesses/apply` | [`HarnessChangeRequest`] → [`HarnessApplied`]; then syncs; never removes placed content; 409 if `machine.toml` changed while it was written |
@@ -879,6 +880,14 @@ impl Client {
 
     pub async fn set_setup_harness(&self, name: &str, enabled: bool) -> Result<Vec<HarnessChoice>> {
         self.post(&format!("/setup/harnesses/{}", encode(name)), &SetHarnessEnabled { enabled }).await
+    }
+
+    pub async fn notifications_enabled(&self) -> Result<bool> {
+        self.get("/notifications").await
+    }
+
+    pub async fn set_notifications(&self, enabled: bool) -> Result<bool> {
+        self.post("/notifications", &enabled).await
     }
 
     pub async fn harness_settings(&self) -> Result<HarnessSettings> {
