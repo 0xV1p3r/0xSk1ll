@@ -493,6 +493,9 @@ pub(crate) async fn copy_assignment(
         })?;
     let status = resp.status();
     let body = resp.bytes().await.context("reading the Server's response").map_err(CopyFailure::Lost)?;
+    if status.is_server_error() {
+        return Err(CopyFailure::Lost(anyhow::anyhow!("HTTP {status}")));
+    }
     if !status.is_success() {
         let error = serde_json::from_slice::<ErrorBody>(&body);
         // Only this Server's own errors have a JSON body; an older Server's router has no route.
@@ -506,11 +509,4 @@ pub(crate) async fn copy_assignment(
         )));
     }
     serde_json::from_slice(&body).context("parsing the Server's response").map_err(CopyFailure::Lost)
-}
-
-/// This machine's Assignment as the Server has it now.
-pub(crate) async fn fetch_assignment(d: &Daemon) -> anyhow::Result<AssignmentSnapshot> {
-    let state = d.ident.joined()?;
-    let path = format!("/machines/{}/assignment", state.machine_id);
-    Ok(request(&d.http, state, Method::GET, &path, Bytes::new()).await?.error_for_status()?.json().await?)
 }
