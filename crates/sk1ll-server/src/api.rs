@@ -251,9 +251,12 @@ async fn copy_assignment(
     Json(copy): Json<AssignmentCopy>,
 ) -> Result<Json<AssignmentCopied>> {
     caller.require_machine(&id)?;
+    let push = server.push_lock.clone().lock_owned().await;
     let (machine, author, now, items) = (id.clone(), caller.author().to_string(), now(), server.baseline_items());
     let (applied, registration, copied, skipped) = server
         .db(move |conn| {
+            // The database task can outlive a cancelled HTTP request.
+            let _push = push;
             let tx = conn.transaction()?;
             authorize_assignment(&tx, &caller, &machine)?;
             let m = db::machine(&tx, &machine)?.ok_or_else(|| ApiError::NotFound(format!("no machine `{machine}`")))?;
@@ -343,6 +346,35 @@ mod tests {
         server.db(move |conn| db::insert_join_code(conn, &code_hash, "admin", now(), scope)).await.unwrap();
         let req = JoinRequest { code, machine_id: id.into(), harnesses: vec!["claude".into()], copy_from: None };
         join(State(server.clone()), Json(req)).await.unwrap().1.0.token
+    }
+
+    #[tokio::test]
+    async fn copy_checks_baseline_membership_after_an_in_progress_push() {
+        use sk1ll_proto::ItemRef;
+
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::open(Config::new(dir.path().join("data"))).await.unwrap();
+        join_with(&server, "me", Scope::Fleet).await;
+        let from = ItemRef::Skill("pdf".into());
+        let to = ItemRef::Skill("docs".into());
+
+        let push = server.push_lock.lock().await;
+        let copy = copy_assignment(
+            State(server.clone()),
+            Caller::Admin,
+            Path("me".into()),
+            Json(AssignmentCopy { from: from.clone(), to: to.clone() }),
+        );
+        tokio::pin!(copy);
+        assert!(futures_util::poll!(&mut copy).is_pending());
+
+        // Publish the pushed tree before releasing the lock. Both items
+        // now exist, so the established destination cannot be overwritten.
+        crate::lock(&server.baseline).inventory =
+            Some(crate::Inventory { commit: "pushed".into(), items: Arc::new([from, to].into()) });
+        drop(push);
+        let result = copy.await;
+        assert!(matches!(result, Err(ApiError::Conflict(_))), "{result:?}");
     }
 
     /// Review finding: a request authenticated as a `fleet` machine, then
