@@ -30,6 +30,11 @@ use std::path::{Path, PathBuf};
 
 use crate::{Error, IoExt, Result};
 
+/// Atomically replaces a private state file and syncs its parent directory.
+pub fn replace_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    Staged::write(path, bytes, Some(0o600))?.replace()
+}
+
 /// A file staged next to `dest`; see the module docs. Removed unless published.
 #[derive(Debug)]
 pub(crate) struct Staged {

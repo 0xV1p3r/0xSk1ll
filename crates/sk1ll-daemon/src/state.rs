@@ -8,7 +8,6 @@
 //! of `draft_discarded` messages not yet delivered.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -152,30 +151,39 @@ pub(crate) fn has_credentials(url: &str) -> bool {
 
 /// Writes `path` atomically with mode 0600, creating its directory (0700).
 pub(crate) fn write_private(path: &Path, body: &[u8]) -> anyhow::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    use std::os::unix::fs::DirBuilderExt;
     let dir = path.parent().context("state path has no parent")?;
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(dir)
         .with_context(|| format!("creating {}", dir.display()))?;
-    let tmp = dir.join(format!(".{}.tmp", path.file_name().and_then(|n| n.to_str()).unwrap_or("state")));
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)
-        .with_context(|| format!("writing {}", tmp.display()))?;
-    f.write_all(body)?;
-    f.sync_all()?;
-    drop(f);
-    fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
+    sk1ll_core::config_file::replace_private(path, body)?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_write_ignores_staging_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.json");
+        let target = dir.path().join("existing");
+        fs::write(&target, b"keep").unwrap();
+        for name in [".daemon.json.tmp", ".daemon.json.sk1ll-tmp"] {
+            symlink(&target, dir.path().join(name)).unwrap();
+        }
+
+        write_private(&path, b"private").unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"keep");
+        assert_eq!(fs::read(&path).unwrap(), b"private");
+        assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    }
 
     fn state() -> DaemonState {
         DaemonState {

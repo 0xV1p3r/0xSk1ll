@@ -145,6 +145,10 @@ struct Machine {
 }
 
 impl Machine {
+    fn machine_config(home: &std::path::Path) -> std::path::PathBuf {
+        home.join(CONFIG_DIR).join("sk1ll/machine.toml")
+    }
+
     /// A machine with one harness, `agent`, under its temp HOME (copy mode,
     /// rules-format instructions). No presets exist in that HOME.
     fn new(id: &str) -> Self {
@@ -156,7 +160,8 @@ impl Machine {
             h.join("agent/skills").display(),
             h.join("agent/rules").display()
         );
-        write(&h.join(CONFIG_DIR).join("sk1ll"), "machine.toml", &cfg);
+        let config = Self::machine_config(h);
+        write(config.parent().unwrap(), "machine.toml", &cfg);
         let client = Client::new(h.join(SOCKET_PATH));
         Self { id: id.into(), home, child: None, client, env: Vec::new() }
     }
@@ -2231,7 +2236,7 @@ async fn setup_chooses_harnesses_only_before_the_repo_exists() {
     let enabled = |choices: &[sk1ll_daemon::client::HarnessChoice], name: &str| {
         choices.iter().find(|c| c.name == name).map(|c| (c.installed, c.enabled))
     };
-    let path = m.home.path().join(".config/sk1ll/machine.toml");
+    let path = Machine::machine_config(m.home.path());
     let before = std::fs::read_to_string(&path).unwrap();
     let choices = m.client.setup_harnesses().await.unwrap();
     assert_eq!(enabled(&choices, "claude"), Some((true, true)));
@@ -2269,7 +2274,7 @@ async fn harnesses_change_after_setup_with_a_preview_of_what_stays() {
     m.start().await;
     eventually(|| async { (m.harness_skill("pdf").as_deref() == Some("original")).then_some(()) }).await;
     let settings = m.client.harness_settings().await.unwrap();
-    assert_eq!(settings.path, m.home.path().join(".config/sk1ll/machine.toml"));
+    assert_eq!(settings.path, Machine::machine_config(m.home.path()));
     assert!(settings.harnesses.iter().any(|c| c.name == HARNESS && c.configured && !c.preset));
 
     // Adding a custom harness previews what it receives, then syncs it.
