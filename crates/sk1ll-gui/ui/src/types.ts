@@ -81,7 +81,7 @@ export interface HarnessChangeRequest { change: HarnessChange; fingerprint?: str
 export interface InstructionPreview {
   path: string; format: 'block' | 'rules'; content: string; next_content: string; differs: boolean; diff: string;
 }
-export interface SyncResult { fingerprint?: string; conflicts: ConflictView[]; actions?: PlacementView[]; errors?: string[] }
+export interface SyncResult { fingerprint?: string; conflicts: ConflictView[]; actions?: PlacementView[]; completed?: PlacementView[]; changed?: PlacementView; errors?: string[] }
 export interface PlacementView {
   harness: string; kind: 'create' | 'update' | 'remove' | 'conflict'; item: 'skill' | 'rule' | 'instructions';
   name: string; dest: string; reason: string | null;

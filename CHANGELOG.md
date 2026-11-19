@@ -95,15 +95,16 @@ break compatibility.
   notifications keep their retry schedule across Daemon restarts.
 - Harness-wide Assignment and rename-copy require a current Baseline inventory.
   A structured inventory refusal tells rename-copy to retry. Harness-wide
-  changes report skipped names, including when using an older Server. The CLI and Settings
-  shows local placement errors after saving an Assignment, and retries sync
-  even when the revision is unchanged.
+  changes report skipped names, including when using an older Server. The CLI
+  and Settings show local placement errors after saving an Assignment. Settings
+  retries sync even when the revision is unchanged.
 - The Library keeps unsaved text through a Daemon disconnect and restores
   keyboard focus when editing ends.
 - Reviewed Import updates require a dedicated Daemon route. Harness Apply
   reports when either client or Daemon is too old for a fingerprint. Reviewed
   Sync verifies staged copies before publishing and requests a new preview if
-  the staged bytes changed. Settings can open `machine.toml` even when it fails
+  the staged bytes changed. The new preview shows completed placements and
+  earlier errors. Settings can open `machine.toml` even when it fails
   to parse.
 - The development GUI shows historical file contents after a working-copy save.
 - Assignment edits check revisions on supported authorities. The matrix warns

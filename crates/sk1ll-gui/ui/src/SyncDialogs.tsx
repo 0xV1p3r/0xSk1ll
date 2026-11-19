@@ -44,13 +44,20 @@ export function SyncDialog({ onClose, changed }: { onClose: () => void; changed:
   const apply = useMutation();
   const [replanned, setReplanned] = useState(false);
   const actions = preview.data?.actions;
+  const changedPlacement = preview.data?.changed;
+  const completed = preview.data?.completed?.length ?? 0;
   return <Dialog open onOpenChange={open => { if (!open && !apply.pending) onClose(); }}>
     <DialogContent showCloseButton={!apply.pending} className="sm:max-w-2xl">
       <DialogHeader><DialogTitle>Sync now</DialogTitle>
         <DialogDescription>Review the changes before syncing. Resolve any remaining conflicts in Conflicts.</DialogDescription></DialogHeader>
       <ErrorNotice error={preview.error} />
       {preview.loading && <Loading rows={2} />}
-      {replanned && <p role="status">The sync plan changed. Review the new plan before applying.</p>}
+      {replanned && <p role="status">{changedPlacement
+        ? `${completed} ${completed === 1 ? 'change was' : 'changes were'} applied, then ${changedPlacement.name} changed — review the remaining plan.`
+        : 'The sync plan changed. Review the new plan before applying.'}</p>}
+      {!!preview.data?.errors?.length && <ul aria-label="Placement errors" className="text-destructive">
+        {preview.data.errors.map((error, index) => <li key={index}>{error}</li>)}
+      </ul>}
       {actions && <>
         <dl className="grid grid-cols-4 gap-2">
           {actionKinds.map(kind => <div key={kind} className="rounded-md border p-2">
@@ -75,6 +82,7 @@ export function SyncDialog({ onClose, changed }: { onClose: () => void; changed:
               if (result.fingerprint) {
                 preview.setData(result);
                 setReplanned(true);
+                if (result.changed) changed();
                 return;
               }
               toast(result.errors?.length
