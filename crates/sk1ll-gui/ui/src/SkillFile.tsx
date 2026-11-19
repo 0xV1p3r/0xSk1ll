@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { parseDocument } from 'yaml';
@@ -137,13 +137,21 @@ function FileEditor({ file, query, changed, guard, reload, exit, setEditing: set
 export function SkillFile({ file, editor }: { file: FileContent; editor?: FileEditorProps }) {
   const [editing, setEditing] = useState(false);
   const [raw, setRaw] = useState(false);
-  if (editing && editor) return <FileEditor file={file} {...editor} exit={() => setEditing(false)} />;
+  const heading = useRef<HTMLHeadingElement>(null);
+  const restoreFocus = useRef(false);
+  useEffect(() => {
+    if (!editing && restoreFocus.current) {
+      restoreFocus.current = false;
+      (heading.current ?? document.getElementById('main'))?.focus();
+    }
+  }, [editing]);
+  if (editing && editor) return <FileEditor file={file} {...editor} exit={() => { restoreFocus.current = true; setEditing(false); }} />;
   if (file.too_large) return <Notice title="File too large">This file exceeds the 1 MiB preview limit.</Notice>;
   if (file.binary || file.text === null) return <Notice title="Binary file">This file has no text preview.</Notice>;
   const markdown = /\.md$/i.test(file.path);
   const { body, rows } = markdown ? frontmatter(file.text) : { body: file.text, rows: [] };
   return <div className="flex min-w-0 flex-col gap-4 rounded-xl border border-border bg-card p-4">
-    <div className="-mx-4 -mt-4 flex flex-wrap items-center justify-between gap-2 border-b border-border bg-muted/40 px-4 py-3"><h3 className="break-all font-mono text-xs">{file.path}</h3>
+    <div className="-mx-4 -mt-4 flex flex-wrap items-center justify-between gap-2 border-b border-border bg-muted/40 px-4 py-3"><h3 ref={heading} tabIndex={-1} className="break-all font-mono text-xs">{file.path}</h3>
       <div className="flex flex-wrap gap-1">
       {editor?.writable && file.fingerprint && <Button variant="outline" onClick={() => setEditing(true)}>Edit</Button>}
       {markdown && <div role="group" aria-label="Markdown view" className="flex gap-1">

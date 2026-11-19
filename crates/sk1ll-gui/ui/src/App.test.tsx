@@ -1,12 +1,18 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { SkillFile } from './SkillFile';
 import { App } from './App';
 import { api } from './api';
 import type { StatusView } from './types';
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(async () => () => {}) }));
-vi.mock('./api', () => ({ api: { status: vi.fn(), connectionInfo: vi.fn(), skills: vi.fn(), recovered: vi.fn(), imports: vi.fn(), fleet: vi.fn(), log: vi.fn(), logFacets: vi.fn(), init: vi.fn(), setupHarnesses: vi.fn() }, errorMessage: String }));
-vi.mock('./Skills', () => ({ Skills: () => <div>Local library</div> }));
+vi.mock('./api', () => ({ api: { status: vi.fn(), connectionInfo: vi.fn(), skills: vi.fn(), recovered: vi.fn(), imports: vi.fn(), fleet: vi.fn(), log: vi.fn(), logFacets: vi.fn(), init: vi.fn(), setupHarnesses: vi.fn(), writeSkillFile: vi.fn(), skillFile: vi.fn() }, errorMessage: String, errorStatus: (e: {status?: number}) => e?.status }));
+vi.mock('./Skills', () => ({
+  Skills: ({ fileEditState }: { fileEditState: { current: string } }) => <SkillFile
+    file={{ path: 'SKILL.md', fingerprint: 'original', text: 'Original', binary: false, too_large: false, size: 8 }}
+    editor={{ query: { item: 'skill:pdf' }, writable: true, setEditing: () => {}, changed: () => {},
+      guard: state => { fileEditState.current = state; }, reload: () => {} }} />,
+}));
 const status: StatusView = { mode: 'standalone', has_origin: false, repo_ready: true, machine_id: 'local', server_url: null, repo: '/skills', headline: 'in_sync', connection: 'standalone', last_error: null, revoked: false, server_baseline: null, assignment_revision: 0, awaiting_assignment: false, auth_rejected_since: null, pending_discards: 0, report: { baseline: null, drafts: [], unpushed: [], conflicts: [], harnesses: [], blocked: false, clashes: [], behind: false } };
 beforeEach(() => {
   vi.resetAllMocks();
@@ -47,5 +53,29 @@ it('does not request fleet or history during standalone background refresh', asy
     await act(async () => { await vi.advanceTimersByTimeAsync(16000); });
     expect(api.status).toHaveBeenCalled();
     expect(api.fleet).not.toHaveBeenCalled(); expect(api.log).not.toHaveBeenCalled(); expect(api.logFacets).not.toHaveBeenCalled();
+  } finally { cleanup(); vi.useRealTimers(); }
+});
+
+it('keeps a dirty Library editor mounted across daemon failure and saves against the original fingerprint', async () => {
+  vi.useFakeTimers();
+  try {
+    await act(async () => { render(<App />); });
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'SKILL.md' }), { target: { value: 'Unsaved draft' } });
+    vi.mocked(api.status).mockRejectedValue({ unreachable: true });
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+    expect(screen.getByText(/Daemon disconnected/)).toBeTruthy();
+    expect((screen.getByRole('textbox', { name: 'SKILL.md' }) as HTMLTextAreaElement).value).toBe('Unsaved draft');
+    vi.mocked(api.status).mockResolvedValue(status);
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+    expect(screen.queryByText(/Daemon disconnected/)).toBeNull();
+    vi.mocked(api.writeSkillFile).mockRejectedValue({ status: 409 });
+    vi.mocked(api.skillFile).mockResolvedValue({ path: 'SKILL.md', text: 'New disk content', fingerprint: 'new', binary: false, too_large: false, size: 16 });
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Save' })); });
+    expect(api.writeSkillFile).toHaveBeenCalledWith({ item: 'skill:pdf', path: 'SKILL.md', expected: 'original', content: 'Unsaved draft' });
+    expect(screen.getByText('File changed on disk')).toBeTruthy();
+    vi.spyOn(window, 'confirm').mockReturnValueOnce(true);
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(document.activeElement).toBe(screen.getByRole('heading', { name: 'SKILL.md' }));
   } finally { cleanup(); vi.useRealTimers(); }
 });
