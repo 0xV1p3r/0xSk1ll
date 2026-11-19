@@ -92,14 +92,20 @@ break compatibility.
 ### Fixed
 
 - Daemon state writes use exclusive private staging files. Failed desktop
-  notifications are retried with backoff.
+  notifications keep their retry schedule across Daemon restarts.
 - Harness-wide Assignment and rename-copy require a current Baseline inventory.
-  Harness-wide changes skip ineligible item names and sync locally before
-  Settings previews a disable again.
+  A structured inventory refusal tells rename-copy to retry. Harness-wide
+  changes report skipped names in standalone and direct CLI use. Settings
+  shows local placement errors after saving an Assignment, and retries sync
+  even when the revision is unchanged.
 - The Library keeps unsaved text through a Daemon disconnect and restores
   keyboard focus when editing ends.
-- Harness changes, desktop Sync now, and Import updates detect changes made
-  after their previews. Settings can open `machine.toml` even when it fails to parse.
+- Reviewed Import updates require a dedicated Daemon route. Harness Apply
+  reports when either client or Daemon is too old for a fingerprint. Reviewed
+  Sync verifies staged copies before publishing and requests a new preview if
+  the staged bytes changed. Settings can open `machine.toml` even when it fails
+  to parse.
+- The development GUI shows historical file contents after a working-copy save.
 - Assignment edits check revisions on supported authorities. The matrix warns
   before unguarded bulk edits, and Copy Assignment can recover from a conflict
   within the same dialog.

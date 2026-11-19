@@ -132,6 +132,8 @@ struct PullState {
     blocked: Option<Vec<ItemRef>>,
 }
 
+type ReviewedSync = (Repo, Vec<(Action, Option<String>)>);
+
 /// Mutable state, only touched with the engine mutex held.
 pub(crate) struct Engine {
     state: Mode,
@@ -146,6 +148,9 @@ pub(crate) struct Engine {
     /// The published report is not the result of a successful refresh: the
     /// last one failed, or none ran yet. Nothing may be derived from it.
     stale: bool,
+    assignment_placement_failed: bool,
+    #[cfg(test)]
+    after_sync_review: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl Daemon {
@@ -223,6 +228,9 @@ impl Daemon {
                 lock: None,
                 frozen: false,
                 stale: true,
+                assignment_placement_failed: true,
+                #[cfg(test)]
+                after_sync_review: None,
             }),
             view: watch::channel(view).0,
             events: broadcast::channel(256).0,
@@ -292,13 +300,17 @@ impl Daemon {
         eng: &mut Engine,
         harness: &str,
         body: sk1ll_proto::SetHarnessAssignment,
-    ) -> Result<sk1ll_proto::AssignmentChanges> {
+    ) -> Result<(sk1ll_proto::AssignmentChanges, Vec<ItemRef>)> {
         self.ensure_managed(eng)?;
         self.lock_repo(eng)?;
         let repo = Repo::open(Self::root(eng))?;
         let skills = repo.skills()?.into_iter().map(|skill| sk1ll_proto::ItemRef::Skill(skill.name));
         let rules = repo.rules()?.into_iter().map(|rule| sk1ll_proto::ItemRef::Rule(rule.name));
-        Ok(body.changes(harness, skills.chain(rules)))
+        let (eligible, skipped): (Vec<_>, Vec<_>) = skills.chain(rules).partition(|item| match item {
+            ItemRef::Skill(name) | ItemRef::Rule(name) => sk1ll_core::imports::validate_name(name).is_ok(),
+            _ => false,
+        });
+        Ok((body.changes(harness, eligible), skipped))
     }
 
     pub(crate) fn set_local_assignment(
@@ -371,21 +383,31 @@ impl Daemon {
         }
         // Assignment::save replaces the file atomically, like the direct CLI.
         assignment.save(&self.cfg.assignment)?;
-        self.saved_local_assignment(eng);
+        let errors = self.saved_local_assignment(eng);
         let snap = self.snapshot().expect("standalone always has assignment");
         Ok(sk1ll_proto::AssignmentUpdate {
             revision: snap.revision,
             assignment: snap.assignment.clone(),
             entries: Vec::new(),
+            errors,
         })
     }
 
     /// Publishes and applies a just saved local Assignment. The save is the
     /// write: a failure from here on shows in the status, never as a failed write.
-    fn saved_local_assignment(&self, eng: &mut Engine) {
-        if let Err(e) = self.reload_local_assignment().and_then(|()| self.refresh(eng)) {
-            self.set_error(format!("applying the saved Assignment: {e}"));
-        }
+    fn saved_local_assignment(&self, eng: &mut Engine) -> Vec<String> {
+        let result = self.reload_local_assignment().and_then(|()| self.refresh_reporting(eng));
+        self.assignment_placement_outcome(eng, result)
+    }
+
+    fn assignment_placement_outcome(&self, eng: &mut Engine, result: Result<Vec<String>>) -> Vec<String> {
+        let errors = result.unwrap_or_else(|e| {
+            let message = crate::auth::redact(&format!("applying the saved Assignment: {e}"));
+            self.set_error(message.clone());
+            vec![message]
+        });
+        eng.assignment_placement_failed = !errors.is_empty();
+        errors.into_iter().map(|error| crate::auth::redact(&error)).collect()
     }
 
     /// The standalone counterpart of the Server's `POST
@@ -435,7 +457,7 @@ impl Daemon {
         }
         if !applied.is_empty() {
             assignment.save(&self.cfg.assignment)?;
-            self.saved_local_assignment(eng);
+            let _ = self.saved_local_assignment(eng);
         }
         let snap = self.snapshot().expect("standalone always has assignment");
         Ok(sk1ll_proto::AssignmentCopied {
@@ -744,10 +766,12 @@ impl Daemon {
     /// [`Daemon::refresh`], returning what the sync failed to place (also
     /// published as the last error).
     fn refresh_reporting(&self, eng: &mut Engine) -> Result<Vec<String>> {
-        self.refresh_with_plan(eng, None)
+        let result = self.refresh_with_plan(eng, None);
+        eng.assignment_placement_failed = result.as_ref().map_or(true, |errors| !errors.is_empty());
+        result
     }
 
-    fn refresh_with_plan(&self, eng: &mut Engine, reviewed: Option<(Repo, Vec<Action>)>) -> Result<Vec<String>> {
+    fn refresh_with_plan(&self, eng: &mut Engine, reviewed: Option<ReviewedSync>) -> Result<Vec<String>> {
         if Self::idle(eng) {
             return Ok(Vec::new());
         }
@@ -785,12 +809,12 @@ impl Daemon {
             let planned = reviewed.map(Ok).unwrap_or_else(|| {
                 Repo::open(&root).and_then(|repo| {
                     let actions = sync::plan(&repo, &harnesses, &snap.assignment, PlanOptions::default())?;
-                    Ok((repo, actions))
+                    Ok((repo, actions.into_iter().map(|action| (action, None)).collect()))
                 })
             });
             match planned {
                 Ok((repo, actions)) => {
-                    for a in &actions {
+                    for (a, digest) in &actions {
                         if a.kind == ActionKind::Conflict {
                             for item in conflict_items(a) {
                                 let c = ConflictRef { item, harness: a.harness.clone() };
@@ -798,9 +822,14 @@ impl Daemon {
                                     conflicts.push(c);
                                 }
                             }
-                        } else if let Err(e) = sync::apply(&repo, a)
+                        } else if let Err(e) = sync::apply_reviewed(&repo, a, digest.as_deref())
                             && !matches!(e, sk1ll_core::Error::Displaced { .. })
                         {
+                            if digest.is_some()
+                                && let sk1ll_core::Error::Changed(message) = e
+                            {
+                                return Err(Error::ReviewedPlacementChanged(message));
+                            }
                             errors.push(format!("sync {}: {e}", a.dest.display()));
                         }
                     }
@@ -1371,21 +1400,25 @@ impl Daemon {
         let repo = Repo::open(self.repo_root())?;
         let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
         let actions = sync::plan(&repo, &harnesses, &self.current_assignment()?, PlanOptions { force })?;
-        Self::sync_preview_result(&actions)
+        let sources = Self::sync_source_digests(&actions)?;
+        Self::sync_preview_result(&actions, &sources)
     }
 
-    fn sync_preview_result(actions: &[Action]) -> Result<SyncResult> {
-        let sources = actions
+    fn sync_source_digests(actions: &[Action]) -> Result<Vec<Option<String>>> {
+        Ok(actions
             .iter()
-            .filter_map(|action| match (&action.kind, &action.item) {
+            .map(|action| match (&action.kind, &action.item) {
                 (
                     ActionKind::Create | ActionKind::Update,
                     sync::Item::Skill { mode: sk1ll_core::LinkMode::Copy, source: Some(path), .. },
                 ) => Some(path),
                 _ => None,
             })
-            .map(|path| sk1ll_core::hash::hash_dir(path))
-            .collect::<sk1ll_core::Result<Vec<_>>>()?;
+            .map(|path| path.map(|path| sk1ll_core::hash::hash_dir(path)).transpose())
+            .collect::<sk1ll_core::Result<Vec<_>>>()?)
+    }
+
+    fn sync_preview_result(actions: &[Action], sources: &[Option<String>]) -> Result<SyncResult> {
         let serialized = serde_json::to_string(&(actions, sources)).map_err(|e| Error::Internal(e.into()))?;
         Ok(SyncResult {
             fingerprint: Some(sk1ll_core::hash::hash_str(&serialized)),
@@ -1437,11 +1470,16 @@ impl Daemon {
             Self::recover_imports(root)?;
             let repo = Repo::open(root)?;
             let actions = sync::plan(&repo, &harnesses, &snapshot.assignment, PlanOptions { force })?;
-            let preview = Self::sync_preview_result(&actions)?;
+            let sources = Self::sync_source_digests(&actions)?;
+            let preview = Self::sync_preview_result(&actions, &sources)?;
             if preview.fingerprint.as_deref() != Some(fingerprint) {
                 return Ok(preview);
             }
-            Some((repo, actions))
+            #[cfg(test)]
+            if let Some(after_review) = eng.after_sync_review.take() {
+                after_review();
+            }
+            Some((repo, actions.into_iter().zip(sources).collect()))
         } else {
             None
         };
@@ -1451,7 +1489,10 @@ impl Daemon {
                 sync::apply(&repo, a)?;
             }
         }
-        let errors = self.refresh_with_plan(eng, reviewed)?;
+        let errors = match self.refresh_with_plan(eng, reviewed) {
+            Err(Error::ReviewedPlacementChanged(_)) => return self.preview_sync(force),
+            result => result?,
+        };
         self.event(Event::Status);
         Ok(SyncResult { fingerprint: None, conflicts: self.conflicts()?, actions: None, errors })
     }
@@ -1701,8 +1742,10 @@ impl Daemon {
         self.lock_repo(eng)?;
         let repo = Repo::open(Self::root(eng))?;
         let lock = eng.lock.as_ref().ok_or_else(|| Error::Conflict("the repo is not locked".into()))?;
-        let fingerprint =
-            req.fingerprint.as_deref().ok_or_else(|| Error::BadRequest("a preview fingerprint is required".into()))?;
+        let fingerprint = req
+            .fingerprint
+            .as_deref()
+            .ok_or_else(|| Error::BadRequest("this client is older than the daemon; update it".into()))?;
         let plan = harness_change::apply(lock, &repo, &self.cfg.machine_config, &req.change, fingerprint)?;
         tracing::info!("harness change {:?}: {} placed item(s) left in place", req.change, plan.placed.len());
         let errors = match self.refresh_reporting(eng) {
@@ -1866,9 +1909,9 @@ impl Daemon {
     /// Stores `snap` and syncs, unless it is older than what was applied. With
     /// no stored snapshot, any snapshot is taken (also one of the same
     /// revision as before), since the harnesses wait for it.
-    pub(crate) fn apply_assignment(&self, eng: &mut Engine, snap: AssignmentSnapshot) -> Result<bool> {
+    pub(crate) fn apply_assignment(&self, eng: &mut Engine, snap: AssignmentSnapshot) -> Result<Vec<String>> {
         if Self::idle(eng) {
-            return Ok(false);
+            return Ok(Vec::new());
         }
         if let Some(have) = self.snapshot()
             && !newer(have.revision, snap.revision)
@@ -1877,7 +1920,11 @@ impl Daemon {
             if snap.revision < have.revision {
                 tracing::info!("ignoring stale assignment revision {} (have {})", snap.revision, have.revision);
             }
-            return Ok(false);
+            if snap.revision == have.revision && eng.assignment_placement_failed {
+                let result = self.refresh_reporting(eng);
+                return Ok(self.assignment_placement_outcome(eng, result));
+            }
+            return Ok(Vec::new());
         }
         state::save_snapshot(&self.cfg.snapshot_path(), &snap)?;
         if let Err(e) = snap.assignment.save(&self.cfg.assignment) {
@@ -1891,8 +1938,8 @@ impl Daemon {
             v.awaiting_assignment = false;
         });
         self.event(Event::Assignment { revision });
-        self.refresh(eng)?;
-        Ok(true)
+        let result = self.refresh_reporting(eng);
+        Ok(self.assignment_placement_outcome(eng, result))
     }
 
     /// The server's baseline is now `baseline`: pull unless already on it. A
@@ -2687,6 +2734,60 @@ mod tests {
         assert_eq!(parse_batch(b"", 2, 16), [None, None]);
     }
 
+    #[tokio::test]
+    async fn reviewed_sync_returns_a_fresh_plan_when_the_source_changes_after_comparison() {
+        use crate::client::{Client, SyncRequest};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        let repo = Repo::init(&root).unwrap();
+        let source = repo.personal_dir().join("pdf/SKILL.md");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "reviewed").unwrap();
+        let cfg = Config {
+            repo: Some(root),
+            state: dir.path().join("state/daemon.json"),
+            assignment: dir.path().join("assignment.json"),
+            machine_config: dir.path().join("machine.toml"),
+            socket: dir.path().join("daemon.sock"),
+            ..Config::new().unwrap()
+        };
+        let skills = dir.path().join("skills");
+        let presets = sk1ll_core::machine::presets()
+            .map(|name| format!("[harnesses.{name}]\nenabled = false\n"))
+            .collect::<String>();
+        std::fs::write(
+            &cfg.machine_config,
+            format!("id = \"review\"\n[harnesses.test]\nskills = {skills:?}\nmode = \"copy\"\n{presets}"),
+        )
+        .unwrap();
+        let client = Client::new(&cfg.socket);
+        let listener = tokio::net::UnixListener::bind(&cfg.socket).unwrap();
+        let daemon = Daemon::standalone(cfg).unwrap();
+        lock(&daemon.engine).after_sync_review = Some(Box::new(move || {
+            std::fs::write(source, "changed after the fingerprint matched").unwrap();
+        }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, crate::api::router(daemon)).await.unwrap();
+        });
+        let reviewed = client.preview_sync().await.unwrap().fingerprint.unwrap();
+        let returned = client.apply_sync_preview(reviewed.clone()).await.unwrap();
+        let fresh = returned.fingerprint.unwrap();
+        assert_ne!(fresh, reviewed);
+        assert_eq!(returned.actions.unwrap()[0].name, "pdf");
+        assert_eq!(client.preview_sync().await.unwrap().fingerprint.as_deref(), Some(fresh.as_str()));
+        assert!(!skills.join("pdf").exists());
+        let error = client.sync(&SyncRequest { fingerprint: Some(reviewed), ..Default::default() }).await.unwrap_err();
+        assert_eq!(error.status, Some(409));
+        let applied = client.apply_sync_preview(fresh).await.unwrap();
+        assert!(applied.errors.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(skills.join("pdf/SKILL.md")).unwrap(),
+            "changed after the fingerprint matched"
+        );
+        server.abort();
+    }
+
     #[test]
     fn stale_revisions_are_ignored() {
         assert!(newer(0, 1));
@@ -2778,6 +2879,7 @@ mod tests {
                                         assignment,
                                         revision: 2,
                                         entries: vec![],
+                                        errors: Vec::new(),
                                     })
                                     .unwrap(),
                                 )
@@ -3036,8 +3138,12 @@ mod tests {
                                 let error = sk1ll_proto::ErrorBody { error: "changed since revision 2".into() };
                                 return (axum::http::StatusCode::CONFLICT, serde_json::to_string(&error).unwrap());
                             }
-                            let update =
-                                AssignmentUpdate { assignment: fake_assignment(None), revision: 3, entries: vec![] };
+                            let update = AssignmentUpdate {
+                                assignment: fake_assignment(None),
+                                revision: 3,
+                                entries: vec![],
+                                errors: Vec::new(),
+                            };
                             (axum::http::StatusCode::OK, serde_json::to_string(&update).unwrap())
                         }
                     }),

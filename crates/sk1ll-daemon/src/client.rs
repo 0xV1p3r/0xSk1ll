@@ -32,6 +32,7 @@
 //! | POST | `/harnesses/preview` | [`HarnessChangeRequest`] → [`HarnessPreview`]; changes nothing |
 //! | POST | `/harnesses/apply` | [`HarnessChangeRequest`] → [`HarnessApplied`]; then syncs; never removes placed content; 409 if `machine.toml` changed while it was written |
 //! | POST | `/imports/{name}/update` | Optional `?force=true` → [`ImportUpdated`] |
+//! | POST | `/imports/{name}/update-reviewed` | `{expected, force}` → [`ImportUpdated`] |
 //! | GET | `/imports/{name}/changes` | Optional `?upstream=<commit>` → [`ImportChanges`] |
 //! | POST | `/imports/resolve` | [`ResolveImportRequest`] → [`ResolvedSource`] |
 //! | POST | `/imports/add` | [`AddImportRequest`] → [`ImportUpdated`] |
@@ -99,6 +100,13 @@ const NEWER_ROUTES: [&str; 3] = ["/harnesses/config", "/harnesses/preview", "/ha
 
 /// What a failed response says: its error, or why there is none.
 fn failure_message(status: StatusCode, bytes: &[u8], method: &Method, path: &str) -> String {
+    if status == StatusCode::NOT_FOUND
+        && path.starts_with("/imports/")
+        && path.ends_with("/update-reviewed")
+        && serde_json::from_slice::<serde_json::Value>(bytes).is_err()
+    {
+        return "the running daemon is older than this app; restart it".into();
+    }
     let message = serde_json::from_slice::<ErrorBody>(bytes)
         .map(|e| e.error)
         .unwrap_or_else(|_| String::from_utf8_lossy(bytes).trim().to_string());
@@ -360,6 +368,7 @@ pub struct PlacementView {
 /// `POST /harnesses/preview`: what a harness change would do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarnessPreview {
+    #[serde(default)]
     pub fingerprint: String,
     pub path: PathBuf,
     pub name: String,
@@ -703,6 +712,8 @@ impl ClientError {
 pub struct HarnessAssignmentUpdate {
     pub update: AssignmentUpdate,
     pub warning: Option<String>,
+    #[serde(default)]
+    pub skipped: Vec<ItemRef>,
 }
 
 pub const LEGACY_HARNESS_ASSIGNMENT_WARNING: &str =
@@ -908,10 +919,19 @@ impl Client {
     }
 
     pub async fn preview_harness(&self, req: &HarnessChangeRequest) -> Result<HarnessPreview> {
-        self.post("/harnesses/preview", req).await
+        let preview: HarnessPreview = self.post("/harnesses/preview", req).await?;
+        if preview.fingerprint.is_empty() {
+            return Err(ClientError::transport(
+                "the running daemon is older than this app; restart or upgrade the daemon",
+            ));
+        }
+        Ok(preview)
     }
 
     pub async fn apply_harness(&self, req: &HarnessChangeRequest) -> Result<HarnessApplied> {
+        if req.fingerprint.as_deref().is_none_or(str::is_empty) {
+            return Err(ClientError::transport("a reviewed preview is required; restart or upgrade the daemon"));
+        }
         self.post("/harnesses/apply", req).await
     }
 
@@ -931,8 +951,11 @@ impl Client {
     ) -> Result<ImportUpdated> {
         match expected {
             Some(sha) => {
-                self.post(&format!("/imports/{}/update?force={force}&expected={}", encode(name), encode(sha)), &())
-                    .await
+                self.post(
+                    &format!("/imports/{}/update-reviewed", encode(name)),
+                    &serde_json::json!({"expected": sha, "force": force}),
+                )
+                .await
             }
             None if force => self.force_update_import(name).await,
             None => self.update_import(name).await,
@@ -956,6 +979,11 @@ impl Client {
     }
 
     pub async fn update_imports(&self, req: &UpdateImportsRequest) -> Result<Vec<ImportUpdated>> {
+        if let Some(expected) = req.expected.as_deref() {
+            let name =
+                req.name.as_deref().ok_or_else(|| ClientError::transport("a reviewed update needs an import name"))?;
+            return self.update_reviewed_import(name, req.force, Some(expected)).await.map(|updated| vec![updated]);
+        }
         self.post("/imports/update", req).await
     }
 
@@ -1169,6 +1197,62 @@ pub(crate) fn encode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reviewed_writes_are_refused_by_a_legacy_daemon() {
+        use axum::{Json, Router, routing::post};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("legacy.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let writes = Arc::new(AtomicUsize::new(0));
+        let count = writes.clone();
+        let app = Router::new()
+            .route(
+                "/imports/{name}/update",
+                post(move || async move {
+                    count.fetch_add(1, Ordering::Relaxed);
+                    StatusCode::OK
+                }),
+            )
+            .route(
+                "/harnesses/preview",
+                post(|| async {
+                    Json(serde_json::json!({
+                        "path": "/machine.toml", "name": "codex", "before": null, "after": null,
+                        "placed": [], "sync": [], "awaiting_assignment": false
+                    }))
+                }),
+            )
+            .route(
+                "/harnesses/apply",
+                post({
+                    let count = writes.clone();
+                    move || async move {
+                        count.fetch_add(1, Ordering::Relaxed);
+                        StatusCode::OK
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = Client::new(socket);
+        for force in [false, true] {
+            let error = client.update_reviewed_import("pdf", force, Some("reviewed")).await.unwrap_err();
+            assert_eq!(error.status, Some(404));
+            assert!(error.message.contains("older than this app; restart it"));
+        }
+        let req = HarnessChangeRequest { fingerprint: None, change: HarnessChange::Disable { name: "codex".into() } };
+        let error = client.preview_harness(&req).await.unwrap_err();
+        assert!(error.message.contains("restart or upgrade the daemon"), "{error}");
+        let error = client.apply_harness(&req).await.unwrap_err();
+        assert!(error.message.contains("restart or upgrade the daemon"));
+        assert_eq!(writes.load(Ordering::Relaxed), 0);
+        server.abort();
+    }
 
     #[test]
     fn encodes_query_values() {

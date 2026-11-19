@@ -3,6 +3,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { HarnessPanel, harnessOrigin } from './HarnessSettings';
 import { api } from './api';
+import { toast } from './toast';
 import type { HarnessChoice, HarnessPreview } from './types';
 vi.mock('./api', () => ({ api: { harnessSettings: vi.fn(), previewHarness: vi.fn(), applyHarness: vi.fn(), openMachineConfig: vi.fn(),
   setHarnessAssignment: vi.fn() }, errorMessage: String, errorStatus: (e: { status?: number }) => e?.status }));
@@ -70,6 +71,22 @@ it("turns the Harness's items off in the Assignment first, then previews again",
   expect(await within(dialog).findByText('Nothing that sk1ll placed is left behind by this change.')).toBeTruthy();
   expect(within(dialog).getByRole('status').textContent).toBe('Unpulled items may stay on.');
   expect(api.applyHarness).not.toHaveBeenCalled();
+});
+
+it('shows placement errors after saving an Assignment and allows a retry', async () => {
+  vi.mocked(api.setHarnessAssignment).mockResolvedValueOnce({
+    update: { assignment: { harnesses: {} }, revision: 1, entries: [], errors: ['permission denied'] },
+    warning: null,
+  });
+  mount();
+  fireEvent.click(await screen.findByRole('checkbox', { name: 'Sync into codex' }));
+  const dialog = await screen.findByRole('dialog');
+  const button = await within(dialog).findByRole('button', { name: "Turn off this Harness's items first" });
+  fireEvent.click(button);
+  expect(await within(dialog).findByText(/Assignment saved, but sync failed: permission denied/)).toBeTruthy();
+  expect(toast).not.toHaveBeenCalled();
+  fireEvent.click(button);
+  await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: "Turned off codex's items" })));
 });
 
 it('validates a new Harness before previewing it', async () => {

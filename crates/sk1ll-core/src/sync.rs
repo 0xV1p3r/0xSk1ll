@@ -236,10 +236,12 @@ pub fn placed(repo: &Repo, hname: &str, harness: &Harness) -> Result<Vec<Action>
 }
 
 pub fn apply(repo: &Repo, action: &Action) -> Result<()> {
+    apply_reviewed(repo, action, None)
+}
+
+pub fn apply_reviewed(repo: &Repo, action: &Action, reviewed_digest: Option<&str>) -> Result<()> {
     match &action.item {
-        Item::Skill { name, mode, source, expected } => {
-            apply_skill(repo, action, name, *mode, source.as_deref(), expected.as_deref(), false)
-        }
+        Item::Skill { .. } => apply_skill(repo, action, false, reviewed_digest),
         Item::Instructions { content, expected, .. } => {
             apply_instructions(action, content.as_deref(), expected.as_deref())
         }
@@ -497,15 +499,11 @@ fn apply_instructions(action: &Action, content: Option<&str>, expected: Option<&
     replace_file(dest, &spliced, unchanged, displace)?.map_or(Ok(()), Err)
 }
 
-fn apply_skill(
-    repo: &Repo,
-    action: &Action,
-    name: &str,
-    mode: LinkMode,
-    source: Option<&Path>,
-    expected: Option<&str>,
-    adopted: bool,
-) -> Result<()> {
+fn apply_skill(repo: &Repo, action: &Action, adopted: bool, reviewed_digest: Option<&str>) -> Result<()> {
+    let Item::Skill { name, mode, source, expected } = &action.item else {
+        unreachable!("only skill placements reach apply_skill");
+    };
+    let (name, mode, source, expected) = (name.as_str(), *mode, source.as_deref(), expected.as_deref());
     if action.kind == ActionKind::Conflict {
         return Ok(());
     }
@@ -518,9 +516,9 @@ fn apply_skill(
     }
     let existing = classify(repo.root(), dest, source)?;
     let managed = match &existing {
+        Existing::Unmanaged(_) if adopted => true,
         Existing::Missing => false,
         Existing::ManagedLink(_) | Existing::ManagedCopy(_) => true,
-        Existing::Unmanaged(_) if adopted => true,
         Existing::Unmanaged(why) => {
             return Err(Error::Invalid(format!("refusing to touch {}: {why}", dest.display())));
         }
@@ -544,12 +542,6 @@ fn apply_skill(
         ActionKind::Create | ActionKind::Update => {
             let src = source.ok_or_else(|| Error::Invalid(format!("no source for {name}")))?;
             // Validate the entire source before replacing any harness content.
-            let hash = if mode == LinkMode::Copy {
-                validate_copy(src, &[".git", MARKER])?;
-                Some(hash_dir(src)?)
-            } else {
-                None
-            };
             let canonical = lexical_normalize(&src.canonicalize().at(src)?);
             if mode == LinkMode::Symlink && !canonical.starts_with(repo.root()) {
                 return Err(Error::Invalid(format!("{} resolves outside the repo", src.display())));
@@ -571,9 +563,15 @@ fn apply_skill(
                 match mode {
                     LinkMode::Symlink => symlink_dir(src, &stage).at(&stage),
                     LinkMode::Copy => {
+                        #[cfg(test)]
+                        hook(Hook::BeforeCopy, src);
                         copy_dir(src, &stage, &[".git", MARKER])?;
+                        let digest = hash_dir(&stage)?;
+                        if reviewed_digest.is_some_and(|expected| expected != digest) {
+                            return Err(Error::Changed(format!("{} changed since the sync preview", src.display())));
+                        }
                         let marker = stage.join(MARKER);
-                        fs::write(&marker, hash.expect("copy hash")).at(&marker)
+                        fs::write(&marker, digest).at(&marker)
                     }
                 }
             })();
@@ -1946,6 +1944,8 @@ pub mod displaced {
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Hook {
+    BeforeCopy,
+    CopyEntry,
     /// While planning a skill, after observing the destination and before
     /// hashing the source (the slow part with a large skill), or before
     /// reusing the hash an earlier harness of the same plan took.
@@ -2099,6 +2099,8 @@ fn copy_dir(src: &Path, dest: &Path, skip: &[&str]) -> Result<()> {
         let entry = entry.map_err(std::io::Error::from).at(src)?;
         let rel = entry.path().strip_prefix(src).unwrap_or(entry.path());
         let out = dest.join(rel);
+        #[cfg(test)]
+        hook(Hook::CopyEntry, entry.path());
         if entry.file_type().is_dir() {
             fs::create_dir_all(&out).at(&out)?;
         } else if entry.file_type().is_symlink() {
@@ -2144,6 +2146,31 @@ mod tests {
             ..Harness::default()
         };
         (tmp, repo, BTreeMap::from([("h".to_string(), harness)]))
+    }
+
+    #[test]
+    fn reviewed_copies_reject_source_edits_before_and_during_staging() {
+        for point in [Hook::BeforeCopy, Hook::CopyEntry] {
+            let (_tmp, repo, harnesses) = skill_setup(LinkMode::Copy);
+            let src = repo.personal_dir().join("pdf");
+            let file = src.join("SKILL.md");
+            let actions = plan(&repo, &harnesses, &Assignment::default(), PlanOptions::default()).unwrap();
+            let action = &actions[0];
+            let digest = hash_dir(&src).unwrap();
+            let error = with_hooks(
+                move |at, path| {
+                    if at == point && path == if point == Hook::BeforeCopy { &src } else { &file } {
+                        write(&file, "Edited since review.\n");
+                    }
+                },
+                || apply_reviewed(&repo, action, Some(&digest)),
+            )
+            .unwrap_err();
+            assert!(matches!(error, Error::Changed(_)), "{point:?}: {error}");
+            assert!(!action.dest.exists());
+            apply(&repo, action).unwrap();
+            assert_eq!(fs::read_to_string(action.dest.join(MARKER)).unwrap(), hash_dir(&action.dest).unwrap());
+        }
     }
 
     #[test]

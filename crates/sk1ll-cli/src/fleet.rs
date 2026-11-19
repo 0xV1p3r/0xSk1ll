@@ -70,13 +70,16 @@ pub(crate) fn assign_direct(cli: &Cli, repo: &Path, lock: Option<&sk1ll_core::En
     let target = assign_target(*kind, name.clone(), *enabled, *default_skills, *default_rules, *all)?;
     if let Some(s) = all {
         let lock = lock.context("a fleet assignment change requires the engine lock")?;
-        if let Some(update) =
+        if let Some(result) =
             runtime()?.block_on(sk1ll_daemon::set_harness_assignment_direct(&cfg, lock, harness, s.on()))?
         {
             println!(
                 "fleet assignment of {} is now revision {}; run `sk1ll sync` to apply",
-                state.machine_id, update.revision
+                state.machine_id, result.update.revision
             );
+            for item in result.skipped {
+                eprintln!("Skipped item with an ineligible name: {item}");
+            }
             return Ok(true);
         }
         eprintln!("warning: {}", sk1ll_daemon::client::LEGACY_HARNESS_ASSIGNMENT_WARNING);

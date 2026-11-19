@@ -137,6 +137,16 @@ baseline branch from HEAD once at startup and writes `hooks/pre-receive` over
 on every start. Changing HEAD while it runs isn't supported, and pushes keep
 going to the branch it started with until it restarts.
 
+## Reviewed actions across versions
+
+Reviewed Import updates require the Daemon's reviewed update route. Harness
+Apply requires a fingerprint from Harness Preview. Restart or upgrade the
+Daemon if the desktop app reports that either capability is missing.
+
+A reviewed Sync can apply several placements. When a staged copy's digest
+differs from the reviewed digest, the Daemon leaves that copy unpublished and
+returns a new preview. Placements completed before the mismatch remain applied.
+
 ## Assignment edits on older Servers
 
 Servers that omit Machine registrations do not enforce the Assignment

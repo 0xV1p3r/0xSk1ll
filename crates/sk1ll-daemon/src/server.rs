@@ -385,7 +385,7 @@ pub async fn set_harness_assignment_direct(
     _lock: &sk1ll_core::EngineLock,
     harness: &str,
     enabled: bool,
-) -> anyhow::Result<Option<AssignmentUpdate>> {
+) -> anyhow::Result<Option<sk1ll_proto::HarnessAssignmentResult>> {
     use anyhow::Context;
     let state = DaemonState::load(&cfg.state)?.context("this machine hasn't joined a fleet")?;
     let http = http_client().build().context("building the HTTP client")?;
@@ -393,7 +393,7 @@ pub async fn set_harness_assignment_direct(
     if let Some(update) = &update {
         save_direct_update(cfg, &update.update)?;
     }
-    Ok(update.map(|result| result.update))
+    Ok(update)
 }
 
 fn save_direct_update(cfg: &Config, update: &AssignmentUpdate) -> anyhow::Result<()> {
@@ -551,22 +551,30 @@ pub(crate) async fn copy_assignment(
         })?;
     let status = resp.status();
     let body = resp.bytes().await.context("reading the Server's response").map_err(CopyFailure::Lost)?;
-    if status.is_server_error() {
-        return Err(CopyFailure::Lost(anyhow::anyhow!("HTTP {status}")));
-    }
+    decode_copy_response(status, &body)
+}
+
+fn decode_copy_response(
+    status: StatusCode,
+    body: &[u8],
+) -> std::result::Result<sk1ll_proto::AssignmentCopied, CopyFailure> {
+    use anyhow::Context;
     if !status.is_success() {
-        let error = serde_json::from_slice::<ErrorBody>(&body);
+        let error = serde_json::from_slice::<ErrorBody>(body);
+        if status.is_server_error() && (status != StatusCode::SERVICE_UNAVAILABLE || error.is_err()) {
+            return Err(CopyFailure::Lost(anyhow::anyhow!("HTTP {status}")));
+        }
         // Only this Server's own errors have a JSON body; an older Server's router has no route.
         if status == StatusCode::NOT_FOUND && error.is_err() {
             return Err(CopyFailure::Unsupported);
         }
-        let message = error.map_or_else(|_| String::from_utf8_lossy(&body).into_owned(), |e| e.error);
+        let message = error.map_or_else(|_| String::from_utf8_lossy(body).into_owned(), |e| e.error);
         return Err(CopyFailure::Refused(anyhow::anyhow!(
             "Server refused the copy (HTTP {status}): {}",
             redact(&message)
         )));
     }
-    serde_json::from_slice(&body).context("parsing the Server's response").map_err(CopyFailure::Lost)
+    serde_json::from_slice(body).context("parsing the Server's response").map_err(CopyFailure::Lost)
 }
 
 #[cfg(test)]
@@ -574,6 +582,19 @@ mod tests {
     use super::*;
     use sk1ll_core::repo::Repo;
     use sk1ll_proto::ItemRef;
+
+    #[test]
+    fn copy_inventory_refusal_is_definite_but_gateway_failure_is_ambiguous() {
+        let status = StatusCode::SERVICE_UNAVAILABLE;
+        let error =
+            decode_copy_response(status, br#"{"error":"could not read inventory; retry shortly"}"#).unwrap_err();
+        assert!(matches!(error, CopyFailure::Refused(error) if error.to_string().contains("retry shortly")));
+        assert!(matches!(decode_copy_response(status, b"gateway unavailable"), Err(CopyFailure::Lost(_))));
+        assert!(matches!(
+            decode_copy_response(StatusCode::BAD_GATEWAY, br#"{"error":"gateway error"}"#),
+            Err(CopyFailure::Lost(_))
+        ));
+    }
 
     #[tokio::test]
     async fn outbox_flush_sends_an_already_published_draft_while_the_engine_is_busy() {

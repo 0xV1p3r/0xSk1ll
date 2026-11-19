@@ -296,11 +296,11 @@ pub fn complete(repo: &Repo, harnesses: &BTreeMap<String, Harness>, adoption: &A
                 name: adoption.name.clone(),
                 mode: config.mode,
                 source: Some(source.clone()),
-                expected: expected.clone(),
+                expected,
             },
             reason: None,
         };
-        apply_skill(repo, &action, &adoption.name, config.mode, Some(&source), expected.as_deref(), true)?;
+        apply_skill(repo, &action, true, None)?;
     }
     Ok(())
 }
