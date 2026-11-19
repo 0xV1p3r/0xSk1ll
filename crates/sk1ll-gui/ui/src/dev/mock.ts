@@ -106,9 +106,11 @@ export function installMock(scenario: string) {
       : change.op === 'disable' || (change.op === 'remove' && !choice?.preset) ? null : choice?.harness ?? null;
     const placement = (h: T.HarnessView['harness'], kind: T.PlacementView['kind']): T.PlacementView[] => h.skills ? [{ harness: change.name, kind, item: 'skill', name: 'code-review', dest: `${h.skills}/code-review`, reason: null }] : [];
     const moved = before && (!after || after.skills !== before.skills);
-    return { path: machineConfig, name: change.name, before, after, placed: moved ? placement(before, 'remove') : [],
+    return { fingerprint: JSON.stringify(setupHarnesses), path: machineConfig, name: change.name, before, after, placed: moved ? placement(before, 'remove') : [],
       warnings: [], sync: after && (!before || after.skills !== before.skills) ? placement(after, 'create') : [], awaiting_assignment: false };
   };
+  const editedFiles = new Map<string, { text: string; fingerprint: string }>();
+  let fileRevision = 0;
   let running = scenario !== 'unreachable';
   const delay = <V,>(value: V, ms = 250) => new Promise<V>(resolve => setTimeout(() => resolve(value), ms));
   // The authority copies this Machine's toggles for `from` to the new name first, keeping toggles the new name already has; the rename is refused when it can't be asked.
@@ -134,11 +136,13 @@ export function installMock(scenario: string) {
       const diff = '--- on-disk\n+++ next-sync\n@@ -1 +1 @@\n-Use tabs for indentation.\n+Use two spaces for indentation.';
       return [{ path, format: 'block', content, next_content: content, differs: syncPending, diff: syncPending ? diff : '' }] satisfies T.InstructionPreview[];
     }
-    if (cmd === 'preview_sync') return { conflicts, actions: syncPending ? [
+    const syncPreview = (): T.SyncResult => ({ fingerprint: JSON.stringify([syncPending, conflicts]), conflicts, actions: syncPending ? [
       { harness: 'claude', kind: 'update', item: 'instructions', name: 'style', dest: '/home/dev/.claude/CLAUDE.md', reason: null },
       { harness: 'codex', kind: 'conflict', item: 'skill', name: 'code-review', dest: '/home/dev/.codex/skills/code-review', reason: conflicts[0]?.reason ?? null },
-    ] : [] } satisfies T.SyncResult;
+    ] : [] });
+    if (cmd === 'preview_sync') return syncPreview();
     if (cmd === 'sync_now') {
+      if ((args as { fingerprint: string }).fingerprint !== syncPreview().fingerprint) return syncPreview();
       syncPending = false;
       return { conflicts } satisfies T.SyncResult;
     }
@@ -214,13 +218,23 @@ export function installMock(scenario: string) {
         draft.push({ item, change: 'deleted', paths: [`imported/${a.name}/SKILL.md`], fingerprint: 'removed' }); local.drafts.push(item);
         return delay(undefined);
       }
+      case 'force_update_import':
       case 'update_import': {
         const entry = imports.imports.find(i => i.name === a.name);
         if (!entry) return Promise.reject({ message: 'Import no longer exists' });
         const update = imports.updates.find(i => i.name === a.name);
+        if (a.expected && a.expected !== (update?.upstream ?? entry.locked))
+          return Promise.reject({ status: 409, message: 'The upstream ref changed since the preview' });
         const old = entry.locked; entry.locked = update?.upstream ?? entry.locked;
         imports.updates = imports.updates.filter(i => i.name !== a.name);
         return delay({ name: entry.name, old_commit: old, new_commit: entry.locked ?? '', changed: old !== entry.locked });
+      }
+      case 'import_changes': {
+        const update = imports.updates.find(i => i.name === a.name);
+        if (!update || !update.locked) return Promise.reject({ status: 404, message: 'No upstream changes' });
+        const upstream = String(a.upstream ?? update.upstream);
+        return delay({ locked: update.locked, upstream, truncated: false, files: ['SKILL.md'],
+          commits: [{ sha: upstream, date: '2026-11-19', subject: 'Update skill instructions' }] } satisfies T.ImportChanges);
       }
       case 'check_imports': imports.checked_at = Math.floor(Date.now() / 1000); return delay(imports);
       case 'status': return delay(status, 60);
@@ -234,7 +248,18 @@ export function installMock(scenario: string) {
       }
       case 'skill_file': {
         const query = a.query as T.ContentQuery & { path: string };
-        return delay({ path: query.path, text: `---\nname: ${query.item.split(':')[1]}\ndescription: ${query.hash === 'sha256:two' ? 'Collect detailed notes.' : 'Work with this Skill.'}\n---\n# Instructions\n\nUse **careful review** before making changes.\n\n- Read the files.\n- Check the result.`, binary: false, too_large: false, size: 120 });
+        const edited = editedFiles.get(JSON.stringify([query.item, query.path]));
+        if (edited) return delay({ path: query.path, ...edited, binary: false, too_large: false, size: new TextEncoder().encode(edited.text).length });
+        return delay({ fingerprint: query.hash || !content.some(entry => entry.item === query.item && (entry.type === 'personal' || entry.type === 'rule')) ? null : "mock-file", path: query.path, text: `---\nname: ${query.item.split(':')[1]}\ndescription: ${query.hash === 'sha256:two' ? 'Collect detailed notes.' : 'Work with this Skill.'}\n---\n# Instructions\n\nUse **careful review** before making changes.\n\n- Read the files.\n- Check the result.`, binary: false, too_large: false, size: 120 });
+      }
+      case 'write_skill_file': {
+        const request = a.request as T.ContentQuery & { path: string; expected: string; content: string };
+        const key = JSON.stringify([request.item, request.path]);
+        if (request.expected !== (editedFiles.get(key)?.fingerprint ?? 'mock-file')) {
+          return Promise.reject({ status: 409, message: 'File changed on disk' });
+        }
+        editedFiles.set(key, { text: request.content, fingerprint: `file-${++fileRevision}` });
+        return delay(undefined);
       }
       case 'editors': return delay({ preferred_editor: preferredEditor, editors: [
         { id: 'code', name: 'VS Code', kind: 'gui' }, { id: 'nvim', name: 'Neovim', kind: 'terminal' }, { id: 'file-manager', name: 'File manager', kind: 'system' },
@@ -268,6 +293,58 @@ export function installMock(scenario: string) {
         snapshot.revision++;
         const { revision, ...assignment } = snapshot;
         return delay({ update: { revision, assignment: structuredClone(assignment), entries: [] }, warning: null });
+      }
+      case 'preview_assignment_copy':
+      case 'copy_machine_assignment': {
+        const copy = a.copy as T.MachineAssignmentCopy;
+        const target = assignments[a.machine as string], source = assignments[copy.source];
+        if (!target || !source) return Promise.reject({ status: 404, message: 'Machine no longer exists' });
+        const stamp = (id: string, snapshot: T.AssignmentSnapshot) => ({
+          revision: snapshot.revision, registration: machines.find(machine => machine.id === id)?.registration,
+        });
+        const current = stamp(a.machine as string, target), from = stamp(copy.source, source);
+        const matches = (expected: T.Expected | undefined, actual: T.Expected) =>
+          !expected || (expected.revision === actual.revision && (!expected.registration || expected.registration === actual.registration));
+        if (!matches(copy.expected, current) || !matches(copy.source_expected, from))
+          return Promise.reject({ status: 409, message: 'Assignment changed since the preview' });
+        const next = structuredClone(target.harnesses);
+        const entries: T.LogEntry[] = [];
+        const record = (harness: string, kind: T.ToggleKind, name: string | null, before: boolean | null, after: boolean | null) => {
+          if (before === after) return;
+          entries.push({ id: Math.max(0, ...log.map(entry => entry.id)) + entries.length + 1,
+            at: Math.floor(Date.now() / 1000), author: status.machine_id, machine: a.machine as string,
+            harness, kind, name, before, after, cause: { type: 'change' } });
+        };
+        for (const mapping of copy.harnesses ?? []) {
+          const src = source.harnesses[mapping.from], dest = next[mapping.to] ??= harness();
+          if (!src) continue;
+          for (const kind of ['skills', 'rules'] as const) {
+            const toggle = kind === 'skills' ? 'skill' : 'rule';
+            if (copy.mode === 'replace') {
+              const key = kind === 'skills' ? 'new_skills_default' : 'new_rules_default';
+              record(mapping.to, key, null, dest[key], src[key]);
+              dest[key] = src[key];
+              for (const name of Object.keys(dest[kind])) {
+                if (!Object.hasOwn(src[kind], name)) {
+                  record(mapping.to, toggle, name, dest[kind][name], null);
+                  delete dest[kind][name];
+                }
+              }
+            }
+            for (const [name, enabled] of Object.entries(src[kind])) {
+              if (copy.mode === 'merge' && Object.hasOwn(dest[kind], name)) continue;
+              record(mapping.to, toggle, name, dest[kind][name] ?? null, enabled);
+              dest[kind][name] = enabled;
+            }
+          }
+        }
+        if (cmd === 'preview_assignment_copy') return delay({ count: entries.length, target: current, source: from });
+        target.harnesses = next;
+        if (entries.length) {
+          target.revision++;
+          log.unshift(...entries.slice().reverse());
+        }
+        return delay({ assignment: { harnesses: next }, revision: target.revision, entries });
       }
       case 'set_assignment': {
         const snapshot = assignments[a.machine as string];
@@ -317,7 +394,9 @@ export function installMock(scenario: string) {
       case 'harness_settings': return delay({ path: machineConfig, harnesses: setupHarnesses });
       case 'preview_harness': return delay(harnessPreview((a.request as T.HarnessChangeRequest).change), 400);
       case 'apply_harness': {
-        const { change } = a.request as T.HarnessChangeRequest;
+        const { change, fingerprint } = a.request as T.HarnessChangeRequest;
+        if (fingerprint !== harnessPreview(change).fingerprint)
+          return Promise.reject({ status: 409, message: 'machine.toml changed since the preview — preview again' });
         const index = setupHarnesses.findIndex(h => h.name === change.name);
         if (change.op === 'set') {
           if (index < 0) setupHarnesses.push({ name: change.name, installed: true, enabled: true, preset: false, configured: true, harness: change.harness });
@@ -326,15 +405,17 @@ export function installMock(scenario: string) {
         else if (index >= 0) Object.assign(setupHarnesses[index], change.op === 'remove' ? { configured: false, enabled: setupHarnesses[index].installed } : { enabled: change.op === 'enable', configured: true, available: change.op === 'enable' ? false : setupHarnesses[index].available });
         return delay({ harnesses: setupHarnesses, errors: [] }, 600);
       }
+      case 'open_fleet_deployment_docs':
       case 'open_machine_config': return delay(undefined);
+      case 'restart_daemon': return delay(undefined);
       case 'imports': return delay(imports);
       // A tree/blob link resolves one Skill; a repository link resolves several.
       case 'resolve_import': {
         const request = a.request as T.ResolveRequest;
         const single = /\/(tree|blob)\//.test(request.link);
-        return delay({ source: 'github:example/skills', git_ref: 'main', commit: 'c0ffee1234567890',
-          candidates: (single ? ['pdf'] : ['pdf', 'writing']).map(name => ({ path: `skills/${name}`,
-            default_name: name, description: `Tools for ${name}.`, taken: items.some(i => i.item === `skill:${name}`) })) });
+        return delay({ source: 'github:example/skills', git_ref: request.ref ?? 'main', commit: 'c0ffee1234567890',
+          candidates: (single ? ['pdf'] : ['pdf', 'writing']).map(name => ({ path: request.path ?? `skills/${name}`, total_bytes: 2048,
+            warnings: name === 'pdf' ? [{ path: 'scripts/check.py', kinds: ['script', 'executable'] }] : [], default_name: name, description: `Tools for ${name}.`, taken: items.some(i => i.item === `skill:${name}`) })) });
       }
       case 'add_import': {
         const request = a.request as T.AddImportRequest;
@@ -367,7 +448,7 @@ export function installMock(scenario: string) {
         standalone = false; status.mode = 'joined'; status.connection = 'connected'; status.has_origin = true; status.repo_ready = true;
         status.server_url = (a.request as T.JoinApiRequest).server_url;
         return delay({ machine_id: (a.request as T.JoinApiRequest).machine_id ?? 'laptop', repo: '/home/user/.local/share/sk1ll/repo', setup: 'cloned', harnesses: ['claude', 'codex'], revision: 1 }, 500);
-      default: return undefined;
+      default: return Promise.reject({ message: `Unhandled mock command: ${cmd}` });
     }
   }, { shouldMockEvents: true });
 }
