@@ -2137,18 +2137,17 @@ impl Daemon {
                 return Err(refused("Assignment copy is not supported by this Server".into()));
             }
             Err(CopyFailure::Refused(e)) => return Err(refused(format!("{e:#}"))),
-            Err(CopyFailure::Lost(e)) => self.lost_copy(copy, &e).map_err(|why| match why {
-                Some(why) => refused(why),
-                None => Error::Conflict(format!(
+            Err(CopyFailure::Lost(e)) => {
+                return Err(Error::Conflict(format!(
                     "`{}` was not renamed: the Server may have copied its Assignment to `{}`, but its response was \
-                     lost ({}). `{}` may already have copied toggles; they stay unused unless an item with that \
+                     uncertain ({}). `{}` may already have copied toggles; they stay unused unless an item with that \
                      name appears. Try again, or rename without copying the Assignment",
                     req.name,
                     req.to,
                     crate::auth::redact(&format!("{e:#}")),
                     req.to
-                )),
-            })?,
+                )));
+            }
         };
         let snapshot =
             AssignmentSnapshot { revision: copied.revision, assignment: copied.assignment.clone(), registration: None };
@@ -2157,66 +2156,6 @@ impl Daemon {
             tracing::warn!("applying the assignment after copying it for a rename: {e:#}");
         }
         Ok(copied)
-    }
-
-    /// Whether a copy whose response was lost applied, read from the
-    /// Assignment the Server has now: it did when the new name has exactly
-    /// the old name's explicit toggles (none, when there was nothing to
-    /// copy). `Err(Some(why))` when it certainly didn't, `Err(None)` when
-    /// that can't be told.
-    fn lost_copy(
-        &self,
-        copy: &sk1ll_proto::AssignmentCopy,
-        error: &anyhow::Error,
-    ) -> std::result::Result<sk1ll_proto::AssignmentCopied, Option<String>> {
-        use sk1ll_proto::{ToggleChange, ToggleKind};
-        let snapshot =
-            tokio::runtime::Handle::current().block_on(crate::server::fetch_assignment(self)).map_err(|e| {
-                tracing::warn!("re-reading the Assignment after a lost copy response: {e:#}");
-                None
-            })?;
-        let toggles = |item: &ItemRef| -> BTreeMap<String, bool> {
-            let (kind, name) = match item {
-                ItemRef::Skill(name) => (ToggleKind::Skill, name),
-                ItemRef::Rule(name) => (ToggleKind::Rule, name),
-                _ => return BTreeMap::new(),
-            };
-            snapshot
-                .assignment
-                .harnesses
-                .iter()
-                .filter_map(|(harness, h)| {
-                    (if kind == ToggleKind::Skill { &h.skills } else { &h.rules })
-                        .get(name)
-                        .map(|&enabled| (harness.clone(), enabled))
-                })
-                .collect()
-        };
-        let (from, to) = (toggles(&copy.from), toggles(&copy.to));
-        if from != to {
-            return Err(to.is_empty().then(|| format!("{error:#}; the Server has not copied it")));
-        }
-        let (kind, name) = match &copy.to {
-            ItemRef::Skill(name) => (ToggleKind::Skill, name),
-            ItemRef::Rule(name) => (ToggleKind::Rule, name),
-            _ => return Err(None),
-        };
-        Ok(sk1ll_proto::AssignmentCopied {
-            applied: to
-                .into_iter()
-                .map(|(harness, enabled)| ToggleChange {
-                    harness,
-                    kind,
-                    name: Some(name.clone()),
-                    enabled: Some(enabled),
-                })
-                .collect(),
-            skipped: Vec::new(),
-            entries: Vec::new(),
-            revision: snapshot.revision,
-            registration: snapshot.registration.clone(),
-            assignment: snapshot.assignment,
-        })
     }
 
     /// Writes `changes` to this machine's Assignment authority: the local
@@ -2769,19 +2708,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_lost_copy_response_is_resolved_from_the_servers_assignment() {
+    async fn a_lost_copy_response_never_renames_or_cleans_up_matching_toggles() {
         use axum::routing::{get, post};
-        for docs in [Some(true), Some(false), None] {
+        for destination_appears in [false, true] {
             let dir = tempfile::tempdir().unwrap();
-            let committed = Arc::new(AtomicBool::new(false));
+            let destination = dir.path().join("repo/personal/docs");
+            let cleanup = Arc::new(AtomicBool::new(false));
             let app = axum::Router::new()
                 .route(
                     "/api/machines/a/assignment/copy",
                     post({
-                        let committed = committed.clone();
+                        let destination = destination.clone();
                         move || async move {
-                            // The Server commits, then the connection drops mid-response.
-                            committed.store(true, Ordering::SeqCst);
+                            if destination_appears {
+                                std::fs::create_dir_all(&destination).unwrap();
+                            }
+                            // The response is lost. The destination toggle could have
+                            // been present before the copy request.
                             let chunks: Vec<std::io::Result<bytes::Bytes>> =
                                 vec![Ok("{".into()), Err(std::io::Error::other("dropped"))];
                             axum::body::Body::from_stream(futures_util::stream::iter(chunks))
@@ -2790,44 +2733,24 @@ mod tests {
                 )
                 .route(
                     "/api/machines/a/assignment",
-                    get({
-                        let committed = committed.clone();
-                        move || async move {
-                            assert!(committed.load(Ordering::SeqCst));
-                            axum::Json(AssignmentSnapshot {
-                                revision: 2,
-                                assignment: fake_assignment(docs),
-                                registration: Some("r1".into()),
-                            })
-                        }
+                    get(|| async {
+                        axum::Json(AssignmentSnapshot {
+                            revision: 2,
+                            assignment: fake_assignment(Some(true)),
+                            registration: Some("r1".into()),
+                        })
+                    })
+                    .put({
+                        let cleanup = cleanup.clone();
+                        move || async move { cleanup.store(true, Ordering::SeqCst) }
                     }),
                 );
             let (d, server) = fake_fleet_daemon(dir.path(), app).await;
-            let result = rename_pdf(&d).await;
-            let renamed = dir.path().join("repo/personal/docs").is_dir();
-            match docs {
-                // `docs` has exactly `pdf`'s toggles: the copy applied.
-                Some(true) => {
-                    assert_eq!(result.unwrap().migrated, ["h"]);
-                    assert!(renamed);
-                    assert_eq!(d.snapshot().unwrap().revision, 2);
-                }
-                // Something else: it can't be told, so nothing is renamed.
-                Some(false) => {
-                    let error = result.unwrap_err();
-                    assert!(
-                        matches!(&error, Error::Conflict(m) if m.contains("may already have copied toggles")),
-                        "{error}"
-                    );
-                    assert!(!renamed);
-                }
-                // Nothing on `docs`: the copy certainly didn't apply.
-                None => {
-                    let error = result.unwrap_err();
-                    assert!(matches!(&error, Error::Conflict(m) if m.contains("has not copied it")), "{error}");
-                    assert!(!renamed);
-                }
-            }
+            let error = rename_pdf(&d).await.unwrap_err();
+            assert!(matches!(&error, Error::Conflict(m) if m.contains("may already have copied toggles")), "{error}");
+            assert!(dir.path().join("repo/personal/pdf/SKILL.md").is_file());
+            assert!(!destination.join("SKILL.md").exists());
+            assert!(!cleanup.load(Ordering::SeqCst));
             server.abort();
         }
     }

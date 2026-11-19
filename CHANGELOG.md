@@ -126,9 +126,9 @@ break compatibility.
   `POST /api/machines/{id}/assignment/copy {from, to}`, which checks the
   caller's scope like a `PUT`, checks both items and copies the current
   explicit toggles of `from` in one transaction, or the Daemon itself when standalone. When the copy fails
-  (offline, an older Server without the endpoint, or a lost response the
-  Daemon can't resolve by reading the Assignment again), nothing is renamed
-  and `POST /items/rename` answers HTTP 409; `"copy_assignment": false`
+  (offline, an older Server without the endpoint, or an uncertain response), nothing is renamed
+  and `POST /items/rename` answers HTTP 409. An uncertain response leaves
+  any copied toggles in place and reports that they may exist. `"copy_assignment": false`
   renames anyway, and the Library offers it as Rename without copying
   Assignment. The copy never overwrites a toggle the new name already has:
   the response lists those Harnesses in `kept` instead of `migrated`. When

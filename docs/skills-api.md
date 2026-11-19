@@ -200,13 +200,12 @@ always null; it stays for older clients.
 When the copy can't be made, nothing is renamed and the request fails with
 HTTP 409 and the reason: offline, the Server refused it, or the Server is
 older and has no copy endpoint (HTTP 404, reported as "Assignment copy is not
-supported by this Server"). When the copy's response is lost after it was
-sent, the Daemon reads the Machine's Assignment again: if the new name has
-exactly the old name's explicit toggles, the copy applied and the rename goes
-ahead; otherwise nothing is renamed, and the error says when the new name may
-already have copied toggles (they stay unused unless an item with that name
-appears). To rename anyway, send `"copy_assignment": false`: the new name then
-follows each Harness's default on this Machine.
+supported by this Server"). When the copy's response is lost or uncertain, the Daemon
+refuses the rename and leaves the Assignment alone. The error says the new
+name may already have copied toggles. Those toggles stay unused unless an
+item with that name appears. To rename anyway, send `"copy_assignment": false`.
+The new name uses any explicit toggles already present, and each Harness's
+default otherwise.
 
 When the rename then moves nothing (the new name appeared since it was
 checked, say), the Daemon removes the toggles the copy applied again, with the
