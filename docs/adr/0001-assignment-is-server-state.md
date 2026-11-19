@@ -7,3 +7,7 @@ Which skills and rules are enabled in which harness on which machine is held by 
 - We lose git history for assignments, so the server keeps an append-only assignment log with per-entry undo instead.
 - `[profiles]` leaves `sk1ll.toml`, and `[targets]` becomes machine-local harness configuration (detected, with local overrides) that is reported to the server.
 - A skill that exists only in one machine's draft can be assigned only on that machine.
+- Copying an Assignment between Machines carries explicit toggles for items absent on
+  the destination. They take effect when those items arrive. Replace copies the source
+  defaults and clears destination-only overrides, so items that inherit on the source
+  inherit the same values on the destination.

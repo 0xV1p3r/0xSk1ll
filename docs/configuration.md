@@ -70,7 +70,7 @@ A custom harness name uses lowercase letters, digits, `-` and `_`. Paths are abs
 
 The Daemon shows desktop notifications when a pull becomes Blocked, Conflicts
 increase, the Machine is revoked, authentication is rejected for two minutes,
-or Import checks report new failures. This works with the desktop app closed.
+or Import checks report new failures. The Daemon runs independently of the desktop app.
 Repeated alerts of the same kind wait ten minutes unless the affected list
 grows. The Daemon keeps notification history next to its state file.
 
@@ -84,7 +84,8 @@ enabled = false
 
 Set `SK1LL_NOTIFICATIONS=0` in the Daemon's environment to disable alerts on
 headless Machines or in CI. On Linux, install `notify-send` and run the Daemon
-in a user session with a desktop notification service.
+in a user session with a desktop notification service. On macOS, the Daemon
+uses `osascript` in the GUI login session. Live delivery is unverified.
 
 ### Paths with `..`
 
@@ -180,6 +181,6 @@ sk1ll assign codex --default-rules on       # default for new rules
 
 Changing a default first records every existing item's current value as an explicit toggle, so existing items keep their state.
 
-A standalone machine keeps assignment in `~/.cache/sk1ll/assignment.json` on Linux or `~/Library/Caches/sk1ll/assignment.json` on macOS (override with `--assignment` or `SK1LL_ASSIGNMENT`). The daemon watches this file and applies changes from either the GUI or CLI. There is no standalone assignment log or undo. [ADR 0004](adr/0004-standalone-assignment-is-machine-local.md) records this choice. A joined machine sends every change to the server, which keeps a log with per-entry undo. [ADR 0001](adr/0001-assignment-is-server-state.md) explains why assignment isn't stored in the repo.
+A standalone machine keeps assignment in `~/.cache/sk1ll/assignment.json` on Linux or `~/Library/Caches/sk1ll/assignment.json` on macOS (override with `--assignment` or `SK1LL_ASSIGNMENT`). The daemon watches this file and applies changes from either the GUI or CLI. Standalone Machines have no Assignment log. The desktop Assignment matrix offers revision-guarded Undo for bulk changes. [ADR 0004](adr/0004-standalone-assignment-is-machine-local.md) records this choice. A joined machine sends every change to the server, which keeps a log with per-entry undo. [ADR 0001](adr/0001-assignment-is-server-state.md) explains why assignment isn't stored in the repo.
 
 Join codes expire after `SK1LL_SERVER_JOIN_CODE_TTL` (default `24h`), using the server duration syntax.

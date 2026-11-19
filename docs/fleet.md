@@ -170,6 +170,7 @@ The table lists Linux paths. On macOS, config and data use `~/Library/Applicatio
 | `SK1LL_DEBOUNCE_MAX` | `2s` | Longest a stream of file changes can postpone a sync |
 | `SK1LL_RECONCILE_INTERVAL` | `60s` | Local re-sync of the harnesses, even while offline |
 | `SK1LL_AUTH_WARN_AFTER` | `24h` | After the server rejects the token this long, status reports the machine as probably removed |
+| `SK1LL_NOTIFICATIONS` | unset | Set to `0` to disable [desktop notifications](configuration.md#desktop-notifications) |
 | `SK1LL_RECONNECT_MAX` | `60s` | Longest reconnect backoff |
 
 ## Machine status

@@ -138,7 +138,9 @@ editing. The Daemon refuses symlink traversal on writes.
 
 A successful save returns `204 No Content` and refreshes the Draft and
 Harnesses. A stale fingerprint returns `409 Conflict`. To replace the new
-disk contents, read the file again and use its new fingerprint.
+disk contents, read the file again and use its new fingerprint. See
+[Known limitations](known-limitations.md#a-concurrent-save-in-the-library-editor)
+for a write that lands after the final fingerprint check.
 
 ## Adopt and fork
 
