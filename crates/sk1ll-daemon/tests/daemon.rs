@@ -507,6 +507,38 @@ async fn harness_assignment_passes_through_to_the_fleet_and_reaches_sync() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn harness_assignment_applies_the_http_snapshot_without_websocket_delivery() {
+    use axum::{Json, Router, routing::post};
+
+    let app = Router::new().route(
+        "/api/machines/box/assignment/harness/agent",
+        post(|| async {
+            Json(sk1ll_proto::HarnessAssignmentResult {
+                update: sk1ll_proto::AssignmentUpdate {
+                    assignment: snapshot(2, &[]).assignment,
+                    revision: 2,
+                    entries: vec![],
+                },
+                skipped: vec![],
+            })
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut m = solo("box", &url, Some(snapshot(1, &["x"])));
+    m.start().await;
+    eventually(|| async { m.harness_skill("x").is_some().then_some(()) }).await;
+
+    let result = m.client.set_harness_assignment(HARNESS, false).await.unwrap();
+
+    assert_eq!(result.update.revision, 2);
+    assert!(m.harness_skill("x").is_none());
+    assert_eq!(m.status().await.assignment_revision, 2);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn harness_assignment_falls_back_only_for_a_missing_legacy_route() {
     use axum::{
         Json, Router,
@@ -541,7 +573,9 @@ async fn harness_assignment_falls_back_only_for_a_missing_legacy_route() {
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let mut m = solo("box", &url, Some(snapshot(1, &["x"])));
     m.start().await;
+    eventually(|| async { m.harness_skill("x").is_some().then_some(()) }).await;
     let result = m.client.set_harness_assignment(HARNESS, false).await.unwrap();
+    assert!(m.harness_skill("x").is_none(), "the fake server never delivers a WebSocket snapshot");
     assert!(result.warning.unwrap().contains("Unpulled items may stay on"));
     assert_eq!(result.update.revision, 2);
     let error = m.client.set_harness_assignment("absent", false).await.unwrap_err();
@@ -1143,7 +1177,7 @@ async fn failed_refresh_sends_no_status_or_discards() {
     let mut m = solo("solo", &server.url(), Some(snapshot(1, &[]))).with_env("SK1LL_RECONCILE_INTERVAL", "1h");
     write(m.outbox_path().parent().unwrap(), "daemon-outbox.json", r#"[{"id":1,"items":["skill:w"]}]"#);
     m.write("personal/w/SKILL.md", "recreated\n");
-    let config = m.home.path().join(CONFIG_DIR).join("sk1ll/machine.toml");
+    let config = Machine::machine_config(m.home.path());
     let good = std::fs::read_to_string(&config).unwrap();
     std::fs::write(&config, "[broken").unwrap();
     m.start().await;
@@ -1604,7 +1638,7 @@ async fn skills_api_browses_content_and_adopts_only_while_connected() {
     let mut m = Machine::new("skills");
     // Identical copies in two Harnesses, a differing third, and an empty
     // fourth whose new-skills default remains off.
-    let config = m.home.path().join(CONFIG_DIR).join("sk1ll/machine.toml");
+    let config = Machine::machine_config(m.home.path());
     let mut text = std::fs::read_to_string(&config).unwrap();
     for h in ["second", "different", "empty"] {
         text.push_str(&format!(
@@ -1726,9 +1760,7 @@ async fn unmanaged_adoption_retries_after_crash_between_publication_and_assignme
     m.stop();
     write(&m.skills().join("pdf"), "SKILL.md", "original user content");
     let repo = sk1ll_core::Repo::open(m.repo()).unwrap();
-    let hs = sk1ll_core::MachineConfig::load(&m.home.path().join(CONFIG_DIR).join("sk1ll/machine.toml"))
-        .unwrap()
-        .harnesses();
+    let hs = sk1ll_core::MachineConfig::load(&Machine::machine_config(m.home.path())).unwrap().harnesses();
     // Simulate a process dying just after atomic draft publication. There is
     // no intent or startup reconciliation; the original is still unmanaged.
     sk1ll_core::sync::unmanaged::prepare(&repo, &hs, HARNESS, "pdf").unwrap();
@@ -2021,7 +2053,7 @@ async fn block_conflict_diff_preserves_surrounding_notes() {
     let mut snap = snapshot(1, &[]);
     snap.assignment.harnesses.get_mut(HARNESS).unwrap().new_rules_default = true;
     let mut m = solo("block-diff", "http://127.0.0.1:1", Some(snap));
-    let config = m.home.path().join(CONFIG_DIR).join("sk1ll/machine.toml");
+    let config = Machine::machine_config(m.home.path());
     let cfg = std::fs::read_to_string(&config)
         .unwrap()
         .replace("instructions_format = \"rules\"", "instructions_format = \"block\"");
