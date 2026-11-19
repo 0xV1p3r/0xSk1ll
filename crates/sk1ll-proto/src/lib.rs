@@ -558,10 +558,14 @@ pub struct ImportError {
     pub message: String,
 }
 
+pub const INVENTORY_UNAVAILABLE: &str = "inventory_unavailable";
+
 /// Body of every non-2xx API response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorBody {
     pub error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
 }
 
 #[cfg(test)]

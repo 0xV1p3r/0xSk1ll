@@ -296,10 +296,9 @@ async fn set_harness_assignment(
 }
 
 async fn assignment_inventory(server: &Server) -> Result<Arc<std::collections::BTreeSet<sk1ll_proto::ItemRef>>> {
-    server
-        .live_items()
-        .await
-        .ok_or_else(|| ApiError::Unavailable("could not read the current baseline inventory; retry shortly".into()))
+    server.live_items().await.ok_or_else(|| {
+        ApiError::InventoryUnavailable("could not read the current baseline inventory; retry shortly".into())
+    })
 }
 
 fn plan_copy(
@@ -577,12 +576,12 @@ mod tests {
                 Json(SetHarnessAssignment { enabled: false })
             )
             .await,
-            Err(ApiError::Unavailable(_))
+            Err(ApiError::InventoryUnavailable(_))
         ));
         let copy = AssignmentCopy { from: ItemRef::Skill("unpulled".into()), to: ItemRef::Skill("new".into()) };
         assert!(matches!(
             copy_assignment(State(server.clone()), caller.clone(), Path("me".into()), Json(copy.clone())).await,
-            Err(ApiError::Unavailable(_))
+            Err(ApiError::InventoryUnavailable(_))
         ));
         server.fail_listing.store(false, std::sync::atomic::Ordering::SeqCst);
         let _ = copy_assignment(State(server.clone()), caller.clone(), Path("me".into()), Json(copy)).await.unwrap();

@@ -561,7 +561,9 @@ fn decode_copy_response(
     use anyhow::Context;
     if !status.is_success() {
         let error = serde_json::from_slice::<ErrorBody>(body);
-        if status.is_server_error() && (status != StatusCode::SERVICE_UNAVAILABLE || error.is_err()) {
+        let inventory_refused = status == StatusCode::SERVICE_UNAVAILABLE
+            && error.as_ref().is_ok_and(|body| body.code.as_deref() == Some(sk1ll_proto::INVENTORY_UNAVAILABLE));
+        if status.is_server_error() && !inventory_refused {
             return Err(CopyFailure::Lost(anyhow::anyhow!("HTTP {status}")));
         }
         // Only this Server's own errors have a JSON body; an older Server's router has no route.
@@ -586,10 +588,16 @@ mod tests {
     #[test]
     fn copy_inventory_refusal_is_definite_but_gateway_failure_is_ambiguous() {
         let status = StatusCode::SERVICE_UNAVAILABLE;
-        let error =
-            decode_copy_response(status, br#"{"error":"could not read inventory; retry shortly"}"#).unwrap_err();
+        let error = decode_copy_response(
+            status,
+            br#"{"error":"could not read inventory; retry shortly","code":"inventory_unavailable"}"#,
+        )
+        .unwrap_err();
         assert!(matches!(error, CopyFailure::Refused(error) if error.to_string().contains("retry shortly")));
-        assert!(matches!(decode_copy_response(status, b"gateway unavailable"), Err(CopyFailure::Lost(_))));
+        assert!(matches!(
+            decode_copy_response(status, br#"{"error":"gateway unavailable"}"#),
+            Err(CopyFailure::Lost(_))
+        ));
         assert!(matches!(
             decode_copy_response(StatusCode::BAD_GATEWAY, br#"{"error":"gateway error"}"#),
             Err(CopyFailure::Lost(_))

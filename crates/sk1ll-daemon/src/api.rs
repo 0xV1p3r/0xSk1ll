@@ -111,7 +111,7 @@ async fn check_api_version(request: Request, next: Next) -> Response {
                  restart the daemon so it runs the installed sk1ll (systemctl --user restart sk1ll-daemon)",
                 sk1ll_core::VERSION
             );
-            (StatusCode::UPGRADE_REQUIRED, Json(sk1ll_proto::ErrorBody { error })).into_response()
+            (StatusCode::UPGRADE_REQUIRED, Json(sk1ll_proto::ErrorBody { error, code: None })).into_response()
         }
         _ => next.run(request).await,
     }
