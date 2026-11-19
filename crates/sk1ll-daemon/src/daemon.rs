@@ -774,8 +774,10 @@ impl Daemon {
         let machine = MachineConfig::load(&self.cfg.machine_config)?;
         let harnesses = machine.harnesses();
         let lock = eng.lock.as_ref().ok_or_else(|| Error::Conflict(format!("{} is not locked", root.display())))?;
-        sync::recover(lock, &harnesses)?;
-        Self::recover_imports(&root)?;
+        if reviewed.is_none() {
+            sync::recover(lock, &harnesses)?;
+            Self::recover_imports(&root)?;
+        }
         let mut errors = Vec::new();
         let mut conflicts: Vec<ConflictRef> = Vec::new();
         let snapshot = self.snapshot();
@@ -1375,8 +1377,11 @@ impl Daemon {
     fn sync_preview_result(actions: &[Action]) -> Result<SyncResult> {
         let sources = actions
             .iter()
-            .filter_map(|action| match &action.item {
-                sync::Item::Skill { mode: sk1ll_core::LinkMode::Copy, source: Some(path), .. } => Some(path),
+            .filter_map(|action| match (&action.kind, &action.item) {
+                (
+                    ActionKind::Create | ActionKind::Update,
+                    sync::Item::Skill { mode: sk1ll_core::LinkMode::Copy, source: Some(path), .. },
+                ) => Some(path),
                 _ => None,
             })
             .map(|path| sk1ll_core::hash::hash_dir(path))
@@ -1423,7 +1428,15 @@ impl Daemon {
             }
             let snapshot =
                 self.snapshot().ok_or_else(|| Error::Conflict("waiting for the server's assignment".into()))?;
-            let (repo, actions) = self.plan_as_is(&snapshot, force)?;
+            let root = Self::root(eng);
+            let lock = eng.lock.as_ref().ok_or_else(|| Error::Conflict(format!("{} is not locked", root.display())))?;
+            let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
+            // Recovery may restore a source or change a placement. Compare the
+            // plan for the recovered state, before applying any placements.
+            sync::recover(lock, &harnesses)?;
+            Self::recover_imports(root)?;
+            let repo = Repo::open(root)?;
+            let actions = sync::plan(&repo, &harnesses, &snapshot.assignment, PlanOptions { force })?;
             let preview = Self::sync_preview_result(&actions)?;
             if preview.fingerprint.as_deref() != Some(fingerprint) {
                 return Ok(preview);
