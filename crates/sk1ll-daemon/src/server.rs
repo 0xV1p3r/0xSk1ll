@@ -391,9 +391,9 @@ pub async fn set_harness_assignment_direct(
     let http = http_client().build().context("building the HTTP client")?;
     let update = set_harness_assignment(&http, &state, harness, sk1ll_proto::SetHarnessAssignment { enabled }).await?;
     if let Some(update) = &update {
-        save_direct_update(cfg, update)?;
+        save_direct_update(cfg, &update.update)?;
     }
-    Ok(update)
+    Ok(update.map(|result| result.update))
 }
 
 fn save_direct_update(cfg: &Config, update: &AssignmentUpdate) -> anyhow::Result<()> {
@@ -409,7 +409,7 @@ pub(crate) async fn set_harness_assignment(
     state: &DaemonState,
     harness: &str,
     body: sk1ll_proto::SetHarnessAssignment,
-) -> Result<Option<AssignmentUpdate>> {
+) -> Result<Option<sk1ll_proto::HarnessAssignmentResult>> {
     if harness.starts_with('.') {
         return Err(Error::BadRequest(format!("invalid harness `{harness}`")));
     }

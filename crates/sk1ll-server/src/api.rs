@@ -249,13 +249,13 @@ async fn set_harness_assignment(
     caller: Caller,
     Path((machine, harness)): Path<(String, String)>,
     Json(body): Json<sk1ll_proto::SetHarnessAssignment>,
-) -> Result<Json<AssignmentUpdate>> {
+) -> Result<Json<sk1ll_proto::HarnessAssignmentResult>> {
     caller.require_machine(&machine)?;
     check_name("harness", &harness)?;
     let push = server.push_lock.clone().lock_owned().await;
-    let items = server.baseline_items();
+    let items = assignment_inventory(&server).await?;
     let id = machine.clone();
-    let applied = server
+    let (applied, skipped) = server
         .db(move |conn| {
             let _push = push;
             let tx = conn.transaction()?;
@@ -264,8 +264,14 @@ async fn set_harness_assignment(
             let report = m.report.unwrap_or_default();
             let known: std::collections::BTreeSet<_> =
                 items.iter().cloned().chain(report.drafts).chain(report.unpushed).collect();
+            let (eligible, skipped): (Vec<_>, Vec<_>) = known.into_iter().partition(|item| match item {
+                sk1ll_proto::ItemRef::Skill(name) | sk1ll_proto::ItemRef::Rule(name) => {
+                    check_name("item name", name).is_ok()
+                }
+                _ => false,
+            });
             let changes = body
-                .changes(&harness, known)
+                .changes(&harness, eligible)
                 .changes
                 .into_iter()
                 .map(|c| Change {
@@ -278,10 +284,17 @@ async fn set_harness_assignment(
                 .collect();
             let applied = assign::apply(&tx, &machine, caller.author(), changes, now(), None)?;
             tx.commit()?;
-            Ok(applied)
+            Ok((applied, skipped))
         })
         .await?;
-    Ok(Json(published(&server, &id, applied)))
+    Ok(Json(sk1ll_proto::HarnessAssignmentResult { update: published(&server, &id, applied), skipped }))
+}
+
+async fn assignment_inventory(server: &Server) -> Result<Arc<std::collections::BTreeSet<sk1ll_proto::ItemRef>>> {
+    server
+        .live_items()
+        .await
+        .ok_or_else(|| ApiError::Unavailable("could not read the current baseline inventory; retry shortly".into()))
 }
 
 fn plan_copy(
@@ -357,7 +370,8 @@ async fn copy_assignment(
 ) -> Result<Json<AssignmentCopied>> {
     caller.require_machine(&id)?;
     let push = server.push_lock.clone().lock_owned().await;
-    let (machine, author, now, items) = (id.clone(), caller.author().to_string(), now(), server.baseline_items());
+    let items = assignment_inventory(&server).await?;
+    let (machine, author, now) = (id.clone(), caller.author().to_string(), now());
     let (applied, registration, copied, skipped) = server
         .db(move |conn| {
             // The database task can outlive a cancelled HTTP request.
@@ -465,6 +479,29 @@ mod tests {
         join(State(server.clone()), Json(req)).await.unwrap().1.0.token
     }
 
+    fn push_items(server: &Server, directory: &std::path::Path, names: &[&str]) {
+        let work = directory.join("work");
+        let git = |path: &std::path::Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["-c", "user.name=test", "-c", "user.email=test@test", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{args:?}: {}", String::from_utf8_lossy(&output.stderr));
+        };
+        git(directory, &["clone", server.config.repo_dir().to_str().unwrap(), "work"]);
+        for name in names {
+            let path = work.join("personal").join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("SKILL.md"), "skill").unwrap();
+        }
+        git(&work, &["add", "--all"]);
+        git(&work, &["commit", "-m", "add skills"]);
+        git(&work, &["push", "origin", "HEAD:main"]);
+    }
+
     #[tokio::test]
     async fn copy_checks_baseline_membership_after_an_in_progress_push() {
         use sk1ll_proto::ItemRef;
@@ -487,8 +524,8 @@ mod tests {
 
         // Publish the pushed tree before releasing the lock. Both items
         // now exist, so the established destination cannot be overwritten.
-        crate::lock(&server.baseline).inventory =
-            Some(crate::Inventory { commit: "pushed".into(), items: Arc::new([from, to].into()) });
+        crate::lock(&server.baseline).inventory = None;
+        push_items(&server, dir.path(), &["pdf", "docs"]);
         drop(push);
         let result = copy.await;
         assert!(matches!(result, Err(ApiError::Conflict(_))), "{result:?}");
@@ -519,18 +556,33 @@ mod tests {
         .await
         .unwrap()
         .0;
-        assert!(!on.assignment.harness("claude").skills.contains_key("unpulled"));
-        crate::lock(&server.baseline).inventory = Some(crate::Inventory {
-            commit: "pushed".into(),
-            items: Arc::new([ItemRef::Skill("unpulled".into())].into()),
-        });
+        assert!(!on.update.assignment.harness("claude").skills.contains_key("unpulled"));
+        push_items(&server, dir.path(), &["unpulled", "team notes"]);
+        server.fail_listing.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            set_harness_assignment(
+                State(server.clone()),
+                caller.clone(),
+                path("me"),
+                Json(SetHarnessAssignment { enabled: false })
+            )
+            .await,
+            Err(ApiError::Unavailable(_))
+        ));
+        let copy = AssignmentCopy { from: ItemRef::Skill("unpulled".into()), to: ItemRef::Skill("new".into()) };
+        assert!(matches!(
+            copy_assignment(State(server.clone()), caller.clone(), Path("me".into()), Json(copy.clone())).await,
+            Err(ApiError::Unavailable(_))
+        ));
+        server.fail_listing.store(false, std::sync::atomic::Ordering::SeqCst);
+        copy_assignment(State(server.clone()), caller.clone(), Path("me".into()), Json(copy)).await.unwrap();
         server
             .db(|conn| {
                 db::save_report(
                     conn,
                     "me",
                     &MachineReport {
-                        drafts: vec![ItemRef::Skill("draft".into())],
+                        drafts: vec![ItemRef::Skill("draft".into()), ItemRef::Skill("draft notes".into())],
                         unpushed: vec![ItemRef::Rule("local".into())],
                         ..Default::default()
                     },
@@ -548,7 +600,9 @@ mod tests {
         .await
         .unwrap()
         .0;
-        assert_eq!(off.revision, on.revision + 1);
+        assert_eq!(off.skipped, [ItemRef::Skill("draft notes".into()), ItemRef::Skill("team notes".into())]);
+        let off = off.update;
+        assert_eq!(off.revision, on.update.revision + 1);
         let harness = off.assignment.harness("claude");
         assert!(!harness.skills["unpulled"]);
         assert!(!harness.skills["draft"]);
