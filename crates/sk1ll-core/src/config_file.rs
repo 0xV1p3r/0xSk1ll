@@ -284,6 +284,25 @@ impl Snapshot {
         &self.path
     }
 
+    pub(crate) fn fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+
+        let mut hash = Sha256::new();
+        let target = self.target.as_os_str().as_encoded_bytes();
+        hash.update((target.len() as u64).to_le_bytes());
+        hash.update(target);
+        hash.update([u8::from(self.linked), u8::from(self.seen.is_some())]);
+        if let Some(seen) = &self.seen {
+            hash.update(seen.id.0.to_le_bytes());
+            hash.update(seen.id.1.to_le_bytes());
+            hash.update(seen.mode.to_le_bytes());
+            hash.update(seen.owner.0.to_le_bytes());
+            hash.update(seen.owner.1.to_le_bytes());
+            hash.update(&seen.bytes);
+        }
+        format!("{:x}", hash.finalize())
+    }
+
     pub fn exists(&self) -> bool {
         self.seen.is_some()
     }

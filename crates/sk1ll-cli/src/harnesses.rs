@@ -143,7 +143,7 @@ pub(crate) fn run(mut cli: Cli, repo: &Path, machine_path: &Path, assignment_pat
     }
     print_preview(machine_path, &change, &rows, assignment.is_none(), true);
     decide(&opts)?;
-    harness_change::apply(&lock, &repo, machine_path, &change)?;
+    harness_change::apply(&lock, &repo, machine_path, &change, &plan.fingerprint)?;
     let mut failed = 0;
     match assignment {
         None => println!("no assignment yet; the harnesses sync once the daemon has the server's"),
@@ -309,7 +309,7 @@ fn via_daemon(daemon: crate::fleet::Daemon, change: HarnessChange, opts: ChangeO
         reason: p.reason.clone(),
         placed,
     };
-    let req = HarnessChangeRequest { change };
+    let mut req = HarnessChangeRequest { change, fingerprint: None };
     let preview = rt.block_on(client.preview_harness(&req))?;
     let rows: Vec<Row> =
         preview.placed.iter().map(|p| view(p, true)).chain(preview.sync.iter().map(|p| view(p, false))).collect();
@@ -318,6 +318,7 @@ fn via_daemon(daemon: crate::fleet::Daemon, change: HarnessChange, opts: ChangeO
     }
     print_preview(&preview.path, &req.change, &rows, preview.awaiting_assignment, false);
     decide(&opts)?;
+    req.fingerprint = Some(preview.fingerprint);
     let applied = rt.block_on(client.apply_harness(&req))?;
     for e in &applied.errors {
         eprintln!("error: {e}");

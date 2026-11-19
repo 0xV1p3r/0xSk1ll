@@ -336,6 +336,8 @@ pub struct HarnessSettings {
 /// `POST /harnesses/preview`, `POST /harnesses/apply`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarnessChangeRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
     pub change: HarnessChange,
 }
 
@@ -358,6 +360,7 @@ pub struct PlacementView {
 /// `POST /harnesses/preview`: what a harness change would do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarnessPreview {
+    pub fingerprint: String,
     pub path: PathBuf,
     pub name: String,
     /// The harness as synced into now (`None`: it isn't).
@@ -470,6 +473,8 @@ pub struct AddImportRequest {
 /// `POST /imports/update`: one import (`name`) or all.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateImportsRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
     /// Overwrite local edits to vendored imports.
@@ -486,6 +491,8 @@ pub struct ImportName {
 /// `POST /sync`: re-sync the harnesses now.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
     #[serde(default)]
     pub dry_run: bool,
     /// Also overwrite hand edits sk1ll would otherwise report as conflicts
@@ -496,6 +503,8 @@ pub struct SyncRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
     /// Conflicts left after the sync.
     pub conflicts: Vec<ConflictView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -890,6 +899,10 @@ impl Client {
         self.post("/notifications", &enabled).await
     }
 
+    pub async fn machine_config_path(&self) -> Result<PathBuf> {
+        self.get("/harnesses/config/path").await
+    }
+
     pub async fn harness_settings(&self) -> Result<HarnessSettings> {
         self.get("/harnesses/config").await
     }
@@ -908,6 +921,22 @@ impl Client {
 
     pub async fn force_update_import(&self, name: &str) -> Result<ImportUpdated> {
         self.post(&format!("/imports/{}/update?force=true", encode(name)), &()).await
+    }
+
+    pub async fn update_reviewed_import(
+        &self,
+        name: &str,
+        force: bool,
+        expected: Option<&str>,
+    ) -> Result<ImportUpdated> {
+        match expected {
+            Some(sha) => {
+                self.post(&format!("/imports/{}/update?force={force}&expected={}", encode(name), encode(sha)), &())
+                    .await
+            }
+            None if force => self.force_update_import(name).await,
+            None => self.update_import(name).await,
+        }
     }
 
     pub async fn import_changes(&self, name: &str, upstream: Option<&str>) -> Result<ImportChanges> {
@@ -955,6 +984,26 @@ impl Client {
             return self.get("/sync?force=true").await;
         }
         self.post("/sync", req).await
+    }
+
+    /// Returns a fresh preview if the daemon refused the reviewed plan.
+    pub async fn apply_sync_preview(&self, fingerprint: String) -> Result<SyncResult> {
+        let path = "/sync";
+        let req = SyncRequest { fingerprint: Some(fingerprint), ..Default::default() };
+        let body = serde_json::to_vec(&req).map_err(ClientError::transport)?;
+        let response = self.send(Method::POST, path, Some(body)).await?;
+        let status = response.status();
+        let bytes = response.into_body().collect().await.map_err(ClientError::transport)?.to_bytes();
+        if (status.is_success() || status == StatusCode::CONFLICT)
+            && let Ok(result) = serde_json::from_slice(&bytes)
+        {
+            return Ok(result);
+        }
+        Err(ClientError {
+            status: Some(status.as_u16()),
+            message: failure_message(status, &bytes, &Method::POST, path),
+            not_running: false,
+        })
     }
 
     pub async fn push(&self) -> Result<PushResult> {
@@ -1187,7 +1236,8 @@ mod tests {
         let req: HarnessChangeRequest = serde_json::from_value(json).unwrap();
         assert!(matches!(&req.change, HarnessChange::Set { name, harness } if name == "agents"
             && harness.mode == sk1ll_core::LinkMode::Copy));
-        let disable = HarnessChangeRequest { change: HarnessChange::Disable { name: "codex".into() } };
+        let disable =
+            HarnessChangeRequest { fingerprint: None, change: HarnessChange::Disable { name: "codex".into() } };
         assert_eq!(
             serde_json::to_value(&disable).unwrap(),
             serde_json::json!({"change": {"op": "disable", "name": "codex"}})

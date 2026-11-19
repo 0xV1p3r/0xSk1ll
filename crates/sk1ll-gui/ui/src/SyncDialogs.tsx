@@ -1,4 +1,4 @@
-import { useCallback } from 'react';
+import { useCallback, useState } from 'react';
 import { Tabs } from '@base-ui/react/tabs';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
@@ -42,6 +42,7 @@ const actionKinds = ['create', 'update', 'remove', 'conflict'] as const;
 export function SyncDialog({ onClose, changed }: { onClose: () => void; changed: () => void }) {
   const preview = useResource(api.previewSync, 0);
   const apply = useMutation();
+  const [replanned, setReplanned] = useState(false);
   const actions = preview.data?.actions;
   return <Dialog open onOpenChange={open => { if (!open && !apply.pending) onClose(); }}>
     <DialogContent showCloseButton={!apply.pending} className="sm:max-w-2xl">
@@ -49,6 +50,7 @@ export function SyncDialog({ onClose, changed }: { onClose: () => void; changed:
         <DialogDescription>Review the changes before syncing. Resolve any remaining conflicts in Conflicts.</DialogDescription></DialogHeader>
       <ErrorNotice error={preview.error} />
       {preview.loading && <Loading rows={2} />}
+      {replanned && <p role="status">The sync plan changed. Review the new plan before applying.</p>}
       {actions && <>
         <dl className="grid grid-cols-4 gap-2">
           {actionKinds.map(kind => <div key={kind} className="rounded-md border p-2">
@@ -66,19 +68,24 @@ export function SyncDialog({ onClose, changed }: { onClose: () => void; changed:
       </>}
       <DialogFooter>
         <Button variant="outline" disabled={apply.pending} onClick={onClose}>Cancel</Button>
-        <Button disabled={preview.loading || !actions?.some(action => action.kind !== 'conflict') || apply.pending}
+        <Button disabled={preview.loading || !preview.data?.fingerprint || !actions?.some(action => action.kind !== 'conflict') || apply.pending}
           onClick={() => void apply.run(async () => {
             try {
-              const result = await api.syncNow();
+              const result = await api.syncNow(preview.data!.fingerprint!);
+              if (result.fingerprint) {
+                preview.setData(result);
+                setReplanned(true);
+                return;
+              }
               toast(result.errors?.length
                 ? { title: 'Sync completed with errors', description: result.errors.join('\n'), tone: 'destructive' }
                 : { title: 'Sync complete', description: result.conflicts.length ? `${result.conflicts.length} ${result.conflicts.length === 1 ? 'conflict' : 'conflicts'} remaining.` : undefined });
             } catch (error) {
               toast({ title: 'Sync failed', description: errorMessage(error), tone: 'destructive' });
-            } finally {
-              changed();
-              onClose();
+              return;
             }
+            changed();
+            onClose();
           })}><Pending pending={apply.pending}>Apply</Pending></Button>
       </DialogFooter>
     </DialogContent>

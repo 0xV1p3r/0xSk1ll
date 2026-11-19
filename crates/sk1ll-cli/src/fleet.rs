@@ -591,7 +591,7 @@ impl Daemon {
                 ),
             },
             Cmd::Sync { dry_run: _, force } => {
-                let result = self.block(c.sync(&SyncRequest { force, dry_run: false }))?;
+                let result = self.block(c.sync(&SyncRequest { force, ..Default::default() }))?;
                 if result.conflicts.is_empty() {
                     println!("harnesses in sync");
                 }
@@ -629,7 +629,7 @@ impl Daemon {
                 print_import_changes(&name, self.block(c.import_changes(&name, None))?);
             }
             Cmd::Update { name, force, .. } => {
-                for r in self.block(c.update_imports(&UpdateImportsRequest { name, force }))? {
+                for r in self.block(c.update_imports(&UpdateImportsRequest { name, force, expected: None }))? {
                     print_update(&r.name, r.old_commit.as_deref(), &r.new_commit, r.changed);
                 }
                 println!("review with `sk1ll diff`, then commit");

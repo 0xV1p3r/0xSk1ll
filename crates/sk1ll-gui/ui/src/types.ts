@@ -37,7 +37,7 @@ export interface AssignmentChanges { changes: ToggleChange[]; expected?: Expecte
 export interface AssignmentSnapshot extends Assignment { revision: number; registration?: string | null }
 // `registration`: which registration of the Machine it was read for (see `registrationOf`).
 export interface CachedAssignmentSnapshot { assignment: Assignment; revision: number; registration?: string | null }
-export interface AssignmentUpdate extends CachedAssignmentSnapshot { entries: LogEntry[] }
+export interface AssignmentUpdate extends Omit<CachedAssignmentSnapshot, 'registration'> { entries: LogEntry[] }
 export type LogCause = { type: 'change' | 'item_removed' | 'default_materialized' | 'machine_removed' | 'harness_added' }
   | { type: 'undo'; entry: number };
 export interface LogEntry {
@@ -77,11 +77,11 @@ export interface HarnessChoice { name: string; installed: boolean; enabled: bool
 export interface HarnessSettings { path: string; harnesses: HarnessChoice[] }
 export type HarnessChange = { op: 'enable' | 'disable' | 'remove'; name: string } | { op: 'set'; name: string; harness: HarnessView['harness'] };
 // Apply answers 409 if machine.toml changed while it was written; it never removes what sk1ll placed.
-export interface HarnessChangeRequest { change: HarnessChange }
+export interface HarnessChangeRequest { change: HarnessChange; fingerprint?: string }
 export interface InstructionPreview {
   path: string; format: 'block' | 'rules'; content: string; next_content: string; differs: boolean; diff: string;
 }
-export interface SyncResult { conflicts: ConflictView[]; actions?: PlacementView[]; errors?: string[] }
+export interface SyncResult { fingerprint?: string; conflicts: ConflictView[]; actions?: PlacementView[]; errors?: string[] }
 export interface PlacementView {
   harness: string; kind: 'create' | 'update' | 'remove' | 'conflict'; item: 'skill' | 'rule' | 'instructions';
   name: string; dest: string; reason: string | null;
@@ -89,6 +89,7 @@ export interface PlacementView {
 // `placed`: what sk1ll placed where the change stops syncing, which stays there (`remove`: managed, `conflict`: edited
 // by hand); turning the Harness's items off first lets sync take it out. `sync`: what the sync after the change does.
 export interface HarnessPreview {
+  fingerprint: string;
   path: string; name: string; before: HarnessView['harness'] | null; after: HarnessView['harness'] | null;
   placed: PlacementView[]; warnings?: string[]; sync: PlacementView[]; awaiting_assignment: boolean;
 }
@@ -138,7 +139,7 @@ export interface ContentEntry {
 export interface ContentQuery { item: string; hash?: string; harness?: string }
 export interface FileEntry { path: string; kind: 'file' | 'directory' | 'symlink'; size: number }
 export type WriteFileRequest = ContentQuery & { path: string; content: string; expected: string };
-export interface FileContent { fingerprint?: string | null; path: string; text: string | null; binary: boolean; too_large: boolean; size: number }
+export interface FileContent { fingerprint: string | null; path: string; text: string | null; binary: boolean; too_large: boolean; size: number }
 export interface Editor { id: string; name: string; kind: 'gui' | 'terminal' | 'system' }
 export interface EditorsView { editors: Editor[]; preferred_editor: string }
 

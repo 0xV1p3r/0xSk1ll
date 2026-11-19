@@ -9,7 +9,7 @@ import { NativeSelect } from '@/components/ui/native-select';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { toast } from './toast';
-import { api } from './api';
+import { api, errorStatus } from './api';
 import { useMutation, useResource } from './hooks';
 import { ErrorNotice, Loading, Pending } from './shared';
 import type { HarnessChange, HarnessChoice, HarnessView, PlacementView } from './types';
@@ -43,7 +43,7 @@ export function HarnessPanel({ revision, editorId, changed, actions }: {
   return <div className="flex flex-col gap-3 p-3.5">
     <div className="flex flex-wrap items-start justify-between gap-3"><div><h3 className="text-sm font-medium">Harnesses on this Machine</h3>
       <p className="text-sm text-muted-foreground">Saved in {settings.data ? <code className="font-mono text-xs break-all">{settings.data.path}</code> : <code className="font-mono">machine.toml</code>}. Every change is previewed before it is applied.</p></div>
-      <div className="flex gap-2"><Button variant="outline" size="sm" disabled={!editorId || !settings.data || open.pending} title={editorId ? undefined : 'Choose a preferred editor below first'}
+      <div className="flex gap-2"><Button variant="outline" size="sm" disabled={!editorId || open.pending} title={editorId ? undefined : 'Choose a preferred editor below first'}
         onClick={() => void open.run(() => api.openMachineConfig(editorId!))}><FileCog data-icon="inline-start" /><Pending pending={open.pending}>Open configuration</Pending></Button>
         <Button size="sm" onClick={() => setEditing({ name: '', existing: false, harness: { skills: null, instructions: null, instructions_format: 'block', mode: 'symlink' } })}><Plus data-icon="inline-start" />Add Harness</Button></div></div>
     <ErrorNotice error={settings.error || open.error} />
@@ -117,7 +117,11 @@ export function ChangeDialog({ change, onClose, onApplied }: { change: HarnessCh
   const [failed, setFailed] = useState<string[]>();
   const apply = useMutation();
   const [warning, setWarning] = useState<string | null>(null);
-  const turnOff = useMutation(() => void preview.refresh());
+  const refreshPreview = () => {
+    preview.setData(undefined);
+    return preview.refresh();
+  };
+  const turnOff = useMutation(() => void refreshPreview());
   const managed = preview.data?.placed.filter(p => p.kind === 'remove').length ?? 0;
   const edited = preview.data?.placed.filter(p => p.kind === 'conflict').length ?? 0;
   const busy = apply.pending || turnOff.pending;
@@ -152,8 +156,15 @@ export function ChangeDialog({ change, onClose, onApplied }: { change: HarnessCh
         <ul className="mt-1 list-disc pl-5 text-destructive">{failed.map(e => <li key={e} className="break-all">{e}</li>)}</ul></section>}
       <DialogFooter>{failed ? <Button onClick={onApplied}>Done</Button> : <>
         <Button variant="outline" disabled={busy} onClick={onClose}>Cancel</Button>
-        {apply.error && !apply.pending && <Button variant="outline" onClick={() => void preview.refresh()}>Preview again</Button>}
-        <Button disabled={!preview.data || preview.loading || busy} onClick={() => void apply.run(() => api.applyHarness({ change }), result => {
+        {(apply.error || preview.error) && !preview.loading && !busy && <Button variant="outline" onClick={() => void refreshPreview()}>Preview again</Button>}
+        <Button disabled={!preview.data?.fingerprint || !!preview.error || preview.loading || busy} onClick={() => void apply.run(async () => {
+          try {
+            return await api.applyHarness({ change, fingerprint: preview.data?.fingerprint });
+          } catch (error) {
+            if (errorStatus(error) === 409) preview.setData(undefined);
+            throw error;
+          }
+        }, result => {
           if (result.errors.length) return setFailed(result.errors);
           toast({ title: 'Harness changed', description: 'The Harnesses are synced.' });
           onApplied();

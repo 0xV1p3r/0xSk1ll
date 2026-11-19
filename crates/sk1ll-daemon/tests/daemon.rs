@@ -1494,9 +1494,15 @@ async fn imports_resolve_links_and_add_one_skill() {
     assert!(error.message.contains("locally modified imports: pdf"), "{}", error.message);
     assert!(error.message.contains("fork") && error.message.contains("overwrite"), "{}", error.message);
     assert_eq!(std::fs::read_to_string(&local).unwrap(), "my edits");
-    let updated = m.client.force_update_import("pdf").await.unwrap();
-    assert_eq!(updated.new_commit, selected_ref.commit);
-    assert!(std::fs::read_to_string(&local).unwrap().contains("v2"));
+    write(&source.join("skills/pdf"), "SKILL.md", "---\ndescription: v3\n---\n");
+    git(&source, &["commit", "--quiet", "-am", "v3"]);
+    let rejected = m.client.update_reviewed_import("pdf", true, Some(&preview.upstream)).await.unwrap_err();
+    assert_eq!(rejected.status, Some(409));
+    assert_eq!(std::fs::read_to_string(&local).unwrap(), "my edits");
+    let fresh = m.client.import_changes("pdf", None).await.unwrap();
+    let updated = m.client.update_reviewed_import("pdf", true, Some(&fresh.upstream)).await.unwrap();
+    assert_eq!(updated.new_commit, fresh.upstream);
+    assert!(std::fs::read_to_string(&local).unwrap().contains("v3"));
 }
 
 /// A GitHub folder link with an explicit `ref` and an explicit root `path`
@@ -2309,6 +2315,12 @@ async fn harnesses_change_after_setup_with_a_preview_of_what_stays() {
     assert_eq!(settings.path, Machine::machine_config(m.home.path()));
     assert!(settings.harnesses.iter().any(|c| c.name == HARNESS && c.configured && !c.preset));
 
+    let config_text = std::fs::read_to_string(&settings.path).unwrap();
+    std::fs::write(&settings.path, "broken = [").unwrap();
+    assert!(m.client.harness_settings().await.is_err());
+    assert_eq!(m.client.machine_config_path().await.unwrap(), settings.path);
+    std::fs::write(&settings.path, config_text).unwrap();
+
     // Adding a custom harness previews what it receives, then syncs it.
     let extra = m.home.path().join("extra/skills");
     let harness = sk1ll_core::Harness {
@@ -2316,7 +2328,8 @@ async fn harnesses_change_after_setup_with_a_preview_of_what_stays() {
         mode: sk1ll_core::LinkMode::Copy,
         ..Default::default()
     };
-    let add = HarnessChangeRequest { change: HarnessChange::Set { name: "extra".into(), harness } };
+    let mut add =
+        HarnessChangeRequest { fingerprint: None, change: HarnessChange::Set { name: "extra".into(), harness } };
     let preview = m.client.preview_harness(&add).await.unwrap();
     assert!(preview.before.is_none() && preview.placed.is_empty());
     assert_eq!(
@@ -2324,18 +2337,33 @@ async fn harnesses_change_after_setup_with_a_preview_of_what_stays() {
         [("create", "pdf")]
     );
     assert!(!extra.exists(), "a preview changes nothing");
+    let original = std::fs::read_to_string(&settings.path).unwrap();
+    let edited = format!(
+        "{original}
+# External edit
+"
+    );
+    std::fs::write(&settings.path, &edited).unwrap();
+    add.fingerprint = Some(preview.fingerprint);
+    let error = m.client.apply_harness(&add).await.unwrap_err();
+    assert_eq!(error.status, Some(409));
+    assert!(error.message.contains("machine.toml changed since the preview"));
+    assert_eq!(std::fs::read_to_string(&settings.path).unwrap(), edited);
+    add.fingerprint = Some(m.client.preview_harness(&add).await.unwrap().fingerprint);
     let applied = m.client.apply_harness(&add).await.unwrap();
     assert!(applied.errors.is_empty(), "{:?}", applied.errors);
     assert!(extra.join("pdf/SKILL.md").is_file());
 
     // Disabling shows what sk1ll placed, and leaves it.
-    let disable = HarnessChangeRequest { change: HarnessChange::Disable { name: "extra".into() } };
+    let mut disable =
+        HarnessChangeRequest { fingerprint: None, change: HarnessChange::Disable { name: "extra".into() } };
     let preview = m.client.preview_harness(&disable).await.unwrap();
     assert!(preview.after.is_none());
     assert_eq!(
         preview.placed.iter().map(|p| (p.kind.as_str(), p.name.as_str())).collect::<Vec<_>>(),
         [("remove", "pdf")]
     );
+    disable.fingerprint = Some(preview.fingerprint);
     let applied = m.client.apply_harness(&disable).await.unwrap();
     assert!(applied.errors.is_empty(), "{:?}", applied.errors);
     assert!(extra.join("pdf/SKILL.md").is_file(), "left in place");
@@ -2346,8 +2374,10 @@ async fn harnesses_change_after_setup_with_a_preview_of_what_stays() {
     assert!(result.warning.is_none());
     assert!(!result.update.assignment.skill_enabled(HARNESS, "pdf"));
     eventually(|| async { m.harness_skill("pdf").is_none().then_some(()) }).await;
-    let disable = HarnessChangeRequest { change: HarnessChange::Disable { name: HARNESS.into() } };
+    let mut disable =
+        HarnessChangeRequest { fingerprint: None, change: HarnessChange::Disable { name: HARNESS.into() } };
     assert!(m.client.preview_harness(&disable).await.unwrap().placed.is_empty());
+    disable.fingerprint = Some(m.client.preview_harness(&disable).await.unwrap().fingerprint);
     m.client.apply_harness(&disable).await.unwrap();
     assert_eq!(m.harness_skill("mine").as_deref(), Some("unmanaged"));
     assert!(m.client.harnesses().await.unwrap().iter().all(|h| h.name != HARNESS));
@@ -2362,17 +2392,25 @@ async fn harnesses_change_after_setup_with_a_preview_of_what_stays() {
         mode: sk1ll_core::LinkMode::Copy,
         ..Default::default()
     };
-    let add_blocked = HarnessChangeRequest { change: HarnessChange::Set { name: "blocked".into(), harness: blocked } };
+    let mut add_blocked = HarnessChangeRequest {
+        fingerprint: None,
+        change: HarnessChange::Set { name: "blocked".into(), harness: blocked },
+    };
+    add_blocked.fingerprint = Some(m.client.preview_harness(&add_blocked).await.unwrap().fingerprint);
     let applied = m.client.apply_harness(&add_blocked).await.unwrap();
     assert!(applied.errors.iter().any(|e| e.contains("blocked/skills")), "{:?}", applied.errors);
     assert!(applied.harnesses.iter().any(|c| c.name == "blocked" && c.enabled), "machine.toml changed anyway");
-    let drop_blocked = HarnessChangeRequest { change: HarnessChange::Remove { name: "blocked".into() } };
+    let mut drop_blocked =
+        HarnessChangeRequest { fingerprint: None, change: HarnessChange::Remove { name: "blocked".into() } };
+    drop_blocked.fingerprint = Some(m.client.preview_harness(&drop_blocked).await.unwrap().fingerprint);
     m.client.apply_harness(&drop_blocked).await.unwrap();
     std::fs::set_permissions(m.home.path().join("blocked/skills"), std::os::unix::fs::PermissionsExt::from_mode(0o755))
         .unwrap();
 
-    let bad =
-        HarnessChangeRequest { change: HarnessChange::Set { name: "Bad Name".into(), harness: Default::default() } };
+    let bad = HarnessChangeRequest {
+        fingerprint: None,
+        change: HarnessChange::Set { name: "Bad Name".into(), harness: Default::default() },
+    };
     assert_eq!(m.client.preview_harness(&bad).await.unwrap_err().status, Some(400));
     assert_eq!(m.client.apply_harness(&bad).await.unwrap_err().status, Some(400));
 }
@@ -2849,7 +2887,7 @@ async fn render_and_dry_run_use_the_current_draft_without_writing() {
     m.write("instructions/style.md", draft);
     m.write("instructions/other.md", "---\nharnesses: [elsewhere]\n---\n\nSkip this.\n");
     let path = m.home.path().join("agent/rules/style.md");
-    let config = sk1ll_core::MachineConfig::load(&m.home.path().join(CONFIG_DIR).join("sk1ll/machine.toml")).unwrap();
+    let config = sk1ll_core::MachineConfig::load(&Machine::machine_config(m.home.path())).unwrap();
     let assignment = Assignment::load(&m.cache_path()).unwrap();
     let cli_files = sk1ll_core::sync::render_instructions(&repo, &config.harnesses(), &assignment, HARNESS).unwrap();
 
@@ -2880,9 +2918,21 @@ async fn render_and_dry_run_use_the_current_draft_without_writing() {
     assert!(!path.parent().unwrap().exists());
     assert_eq!(std::fs::read_to_string(m.repo().join("instructions/style.md")).unwrap(), draft);
 
-    let applied = m.client.sync(&Default::default()).await.unwrap();
+    m.write("instructions/style.md", &draft.replace("short", "readable"));
+    let reviewed = plan.fingerprint.unwrap();
+    let refused = m
+        .client
+        .sync(&sk1ll_daemon::client::SyncRequest { fingerprint: Some(reviewed.clone()), ..Default::default() })
+        .await
+        .unwrap_err();
+    assert_eq!(refused.status, Some(409));
+    let fresh = m.client.apply_sync_preview(reviewed).await.unwrap();
+    assert!(fresh.actions.is_some());
+    assert!(!path.exists());
+    let applied = m.client.apply_sync_preview(fresh.fingerprint.unwrap()).await.unwrap();
     assert!(applied.errors.is_empty());
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), files[0].next_content);
+    assert!(applied.fingerprint.is_none());
+    assert!(std::fs::read_to_string(&path).unwrap().contains("readable"));
     let files = m.client.render_instructions(HARNESS).await.unwrap();
     assert!(!files[0].differs && files[0].diff.is_empty());
 }

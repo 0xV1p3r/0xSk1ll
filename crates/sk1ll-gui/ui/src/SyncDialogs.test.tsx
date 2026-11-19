@@ -27,7 +27,7 @@ it('shows the proposed file and switches the diff when a file tab is selected', 
 });
 
 it('lists the dry-run plan and applies only after confirmation', async () => {
-  vi.mocked(api.previewSync).mockResolvedValue({ conflicts: [], actions: [
+  vi.mocked(api.previewSync).mockResolvedValue({ fingerprint: 'reviewed', conflicts: [], actions: [
     { harness: 'codex', kind: 'create', item: 'skill', name: 'pdf', dest: '/skills/pdf', reason: null },
     { harness: 'codex', kind: 'conflict', item: 'rule', name: 'style', dest: '/rules/style.md', reason: 'Edited by hand' },
   ] });
@@ -41,6 +41,23 @@ it('lists the dry-run plan and applies only after confirmation', async () => {
   fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
   await waitFor(() => expect(close).toHaveBeenCalledOnce());
   expect(changed).toHaveBeenCalledOnce();
-  expect(api.syncNow).toHaveBeenCalledExactlyOnceWith();
+  expect(api.syncNow).toHaveBeenCalledExactlyOnceWith('reviewed');
   expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Sync complete' }));
+});
+
+it('requires a second confirmation when the daemon returns a changed plan', async () => {
+  const action = { harness: 'codex', kind: 'create', item: 'skill', name: 'pdf', dest: '/skills/pdf', reason: null } as const;
+  vi.mocked(api.previewSync).mockResolvedValue({ fingerprint: 'first', conflicts: [], actions: [action] });
+  vi.mocked(api.syncNow).mockResolvedValueOnce({ fingerprint: 'new', conflicts: [], actions: [{ ...action, dest: '/new/pdf' }] })
+    .mockResolvedValueOnce({ conflicts: [] });
+  const close = vi.fn();
+  render(<SyncDialog changed={vi.fn()} onClose={close} />);
+  await screen.findByText('/skills/pdf');
+  fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+  await screen.findByText('/new/pdf');
+  expect(close).not.toHaveBeenCalled();
+  expect(api.syncNow).toHaveBeenCalledExactlyOnceWith('first');
+  fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+  await waitFor(() => expect(close).toHaveBeenCalledOnce());
+  expect(api.syncNow).toHaveBeenLastCalledWith('new');
 });

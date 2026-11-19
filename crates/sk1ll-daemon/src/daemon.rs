@@ -744,6 +744,10 @@ impl Daemon {
     /// [`Daemon::refresh`], returning what the sync failed to place (also
     /// published as the last error).
     fn refresh_reporting(&self, eng: &mut Engine) -> Result<Vec<String>> {
+        self.refresh_with_plan(eng, None)
+    }
+
+    fn refresh_with_plan(&self, eng: &mut Engine, reviewed: Option<(Repo, Vec<Action>)>) -> Result<Vec<String>> {
         if Self::idle(eng) {
             return Ok(Vec::new());
         }
@@ -776,9 +780,11 @@ impl Daemon {
         let mut conflicts: Vec<ConflictRef> = Vec::new();
         let snapshot = self.snapshot();
         if let Some(snap) = &snapshot {
-            let planned = Repo::open(&root).and_then(|repo| {
-                let actions = sync::plan(&repo, &harnesses, &snap.assignment, PlanOptions::default())?;
-                Ok((repo, actions))
+            let planned = reviewed.map(Ok).unwrap_or_else(|| {
+                Repo::open(&root).and_then(|repo| {
+                    let actions = sync::plan(&repo, &harnesses, &snap.assignment, PlanOptions::default())?;
+                    Ok((repo, actions))
+                })
             });
             match planned {
                 Ok((repo, actions)) => {
@@ -1363,7 +1369,21 @@ impl Daemon {
         let repo = Repo::open(self.repo_root())?;
         let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
         let actions = sync::plan(&repo, &harnesses, &self.current_assignment()?, PlanOptions { force })?;
+        Self::sync_preview_result(&actions)
+    }
+
+    fn sync_preview_result(actions: &[Action]) -> Result<SyncResult> {
+        let sources = actions
+            .iter()
+            .filter_map(|action| match &action.item {
+                sync::Item::Skill { mode: sk1ll_core::LinkMode::Copy, source: Some(path), .. } => Some(path),
+                _ => None,
+            })
+            .map(|path| sk1ll_core::hash::hash_dir(path))
+            .collect::<sk1ll_core::Result<Vec<_>>>()?;
+        let serialized = serde_json::to_string(&(actions, sources)).map_err(|e| Error::Internal(e.into()))?;
         Ok(SyncResult {
+            fingerprint: Some(sk1ll_core::hash::hash_str(&serialized)),
             conflicts: actions.iter().filter(|a| a.kind == ActionKind::Conflict).map(conflict_view).collect(),
             actions: Some(actions.iter().map(placement_view).collect()),
             errors: Vec::new(),
@@ -1394,18 +1414,33 @@ impl Daemon {
 
     /// `POST /sync`: re-syncs now; `force` also overwrites what a forced plan
     /// may overwrite (hand edits inside managed blocks).
-    pub(crate) fn sync(&self, eng: &mut Engine, force: bool) -> Result<SyncResult> {
+    pub(crate) fn sync(&self, eng: &mut Engine, force: bool, fingerprint: Option<&str>) -> Result<SyncResult> {
         self.ensure_managed(eng)?;
         self.lock_repo(eng)?;
-        if force {
+        let reviewed = if let Some(fingerprint) = fingerprint {
+            if self.is_standalone() {
+                self.reload_local_assignment()?;
+            }
+            let snapshot =
+                self.snapshot().ok_or_else(|| Error::Conflict("waiting for the server's assignment".into()))?;
+            let (repo, actions) = self.plan_as_is(&snapshot, force)?;
+            let preview = Self::sync_preview_result(&actions)?;
+            if preview.fingerprint.as_deref() != Some(fingerprint) {
+                return Ok(preview);
+            }
+            Some((repo, actions))
+        } else {
+            None
+        };
+        if force && reviewed.is_none() {
             let (repo, actions) = self.plan(eng, true)?;
             for a in actions.iter().filter(|a| a.kind != ActionKind::Conflict) {
                 sync::apply(&repo, a)?;
             }
         }
-        let errors = self.refresh_reporting(eng)?;
+        let errors = self.refresh_with_plan(eng, reviewed)?;
         self.event(Event::Status);
-        Ok(SyncResult { conflicts: self.conflicts()?, actions: None, errors })
+        Ok(SyncResult { fingerprint: None, conflicts: self.conflicts()?, actions: None, errors })
     }
 
     pub(crate) fn resolve_displaced(&self, eng: &mut Engine, id: &str, adopt: bool) -> Result<()> {
@@ -1633,6 +1668,7 @@ impl Daemon {
         let plan =
             harness_change::plan(&repo, &self.cfg.machine_config, change, snapshot.as_ref().map(|s| &s.assignment))?;
         Ok(HarnessPreview {
+            fingerprint: plan.fingerprint,
             path: self.cfg.machine_config.clone(),
             name: change.name().to_string(),
             before: plan.before,
@@ -1652,7 +1688,9 @@ impl Daemon {
         self.lock_repo(eng)?;
         let repo = Repo::open(Self::root(eng))?;
         let lock = eng.lock.as_ref().ok_or_else(|| Error::Conflict("the repo is not locked".into()))?;
-        let plan = harness_change::apply(lock, &repo, &self.cfg.machine_config, &req.change)?;
+        let fingerprint =
+            req.fingerprint.as_deref().ok_or_else(|| Error::BadRequest("a preview fingerprint is required".into()))?;
+        let plan = harness_change::apply(lock, &repo, &self.cfg.machine_config, &req.change, fingerprint)?;
         tracing::info!("harness change {:?}: {} placed item(s) left in place", req.change, plan.placed.len());
         let errors = match self.refresh_reporting(eng) {
             Ok(failed) => failed,
@@ -1689,7 +1727,7 @@ impl Daemon {
 
     /// Re-vendors imports into the draft: `name`, or all of them.
     pub(crate) async fn update_imports(self: &Arc<Self>, req: UpdateImportsRequest) -> Result<Vec<ImportUpdated>> {
-        let UpdateImportsRequest { name, force } = req;
+        let UpdateImportsRequest { name, force, expected } = req;
         let (root, todo) = self
             .blocking(move |d, eng| {
                 d.ensure_managed(eng)?;
@@ -1698,6 +1736,9 @@ impl Daemon {
             })
             .await?;
         let fetched = unlocked(move || imports::fetch_updates(&root, todo)).await?;
+        if let Some(expected) = &expected {
+            fetched.check_commit(expected)?;
+        }
         self.blocking(move |d, eng| {
             d.ensure_managed(eng)?;
             d.lock_repo(eng)?;
@@ -1709,8 +1750,13 @@ impl Daemon {
     }
 
     /// Re-vendors one import into the draft.
-    pub(crate) async fn update_import(self: &Arc<Self>, name: String, force: bool) -> Result<ImportUpdated> {
-        let req = UpdateImportsRequest { name: Some(name), force };
+    pub(crate) async fn update_import(
+        self: &Arc<Self>,
+        name: String,
+        force: bool,
+        expected: Option<String>,
+    ) -> Result<ImportUpdated> {
+        let req = UpdateImportsRequest { name: Some(name), force, expected };
         self.update_imports(req).await?.into_iter().next().context("no update report").map_err(Error::Internal)
     }
 

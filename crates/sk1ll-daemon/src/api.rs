@@ -61,6 +61,7 @@ pub(crate) fn router(d: Arc<Daemon>) -> Router {
         .route("/harnesses", get(harnesses))
         .route("/notifications", get(notifications_enabled).post(set_notifications))
         .route("/harnesses/config", get(harness_settings))
+        .route("/harnesses/config/path", get(machine_config_path))
         .route("/harnesses/preview", post(preview_harness))
         .route("/harnesses/apply", post(apply_harness))
         .route("/setup/harnesses", get(setup_harnesses))
@@ -353,6 +354,10 @@ async fn set_notifications(State(d): St, Json(enabled): Json<bool>) -> Result<Js
     Ok(Json(enabled))
 }
 
+async fn machine_config_path(State(d): St) -> Result<Json<std::path::PathBuf>> {
+    Ok(Json(std::path::absolute(&d.cfg.machine_config).map_err(|error| Error::Internal(error.into()))?))
+}
+
 async fn harness_settings(State(d): St) -> Result<Json<HarnessSettings>> {
     Ok(Json(d.reading(|d| d.harness_settings()).await?))
 }
@@ -367,6 +372,7 @@ async fn apply_harness(State(d): St, Json(req): Json<HarnessChangeRequest>) -> R
 
 #[derive(serde::Deserialize)]
 struct UpdateImportQuery {
+    expected: Option<String>,
     #[serde(default)]
     force: bool,
 }
@@ -376,7 +382,7 @@ async fn update_import(
     UrlPath(name): UrlPath<String>,
     Query(q): Query<UpdateImportQuery>,
 ) -> Result<Json<ImportUpdated>> {
-    Ok(Json(d.update_import(name, q.force).await?))
+    Ok(Json(d.update_import(name, q.force, q.expected).await?))
 }
 
 async fn import_changes(
@@ -409,11 +415,13 @@ async fn fork(State(d): St, Json(req): Json<ImportName>) -> Result<StatusCode> {
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn sync(State(d): St, Json(req): Json<SyncRequest>) -> Result<Json<SyncResult>> {
+async fn sync(State(d): St, Json(req): Json<SyncRequest>) -> Result<impl IntoResponse> {
     if req.dry_run {
-        return Ok(Json(d.reading(move |d| d.preview_sync(req.force)).await?));
+        return Ok((StatusCode::OK, Json(d.reading(move |d| d.preview_sync(req.force)).await?)));
     }
-    Ok(Json(d.blocking(move |d, eng| d.sync(eng, req.force)).await?))
+    let result = d.blocking(move |d, eng| d.sync(eng, req.force, req.fingerprint.as_deref())).await?;
+    let status = if result.fingerprint.is_some() { StatusCode::CONFLICT } else { StatusCode::OK };
+    Ok((status, Json(result)))
 }
 
 #[derive(Deserialize)]

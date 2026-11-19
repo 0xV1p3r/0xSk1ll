@@ -533,6 +533,15 @@ struct FetchedUpdate {
     staged: source::Staged,
 }
 
+impl FetchedUpdates {
+    pub fn check_commit(&self, expected: &str) -> Result<()> {
+        if matches!(self.0.as_slice(), [update] if update.commit == expected) {
+            return Ok(());
+        }
+        Err(Error::Changed("the upstream ref changed since the preview; check upstream changes again".into()))
+    }
+}
+
 /// The network half of [`Repo::update`]: fetches each import's source once,
 /// resolves its ref and stages its content. Reads nothing but `root` (for
 /// relative sources).

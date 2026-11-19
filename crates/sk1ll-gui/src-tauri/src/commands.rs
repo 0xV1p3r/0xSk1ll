@@ -77,7 +77,7 @@ command!(setup_harnesses() -> Vec<HarnessChoice>, setup_harnesses());
 command!(set_setup_harness(name: String, enabled: bool) -> Vec<HarnessChoice>, set_setup_harness(&name, enabled));
 command!(render_instructions(name: String) -> Vec<InstructionPreview>, render_instructions(&name));
 command!(preview_sync() -> SyncResult, preview_sync());
-command!(sync_now() -> SyncResult, sync(&SyncRequest::default()));
+command!(sync_now(fingerprint: String) -> SyncResult, apply_sync_preview(fingerprint));
 command!(notifications_enabled() -> bool, notifications_enabled());
 command!(set_notifications(enabled: bool) -> bool, set_notifications(enabled));
 command!(harness_settings() -> HarnessSettings, harness_settings());
@@ -90,8 +90,14 @@ command!(apply_harness(request: HarnessChangeRequest) -> HarnessApplied, apply_h
 command!(resolve_import(request: ResolveImportRequest) -> ResolvedSource, resolve_import(&request));
 command!(add_import(request: AddImportRequest) -> ImportUpdated, add_import(&request));
 command!(imports() -> ImportsView, imports());
-command!(update_import(name: String) -> ImportUpdated, update_import(&name));
-command!(force_update_import(name: String) -> ImportUpdated, force_update_import(&name));
+command!(
+    update_import(name: String, expected: Option<String>) -> ImportUpdated,
+    update_reviewed_import(&name, false, expected.as_deref())
+);
+command!(
+    force_update_import(name: String, expected: Option<String>) -> ImportUpdated,
+    update_reviewed_import(&name, true, expected.as_deref())
+);
 command!(import_changes(name: String, upstream: String) -> ImportChanges, import_changes(&name, Some(&upstream)));
 command!(
     preview_assignment_copy(machine: String, copy: MachineAssignmentCopy) -> AssignmentCopyPreview,
@@ -270,7 +276,7 @@ impl Bridge {
     /// The Daemon's own `machine.toml`, the only configuration file the app
     /// opens; created empty (with a pointer to the docs) if it doesn't exist.
     pub(crate) async fn machine_config_target(&self) -> Result<crate::editors::Target> {
-        let path = self.client.harness_settings().await?.path;
+        let path = self.client.machine_config_path().await?;
         tokio::task::spawn_blocking(move || crate::editors::config_target(&path))
             .await
             .map_err(|e| local_error(e.to_string()))?

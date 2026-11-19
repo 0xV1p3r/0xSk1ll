@@ -7,7 +7,7 @@ import { Check, CircleAlert } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { toast } from './toast';
-import { api, errorMessage } from './api';
+import { api, errorMessage, errorStatus } from './api';
 import { AddImport } from './AddImport';
 import { useResource } from './hooks';
 import { Action, Confirm, ErrorNotice, Loading, Nothing, Panel, PanelToolbar, SectionTitle, When } from './shared';
@@ -40,12 +40,24 @@ export function Imports({ revision, changed, reviewDraft, openAdd = false }: { r
   const [refused, setRefused] = useState<Record<string, string>>({});
   const [batchPending, setBatchPending] = useState(false);
   const [results, setResults] = useState<{ name: string; error?: string }[]>([]);
+  const updateReviewed = async (name: string, upstream: string, force = false) => {
+    try {
+      await (force ? api.forceUpdateImport(name, upstream) : api.updateImport(name, upstream));
+    } catch (error) {
+      if (errorStatus(error) === 409 && !localEdits(errorMessage(error))) {
+        setData(previous => previous && { ...previous, updates: previous.updates.filter(update => update.name !== name) });
+        toast({ title: 'Upstream changed', description: 'Review the refreshed Import before updating.' });
+        setData(await api.checkImports());
+      }
+      throw error;
+    }
+  };
   const updateAll = async () => {
     setBatchPending(true); setResults([]);
     const successes: string[] = [];
     try {
       for (const entry of data?.updates ?? []) {
-        try { await api.updateImport(entry.name); successes.push(entry.name); setResults(r => [...r, { name: entry.name }]); }
+        try { await updateReviewed(entry.name, entry.upstream); successes.push(entry.name); setResults(r => [...r, { name: entry.name }]); }
         catch (e) { setResults(r => [...r, { name: entry.name, error: errorMessage(e) }]); }
       }
       if (successes.length) { setUpdated(successes.join(', ')); changed(); }
@@ -79,7 +91,7 @@ export function Imports({ revision, changed, reviewDraft, openAdd = false }: { r
           {update && <UpstreamChanges key={`${update.locked}:${update.upstream}`} update={update} />}
           {refusal && <p role="alert" className="mt-1 text-sm text-destructive">This Import has local edits. Fork it to keep them, or overwrite them with the upstream version.</p>}</TableCell>
           <TableCell><div className="flex justify-end gap-2 [&_button]:h-8">{update && !refusal && <Action disabled={batchPending} label="Update into Draft" ariaLabel={`Update ${entry.name} into Draft`} action={async () => {
-              try { await api.updateImport(entry.name); done(); toast({ title: `${entry.name} updated into Draft` }); }
+              try { await updateReviewed(entry.name, update.upstream); done(); toast({ title: `${entry.name} updated into Draft` }); }
               catch (e) {
                 if (!localEdits(errorMessage(e))) throw e;
                 setRefused(previous => ({ ...previous, [entry.name]: update.locked }));
@@ -87,9 +99,9 @@ export function Imports({ revision, changed, reviewDraft, openAdd = false }: { r
             }} />}
             {refusal && <>
               <Action disabled={batchPending} label="Fork to keep my edits" action={() => api.fork(entry.name)} onDone={done} toastOnDone={`${entry.name} forked into Draft`} />
-              <Confirm disabled={batchPending} label="Overwrite my edits" title={`Overwrite edits to ${entry.name}?`}
-                description="This replaces your local edits with the upstream version in this Machine's Draft."
-                action={() => api.forceUpdateImport(entry.name)} onDone={done} />
+              <Confirm key={update?.upstream} disabled={batchPending} label="Overwrite my edits" title={`Overwrite edits to ${entry.name}?`}
+                description={`This replaces your local edits with upstream commit ${shortSha(update?.upstream)} in this Machine’s Draft.`}
+                action={() => updateReviewed(entry.name, update!.upstream, true)} onDone={done} />
             </>}
             <Confirm disabled={batchPending} label="Remove" triggerVariant="outline" ariaLabel={`Remove ${entry.name}`} title={`Remove ${entry.name}?`} description={`Removes ${entry.name} in this Machine's Draft. Review and Commit the removal to update the Baseline.`}
               action={() => api.removeImport(entry.name)} onDone={() => { setUpdated(`${entry.name} removal`); setData(previous => previous && { ...previous, imports: rows.filter(row => row.name !== entry.name), updates: previous.updates.filter(row => row.name !== entry.name), errors: previous.errors.filter(row => row.name !== entry.name), skipped: previous.skipped?.filter(row => row.name !== entry.name) }); toast({ title: `${entry.name} removal is in the Draft` }); changed(); }} /></div></TableCell></TableRow>;
