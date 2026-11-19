@@ -144,6 +144,10 @@ function AuthorityMatrix({ revision, status, target, openLog }: MatrixProps) {
   // A collapsed or unloaded Machine keeps one summary column so it can be expanded or retried.
   const segments = <T,>(column: (c: (typeof columns)[number]) => T, summary: (g: (typeof groups)[number]) => T) =>
     groups.flatMap(g => g.collapsed || !g.loaded ? [summary(g)] : g.harnesses.map(harness => column({ machine: g.machine.id, harness })));
+  const expectedFor = (machine: string) => {
+    const registration = data.fleet.machines.find(row => row.id === machine)?.registration;
+    return standalone || registration ? { revision: own(data.assignments, machine)!.revision, ...(registration && { registration }) } : undefined;
+  };
   const cell = (item: ItemView, machine: string, harness: string) => {
     const state = cellState(assignment(machine), harness, item.item);
     const defaults = assignment(machine).harnesses[harness] ?? emptyHarness();
@@ -163,16 +167,18 @@ function AuthorityMatrix({ revision, status, target, openLog }: MatrixProps) {
         <Checkbox ref={focused ? destination : undefined} className={matrixCheckbox(state.explicit, state.enabled)} checked={state.enabled} disabled={localOnly || !!pending.get(machine)}
           aria-label={`${item.item} in ${machine} / ${harness}, ${state.explicit ? 'explicit' : 'inherited'}`}
           aria-description={localOnly ? reason : note || undefined}
-          onCheckedChange={enabled => void write(machine, [{ harness, kind: kind as 'skill' | 'rule', name, enabled }])} />
+          onCheckedChange={enabled => void write(machine, [{ harness, kind: kind as 'skill' | 'rule', name, enabled }], { expected: expectedFor(machine) })} />
       </TooltipTrigger><TooltipContent className="max-w-64">{reason}</TooltipContent></Tooltip>
       <span className="inline-flex size-6 shrink-0 items-center justify-center">{state.explicit && !localOnly && <Tooltip><TooltipTrigger render={<Button size="icon-xs" variant="ghost" disabled={!!pending.get(machine)}
         aria-label={`Use default for ${item.item} in ${machine} / ${harness}`}
-        onClick={() => void write(machine, [{ harness, kind: kind as 'skill' | 'rule', name, enabled: null }])} />}>
+        onClick={() => void write(machine, [{ harness, kind: kind as 'skill' | 'rule', name, enabled: null }], { expected: expectedFor(machine) })} />}>
         <RotateCcw /></TooltipTrigger><TooltipContent>Inherit the Harness default</TooltipContent></Tooltip>}</span>
     </div></TableCell>;
   };
   // Writes once per Machine, then announces what the Server accepted.
   const bulk = async (selected: ItemView[], selectedColumns: typeof columns, enabled: boolean | null, title: (changes: number) => string) => {
+    if (!standalone && selectedColumns.some(column => !expectedFor(column.machine)) &&
+      !window.confirm('This Server cannot detect concurrent Assignment edits. This bulk change may overwrite them. Continue?')) return;
     const accepted = await Promise.all(groups.filter(g => g.loaded).map(async ({ machine }) => {
       const changes: ToggleChange[] = selectedColumns.filter(c => c.machine === machine.id).flatMap(c =>
         selected.filter(item => item.in_baseline || machine.id === status.machine_id).map(item => {
@@ -185,10 +191,10 @@ function AuthorityMatrix({ revision, status, target, openLog }: MatrixProps) {
         const state = cellState(shown.assignment, change.harness, `${change.kind}:${change.name}`);
         return { ...change, enabled: state.explicit ? state.enabled : null };
       });
-      const expected = { revision: shown.revision, ...machine.registration && { registration: machine.registration } };
+      const expected = expectedFor(machine.id);
       const snapshot = await write(machine.id, changes, { expected });
       // Only an authority that checks `expected` can guard an Undo: the Daemon standalone, or a Server that reports registrations.
-      const guarded = standalone || !!machine.registration;
+      const guarded = !!expected;
       return snapshot ? { machine: machine.id, registration: registrationOf(machine), changes: changes.length, previous, snapshot, guarded } : null;
     }));
     if (!active.current) return;
@@ -253,6 +259,7 @@ function AuthorityMatrix({ revision, status, target, openLog }: MatrixProps) {
         return machine.id !== copyTarget.id && snapshot ? [{ id: machine.id, harnesses: Object.keys(snapshot.assignment.harnesses).sort() }] : [];
       })}
       close={() => setCopyTarget(undefined)}
+      refreshed={resource.refresh}
       copied={update => {
         setCopyTarget(undefined);
         void retry(copyTarget.id);
@@ -323,7 +330,7 @@ function AuthorityMatrix({ revision, status, target, openLog }: MatrixProps) {
               checked={(assignment(c.machine).harnesses[c.harness] ?? emptyHarness())[kind === 'skill' ? 'new_skills_default' : 'new_rules_default']}
               disabled={!!pending.get(c.machine)} aria-label={`Default for new ${kind}s in ${c.machine} / ${c.harness}`} aria-describedby="default-hint"
               onCheckedChange={enabled => void write(c.machine, [{ harness: c.harness,
-                kind: kind === 'skill' ? 'new_skills_default' : 'new_rules_default', enabled }])}>
+                kind: kind === 'skill' ? 'new_skills_default' : 'new_rules_default', enabled }], { expected: expectedFor(c.machine) })}>
               <Switch.Thumb className="size-3.5 rounded-full bg-card shadow-sm transition-transform data-checked:translate-x-3.5" /></Switch.Root></label></TableCell>,
           g => <TableCell key={`${g.machine.id}/${g.loaded ? 'collapsed' : 'unavailable'}`} className="border-l" />)}
         </TableRow>)}

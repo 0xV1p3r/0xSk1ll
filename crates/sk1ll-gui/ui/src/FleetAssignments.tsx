@@ -12,7 +12,7 @@ import type { ItemView } from './types';
 
 type Data = { items: ItemView[]; assignments: Record<string, StampedSnapshot> };
 const merge = (previous: Data | undefined, next: Data): Data => ({ ...next, assignments: mergeAssignments(previous?.assignments ?? {}, next.assignments) });
-export function FleetAssignments({ revision, machineId, harnesses, navigate }: { revision: number; machineId: string; harnesses: string[]; navigate: (screen: 'Assignment matrix') => void }) {
+export function FleetAssignments({ revision, machineId, harnesses, navigate, registration }: { revision: number; machineId: string; harnesses: string[]; registration?: string | null; navigate: (screen: 'Assignment matrix') => void }) {
   const load = useCallback(async (): Promise<Data> => {
     const [items, snapshot] = await Promise.all([api.items(), stamped(() => api.assignment(machineId))]);
     return { items, assignments: { [machineId]: snapshot } };
@@ -37,7 +37,7 @@ export function FleetAssignments({ revision, machineId, harnesses, navigate }: {
       {!resource.data && resource.loading && <Loading />}
       {current && (columns.length && items.length ? <Table aria-label="This Machine assignments"><TableHeader><TableRow><TableHead className="text-xs">Item</TableHead>{columns.map(harness => <TableHead key={harness} className="min-w-20 text-center text-xs">{harness}</TableHead>)}</TableRow></TableHeader><TableBody>{items.map(item => <TableRow key={item.item}><TableHead scope="row" className="text-sm font-medium"><span className="inline-flex items-center gap-2">{splitItem(item.item).name}<KindBadge kind={splitItem(item.item).kind} /></span></TableHead>{columns.map(harness => {
         const state = cellState(current, harness, item.item), { kind, name } = splitItem(item.item);
-        return <TableCell key={harness} className="text-center"><label className="inline-flex min-h-8 min-w-8 cursor-pointer items-center justify-center"><Checkbox className={matrixCheckbox(state.explicit, state.enabled)} checked={state.enabled} disabled={!!pending.get(machineId)} aria-label={`${item.item} in ${machineId} / ${harness}, ${state.explicit ? terms.explicit : terms.inherited}`} onCheckedChange={enabled => void write(machineId, [{ harness, kind: kind as 'skill' | 'rule', name, enabled }])} /></label></TableCell>;
+        return <TableCell key={harness} className="text-center"><label className="inline-flex min-h-8 min-w-8 cursor-pointer items-center justify-center"><Checkbox className={matrixCheckbox(state.explicit, state.enabled)} checked={state.enabled} disabled={!!pending.get(machineId)} aria-label={`${item.item} in ${machineId} / ${harness}, ${state.explicit ? terms.explicit : terms.inherited}`} onCheckedChange={enabled => void write(machineId, [{ harness, kind: kind as 'skill' | 'rule', name, enabled }], { expected: registration ? { revision: resource.data!.assignments[machineId].revision, registration } : undefined })} /></label></TableCell>;
       })}</TableRow>)}</TableBody></Table> : <Nothing className="rounded-none border-0" title={columns.length ? 'No Skills or Rules' : 'No Harnesses'}>Assignments for this Machine will appear here.</Nothing>)}
       {pending.get(machineId) && <div role="status" className="px-3.5 py-2 text-xs"><Pending pending>Saving Assignment for {machineId}…</Pending></div>}
     </div>
