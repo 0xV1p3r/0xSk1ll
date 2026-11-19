@@ -1417,11 +1417,15 @@ impl Daemon {
         let repo = Repo::open(self.repo_root())?;
         let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
         let actions = sync::plan(&repo, &harnesses, &self.current_assignment()?, PlanOptions { force })?;
-        let sources = Self::sync_source_digests(&actions)?;
+        let sources = Self::sync_source_digests(&actions, sk1ll_core::hash::hash_dir)?;
         Self::sync_preview_result(&actions, &sources)
     }
 
-    fn sync_source_digests(actions: &[Action]) -> Result<Vec<Option<String>>> {
+    fn sync_source_digests(
+        actions: &[Action],
+        mut hash: impl FnMut(&Path) -> sk1ll_core::Result<String>,
+    ) -> Result<Vec<Option<String>>> {
+        let mut digests = BTreeMap::new();
         Ok(actions
             .iter()
             .map(|action| match (&action.kind, &action.item) {
@@ -1431,7 +1435,17 @@ impl Daemon {
                 ) => Some(path),
                 _ => None,
             })
-            .map(|path| path.map(|path| sk1ll_core::hash::hash_dir(path)).transpose())
+            .map(|path| {
+                path.map(|path| {
+                    use std::collections::btree_map::Entry;
+                    let digest = match digests.entry(path) {
+                        Entry::Occupied(entry) => entry.into_mut(),
+                        Entry::Vacant(entry) => entry.insert(hash(path)?),
+                    };
+                    Ok(digest.clone())
+                })
+                .transpose()
+            })
             .collect::<sk1ll_core::Result<Vec<_>>>()?)
     }
 
@@ -1489,7 +1503,7 @@ impl Daemon {
             Self::recover_imports(root)?;
             let repo = Repo::open(root)?;
             let actions = sync::plan(&repo, &harnesses, &snapshot.assignment, PlanOptions { force })?;
-            let sources = Self::sync_source_digests(&actions)?;
+            let sources = Self::sync_source_digests(&actions, sk1ll_core::hash::hash_dir)?;
             let preview = Self::sync_preview_result(&actions, &sources)?;
             if preview.fingerprint.as_deref() != Some(fingerprint) {
                 return Ok(preview);
@@ -2762,6 +2776,36 @@ mod tests {
         assert_eq!(got, want.map(|content| content.map(<[u8]>::to_vec)));
         assert_eq!(parse_batch(&out, 1, 16)[0].as_deref(), Some(&b"a\n\0 b\nc\n"[..]));
         assert_eq!(parse_batch(b"", 2, 16), [None, None]);
+    }
+
+    #[test]
+    fn plan_hashes_each_copy_source_once_per_computation() {
+        let copy = |harness: &str, source: &str| Action {
+            harness: harness.into(),
+            kind: ActionKind::Create,
+            dest: PathBuf::from(harness).join(source),
+            item: Item::Skill {
+                name: source.into(),
+                mode: sk1ll_core::LinkMode::Copy,
+                source: Some(source.into()),
+                expected: None,
+            },
+            reason: None,
+        };
+        let actions = [copy("a", "pdf"), copy("a", "notes"), copy("b", "pdf")];
+        let mut calls = Vec::new();
+        for digest in ["before", "after"] {
+            let sources = Daemon::sync_source_digests(&actions, |path| {
+                calls.push(path.to_path_buf());
+                Ok(format!("{}-{digest}", path.display()))
+            })
+            .unwrap();
+            assert_eq!(
+                sources,
+                [Some(format!("pdf-{digest}")), Some(format!("notes-{digest}")), Some(format!("pdf-{digest}"))]
+            );
+        }
+        assert_eq!(calls, ["pdf", "notes", "pdf", "notes"].map(PathBuf::from));
     }
 
     #[tokio::test]
