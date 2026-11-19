@@ -523,13 +523,27 @@ async fn set_harness_assignment(
     }
     let state = d.ident.joined()?;
     let (update, warning) = match server::set_harness_assignment(&d.http, state, &harness, body).await? {
-        Some(update) => (update, None),
+        Some(result) => {
+            let warning = (!result.skipped.is_empty()).then(|| {
+                format!(
+                    "Skipped items with ineligible names: {}",
+                    result.skipped.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+                )
+            });
+            (result.update, warning)
+        }
         None => {
             let changes = d.blocking(move |d, eng| d.harness_assignment_changes(eng, &harness, body)).await?;
             let update = server::change_assignment(&d.http, state, &changes).await.map_err(Error::Internal)?;
             (update, Some(LEGACY_HARNESS_ASSIGNMENT_WARNING.into()))
         }
     };
+    let snapshot = sk1ll_proto::AssignmentSnapshot {
+        revision: update.revision,
+        assignment: update.assignment.clone(),
+        registration: None,
+    };
+    d.blocking(move |d, eng| d.apply_assignment(eng, snapshot)).await?;
     d.event(crate::client::Event::Fleet);
     Ok(Json(HarnessAssignmentUpdate { update, warning }))
 }

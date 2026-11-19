@@ -358,6 +358,15 @@ pub struct AssignmentUpdate {
     pub entries: Vec<LogEntry>,
 }
 
+/// Result of setting all items and defaults for a harness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessAssignmentResult {
+    #[serde(flatten)]
+    pub update: AssignmentUpdate,
+    #[serde(default)]
+    pub skipped: Vec<ItemRef>,
+}
+
 /// `POST /api/machines/{id}/assignment/copy` body: copy the machine's
 /// explicit toggles of `from` to `to`, before a rename of `from` to `to`
 /// reaches its Draft. A 0.1.0 Server answers HTTP 404.
