@@ -11,6 +11,8 @@ break compatibility.
 
 - Edit Personal Skill text files and Rules in the desktop Library, with a diff
   before overwriting a concurrent disk edit and a link to review the Draft.
+- Choose a branch, tag or commit in Add Import. Preview upstream commits and
+  changed files in Imports or with `sk1ll update <name> --dry-run`.
 - macOS arm64 builds in CI and release archives with the unsigned desktop app,
   CLI and server. Setup and the desktop app can start the daemon through launchd.
 - Create a Rule from the desktop getting-started checklist and reopen the
@@ -61,6 +63,9 @@ break compatibility.
 
 ### Changed
 
+- Add Import and `sk1ll add --list` show file sizes and warn about scripts,
+  executable files, binaries and files over 1 MiB.
+
 - Machines that joined with a `self` join code get `403` for creating join
   codes or managing other Machines.
 - The server accepts pushes only to the baseline branch, the one HEAD names
@@ -95,6 +100,8 @@ break compatibility.
 - In Fleet mode, `sk1ll assign <harness> --all on|off` and the Settings
   turn-off button include Baseline items the Machine has yet to pull.
   Older Servers use the local item list and show a warning.
+- When local edits prevent an Import update, the desktop app offers to fork
+  the Import or overwrite the edits after confirmation.
 - Starting the macOS daemon recreates its log directory and repairs generated
   LaunchAgents after the app moves. New agents include the Git directory found
   on PATH, and the desktop app shows start commands for the detected manager.

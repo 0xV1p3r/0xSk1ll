@@ -69,6 +69,8 @@ pub fn run() {
             commands::resolve_import,
             commands::add_import,
             commands::update_import,
+            commands::force_update_import,
+            commands::import_changes,
             commands::assignment,
             commands::set_assignment,
             commands::log,

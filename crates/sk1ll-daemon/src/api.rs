@@ -71,6 +71,7 @@ pub(crate) fn router(d: Arc<Daemon>) -> Router {
         .route("/items/rename", post(rename_item))
         .route("/conflicts/diff", post(conflict_diff))
         .route("/imports/{name}/update", post(update_import))
+        .route("/imports/{name}/changes", get(import_changes))
         .route("/imports/resolve", post(resolve_import))
         .route("/imports/add", post(add_import))
         .route("/imports/update", post(update_imports))
@@ -347,8 +348,26 @@ async fn apply_harness(State(d): St, Json(req): Json<HarnessChangeRequest>) -> R
     Ok(Json(d.blocking(move |d, eng| d.apply_harness(eng, req)).await?))
 }
 
-async fn update_import(State(d): St, UrlPath(name): UrlPath<String>) -> Result<Json<ImportUpdated>> {
-    Ok(Json(d.update_import(name).await?))
+#[derive(serde::Deserialize)]
+struct UpdateImportQuery {
+    #[serde(default)]
+    force: bool,
+}
+
+async fn update_import(
+    State(d): St,
+    UrlPath(name): UrlPath<String>,
+    Query(q): Query<UpdateImportQuery>,
+) -> Result<Json<ImportUpdated>> {
+    Ok(Json(d.update_import(name, q.force).await?))
+}
+
+async fn import_changes(
+    State(d): St,
+    UrlPath(name): UrlPath<String>,
+    Query(q): Query<crate::client::ImportChangesQuery>,
+) -> Result<Json<crate::client::ImportChanges>> {
+    Ok(Json(d.import_changes(name, q.upstream).await?))
 }
 
 async fn resolve_import(State(d): St, Json(req): Json<ResolveImportRequest>) -> Result<Json<ResolvedSource>> {

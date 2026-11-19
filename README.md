@@ -87,8 +87,9 @@ Commands take a bare skill or rule name, or `skill:<name>`, `rule:<name>`, `mani
 |---|---|
 | `setup` | Set up this machine step by step: a standalone repo, joining a fleet or starting one, harnesses and the daemon service |
 | `init [path]` | Create a skills repo |
-| `add <link>` | Import a skill (`--path`, `--ref`, `--name`, `--list`) |
-| `update [name] [--force]` | Re-fetch imports; refuses to overwrite local edits unless forced |
+| `add <link>` | Import a skill (`--path`, `--ref`, `--name`). Use `--list` to preview candidates, total sizes and file warnings |
+| `update [name] [--force]` | Re-fetch imports. Local edits require `--force` |
+| `update <name> --dry-run` | Preview upstream commits and changed files for one Import |
 | `remove <name>` | Remove an import |
 | `fork <name>` | Turn an import into a personal skill you can edit |
 | `edit <name>` | Open a personal skill or rule in `$VISUAL` or `$EDITOR` |

@@ -30,7 +30,8 @@
 //! | GET | `/harnesses/config` | → [`HarnessSettings`] |
 //! | POST | `/harnesses/preview` | [`HarnessChangeRequest`] → [`HarnessPreview`]; changes nothing |
 //! | POST | `/harnesses/apply` | [`HarnessChangeRequest`] → [`HarnessApplied`]; then syncs; never removes placed content; 409 if `machine.toml` changed while it was written |
-//! | POST | `/imports/{name}/update` | → [`ImportUpdated`] |
+//! | POST | `/imports/{name}/update` | Optional `?force=true` → [`ImportUpdated`] |
+//! | GET | `/imports/{name}/changes` | Optional `?upstream=<commit>` → [`ImportChanges`] |
 //! | POST | `/imports/resolve` | [`ResolveImportRequest`] → [`ResolvedSource`] |
 //! | POST | `/imports/add` | [`AddImportRequest`] → [`ImportUpdated`] |
 //! | POST | `/imports/update` | [`UpdateImportsRequest`] → `Vec<`[`ImportUpdated`]`>` |
@@ -402,6 +403,15 @@ pub struct ResolveImportRequest {
     /// since a resolve lists every skill under it anyway).
     #[serde(default)]
     pub path: String,
+    #[serde(rename = "ref", default, skip_serializing_if = "String::is_empty")]
+    pub git_ref: String,
+}
+
+pub use sk1ll_core::imports::ImportChanges;
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct ImportChangesQuery {
+    pub upstream: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -425,6 +435,10 @@ pub struct SkillCandidate {
     pub description: Option<String>,
     /// An import or personal skill already has `default_name`.
     pub taken: bool,
+    #[serde(default)]
+    pub total_bytes: u64,
+    #[serde(default)]
+    pub warnings: Vec<sk1ll_core::imports::FileWarning>,
 }
 
 /// `POST /imports/add`. `source` may be any link [`ResolveImportRequest`]
@@ -862,6 +876,18 @@ impl Client {
         self.post(&format!("/imports/{}/update", encode(name)), &()).await
     }
 
+    pub async fn force_update_import(&self, name: &str) -> Result<ImportUpdated> {
+        self.post(&format!("/imports/{}/update?force=true", encode(name)), &()).await
+    }
+
+    pub async fn import_changes(&self, name: &str, upstream: Option<&str>) -> Result<ImportChanges> {
+        let mut path = format!("/imports/{}/changes", encode(name));
+        if let Some(commit) = upstream {
+            path.push_str(&format!("?upstream={}", encode(commit)));
+        }
+        self.get(&path).await
+    }
+
     pub async fn resolve_import(&self, req: &ResolveImportRequest) -> Result<ResolvedSource> {
         self.post("/imports/resolve", req).await
     }
@@ -1065,13 +1091,15 @@ mod tests {
                 default_name: "r".into(),
                 description: None,
                 taken: true,
+                total_bytes: 0,
+                warnings: vec![],
             }],
         };
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(
             v,
             serde_json::json!({"source": "github:o/r", "git_ref": "main", "commit": "c", "candidates": [
-                {"path": "", "default_name": "r", "description": null, "taken": true}]})
+                {"path": "", "default_name": "r", "description": null, "taken": true, "total_bytes": 0, "warnings": []}]})
         );
         assert_eq!(serde_json::from_value::<ResolvedSource>(v).unwrap(), r);
     }

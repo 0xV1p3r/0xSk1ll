@@ -10,7 +10,7 @@ vi.mock('./toast', () => ({ toast: vi.fn() }));
 import { JoinCodeButton, Settings } from './Settings';
 import type { SkillCandidate, StatusView } from './types';
 
-vi.mock('./api', () => ({ api: { editors: vi.fn(), imports: vi.fn(), checkImports: vi.fn(), removeImport: vi.fn(), updateImport: vi.fn(), conflictDiff: vi.fn(), items: vi.fn(), resolveImport: vi.fn(), addImport: vi.fn(), log: vi.fn(), logFacets: vi.fn(), undo: vi.fn(), conflicts: vi.fn(), recovered: vi.fn(), harnesses: vi.fn(), fleet: vi.fn(), join: vi.fn(), joinCode: vi.fn() },
+vi.mock('./api', () => ({ api: { editors: vi.fn(), imports: vi.fn(), checkImports: vi.fn(), removeImport: vi.fn(), updateImport: vi.fn(), forceUpdateImport: vi.fn(), importChanges: vi.fn(), fork: vi.fn(), conflictDiff: vi.fn(), items: vi.fn(), resolveImport: vi.fn(), addImport: vi.fn(), log: vi.fn(), logFacets: vi.fn(), undo: vi.fn(), conflicts: vi.fn(), recovered: vi.fn(), harnesses: vi.fn(), fleet: vi.fn(), join: vi.fn(), joinCode: vi.fn() },
   errorMessage: (e: unknown) => String(e) }));
 const changed = vi.fn();
 const reviewDraft = vi.fn();
@@ -42,6 +42,53 @@ it('prefills a single candidate and adds it into Draft', async () => {
   expect(api.addImport).toHaveBeenCalledWith({ name: 'pdf', source: 'github:test/repo', path: 'pdf', ref: 'main', commit: 'abcdef123456' });
   expect(changed).toHaveBeenCalledOnce(); expect(reviewDraft).toHaveBeenCalledOnce();
 });
+it('passes a ref override and shows warnings without disabling add', async () => {
+  vi.mocked(api.resolveImport).mockResolvedValue({ source: 'github:test/repo', git_ref: 'v2', commit: 'abcdef123456',
+    candidates: [{ ...candidate('pdf'), total_bytes: 25, warnings: [{ path: 'run.sh', kinds: ['executable', 'script'] }] }] });
+  render(<Imports revision={0} changed={changed} reviewDraft={reviewDraft} />);
+  fireEvent.click(screen.getByRole('button', { name: 'Add Import' }));
+  fireEvent.change(await screen.findByLabelText('Link'), { target: { value: 'github:test/repo' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Advanced' }));
+  fireEvent.change(await screen.findByLabelText('Branch, tag or commit (optional)'), { target: { value: ' v2 ' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Resolve' }));
+  await screen.findByText('v2');
+  expect(api.resolveImport).toHaveBeenCalledWith({ link: 'github:test/repo', path: '', ref: 'v2' });
+  expect(screen.getByText('25 bytes total')).toBeTruthy();
+  expect(screen.getByRole('list', { name: 'File warnings for pdf' }).textContent).toContain('run.sh · executable, script');
+  expect(confirm().disabled).toBe(false);
+});
+
+it.each(['fork', 'overwrite'])('previews upstream changes and can %s after a refusal', async choice => {
+  const update = { name: 'pdf', source: 'github:test/repo', ref: 'main', locked: 'abcdef1', upstream: 'abcdef2' };
+  vi.mocked(api.imports).mockResolvedValue({ checked_at: 1, updates: [update], errors: [] });
+  vi.mocked(api.importChanges).mockResolvedValue({ locked: update.locked, upstream: update.upstream, truncated: false,
+    commits: [{ sha: 'abcdef2', date: '2026-11-19', subject: 'Refresh PDF instructions' }], files: ['pdf/SKILL.md'] });
+  vi.mocked(api.updateImport).mockRejectedValue('locally modified imports: pdf');
+  vi.mocked(api.fork).mockResolvedValue(undefined);
+  vi.mocked(api.forceUpdateImport).mockResolvedValue({ name: 'pdf', old_commit: update.locked, new_commit: update.upstream, changed: true });
+  render(<Imports revision={0} changed={changed} reviewDraft={reviewDraft} />);
+  const updateButton = await screen.findByRole('button', { name: 'Update pdf into Draft' });
+  expect(api.importChanges).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole('button', { name: 'Upstream changes' }));
+  await screen.findByText(/Refresh PDF instructions/);
+  expect(screen.getByText('pdf/SKILL.md')).toBeTruthy();
+  expect(api.importChanges).toHaveBeenCalledWith('pdf', update.upstream);
+  fireEvent.click(updateButton);
+  expect((await screen.findByRole('alert')).textContent).toContain('This Import has local edits.');
+  if (choice === 'fork') {
+    fireEvent.click(screen.getByRole('button', { name: 'Fork to keep my edits' }));
+    expect(api.fork).toHaveBeenCalledWith('pdf');
+    expect(api.forceUpdateImport).not.toHaveBeenCalled();
+  } else {
+    fireEvent.click(screen.getByRole('button', { name: 'Overwrite my edits' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Overwrite edits to pdf?' });
+    expect(api.forceUpdateImport).not.toHaveBeenCalled();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Overwrite my edits' }));
+    expect(api.forceUpdateImport).toHaveBeenCalledWith('pdf');
+  }
+  await waitFor(() => expect(changed).toHaveBeenCalledOnce());
+});
+
 it('leaves all candidates unchecked for a repository', async () => {
   await resolve([candidate('pdf'), candidate('writing')]);
   for (const checkbox of screen.getAllByRole('checkbox')) expect(checkbox.getAttribute('aria-checked')).toBe('false');

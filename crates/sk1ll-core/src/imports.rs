@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::hash::hash_dir;
 use crate::lock::LockEntry;
@@ -57,6 +57,50 @@ pub struct SkillCandidate {
     pub description: Option<String>,
     /// An import or personal skill already has `default_name`.
     pub taken: bool,
+    pub total_bytes: u64,
+    pub warnings: Vec<FileWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileWarning {
+    pub path: String,
+    pub kinds: Vec<WarningKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WarningKind {
+    Executable,
+    Script,
+    Binary,
+    Large,
+}
+
+impl WarningKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Executable => "executable",
+            Self::Script => "script",
+            Self::Binary => "binary",
+            Self::Large => "large (> 1 MiB)",
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ImportChanges {
+    pub locked: String,
+    pub upstream: String,
+    pub commits: Vec<ImportCommit>,
+    pub truncated: bool,
+    pub files: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ImportCommit {
+    pub sha: String,
+    pub date: String,
+    pub subject: String,
 }
 
 impl Repo {
@@ -86,7 +130,7 @@ impl Repo {
     /// Resolves a pasted link or source without changing the repo (see
     /// [`fetch_link`]), with each candidate's `taken` filled in.
     pub fn resolve_source(&self, link: &str, path: Option<&str>, git_ref: Option<&str>) -> Result<ResolvedSource> {
-        Ok(self.with_taken(fetch_link(self.root(), link, path, git_ref, None)?.resolved))
+        Ok(self.with_taken(fetch_link(self.root(), link, path, git_ref, None)?.inspect()?.resolved))
     }
 
     /// Fills in each candidate's `taken` from the repo as it is now.
@@ -355,6 +399,15 @@ pub struct FetchedLink {
 }
 
 impl FetchedLink {
+    /// Inspects candidate blobs for the preview without checking them out.
+    pub fn inspect(mut self) -> Result<Self> {
+        for candidate in &mut self.resolved.candidates {
+            (candidate.total_bytes, candidate.warnings) =
+                source::file_warnings(&self.cache, &self.resolved.commit, &candidate.path)?;
+        }
+        Ok(self)
+    }
+
     /// The one skill the link leads to.
     fn skill(&self) -> Result<&SkillCandidate> {
         let resolved = &self.resolved;
@@ -435,7 +488,7 @@ pub fn fetch_link(
             let file = if dir.is_empty() { "SKILL.md".into() } else { format!("{dir}/SKILL.md") };
             let description =
                 source::show(&cache, &commit, &file).and_then(|t| skill::frontmatter_field(&t, "description"));
-            SkillCandidate { path: dir, default_name, description, taken: false }
+            SkillCandidate { path: dir, default_name, description, taken: false, total_bytes: 0, warnings: Vec::new() }
         })
         .collect();
     let resolved = ResolvedSource { source: parsed.source, git_ref, commit, candidates };
@@ -446,6 +499,23 @@ pub fn fetch_link(
 /// declared, and its lock entry when the update started.
 #[derive(Debug, Clone, Serialize)]
 pub struct UpdateTargets(Vec<(String, Import, Option<LockEntry>)>);
+
+/// Fetches the current ref (or previews a previously advertised commit).
+/// Only the source cache is written.
+pub fn fetch_changes(root: &Path, targets: UpdateTargets, upstream: Option<&str>) -> Result<ImportChanges> {
+    let [(name, import, lock)] = targets.0.as_slice() else {
+        return Err(Error::Invalid("select one import to preview".into()));
+    };
+    let locked = &lock.as_ref().ok_or_else(|| Error::Invalid(format!("import `{name}` has no locked commit")))?.commit;
+    source::check_commit(locked)?;
+    upstream.map(source::check_commit).transpose()?;
+    let cache = source::fetch(&import.source, root)?;
+    let upstream = match upstream {
+        Some(commit) => source::verify_commit(&cache, &import.source, commit)?,
+        None => source::resolve_commit(&cache, &import.git_ref)?,
+    };
+    source::changes(&cache, locked, &upstream, import.path.trim_matches('/'))
+}
 
 /// Imports fetched and staged for an update ([`fetch_updates`]): what
 /// [`Repo::apply_updates`] installs without the network. Dropping it
@@ -593,6 +663,50 @@ mod tests {
 
     fn paths(r: &ResolvedSource) -> Vec<&str> {
         r.candidates.iter().map(|c| c.path.as_str()).collect()
+    }
+
+    #[test]
+    fn preview_reports_warnings_from_git_blobs() {
+        let src = Source::new();
+        let origin = PathBuf::from(src.origin());
+        let skill = origin.join("skills/pdf");
+        fs::write(skill.join("run"), "#!/bin/sh\n").unwrap();
+        fs::write(skill.join("test.PY"), "print(1)\n").unwrap();
+        fs::write(skill.join("big"), vec![0xff; 1024 * 1024 + 1]).unwrap();
+        git(&origin, &["add", "-A"]);
+        git(&origin, &["update-index", "--chmod=+x", "skills/pdf/run"]);
+        git(&origin, &["-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-qm", "files"]);
+        let resolved = src.repo().resolve_source(&src.origin(), Some("skills/pdf"), None).unwrap();
+        let candidate = &resolved.candidates[0];
+        assert_eq!(
+            candidate.total_bytes,
+            1024 * 1024 + 1 + 10 + 9 + fs::metadata(skill.join("SKILL.md")).unwrap().len()
+        );
+        let warnings: Vec<_> = candidate.warnings.iter().map(|w| (w.path.as_str(), w.kinds.as_slice())).collect();
+        use WarningKind::{Binary, Executable, Large, Script};
+        assert_eq!(warnings, [("big", &[Binary, Large][..]), ("run", &[Executable, Script]), ("test.PY", &[Script])]);
+    }
+
+    #[test]
+    fn update_preview_lists_commits_and_only_files_in_the_skill() {
+        let src = Source::new();
+        let mut repo = src.repo();
+        let added = repo.add_link(None, &src.origin(), Some("skills/pdf"), Some("main"), None).unwrap();
+        let origin = PathBuf::from(src.origin());
+        fs::write(origin.join("README.md"), "unrelated\n").unwrap();
+        commit_all(&origin);
+        fs::write(origin.join("skills/pdf/new.txt"), "new\n").unwrap();
+        commit_all(&origin);
+        let preview = fetch_changes(repo.root(), repo.update_targets(Some("pdf"), true).unwrap(), None).unwrap();
+        assert_eq!(preview.locked, added.new_commit);
+        assert_eq!(preview.commits.len(), 2);
+        assert_eq!(preview.commits[0].subject, "seed");
+        assert!(preview.upstream.starts_with(&preview.commits[0].sha));
+        assert_eq!(preview.commits[0].date.len(), 10);
+        assert_eq!(preview.files, ["skills/pdf/new.txt"]);
+        assert!(!preview.truncated);
+        assert_eq!(repo.import_status().unwrap()[0].commit.as_ref(), Some(&added.new_commit));
+        assert!(!repo.imported_dir().join("pdf/new.txt").exists());
     }
 
     #[test]

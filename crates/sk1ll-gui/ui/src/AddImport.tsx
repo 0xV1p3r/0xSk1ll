@@ -43,6 +43,7 @@ function AddImportForm({ busy, changed, reviewDraft, finalFocus }: {
 }) {
   const [link, setLink] = useState('');
   const [path, setPath] = useState('');
+  const [gitRef, setGitRef] = useState('');
   const [resolved, setResolved] = useState<ResolvedSource>();
   const [taken, setTaken] = useState<string[]>([]);
   const [names, setNames] = useState<string[]>([]);
@@ -71,7 +72,7 @@ function AddImportForm({ busy, changed, reviewDraft, finalFocus }: {
     if (busy.current) return;
     busy.current = true; setPending(true); setError(''); setAnnouncement(''); setResolved(undefined);
     try {
-      const [source, inventory] = await Promise.all([api.resolveImport({ link: link.trim(), path: path.trim() }), api.items()]);
+      const [source, inventory] = await Promise.all([api.resolveImport({ link: link.trim(), path: path.trim(), ...(gitRef.trim() ? { ref: gitRef.trim() } : {}) }), api.items()]);
       setTaken(takenNames(inventory));
       setResolved(source); setAnnouncement(source.candidates.length ? `${source.candidates.length} ${source.candidates.length === 1 ? 'Skill' : 'Skills'} found` : ''); setNames(source.candidates.map(c => c.default_name));
       setSelected(source.candidates.map(() => source.candidates.length === 1));
@@ -143,14 +144,19 @@ function AddImportForm({ busy, changed, reviewDraft, finalFocus }: {
     {!resolved && <form onSubmit={event => { event.preventDefault(); if (link.trim()) void resolve(); }}><FieldGroup><Field><FieldLabel htmlFor="import-link">Link</FieldLabel>
       <Input ref={linkInput} id="import-link" placeholder="https://github.com/owner/repo" value={link} disabled={pending} onChange={e => setLink(e.target.value)} /></Field>
       <Collapsible><CollapsibleTrigger render={<Button variant="ghost" className="group/advanced -ml-2.5" disabled={pending} />}><ChevronRight className="transition-transform group-data-panel-open/advanced:rotate-90" />Advanced</CollapsibleTrigger>
-        <CollapsibleContent><Field><FieldLabel htmlFor="import-path">Path (subdirectory for other git URLs)</FieldLabel>
-          <Input id="import-path" value={path} disabled={pending} onChange={e => setPath(e.target.value)} /></Field></CollapsibleContent></Collapsible>
+        <CollapsibleContent><FieldGroup><Field><FieldLabel htmlFor="import-ref">Branch, tag or commit (optional)</FieldLabel>
+          <Input id="import-ref" value={gitRef} disabled={pending} onChange={e => setGitRef(e.target.value)} /></Field><Field><FieldLabel htmlFor="import-path">Path (subdirectory for other git URLs)</FieldLabel>
+          <Input id="import-path" value={path} disabled={pending} onChange={e => setPath(e.target.value)} /></Field></FieldGroup></CollapsibleContent></Collapsible>
       <Button type="submit" disabled={pending || !link.trim()}>{pending ? 'Resolving…' : 'Resolve'}</Button></FieldGroup></form>}
     {resolved && <form id="add-import" onSubmit={event => { event.preventDefault(); void add(); }}><dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2 rounded-xl border border-border bg-muted/40 p-3 text-xs break-all [&_dt]:text-muted-foreground [&_dd]:font-mono"><dt>Source</dt><dd>{resolved.source}</dd><dt>Ref</dt><dd>{resolved.git_ref}</dd><dt>Commit</dt><dd>{shortSha(resolved.commit)}</dd></dl>
       <FieldGroup className="rounded-xl border border-border bg-card p-4" ref={candidates}><h2 tabIndex={-1} className="font-medium outline-none">Resolved Skills</h2>{resolved.candidates.map((candidate, i) => <Field key={candidate.path} data-invalid={selected[i] && !!problems[i]}>
         {resolved.candidates.length > 1 && <FieldLabel><Checkbox aria-label={`Select ${candidate.path || 'root'}`} checked={selected[i]} disabled={pending || added(i)}
           onCheckedChange={checked => setSelected(s => s.map((v, j) => j === i ? !!checked : v))} />{candidate.path || '(root)'}</FieldLabel>}
         <p>{candidate.description}</p>
+        {candidate.total_bytes !== undefined && <p className="text-xs text-muted-foreground">{candidate.total_bytes.toLocaleString()} bytes total</p>}
+        {!!candidate.warnings?.length && <ul aria-label={`File warnings for ${candidate.path || 'root'}`} className="max-h-28 overflow-auto text-xs break-all">
+          {candidate.warnings.map(warning => <li key={warning.path}><code>{warning.path}</code> · {warning.kinds.map(kind => kind === 'large' ? 'large (> 1 MiB)' : kind).join(', ')}</li>)}
+        </ul>}
         {selected[i] && <><FieldLabel htmlFor={`import-name-${i}`}>Name{resolved.candidates.length > 1 ? ` for ${candidate.path || 'root'}` : ''}</FieldLabel>
           <Input id={`import-name-${i}`} value={names[i]} disabled={pending || added(i)} aria-invalid={!!problems[i]} aria-describedby={problems[i] ? `import-name-error-${i}` : undefined}
             onChange={e => setNames(n => n.map((v, j) => j === i ? e.target.value : v))} />
