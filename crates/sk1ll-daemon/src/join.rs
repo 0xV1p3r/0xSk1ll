@@ -201,6 +201,13 @@ async fn register_inner(
         gitx::check_repo_path(&repo, &remote)?;
     }
 
+    // Joining a machine without a repo is its first-run setup: it takes up
+    // the opt-in presets setup kept on before registering its harnesses.
+    if !repo.join(".git").exists() {
+        for warning in MachineConfig::adopt_detected_presets(&cfg.machine_config, &repo)? {
+            tracing::warn!("{warning}");
+        }
+    }
     let machine = MachineConfig::load(&cfg.machine_config)?;
     let machine_id = opts.machine_id.clone().unwrap_or_else(|| machine.id.clone());
     let harnesses: Vec<String> = machine.harnesses().into_keys().collect();

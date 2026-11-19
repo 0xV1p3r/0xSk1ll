@@ -768,3 +768,52 @@ fn editors_get_the_user_environment_back_from_a_sandboxed_gui() {
     assert_eq!(value("XDG_DATA_HOME"), None);
     assert_eq!(value("XDG_CACHE_HOME"), None);
 }
+
+#[tokio::test]
+async fn harness_commands_forward_changes_and_open_only_the_daemons_machine_config() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config/sk1ll/machine.toml");
+    let requests = Recorded::default();
+    let mut replies = Replies::new();
+    replies.insert("GET /harnesses/config".into(), (StatusCode::OK, json!({"path": config, "harnesses": []})));
+    replies.insert(
+        "POST /harnesses/preview".into(),
+        (
+            StatusCode::OK,
+            json!({"path": config, "name": "codex", "before": null, "after": null, "placed": [
+                {"harness":"codex","kind":"remove","item":"skill","name":"pdf","dest":"/h/pdf","reason":null}],
+                "sync": [], "awaiting_assignment": false}),
+        ),
+    );
+    let daemon = FakeDaemon::start(Router::new().fallback(respond).with_state((requests.clone(), replies))).await;
+    let bridge = Bridge::new(daemon.client.clone());
+    let request = HarnessChangeRequest { change: HarnessChange::Disable { name: "codex".into() } };
+    let preview = bridge.preview_harness(request).await.unwrap();
+    assert_eq!(preview.placed[0].name, "pdf");
+    assert_eq!(requests.lock().unwrap()[0].2, json!({"change": {"op": "disable", "name": "codex"}}));
+
+    let target = bridge.machine_config_target().await.unwrap();
+    assert_eq!(target.file, config.canonicalize().unwrap());
+    assert!(target.rule, "GUI editors open the file itself");
+    assert!(std::fs::read_to_string(&config).unwrap().starts_with("# "), "a missing file is created");
+    std::fs::write(&config, "id = \"box\"\n").unwrap();
+    crate::editors::config_target(&config).unwrap();
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), "id = \"box\"\n", "an existing file is left alone");
+    assert!(crate::editors::config_target(std::path::Path::new("relative.toml")).is_err());
+    assert!(crate::editors::config_target(directory.path()).is_err(), "a directory is not a config file");
+}
+
+/// A daemon started before an upgrade has no harness routes: it answers 404
+/// without a body, which the app reports as a daemon to restart.
+#[tokio::test]
+async fn a_daemon_without_a_route_is_reported_as_too_old() {
+    let daemon = FakeDaemon::start(Router::new()).await;
+    let bridge = Bridge::new(daemon.client.clone());
+    let error = bridge.harness_settings().await.unwrap_err();
+    assert_eq!(error.status, Some(404));
+    assert!(error.message.contains("older than this client") && error.message.contains("restart"), "{}", error.message);
+    // Any other route missing is no sign of an old daemon.
+    let error = bridge.harnesses().await.unwrap_err();
+    assert_eq!(error.status, Some(404));
+    assert!(!error.message.contains("older than this client"), "{}", error.message);
+}

@@ -73,7 +73,8 @@ pub fn discover(root: &Path) -> Result<Vec<Rule>> {
     paths
         .into_iter()
         .map(|path| {
-            let text = fs::read_to_string(&path).at(&path)?;
+            let text =
+                read_optional(&path)?.ok_or_else(|| Error::Invalid(format!("{} no longer exists", path.display())))?;
             let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
             let harnesses = parse_harnesses(&text, &path)?;
             // Prepare this while errors can still be returned, before sync writes
@@ -379,15 +380,13 @@ pub(crate) fn splice(text: &str, block: Option<&Block>, content: Option<&str>) -
 }
 
 pub(crate) fn read_optional(path: &Path) -> Result<Option<String>> {
-    match fs::read_to_string(path) {
-        Ok(text) => Ok(Some(text)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).at(path),
-    }
+    crate::config_file::read_text(path, true)
 }
 
 /// Atomic write that goes through symlinks, since global instruction files are
-/// often linked from a dotfiles repo.
+/// often linked from a dotfiles repo. The new text is staged in a file only
+/// this write created (see [`crate::config_file::Staged`]), so nothing that
+/// holds the temporary name is followed, truncated or published.
 pub(crate) fn write_file(path: &Path, text: &str) -> Result<()> {
     let real = match fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_symlink() => fs::canonicalize(path).at(path)?,
@@ -396,10 +395,7 @@ pub(crate) fn write_file(path: &Path, text: &str) -> Result<()> {
     if let Some(parent) = real.parent() {
         fs::create_dir_all(parent).at(parent)?;
     }
-    let file_name = real.file_name().unwrap_or_default().to_string_lossy();
-    let tmp = real.with_file_name(format!(".{file_name}.sk1ll-tmp"));
-    fs::write(&tmp, text).at(&tmp)?;
-    fs::rename(&tmp, &real).at(&real)
+    crate::config_file::Staged::write(&real, text.as_bytes(), crate::config_file::existing_mode(&real))?.replace()
 }
 
 fn find_at_line_start(text: &str, pat: &str) -> Option<usize> {
@@ -717,5 +713,21 @@ mod tests {
         assert!(block(&edited).unwrap().edited());
         assert!(find_block("<!-- 0xSk1ll:begin x -->\nno end", Path::new("f")).is_err());
         assert!(block("text mentioning <!-- 0xSk1ll:begin inline").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bookkeeping_writes_never_follow_a_planted_temp_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("victim");
+        fs::write(&victim, "victim\n").unwrap();
+        let planted = tmp.path().join(format!(".{MARKER}.sk1ll-tmp"));
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        let index = RulesIndex::from([("git.md".to_string(), "sha256:1".to_string())]);
+        save_rules_index(tmp.path(), &index).unwrap();
+        assert_eq!(load_rules_index(tmp.path()).unwrap(), index);
+        assert!(fs::symlink_metadata(tmp.path().join(MARKER)).unwrap().file_type().is_file(), "never a symlink");
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "victim\n");
+        assert!(fs::symlink_metadata(&planted).unwrap().file_type().is_symlink());
     }
 }

@@ -191,6 +191,32 @@ pub fn render_instructions(
     })
 }
 
+/// What sk1ll placed in `harness`: each managed skill, rule file and
+/// instructions block as the Remove sync would make of it were it turned
+/// off, or as a Conflict when it was edited by hand. Content sk1ll doesn't
+/// manage is left out. Side-effect free; harness changes list it with this.
+pub fn placed(repo: &Repo, hname: &str, harness: &Harness) -> Result<Vec<Action>> {
+    let sel = Selection { skills: Vec::new(), rules: Vec::new(), source_hashes: RefCell::default() };
+    let opts = PlanOptions::default();
+    let mut skills = Vec::new();
+    plan_skills(repo, hname, harness, &sel, &[], opts, &mut skills)?;
+    let mut actions = Vec::new();
+    for a in skills {
+        // A symlink sk1ll doesn't own is a sync conflict, but was never sk1ll's.
+        if a.kind != ActionKind::Conflict || !matches!(classify(repo.root(), &a.dest, None)?, Existing::Unmanaged(_)) {
+            actions.push(a);
+        }
+    }
+    if let Some(path) = harness.instructions_file() {
+        match harness.instructions_format {
+            InstructionsFormat::Block => plan_instructions(hname, &path, &[], opts, &mut actions)?,
+            InstructionsFormat::Rules => plan_rules(hname, &path, &[], opts, &mut actions)?,
+        }
+    }
+    actions.retain(|a| !matches!(&a.item, Item::Rule { expected: None, .. }));
+    Ok(actions)
+}
+
 pub fn apply(repo: &Repo, action: &Action) -> Result<()> {
     match &action.item {
         Item::Skill { name, mode, source, expected } => {
@@ -342,9 +368,8 @@ fn plan_rules(hname: &str, dir: &Path, rules: &[&Rule], opts: PlanOptions, actio
         item: Item::Rule { file: file.to_string(), content, expected },
         reason,
     };
-    let current_hash = |file: &str| -> Result<Option<String>> {
-        Ok(instructions::read_optional(&dir.join(file))?.map(|t| hash_str(&t)))
-    };
+    let current_hash = |file: &str| rule_state(&dir.join(file));
+    let foreign = || Some(format!("{NOT_A_FILE} where sk1ll placed the rule; left alone"));
 
     let mut desired = BTreeSet::new();
     for rule in rules {
@@ -353,6 +378,7 @@ fn plan_rules(hname: &str, dir: &Path, rules: &[&Rule], opts: PlanOptions, actio
         let current = current_hash(&file)?;
         let (kind, reason) = match (&current, index.get(&file)) {
             (None, _) => (ActionKind::Create, None),
+            (Some(cur), _) if cur.starts_with(NOT_A_FILE) => (ActionKind::Conflict, foreign()),
             (Some(cur), Some(rec)) if *cur == want && *rec == want => {
                 desired.insert(file);
                 continue;
@@ -374,6 +400,7 @@ fn plan_rules(hname: &str, dir: &Path, rules: &[&Rule], opts: PlanOptions, actio
         }
         let current = current_hash(file)?;
         let (kind, reason) = match &current {
+            Some(cur) if cur.starts_with(NOT_A_FILE) => (ActionKind::Conflict, foreign()),
             Some(cur) if cur != recorded && !opts.force => (ActionKind::Conflict, Some(format!("rule {EDITED}"))),
             _ => (ActionKind::Remove, None),
         };
@@ -389,12 +416,15 @@ fn apply_rule(action: &Action, file: &str, content: Option<&str>, expected: Opti
     let dest = &action.dest;
     let dir = dest.parent().ok_or_else(|| Error::Invalid(format!("{} has no parent", dest.display())))?;
     recover_rules_dir(&action.harness, dir)?;
-    let current = instructions::read_optional(dest)?.map(|t| hash_str(&t));
+    let current = rule_state(dest)?;
     if current.as_deref() != expected {
         return Err(changed_since_plan(dest));
     }
+    if current.as_deref().is_some_and(|c| c.starts_with(NOT_A_FILE)) {
+        return Err(Error::Invalid(format!("refusing to touch {}: {NOT_A_FILE}", dest.display())));
+    }
     let unchanged = || -> Result<()> {
-        match instructions::read_optional(dest)?.map(|t| hash_str(&t)).as_deref() == expected {
+        match rule_state(dest)?.as_deref() == expected {
             true => Ok(()),
             false => Err(changed_since_plan(dest)),
         }
@@ -549,6 +579,27 @@ fn apply_skill(
     };
     save_links_index(dir, &links)?;
     displaced.map_or(Ok(()), Err)
+}
+
+/// What [`rule_state`] says of anything at a rule file's place that isn't
+/// a plain file (a symlink, even to identical text, is someone else's).
+const NOT_A_FILE: &str = "not a plain file";
+
+/// A rule file's hash, as one look at the entry itself, never following a
+/// symlink there; `None`: absent. Whatever isn't a plain file never matches
+/// a hash sk1ll recorded, so it is never replaced or removed.
+fn rule_state(path: &Path) -> Result<Option<String>> {
+    use crate::config_file::{Entry, open_entry};
+    use std::io::Read;
+    // Opened without blocking, so a FIFO there can't stall the engine.
+    let mut file = match open_entry(path)? {
+        Entry::Missing => return Ok(None),
+        Entry::Other(what) => return Ok(Some(format!("{NOT_A_FILE}: {what}"))),
+        Entry::File(file, _) => file,
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).at(path)?;
+    Ok(Some(hash_str(&String::from_utf8_lossy(&bytes))))
 }
 
 /// One look at a skill destination.
@@ -727,7 +778,7 @@ fn replace_file(
     let holder = real.parent().ok_or_else(|| Error::Invalid(format!("{} has no parent", real.display())))?;
     fs::create_dir_all(holder).at(holder)?;
     let tmp = sibling(&real, "sk1ll-tmp");
-    fs::write(&tmp, text).at(&tmp)?;
+    crate::config_file::write_new(&tmp, text.as_bytes())?;
     let fail = |e: Error| {
         let _ = fs::remove_file(&tmp);
         Err(e)
@@ -1076,7 +1127,7 @@ fn copy_into_repo(repo: &Repo, src: &Path, name: &str) -> Result<()> {
 }
 
 fn adopt_rule(repo: &Repo, src: &Path, file: &str) -> Result<()> {
-    let Some(text) = instructions::read_optional(src)? else {
+    let Some(text) = crate::config_file::read_text(src, false)? else {
         return Err(Error::Invalid(format!("{} no longer exists; nothing to adopt", src.display())));
     };
     rule_into_repo(repo, file, &text)?;
@@ -1579,7 +1630,9 @@ pub mod displaced {
     }
 
     fn read_text(path: &Path) -> Result<String> {
-        Ok(String::from_utf8_lossy(&fs::read(path).at(path)?).into_owned())
+        let bytes = crate::config_file::read_regular(path, false)?
+            .ok_or_else(|| Error::Invalid(format!("{} no longer exists", path.display())))?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     /// What sync compares content by: a skill as [`observe_skill`] sees it,
@@ -1587,11 +1640,11 @@ pub mod displaced {
     fn fingerprint(kind: Kind, path: &Path) -> Result<Option<String>> {
         match kind {
             Kind::Skill => Ok(observe_skill(path)?.state),
-            Kind::Rule | Kind::Instructions => match fs::read(path) {
-                Ok(bytes) => Ok(Some(hash_str(&String::from_utf8_lossy(&bytes)))),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(e) => Err(e).at(path),
-            },
+            Kind::Rule => super::rule_state(path),
+            Kind::Instructions => {
+                Ok(crate::config_file::read_regular(path, false)?
+                    .map(|bytes| hash_str(&String::from_utf8_lossy(&bytes))))
+            }
         }
     }
 
@@ -2270,6 +2323,114 @@ mod tests {
                 .collect();
             assert!(stray.is_empty(), "{stray:?}");
         }
+    }
+
+    #[test]
+    fn absent_rule_is_omitted_from_placements_but_removed_from_index() {
+        let (_tmp, repo, harnesses, dir) = instructions_setup(InstructionsFormat::Rules);
+        let mut assignment = Assignment::default();
+        let initial = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
+        apply(&repo, &initial[0]).unwrap();
+        fs::remove_file(dir.join("git.md")).unwrap();
+        assert!(placed(&repo, "h", &harnesses["h"]).unwrap().is_empty());
+        assignment.set_rule("h", "git", false);
+        let cleanup = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
+        assert_eq!(cleanup[0].kind, ActionKind::Remove);
+        apply(&repo, &cleanup[0]).unwrap();
+        assert!(instructions::load_rules_index(&dir).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bookkeeping_honors_umask_and_preserves_replacements() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+        const CHILD: &str = "SK1LL_BOOKKEEPING_UMASK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // The shared target directory can be rebuilt while this binary runs.
+            #[cfg(target_os = "linux")]
+            let executable = PathBuf::from("/proc/self/exe");
+            #[cfg(not(target_os = "linux"))]
+            let executable = std::env::current_exe().unwrap();
+            let mut cmd = std::process::Command::new(executable);
+            cmd.args(["--exact", "sync::tests::bookkeeping_honors_umask_and_preserves_replacements", "--nocapture"])
+                .env(CHILD, "1");
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::umask(0o077);
+                    Ok(())
+                });
+            }
+            assert!(cmd.status().unwrap().success());
+            return;
+        }
+        let (tmp, repo, _, rules_dir) = instructions_setup(InstructionsFormat::Rules);
+        let assignment_path = tmp.path().join("assignment.json");
+        let links_dir = tmp.path().join("links");
+        let incoming = rules_dir.join("new.md");
+        let adopted = repo.root().join("instructions/new.md");
+        write(&incoming, "A local rule.\n");
+        let links = LinksIndex::from([("pdf".into(), "personal/pdf".into())]);
+        let save = || {
+            Assignment::default().save(&assignment_path).unwrap();
+            adopt_rule(&repo, &incoming, "new.md").unwrap();
+            save_links_index(&links_dir, &links).unwrap();
+        };
+        save();
+        let files = [assignment_path.clone(), adopted, links_dir.join(LINK_INDEX), rules_dir.join(MARKER)];
+        for file in &files {
+            assert_eq!(fs::metadata(file).unwrap().permissions().mode() & 0o777, 0o600, "{file:?}");
+            fs::set_permissions(file, fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        save();
+        for file in files {
+            assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o640, "{file:?}");
+        }
+    }
+
+    /// Whatever holds the staging name next to a rule file is never written
+    /// through, nor published as the rule.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_staging_name_is_never_followed() {
+        let (tmp, repo, harnesses, dest) = instructions_setup(InstructionsFormat::Rules);
+        let assignment = Assignment::default();
+        let victim = tmp.path().join("victim");
+        write(&victim, "victim\n");
+        fs::create_dir_all(&dest).unwrap();
+        std::os::unix::fs::symlink(&victim, dest.join(".git.md.sk1ll-tmp")).unwrap();
+        apply(&repo, &plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap()[0]).unwrap();
+        assert!(fs::symlink_metadata(dest.join("git.md")).unwrap().file_type().is_file());
+        assert_eq!(fs::read_to_string(dest.join("git.md")).unwrap(), "Use CC.\n");
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "victim\n");
+    }
+
+    /// A rule file replaced by a symlink (even to the same text) or a FIFO
+    /// is someone else's: a conflict, never followed, read or replaced.
+    #[cfg(unix)]
+    #[test]
+    fn a_rule_file_that_isnt_a_plain_file_is_a_conflict() {
+        let (tmp, repo, harnesses, dest) = instructions_setup(InstructionsFormat::Rules);
+        let assignment = Assignment::default();
+        apply(&repo, &plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap()[0]).unwrap();
+        let rule = dest.join("git.md");
+        let text = fs::read_to_string(&rule).unwrap();
+        let mine = tmp.path().join("dotfiles/git.md");
+        write(&mine, &text);
+        fs::remove_file(&rule).unwrap();
+        std::os::unix::fs::symlink(&mine, &rule).unwrap();
+        write(&repo.root().join("instructions/git.md"), "Use CC always.\n");
+        let actions = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
+        assert_eq!(actions.iter().map(|a| a.kind).collect::<Vec<_>>(), [ActionKind::Conflict], "{actions:?}");
+        assert!(fs::symlink_metadata(&rule).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_to_string(&mine).unwrap(), text);
+
+        fs::remove_file(&rule).unwrap();
+        let c = std::ffi::CString::new(rule.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let actions = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
+        assert_eq!(actions.iter().map(|a| a.kind).collect::<Vec<_>>(), [ActionKind::Conflict], "{actions:?}");
+        assert!(actions[0].reason.as_deref().is_some_and(|r| r.contains(NOT_A_FILE)), "{actions:?}");
     }
 
     #[cfg(unix)]

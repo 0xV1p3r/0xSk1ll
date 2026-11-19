@@ -35,6 +35,16 @@ export function everythingOn(harnesses: string[], items: ItemView[]): ToggleChan
     }),
   ]);
 }
+// Every Skill and Rule off for one Harness, defaults too, so sync takes out what it placed there.
+export function everythingOff(harness: string, items: ItemView[]): ToggleChange[] {
+  return [
+    { harness, kind: 'new_skills_default', enabled: false }, { harness, kind: 'new_rules_default', enabled: false },
+    ...items.map((item): ToggleChange => {
+      const { kind, name } = splitItem(item.item);
+      return { harness, kind: kind === 'rule' ? 'rule' : 'skill', name, enabled: false };
+    }),
+  ];
+}
 // Mirrors the Daemon's warning: plain HTTP sends the Machine token in clear text, except to this computer.
 export function insecureHttp(server: string): boolean {
   let url: URL;

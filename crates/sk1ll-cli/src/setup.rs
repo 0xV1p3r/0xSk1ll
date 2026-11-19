@@ -55,7 +55,7 @@ pub(crate) fn run(cli: &Cli) -> Result<()> {
     };
 
     println!();
-    choose_harnesses(&mut input, &cfg.machine_config, daemon.is_some().then_some(&client), &rt)?;
+    choose_harnesses(&mut input, &cfg.machine_config, &repo, daemon.is_some().then_some(&client), &rt)?;
     println!();
 
     let joined = if path == 1 {
@@ -64,6 +64,9 @@ pub(crate) fn run(cli: &Cli) -> Result<()> {
             None => {
                 let _lock = crate::lock_direct(&repo)?;
                 std::fs::create_dir_all(&repo)?;
+                for warning in MachineConfig::adopt_detected_presets(&cfg.machine_config, &repo)? {
+                    eprintln!("{warning}");
+                }
                 Repo::init_committed(&repo)?;
             }
         }
@@ -130,12 +133,14 @@ fn shell_quote(path: &Path) -> String {
 fn choose_harnesses(
     input: &mut Input,
     machine_config: &Path,
+    repo: &Path,
     client: Option<&Client>,
     rt: &tokio::runtime::Runtime,
 ) -> Result<()> {
     let choices: Vec<HarnessChoice> = match client {
         Some(client) => rt.block_on(client.setup_harnesses())?,
-        None => MachineConfig::load(machine_config)?.choices(),
+        // The opt-in presets found here read as on: setup enables them as it ends.
+        None => MachineConfig::setup_choices(machine_config, repo)?,
     };
     let (shown, missing): (Vec<_>, Vec<_>) = choices.into_iter().partition(|c| c.installed || c.enabled);
     if shown.is_empty() {
@@ -144,6 +149,12 @@ fn choose_harnesses(
         println!("Choose the harnesses to sync into (saved in {}):", machine_config.display());
     }
     for choice in shown {
+        if let Some(warning) = &choice.setup_warning {
+            println!("  {}: {warning}", choice.name);
+            if !choice.enabled {
+                continue;
+            }
+        }
         let paths = [choice.harness.skills.as_deref(), choice.harness.instructions.as_deref()];
         let paths = paths.into_iter().flatten().collect::<Vec<_>>().join(", ");
         let enabled = input.yes(&format!("  Sync {} ({paths})?", choice.name), choice.enabled)?;

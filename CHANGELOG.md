@@ -29,6 +29,33 @@ break compatibility.
 - Server settings for import checks: `SK1LL_SERVER_IMPORT_CHECKS=off` and the
   host allowlist `SK1LL_SERVER_IMPORT_HOSTS`. Skipped Imports are reported with
   a reason and shown on the desktop Imports screen.
+- Harnesses can be changed at any time, not only during first-run setup.
+  Settings and `sk1ll harnesses enable|disable|add|remove` turn harnesses on
+  and off and add, edit or remove custom harnesses and preset overrides in
+  `machine.toml`. Comments and layout are kept. Each change previews what
+  sk1ll already placed where it stops syncing, which stays there, and what
+  the next sync does. A change never removes anything. Failed placements
+  are reported, and the CLI exits nonzero. The local API adds
+  `GET /harnesses/config`, `POST /harnesses/preview` and
+  `POST /harnesses/apply` (409 if `machine.toml` changed while it was
+  written). A client talking to a daemon too old for these routes says to
+  restart the daemon.
+- `sk1ll assign <harness> --all on|off` sets every skill and rule and both
+  defaults. Turning a harness's items off before turning it off lets sync
+  take out what it placed; the preview says so, and Settings offers
+  **Turn off this Harness's items first**.
+- Opt-in presets for GitHub Copilot CLI (`copilot`), Cursor (`cursor`), Amp
+  (`amp`), Kiro (`kiro`), Cline (`cline`) and Roo Code (`roo`), and gemini's
+  skills directory (`~/.gemini/skills`). They sync only while
+  `machine.toml` enables them (`enabled = true`; for gemini,
+  `skills = "~/.gemini/skills"`), so an upgraded machine syncs only where it
+  did before. First-run setup enables the ones it finds and you keep;
+  elsewhere they are listed as available. An existing custom harness with
+  such a name keeps its own paths.
+- `sk1ll harnesses --all` also lists every harness that is off: turned
+  off, available, or not found on this machine.
+- Settings shows the resolved `machine.toml` path and opens it in the
+  preferred editor.
 
 ### Changed
 
@@ -46,6 +73,20 @@ break compatibility.
   before it; only the items it removed lose their toggles.
 - CLI setup explains how to join as the first machine and shows manual sync commands when the daemon is skipped.
 - `sk1ll sync --force` help lists managed instruction blocks, skill copies, and rule files.
+- `machine.toml` is written through a temporary file only sk1ll created,
+  and only if the file is still exactly as read (bytes, identity and
+  permissions); it keeps its permissions and symlink. See known limitations
+  for the instant between that check and the rename.
+- Sync's own bookkeeping (rules and links indexes, the assignment cache) is
+  staged the same way, never through whatever holds the temporary name.
+- Harness paths may not contain `..`, and locations may not be nested in one
+  another. The home directory, `/` and the repo are compared where paths
+  resolve. See the configuration docs for rewriting an existing entry.
+- Sync treats a rule file replaced by a symlink, or anything that isn't a
+  plain file, as someone else's, even when its text is identical, and never
+  blocks on a FIFO there.
+- A dangling symlink at the assignment snapshot is an error, not a missing
+  snapshot.
 
 ### Fixed
 

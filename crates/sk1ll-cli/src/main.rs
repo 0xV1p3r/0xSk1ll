@@ -4,12 +4,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use sk1ll_core::{
-    Action, ActionKind, Assignment, Change, EngineLock, HarnessOrigin, ImportState, InstructionsFormat, Item, ItemRef,
-    LinkMode, MachineConfig, Origin, PlanOptions, PullOutcome, Repo, default_commit_message, machine_author, sync,
+    Action, ActionKind, Assignment, Change, EngineLock, ImportState, Item, ItemRef, MachineConfig, Origin, PlanOptions,
+    PullOutcome, Repo, default_commit_message, machine_author, sync,
 };
 
 #[cfg(unix)]
 mod fleet;
+mod harnesses;
 #[cfg(unix)]
 mod setup;
 
@@ -196,10 +197,19 @@ enum Cmd {
     Adopt { harness: String, name: String },
     /// Print the instruction files a harness would receive
     Render { harness: String },
-    /// List this machine's harnesses (detected presets + machine.toml)
-    Harnesses,
+    /// List the harnesses sync writes into (detected presets + machine.toml), or change them
+    Harnesses {
+        /// Also list disabled harnesses, and presets a newer sk1ll added that are off until enabled
+        #[arg(long)]
+        all: bool,
+        #[command(subcommand)]
+        command: Option<harnesses::HarnessCmd>,
+    },
     /// Turn a skill or rule on/off for a harness, or set its defaults
-    #[command(after_help = "Examples:\n  sk1ll assign claude skill pdf off\n  sk1ll assign codex --default-skills off")]
+    #[command(
+        after_help = "Examples:\n  sk1ll assign claude skill pdf off\n  sk1ll assign codex --default-skills off\n  \
+                      sk1ll assign kiro --all off   # then `sk1ll sync` takes out what sk1ll placed there"
+    )]
     Assign {
         harness: String,
         kind: Option<Kind>,
@@ -211,6 +221,9 @@ enum Cmd {
         /// Whether newly appearing rules are enabled
         #[arg(long, value_name = "on|off")]
         default_rules: Option<Switch>,
+        /// Every skill and rule in the repo, and both defaults
+        #[arg(long, value_name = "on|off", conflicts_with_all = ["kind", "default_skills", "default_rules"])]
+        all: Option<Switch>,
     },
     /// Set up this machine step by step: a standalone repo, joining a fleet or starting one
     Setup,
@@ -332,7 +345,7 @@ impl Cmd {
             | Self::Draft
             | Self::Diff { .. }
             | Self::Render { .. }
-            | Self::Harnesses
+            | Self::Harnesses { .. }
             | Self::Join { .. }
             | Self::Setup
             | Self::Daemon
@@ -412,6 +425,14 @@ fn run(cli: Cli) -> Result<()> {
     if let Cmd::Init { path } = &cli.cmd {
         let root = path.clone().unwrap_or(repo_path);
         let _lock = lock_direct(&root)?;
+        // A machine without machine.toml is set up for the first time here:
+        // it takes up the opt-in presets it finds (see MachineConfig::adopt_detected_presets).
+        let machine_path = cli.machine_config.clone().map_or_else(MachineConfig::default_path, Ok)?;
+        if !root.join(".git").exists() && std::fs::symlink_metadata(&machine_path).is_err() {
+            for warning in MachineConfig::adopt_detected_presets(&machine_path, &root)? {
+                eprintln!("{warning}");
+            }
+        }
         std::fs::create_dir_all(&root)?;
         let repo = Repo::init_committed(&root)?;
         println!("initialized skills repo at {}", repo.root().display());
@@ -431,28 +452,8 @@ fn run(cli: Cli) -> Result<()> {
     let daemon_state = cli.daemon_state.clone();
     let assignment = || fleet::assignment(daemon_state.as_deref(), &assignment_path);
 
-    if let Cmd::Harnesses = &cli.cmd {
-        let machine = machine()?;
-        println!("machine {} ({})", machine.id, machine_path.display());
-        for (name, e) in machine.effective() {
-            let origin = match e.origin {
-                HarnessOrigin::Detected => "detected",
-                HarnessOrigin::Override => "override",
-                HarnessOrigin::Local => "local",
-            };
-            let mode = match e.harness.mode {
-                LinkMode::Symlink => "symlink",
-                LinkMode::Copy => "copy",
-            };
-            let format = match e.harness.instructions_format {
-                InstructionsFormat::Block => "block",
-                InstructionsFormat::Rules => "rules",
-            };
-            let skills = e.harness.skills.as_deref().map(|s| format!("skills {s} ({mode})")).unwrap_or_default();
-            let instr = e.harness.instructions.as_deref().map(|i| format!("instructions {i} ({format})"));
-            println!("{name:<10} {origin:<9} {skills:<40} {}", instr.unwrap_or_default());
-        }
-        return Ok(());
+    if let Cmd::Harnesses { .. } = &cli.cmd {
+        return harnesses::run(cli, &repo_path, &machine_path, &assignment_path);
     }
 
     // A daemon managing this repo does every change, so that changes never
@@ -619,7 +620,7 @@ fn run(cli: Cli) -> Result<()> {
                 println!("==> {} <==\n{}\n", f.path.display(), f.content.trim_end());
             }
         }
-        Cmd::Harnesses => unreachable!(),
+        Cmd::Harnesses { .. } => unreachable!(),
         Cmd::Draft => {
             let draft = repo.draft()?;
             if draft.is_empty() {
@@ -736,12 +737,24 @@ fn run(cli: Cli) -> Result<()> {
             sync::adopt(&repo, action)?;
             println!("adopted {name} from {harness} into the draft; review with `sk1ll diff {name}`");
         }
-        Cmd::Assign { harness, kind, name, state, default_skills, default_rules } => {
+        Cmd::Assign { harness, kind, name, state, default_skills, default_rules, all } => {
             if !machine()?.harnesses().contains_key(&harness) {
                 bail!("unknown harness `{harness}` on this machine (see `sk1ll harnesses`)");
             }
             let mut a = assignment()?;
-            if let Some((kind, name, state)) = assign_target(kind, name, state, default_skills, default_rules)? {
+            if let Some(s) = all {
+                let (skills, rules) = every_item(&repo)?;
+                for name in &skills {
+                    a.set_skill(&harness, name, s.on());
+                }
+                for name in &rules {
+                    a.set_rule(&harness, name, s.on());
+                }
+                a.set_new_skills_default(&harness, s.on());
+                a.set_new_rules_default(&harness, s.on());
+                println!("{harness}: every skill and rule {}, and both defaults", s.label());
+            }
+            if let Some((kind, name, state)) = assign_target(kind, name, state, default_skills, default_rules, all)? {
                 let label = check_exists(&repo, kind, &name)?;
                 match kind {
                     Kind::Skill => a.set_skill(&harness, &name, state.on()),
@@ -782,22 +795,28 @@ fn lock_direct(repo: &Path) -> Result<Option<EngineLock>> {
     Ok(Some(EngineLock::acquire(existing)?))
 }
 
-/// What `assign` toggles: an item (`None` when only defaults change).
+/// What `assign` toggles: an item (`None` when only defaults, or `--all`, change).
 fn assign_target(
     kind: Option<Kind>,
     name: Option<String>,
     state: Option<Switch>,
     default_skills: Option<Switch>,
     default_rules: Option<Switch>,
+    all: Option<Switch>,
 ) -> Result<Option<(Kind, String, Switch)>> {
     match (kind, name, state) {
         (Some(kind), Some(name), Some(state)) => Ok(Some((kind, name, state))),
-        (None, None, None) if default_skills.is_some() || default_rules.is_some() => Ok(None),
+        (None, None, None) if default_skills.is_some() || default_rules.is_some() || all.is_some() => Ok(None),
         _ => bail!(
             "usage: sk1ll assign <harness> <skill|rule> <name> <on|off>, \
-             or sk1ll assign <harness> --default-skills|--default-rules <on|off>"
+             or sk1ll assign <harness> --default-skills|--default-rules|--all <on|off>"
         ),
     }
+}
+
+/// What `assign --all` names: every skill and every rule in the repo.
+fn every_item(repo: &Repo) -> Result<(Vec<String>, Vec<String>)> {
+    Ok((repo.skills()?.into_iter().map(|s| s.name).collect(), repo.rules()?.into_iter().map(|r| r.name).collect()))
 }
 
 /// Fails unless the repo has that skill or rule; returns its label.
@@ -984,6 +1003,11 @@ mod tests {
         }
     }
 
+    /// Disables every preset: they would find the developer's real harnesses.
+    fn no_presets() -> String {
+        sk1ll_core::machine::presets().map(|p| format!("[harnesses.{p}]\nenabled = false\n")).collect()
+    }
+
     fn git(root: &Path, args: &[&str]) {
         let out = Command::new("git")
             .arg("-C")
@@ -1106,12 +1130,7 @@ mod tests {
         let skills = repo.0.join(".git/harness/skills");
         fs::write(
             repo.0.join("machine.toml"),
-            format!(
-                "id = 'test'\n[harnesses.h]\nskills = '{}'\nmode = 'copy'\n\
-             [harnesses.claude]\nenabled = false\n[harnesses.codex]\nenabled = false\n\
-             [harnesses.opencode]\nenabled = false\n[harnesses.cursor]\nenabled = false\n",
-                skills.display()
-            ),
+            format!("id = 'test'\n[harnesses.h]\nskills = '{}'\nmode = 'copy'\n{}", skills.display(), no_presets()),
         )
         .unwrap();
         sk1ll_daemon::DaemonState {
@@ -1236,12 +1255,7 @@ mod tests {
         let skills = repo.0.join(".git/harness/skills");
         fs::write(
             repo.0.join("machine.toml"),
-            format!(
-                "id = 'test'\n[harnesses.h]\nskills = '{}'\nmode = 'copy'\n\
-             [harnesses.claude]\nenabled = false\n[harnesses.codex]\nenabled = false\n\
-             [harnesses.opencode]\nenabled = false\n[harnesses.cursor]\nenabled = false\n",
-                skills.display()
-            ),
+            format!("id = 'test'\n[harnesses.h]\nskills = '{}'\nmode = 'copy'\n{}", skills.display(), no_presets()),
         )
         .unwrap();
         let stage = skills.join(".sk1ll-tmp/stage-pdf");

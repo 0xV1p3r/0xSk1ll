@@ -74,6 +74,9 @@ command!(discard_displaced(id: String) -> (), discard_displaced(&id));
 command!(harnesses() -> Vec<HarnessView>, harnesses());
 command!(setup_harnesses() -> Vec<HarnessChoice>, setup_harnesses());
 command!(set_setup_harness(name: String, enabled: bool) -> Vec<HarnessChoice>, set_setup_harness(&name, enabled));
+command!(harness_settings() -> HarnessSettings, harness_settings());
+command!(preview_harness(request: HarnessChangeRequest) -> HarnessPreview, preview_harness(&request));
+command!(apply_harness(request: HarnessChangeRequest) -> HarnessApplied, apply_harness(&request));
 command!(resolve_import(request: ResolveImportRequest) -> ResolvedSource, resolve_import(&request));
 command!(add_import(request: AddImportRequest) -> ImportUpdated, add_import(&request));
 command!(imports() -> ImportsView, imports());
@@ -243,6 +246,18 @@ impl Bridge {
     }
 }
 
+impl Bridge {
+    /// The Daemon's own `machine.toml`, the only configuration file the app
+    /// opens; created empty (with a pointer to the docs) if it doesn't exist.
+    pub(crate) async fn machine_config_target(&self) -> Result<crate::editors::Target> {
+        let path = self.client.harness_settings().await?.path;
+        tokio::task::spawn_blocking(move || crate::editors::config_target(&path))
+            .await
+            .map_err(|e| local_error(e.to_string()))?
+            .map_err(local_error)
+    }
+}
+
 fn preference_path<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<PathBuf> {
     use tauri::Manager;
     Ok(app.path().app_config_dir().map_err(|e| local_error(e.to_string()))?.join("editors.json"))
@@ -294,6 +309,25 @@ pub async fn open_in_editor(
     std::fs::write(path, bytes)
         .map_err(|e| local_error(format!("Editor opened, but preference could not be saved: {e}")))?;
     Ok(())
+}
+
+#[tauri::command]
+pub async fn open_machine_config(
+    bridge: State<'_, Bridge>,
+    cache: State<'_, crate::editors::EditorCache>,
+    editor_id: String,
+) -> Result<()> {
+    let editor = {
+        let mut guard = cache.0.lock().map_err(|_| local_error("Editor cache unavailable"))?;
+        let editors = guard.get_or_insert_with(|| crate::editors::Discovery::environment().detect());
+        editors
+            .iter()
+            .find(|e| e.view.id == editor_id)
+            .cloned()
+            .ok_or_else(|| local_error("Editor is not available; refresh the editor list"))?
+    };
+    let target = bridge.machine_config_target().await?;
+    crate::editors::launch(&editor, &target).map_err(local_error)
 }
 
 command!(push() -> PushResult, push());

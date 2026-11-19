@@ -14,8 +14,8 @@ use sk1ll_daemon::{Config, DaemonState};
 use sk1ll_proto::{AssignmentChanges, LogQuery, Scope, ToggleChange, ToggleKind};
 
 use crate::{
-    Cli, Cmd, FleetCmd, InviteScope, Kind, assign_target, bundled_fallback, check_exists, confirm, fetch_hint, names,
-    print_bundled, print_update, short,
+    Cli, Cmd, FleetCmd, InviteScope, Kind, assign_target, bundled_fallback, check_exists, confirm, every_item,
+    fetch_hint, names, print_bundled, print_update, short,
 };
 
 /// Sets up this process's environment, before any thread starts: the
@@ -59,7 +59,7 @@ pub(crate) fn runtime() -> Result<tokio::runtime::Runtime> {
 pub(crate) fn assign_direct(cli: &Cli, repo: &Path, lock: Option<&sk1ll_core::EngineLock>) -> Result<bool> {
     let cfg = daemon_config(cli)?;
     let Some(state) = DaemonState::load(&cfg.state)?.filter(|s| !s.revoked) else { return Ok(false) };
-    let Cmd::Assign { harness, kind, name, state: enabled, default_skills, default_rules } = &cli.cmd else {
+    let Cmd::Assign { harness, kind, name, state: enabled, default_skills, default_rules, all } = &cli.cmd else {
         return Ok(false);
     };
     if !sk1ll_core::MachineConfig::load(&cfg.machine_config)?.harnesses().contains_key(harness) {
@@ -67,7 +67,10 @@ pub(crate) fn assign_direct(cli: &Cli, repo: &Path, lock: Option<&sk1ll_core::En
     }
     let mut changes = Vec::new();
     let toggle = |kind, name, on: bool| ToggleChange { harness: harness.clone(), kind, name, enabled: Some(on) };
-    let target = assign_target(*kind, name.clone(), *enabled, *default_skills, *default_rules)?;
+    let target = assign_target(*kind, name.clone(), *enabled, *default_skills, *default_rules, *all)?;
+    if let Some(s) = all {
+        changes.extend(every_toggle(&sk1ll_core::Repo::open(repo)?, harness, s.on())?);
+    }
     if let Some((kind, name, enabled)) = target {
         check_exists(&sk1ll_core::Repo::open(repo)?, kind, &name)?;
         let kind = match kind {
@@ -90,6 +93,18 @@ pub(crate) fn assign_direct(cli: &Cli, repo: &Path, lock: Option<&sk1ll_core::En
     ))?;
     println!("fleet assignment of {} is now revision {}; run `sk1ll sync` to apply", state.machine_id, update.revision);
     Ok(true)
+}
+
+/// `assign <harness> --all on|off`: every skill and rule, then both defaults.
+fn every_toggle(repo: &sk1ll_core::Repo, harness: &str, on: bool) -> Result<Vec<ToggleChange>> {
+    let (skills, rules) = every_item(repo)?;
+    let toggle = |kind, name| ToggleChange { harness: harness.to_string(), kind, name, enabled: Some(on) };
+    Ok(skills
+        .into_iter()
+        .map(|s| toggle(ToggleKind::Skill, Some(s)))
+        .chain(rules.into_iter().map(|r| toggle(ToggleKind::Rule, Some(r))))
+        .chain([toggle(ToggleKind::NewSkillsDefault, None), toggle(ToggleKind::NewRulesDefault, None)])
+        .collect())
 }
 
 /// The daemon's config, with the CLI's `--machine-config` / `--assignment`.
@@ -118,6 +133,16 @@ pub(crate) fn assignment(state: Option<&Path>, cache: &Path) -> Result<sk1ll_cor
     }
     cfg.assignment = cache.to_path_buf();
     sk1ll_daemon::state::load_assignment(&cfg)
+}
+
+/// [`assignment`], with a joined machine still waiting for its own as `None`.
+pub(crate) fn assignment_if_present(state: Option<&Path>, cache: &Path) -> Result<Option<sk1ll_core::Assignment>> {
+    let mut cfg = Config::from_env()?;
+    if let Some(p) = state {
+        cfg.state = p.to_path_buf();
+    }
+    cfg.assignment = cache.to_path_buf();
+    sk1ll_daemon::state::load_assignment_if_present(&cfg)
 }
 
 pub(crate) fn queue_discarded(
@@ -425,6 +450,10 @@ pub(crate) fn connect(cli: &Cli, repo: &Path) -> Result<Option<Daemon>> {
 }
 
 impl Daemon {
+    pub(crate) fn into_parts(self) -> (tokio::runtime::Runtime, Client) {
+        (self.rt, self.client)
+    }
+
     fn block<T>(&self, f: impl Future<Output = sk1ll_daemon::client::Result<T>>) -> Result<T> {
         Ok(self.rt.block_on(f)?)
     }
@@ -562,7 +591,7 @@ impl Daemon {
                 self.block(c.fork(&name))?;
                 println!("moved {name} to personal/");
             }
-            Cmd::Assign { harness, kind, name, state, default_skills, default_rules } => {
+            Cmd::Assign { harness, kind, name, state, default_skills, default_rules, all } => {
                 // Assignment is server state: change it there, for this machine.
                 if !self.block(c.harnesses())?.iter().any(|h| h.name == harness) {
                     bail!("unknown harness `{harness}` on this machine (see `sk1ll harnesses`)");
@@ -570,7 +599,10 @@ impl Daemon {
                 let mut changes = Vec::new();
                 let toggle =
                     |kind, name, on: bool| ToggleChange { harness: harness.clone(), kind, name, enabled: Some(on) };
-                let target = assign_target(kind, name, state, default_skills, default_rules)?;
+                let target = assign_target(kind, name, state, default_skills, default_rules, all)?;
+                if let Some(s) = all {
+                    changes.extend(every_toggle(&sk1ll_core::Repo::open(repo)?, &harness, s.on())?);
+                }
                 if let Some((kind, name, state)) = target {
                     check_exists(&sk1ll_core::Repo::open(repo)?, kind, &name)?;
                     let kind = match kind {

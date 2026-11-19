@@ -146,9 +146,9 @@ function HarnessStep() {
     {choices.data && !shown.length && <Notice title="No Harnesses found">Install an agent tool such as Claude Code or Codex, or add a Harness to machine.toml. You can continue now and sync later.</Notice>}
     {shown.length > 0 && <ul className="flex flex-col divide-y rounded-lg border" aria-label="Harnesses">{shown.map(choice => <li key={choice.name}>
       <label className="flex cursor-pointer items-start gap-3 p-3">
-        <Checkbox className="mt-0.5" checked={choice.enabled} disabled={toggle.pending} aria-label={`Sync ${choice.name}`} onCheckedChange={enabled => set(choice, enabled)} />
+        <Checkbox className="mt-0.5" checked={choice.enabled} disabled={toggle.pending || (!!choice.setup_warning && !choice.enabled)} aria-label={`Sync ${choice.name}`} onCheckedChange={enabled => set(choice, enabled)} />
         <span className="flex min-w-0 flex-col gap-0.5"><span className="flex items-center gap-2 font-medium">{choice.name}{changing === choice.name && <LoaderCircle aria-hidden className="size-3.5 animate-spin" />}</span>
-          <span className="font-mono text-xs break-all text-muted-foreground">{[choice.harness.skills, choice.harness.instructions].filter(Boolean).join(' · ') || 'Nothing to sync'}</span></span>
+          <span className="font-mono text-xs break-all text-muted-foreground">{[choice.harness.skills, choice.harness.instructions].filter(Boolean).join(' · ') || 'Nothing to sync'}</span>{choice.setup_warning && <span className="text-sm text-muted-foreground">{choice.setup_warning}</span>}</span>
       </label></li>)}</ul>}
     {shown.length > 0 && shown.every(choice => !choice.enabled) && <p className="text-muted-foreground" role="status">Nothing is synced until you keep at least one Harness on.</p>}
     {missing.length > 0 && <p className="text-xs text-muted-foreground">Not found on this Machine: {missing.map(choice => choice.name).join(', ')}</p>}
