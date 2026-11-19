@@ -610,11 +610,15 @@ async fn harness_assignment_falls_back_only_for_a_missing_legacy_route() {
     let url = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let mut m = solo("box", &url, Some(snapshot(1, &["x"])));
+    m.write("personal/old name/SKILL.md", "legacy item");
     m.start().await;
     eventually(|| async { m.harness_skill("x").is_some().then_some(()) }).await;
     let result = m.client.set_harness_assignment(HARNESS, false).await.unwrap();
     assert!(m.harness_skill("x").is_none(), "the fake server never delivers a WebSocket snapshot");
-    assert!(result.warning.unwrap().contains("Unpulled items may stay on"));
+    let warning = result.warning.unwrap();
+    assert!(warning.contains("Unpulled items may stay on"));
+    assert!(warning.contains("old name"));
+    assert_eq!(result.skipped, [ItemRef::Skill("old name".into())]);
     assert_eq!(result.update.revision, 2);
     let error = m.client.set_harness_assignment("absent", false).await.unwrap_err();
     assert_eq!(error.status, Some(404));

@@ -153,3 +153,22 @@ fn joined_adoption_requires_a_running_connected_daemon() {
     assert!(!root.join("daemon-outbox.json").exists());
     assert_eq!(std::fs::read_to_string(root.join("a/pdf/SKILL.md")).unwrap(), "unmanaged user content");
 }
+
+#[test]
+fn daemonless_assign_all_pins_and_reports_skipped_names() {
+    let fixture = Fixture::new();
+    fixture.write("repo/personal/old name/SKILL.md", "Legacy");
+    fixture.write("repo/personal/pdf/SKILL.md", "PDF");
+    fixture.write("repo/instructions/old rule.md", "Legacy rule");
+    let out = fixture.command(&["assign", "a", "--all", "off"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("old name"));
+    assert!(stderr.contains("old rule"));
+    let assignment = sk1ll_core::Assignment::load(&fixture.0.path().join("assignment.json")).unwrap();
+    assert!(assignment.skill_enabled("a", "old name"));
+    assert!(assignment.rule_enabled("a", "old rule"));
+    assert!(!assignment.skill_enabled("a", "pdf"));
+    assert!(!assignment.skill_enabled("a", "future"));
+    assert!(!assignment.rule_enabled("a", "future"));
+}

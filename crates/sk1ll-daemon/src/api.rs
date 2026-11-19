@@ -551,7 +551,12 @@ async fn set_harness_assignment(
             let (changes, skipped) =
                 d.blocking(move |d, eng| d.harness_assignment_changes(eng, &harness, body)).await?;
             let update = server::change_assignment(&d.http, state, &changes).await.map_err(Error::Internal)?;
-            (update, Some(LEGACY_HARNESS_ASSIGNMENT_WARNING.into()), skipped)
+            let mut warning = LEGACY_HARNESS_ASSIGNMENT_WARNING.to_string();
+            if let Some(names) = skipped_warning(&skipped) {
+                warning.push(' ');
+                warning.push_str(&names);
+            }
+            (update, Some(warning), skipped)
         }
     };
     let snapshot = sk1ll_proto::AssignmentSnapshot {
