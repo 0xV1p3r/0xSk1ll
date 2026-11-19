@@ -5,7 +5,7 @@ import { HarnessPanel, harnessOrigin } from './HarnessSettings';
 import { api } from './api';
 import type { HarnessChoice, HarnessPreview } from './types';
 vi.mock('./api', () => ({ api: { harnessSettings: vi.fn(), previewHarness: vi.fn(), applyHarness: vi.fn(), openMachineConfig: vi.fn(),
-  setHarnessAssignment: vi.fn() }, errorMessage: String }));
+  setHarnessAssignment: vi.fn() }, errorMessage: String, errorStatus: (e: { status?: number }) => e?.status }));
 vi.mock('./toast', () => ({ toast: vi.fn() }));
 afterEach(cleanup);
 const paths = (skills: string | null): HarnessChoice['harness'] => ({ skills, instructions: null, instructions_format: 'block', mode: 'copy' });
@@ -16,7 +16,7 @@ const harnesses: HarnessChoice[] = [
   { name: 'cursor', installed: true, enabled: false, preset: true, configured: false, available: true, harness: paths('~/.cursor/skills') },
   { name: 'gemini', installed: true, enabled: true, preset: true, configured: false, available: true, harness: paths(null) },
 ];
-const preview = (over: Partial<HarnessPreview> = {}): HarnessPreview => ({ path: '/cfg/machine.toml', name: 'codex', before: paths('~/.codex/skills'), after: null,
+const preview = (over: Partial<HarnessPreview> = {}): HarnessPreview => ({ fingerprint: "preview", path: '/cfg/machine.toml', name: 'codex', before: paths('~/.codex/skills'), after: null,
   placed: [{ harness: 'codex', kind: 'remove', item: 'skill', name: 'pdf', dest: '/h/.codex/skills/pdf', reason: null },
     { harness: 'codex', kind: 'conflict', item: 'skill', name: 'notes', dest: '/h/.codex/skills/notes', reason: 'edited' }],
   sync: [], awaiting_assignment: false, ...over });
@@ -51,7 +51,7 @@ it('previews a disable, which leaves what sk1ll placed, and applies it', async (
   expect(within(dialog).getByText('Edited by hand')).toBeTruthy();
   expect(within(dialog).queryByRole('checkbox')).toBeNull();
   fireEvent.click(within(dialog).getByRole('button', { name: 'Apply' }));
-  await waitFor(() => expect(api.applyHarness).toHaveBeenCalledWith({ change: { op: 'disable', name: 'codex' } }));
+  await waitFor(() => expect(api.applyHarness).toHaveBeenCalledWith({ fingerprint: "preview", change: { op: 'disable', name: 'codex' } }));
   await waitFor(() => expect(changed).toHaveBeenCalled());
 });
 
@@ -117,7 +117,7 @@ it('offers opt-in presets as available with Enable, and gemini its skills direct
 });
 
 it('asks for a fresh preview when machine.toml changed meanwhile, and lists what failed after applying', async () => {
-  vi.mocked(api.applyHarness).mockRejectedValueOnce(new Error('machine.toml changed while sk1ll was changing it; nothing was written'));
+  vi.mocked(api.applyHarness).mockRejectedValueOnce(Object.assign(new Error('machine.toml changed while sk1ll was changing it; nothing was written'), { status: 409 }));
   const changed = mount();
   fireEvent.click(await screen.findByRole('checkbox', { name: 'Sync into codex' }));
   const dialog = await screen.findByRole('dialog');
@@ -134,4 +134,24 @@ it('asks for a fresh preview when machine.toml changed meanwhile, and lists what
   expect(changed).not.toHaveBeenCalled();
   fireEvent.click(within(dialog).getByRole('button', { name: 'Done' }));
   await waitFor(() => expect(changed).toHaveBeenCalled());
+});
+
+it('disables Apply if re-preview after turning off items fails', async () => {
+  mount();
+  fireEvent.click(await screen.findByRole('checkbox', { name: 'Sync into codex' }));
+  const dialog = await screen.findByRole('dialog');
+  await within(dialog).findByText('/h/.codex/skills/pdf');
+  vi.mocked(api.previewHarness).mockRejectedValueOnce(new Error('Preview unavailable'));
+  fireEvent.click(within(dialog).getByRole('button', { name: "Turn off this Harness's items first" }));
+  await within(dialog).findByText(/Preview unavailable/);
+  expect(within(dialog).queryByText('/h/.codex/skills/pdf')).toBeNull();
+  expect((within(dialog).getByRole('button', { name: 'Apply' }) as HTMLButtonElement).disabled).toBe(true);
+});
+
+it('opens the daemon configuration even when settings cannot be parsed', async () => {
+  vi.mocked(api.harnessSettings).mockRejectedValueOnce(new Error('Invalid TOML'));
+  mount();
+  await screen.findByText(/Invalid TOML/);
+  fireEvent.click(screen.getByRole('button', { name: 'Open configuration' }));
+  expect(api.openMachineConfig).toHaveBeenCalledWith('code');
 });

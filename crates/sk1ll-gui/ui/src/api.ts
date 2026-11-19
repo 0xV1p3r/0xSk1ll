@@ -4,7 +4,7 @@ import type * as T from './types';
 export const api = {
   renderInstructions: (name: string) => invoke<T.InstructionPreview[]>('render_instructions', { name }),
   previewSync: () => invoke<T.SyncResult>('preview_sync'),
-  syncNow: () => invoke<T.SyncResult>('sync_now'),
+  syncNow: (fingerprint: string) => invoke<T.SyncResult>('sync_now', { fingerprint }),
   init: () => invoke<void>('init'),
   push: () => invoke<T.PushResult>('push'),
   createItem: (request: T.CreateItemRequest) => invoke<void>('create_item', { request }),
@@ -55,9 +55,9 @@ export const api = {
   imports: () => invoke<T.ImportsView>('imports'),
   resolveImport: (request: T.ResolveRequest) => invoke<T.ResolvedSource>('resolve_import', { request }),
   addImport: (request: T.AddImportRequest) => invoke<T.ImportUpdated>('add_import', { request }),
-  forceUpdateImport: (name: string) => invoke<T.ImportUpdated>('force_update_import', { name }),
+  forceUpdateImport: (name: string, expected?: string) => invoke<T.ImportUpdated>('force_update_import', { name, expected }),
   importChanges: (name: string, upstream: string) => invoke<T.ImportChanges>('import_changes', { name, upstream }),
-  updateImport: (name: string) => invoke<T.ImportUpdated>('update_import', { name }),
+  updateImport: (name: string, expected?: string) => invoke<T.ImportUpdated>('update_import', { name, expected }),
   previewAssignmentCopy: (machine: string, copy: T.MachineAssignmentCopy) =>
     invoke<T.AssignmentCopyPreview>('preview_assignment_copy', { machine, copy }),
   copyMachineAssignment: (machine: string, copy: T.MachineAssignmentCopy) =>

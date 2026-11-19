@@ -279,7 +279,10 @@ pub(crate) fn config_target(path: &Path) -> Result<Target, String> {
         let parent = path.parent().ok_or("The machine configuration has no folder")?;
         std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create {}: {e}", parent.display()))?;
         let header = "# This machine's harnesses: see docs/configuration.md in 0xSk1ll.\n";
-        std::fs::OpenOptions::new()
+        let mut options = std::fs::OpenOptions::new();
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        options
             .write(true)
             .create_new(true)
             .open(path)

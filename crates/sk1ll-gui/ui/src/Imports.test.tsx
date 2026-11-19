@@ -11,7 +11,7 @@ import { JoinCodeButton, Settings } from './Settings';
 import type { SkillCandidate, StatusView } from './types';
 
 vi.mock('./api', () => ({ api: { editors: vi.fn(), imports: vi.fn(), checkImports: vi.fn(), removeImport: vi.fn(), updateImport: vi.fn(), forceUpdateImport: vi.fn(), importChanges: vi.fn(), fork: vi.fn(), conflictDiff: vi.fn(), items: vi.fn(), resolveImport: vi.fn(), addImport: vi.fn(), log: vi.fn(), logFacets: vi.fn(), undo: vi.fn(), conflicts: vi.fn(), recovered: vi.fn(), harnesses: vi.fn(), fleet: vi.fn(), join: vi.fn(), joinCode: vi.fn() },
-  errorMessage: (e: unknown) => String(e) }));
+  errorMessage: (e: unknown) => String(e), errorStatus: (e: { status?: number }) => e?.status }));
 const changed = vi.fn();
 const reviewDraft = vi.fn();
 const candidate = (name: string, taken = false): SkillCandidate => ({ path: name, default_name: name, description: `About ${name}`, taken });
@@ -84,7 +84,7 @@ it.each(['fork', 'overwrite'])('previews upstream changes and can %s after a ref
     const dialog = await screen.findByRole('dialog', { name: 'Overwrite edits to pdf?' });
     expect(api.forceUpdateImport).not.toHaveBeenCalled();
     fireEvent.click(within(dialog).getByRole('button', { name: 'Overwrite my edits' }));
-    expect(api.forceUpdateImport).toHaveBeenCalledWith('pdf');
+    expect(api.forceUpdateImport).toHaveBeenCalledWith('pdf', update.upstream);
   }
   await waitFor(() => expect(changed).toHaveBeenCalledOnce());
 });
@@ -523,4 +523,20 @@ it('reopens Add Import for each new request while the screen stays mounted', asy
   expect(screen.queryByRole('dialog')).toBeNull();
   view.rerender(<Imports revision={0} changed={changed} reviewDraft={reviewDraft} openAdd={1} />);
   expect(await screen.findByRole('dialog', { name: 'Add Import' })).toBeTruthy();
+});
+
+it('refreshes the upstream commit before another update after a conflict', async () => {
+  const update = { name: 'pdf', locked: 'aaaaaa111111', upstream: 'bbbbbb222222', source: 'github:test/repo', ref: 'main' };
+  const refreshed = { ...update, upstream: 'cccccc333333' };
+  vi.mocked(api.imports).mockResolvedValue({ checked_at: 1, updates: [update], errors: [] });
+  vi.mocked(api.checkImports).mockResolvedValue({ checked_at: 2, updates: [refreshed], errors: [] });
+  vi.mocked(api.updateImport).mockRejectedValueOnce(Object.assign(new Error('Upstream changed'), { status: 409 }))
+    .mockResolvedValueOnce({ name: 'pdf', old_commit: update.locked, new_commit: refreshed.upstream, changed: true });
+  render(<Imports revision={0} changed={vi.fn()} reviewDraft={vi.fn()} />);
+
+  fireEvent.click(await screen.findByRole('button', { name: 'Update pdf into Draft' }));
+  await waitFor(() => expect(api.checkImports).toHaveBeenCalledOnce());
+  expect(api.updateImport).toHaveBeenCalledExactlyOnceWith('pdf', update.upstream);
+  fireEvent.click(await screen.findByRole('button', { name: 'Update pdf into Draft' }));
+  expect(api.updateImport).toHaveBeenLastCalledWith('pdf', refreshed.upstream);
 });

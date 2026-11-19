@@ -794,19 +794,19 @@ async fn harness_commands_forward_changes_and_open_only_the_daemons_machine_conf
     let config = directory.path().join("config/sk1ll/machine.toml");
     let requests = Recorded::default();
     let mut replies = Replies::new();
-    replies.insert("GET /harnesses/config".into(), (StatusCode::OK, json!({"path": config, "harnesses": []})));
+    replies.insert("GET /harnesses/config/path".into(), (StatusCode::OK, json!(config)));
     replies.insert(
         "POST /harnesses/preview".into(),
         (
             StatusCode::OK,
-            json!({"path": config, "name": "codex", "before": null, "after": null, "placed": [
+            json!({"path": config, "fingerprint": "preview", "name": "codex", "before": null, "after": null, "placed": [
                 {"harness":"codex","kind":"remove","item":"skill","name":"pdf","dest":"/h/pdf","reason":null}],
                 "sync": [], "awaiting_assignment": false}),
         ),
     );
     let daemon = FakeDaemon::start(Router::new().fallback(respond).with_state((requests.clone(), replies))).await;
     let bridge = Bridge::new(daemon.client.clone());
-    let request = HarnessChangeRequest { change: HarnessChange::Disable { name: "codex".into() } };
+    let request = HarnessChangeRequest { fingerprint: None, change: HarnessChange::Disable { name: "codex".into() } };
     let preview = bridge.preview_harness(request).await.unwrap();
     assert_eq!(preview.placed[0].name, "pdf");
     assert_eq!(requests.lock().unwrap()[0].2, json!({"change": {"op": "disable", "name": "codex"}}));
@@ -814,6 +814,8 @@ async fn harness_commands_forward_changes_and_open_only_the_daemons_machine_conf
     let target = bridge.machine_config_target().await.unwrap();
     assert_eq!(target.file, config.canonicalize().unwrap());
     assert!(target.rule, "GUI editors open the file itself");
+    #[cfg(unix)]
+    assert_eq!(std::os::unix::fs::PermissionsExt::mode(&config.metadata().unwrap().permissions()) & 0o777, 0o600);
     assert!(std::fs::read_to_string(&config).unwrap().starts_with("# "), "a missing file is created");
     std::fs::write(&config, "id = \"box\"\n").unwrap();
     crate::editors::config_target(&config).unwrap();
@@ -849,9 +851,12 @@ async fn sync_commands_forward_preview_and_apply_separately() {
     let bridge = Bridge::new(daemon.client.clone());
     assert!(bridge.render_instructions("codex".into()).await.unwrap().is_empty());
     assert_eq!(bridge.preview_sync().await.unwrap().actions, Some(vec![]));
-    assert!(bridge.sync_now().await.unwrap().conflicts.is_empty());
+    assert!(bridge.sync_now("reviewed".into()).await.unwrap().conflicts.is_empty());
     let recorded = requests.lock().unwrap();
     assert_eq!(recorded[0].1, "/harnesses/codex/render");
     assert_eq!(recorded[1], ("GET".into(), "/sync".into(), Value::Null));
-    assert_eq!(recorded[2], ("POST".into(), "/sync".into(), json!({"dry_run": false, "force": false})));
+    assert_eq!(
+        recorded[2],
+        ("POST".into(), "/sync".into(), json!({"dry_run": false, "force": false, "fingerprint": "reviewed"}))
+    );
 }

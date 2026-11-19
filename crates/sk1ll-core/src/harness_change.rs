@@ -27,6 +27,7 @@ use crate::{Assignment, Error, Repo, Result};
 #[derive(Debug, Clone, Serialize)]
 pub struct ChangePlan {
     pub change: HarnessChange,
+    pub fingerprint: String,
     /// The changed harness as it is now (`None`: not synced into).
     pub before: Option<Harness>,
     /// The changed harness once the change is made (`None`: not synced into).
@@ -48,7 +49,15 @@ pub struct ChangePlan {
 /// What `change` to the `machine.toml` at `path` would do. Without an
 /// `assignment` (a joined machine still waiting for its own), `sync` is empty.
 pub fn plan(repo: &Repo, path: &Path, change: &HarnessChange, assignment: Option<&Assignment>) -> Result<ChangePlan> {
-    let snapshot = Snapshot::take(path)?;
+    plan_snapshot(repo, change, assignment, Snapshot::take(path)?)
+}
+
+fn plan_snapshot(
+    repo: &Repo,
+    change: &HarnessChange,
+    assignment: Option<&Assignment>,
+    snapshot: Snapshot,
+) -> Result<ChangePlan> {
     let name = change.name();
     let before = MachineConfig::from_snapshot(&snapshot)?.harnesses();
     let edit = MachineConfig::edit(&snapshot, change)?;
@@ -76,6 +85,7 @@ pub fn plan(repo: &Repo, path: &Path, change: &HarnessChange, assignment: Option
     };
     Ok(ChangePlan {
         change: change.clone(),
+        fingerprint: snapshot.fingerprint(),
         before: before.get(name).cloned(),
         after: after.get(name).cloned(),
         placed,
@@ -90,8 +100,18 @@ pub fn plan(repo: &Repo, path: &Path, change: &HarnessChange, assignment: Option
 /// as read ([`Error::Changed`] otherwise). Nothing placed is removed. The
 /// caller syncs afterwards, so the changed harness receives its content.
 /// Hold the engine lock.
-pub fn apply(_lock: &crate::EngineLock, repo: &Repo, path: &Path, change: &HarnessChange) -> Result<ChangePlan> {
-    let plan = plan(repo, path, change, None)?;
+pub fn apply(
+    _lock: &crate::EngineLock,
+    repo: &Repo,
+    path: &Path,
+    change: &HarnessChange,
+    expected: &str,
+) -> Result<ChangePlan> {
+    let snapshot = Snapshot::take(path)?;
+    if snapshot.fingerprint() != expected {
+        return Err(Error::Changed("machine.toml changed since the preview — preview again".into()));
+    }
+    let plan = plan_snapshot(repo, change, None, snapshot)?;
     if plan.snapshot.text()? != plan.text {
         plan.snapshot.replace(&plan.text)?;
     }
@@ -189,7 +209,7 @@ mod tests {
         assert_eq!(kinds, [(skill.clone(), ActionKind::Remove), (agents.clone(), ActionKind::Remove)]);
         assert!(fs::read_to_string(&config).unwrap().contains("mode = \"copy\"\n"), "a preview writes nothing");
 
-        apply(&lock, &repo, &config, &change).unwrap();
+        apply(&lock, &repo, &config, &change, &Snapshot::take(&config).unwrap().fingerprint()).unwrap();
         assert!(skill.join("SKILL.md").is_file() && fs::read_to_string(&agents).unwrap().contains("Git."));
         let text = fs::read_to_string(&config).unwrap();
         assert!(text.starts_with("# my harnesses\n") && text.contains("enabled = false"), "{text}");
@@ -221,9 +241,17 @@ mod tests {
             assert_eq!(preview.warnings.len(), 1, "{case}");
             assert_eq!(preview.placed.len(), 1, "{case}");
             let disable = HarnessChange::Disable { name: "h".into() };
-            assert_eq!(apply(&lock, &repo, &config, &disable).unwrap().warnings.len(), 1, "{case}");
+            assert_eq!(
+                apply(&lock, &repo, &config, &disable, &Snapshot::take(&config).unwrap().fingerprint())
+                    .unwrap()
+                    .warnings
+                    .len(),
+                1,
+                "{case}"
+            );
             MachineConfig::write_change(&config, &HarnessChange::Enable { name: "h".into() }).unwrap();
-            let removed = apply(&lock, &repo, &config, &remove).unwrap();
+            let removed =
+                apply(&lock, &repo, &config, &remove, &Snapshot::take(&config).unwrap().fingerprint()).unwrap();
             assert_eq!(removed.warnings.len(), 1, "{case}");
             assert!(removed.after.is_none());
         }
@@ -241,7 +269,7 @@ mod tests {
         sync_all(&repo, &config, &off);
         let change = HarnessChange::Disable { name: "h".into() };
         assert!(plan(&repo, &config, &change, Some(&off)).unwrap().placed.is_empty());
-        apply(&lock, &repo, &config, &change).unwrap();
+        apply(&lock, &repo, &config, &change, &Snapshot::take(&config).unwrap().fingerprint()).unwrap();
         assert!(!tmp.path().join("h/skills/pdf").exists());
         assert!(!fs::read_to_string(tmp.path().join("h/AGENTS.md")).unwrap_or_default().contains("Git."));
     }
@@ -266,7 +294,7 @@ mod tests {
             preview.sync.iter().map(|a| (a.dest.clone(), a.kind)).collect::<Vec<_>>(),
             [(tmp.path().join("h/new-skills/pdf"), ActionKind::Create)]
         );
-        apply(&lock, &repo, &config, &change).unwrap();
+        apply(&lock, &repo, &config, &change, &Snapshot::take(&config).unwrap().fingerprint()).unwrap();
         assert!(tmp.path().join("h/skills/pdf/SKILL.md").is_file(), "left in place");
     }
 
