@@ -42,16 +42,22 @@ struct Alert {
     active: Items,
     pending: bool,
     sent_at: Option<i64>,
+    #[serde(default)]
+    retry_at: Option<i64>,
+    #[serde(default)]
+    failures: usize,
 }
 
 type History = BTreeMap<Kind, Alert>;
 
 impl Alert {
-    fn observe(&mut self, kind: Kind, items: Items, now: i64, notify: impl FnOnce(&Items)) {
+    fn observe(&mut self, kind: Kind, items: Items, now: i64) -> bool {
         let grew = !self.active.is_empty() && items.len() > self.active.len();
         let new_failure = kind == Kind::Imports && !items.is_subset(&self.active);
         if items.is_empty() {
             self.pending = false;
+            self.retry_at = None;
+            self.failures = 0;
         } else if self.active.is_empty() || grew || new_failure {
             self.pending = true;
         }
@@ -59,10 +65,21 @@ impl Alert {
         // A recurrence inside the cooldown is queued while the issue is active.
         // A larger active set can be reported immediately.
         let past_cooldown = self.sent_at.is_none_or(|sent| now.saturating_sub(sent) >= 600);
-        if self.pending && (past_cooldown || grew) {
+        self.pending
+            && (past_cooldown || grew || self.retry_at.is_some())
+            && self.retry_at.is_none_or(|retry| now >= retry)
+    }
+
+    fn delivered(&mut self, now: i64, success: bool) {
+        if success {
             self.pending = false;
             self.sent_at = Some(now);
-            notify(&self.active);
+            self.retry_at = None;
+            self.failures = 0;
+        } else {
+            let delay = [60, 300, 600][self.failures.min(2)];
+            self.failures = (self.failures + 1).min(2);
+            self.retry_at = Some(now.saturating_add(delay));
         }
     }
 }
@@ -136,22 +153,22 @@ pub(crate) async fn run(d: Arc<Daemon>) {
                 (Kind::AuthRejected, auth),
                 (Kind::Imports, import_failures),
             ];
-            let mut messages = Vec::new();
             let mut changed = false;
             for (kind, items) in observations {
                 let Some(items) = items else { continue };
                 let alert = history.entry(kind).or_default();
                 let before = alert.clone();
-                alert.observe(kind, items, now, |items| messages.push((kind.title(), body(items))));
+                if alert.observe(kind, items, now) {
+                    let result = deliver(kind.title(), &body(&alert.active)).await;
+                    alert.delivered(now, result.is_ok());
+                    if let Err(err) = result {
+                        tracing::debug!(%err, "could not send desktop notification");
+                    }
+                }
                 changed |= before != *alert;
             }
             if changed && let Err(err) = save(&path, &history) {
                 tracing::debug!(%err, "could not save desktop notification history");
-            }
-            for (title, body) in messages {
-                if let Err(err) = deliver(title, &body).await {
-                    tracing::debug!(%err, "could not send desktop notification");
-                }
             }
         }
     });
@@ -265,7 +282,10 @@ mod tests {
         let mut alert = Alert::default();
         let mut calls = Vec::new();
         let mut observe = |now, names: &[&str]| {
-            alert.observe(Kind::Conflict, items(names), now, |names| calls.push((now, names.clone())));
+            if alert.observe(Kind::Conflict, items(names), now) {
+                calls.push((now, alert.active.clone()));
+                alert.delivered(now, true);
+            }
         };
         observe(0, &["a"]);
         observe(10, &["b"]);
@@ -282,11 +302,10 @@ mod tests {
     #[test]
     fn new_import_failure_is_reported_after_cooldown_even_at_same_count() {
         let mut alert = Alert::default();
-        alert.observe(Kind::Imports, items(&["a"]), 0, |_| {});
-        alert.observe(Kind::Imports, items(&["b"]), 1, |_| panic!("cooldown"));
-        let mut sent = None;
-        alert.observe(Kind::Imports, items(&["b"]), 600, |items| sent = Some(items.clone()));
-        assert_eq!(sent, Some(items(&["b"])));
+        assert!(alert.observe(Kind::Imports, items(&["a"]), 0));
+        alert.delivered(0, true);
+        assert!(!alert.observe(Kind::Imports, items(&["b"]), 1));
+        assert!(alert.observe(Kind::Imports, items(&["b"]), 600));
     }
 
     #[test]
@@ -294,14 +313,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("daemon.notifications.json");
         let mut alert = Alert::default();
-        alert.observe(Kind::Revoked, items(&["machine"]), 0, |_| {});
+        assert!(alert.observe(Kind::Revoked, items(&["machine"]), 0));
+        alert.delivered(0, true);
         save(&path, &History::from([(Kind::Revoked, alert)])).unwrap();
-        load(&path)
-            .get_mut(&Kind::Revoked)
-            .unwrap()
-            .observe(Kind::Revoked, items(&["machine"]), 1200, |_| panic!("unchanged after restart"));
+        assert!(!load(&path).get_mut(&Kind::Revoked).unwrap().observe(Kind::Revoked, items(&["machine"]), 1200));
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn unchanged_conflict_retries_after_delivery_failure() {
+        let mut alert = Alert::default();
+        assert!(alert.observe(Kind::Conflict, items(&["conflict"]), 0));
+        alert.delivered(0, false);
+        assert_eq!(alert.sent_at, None);
+        assert!(!alert.observe(Kind::Conflict, items(&["conflict"]), 59));
+        assert!(alert.observe(Kind::Conflict, items(&["conflict"]), 60));
+        alert.delivered(60, true);
+        assert_eq!(alert.sent_at, Some(60));
+        assert!(!alert.observe(Kind::Conflict, items(&["conflict"]), 660));
     }
 
     #[test]
