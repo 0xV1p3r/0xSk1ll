@@ -14,27 +14,45 @@ import { toast } from './toast';
 import { api } from './api';
 import { useMutation, useResource } from './hooks';
 import { Action, Details, ErrorNotice, Loading, Pending, Panel, PanelToolbar, SectionTitle, When } from './shared';
-import type { StatusView } from './types';
+import type { FleetView, JoinCode, Scope, StatusView } from './types';
 
-// Creates a single-use join code and shows it once.
-export function JoinCodeButton({ label, serverUrl, variant = 'outline' }: { label: string; serverUrl: string | null; variant?: 'outline' | 'default' }) {
-  const [joinCode, setJoinCode] = useState<string>();
+// What each scope lets the joining Machine do.
+export const scopeSummary: Record<Scope, string> = {
+  fleet: 'Can create join codes, change any Machine\'s Assignment, undo any log entry, and remove any Machine.',
+  self: 'Can change only its own Assignment, undo log entries for itself, and remove itself. It cannot create join codes.',
+};
+// The scope this Machine joined with; undefined until the Fleet view loads.
+export const ownScope = (fleet: FleetView | undefined, machineId: string): Scope | undefined => {
+  const row = fleet?.machines.find(machine => machine.id === machineId);
+  return row ? row.scope ?? 'fleet' : undefined;
+};
+
+// Creates a single-use join code of the chosen scope and shows it once. A self-only Machine can't create codes.
+export function JoinCodeButton({ label, serverUrl, variant = 'outline', scope: own }: { label: string; serverUrl: string | null; variant?: 'outline' | 'default'; scope?: Scope }) {
+  const [joinCode, setJoinCode] = useState<JoinCode>();
+  const [scope, setScope] = useState<Scope>('fleet');
   const quote = (arg: string) => /^[a-zA-Z0-9_:/.-]+$/.test(arg) ? arg : "'" + arg.replaceAll("'", "'\\''") + "'";
-  const command = serverUrl && joinCode ? `sk1ll join ${quote(serverUrl)} ${quote(joinCode)}` : null;
+  const command = serverUrl && joinCode ? `sk1ll join ${quote(serverUrl)} ${quote(joinCode.code)}` : null;
   const createCode = useMutation();
   const trigger = useRef<HTMLButtonElement>(null);
+  if (own === 'self') return <p className="text-xs text-muted-foreground">This Machine joined with a Self-only join code, so it can manage only itself and cannot create join codes. Ask a Machine with Fleet scope, or the Server admin.</p>;
+  const id = `join-scope-${label.replaceAll(' ', '-').toLowerCase()}`;
   return <div className="flex flex-col items-start gap-3">
-    <Button ref={trigger} variant={variant} className="relative" aria-label={label} aria-busy={createCode.pending} disabled={createCode.pending} onClick={() => void createCode.run(api.joinCode, value => setJoinCode(value.code))}>
-      {/* Keep the label's width while pending so the header doesn't reflow. */}
-      <span className={createCode.pending ? 'invisible' : undefined}>{label}</span>
-      {createCode.pending && <LoaderCircle aria-hidden className="absolute inset-0 m-auto animate-spin" />}</Button><ErrorNotice error={createCode.error} />
-    <p className="text-xs text-muted-foreground">Any joined Machine can create join codes, change any Machine's Assignment, undo log entries, and remove Machines.</p>
+    <div className="flex flex-wrap items-center gap-2">
+      <NativeSelect id={id} aria-label="New Machine may manage" value={scope} disabled={createCode.pending} onChange={e => setScope(e.target.value as Scope)}>
+        <option value="fleet">Whole Fleet</option><option value="self">Only itself</option></NativeSelect>
+      <Button ref={trigger} variant={variant} className="relative" aria-label={label} aria-busy={createCode.pending} disabled={createCode.pending} onClick={() => void createCode.run(() => api.joinCode(scope), setJoinCode)}>
+        {/* Keep the label's width while pending so the header doesn't reflow. */}
+        <span className={createCode.pending ? 'invisible' : undefined}>{label}</span>
+        {createCode.pending && <LoaderCircle aria-hidden className="absolute inset-0 m-auto animate-spin" />}</Button></div><ErrorNotice error={createCode.error} />
+    <p className="text-xs text-muted-foreground">{scope === 'fleet' ? 'Whole Fleet' : 'Only itself'}: the new Machine {scopeSummary[scope].charAt(0).toLowerCase() + scopeSummary[scope].slice(1)}</p>
     <Dialog open={joinCode !== undefined} onOpenChange={open => { if (!open) setJoinCode(undefined); }}>
       <DialogContent finalFocus={trigger}><DialogHeader><DialogTitle>Join code</DialogTitle>
-        <DialogDescription>Copy this single-use code now. It cannot be shown again and expires after 24 hours by default. The Server operator can change the expiry with SK1LL_SERVER_JOIN_CODE_TTL.
-          On the new Machine, enter the code under Settings → Join / rejoin this Machine{command ? ', or run the command below.' : '.'}</DialogDescription></DialogHeader>
-        <code className="rounded-md border bg-muted px-3 py-2 font-mono text-base break-all select-all">{joinCode}</code>
-        <Action className="h-8" label="Copy code" doneLabel="Copied" action={() => navigator.clipboard.writeText(joinCode ?? '')} />
+        <DialogDescription>Copy this single-use code now. It cannot be shown again and {joinCode?.expires_at != null ? <>expires {time(joinCode.expires_at)}.</> : <>expires after 24 hours by default. The Server operator can change the expiry with SK1LL_SERVER_JOIN_CODE_TTL.</>}
+          {' '}On the new Machine, enter the code under Settings → Join / rejoin this Machine{command ? ', or run the command below.' : '.'}</DialogDescription></DialogHeader>
+        <code className="rounded-md border bg-muted px-3 py-2 font-mono text-base break-all select-all">{joinCode?.code}</code>
+        <p className="text-sm text-muted-foreground"><span className="font-medium text-foreground">{(joinCode?.scope ?? 'fleet') === 'fleet' ? 'Whole Fleet' : 'Only itself'}.</span> {scopeSummary[joinCode?.scope ?? 'fleet']}</p>
+        <Action className="h-8" label="Copy code" doneLabel="Copied" action={() => navigator.clipboard.writeText(joinCode?.code ?? '')} />
         {command && <><code className="rounded-md border bg-muted px-3 py-2 font-mono text-sm break-all select-all">{command}</code>
           <Action className="h-8" label="Copy command" doneLabel="Copied" action={() => navigator.clipboard.writeText(command)} /></>}
       </DialogContent></Dialog>
@@ -91,7 +109,7 @@ export function Settings({ revision, fleetRevision = revision, status, socket, c
 
     </Panel>
     <Panel label="Fleet membership"><PanelToolbar><SectionTitle>Fleet membership</SectionTitle></PanelToolbar>
-      {!standalone && <div className="border-b p-3.5"><h3 className="mb-1 text-sm font-medium">Join code for another Machine</h3><p className="mb-3 text-sm text-muted-foreground">Create a single-use code for another Machine. The code is shown once. Remove Machines from the Fleet screen.</p><JoinCodeButton label="Create join code" serverUrl={status.server_url} /></div>}
+      {!standalone && <div className="border-b p-3.5"><h3 className="mb-1 text-sm font-medium">Join code for another Machine</h3><p className="mb-3 text-sm text-muted-foreground">Create a single-use code for another Machine. The code is shown once. Remove Machines from the Fleet screen.</p><JoinCodeButton label="Create join code" serverUrl={status.server_url} scope={ownScope(fleet.data, status.machine_id)} /></div>}
       <div className="px-3.5 pt-3.5"><h3 className="text-sm font-medium">{standalone ? 'Join a Fleet' : 'Join / rejoin this Machine'}</h3><p className="text-sm text-muted-foreground">Join uses a single-use join code. Rejoin replaces this Machine's credentials and restarts its Daemon.</p></div>
       <div className="p-3.5"><Collapsible key={String(alreadyJoined)} defaultOpen={!alreadyJoined}>
           {alreadyJoined && <><p className="mb-3 text-sm text-muted-foreground">This Machine is joined. Rejoin to replace its credentials.</p><CollapsibleTrigger render={<Button variant="outline" />}>Rejoin this Machine…</CollapsibleTrigger></>}

@@ -74,7 +74,43 @@ that check. Avoid browsing content being changed by an untrusted process there.
 
 The server checks each import's upstream with `git ls-remote`. The source
 comes from the pushed manifest, and only the `https`, `http`, `ssh` and `git`
-transports are allowed. Any joined machine can still point a source at an
-address inside the server's own network, and the server will send git's
-discovery request there. Run the server where its outbound network access is
-limited to what imports need if that matters to you.
+transports are allowed. By default any machine that can push, whatever its
+scope, can point a source at an address inside the server's own network, and
+the server will send git's discovery request there.
+
+Set `SK1LL_SERVER_IMPORT_HOSTS` to the hosts imports come from, or turn the
+checks off with `SK1LL_SERVER_IMPORT_CHECKS=off` (see
+[Import checks](fleet.md#import-checks)). The allowlist is matched on the host
+name in the source, before DNS: an allowed name that resolves to an internal
+address is still contacted, and a proxy set in the server's environment
+decides where an allowed name's connection goes. While the allowlist is set, the check ignores the
+server's git and ssh configuration, so url rewrites, ssh `Host` aliases and
+proxy commands can't send it elsewhere, but private sources that relied on
+that configuration need the real host name and a default key or the agent.
+Restrict the server's outbound network too if that matters to you.
+
+## Toggles for items no longer in the baseline
+
+A push drops toggles only for the items it removed itself: on every machine
+for a `fleet` machine or the admin, on its own assignment only for a `self`
+machine (ADR 0005). Other toggles for items that aren't in the baseline stay
+in their assignments, and in `GET /machines/{id}/assignment`: other machines'
+toggles for items a `self` machine removed, toggles kept for a draft or
+unpushed commit that has since gone, toggles for items that were already
+absent before a push (servers before ADR 0005 dropped those on any push),
+and toggles a cleanup failed, timed out or gave up reading the repo, or a
+restart skipped. They do nothing while the item is absent, and apply again
+when an item of the same kind and name is pushed, even if it's a new item
+that only shares the name. A `fleet` machine or the admin can clear them by
+setting the toggles.
+
+## The server's repo at startup and HEAD changes
+
+The server's reads of its repo while serving have a deadline, an output cap
+and, for each push or draft discard, a total budget (ADR 0005). The git
+commands it runs while setting the repo up at startup (creating it, the
+initial commit, its config and the pre-receive hook) don't: a repo stuck on
+storage or a lock can hold startup until git gives up. The server decides the
+baseline branch from HEAD once at startup and writes `hooks/pre-receive` over
+on every start. Changing HEAD while it runs isn't supported, and pushes keep
+going to the branch it started with until it restarts.

@@ -483,9 +483,11 @@ async fn imports(State(d): St) -> Result<Json<crate::client::ImportsView>> {
         view.checked_at = remote.checked_at;
         view.updates = remote.updates;
         view.errors = remote.errors;
+        view.skipped = remote.skipped;
     }
     view.updates.retain(|u| view.imports.iter().any(|i| i.name == u.name && i.locked.as_ref() == Some(&u.locked)));
     view.errors.retain(|e| view.imports.iter().any(|i| i.name == e.name));
+    view.skipped.retain(|s| view.imports.iter().any(|i| i.name == s.name));
     Ok(Json(view))
 }
 

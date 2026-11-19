@@ -26,13 +26,33 @@ The server listens on port 7878 and keeps `repo.git` and `server.db` in the `ser
 | `SK1LL_SERVER_DATA` | `/data` | Directory for `repo.git` and `server.db` |
 | `SK1LL_SERVER_BIND` | `0.0.0.0:7878` | Listen address |
 | `SK1LL_SERVER_OFFLINE_AFTER` | `2m` | A machine with no connection is Offline after this long |
+| `SK1LL_SERVER_JOIN_CODE_TTL` | `24h` | How long a join code works |
 | `SK1LL_SERVER_IMPORT_POLL` | `1h` | How often to check imports for newer upstream commits |
+| `SK1LL_SERVER_IMPORT_CHECKS` | `on` | `off` stops the server from checking imports at all |
+| `SK1LL_SERVER_IMPORT_HOSTS` | unset: any host | Comma-separated hosts the import check may contact, e.g. `github.com,gitlab.com`. Set but empty, it stops the server from starting |
 | `SK1LL_SERVER_PING` | `30s` | Ping interval for daemon connections |
 | `SK1LL_SERVER_SEND_TIMEOUT` | `10s` | A daemon that takes longer to receive one frame is disconnected |
 | `SK1LL_SERVER_PUSH_IDLE` | `30s` | Maximum idle time inside a git request |
 | `SK1LL_SERVER_PUSH_MAX` | `10m` | Deadline for one whole git exchange |
 
-Durations take `s`, `m`, `h` or `d`. A bare number is seconds.
+Durations take `s`, `m`, `h` or `d`. A bare number is seconds. Other variables set to an empty value count as unset.
+
+### Import checks
+
+The server checks each import's upstream for a newer commit with `git ls-remote`, using only the `https`, `http`, `ssh` and `git` transports. The sources come from the pushed manifest, so any machine that can push decides where the server connects. Two settings limit that:
+
+- `SK1LL_SERVER_IMPORT_CHECKS=off` turns server-side checks off.
+- `SK1LL_SERVER_IMPORT_HOSTS` lists the only hosts the check may contact. A host must match an entry exactly, ignoring case. Entries are host names or IP addresses (IPv6 in brackets), with no port, user or wildcard. Write internationalized names either way in the list; in sources they must be in punycode (`xn--...`). The host is read from `scheme://[user@]host[:port]/...` and scp-like `[user@]host:path` sources (`github:owner/repo` means `github.com`). A source whose host can't be read unambiguously isn't checked, and neither is one with a percent escape before its path or an ssh user name other than letters, digits, `.`, `_` and `-`. The list can't be empty: leave the variable unset to allow any host.
+
+While the list is set, the check restricts the host name in the source, not where the connection ends up: DNS for an allowed name, or a proxy set in the server's environment, can still lead elsewhere (see [known limitations](known-limitations.md#import-checks-reach-whatever-the-server-can-reach)). Within that, nothing in the check moves it to another host name:
+
+- It doesn't follow HTTP redirects, so a moved repository fails the check instead of leading to another host.
+- `git ls-remote` runs outside any repository, without the server's git configuration (`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`) and with only `PATH`, `HOME`, `LANG`, `LC_ALL`, `TMPDIR`, `SSH_AUTH_SOCK`, the proxy variables (`https_proxy`, `no_proxy` and the like) and the CA variables (`SSL_CERT_FILE`, `SSL_CERT_DIR`, `GIT_SSL_CAINFO`, `GIT_SSL_CAPATH`) from its environment. `url.*.insteadOf` rules, credential helpers and `http.*` settings in the server's git config don't apply.
+- ssh runs as `ssh -F /dev/null -o BatchMode=yes`, so no ssh config file applies: no `Host` aliases, `HostName`, `Port`, `IdentityFile`, `ProxyJump` or `ProxyCommand`. The default keys (`~/.ssh/id_*`), the agent and `~/.ssh/known_hosts` still work, and a host missing from `known_hosts` fails the check.
+
+If your checks relied on that configuration, write sources with the real host name and port, list that host, and use a default key or the agent; for https, set a proxy or CA with the variables above. Without the list, the check uses the server's git and ssh configuration as before.
+
+The server skips imports these settings exclude and reports each with the reason. The GUI's Imports screen shows them as *Not checked by Server*, and **Check now** checks every import from that machine instead. `sk1ll status` shows only local import state, so it isn't affected. Neither setting restricts other outbound traffic: a firewall is still the way to keep the server out of its own network.
 
 ## Join a machine
 
@@ -45,11 +65,34 @@ SK1LL_SERVER_ADMIN_TOKEN=... sk1ll join http://server:7878   # or --admin-token 
 To create a code by hand instead:
 
 ```sh
-curl -X POST -H "Authorization: Bearer $SK1LL_SERVER_ADMIN_TOKEN" \
-  http://server:7878/api/join-codes
+curl -fsS -X POST -H "Authorization: Bearer $SK1LL_SERVER_ADMIN_TOKEN" \
+  -d '{"scope": "self"}' http://server:7878/api/join-codes \
+  | jq -er 'if .scope == "self" then .code else error("the server did not grant self scope") end'
 ```
 
-On a joined machine with a running daemon, run `sk1ll fleet invite` to create a single-use join code. It prints the code and a ready-to-paste join command for the new machine. You can also create a code from the GUI's Settings screen.
+The response holds the `code`, its `scope` and `expires_at` (Unix seconds). Without a body, the code has `fleet` scope. An older server ignores the requested scope and grants `fleet` without saying so in the response, which is why the example prints the code only when the response confirms `"scope": "self"`, as `sk1ll fleet invite` and the GUI do.
+
+On a joined machine with a running daemon, run `sk1ll fleet invite` to create a single-use join code. It prints the code, a ready-to-paste join command for the new machine, when the code expires, and its scope. You can also create a code from the GUI's Fleet or Settings screen.
+
+```sh
+sk1ll fleet invite                 # the new machine may manage the whole fleet
+sk1ll fleet invite --scope self    # the new machine may manage only itself
+```
+
+### Scopes
+
+A join code decides what the machine that joins with it may manage ([ADR 0005](adr/0005-join-code-scopes.md)):
+
+| Scope | May |
+|---|---|
+| `fleet` (default) | Create join codes, change any machine's assignment, undo any log entry, remove any machine |
+| `self` | Change its own assignment, undo log entries for itself, remove itself |
+
+Every machine can read the fleet view, the log and every assignment. The admin token can do everything. A `self` machine that tries more gets `403` with the reason, and since it can't create join codes, it can't create a `fleet` code either. Scopes cover fleet administration only: a `self` machine can still push content to the baseline.
+
+A push drops toggles only for the skills and rules it removed from the baseline, and keeps each machine's toggles for items in its draft or unpushed commits. A push by a `fleet` machine or the admin drops them on every machine; a push by a `self` machine drops only its own, and the other machines keep theirs. Toggles for items no longer in the baseline do nothing, and apply again if an item with the same kind and name comes back from any machine's push. Later pushes that don't remove the item leave them alone; a `fleet` machine or the admin can clear them by changing the assignment. Every write also checks the caller's token and scope again as it is stored, so a request sent just before its machine was removed, or joined again with a `self` code, fails. Removing a machine waits for a push in progress, and a push queued behind the removal of its machine is refused with `401`. The server accepts pushes only to the baseline branch, the one the repo's HEAD names when the server starts: pushes to tags, other branches, refs under the branch's name or `refs/replace/` are refused, and its own reads ignore replacement objects. The server writes `hooks/pre-receive` in the repo over on every start to enforce this, so put your own checks elsewhere. If HEAD is detached or names something outside `refs/heads/`, the server refuses to start; point it at the branch with `git -C <data>/repo.git symbolic-ref HEAD refs/heads/<branch>`. Changing HEAD while the server runs isn't supported: restart it afterwards. If it can't list the tree before or after a push, that push drops no toggles. If it can't read the baseline when a draft is discarded, it drops nothing and closes the daemon's session with code 1013; the daemon reconnects, backing off, and sends the discard again. `sk1ll fleet` marks `self` machines with *manages only itself*, and the GUI's Fleet screen shows each machine's scope.
+
+Machines that joined before scopes existed have `fleet` scope. A machine removed and joined again gets the scope of its new code.
 
 On the new machine:
 
@@ -134,7 +177,7 @@ The table lists Linux paths. On macOS, config and data use `~/Library/Applicatio
 
 To clear Blocked, commit or restore the clashing items, then run `sk1ll pull`.
 
-Join codes expire after `SK1LL_SERVER_JOIN_CODE_TTL` (default `24h`), using the server duration syntax.
+Join codes expire after `SK1LL_SERVER_JOIN_CODE_TTL` (default `24h`), using the server duration syntax. `sk1ll fleet invite` and the GUI show the exact time.
 
 ## Upgrade
 

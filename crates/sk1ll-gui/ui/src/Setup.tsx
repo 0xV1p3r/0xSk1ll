@@ -17,7 +17,7 @@ import { useMutation, useResource } from './hooks';
 import { everythingOn, insecureHttp, plural } from './model';
 import { JoinCodeButton } from './Settings';
 import { Details, ErrorNotice, Loading, Notice, Panel, PanelToolbar, Pending, SectionTitle } from './shared';
-import type { ContentEntry, DaemonStarted, HarnessChoice, ServiceManager, StatusView } from './types';
+import type { ContentEntry, DaemonStarted, HarnessChoice, Scope, ServiceManager, StatusView } from './types';
 
 export function Wordmark() {
   return <div className="mb-3 w-44"><img src={wordmarkLight} alt="0xSk1ll" className="block h-auto w-full dark:hidden" /><img src={wordmarkDark} alt="0xSk1ll" className="hidden h-auto w-full dark:block" /></div>;
@@ -219,8 +219,8 @@ export const gettingStartedShown = () => { try { return localStorage.getItem(get
 const hideGettingStarted = () => { try { localStorage.removeItem(gettingStartedKey); } catch { /* Storage may be unavailable. */ } };
 
 // Shown in the Library after the setup wizard until every step is done or it is dismissed.
-export function GettingStarted({ status, entries, machines, addImport, newSkill, newRule, showUnmanaged, reviewDraft, reopened, onDismiss }: {
-  status: StatusView; entries: ContentEntry[] | undefined; machines: number | undefined;
+export function GettingStarted({ status, entries, machines, scope, addImport, newSkill, newRule, showUnmanaged, reviewDraft, reopened, onDismiss }: {
+  status: StatusView; entries: ContentEntry[] | undefined; machines: number | undefined; scope?: Scope;
   reopened: boolean; onDismiss: () => void; addImport: () => void; newSkill: () => void; newRule: () => void; showUnmanaged: () => void; reviewDraft: () => void;
 }) {
   const [visible, setVisible] = useState(() => reopened || gettingStartedShown());
@@ -233,7 +233,7 @@ export function GettingStarted({ status, entries, machines, addImport, newSkill,
       action: <Button size="sm" variant="outline" onClick={showUnmanaged}>Show</Button> }] : []),
     { title: standalone ? 'Commit your Draft' : 'Commit your Draft to the Fleet', done: status.report.baseline !== null && status.report.drafts.length === 0,
       action: <Button size="sm" variant="outline" onClick={reviewDraft}>Review Draft</Button> },
-    ...(standalone ? [] : [{ title: 'Add another Machine', done: (machines ?? 0) > 1, action: <JoinCodeButton label="Create join code" serverUrl={status.server_url} /> }]),
+    ...(standalone ? [] : [{ title: 'Add another Machine', done: (machines ?? 0) > 1, action: <JoinCodeButton label="Create join code" serverUrl={status.server_url} scope={scope} /> }]),
   ];
   const known = !!entries && (standalone || machines !== undefined);
   const finished = known && steps.every(step => step.done);

@@ -20,8 +20,31 @@ break compatibility.
 - Restart a systemd user Daemon from the desktop app after a local API mismatch.
 - CLI commands to create join codes, remove machines, and view or undo Assignment log entries.
 - Shell completion generation with `sk1ll completions <shell>`.
+- Join-code scopes: a `self` code limits the joining Machine to its own
+  Assignment, its own log entries and removing itself; `fleet` (the default)
+  keeps today's rights. `sk1ll fleet invite --scope self|fleet`, a scope choice
+  in the desktop app, and each Machine's scope in the Fleet view. Existing
+  Machines keep `fleet` scope (ADR 0005).
+- Join-code responses include `expires_at` and `scope`; `sk1ll fleet invite`
+  and the desktop app show the exact expiry.
+- Server settings for import checks: `SK1LL_SERVER_IMPORT_CHECKS=off` and the
+  host allowlist `SK1LL_SERVER_IMPORT_HOSTS`. Skipped Imports are reported with
+  a reason and shown on the desktop Imports screen.
 
 ### Changed
+
+- Machines that joined with a `self` join code get `403` for creating join
+  codes or managing other Machines.
+- The server accepts pushes only to the baseline branch, the one HEAD names
+  when it starts; pushes to tags, other branches, refs under the branch's name
+  or `refs/replace/` are refused, also by a `pre-receive` hook the server
+  writes over on every start. Replacement refs already in the repo are ignored
+  and logged at startup.
+- The server refuses to start when the repo's HEAD is detached or names
+  something outside `refs/heads/`, and says how to fix it. Changing HEAD needs
+  a restart.
+- Every push, by any Machine, keeps toggles for items that were already absent
+  before it; only the items it removed lose their toggles.
 
 - CLI setup explains how to join as the first machine and shows manual sync commands when the daemon is skipped.
 - `sk1ll sync --force` help lists managed instruction blocks, skill copies, and rule files.
@@ -35,6 +58,45 @@ break compatibility.
 - Machine entries in the desktop command palette open the selected Machine.
 - Desktop messages identify origin for standalone pushes, explain when Fleet
   deletions reach other Machines, and clarify how to join as the first Machine.
+- A push drops toggles only for the items it removed, and a push by a `self`
+  Machine only its own; other Machines' toggles stay and apply again when the
+  items come back. Unrelated pushes no longer drop toggles for drafts missing
+  from a Machine's latest status.
+- A push queued behind its Machine's removal is refused with `401`, and a
+  removal waits for a push in progress. A delayed WebSocket upgrade or
+  revocation for a removed token can't end a rejoined Machine's session.
+- A push whose tree the server can't list, or that times out listing it,
+  drops no toggles, and a later push no longer drops toggles for what it
+  removed. Server reads of the repo have a deadline and a 64 MiB output cap,
+  each push and draft discard a total budget for its reads, and a read that
+  misses them or is cancelled stops its git process group.
+- A draft discard reads the baseline branch itself instead of the HEAD cached
+  after the last push, so a push whose HEAD read failed can't make it drop a
+  toggle for an item in the baseline. A failed read is no longer taken for an
+  empty repo. While the baseline can't be read, the server drops nothing and
+  closes the session with code 1013; the daemon keeps backing off and sends
+  its unacknowledged discards again.
+- An empty repo whose unborn HEAD named another branch takes pushes to the
+  `main` branch the server creates in it.
+- Server reads of the repo ignore replacement objects, so a replacement ref
+  can't change what the server sees in the baseline.
+- A Machine removal whose request goes away keeps pushes out until the
+  removal is stored.
+- Server writes check the caller's token and scope again inside their
+  transaction, so a request racing its Machine's removal or a rejoin with a
+  `self` code can't use the old scope.
+- Import checks with `SK1LL_SERVER_IMPORT_HOSTS` refuse sources with percent
+  escapes before the path or unusual ssh user names, and run `git ls-remote`
+  without the server's git and ssh configuration, so neither can lead them
+  to an unlisted host.
+- Daemons are told when skipped or failed import checks change, so the
+  desktop Imports screen shows newly skipped Imports.
+- A set but empty, blank or non-UTF-8 `SK1LL_SERVER_IMPORT_HOSTS` stops the
+  server from starting instead of allowing any host.
+- The `curl` join-code example in the fleet guide prints a `self` code only
+  when the server confirms the scope.
+- Join codes are invalid from their `expires_at` second on, matching the
+  reported expiry.
 
 ## [0.1.0] - 2026-11-17
 

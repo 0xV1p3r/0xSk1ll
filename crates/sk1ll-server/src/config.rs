@@ -28,6 +28,16 @@ pub struct Config {
     /// Transports the import check may use for upstream sources, which come
     /// from the pushed manifest. Not configurable from the environment.
     pub import_protocols: String,
+    /// Whether the server checks imports' upstreams at all
+    /// (`SK1LL_SERVER_IMPORT_CHECKS`, `on` or `off`, default `on`).
+    pub import_checks: bool,
+    /// The only hosts the import check may contact, normalized (lowercase,
+    /// IDNs as punycode); `None` for any (`SK1LL_SERVER_IMPORT_HOSTS`,
+    /// comma separated, e.g. `github.com,gitlab.com`).
+    pub import_hosts: Option<Vec<String>>,
+    /// The ssh program the import check runs while `import_hosts` is set,
+    /// without the server's ssh config. Not configurable from the environment.
+    pub import_ssh: String,
     /// How often the server pings each daemon (`SK1LL_SERVER_PING`, default `30s`).
     /// A connection that sends nothing, pongs included, for
     /// [`Config::idle_limit`] is closed.
@@ -54,6 +64,9 @@ impl Config {
             join_code_ttl: Duration::from_secs(86400),
             import_poll: Duration::from_secs(3600),
             import_protocols: IMPORT_PROTOCOLS.into(),
+            import_checks: true,
+            import_hosts: None,
+            import_ssh: "ssh".into(),
             ping_every: Duration::from_secs(30),
             send_timeout: Duration::from_secs(10),
             push_idle: Duration::from_secs(30),
@@ -77,6 +90,12 @@ impl Config {
         if let Some(v) = var("SK1LL_SERVER_IMPORT_POLL") {
             cfg.import_poll = parse_duration(&v).with_context(|| format!("SK1LL_SERVER_IMPORT_POLL: `{v}`"))?;
         }
+        if let Some(v) = var("SK1LL_SERVER_IMPORT_CHECKS") {
+            cfg.import_checks = parse_switch(&v).with_context(|| format!("SK1LL_SERVER_IMPORT_CHECKS: `{v}`"))?;
+        }
+        // Unlike the others, set but empty is an error: it would otherwise
+        // mean any host, the opposite of what setting it asks for.
+        cfg.import_hosts = import_hosts(std::env::var_os("SK1LL_SERVER_IMPORT_HOSTS"))?;
         if let Some(v) = var("SK1LL_SERVER_PING") {
             cfg.ping_every = parse_duration(&v).with_context(|| format!("SK1LL_SERVER_PING: `{v}`"))?;
         }
@@ -104,6 +123,43 @@ impl Config {
     pub fn db_path(&self) -> PathBuf {
         self.data_dir.join("server.db")
     }
+}
+
+/// `on` or `off`, ignoring ASCII case.
+fn parse_switch(s: &str) -> anyhow::Result<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => bail!("use on or off"),
+    }
+}
+
+/// `SK1LL_SERVER_IMPORT_HOSTS`: `None` only when it is unset. Set, it must
+/// name at least one host in UTF-8.
+fn import_hosts(value: Option<std::ffi::OsString>) -> anyhow::Result<Option<Vec<String>>> {
+    let Some(value) = value else { return Ok(None) };
+    let v = value
+        .into_string()
+        .map_err(|v| anyhow::anyhow!("SK1LL_SERVER_IMPORT_HOSTS: `{}` is not UTF-8", v.display()))?;
+    Ok(Some(parse_hosts(&v).with_context(|| format!("SK1LL_SERVER_IMPORT_HOSTS: `{v}`"))?))
+}
+
+/// Comma-separated host names or IP addresses, normalized like the hosts
+/// they are compared with. Ports, userinfo, paths and wildcards are refused.
+pub fn parse_hosts(s: &str) -> anyhow::Result<Vec<String>> {
+    let mut hosts = Vec::new();
+    for entry in s.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let host = crate::imports::normalize_host(entry).map_err(anyhow::Error::msg)?;
+        if !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
+    if hosts.is_empty() {
+        bail!(
+            "names no host; leave it unset to allow any host, or turn checks off with SK1LL_SERVER_IMPORT_CHECKS=off"
+        );
+    }
+    Ok(hosts)
 }
 
 /// `90`, `90s`, `2m`, `1h` or `1d`; a bare number is seconds.
@@ -137,5 +193,30 @@ mod tests {
         assert!(parse_duration("0").is_err());
         assert!(parse_duration("5w").is_err());
         assert!(parse_duration("m").is_err());
+    }
+
+    #[test]
+    fn switches_and_hosts() {
+        assert!(parse_switch("ON").unwrap());
+        assert!(!parse_switch(" off ").unwrap());
+        assert!(parse_switch("no").is_err());
+        assert_eq!(parse_hosts("GitHub.com, gitlab.com,,github.com").unwrap(), ["github.com", "gitlab.com"]);
+        assert_eq!(parse_hosts("bücher.example").unwrap(), ["xn--bcher-kva.example"]);
+        assert_eq!(parse_hosts("[::1],10.0.0.1").unwrap(), ["[::1]", "10.0.0.1"]);
+        assert_eq!(import_hosts(None).unwrap(), None);
+        assert_eq!(import_hosts(Some("github.com".into())).unwrap(), Some(vec!["github.com".into()]));
+        for set in ["", "   ", ","] {
+            let err = format!("{:#}", import_hosts(Some(set.into())).unwrap_err());
+            assert!(err.contains("names no host"), "{set:?}: {err}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let err = import_hosts(Some(std::ffi::OsString::from_vec(b"git\xffhub.com".to_vec()))).unwrap_err();
+            assert!(err.to_string().contains("not UTF-8"), "{err}");
+        }
+        for bad in [" , ", "github.com:443", "git@github.com", "*.github.com", "github.com/x", "a b", "git%68ub.com"] {
+            assert!(parse_hosts(bad).is_err(), "{bad}");
+        }
     }
 }

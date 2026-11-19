@@ -116,7 +116,10 @@ async fn commands_use_the_unix_client_and_preserve_payloads_and_errors() {
     assert_eq!(restore.discarded.len(), 1);
     assert!(matches!(bridge.pull().await.unwrap(), PullResult::Blocked { .. }));
     assert!(bridge.log(LogQuery { before: Some(42), limit: Some(10), ..Default::default() }).await.unwrap().is_empty());
-    assert_eq!(bridge.join_code().await.unwrap().code, "ONCE");
+    assert_eq!(bridge.join_code(Scope::Fleet).await.unwrap().code, "ONCE");
+    // That reply has no scope, like an older Server's: it can't grant `self`.
+    let old = bridge.join_code(Scope::SelfOnly).await.unwrap_err();
+    assert!(old.message.contains("too old"), "{}", old.message);
     let joined = bridge
         .join(JoinApiRequest {
             server_url: "http://server".into(),

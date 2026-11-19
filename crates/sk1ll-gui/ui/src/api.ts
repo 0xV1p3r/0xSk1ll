@@ -54,7 +54,7 @@ export const api = {
   logFacets: () => invoke<T.LogFacets>('log_facets'),
   undo: (entry: number) => invoke<T.AssignmentUpdate>('undo', { entry }),
   join: (request: T.JoinApiRequest) => invoke<T.Joined>('join', { request }),
-  joinCode: () => invoke<T.JoinCode>('join_code'),
+  joinCode: (scope: T.Scope) => invoke<T.JoinCode>('join_code', { scope }),
   removeMachine: (machine: string) => invoke<void>('remove_machine', { machine }),
   connectionInfo: () => invoke<string>('connection_info'),
 };

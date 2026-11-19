@@ -80,6 +80,10 @@ _Avoid_: Agent (reserved for the AI tools that harnesses run)
 A single-use code that lets a new machine enter the fleet and receive its own credential.
 _Avoid_: Invite, fleet token
 
+**Scope**:
+What a machine may manage, set by the join code it joined with: `fleet` (the whole fleet) or `self` (only its own assignment, log entries and membership).
+_Avoid_: Role, permission level
+
 ## Machine status
 
 A machine has one headline status: the most severe that applies, in the order Offline, Blocked, Conflict, Behind, Drafting, In sync. **Conflict** is defined above.

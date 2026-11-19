@@ -209,9 +209,11 @@ fn materialize_changes(a: &Assignment, harness: &str, kind: ToggleKind, existing
         .collect()
 }
 
-/// The change that undoes log entry `id`: restore its `before`.
-pub fn undo_change(conn: &Connection, id: i64) -> Result<(String, Change)> {
+/// The change that undoes log entry `id`: restore its `before`. `allowed`
+/// vets the entry's machine before anything else is checked.
+pub fn undo_change(conn: &Connection, id: i64, allowed: impl FnOnce(&str) -> Result<()>) -> Result<(String, Change)> {
     let e = db::log_entry(conn, id)?.ok_or_else(|| ApiError::NotFound(format!("no log entry {id}")))?;
+    allowed(&e.machine)?;
     if e.cause == LogCause::MachineRemoved {
         return Err(ApiError::Conflict("a removed machine's assignment can't be restored; join it again".into()));
     }
@@ -271,16 +273,15 @@ pub fn sweep_changes(
 /// Drops `machine`'s toggles for items it can no longer have (see
 /// [`sweep_changes`]), as the server, inside the caller's transaction. Idempotent;
 /// `None` if the machine is gone or nothing changed.
-/// With `discarded`, only those explicitly Restore items are considered.
-/// A push keeps toggles for items in the machine's latest drafts or unpushed report.
-/// Once they leave baseline, drafts and unpushed, an explicit `DraftDiscarded` or
-/// a later push's sweep clears those exempt toggles. Status snapshots
+/// Only the items in `only` are considered: those a push removed from the
+/// baseline, or those an explicit Restore discarded. Toggles for items in the
+/// machine's latest drafts or unpushed report are kept. Status snapshots
 /// never sweep: a stash during a pull or an unpushed commit can hide drafts.
 pub fn sweep(
     tx: &Connection,
     machine: &str,
     baseline: &BTreeSet<ItemRef>,
-    discarded: Option<&[ItemRef]>,
+    only: &[ItemRef],
     now: i64,
 ) -> Result<Option<Applied>> {
     let Some(m) = db::machine(tx, machine)? else {
@@ -289,10 +290,7 @@ pub fn sweep(
     let report = m.report.unwrap_or_default();
     let changes = sweep_changes(&m.assignment, baseline, &report.drafts, &report.unpushed)
         .into_iter()
-        .filter(|c| {
-            discarded
-                .is_none_or(|items| c.name.as_deref().and_then(|n| item(c.kind, n)).is_some_and(|i| items.contains(&i)))
-        })
+        .filter(|c| c.name.as_deref().and_then(|n| item(c.kind, n)).is_some_and(|i| only.contains(&i)))
         .collect::<Vec<_>>();
     if changes.is_empty() {
         return Ok(None);

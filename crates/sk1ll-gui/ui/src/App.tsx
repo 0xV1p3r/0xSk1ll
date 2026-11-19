@@ -25,7 +25,7 @@ import { Skills, type SkillsHandoff } from './Skills';
 import { useResource } from './hooks';
 import { eventTopics } from './invalidation';
 import { plural } from './model';
-import { Settings } from './Settings';
+import { Settings, ownScope } from './Settings';
 import { ConnectionPage, GettingStarted, RestartingPage, SetupWizard, StartingAssignment, Wordmark, showGettingStarted, type SetupResult } from './Setup';
 import { ErrorNotice, Loading, Notice } from './shared';
 import type { CommandError, DaemonConnection, StatusView } from './types';
@@ -275,7 +275,7 @@ export function App() {
           <AlertDescription className="min-w-0 [overflow-wrap:anywhere]"><code className="font-mono">{conflict.item.replace(/^(skill|rule):/, '')}</code> was edited in {conflict.harness} after the last sync.</AlertDescription>
           <Button size="sm" className="ml-auto" onClick={() => navigate('Conflicts')}>Resolve</Button>
         </Alert>}
-        {screen === 'Library' && <GettingStarted key={checklist} reopened={checklistReopened} onDismiss={closeChecklist} status={status} entries={skills.data} machines={fleet.data?.machines.length}
+        {screen === 'Library' && <GettingStarted key={checklist} reopened={checklistReopened} onDismiss={closeChecklist} status={status} entries={skills.data} machines={fleet.data?.machines.length} scope={ownScope(fleet.data, status.machine_id)}
           addImport={() => { navigate('Imports'); setOpenAdd(n => n + 1); }} newSkill={() => setSkillsHandoff({ create: 'skill' })}
           newRule={() => setSkillsHandoff({ create: 'rule' })} showUnmanaged={() => setSkillsHandoff({ filter: 'unmanaged' })} reviewDraft={() => navigate('Draft')} />}
         {screen === 'Library' && <><ErrorNotice error={skills.error} />{skills.loading && !skills.data ? <Loading /> : <Skills handoff={skillsHandoff} connection={status.connection} entries={skills.data ?? []} revision={revision} changed={changed} reviewDraft={() => navigate('Draft')} assignment={(item, harness) => { navigate('Assignment matrix'); setMatrixTarget({ item, harness }); }} addImport={() => { navigate('Imports'); setOpenAdd(n => n + 1); }} />}</>}

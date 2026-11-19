@@ -15,9 +15,11 @@ export interface StatusView {
   awaiting_assignment: boolean; auth_rejected_since: number | null; pending_discards: number; report: MachineReport;
   version?: string;
 }
+// What a Machine may manage, from its join code: the whole Fleet, or only itself. Absent means `fleet`.
+export type Scope = 'fleet' | 'self';
 export interface MachineRow {
   id: string; status: MachineStatus; connected: boolean; joined_at: number; last_seen: number | null;
-  report: MachineReport | null;
+  report: MachineReport | null; scope?: Scope;
 }
 export interface FleetView { baseline: string | null; machines: MachineRow[] }
 export interface HarnessAssignment {
@@ -69,12 +71,14 @@ export type ServiceManager = 'systemd' | 'launchd';
 export interface ServiceInfo { default_socket: boolean; binary: string | null; manager: ServiceManager; available: boolean; active: boolean; restartable: boolean; unit: string | null }
 export type DaemonStarted = ServiceManager | 'process';
 export interface ImportUpdate { name: string; source: string; ref: string; locked: string; upstream: string }
-export interface ImportsView { imports?: ImportEntry[]; checked_at: number | null; updates: ImportUpdate[]; errors: { name: string; message: string }[] }
+// `skipped`: Imports the Server's import check settings kept it from checking.
+export interface ImportsView { imports?: ImportEntry[]; checked_at: number | null; updates: ImportUpdate[]; errors: { name: string; message: string }[]; skipped?: { name: string; reason: string }[] }
 export interface ImportUpdated { name: string; old_commit: string | null; new_commit: string; changed: boolean }
 // `admin_token` replaces `code` for the first Machine of a new Fleet.
 export interface JoinApiRequest { server_url: string; code: string; admin_token?: string; machine_id?: string; copy_from?: string; repo?: string }
 export interface Joined { machine_id: string; repo: string; setup: 'cloned' | 'initialized' | 'adopted'; harnesses: string[]; revision: number }
-export interface JoinCode { code: string }
+// `expires_at` and `scope` are null from an older Server.
+export interface JoinCode { code: string; expires_at: number | null; scope: Scope | null }
 export interface CommandError { message: string; status: number | null; unreachable: boolean }
 export interface DaemonConnection { reachable: boolean; message: string | null; retry_in_ms: number }
 export type DaemonEvent = { type: 'status' | 'draft' | 'fleet' } | { type: 'assignment'; revision: number }

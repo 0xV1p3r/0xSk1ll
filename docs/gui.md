@@ -39,7 +39,9 @@ Assignment toggles update the screen before the daemon replies and roll back if 
 
 In the Library, a deletion affects this Machine's Draft immediately. Other Machines pick up the deletion after you commit and push it and they sync.
 
-In a Fleet, create a join code from Fleet, Settings or the getting-started checklist. Copy the code or the ready-to-paste `sk1ll join <server-url> <code>` command. The code works once and expires after 24 hours by default. The Server operator can change [`SK1LL_SERVER_JOIN_CODE_TTL`](fleet.md#machine-status). Any joined Machine can create join codes, change any Machine's Assignment, undo log entries, and remove Machines.
+In a Fleet, create a join code from Fleet, Settings or the getting-started checklist. Copy the code or the ready-to-paste `sk1ll join <server-url> <code>` command. Before creating it, choose what the new Machine may manage: **Whole Fleet** (create join codes, change any Machine's Assignment, undo any log entry, remove any Machine) or **Only itself** (its own Assignment, log entries for itself, and removing itself). See [Scopes](fleet.md#scopes). The code works once, and the dialog shows exactly when it expires (24 hours by default, set by the Server's [`SK1LL_SERVER_JOIN_CODE_TTL`](fleet.md#machine-status)). The Fleet screen marks Self-only Machines and shows each Machine's scope in its details. A Self-only Machine can't create join codes and only offers Remove for itself.
+
+The Imports screen marks Imports the Server didn't check under its [import check settings](fleet.md#import-checks) as *Not checked by Server*, with the reason. **Check now** checks them from this Machine.
 
 When an upgrade leaves the app and Daemon on different local API versions, the connection screen offers **Restart daemon** for a running systemd user service on the default socket. It shows terminal instructions for other setups.
 

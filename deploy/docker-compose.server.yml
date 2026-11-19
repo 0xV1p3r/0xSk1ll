@@ -22,6 +22,10 @@ services:
       SK1LL_SERVER_ADMIN_TOKEN: ${SK1LL_SERVER_ADMIN_TOKEN:?set SK1LL_SERVER_ADMIN_TOKEN}
       SK1LL_SERVER_OFFLINE_AFTER: 2m
       SK1LL_SERVER_IMPORT_POLL: 1h
+      # Only contact these hosts when checking imports for updates (default: any).
+      # SK1LL_SERVER_IMPORT_HOSTS: github.com,gitlab.com
+      # Turn server-side import checks off.
+      # SK1LL_SERVER_IMPORT_CHECKS: "off"
       RUST_LOG: info
     volumes:
       - server-data:/data

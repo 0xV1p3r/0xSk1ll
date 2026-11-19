@@ -534,6 +534,19 @@ async fn join_commit_push_and_nudge_another_machine() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn join_codes_pass_their_scope_and_expiry_through() {
+    let server = Server::start().await;
+    let mut a = Machine::new("alpha");
+    a.join(&server).await;
+    a.start_connected().await;
+    let code = a.client.join_code(sk1ll_proto::Scope::SelfOnly).await.unwrap();
+    assert_eq!(code.scope, Some(sk1ll_proto::Scope::SelfOnly));
+    assert!(code.expires_at.is_some());
+    let fleet = a.client.fleet().await.unwrap();
+    assert_eq!(fleet.machines[0].scope, sk1ll_proto::Scope::Fleet);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn assignment_change_reaches_another_harness_without_git() {
     let server = Server::start().await;
     let (a, b, base) = fleet_of_two(&server).await;
@@ -1118,6 +1131,42 @@ async fn discard_replay_skips_recreated_drafts_and_unpushed_items() {
     ws.send(Message::text(serde_json::to_string(&ServerMessage::DraftDiscardApplied { id: id.unwrap() }).unwrap()))
         .await
         .unwrap();
+    eventually(|| async { (m.status().await.pending_discards == 0).then_some(()) }).await;
+}
+
+/// Review finding: a server that can't read the baseline closes with 1013
+/// instead of leaving a discard unacknowledged on a live session; the daemon
+/// comes back and sends every unacknowledged discard again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_try_again_later_close_replays_every_unacknowledged_discard() {
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+    let server = FakeServer::new().await;
+    let mut m = solo("solo", &server.url(), Some(snapshot(1, &[])));
+    write(
+        m.outbox_path().parent().unwrap(),
+        "daemon-outbox.json",
+        r#"[{"id":1,"items":["skill:a"]},{"id":2,"items":["skill:b"]}]"#,
+    );
+    m.start().await;
+    let (mut ws, _) = server.accept().await;
+    let DaemonMessage::Status(_) = next_message(&mut ws).await else { panic!("fresh status comes first") };
+    let DaemonMessage::DraftDiscarded { id, .. } = next_message(&mut ws).await else { panic!("expected a discard") };
+    assert_eq!(id, Some(1));
+    let close = CloseFrame { code: CloseCode::Again, reason: "the baseline can't be read".into() };
+    ws.close(Some(close)).await.unwrap();
+
+    let (mut ws, _) = server.accept().await;
+    let _ = next_message(&mut ws).await;
+    let mut replayed = Vec::new();
+    for _ in 0..2 {
+        let DaemonMessage::DraftDiscarded { id, .. } = next_message(&mut ws).await else { panic!("expected replay") };
+        replayed.push(id.unwrap());
+        let applied = ServerMessage::DraftDiscardApplied { id: id.unwrap() };
+        ws.send(Message::text(serde_json::to_string(&applied).unwrap())).await.unwrap();
+    }
+    assert_eq!(replayed, [1, 2]);
     eventually(|| async { (m.status().await.pending_discards == 0).then_some(()) }).await;
 }
 
@@ -1839,7 +1888,7 @@ async fn standalone_starts_without_a_repo_and_init_creates_it() {
         m.client.log(&Default::default()).await.unwrap_err(),
         m.client.log_facets().await.unwrap_err(),
         m.client.undo(1).await.unwrap_err(),
-        m.client.join_code().await.unwrap_err(),
+        m.client.join_code(Default::default()).await.unwrap_err(),
         m.client.remove_machine("solo").await.unwrap_err(),
         m.client.assignment("other").await.unwrap_err(),
     ] {

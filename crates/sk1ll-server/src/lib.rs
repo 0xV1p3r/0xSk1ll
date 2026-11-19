@@ -26,7 +26,7 @@ use axum::routing::{any, get};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use sk1ll_proto::{
-    AssignmentSnapshot, ErrorBody, ImportsView, ItemRef, PROTOCOL_HEADER, PROTOCOL_VERSION, ServerMessage,
+    AssignmentSnapshot, ErrorBody, ImportsView, ItemRef, PROTOCOL_HEADER, PROTOCOL_VERSION, Scope, ServerMessage,
 };
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
@@ -37,6 +37,8 @@ use error::{ApiError, Result};
 /// Shared server state.
 pub struct Server {
     config: Config,
+    /// The baseline branch (`refs/heads/<name>`), decided once at startup.
+    branch: String,
     /// Only ever locked on a blocking thread, through [`Server::db`].
     db: Arc<Mutex<Connection>>,
     /// Live daemon sessions by machine id; a newer one replaces (and cancels)
@@ -44,20 +46,37 @@ pub struct Server {
     conns: Mutex<HashMap<String, ws::Handle>>,
     next_conn: AtomicU64,
     /// Last baseline the server acted on.
-    baseline: Mutex<Option<Baseline>>,
+    baseline: Mutex<Baseline>,
     /// Held across a whole push: receive-pack and the pass after it.
     push_lock: Arc<tokio::sync::Mutex<()>>,
     /// Reject pushes until restart if a backend may still be writing refs.
     push_degraded: AtomicBool,
     #[cfg(test)]
     fail_cleanup_confirmation: AtomicBool,
+    #[cfg(test)]
+    fail_listing: AtomicBool,
+    #[cfg(test)]
+    fail_head: AtomicBool,
     imports: Mutex<ImportsView>,
     imports_due: Notify,
 }
 
-/// A baseline commit and the skills and rules in its tree.
-#[derive(Clone)]
+/// HEAD as last read, and the last commit whose tree was listed. They differ
+/// while listing HEAD fails: a commit's items are only ever stored with that
+/// commit, so cleanup never diffs against another commit's items.
+#[derive(Default)]
 struct Baseline {
+    head: Option<String>,
+    /// HEAD may have moved since `head` was read: a push's read of it failed,
+    /// or a backend may still be writing. Nothing trusts `head` until HEAD
+    /// is read again.
+    stale: bool,
+    inventory: Option<Inventory>,
+}
+
+/// A commit and the skills and rules in its tree.
+#[derive(Clone)]
+struct Inventory {
     commit: String,
     items: Arc<BTreeSet<ItemRef>>,
 }
@@ -65,9 +84,11 @@ struct Baseline {
 /// Who made an authenticated request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Caller {
-    /// The bootstrap token (`SK1LL_SERVER_ADMIN_TOKEN`).
+    /// The bootstrap token (`SK1LL_SERVER_ADMIN_TOKEN`); manages the whole fleet.
     Admin,
-    Machine(String),
+    /// A joined machine, with the scope of the join code it joined with and
+    /// the hash of the token it authenticated with.
+    Machine { id: String, scope: Scope, token_hash: String },
 }
 
 impl Caller {
@@ -75,7 +96,47 @@ impl Caller {
     pub fn author(&self) -> &str {
         match self {
             Self::Admin => "admin",
-            Self::Machine(id) => id,
+            Self::Machine { id, .. } => id,
+        }
+    }
+
+    /// The caller as the database has it now, for a write to recheck inside
+    /// its transaction: a request authenticated before its machine was
+    /// removed (or removed and joined again with another scope) must not act
+    /// on the old token or scope. 401 once the token is gone.
+    pub fn current(&self, conn: &Connection) -> Result<Self> {
+        match self {
+            Self::Admin => Ok(Self::Admin),
+            Self::Machine { id, token_hash, .. } => match db::machine_for_token(conn, token_hash)? {
+                Some((current, scope)) if current == *id => {
+                    Ok(Self::Machine { id: current, scope, token_hash: token_hash.clone() })
+                }
+                _ => Err(ApiError::Unauthorized),
+            },
+        }
+    }
+
+    /// Refuses (403) unless the caller manages the whole fleet. `what` says
+    /// what was refused, e.g. "create join codes".
+    pub fn require_fleet(&self, what: &str) -> Result<()> {
+        match self {
+            Self::Machine { id, scope: Scope::SelfOnly, .. } => Err(ApiError::Forbidden(format!(
+                "machine `{id}` joined with a self-only join code and may not {what}; \
+                 ask a machine with fleet scope or the server's admin"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    /// Refuses (403) unless the caller may change `machine`: its assignment,
+    /// undoing log entries for it, or removing it. Checked before the
+    /// machine is looked up, so a refusal doesn't depend on whether it exists.
+    pub fn require_machine(&self, machine: &str) -> Result<()> {
+        match self {
+            Self::Machine { id, scope: Scope::SelfOnly, .. } if id != machine => Err(ApiError::Forbidden(format!(
+                "machine `{id}` joined with a self-only join code and may only manage itself, not `{machine}`"
+            ))),
+            _ => Ok(()),
         }
     }
 }
@@ -84,24 +145,31 @@ impl Server {
     /// Creates the data dir, bare repo and database as needed.
     pub async fn open(config: Config) -> anyhow::Result<Arc<Self>> {
         let (data_dir, repo, db_path) = (config.data_dir.clone(), config.repo_dir(), config.db_path());
-        let conn = tokio::task::spawn_blocking(move || {
+        let (conn, branch) = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
             git::init_bare(&repo)?;
             git::init_baseline(&repo)?;
-            db::open(&db_path)
+            let branch = git::configure_pushes(&repo)?;
+            anyhow::Ok((db::open(&db_path)?, branch))
         })
         .await??;
-        let baseline = match git::head(&config.repo_dir()).await? {
-            Some(commit) => {
-                Some(Baseline { items: Arc::new(git::items_at(&config.repo_dir(), &commit).await?), commit })
-            }
-            None => None,
+        let baseline = match git::head(&config.repo_dir(), &branch).await? {
+            git::Head::Commit(commit) => Baseline {
+                head: Some(commit.clone()),
+                stale: false,
+                inventory: Some(Inventory {
+                    items: Arc::new(git::items_at(&config.repo_dir(), &commit).await?),
+                    commit,
+                }),
+            },
+            git::Head::Unborn => Baseline::default(),
         };
         if config.admin_token.is_none() {
             tracing::warn!("SK1LL_SERVER_ADMIN_TOKEN is not set: only joined machines can create join codes");
         }
         Ok(Arc::new(Self {
             config,
+            branch,
             db: Arc::new(Mutex::new(conn)),
             conns: Mutex::default(),
             next_conn: AtomicU64::new(1),
@@ -110,6 +178,10 @@ impl Server {
             push_degraded: AtomicBool::new(false),
             #[cfg(test)]
             fail_cleanup_confirmation: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_listing: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_head: AtomicBool::new(false),
             imports: Mutex::default(),
             imports_due: Notify::new(),
         }))
@@ -137,13 +209,79 @@ impl Server {
             .map_err(|e| ApiError::Internal(anyhow::anyhow!("database task failed: {e}")))?
     }
 
+    /// HEAD as last read; `None` while the repo is empty or HEAD is stale.
     fn head(&self) -> Option<String> {
-        lock(&self.baseline).as_ref().map(|b| b.commit.clone())
+        let baseline = lock(&self.baseline);
+        if baseline.stale { None } else { baseline.head.clone() }
     }
 
-    /// Items in the current baseline; empty while the repo is.
+    /// Marks the cached HEAD stale: it may lag the repo.
+    fn forget_head(&self) {
+        lock(&self.baseline).stale = true;
+    }
+
+    /// Reads the baseline branch from the repo, never from the cache.
+    async fn read_head(&self) -> anyhow::Result<git::Head> {
+        #[cfg(test)]
+        if self.fail_head.load(Ordering::SeqCst) {
+            anyhow::bail!("forced failure");
+        }
+        git::head(&self.config.repo_dir(), &self.branch).await
+    }
+
+    /// The items in the baseline as it is now, for a draft discard (with the
+    /// push lock held): HEAD is read again rather than taken from the cache,
+    /// which lags a push whose read of HEAD failed. `None`, logged, if HEAD
+    /// or its items can't be read, or a backend may still be writing.
+    async fn live_items(&self) -> Option<Arc<BTreeSet<ItemRef>>> {
+        if self.push_degraded.load(Ordering::SeqCst) {
+            tracing::error!("not reading the baseline: {}", git::DEGRADED_MESSAGE);
+            return None;
+        }
+        let mut budget = git::Budget::default();
+        match budget.spend(self.read_head()).await? {
+            Ok(git::Head::Commit(head)) => budget.spend(self.inventory(&head)).await.flatten(),
+            Ok(git::Head::Unborn) => Some(Arc::default()),
+            Err(e) => {
+                tracing::error!("reading HEAD: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// Items in the last baseline listed; empty while the repo is. Lags HEAD
+    /// while listing it fails, which only checking a toggle can live with:
+    /// cleanup goes through [`Server::inventory`].
     fn baseline_items(&self) -> Arc<BTreeSet<ItemRef>> {
-        lock(&self.baseline).as_ref().map(|b| b.items.clone()).unwrap_or_default()
+        lock(&self.baseline).inventory.as_ref().map(|i| i.items.clone()).unwrap_or_default()
+    }
+
+    /// The items in `commit`, from the cache when it holds that commit, else
+    /// listed again (and cached if it is HEAD). `None`, logged, if listing
+    /// fails or times out: cleanup that needs it must not run.
+    async fn inventory(&self, commit: &str) -> Option<Arc<BTreeSet<ItemRef>>> {
+        if let Some(i) = lock(&self.baseline).inventory.as_ref().filter(|i| i.commit == commit) {
+            return Some(i.items.clone());
+        }
+        #[cfg(test)]
+        if self.fail_listing.load(Ordering::SeqCst) {
+            tracing::error!("listing items of {commit}: forced failure");
+            return None;
+        }
+        match git::items_at(&self.config.repo_dir(), commit).await {
+            Ok(items) => {
+                let items = Arc::new(items);
+                let mut baseline = lock(&self.baseline);
+                if !baseline.stale && baseline.head.as_deref() == Some(commit) {
+                    baseline.inventory = Some(Inventory { commit: commit.to_string(), items: items.clone() });
+                }
+                Some(items)
+            }
+            Err(e) => {
+                tracing::error!("listing items of {commit}: {e:#}");
+                None
+            }
+        }
     }
 
     pub async fn authenticate(&self, token: &str) -> Result<Caller> {
@@ -156,13 +294,16 @@ impl Server {
             return Ok(Caller::Admin);
         }
         let token_hash = hash(token);
-        self.db(move |conn| db::machine_for_token(conn, &token_hash))
+        let hash = token_hash.clone();
+        self.db(move |conn| db::machine_for_token(conn, &hash))
             .await?
-            .map(Caller::Machine)
+            .map(|(id, scope)| Caller::Machine { id, scope, token_hash })
             .ok_or(ApiError::Unauthorized)
     }
 
-    /// Registers a daemon session, cancelling the one it replaces.
+    /// Registers a daemon session, cancelling the one it replaces. Only
+    /// called under the DB lock, after checking the session's token, so it
+    /// is ordered with [`Server::remove_machine`].
     fn connect(&self, machine: &str, handle: ws::Handle) {
         let old = lock(&self.conns).insert(machine.to_string(), handle);
         if let Some(old) = old {
@@ -187,10 +328,15 @@ impl Server {
         lock(&self.conns).contains_key(machine)
     }
 
-    /// Removes and cancels the machine's session; it is told `Revoked` if
-    /// its socket isn't stalled.
-    fn revoke(&self, machine: &str) {
-        if let Some(h) = lock(&self.conns).remove(machine) {
+    /// Removes and cancels the machine's session if it authenticated with
+    /// `token_hash`, so revoking a removed token never ends the session of a
+    /// machine that joined again under the same id. The session is told
+    /// `Revoked` if its socket isn't stalled.
+    fn revoke(&self, machine: &str, token_hash: &str) {
+        let mut conns = lock(&self.conns);
+        if conns.get(machine).is_some_and(|h| h.token_hash == token_hash)
+            && let Some(h) = conns.remove(machine)
+        {
             h.revoke();
         }
     }
@@ -208,45 +354,102 @@ impl Server {
         }
     }
 
-    /// After a push (with the push lock held, `before` being HEAD before
-    /// receive-pack ran): if HEAD moved, nudge every daemon, drop toggles for
-    /// items no machine can have any more, and recheck imports.
-    async fn after_push(self: &Arc<Self>, before: Option<String>) {
-        let repo = self.config.repo_dir();
-        let new = match git::head(&repo).await {
-            Ok(Some(h)) => h,
-            Ok(None) => return,
-            Err(e) => return tracing::error!("reading HEAD after push: {e:#}"),
+    /// Removes `machine` (logged) and revokes its session. Holds the push
+    /// lock, so a push either rechecks its token after the removal and is
+    /// refused, or finishes, cleanup included, before the machine goes. The
+    /// session is revoked under the DB lock that sessions register under, and
+    /// only if it holds the removed token.
+    /// The guard moves into the database work, so dropping this future (a
+    /// caller that disconnects) can't let a push in before the removal commits.
+    async fn remove_machine(self: &Arc<Self>, caller: Caller, machine: String) -> Result<()> {
+        let push = self.push_lock.clone().lock_owned().await;
+        let (server, author, now) = (self.clone(), caller.author().to_string(), now());
+        self.db(move |conn| {
+            let _push = push;
+            caller.current(conn)?.require_machine(&machine)?;
+            let token_hash = db::token_hash(conn, &machine)?;
+            assign::remove_machine(conn, &machine, &author, now)?;
+            if let Some(token_hash) = token_hash {
+                server.revoke(&machine, &token_hash);
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// After a push by `pusher` (with the push lock held, `before` being HEAD
+    /// before receive-pack ran, `budget` what is left for reading the repo):
+    /// if HEAD moved, nudge every daemon, drop toggles for the items the push
+    /// removed, and recheck imports. Drops nothing unless both `before` and
+    /// the new HEAD could be listed. If HEAD can't be read, the cached one is
+    /// marked stale.
+    async fn after_push(self: &Arc<Self>, before: git::Head, mut budget: git::Budget, pusher: &Caller) {
+        let new = match budget.spend(self.read_head()).await {
+            Some(Ok(git::Head::Commit(h))) => h,
+            Some(Ok(git::Head::Unborn)) => return,
+            Some(Err(e)) => {
+                self.forget_head();
+                return tracing::error!("reading HEAD after push: {e:#}");
+            }
+            None => return self.forget_head(),
         };
-        if before.as_deref() == Some(new.as_str()) && self.head().as_deref() == Some(new.as_str()) {
+        if before == git::Head::Commit(new.clone()) && self.head().as_deref() == Some(new.as_str()) {
             return;
         }
-        let items = match git::items_at(&repo, &new).await {
-            Ok(items) => Arc::new(items),
-            Err(e) => {
-                tracing::error!("listing items of {new}: {e:#}");
-                self.baseline_items()
-            }
+        let old = match &before {
+            git::Head::Commit(b) => budget.spend(self.inventory(b)).await.flatten(),
+            git::Head::Unborn => Some(Arc::default()),
         };
-        *lock(&self.baseline) = Some(Baseline { commit: new.clone(), items: items.clone() });
+        {
+            let mut baseline = lock(&self.baseline);
+            baseline.head = Some(new.clone());
+            baseline.stale = false;
+        }
+        let items = budget.spend(self.inventory(&new)).await.flatten();
         tracing::info!("baseline is now {new}");
         self.broadcast(&ServerMessage::Nudge { baseline: new });
-        if let Err(e) = self.sweep_all(items).await {
-            tracing::error!("dropping toggles for removed items: {e:#}");
+        match (old, items) {
+            (Some(old), Some(items)) => {
+                let removed: BTreeSet<ItemRef> = old.difference(&items).cloned().collect();
+                if !removed.is_empty()
+                    && let Err(e) = self.sweep_removed(removed, items, pusher.clone()).await
+                {
+                    tracing::error!("dropping toggles for removed items: {e:#}");
+                }
+            }
+            _ => tracing::warn!("keeping every toggle: this push's removed items are unknown"),
         }
         self.imports_due.notify_one();
     }
 
-    /// [`assign::sweep`] for every machine, publishing what changed.
-    async fn sweep_all(&self, items: Arc<BTreeSet<ItemRef>>) -> Result<()> {
+    /// [`assign::sweep`] for the items in `removed`, which a push by `pusher`
+    /// took out of the baseline (now `items`), publishing what changed. A
+    /// `fleet` pusher or the admin sweeps every machine; a `self` pusher only
+    /// its own assignment (ADR 0005); a pusher whose token is gone, nothing.
+    /// Toggles for items that were already absent are never touched, so a
+    /// sweep that fails or never runs only leaves toggles that do nothing.
+    async fn sweep_removed(
+        &self,
+        removed: BTreeSet<ItemRef>,
+        items: Arc<BTreeSet<ItemRef>>,
+        pusher: Caller,
+    ) -> Result<()> {
         let now = now();
         let updated = self
             .db(move |conn| {
                 let tx = conn.transaction()?;
+                // By token, as it is now: never a machine that joined again under the same id.
+                let machines = match pusher.current(&tx) {
+                    Ok(Caller::Machine { id, scope: Scope::SelfOnly, .. }) => vec![id],
+                    Ok(_) => db::machines(&tx)?.into_iter().map(|m| m.id).collect(),
+                    Err(ApiError::Unauthorized) => Vec::new(),
+                    Err(e) => return Err(e),
+                };
+                let removed: Vec<ItemRef> = removed.into_iter().collect();
                 let mut updated = Vec::new();
-                for m in db::machines(&tx)? {
-                    if let Some(applied) = assign::sweep(&tx, &m.id, &items, None, now)? {
-                        updated.push((m.id, applied.snapshot()));
+                for id in machines {
+                    if let Some(applied) = assign::sweep(&tx, &id, &items, &removed, now)? {
+                        updated.push((id, applied.snapshot()));
                     }
                 }
                 tx.commit()?;
@@ -385,5 +588,117 @@ mod tests {
         assert!(start.elapsed() < Duration::from_millis(300), "the runtime was blocked for {:?}", start.elapsed());
         assert!(query.await.unwrap());
         holder.join().unwrap();
+    }
+
+    /// Review finding: when a push's new HEAD can't be listed, the cache must
+    /// not pair that commit with the old items, or the next push's diff would
+    /// take in what this one removed and sweep it from every machine.
+    #[tokio::test]
+    async fn a_failed_listing_never_feeds_a_later_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::open(Config::new(dir.path().join("data"))).await.unwrap();
+        let work = dir.path().join("work");
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        let repo = server.config.repo_dir();
+        git(dir.path(), &["clone", "--quiet", &repo.to_string_lossy(), &work.to_string_lossy()]);
+        // Commits and pushes the work tree; HEAD before the push.
+        let push = |msg: &str| {
+            git(&work, &["add", "--all"]);
+            git(&work, &["commit", "--quiet", "-m", msg]);
+            let before = server.head().map_or(git::Head::Unborn, git::Head::Commit);
+            git(&work, &["push", "--quiet", "origin", "HEAD:main"]);
+            before
+        };
+        let pdf = ItemRef::Skill("pdf".into());
+        std::fs::create_dir_all(work.join("personal/pdf")).unwrap();
+        std::fs::write(work.join("personal/pdf/SKILL.md"), "x\n").unwrap();
+        server.after_push(push("pdf"), git::Budget::default(), &Caller::Admin).await;
+        assert!(server.baseline_items().contains(&pdf));
+        let mut a = sk1ll_proto::Assignment::default();
+        a.set_skill("claude", "pdf", true);
+        server
+            .db(move |conn| {
+                db::insert_machine(conn, "solo", &hash("solo"), 0, &a, Scope::SelfOnly)?;
+                db::insert_machine(conn, "peer", &hash("peer"), 0, &a, Scope::Fleet).map(drop)
+            })
+            .await
+            .unwrap();
+
+        // The self push removes pdf, and its new HEAD can't be listed.
+        std::fs::remove_dir_all(work.join("personal/pdf")).unwrap();
+        let before = push("without pdf");
+        server.fail_listing.store(true, Ordering::SeqCst);
+        let solo = Caller::Machine { id: "solo".into(), scope: Scope::SelfOnly, token_hash: hash("solo") };
+        server.after_push(before, git::Budget::default(), &solo).await;
+        server.fail_listing.store(false, Ordering::SeqCst);
+
+        // An unrelated fleet push removes nothing.
+        std::fs::create_dir_all(work.join("instructions")).unwrap();
+        std::fs::write(work.join("instructions/git.md"), "x\n").unwrap();
+        server.after_push(push("a rule"), git::Budget::default(), &Caller::Admin).await;
+        let items = server.baseline_items();
+        assert!(!items.contains(&pdf) && items.contains(&ItemRef::Rule("git".into())));
+        let peer = server
+            .db(|conn| Ok(db::assignment(conn, "peer")?.unwrap().harness("claude").skills.contains_key("pdf")))
+            .await
+            .unwrap();
+        assert!(peer, "the fleet push must not sweep what the self push removed");
+    }
+
+    /// Review finding: cleanup must follow the pusher's token as it is now. A
+    /// removed pusher sweeps nothing, even once a machine joined again under
+    /// its id; a current one sweeps by the scope it has now.
+    #[tokio::test]
+    async fn sweeps_follow_the_pushers_current_token_and_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::open(Config::new(dir.path().join("data"))).await.unwrap();
+        let mut a = sk1ll_proto::Assignment::default();
+        a.set_skill("claude", "pdf", true);
+        let a2 = a.clone();
+        server
+            .db(move |conn| {
+                db::insert_machine(conn, "me", &hash("old"), 0, &a2, Scope::Fleet)?;
+                db::insert_machine(conn, "peer", &hash("peer"), 0, &a2, Scope::Fleet).map(drop)
+            })
+            .await
+            .unwrap();
+        let caller = |token: &str| Caller::Machine { id: "me".into(), scope: Scope::Fleet, token_hash: hash(token) };
+        let has_pdf = |id: &'static str| {
+            let server = server.clone();
+            async move {
+                server
+                    .db(move |conn| Ok(db::assignment(conn, id)?.unwrap().harness("claude").skills.contains_key("pdf")))
+                    .await
+                    .unwrap()
+            }
+        };
+        let removed = BTreeSet::from([ItemRef::Skill("pdf".into())]);
+
+        // `me` is removed mid-push and joins again, self-scoped, with a new token.
+        server.remove_machine(Caller::Admin, "me".into()).await.unwrap();
+        server
+            .db(move |conn| db::insert_machine(conn, "me", &hash("new"), 0, &a, Scope::SelfOnly).map(drop))
+            .await
+            .unwrap();
+        server.sweep_removed(removed.clone(), Arc::default(), caller("old")).await.unwrap();
+        assert!(has_pdf("me").await && has_pdf("peer").await, "a removed pusher sweeps nothing");
+
+        // The new token's scope comes from the database, not the caller.
+        server.sweep_removed(removed.clone(), Arc::default(), caller("new")).await.unwrap();
+        assert!(!has_pdf("me").await && has_pdf("peer").await, "a self pusher sweeps only itself");
+
+        server.sweep_removed(removed, Arc::default(), Caller::Admin).await.unwrap();
+        assert!(!has_pdf("peer").await);
     }
 }

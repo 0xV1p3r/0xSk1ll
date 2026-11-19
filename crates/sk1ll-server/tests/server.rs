@@ -10,7 +10,7 @@ use reqwest::StatusCode;
 use serde_json::{Value, json};
 use sk1ll_proto::{
     AssignmentSnapshot, AssignmentUpdate, DaemonMessage, FleetView, ImportsView, ItemRef, JoinCode, JoinResponse,
-    LogCause, LogEntry, MachineReport, MachineRow, MachineStatus, ServerMessage, ToggleKind,
+    LogCause, LogEntry, MachineReport, MachineRow, MachineStatus, Scope, ServerMessage, ToggleKind,
 };
 use sk1ll_server::Config;
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
@@ -74,6 +74,30 @@ impl TestServer {
         let resp = self.http.post(self.url("/join-codes")).bearer_auth(token).send().await.unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
         resp.json::<JoinCode>().await.unwrap().code
+    }
+
+    /// `POST /join-codes` with `body` as raw JSON (`None`: no body).
+    async fn create_code(&self, token: &str, body: Option<&str>) -> reqwest::Response {
+        let req = self.http.post(self.url("/join-codes")).bearer_auth(token);
+        let req = match body {
+            Some(b) => req.header("content-type", "application/json").body(b.to_string()),
+            None => req,
+        };
+        req.send().await.unwrap()
+    }
+
+    async fn scoped_code(&self, token: &str, scope: &str) -> JoinCode {
+        let resp = self.create_code(token, Some(&json!({ "scope": scope }).to_string())).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        resp.json().await.unwrap()
+    }
+
+    /// Joins `id` with a code of `scope` and returns its token.
+    async fn join_scoped(&self, id: &str, harnesses: &[&str], scope: &str) -> String {
+        let code = self.scoped_code(ADMIN, scope).await.code;
+        let resp = self.try_join(&code, id, harnesses).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        resp.json::<JoinResponse>().await.unwrap().token
     }
 
     async fn try_join(&self, code: &str, id: &str, harnesses: &[&str]) -> reqwest::Response {
@@ -347,6 +371,46 @@ async fn existing_empty_server_gets_initial_commit() {
     assert_eq!(git(&config.repo_dir(), &["rev-list", "--all", "--count"]), "1");
     git(&config.repo_dir(), &["cat-file", "-e", "main:sk1ll.toml"]);
     assert_eq!(git(&config.repo_dir(), &["symbolic-ref", "HEAD"]), "refs/heads/main");
+}
+
+/// Review finding: the branch that takes pushes is decided after bootstrap,
+/// so an empty repo whose unborn HEAD named another branch accepts pushes to
+/// the `main` that bootstrap created.
+#[tokio::test(flavor = "multi_thread")]
+async fn existing_empty_repo_on_another_branch_takes_pushes_to_main() {
+    let server = start_with(
+        |c| {
+            std::fs::create_dir_all(&c.data_dir).unwrap();
+            git(&c.data_dir, &["init", "--quiet", "--bare", "--initial-branch=legacy", "repo.git"]);
+        },
+        false,
+    )
+    .await;
+    let token = server.join("writer", &[]).await;
+    let (_dir, head) = seed(&server, "writer", &token, &["personal/pdf/SKILL.md"]).await;
+    let bare = server._dir.path().join("data/repo.git");
+    assert_eq!(git(&bare, &["rev-parse", "refs/heads/main"]), head);
+}
+
+/// Review finding: the server refuses to start without a baseline branch,
+/// rather than serving one branch and taking pushes to another.
+#[tokio::test]
+async fn startup_refuses_a_head_that_names_no_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config::new(dir.path().join("data"));
+    drop(sk1ll_server::Server::open(config.clone()).await.unwrap());
+    let repo = config.repo_dir();
+    let main = git(&repo, &["rev-parse", "main"]);
+    git(&repo, &["update-ref", "--no-deref", "HEAD", &main]);
+    let err = sk1ll_server::Server::open(config.clone()).await.err().expect("a detached HEAD must refuse startup");
+    assert!(format!("{err:#}").contains("HEAD is detached"), "{err:#}");
+    assert!(format!("{err:#}").contains("symbolic-ref HEAD refs/heads/"), "{err:#}");
+    git(&repo, &["tag", "v1", &main]);
+    git(&repo, &["symbolic-ref", "HEAD", "refs/tags/v1"]);
+    let err = sk1ll_server::Server::open(config.clone()).await.err().expect("a tag HEAD must refuse startup");
+    assert!(format!("{err:#}").contains("not a branch under refs/heads/"), "{err:#}");
+    git(&repo, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    sk1ll_server::Server::open(config).await.unwrap();
 }
 
 #[tokio::test]
@@ -701,19 +765,129 @@ async fn toggles_for_items_removed_from_baseline_are_dropped() {
     assert_eq!(dropped.len(), 3);
     assert!(dropped.iter().all(|e| e.author == "server" && e.before == Some(true) && e.after.is_none()));
 
-    // Once `pdf` leaves `other`'s draft, a later push also clears its toggle.
+    // Once `pdf` leaves `other`'s draft, a later push that didn't remove it
+    // leaves its toggle, which does nothing while `pdf` is absent.
     let report = MachineReport { harnesses: vec!["claude".into()], ..Default::default() };
     ws_send(&mut ws, &DaemonMessage::Status(report.clone())).await;
     server.reported("other", &report).await;
-    let before_push = server.get_json::<AssignmentSnapshot>(&token, "/machines/other/assignment").await.assignment;
-    assert!(before_push.harness("claude").skills.contains_key("pdf"));
-    write(&repo, "personal/keep/SKILL.md", "updated\n");
-    commit_push(&server, &repo, "later push sweeps draft-exempt toggles").await;
-    // (Snapshots from the push may still be queued ahead of it.)
-    while ws_assignment(&mut ws).await.assignment.harness("claude").skills.contains_key("pdf") {}
-    let log: Vec<LogEntry> = server.get_json(&token, "/log?machine=other").await;
-    assert_eq!(log[0].name.as_deref(), Some("pdf"));
-    assert_eq!((log[0].author.as_str(), &log[0].cause), ("server", &LogCause::ItemRemoved));
+    std::fs::remove_dir_all(repo.join("personal/keep")).unwrap();
+    commit_push(&server, &repo, "drop keep").await;
+    let other_a = eventually(|| async {
+        let a = server.get_json::<AssignmentSnapshot>(&token, "/machines/other/assignment").await.assignment;
+        Some(a).filter(|a| !a.harness("claude").skills.contains_key("keep"))
+    })
+    .await;
+    assert_eq!(other_a.harness("claude").skills.get("pdf"), Some(&true));
+}
+
+/// Review finding: a `self` machine's push must not change other machines'
+/// assignments. It drops only its own toggles for the items it removed; the
+/// others' stay, so restoring the items restores them. A fleet push drops
+/// toggles only for the items it removed itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn pushes_drop_only_toggles_for_the_items_they_removed() {
+    let server = start().await;
+    let me = server.join_scoped("me", &["claude"], "self").await;
+    let fleet = server.join_scoped("fleet", &["claude"], "fleet").await;
+    let (me_dir, _) = seed(&server, "me", &me, &["personal/pdf/SKILL.md", "instructions/git.md"]).await;
+    let mine = me_dir.path().join("repo");
+    // `gone` was never in the baseline: an explicit off toggle for it is allowed.
+    let on = json!([
+        {"harness": "claude", "kind": "skill", "name": "pdf", "enabled": true},
+        {"harness": "claude", "kind": "rule", "name": "git", "enabled": false},
+        {"harness": "claude", "kind": "skill", "name": "gone", "enabled": false},
+    ]);
+    server.put_assignment(&me, "me", on.clone()).await;
+    server.put_assignment(&fleet, "fleet", on).await;
+    let toggles = |id: &'static str| {
+        let server = &server;
+        async move {
+            let a = server.get_json::<AssignmentSnapshot>(ADMIN, &format!("/machines/{id}/assignment")).await;
+            let claude = a.assignment.harness("claude");
+            (claude.skills.get("pdf").copied(), claude.rules.get("git").copied(), claude.skills.get("gone").copied())
+        }
+    };
+
+    // The self machine removes `pdf` and `git`: only its own toggles for them go.
+    std::fs::remove_dir_all(mine.join("personal/pdf")).unwrap();
+    std::fs::remove_file(mine.join("instructions/git.md")).unwrap();
+    commit_push(&server, &mine, "drop pdf and git").await;
+    eventually(|| async { (toggles("me").await == (None, None, Some(false))).then_some(()) }).await;
+    assert_eq!(toggles("fleet").await, (Some(true), Some(false), Some(false)));
+
+    // A fleet push removing only `tmp` drops only `tmp`, everywhere.
+    let fleet_dir = clone(&server, "fleet", &fleet).await;
+    let theirs = fleet_dir.path().join("repo");
+    write(&theirs, "personal/tmp/SKILL.md", "tmp\n");
+    commit_push(&server, &theirs, "add tmp").await;
+    let tmp = json!([{"harness": "claude", "kind": "skill", "name": "tmp", "enabled": true}]);
+    server.put_assignment(&fleet, "fleet", tmp.clone()).await;
+    server.put_assignment(&me, "me", tmp).await;
+    std::fs::remove_dir_all(theirs.join("personal/tmp")).unwrap();
+    commit_push(&server, &theirs, "drop tmp").await;
+    for id in ["fleet", "me"] {
+        eventually(|| async {
+            let a = server.get_json::<AssignmentSnapshot>(ADMIN, &format!("/machines/{id}/assignment")).await;
+            (!a.assignment.harness("claude").skills.contains_key("tmp")).then_some(())
+        })
+        .await;
+    }
+    assert_eq!(toggles("fleet").await, (Some(true), Some(false), Some(false)));
+    assert_eq!(toggles("me").await, (None, None, Some(false)));
+    let log: Vec<LogEntry> = server.get_json(ADMIN, "/log?machine=fleet").await;
+    let dropped: Vec<_> = log.iter().filter(|e| e.cause == LogCause::ItemRemoved).collect();
+    assert_eq!(dropped.len(), 1, "{log:?}");
+    assert_eq!(dropped[0].name.as_deref(), Some("tmp"));
+
+    // Restoring the content restores the assignment.
+    git(&mine, &["pull", "--quiet", "--rebase", "origin", "main"]);
+    write(&mine, "personal/pdf/SKILL.md", "pdf\n");
+    write(&mine, "instructions/git.md", "git\n");
+    commit_push(&server, &mine, "restore pdf and git").await;
+    assert_eq!(toggles("fleet").await, (Some(true), Some(false), Some(false)));
+
+    // Once restored, a fleet push that removes `pdf` sweeps it as before.
+    git(&theirs, &["pull", "--quiet", "--rebase", "origin", "main"]);
+    std::fs::remove_dir_all(theirs.join("personal/pdf")).unwrap();
+    commit_push(&server, &theirs, "drop pdf").await;
+    eventually(|| async { (toggles("fleet").await == (None, Some(false), Some(false))).then_some(()) }).await;
+}
+
+/// Review finding: a push swept every toggle for an absent item, so a draft
+/// that a peer's latest status happened to leave out (a stash during a pull,
+/// say) lost its toggle to any unrelated push.
+#[tokio::test(flavor = "multi_thread")]
+async fn unrelated_push_keeps_a_draft_missing_from_the_latest_status() {
+    let server = start().await;
+    let token = server.join("ws", &["claude"]).await;
+    let pusher = server.join("pusher", &["claude"]).await;
+    let (dir, _) = seed(&server, "pusher", &pusher, &["personal/tmp/SKILL.md"]).await;
+    let mut ws = ws_connect(&server, &token).await;
+    let drafting = MachineReport {
+        drafts: vec![ItemRef::Skill("wip".into())],
+        harnesses: vec!["claude".into()],
+        ..Default::default()
+    };
+    ws_send(&mut ws, &DaemonMessage::Status(drafting.clone())).await;
+    server.reported("ws", &drafting).await;
+    let changes = json!([
+        {"harness": "claude", "kind": "skill", "name": "wip", "enabled": true},
+        {"harness": "claude", "kind": "skill", "name": "tmp", "enabled": true},
+    ]);
+    server.put_assignment(&token, "ws", changes).await;
+    let empty = MachineReport { harnesses: vec!["claude".into()], ..Default::default() };
+    ws_send(&mut ws, &DaemonMessage::Status(empty.clone())).await;
+    server.reported("ws", &empty).await;
+
+    std::fs::remove_dir_all(dir.path().join("repo/personal/tmp")).unwrap();
+    commit_push(&server, &dir.path().join("repo"), "drop tmp").await;
+    // The `tmp` toggle going proves the push's sweep has completed.
+    let a = eventually(|| async {
+        let a = server.get_json::<AssignmentSnapshot>(&token, "/machines/ws/assignment").await.assignment;
+        Some(a).filter(|a| !a.harness("claude").skills.contains_key("tmp"))
+    })
+    .await;
+    assert_eq!(a.harness("claude").skills.get("wip"), Some(&true));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -721,7 +895,25 @@ async fn imports_with_newer_upstream_are_reported() {
     // The upstream is a local repo; only tests allow the `file` transport.
     let server = start_with(|c| c.import_protocols.push_str(":file"), false).await;
     let token = server.join("ws", &[]).await;
+    let (locked, latest, _upstream) = push_moved_import(&server, "ws", &token).await;
 
+    let view = eventually(|| async {
+        let v: ImportsView = server.get_json(&token, "/imports").await;
+        Some(v).filter(|v| !v.updates.is_empty())
+    })
+    .await;
+    assert_eq!(view.updates.len(), 1);
+    let u = &view.updates[0];
+    assert_eq!((u.name.as_str(), u.locked.as_str(), u.upstream.as_str()), ("pdf", locked.as_str(), latest.as_str()));
+    assert!(view.errors.is_empty(), "{:?}", view.errors);
+    assert!(view.skipped.is_empty(), "{:?}", view.skipped);
+}
+
+/// Review finding: a replaced socket whose writer is stuck must not survive
+/// removing the machine and keep reporting for its re-joined successor.
+/// Pushes a `pdf` import of a local upstream whose `main` moved past the
+/// locked commit; returns (locked, latest).
+async fn push_moved_import(server: &TestServer, id: &str, token: &str) -> (String, String, tempfile::TempDir) {
     let up = tempfile::tempdir().unwrap();
     let upstream = up.path().to_path_buf();
     git(&upstream, &["init", "--quiet", "--initial-branch=main"]);
@@ -733,7 +925,7 @@ async fn imports_with_newer_upstream_are_reported() {
     git(&upstream, &["commit", "--quiet", "-am", "v2"]);
     let latest = git(&upstream, &["rev-parse", "HEAD"]);
 
-    let dir = clone(&server, "ws", &token).await;
+    let dir = clone(server, id, token).await;
     let repo = dir.path().join("repo");
     let source = format!("file://{}", upstream.display());
     write(&repo, "sk1ll.toml", &format!("[import.pdf]\nsource = \"{source}\"\nref = \"main\"\n"));
@@ -745,21 +937,194 @@ async fn imports_with_newer_upstream_are_reported() {
         ),
     );
     write(&repo, "imported/pdf/SKILL.md", "v1\n");
-    commit_push(&server, &repo, "import pdf").await;
-
-    let view = eventually(|| async {
-        let v: ImportsView = server.get_json(&token, "/imports").await;
-        Some(v).filter(|v| !v.updates.is_empty())
-    })
-    .await;
-    assert_eq!(view.updates.len(), 1);
-    let u = &view.updates[0];
-    assert_eq!((u.name.as_str(), u.locked.as_str(), u.upstream.as_str()), ("pdf", locked.as_str(), latest.as_str()));
-    assert!(view.errors.is_empty(), "{:?}", view.errors);
+    commit_push(server, &repo, "import pdf").await;
+    (locked, latest, up)
 }
 
-/// Review finding: a replaced socket whose writer is stuck must not survive
-/// removing the machine and keep reporting for its re-joined successor.
+#[tokio::test(flavor = "multi_thread")]
+async fn import_checks_can_be_turned_off_or_limited_to_hosts() {
+    for (tune, want) in [
+        (
+            Box::new(|c: &mut Config| c.import_checks = false) as Box<dyn FnOnce(&mut Config) + Send>,
+            "SK1LL_SERVER_IMPORT_CHECKS=off",
+        ),
+        (Box::new(|c: &mut Config| c.import_hosts = Some(vec!["github.com".into()])), "can't tell this source's host"),
+    ] {
+        let server = start_with(
+            |c| {
+                c.import_protocols.push_str(":file");
+                tune(c);
+            },
+            false,
+        )
+        .await;
+        let token = server.join("ws", &[]).await;
+        let _upstream = push_moved_import(&server, "ws", &token).await;
+        let view = eventually(|| async {
+            let v: ImportsView = server.get_json(&token, "/imports").await;
+            Some(v).filter(|v| !v.skipped.is_empty())
+        })
+        .await;
+        assert_eq!(view.skipped.len(), 1);
+        assert_eq!(view.skipped[0].name, "pdf");
+        assert!(view.skipped[0].reason.contains(want), "{}", view.skipped[0].reason);
+        assert!(view.updates.is_empty() && view.errors.is_empty(), "{view:?}");
+    }
+}
+
+/// Review finding: git decodes ssh URLs before it finds the host, so a
+/// percent-encoded `/` in the userinfo must not let a source past the
+/// allowlist. A recording `ssh` shows which hosts the check contacts.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn encoded_userinfo_cannot_reach_an_unlisted_host() {
+    use std::os::unix::fs::PermissionsExt;
+    let stub = tempfile::tempdir().unwrap();
+    let log = stub.path().join("ssh.log");
+    let ssh = stub.path().join("ssh");
+    std::fs::write(&ssh, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 1\n", log.display())).unwrap();
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let server = start_with(
+        |c| {
+            c.import_hosts = Some(vec!["github.com".into()]);
+            c.import_ssh = ssh.display().to_string();
+        },
+        false,
+    )
+    .await;
+    let token = server.join("ws", &[]).await;
+    let dir = clone(&server, "ws", &token).await;
+    let repo = dir.path().join("repo");
+    let (crafted, plain) = ("ssh://evil.example%2F@github.com/o/r", "ssh://git@github.com/o/r");
+    let (mut manifest, mut lock) = (String::new(), String::new());
+    for (name, source) in [("crafted", crafted), ("plain", plain)] {
+        manifest.push_str(&format!("[import.{name}]\nsource = \"{source}\"\nref = \"main\"\n"));
+        lock.push_str(&format!(
+            "[skills.{name}]\nsource = \"{source}\"\npath = \"\"\nref = \"main\"\ncommit = \"{}\"\nhash = \"x\"\n",
+            "a".repeat(40)
+        ));
+        write(&repo, &format!("imported/{name}/SKILL.md"), "x\n");
+    }
+    write(&repo, "sk1ll.toml", &manifest);
+    write(&repo, "sk1ll.lock", &lock);
+    commit_push(&server, &repo, "imports").await;
+    let view = eventually(|| async {
+        let v: ImportsView = server.get_json(&token, "/imports").await;
+        Some(v).filter(|v| !v.skipped.is_empty() && !v.errors.is_empty())
+    })
+    .await;
+    assert_eq!(view.skipped.len(), 1, "{view:?}");
+    assert_eq!(view.skipped[0].name, "crafted");
+    assert!(view.skipped[0].reason.contains("percent escape"), "{}", view.skipped[0].reason);
+    assert_eq!(view.errors.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["plain"]);
+    let seen = std::fs::read_to_string(&log).unwrap();
+    assert!(seen.lines().all(|l| l.contains("git@github.com") && !l.contains("evil")), "{seen}");
+}
+
+/// Review finding: daemons must hear about newly skipped imports even when
+/// the updates didn't change, or the GUI never shows them.
+#[tokio::test(flavor = "multi_thread")]
+async fn newly_skipped_imports_are_announced() {
+    let server = start_with(|c| c.import_checks = false, false).await;
+    let token = server.join("ws", &[]).await;
+    let mut ws = ws_connect(&server, &token).await;
+    let _upstream = push_moved_import(&server, "ws", &token).await;
+    loop {
+        if let ServerMessage::ImportsChanged { updates } = ws_next(&mut ws).await {
+            assert!(updates.is_empty(), "{updates:?}");
+            break;
+        }
+    }
+    let view: ImportsView = server.get_json(&token, "/imports").await;
+    assert_eq!(view.skipped.len(), 1, "{view:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn join_codes_carry_their_scope_and_expiry() {
+    let server = start_with(|c| c.join_code_ttl = Duration::from_secs(3600), false).await;
+    let before = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    let code = server.scoped_code(ADMIN, "self").await;
+    assert_eq!(code.scope, Some(Scope::SelfOnly));
+    let expires = code.expires_at.unwrap();
+    assert!((before + 3600..=before + 3605).contains(&expires), "{expires} vs {before}");
+    // No body, `null` (older daemons) and `{}` all ask for a fleet code.
+    for body in [None, Some("null"), Some("{}"), Some(" ")] {
+        let resp = server.create_code(ADMIN, body).await;
+        assert_eq!(resp.status(), StatusCode::CREATED, "{body:?}");
+        assert_eq!(resp.json::<JoinCode>().await.unwrap().scope, Some(Scope::Fleet), "{body:?}");
+    }
+    for body in [r#"{"scope":"admin"}"#, "[", r#""self""#] {
+        assert_eq!(server.create_code(ADMIN, Some(body)).await.status(), StatusCode::BAD_REQUEST, "{body}");
+    }
+    // A fleet machine may mint either scope.
+    let fleet = server.join("f", &[]).await;
+    assert_eq!(server.scoped_code(&fleet, "self").await.scope, Some(Scope::SelfOnly));
+    assert_eq!(server.scoped_code(&fleet, "fleet").await.scope, Some(Scope::Fleet));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn self_scoped_machines_manage_only_themselves() {
+    let server = start().await;
+    let me = server.join_scoped("me", &["claude"], "self").await;
+    let other = server.join_scoped("other", &["claude"], "fleet").await;
+    let fleet: FleetView = server.get_json(&me, "/fleet").await;
+    let scopes: Vec<_> = fleet.machines.iter().map(|m| (m.id.as_str(), m.scope)).collect();
+    assert_eq!(scopes, [("me", Scope::SelfOnly), ("other", Scope::Fleet)]);
+
+    // Reading is open to every machine.
+    for path in ["/fleet", "/machines/other/assignment", "/log", "/log/facets", "/imports"] {
+        assert_eq!(server.get(&me, path).await.status(), StatusCode::OK, "{path}");
+    }
+    let forbidden = |resp: reqwest::Response| async move {
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body: Value = resp.json().await.unwrap();
+        assert!(body["error"].as_str().unwrap().contains("self-only join code"), "{body}");
+    };
+
+    // No join codes of any scope, so it can't mint a fleet one.
+    for body in [None, Some(r#"{"scope":"fleet"}"#), Some(r#"{"scope":"self"}"#)] {
+        forbidden(server.create_code(&me, body).await).await;
+    }
+
+    // Its own assignment, but no one else's, existing or not.
+    let toggle = json!([{"harness": "claude", "kind": "new_skills_default", "enabled": true}]);
+    let mine = server.put_assignment(&me, "me", toggle.clone()).await;
+    forbidden(server.try_put_assignment(&me, "other", toggle.clone()).await).await;
+    forbidden(server.try_put_assignment(&me, "ghost", toggle.clone()).await).await;
+    let theirs = server.put_assignment(&other, "other", toggle.clone()).await;
+    // A fleet machine still manages it.
+    let by_other = server
+        .put_assignment(&other, "me", json!([{"harness": "claude", "kind": "new_rules_default", "enabled": true}]))
+        .await;
+
+    // Undo: entries for itself (whoever wrote them), not for others.
+    let undo = |token: String, id: i64| {
+        let req = server.http.post(server.url(&format!("/log/{id}/undo"))).bearer_auth(token);
+        async move { req.send().await.unwrap() }
+    };
+    assert_eq!(undo(me.clone(), mine.entries[0].id).await.status(), StatusCode::OK);
+    assert_eq!(undo(me.clone(), by_other.entries[0].id).await.status(), StatusCode::OK);
+    forbidden(undo(me.clone(), theirs.entries[0].id).await).await;
+    assert_eq!(undo(me.clone(), 9999).await.status(), StatusCode::NOT_FOUND);
+
+    // Removing others is refused; removing itself is allowed.
+    let remove =
+        |token: &str, id: &str| server.http.delete(server.url(&format!("/machines/{id}"))).bearer_auth(token).send();
+    forbidden(remove(&me, "other").await.unwrap()).await;
+    forbidden(remove(&me, "ghost").await.unwrap()).await;
+    assert!(server.machine_row("other").await.is_some());
+    assert_eq!(remove(&me, "me").await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert_eq!(server.get(&me, "/fleet").await.status(), StatusCode::UNAUTHORIZED);
+
+    // Rejoining takes the new code's scope.
+    let me = server.join_scoped("me", &["claude"], "fleet").await;
+    assert_eq!(server.machine_row("me").await.unwrap().scope, Scope::Fleet);
+    assert_eq!(server.create_code(&me, None).await.status(), StatusCode::CREATED);
+    assert_eq!(remove(&me, "other").await.unwrap().status(), StatusCode::NO_CONTENT);
+    server.join_scoped("other", &[], "self").await;
+    assert_eq!(server.machine_row("other").await.unwrap().scope, Scope::SelfOnly);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn replaced_socket_cannot_report_after_revocation() {
     let server = start_with(|c| c.send_timeout = Duration::from_secs(120), true).await;
@@ -1007,23 +1372,17 @@ async fn assignments_accept_only_the_destination_machines_unpushed_items() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn unrelated_push_preserves_unpushed_commit_toggles() {
+async fn push_keeps_toggles_for_removed_items_in_unpushed_commits() {
     let server = start().await;
     let a = server.join("a", &["claude"]).await;
     let b = server.join("b", &["claude"]).await;
-    let (dir_a, baseline) = seed(&server, "a", &a, &["README.md"]).await;
+    let files = ["README.md", "personal/wip/SKILL.md", "instructions/git.md", "personal/stale/SKILL.md"];
+    let (dir_a, baseline) = seed(&server, "a", &a, &files).await;
     let dir_b = clone(&server, "b", &b).await;
     let repo_a = dir_a.path().join("repo");
     write(&repo_a, "personal/wip/SKILL.md", "local skill\n");
     write(&repo_a, "instructions/git.md", "local rule\n");
     let mut ws = ws_connect(&server, &a).await;
-    let drafting = MachineReport {
-        baseline: Some(baseline),
-        drafts: vec![ItemRef::Skill("wip".into()), ItemRef::Rule("git".into())],
-        ..Default::default()
-    };
-    ws_send(&mut ws, &DaemonMessage::Status(drafting.clone())).await;
-    server.reported("a", &drafting).await;
     server
         .put_assignment(
             &a,
@@ -1037,12 +1396,19 @@ async fn unrelated_push_preserves_unpushed_commit_toggles() {
         .await;
     git_async(repo_a.clone(), vec!["add".into(), "-A".into()]).await;
     git_async(repo_a, vec!["commit".into(), "--quiet".into(), "-m".into(), "commit locally".into()]).await;
-    let committed = MachineReport { unpushed: drafting.drafts.clone(), drafts: vec![], ..drafting };
+    let committed = MachineReport {
+        baseline: Some(baseline),
+        unpushed: vec![ItemRef::Skill("wip".into()), ItemRef::Rule("git".into())],
+        ..Default::default()
+    };
     ws_send(&mut ws, &DaemonMessage::Status(committed.clone())).await;
     server.reported("a", &committed).await;
 
-    write(&dir_b.path().join("repo"), "README.md", "unrelated change\n");
-    commit_push(&server, &dir_b.path().join("repo"), "unrelated push").await;
+    let repo_b = dir_b.path().join("repo");
+    std::fs::remove_dir_all(repo_b.join("personal/wip")).unwrap();
+    std::fs::remove_dir_all(repo_b.join("personal/stale")).unwrap();
+    std::fs::remove_file(repo_b.join("instructions/git.md")).unwrap();
+    commit_push(&server, &repo_b, "drop wip, git and stale").await;
     // The stale toggle proves the push's sweep has completed.
     let assignment = eventually(|| async {
         let a = server.get_json::<AssignmentSnapshot>(&a, "/machines/a/assignment").await.assignment;
@@ -1604,16 +1970,84 @@ async fn defaults_and_undo_materialize_destination_drafts_and_unpushed() {
     }
 }
 
+/// Sets the creation time of join code `code` in the server's database to
+/// `seconds` ago, as the server hashes codes: normalized, then SHA-256.
+fn backdate_code(server: &TestServer, code: &str, seconds: i64) {
+    use sha2::Digest;
+    let normalized: String = code.chars().filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_uppercase()).collect();
+    let hash: String = sha2::Sha256::digest(normalized.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+    let conn = rusqlite::Connection::open(server._dir.path().join("data/server.db")).unwrap();
+    conn.busy_timeout(Duration::from_secs(5)).unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    let changed =
+        conn.execute("UPDATE join_codes SET created_at = ?2 WHERE code_hash = ?1", (hash, now - seconds)).unwrap();
+    assert_eq!(changed, 1, "no such code");
+}
+
+/// A code is invalid from its `expires_at` on, and then looks just like a
+/// code that never existed.
 #[tokio::test]
 async fn expired_join_code_is_invalid() {
-    let server = start_with(|c| c.join_code_ttl = Duration::from_secs(1), false).await;
-    let code = server.join_code(ADMIN).await;
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    let expired = server.try_join(&code, "expired", &[]).await;
+    const TTL: i64 = 3600;
+    let server = start_with(|c| c.join_code_ttl = Duration::from_secs(TTL as u64), false).await;
+    let expired = server.join_code(ADMIN).await;
+    backdate_code(&server, &expired, TTL + 60);
+    let boundary = server.join_code(ADMIN).await;
+    backdate_code(&server, &boundary, TTL);
+    let almost = server.join_code(ADMIN).await;
+    backdate_code(&server, &almost, TTL - 60);
+
     let invalid = server.try_join("invalid", "invalid", &[]).await;
-    assert_eq!(expired.status(), invalid.status());
-    assert_eq!(expired.text().await.unwrap(), invalid.text().await.unwrap());
+    let (status, text) = (invalid.status(), invalid.text().await.unwrap());
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    for (code, id) in [(&expired, "expired"), (&boundary, "boundary")] {
+        let resp = server.try_join(code, id, &[]).await;
+        assert_eq!(resp.status(), status, "{id}");
+        assert_eq!(resp.text().await.unwrap(), text, "{id}");
+    }
+    assert_eq!(server.try_join(&almost, "almost", &[]).await.status(), StatusCode::CREATED);
     server.join("fresh", &[]).await;
+}
+
+/// Review finding: a replacement ref changes the tree git reads for a commit
+/// without moving HEAD, so only the baseline branch may be pushed to.
+#[tokio::test(flavor = "multi_thread")]
+async fn pushes_to_refs_outside_the_baseline_branch_are_refused() {
+    let server = start().await;
+    let token = server.join("writer", &[]).await;
+    let (dir, head) = seed(&server, "writer", &token, &["personal/pdf/SKILL.md"]).await;
+    let repo = dir.path().join("repo");
+    git(&repo, &["rm", "--quiet", "-r", "personal/pdf"]);
+    git(&repo, &["commit", "--quiet", "-m", "without pdf"]);
+    let without = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["replace", &head, &without]);
+    git(&repo, &["tag", "v1"]);
+    let refspecs = [
+        format!("refs/replace/{head}:refs/replace/{head}"),
+        "v1".into(),
+        "HEAD:refs/heads/side".into(),
+        "HEAD:refs/heads/main/x".into(),
+    ];
+    for refspec in refspecs {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["push", "origin", &refspec])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "pushing {refspec} must fail");
+        // Hiding refs matches by prefix, so the hook is what refuses this one.
+        if refspec.ends_with("main/x") {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(stderr.contains("only refs/heads/main takes pushes, not refs/heads/main/x"), "{stderr}");
+        }
+    }
+    let bare = server._dir.path().join("data/repo.git");
+    assert_eq!(git(&bare, &["for-each-ref", "--format=%(refname)"]), "refs/heads/main");
+    assert_eq!(git(&bare, &["rev-parse", "refs/heads/main"]), head);
 }
 
 #[tokio::test(flavor = "multi_thread")]

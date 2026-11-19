@@ -245,7 +245,12 @@ enum Cmd {
 #[derive(Subcommand)]
 enum FleetCmd {
     /// Create a single-use join code
-    Invite,
+    #[command(after_help = "Examples:\n  sk1ll fleet invite\n  sk1ll fleet invite --scope self")]
+    Invite {
+        /// What the joining Machine may manage: the whole Fleet, or only itself
+        #[arg(long, value_enum, default_value_t = InviteScope::Fleet, value_name = "fleet|self")]
+        scope: InviteScope,
+    },
     /// Remove a machine from the fleet
     Remove {
         /// Machine id (put `--` before an id that starts with `-`)
@@ -341,6 +346,13 @@ impl Cmd {
 enum Kind {
     Skill,
     Rule,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum InviteScope {
+    Fleet,
+    #[value(name = "self")]
+    SelfOnly,
 }
 
 #[derive(Clone, Copy, ValueEnum)]

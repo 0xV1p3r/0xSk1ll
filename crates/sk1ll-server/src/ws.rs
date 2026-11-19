@@ -10,7 +10,10 @@
 //! accepted only while the session is current and its token still valid.
 //!
 //! Discards with an id are acknowledged only after a successful commit, including
-//! no-ops. Invalid or stale sessions receive no acknowledgement.
+//! no-ops. Invalid or stale sessions receive no acknowledgement. If the
+//! baseline's items can't be read, the session is closed with code 1013 (try
+//! again later), so the daemon reconnects, backing off, and sends its
+//! unacknowledged discards again; later discards on that session aren't read.
 //!
 //! Outbound state is bounded: the assignment is coalesced in a `watch` (only
 //! the newest revision is kept), and other messages go through a small queue.
@@ -18,7 +21,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::extract::{FromRequestParts, State};
 use axum::http::request::Parts;
 use axum::response::Response;
@@ -30,7 +33,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{ApiError, Result};
-use crate::{Caller, Server, assign, db, hash, now};
+use crate::{Caller, Server, assign, db, now};
 
 /// Non-assignment messages a session may have waiting; a daemon that falls
 /// this far behind is disconnected.
@@ -46,7 +49,7 @@ impl FromRequestParts<Arc<Server>> for WsCaller {
     async fn from_request_parts(parts: &mut Parts, server: &Arc<Server>) -> Result<Self> {
         let token = crate::api::bearer(parts).ok_or(ApiError::Unauthorized)?;
         match server.authenticate(token).await? {
-            Caller::Machine(id) => Ok(Self(id, hash(token))),
+            Caller::Machine { id, token_hash, .. } => Ok(Self(id, token_hash)),
             Caller::Admin => Err(ApiError::Forbidden("the WebSocket is for machine daemons".into())),
         }
     }
@@ -55,6 +58,8 @@ impl FromRequestParts<Arc<Server>> for WsCaller {
 /// The registry's side of a session.
 pub struct Handle {
     pub id: u64,
+    /// The token the session authenticated with; a removal revokes only its own.
+    pub token_hash: String,
     cancel: CancellationToken,
     revoked: Arc<AtomicBool>,
     assignment: Arc<watch::Sender<Option<AssignmentSnapshot>>>,
@@ -111,37 +116,61 @@ async fn session(server: Arc<Server>, machine: String, token_hash: String, socke
     let atx = Arc::new(atx);
     let (qtx, qrx) = mpsc::channel(QUEUE);
     let id = server.next_conn.fetch_add(1, Ordering::Relaxed);
-    let handle =
-        Handle { id, cancel: cancel.clone(), revoked: revoked.clone(), assignment: atx.clone(), queue: qtx.clone() };
-    server.connect(&machine, handle);
-    tracing::info!("{machine} connected (session {id})");
+    let handle = Handle {
+        id,
+        token_hash: token_hash.clone(),
+        cancel: cancel.clone(),
+        revoked: revoked.clone(),
+        assignment: atx.clone(),
+        queue: qtx.clone(),
+    };
 
-    let writer = tokio::spawn(write_loop(sink, qrx, arx, cancel.clone(), revoked, server.config.clone()));
-    // Registered first, so no change committed after this read can be missed.
-    let (m, t) = (machine.clone(), token_hash.clone());
-    match server
-        .db(move |conn| {
-            if db::machine_for_token(conn, &t)?.as_deref() != Some(m.as_str()) {
-                return Ok(None);
-            }
-            db::snapshot(conn, &m)
-        })
-        .await
-    {
-        Ok(Some(snapshot)) => publish(&atx, snapshot),
-        Ok(None) => cancel.cancel(),
-        Err(e) => tracing::error!("{machine}: loading assignment: {e}"),
+    let retry = Arc::new(AtomicBool::new(false));
+    let ends = Ending { revoked, retry: retry.clone() };
+    let writer = tokio::spawn(write_loop(sink, qrx, arx, cancel.clone(), ends, server.config.clone()));
+    match register(&server, &machine, handle).await {
+        Ok(Some(snapshot)) => {
+            tracing::info!("{machine} connected (session {id})");
+            publish(&atx, snapshot);
+        }
+        Ok(None) => {
+            tracing::info!("{machine}: session {id} authenticated with a removed token; closing");
+            cancel.cancel();
+        }
+        Err(e) => {
+            tracing::error!("{machine}: registering session {id}: {e}");
+            cancel.cancel();
+        }
     }
     if let Some(baseline) = server.head() {
         let _ = qtx.try_send(ServerMessage::Nudge { baseline });
     }
     drop((atx, qtx));
 
-    read_loop(&server, &machine, id, &token_hash, stream, &cancel).await;
+    read_loop(&server, &machine, id, &token_hash, stream, &cancel, &retry).await;
     cancel.cancel();
     let _ = writer.await;
     server.disconnect(&machine, id);
     tracing::info!("{machine} disconnected (session {id})");
+}
+
+/// Registers `handle` as `machine`'s session if its token is still the
+/// machine's, and returns the assignment to send first; `None` (and nothing
+/// registered) if the token was removed. The check and the registration share
+/// the DB lock with a removal, so an upgrade delayed past its machine's
+/// removal can't replace the session of a machine that joined again. The
+/// assignment is read after registering, so no later change can be missed.
+async fn register(server: &Arc<Server>, machine: &str, handle: Handle) -> Result<Option<AssignmentSnapshot>> {
+    let (h, m) = (server.clone(), machine.to_string());
+    server
+        .db(move |conn| {
+            if db::machine_for_token(conn, &handle.token_hash)?.map(|(id, _)| id).as_deref() != Some(m.as_str()) {
+                return Ok(None);
+            }
+            h.connect(&m, handle);
+            db::snapshot(conn, &m)
+        })
+        .await
 }
 
 async fn read_loop(
@@ -151,6 +180,7 @@ async fn read_loop(
     token_hash: &str,
     mut stream: SplitStream<WebSocket>,
     cancel: &CancellationToken,
+    retry: &AtomicBool,
 ) {
     let idle = server.config.idle_limit();
     let touch_every = std::time::Duration::from_secs(10).min(server.config.offline_after / 4);
@@ -186,7 +216,7 @@ async fn read_loop(
                     }
                     Ok(DaemonMessage::DraftDiscarded { id: discard_id, items }) => {
                         match on_draft_discarded(server, machine, id, token_hash, items, cancel).await {
-                            Ok(true) => {
+                            Ok(Discard::Applied) => {
                                 if let Some(discard_id) = discard_id
                                     && let Some(h) = crate::lock(&server.conns)
                                         .get(machine)
@@ -195,7 +225,14 @@ async fn read_loop(
                                     h.send(machine, ServerMessage::DraftDiscardApplied { id: discard_id });
                                 }
                             }
-                            Ok(false) => {}
+                            Ok(Discard::Stale) => {}
+                            Ok(Discard::Unknown) => {
+                                retry.store(true, Ordering::SeqCst);
+                                return tracing::warn!(
+                                    "{machine}: keeping toggles for discarded drafts: the baseline's items are \
+                                     unknown; closing so the daemon sends them again later"
+                                );
+                            }
                             // The daemon only replays unacknowledged discards on reconnect.
                             Err(e) => return tracing::error!("{machine}: discarding draft toggles: {e}; closing"),
                         }
@@ -209,6 +246,15 @@ async fn read_loop(
     }
 }
 
+/// Why a session is ending, when the daemon must be told.
+#[derive(Default)]
+struct Ending {
+    /// The machine was removed: send `Revoked` last.
+    revoked: Arc<AtomicBool>,
+    /// The daemon should come back later: close with code 1013.
+    retry: Arc<AtomicBool>,
+}
+
 /// Sends queued messages, the latest assignment and pings until cancelled.
 /// Every frame has a deadline; a stuck send ends with the session.
 async fn write_loop<S: Sink<Message> + Unpin>(
@@ -216,9 +262,10 @@ async fn write_loop<S: Sink<Message> + Unpin>(
     mut queue: mpsc::Receiver<ServerMessage>,
     mut assignment: watch::Receiver<Option<AssignmentSnapshot>>,
     cancel: CancellationToken,
-    revoked: Arc<AtomicBool>,
+    ends: Ending,
     config: crate::Config,
 ) {
+    let Ending { revoked, retry } = ends;
     let deadline = config.send_timeout;
     let mut ping = tokio::time::interval(config.ping_every);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -242,10 +289,11 @@ async fn write_loop<S: Sink<Message> + Unpin>(
         };
         tokio::select! {
             biased;
-            // A removal still needs its final Revoked frame. Other
-            // cancellations drop a stalled socket immediately.
+            // A removal still needs its final Revoked frame, and a retry
+            // its close code. Other cancellations drop a stalled socket
+            // immediately.
             () = cancel.cancelled() => {
-                if revoked.load(Ordering::SeqCst) {
+                if revoked.load(Ordering::SeqCst) || retry.load(Ordering::SeqCst) {
                     break 'frames;
                 }
                 return;
@@ -263,7 +311,10 @@ async fn write_loop<S: Sink<Message> + Unpin>(
     if revoked.load(Ordering::SeqCst) {
         let _ = tokio::time::timeout(deadline, sink.send(text(&ServerMessage::Revoked))).await;
     }
-    let _ = tokio::time::timeout(deadline, sink.send(Message::Close(None))).await;
+    let close = retry
+        .load(Ordering::SeqCst)
+        .then(|| CloseFrame { code: close_code::AGAIN, reason: "the baseline can't be read; try again later".into() });
+    let _ = tokio::time::timeout(deadline, sink.send(Message::Close(close))).await;
 }
 
 fn text(msg: &ServerMessage) -> Message {
@@ -312,7 +363,9 @@ async fn on_status(
     let updated = server
         .db(move |conn| {
             // Checked under the DB lock, so a removal can't slip in between.
-            if !h.is_current(&m, id) || db::machine_for_token(conn, &t)?.as_deref() != Some(m.as_str()) {
+            if !h.is_current(&m, id)
+                || db::machine_for_token(conn, &t)?.map(|(id, _)| id).as_deref() != Some(m.as_str())
+            {
                 tracing::info!("{m}: ignoring status from stale session {id}");
                 return Ok(None);
             }
@@ -336,6 +389,17 @@ async fn on_status(
     Ok(())
 }
 
+/// What became of a draft discard.
+#[derive(Debug, PartialEq, Eq)]
+enum Discard {
+    /// Committed (maybe as a no-op): acknowledge it.
+    Applied,
+    /// The session is no longer current, or its token valid: ignore it.
+    Stale,
+    /// The baseline's items couldn't be read, so nothing was dropped.
+    Unknown,
+}
+
 /// An explicit Restore, scoped to this machine and the named items. A status
 /// snapshot alone never proves that an absent draft item was discarded.
 async fn on_draft_discarded(
@@ -345,30 +409,33 @@ async fn on_draft_discarded(
     token_hash: &str,
     discarded: Vec<ItemRef>,
     cancel: &CancellationToken,
-) -> Result<bool> {
+) -> Result<Discard> {
     if cancel.is_cancelled() {
-        return Ok(false);
+        return Ok(Discard::Stale);
     }
-    // Serialize with pushes so a Restore can't sweep against an old baseline.
+    // Serialize with pushes so a Restore can't sweep against an old baseline,
+    // and read HEAD itself: the cached one lags a push whose read of it failed.
     let _push = server.push_lock.lock().await;
-    let items = server.baseline_items();
+    let Some(items) = server.live_items().await else { return Ok(Discard::Unknown) };
     let (h, m, t, now) = (server.clone(), machine.to_string(), token_hash.to_string(), now());
     let updated = server
         .db(move |conn| {
-            if !h.is_current(&m, id) || db::machine_for_token(conn, &t)?.as_deref() != Some(m.as_str()) {
+            if !h.is_current(&m, id)
+                || db::machine_for_token(conn, &t)?.map(|(id, _)| id).as_deref() != Some(m.as_str())
+            {
                 return Ok(None);
             }
             let tx = conn.transaction()?;
-            let updated = assign::sweep(&tx, &m, &items, Some(&discarded), now)?.map(|a| a.snapshot());
+            let updated = assign::sweep(&tx, &m, &items, &discarded, now)?.map(|a| a.snapshot());
             tx.commit()?;
             Ok(Some(updated))
         })
         .await?;
-    let Some(updated) = updated else { return Ok(false) };
+    let Some(updated) = updated else { return Ok(Discard::Stale) };
     if let Some(snapshot) = updated {
         server.publish_assignment(machine, snapshot);
     }
-    Ok(true)
+    Ok(Discard::Applied)
 }
 
 #[cfg(test)]
@@ -484,7 +551,8 @@ mod tests {
         let (queue_tx, queue_rx) = mpsc::channel(1);
         let (_assignment_tx, assignment_rx) = watch::channel(None);
         queue_tx.send(ServerMessage::Nudge { baseline: "abc".into() }).await.unwrap();
-        write_loop(sink, queue_rx, assignment_rx, cancel, revoked, crate::Config::new("/unused")).await;
+        let ends = Ending { revoked, ..Ending::default() };
+        write_loop(sink, queue_rx, assignment_rx, cancel, ends, crate::Config::new("/unused")).await;
         let frames = frames.lock().unwrap();
         assert!(
             frames.iter().any(|frame| matches!(frame, Message::Text(text)
@@ -492,6 +560,159 @@ mod tests {
             "{frames:?}"
         );
         assert!(matches!(frames.last(), Some(Message::Close(_))), "{frames:?}");
+    }
+
+    /// A session handle for tests, and its cancellation token.
+    fn handle(id: u64, token_hash: String) -> (Handle, CancellationToken) {
+        let cancel = CancellationToken::new();
+        let (queue, _) = mpsc::channel(QUEUE);
+        let handle = Handle {
+            id,
+            token_hash,
+            cancel: cancel.clone(),
+            revoked: Arc::default(),
+            assignment: Arc::new(watch::channel(None).0),
+            queue,
+        };
+        (handle, cancel)
+    }
+
+    /// Review finding: an upgrade authenticated before its machine was
+    /// removed, and delayed until the machine joined again, must not replace
+    /// the new session; nor may revoking the removed token end it.
+    #[tokio::test]
+    async fn a_delayed_upgrade_cannot_replace_a_rejoined_machines_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::open(crate::Config::new(dir.path().join("data"))).await.unwrap();
+        let join = |token: &'static str| {
+            let server = server.clone();
+            async move {
+                let a = sk1ll_proto::Assignment::default();
+                let scope = sk1ll_proto::Scope::Fleet;
+                server.db(move |conn| db::insert_machine(conn, "m", &crate::hash(token), 0, &a, scope)).await.unwrap();
+            }
+        };
+        join("old").await;
+        let (stale, stale_cancel) = handle(1, crate::hash("old"));
+        server.remove_machine(Caller::Admin, "m".into()).await.unwrap();
+        join("new").await;
+        let (fresh, fresh_cancel) = handle(2, crate::hash("new"));
+        assert!(register(&server, "m", fresh).await.unwrap().is_some());
+
+        assert!(register(&server, "m", stale).await.unwrap().is_none());
+        assert!(!stale_cancel.is_cancelled(), "never registered, so the caller closes it");
+        assert!(!fresh_cancel.is_cancelled() && server.is_current("m", 2));
+        server.revoke("m", &crate::hash("old"));
+        assert!(!fresh_cancel.is_cancelled() && server.is_current("m", 2));
+
+        // Removing the machine now revokes the session it registered.
+        server.remove_machine(Caller::Admin, "m".into()).await.unwrap();
+        assert!(fresh_cancel.is_cancelled() && !server.is_current("m", 2));
+        let (late, _) = handle(3, crate::hash("new"));
+        assert!(register(&server, "m", late).await.unwrap().is_none());
+        assert!(!server.is_connected("m"));
+    }
+
+    /// Review finding: after a push whose read of the new HEAD failed, a
+    /// discard must not sweep against the old cached HEAD (which lacks the
+    /// item the push added). While HEAD can't be read it drops nothing and
+    /// closes with 1013 instead of acknowledging; once HEAD reads again, the
+    /// resent discard is checked against the live baseline.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_discard_after_a_failed_head_read_uses_the_live_baseline() {
+        use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest};
+
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::open(crate::Config::new(dir.path().join("data"))).await.unwrap();
+        let mut a = sk1ll_proto::Assignment::default();
+        a.set_skill("claude", "pdf", true);
+        let scope = sk1ll_proto::Scope::Fleet;
+        server.db(move |conn| db::insert_machine(conn, "m", &crate::hash("t"), 0, &a, scope)).await.unwrap();
+        let has_pdf = || {
+            let server = server.clone();
+            async move {
+                server
+                    .db(|conn| Ok(db::assignment(conn, "m")?.unwrap().harness("claude").skills.contains_key("pdf")))
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // A push adds pdf, and reading HEAD after it fails.
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        let work = dir.path().join("work");
+        git(dir.path(), &["clone", "--quiet", &server.config.repo_dir().to_string_lossy(), &work.to_string_lossy()]);
+        std::fs::create_dir_all(work.join("personal/pdf")).unwrap();
+        std::fs::write(work.join("personal/pdf/SKILL.md"), "x\n").unwrap();
+        git(&work, &["add", "--all"]);
+        git(&work, &["commit", "--quiet", "-m", "pdf"]);
+        let before = server.read_head().await.unwrap();
+        git(&work, &["push", "--quiet", "origin", "HEAD:main"]);
+        server.fail_head.store(true, Ordering::SeqCst);
+        server.after_push(before, crate::git::Budget::default(), &Caller::Admin).await;
+        assert_eq!(server.head(), None, "the cached HEAD is no longer trusted");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = server.router();
+        let serve = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let connect = || async move {
+            let mut req = format!("ws://{address}/api/ws").into_client_request().unwrap();
+            req.headers_mut().insert("authorization", "Bearer t".parse().unwrap());
+            let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+            let discard = DaemonMessage::DraftDiscarded { id: Some(7), items: vec![ItemRef::Skill("pdf".into())] };
+            let text = serde_json::to_string(&discard).unwrap();
+            ws.send(tungstenite::Message::text(text)).await.unwrap();
+            ws
+        };
+        let mut ws = connect().await;
+        let close = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(tungstenite::Message::Text(text))) => {
+                        let msg: ServerMessage = serde_json::from_str(&text).unwrap();
+                        assert!(!matches!(msg, ServerMessage::DraftDiscardApplied { .. }), "acknowledged");
+                    }
+                    Some(Ok(tungstenite::Message::Close(frame))) => break frame,
+                    Some(Ok(_)) => {}
+                    other => panic!("connection ended without a close frame: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the session must close");
+        let frame = close.expect("a close code");
+        assert_eq!(u16::from(frame.code), close_code::AGAIN);
+        assert!(has_pdf().await, "an unknown baseline drops nothing");
+
+        // HEAD reads again: the resent discard sees pdf in the live baseline.
+        server.fail_head.store(false, Ordering::SeqCst);
+        let mut ws = connect().await;
+        let applied = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(Ok(tungstenite::Message::Text(text))) = ws.next().await
+                    && let Ok(ServerMessage::DraftDiscardApplied { id }) = serde_json::from_str(&text)
+                {
+                    break id;
+                }
+            }
+        })
+        .await
+        .expect("the resent discard must be acknowledged");
+        assert_eq!(applied, 7);
+        assert!(has_pdf().await, "pdf is in the baseline, so its toggle stays");
+        serve.abort();
     }
 
     #[test]
