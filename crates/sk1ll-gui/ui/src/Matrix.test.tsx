@@ -185,15 +185,18 @@ describe('a Machine whose Assignment fails to load', () => {
     expect(screen.getByRole('button', { name: 'Retry loading the Assignment of b' }).hasAttribute('disabled')).toBe(false);
   });
   it('sends bulk changes and their undo only for loaded Machines', async () => {
-    vi.mocked(api.setAssignment).mockImplementation(async () => {
-      vi.mocked(api.assignment).mockImplementation(async machine => { if (machine === 'b') throw new Error('Machine not found'); return snapshot(true, 2); });
-      return snapshot(true, 2);
-    });
+    const save = deferred<AssignmentUpdate>();
+    vi.mocked(api.setAssignment).mockReturnValueOnce(save.promise).mockResolvedValueOnce(snapshot(false, 3));
     await mount();
     expect(screen.queryByText('Mixed')).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: 'Actions for skill:pdf' }));
     fireEvent.click(await screen.findByRole('menuitem', { name: 'Enable in all visible Harnesses' }));
-    await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Enabled pdf in 1 Harness' })));
+    vi.mocked(api.assignment).mockImplementation(async machine => {
+      if (machine === 'b') throw new Error('Machine not found');
+      return snapshot(true, 2);
+    });
+    await act(async () => { save.resolve(snapshot(true, 2)); });
+    expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Enabled pdf in 1 Harness' }));
     expect(api.setAssignment).toHaveBeenCalledTimes(1);
     expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: true }], expected: { revision: 1, registration: 'r-a' } });
     await act(async () => { vi.mocked(toast).mock.calls[0][0].action!.run(); });
@@ -261,8 +264,11 @@ it('resets row overrides optimistically and skips unavailable remote Draft items
   fireEvent.click(await screen.findByRole('menuitem', { name: 'Reset all to default' }));
   expect(api.setAssignment).toHaveBeenCalledTimes(1);
   expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: null }], expected: { revision: 1, registration: 'r-a' } });
-  expect(screen.getByRole('checkbox', { name: 'skill:pdf in a / claude, inherited' }).className).toContain('border-dashed');
-  await act(async () => { save.resolve(snapshot()); });
+  expect((await screen.findByRole('checkbox', { name: 'skill:pdf in a / claude, inherited' })).className).toContain('border-dashed');
+  const reset = snapshot(false, 2);
+  reset.assignment.harnesses.claude.skills = {};
+  vi.mocked(api.assignment).mockResolvedValue(reset);
+  await act(async () => { save.resolve(reset); });
 });
 
 it('describes explicit values that override the Harness default and clears the note on reset', async () => {
@@ -274,11 +280,14 @@ it('describes explicit values that override the Harness default and clears the n
   expect(cell('b').hasAttribute('aria-description')).toBe(false);
   expect(cell('a').closest('td')?.className).not.toContain('bg-warning');
   fireEvent.click(screen.getByRole('button', { name: 'Use default for skill:pdf in a / claude' }));
-  const inherited = screen.getByRole('checkbox', { name: 'skill:pdf in a / claude, inherited' });
+  const inherited = await screen.findByRole('checkbox', { name: 'skill:pdf in a / claude, inherited' });
   expect(inherited.hasAttribute('aria-description')).toBe(false);
   expect(inherited.getAttribute('aria-checked')).toBe('false');
   expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: null }] });
-  await act(async () => { save.resolve(snapshot()); });
+  const reset = snapshot(false, 2);
+  reset.assignment.harnesses.claude.skills = {};
+  vi.mocked(api.assignment).mockResolvedValue(reset);
+  await act(async () => { save.resolve(reset); });
 });
 
 it('marks offline Machines in the header and on their cells while keeping them editable', async () => {
