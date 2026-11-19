@@ -2876,6 +2876,26 @@ async fn joined_daemon_proxies_machine_assignment_copy() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn reviewed_sync_replans_after_recovering_an_interrupted_import() {
+    let mut m = Machine::new("preview").with_env("SK1LL_DEBOUNCE", "60s");
+    sk1ll_core::Repo::init(&m.repo()).unwrap();
+    m.write("imported/pdf/SKILL.md", "pdf");
+    m.start().await;
+    eventually(|| async { (m.harness_skill("pdf").as_deref() == Some("pdf")).then_some(()) }).await;
+    let imported = m.repo().join("imported");
+    std::fs::rename(imported.join("pdf"), imported.join(".sk1ll-stage-old-pdf")).unwrap();
+
+    let preview = m.client.preview_sync().await.unwrap();
+    assert!(preview.actions.unwrap().iter().any(|action| action.kind == "remove" && action.name == "pdf"));
+    let fresh = m.client.apply_sync_preview(preview.fingerprint.unwrap()).await.unwrap();
+
+    assert!(fresh.fingerprint.is_some(), "recovery changes the plan and requires confirmation");
+    assert!(fresh.actions.unwrap().is_empty());
+    assert!(imported.join("pdf/SKILL.md").is_file());
+    assert_eq!(m.harness_skill("pdf").as_deref(), Some("pdf"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn render_and_dry_run_use_the_current_draft_without_writing() {
     use sk1ll_daemon::client::{API_VERSION, SyncResult};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

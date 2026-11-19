@@ -298,7 +298,7 @@ without applying changes or running recovery. Each action has `harness`,
 an optional `force` boolean, which defaults to false. Use GET when a Daemon
 might predate dry-run support.
 
-A regular `POST /sync` replans and applies. Supply the preview’s `fingerprint` to apply a reviewed plan. If the plan changed, the Daemon returns 409 with the fresh preview. It returns remaining `conflicts`
+A regular `POST /sync` replans and applies. Supply the preview’s `fingerprint` to apply a reviewed plan. The Daemon checks it under the engine lock after recovering interrupted writes. If the plan changed, it returns 409 with the fresh preview. It returns remaining `conflicts`
 and includes `errors` if any placements fail.
 
 ## Harness change and import update preconditions
