@@ -90,6 +90,9 @@ break compatibility.
 
 ### Fixed
 
+- In Fleet mode, `sk1ll assign <harness> --all on|off` and the Settings
+  turn-off button include Baseline items the Machine has yet to pull.
+  Older Servers use the local item list and show a warning.
 - Starting the macOS daemon recreates its log directory and repairs generated
   LaunchAgents after the app moves. New agents include the Git directory found
   on PATH, and the desktop app shows start commands for the detected manager.

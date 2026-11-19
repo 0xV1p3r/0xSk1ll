@@ -96,10 +96,15 @@ fn failure_message(status: StatusCode, bytes: &[u8], method: &Method, path: &str
         .map(|e| e.error)
         .unwrap_or_else(|_| String::from_utf8_lossy(bytes).trim().to_string());
     match message.is_empty() {
-        true if status == StatusCode::NOT_FOUND && bytes.is_empty() && NEWER_ROUTES.contains(&path) => format!(
-            "the running daemon doesn't know {method} {path}: it is older than this client; restart it so it \
+        true if status == StatusCode::NOT_FOUND
+            && bytes.is_empty()
+            && (NEWER_ROUTES.contains(&path) || path.starts_with("/assignment/harness/")) =>
+        {
+            format!(
+                "the running daemon doesn't know {method} {path}: it is older than this client; restart it so it \
              runs the installed sk1ll (systemctl --user restart sk1ll-daemon)"
-        ),
+            )
+        }
         true => status.to_string(),
         false => message,
     }
@@ -646,6 +651,15 @@ impl ClientError {
     }
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct HarnessAssignmentUpdate {
+    pub update: AssignmentUpdate,
+    pub warning: Option<String>,
+}
+
+pub const LEGACY_HARNESS_ASSIGNMENT_WARNING: &str =
+    "This Server only accepted items in the local repo. Unpulled items may stay on.";
+
 pub type Result<T> = std::result::Result<T, ClientError>;
 
 /// Talks to a daemon's local API; one connection per request.
@@ -887,6 +901,11 @@ impl Client {
         self.call(Method::PUT, &format!("/machines/{}/assignment", encode(machine)), Some(changes)).await
     }
 
+    pub async fn set_harness_assignment(&self, harness: &str, enabled: bool) -> Result<HarnessAssignmentUpdate> {
+        self.post(&format!("/assignment/harness/{}", encode(harness)), &sk1ll_proto::SetHarnessAssignment { enabled })
+            .await
+    }
+
     pub async fn remove_machine(&self, machine: &str) -> Result<()> {
         self.raw(Method::DELETE, &format!("/machines/{}", encode(machine)), None).await.map(drop)
     }
@@ -991,7 +1010,7 @@ fn content_query(q: &ContentQuery) -> String {
     query
 }
 
-fn encode(s: &str) -> String {
+pub(crate) fn encode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {

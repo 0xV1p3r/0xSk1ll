@@ -37,6 +37,7 @@ pub fn routes() -> Router<Arc<Server>> {
         .route("/machines/{id}", delete(remove_machine))
         .route("/machines/{id}/assignment", get(get_assignment).put(put_assignment))
         .route("/machines/{id}/assignment/copy", post(copy_assignment))
+        .route("/machines/{id}/assignment/harness/{harness}", post(set_harness_assignment))
         .route("/log", get(log))
         .route("/log/facets", get(log_facets))
         .route("/log/{id}/undo", post(undo))
@@ -241,6 +242,46 @@ async fn put_assignment(
     Ok(Json(published(&server, &id, applied)))
 }
 
+async fn set_harness_assignment(
+    State(server): ServerState,
+    caller: Caller,
+    Path((machine, harness)): Path<(String, String)>,
+    Json(body): Json<sk1ll_proto::SetHarnessAssignment>,
+) -> Result<Json<AssignmentUpdate>> {
+    caller.require_machine(&machine)?;
+    check_name("harness", &harness)?;
+    let push = server.push_lock.clone().lock_owned().await;
+    let items = server.baseline_items();
+    let id = machine.clone();
+    let applied = server
+        .db(move |conn| {
+            let _push = push;
+            let tx = conn.transaction()?;
+            authorize_assignment(&tx, &caller, &machine)?;
+            let m = db::machine(&tx, &machine)?.ok_or_else(|| ApiError::NotFound(format!("no machine `{machine}`")))?;
+            let report = m.report.unwrap_or_default();
+            let known: std::collections::BTreeSet<_> =
+                items.iter().cloned().chain(report.drafts).chain(report.unpushed).collect();
+            let changes = body
+                .changes(&harness, known)
+                .changes
+                .into_iter()
+                .map(|c| Change {
+                    harness: c.harness,
+                    kind: c.kind,
+                    name: c.name,
+                    after: c.enabled,
+                    cause: LogCause::Change,
+                })
+                .collect();
+            let applied = assign::apply(&tx, &machine, caller.author(), changes, now(), None)?;
+            tx.commit()?;
+            Ok(applied)
+        })
+        .await?;
+    Ok(Json(published(&server, &id, applied)))
+}
+
 /// Copies a machine's explicit toggles of one item to another, before a
 /// rename reaches its Draft, in one transaction. A toggle the new name
 /// already has is kept; the toggles copied are logged like any change.
@@ -375,6 +416,76 @@ mod tests {
         drop(push);
         let result = copy.await;
         assert!(matches!(result, Err(ApiError::Conflict(_))), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn harness_bulk_assignment_includes_unpulled_baseline_and_reported_items() {
+        use sk1ll_proto::{ItemRef, MachineReport, SetHarnessAssignment};
+
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::open(Config::new(dir.path().join("data"))).await.unwrap();
+        let token = join_with(&server, "me", Scope::SelfOnly).await;
+        join_with(&server, "other", Scope::Fleet).await;
+        let caller = server.authenticate(&token).await.unwrap();
+        let body = Json(SetHarnessAssignment { enabled: false });
+        let path = |id: &str| Path((id.into(), "claude".into()));
+        assert!(matches!(
+            set_harness_assignment(State(server.clone()), caller.clone(), path("other"), body).await,
+            Err(ApiError::Forbidden(_))
+        ));
+
+        let on = set_harness_assignment(
+            State(server.clone()),
+            caller.clone(),
+            path("me"),
+            Json(SetHarnessAssignment { enabled: true }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(!on.assignment.harness("claude").skills.contains_key("unpulled"));
+        crate::lock(&server.baseline).inventory = Some(crate::Inventory {
+            commit: "pushed".into(),
+            items: Arc::new([ItemRef::Skill("unpulled".into())].into()),
+        });
+        server
+            .db(|conn| {
+                db::save_report(
+                    conn,
+                    "me",
+                    &MachineReport {
+                        drafts: vec![ItemRef::Skill("draft".into())],
+                        unpushed: vec![ItemRef::Rule("local".into())],
+                        ..Default::default()
+                    },
+                    now(),
+                )
+            })
+            .await
+            .unwrap();
+        let off = set_harness_assignment(
+            State(server.clone()),
+            caller,
+            path("me"),
+            Json(SetHarnessAssignment { enabled: false }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(off.revision, on.revision + 1);
+        let harness = off.assignment.harness("claude");
+        assert!(!harness.skills["unpulled"]);
+        assert!(!harness.skills["draft"]);
+        assert!(!harness.rules["local"]);
+        assert!(!harness.new_skills_default && !harness.new_rules_default);
+        assert_eq!(off.entries.len(), 5);
+        assert!(off.entries.iter().all(|entry| entry.author == "me"
+            && entry.machine == "me"
+            && entry.before == if entry.kind.has_name() { None } else { Some(true) }
+            && entry.after == Some(false)
+            && entry.cause == LogCause::Change));
+        let entries = server.db(|conn| db::log_entries(conn, &LogQuery::default())).await.unwrap();
+        assert!(off.entries.iter().all(|entry| entries.iter().any(|stored| stored.id == entry.id)));
     }
 
     /// Review finding: a request authenticated as a `fleet` machine, then

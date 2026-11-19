@@ -17,6 +17,8 @@ pub enum Error {
     /// The server is unreachable.
     #[error("{0}")]
     Unavailable(String),
+    #[error("{1}")]
+    Upstream(StatusCode, String),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -45,6 +47,7 @@ impl IntoResponse for Error {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Upstream(status, _) => *status,
             Self::Internal(e) => {
                 tracing::error!("{e:#}");
                 StatusCode::INTERNAL_SERVER_ERROR

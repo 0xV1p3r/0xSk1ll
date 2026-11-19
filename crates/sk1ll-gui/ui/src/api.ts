@@ -38,6 +38,7 @@ export const api = {
   setSetupHarness: (name: string, enabled: boolean) => invoke<T.HarnessChoice[]>('set_setup_harness', { name, enabled }),
   harnessSettings: () => invoke<T.HarnessSettings>('harness_settings'),
   previewHarness: (request: T.HarnessChangeRequest) => invoke<T.HarnessPreview>('preview_harness', { request }),
+  setHarnessAssignment: (harness: string, enabled: boolean) => invoke<{ update: T.AssignmentUpdate; warning: string | null }>('set_harness_assignment', { harness, enabled }),
   applyHarness: (request: T.HarnessChangeRequest) => invoke<T.HarnessApplied>('apply_harness', { request }),
   // Opens the Daemon's own machine.toml; the app opens no other configuration file.
   openMachineConfig: (editorId: string) => invoke<void>('open_machine_config', { editorId }),

@@ -284,6 +284,28 @@ pub struct AssignmentChanges {
     pub expected: Option<Expected>,
 }
 
+/// Set both defaults and every known item for one harness.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SetHarnessAssignment {
+    pub enabled: bool,
+}
+
+impl SetHarnessAssignment {
+    pub fn changes(self, harness: &str, items: impl IntoIterator<Item = ItemRef>) -> AssignmentChanges {
+        let toggle = |kind, name| ToggleChange { harness: harness.into(), kind, name, enabled: Some(self.enabled) };
+        let changes = items
+            .into_iter()
+            .filter_map(|item| match item {
+                ItemRef::Skill(name) => Some(toggle(ToggleKind::Skill, Some(name))),
+                ItemRef::Rule(name) => Some(toggle(ToggleKind::Rule, Some(name))),
+                ItemRef::Manifest | ItemRef::Other(_) => None,
+            })
+            .chain([toggle(ToggleKind::NewSkillsDefault, None), toggle(ToggleKind::NewRulesDefault, None)])
+            .collect();
+        AssignmentChanges { changes, expected: None }
+    }
+}
+
 /// A precondition of [`AssignmentChanges`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Expected {

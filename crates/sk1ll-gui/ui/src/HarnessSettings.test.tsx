@@ -5,7 +5,7 @@ import { HarnessPanel, harnessOrigin } from './HarnessSettings';
 import { api } from './api';
 import type { HarnessChoice, HarnessPreview } from './types';
 vi.mock('./api', () => ({ api: { harnessSettings: vi.fn(), previewHarness: vi.fn(), applyHarness: vi.fn(), openMachineConfig: vi.fn(),
-  status: vi.fn(), items: vi.fn(), setAssignment: vi.fn() }, errorMessage: String }));
+  setHarnessAssignment: vi.fn() }, errorMessage: String }));
 vi.mock('./toast', () => ({ toast: vi.fn() }));
 afterEach(cleanup);
 const paths = (skills: string | null): HarnessChoice['harness'] => ({ skills, instructions: null, instructions_format: 'block', mode: 'copy' });
@@ -25,9 +25,9 @@ beforeEach(() => {
   vi.mocked(api.harnessSettings).mockResolvedValue({ path: '/cfg/machine.toml', harnesses });
   vi.mocked(api.previewHarness).mockResolvedValue(preview());
   vi.mocked(api.applyHarness).mockResolvedValue({ harnesses, errors: [] });
-  vi.mocked(api.status).mockResolvedValue({ machine_id: 'box' } as Awaited<ReturnType<typeof api.status>>);
-  vi.mocked(api.items).mockResolvedValue([{ item: 'skill:pdf' }, { item: 'rule:git' }] as Awaited<ReturnType<typeof api.items>>);
-  vi.mocked(api.setAssignment).mockResolvedValue({} as Awaited<ReturnType<typeof api.setAssignment>>);
+  vi.mocked(api.setHarnessAssignment).mockResolvedValue({
+    update: { assignment: { harnesses: {} }, revision: 1, entries: [] }, warning: null,
+  });
 });
 const mount = (changed = vi.fn()) => { render(<HarnessPanel revision={0} editorId="code" changed={changed} />); return changed; };
 
@@ -56,16 +56,19 @@ it('previews a disable, which leaves what sk1ll placed, and applies it', async (
 });
 
 it("turns the Harness's items off in the Assignment first, then previews again", async () => {
+  vi.mocked(api.setHarnessAssignment).mockResolvedValueOnce({
+    update: { assignment: { harnesses: {} }, revision: 1, entries: [] },
+    warning: 'Unpulled items may stay on.',
+  });
   mount();
   fireEvent.click(await screen.findByRole('checkbox', { name: 'Sync into codex' }));
   const dialog = await screen.findByRole('dialog');
   await within(dialog).findByText('/h/.codex/skills/pdf');
   vi.mocked(api.previewHarness).mockResolvedValue(preview({ placed: [] }));
   fireEvent.click(within(dialog).getByRole('button', { name: "Turn off this Harness's items first" }));
-  await waitFor(() => expect(api.setAssignment).toHaveBeenCalledWith('box', { changes: [
-    { harness: 'codex', kind: 'new_skills_default', enabled: false }, { harness: 'codex', kind: 'new_rules_default', enabled: false },
-    { harness: 'codex', kind: 'skill', name: 'pdf', enabled: false }, { harness: 'codex', kind: 'rule', name: 'git', enabled: false }] }));
+  await waitFor(() => expect(api.setHarnessAssignment).toHaveBeenCalledWith('codex', false));
   expect(await within(dialog).findByText('Nothing that sk1ll placed is left behind by this change.')).toBeTruthy();
+  expect(within(dialog).getByRole('status').textContent).toBe('Unpulled items may stay on.');
   expect(api.applyHarness).not.toHaveBeenCalled();
 });
 

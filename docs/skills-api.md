@@ -236,3 +236,17 @@ A 0.1.0 Server ignores it, and leaves `registration` out of `GET /fleet`, so the
 GUI offers matrix Undo only when it is there (or standalone). `GET /fleet` lists each Machine's
 `registration`, a random id that is new for every join, and the Server's
 `GET /machines/{id}/assignment` returns it too.
+
+
+### Set a Harness's items and defaults
+
+Send `POST /api/machines/{id}/assignment/harness/{harness}` with
+`{"enabled": false}` (or `true`) to set both defaults and every Baseline item,
+reported draft, and unpushed item for that Machine in one transaction.
+It uses the same scope, change log and response as the assignment PUT.
+
+The local endpoint `POST /assignment/harness/{harness}` targets the
+Daemon's own Machine and returns the assignment update in `update`, with
+`warning` set to null. Standalone uses the local repo. If the Server returns
+a 404 without a JSON body, the Daemon uses the local repo and returns a warning
+that unpulled items may stay on.

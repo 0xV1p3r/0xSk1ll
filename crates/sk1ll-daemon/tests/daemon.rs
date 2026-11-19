@@ -487,6 +487,66 @@ async fn fleet_of_two(server: &Server) -> (Machine, Machine, String) {
 // Tests
 
 #[tokio::test(flavor = "multi_thread")]
+async fn harness_assignment_passes_through_to_the_fleet_and_reaches_sync() {
+    let server = Server::start().await;
+    let (_a, b, _) = fleet_of_two(&server).await;
+    let on = b.client.set_harness_assignment(HARNESS, true).await.unwrap();
+    assert!(on.warning.is_none());
+    assert!(on.update.assignment.skill_enabled(HARNESS, "x"));
+    eventually(|| async { b.harness_skill("x").is_some().then_some(()) }).await;
+    let off = b.client.set_harness_assignment(HARNESS, false).await.unwrap();
+    assert!(off.warning.is_none());
+    assert!(!off.update.assignment.skill_enabled(HARNESS, "x"));
+    assert!(off.update.entries.iter().any(|entry| entry.machine == "beta" && entry.name.as_deref() == Some("x")));
+    eventually(|| async { b.harness_skill("x").is_none().then_some(()) }).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn harness_assignment_falls_back_only_for_a_missing_legacy_route() {
+    use axum::{
+        Json, Router,
+        http::StatusCode,
+        routing::{post, put},
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let puts = calls.clone();
+    let app = Router::new()
+        .route(
+            "/api/machines/box/assignment/harness/absent",
+            post(|| async { (StatusCode::NOT_FOUND, Json(sk1ll_proto::ErrorBody { error: "machine absent".into() })) }),
+        )
+        .route(
+            "/api/machines/box/assignment",
+            put(move |Json(body): Json<AssignmentChanges>| async move {
+                puts.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(body.changes.len(), 5);
+                assert!(body.changes.iter().all(|change| change.harness == HARNESS && change.enabled == Some(false)));
+                assert!(body.changes.iter().any(|change| change.name.as_deref() == Some("x")));
+                Json(sk1ll_proto::AssignmentUpdate {
+                    assignment: snapshot(2, &[]).assignment,
+                    revision: 2,
+                    entries: vec![],
+                })
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut m = solo("box", &url, Some(snapshot(1, &["x"])));
+    m.start().await;
+    let result = m.client.set_harness_assignment(HARNESS, false).await.unwrap();
+    assert!(result.warning.unwrap().contains("Unpulled items may stay on"));
+    assert_eq!(result.update.revision, 2);
+    let error = m.client.set_harness_assignment("absent", false).await.unwrap_err();
+    assert_eq!(error.status, Some(404));
+    assert_eq!(error.message, "machine absent");
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn join_commit_push_and_nudge_another_machine() {
     let server = Server::start().await;
     let (a, b, _) = fleet_of_two(&server).await;
@@ -2211,18 +2271,9 @@ async fn harnesses_change_after_setup_with_a_preview_of_what_stays() {
     assert!(m.status().await.report.harnesses.iter().all(|h| h != "extra"));
 
     // Turning a harness's items off first lets sync take them out; then disabling leaves nothing.
-    let off = |kind, name: Option<&str>| ToggleChange {
-        harness: HARNESS.into(),
-        kind,
-        name: name.map(String::from),
-        enabled: Some(false),
-    };
-    let changes = vec![
-        off(ToggleKind::NewSkillsDefault, None),
-        off(ToggleKind::NewRulesDefault, None),
-        off(ToggleKind::Skill, Some("pdf")),
-    ];
-    m.client.set_assignment("solo", &AssignmentChanges { changes, ..Default::default() }).await.unwrap();
+    let result = m.client.set_harness_assignment(HARNESS, false).await.unwrap();
+    assert!(result.warning.is_none());
+    assert!(!result.update.assignment.skill_enabled(HARNESS, "pdf"));
     eventually(|| async { m.harness_skill("pdf").is_none().then_some(()) }).await;
     let disable = HarnessChangeRequest { change: HarnessChange::Disable { name: HARNESS.into() } };
     assert!(m.client.preview_harness(&disable).await.unwrap().placed.is_empty());

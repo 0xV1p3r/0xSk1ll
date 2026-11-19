@@ -79,6 +79,7 @@ pub(crate) fn router(d: Arc<Daemon>) -> Router {
         .route("/fleet", get(pass))
         .route("/machines/{id}", delete(pass))
         .route("/machines/{id}/assignment", get(assignment).put(assignment))
+        .route("/assignment/harness/{harness}", post(set_harness_assignment))
         .route("/log", get(pass))
         .route("/log/facets", get(pass))
         .route("/log/{id}/undo", post(pass))
@@ -442,6 +443,34 @@ async fn assignment(
     let changes = serde_json::from_slice(&body).map_err(|e| Error::BadRequest(e.to_string()))?;
     let update = d.blocking(move |d, eng| d.set_local_assignment(eng, &changes)).await?;
     Ok(Json(update).into_response())
+}
+
+async fn set_harness_assignment(
+    State(d): St,
+    UrlPath(harness): UrlPath<String>,
+    Json(body): Json<sk1ll_proto::SetHarnessAssignment>,
+) -> Result<Json<crate::client::HarnessAssignmentUpdate>> {
+    use crate::client::{HarnessAssignmentUpdate, LEGACY_HARNESS_ASSIGNMENT_WARNING};
+    if d.is_standalone() {
+        let update = d
+            .blocking(move |d, eng| {
+                let changes = d.harness_assignment_changes(eng, &harness, body)?;
+                d.set_local_assignment(eng, &changes)
+            })
+            .await?;
+        return Ok(Json(HarnessAssignmentUpdate { update, warning: None }));
+    }
+    let state = d.ident.joined()?;
+    let (update, warning) = match server::set_harness_assignment(&d.http, state, &harness, body).await? {
+        Some(update) => (update, None),
+        None => {
+            let changes = d.blocking(move |d, eng| d.harness_assignment_changes(eng, &harness, body)).await?;
+            let update = server::change_assignment(&d.http, state, &changes).await.map_err(Error::Internal)?;
+            (update, Some(LEGACY_HARNESS_ASSIGNMENT_WARNING.into()))
+        }
+    };
+    d.event(crate::client::Event::Fleet);
+    Ok(Json(HarnessAssignmentUpdate { update, warning }))
 }
 
 /// Server pass-through: same path and query under the server's `/api`.
