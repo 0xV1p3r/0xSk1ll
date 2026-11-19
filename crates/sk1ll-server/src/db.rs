@@ -57,6 +57,11 @@ const MIGRATIONS: &[&str] = &[
     // Machines and codes from before scopes managed the whole fleet.
     "ALTER TABLE machines ADD COLUMN scope TEXT NOT NULL DEFAULT 'fleet';
     ALTER TABLE join_codes ADD COLUMN scope TEXT NOT NULL DEFAULT 'fleet';",
+    // A random id per join; existing machines get one now.
+    "
+    ALTER TABLE machines ADD COLUMN registration TEXT NOT NULL DEFAULT '';
+    UPDATE machines SET registration = lower(hex(randomblob(16))) WHERE registration = '';
+",
 ];
 
 pub fn open(path: &Path) -> anyhow::Result<Connection> {
@@ -85,6 +90,8 @@ pub struct MachineRecord {
     pub report: Option<MachineReport>,
     pub assignment: Assignment,
     pub scope: Scope,
+    /// Random, new for every join (see `MachineRow::registration`).
+    pub registration: String,
 }
 
 fn json<T: serde::de::DeserializeOwned>(text: &str, what: &str) -> Result<T> {
@@ -95,19 +102,21 @@ fn to_json<T: serde::Serialize>(value: &T) -> String {
     serde_json::to_string(value).expect("serializing plain data")
 }
 
-const MACHINE_COLS: &str = "id, joined_at, last_seen, report, assignment, scope";
+const MACHINE_COLS: &str = "id, joined_at, last_seen, report, assignment, scope, registration";
 
-type MachineRow = (String, i64, Option<i64>, Option<String>, String, String);
+type MachineRow = (String, i64, Option<i64>, Option<String>, String, String, String);
 
 fn machine_row(row: &Row) -> rusqlite::Result<MachineRow> {
-    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
 }
 
 fn parse_scope(s: &str) -> Result<Scope> {
     Ok(s.parse::<Scope>().map_err(anyhow::Error::msg).context("corrupt scope in server.db")?)
 }
 
-fn machine_record((id, joined_at, last_seen, report, assignment, scope): MachineRow) -> Result<MachineRecord> {
+fn machine_record(
+    (id, joined_at, last_seen, report, assignment, scope, registration): MachineRow,
+) -> Result<MachineRecord> {
     Ok(MachineRecord {
         report: report.map(|r| json(&r, "report")).transpose()?,
         assignment: json(&assignment, "assignment")?,
@@ -115,6 +124,7 @@ fn machine_record((id, joined_at, last_seen, report, assignment, scope): Machine
         id,
         joined_at,
         last_seen,
+        registration,
     })
 }
 
@@ -138,7 +148,7 @@ pub fn machine_for_token(conn: &Connection, token_hash: &str) -> Result<Option<(
     row.map(|(id, scope)| Ok((id, parse_scope(&scope)?))).transpose()
 }
 
-/// Inserts a machine; returns its assignment's revision.
+/// Inserts a machine under a new registration; returns its assignment's revision.
 pub fn insert_machine(
     conn: &Connection,
     id: &str,
@@ -148,9 +158,11 @@ pub fn insert_machine(
     scope: Scope,
 ) -> Result<u64> {
     let revision = next_revision(conn)?;
+    let registration = crate::hex(&crate::random_bytes::<16>());
     conn.execute(
-        "INSERT INTO machines (id, token_hash, joined_at, assignment, revision, scope) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![id, token_hash, now, to_json(a), revision as i64, scope.as_str()],
+        "INSERT INTO machines (id, token_hash, joined_at, assignment, revision, scope, registration)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![id, token_hash, now, to_json(a), revision as i64, scope.as_str(), registration],
     )?;
     Ok(revision)
 }
@@ -174,7 +186,11 @@ pub fn snapshot(conn: &Connection, id: &str) -> Result<Option<AssignmentSnapshot
         .query_row("SELECT assignment, revision FROM machines WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?;
     row.map(|(t, revision)| {
-        Ok(AssignmentSnapshot { revision: revision.max(0) as u64, assignment: json(&t, "assignment")? })
+        Ok(AssignmentSnapshot {
+            revision: revision.max(0) as u64,
+            assignment: json(&t, "assignment")?,
+            registration: None,
+        })
     })
     .transpose()
 }
@@ -331,6 +347,51 @@ pub fn log_entry(conn: &Connection, id: i64) -> Result<Option<LogEntry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Applies the first `version` migrations, as an older server left them.
+    fn at_version(version: usize) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..version] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", version as i64).unwrap();
+        conn
+    }
+
+    fn user_version(conn: &Connection) -> i64 {
+        conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn existing_machines_get_a_registration() {
+        // From before scopes (v3) and from scopes only (v4).
+        for version in [3, 4] {
+            let mut conn = at_version(version);
+            for id in ["a", "b"] {
+                conn.execute(
+                    "INSERT INTO machines (id, token_hash, joined_at, assignment) VALUES (?1, ?1, 1, '{}')",
+                    [id],
+                )
+                .unwrap();
+            }
+            if version == 4 {
+                conn.execute("UPDATE machines SET scope = 'self' WHERE id = 'b'", []).unwrap();
+            }
+            migrate(&mut conn).unwrap();
+            assert_eq!(user_version(&conn), 5);
+            let all = machines(&conn).unwrap();
+            let registrations: Vec<&str> = all.iter().map(|m| m.registration.as_str()).collect();
+            assert!(registrations.iter().all(|r| r.len() == 32), "{registrations:?}");
+            assert_ne!(registrations[0], registrations[1]);
+            let scopes: Vec<Scope> = all.iter().map(|m| m.scope).collect();
+            let b = if version == 4 { Scope::SelfOnly } else { Scope::Fleet };
+            assert_eq!(scopes, [Scope::Fleet, b], "v{version}");
+            insert_machine(&conn, "c", "c", 2, &Assignment::default(), Scope::SelfOnly).unwrap();
+            let c = machine(&conn, "c").unwrap().unwrap();
+            assert_eq!((c.registration.len(), c.scope), (32, Scope::SelfOnly));
+            assert_ne!(c.registration, registrations[0]);
+        }
+    }
 
     #[test]
     fn migrates_once_and_round_trips_log() {

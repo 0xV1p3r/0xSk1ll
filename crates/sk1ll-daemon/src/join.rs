@@ -232,7 +232,7 @@ async fn register_inner(
     }
     Ok(Registered {
         state: DaemonState { machine_id: joined.machine_id, server_url, token: joined.token, repo, revoked: false },
-        snapshot: AssignmentSnapshot { revision: joined.revision, assignment: joined.assignment },
+        snapshot: AssignmentSnapshot { revision: joined.revision, assignment: joined.assignment, registration: None },
         harnesses,
     })
 }

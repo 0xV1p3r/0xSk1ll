@@ -56,7 +56,8 @@ An unmanaged entry uses the same fields:
       "locations": [
         {"harness": "claude", "path": "/home/me/.claude/skills/pdf"},
         {"harness": "codex", "path": "/home/me/.codex/skills/pdf"}
-      ]
+      ],
+      "resumable": false
     }
   ]
 }
@@ -64,8 +65,12 @@ An unmanaged entry uses the same fields:
 
 Identical copies share one variant. Multiple variants mean the content differs.
 The entry's description comes from its first variant; each variant also has its
-own description. `clashes_with_repo` means a repo Skill already has this name.
-Repo entries always have an empty `variants` array and `clashes_with_repo: false`.
+own description. `resumable` marks the variant identical to an existing
+personal copy of the same name, which an interrupted Adopt left behind (see
+[Adopt and fork](#adopt-and-fork)). `clashes_with_repo` means a repo Skill
+already has this name and no variant is resumable. When one is, only the
+resumable variants can be adopted. Repo entries always have an empty
+`variants` array and `clashes_with_repo: false`.
 
 ## Tree and text
 
@@ -131,7 +136,8 @@ On a joined repo, the CLI also requires the connected Daemon and suggests
 Adopt selects the chosen variant and its identical copies across Harnesses.
 It refuses an existing repo Skill with different content or an Import with the
 same name. An identical personal copy is accepted so an interrupted Adopt can
-be retried. Differing Harness copies stay unmanaged.
+be retried: that variant is `resumable` in `GET /skills`, and the Library offers
+Resume adoption for it. Differing Harness copies stay unmanaged.
 
 The Server rejects toggles for unknown items, so Adopt first copies the selected
 content into `personal/<name>/` and reports the Draft. It waits for the Server to
@@ -162,3 +168,72 @@ Draft. Errors use the existing non-2xx JSON body:
 ```json
 {"error": "a repo skill named `pdf` already exists"}
 ```
+
+## Rename
+
+`POST /items/rename` takes:
+
+```json
+{"kind": "skill", "name": "pdf", "to": "docs"}
+```
+
+It copies this Machine's explicit toggles for the old name to the new one
+first, then renames the personal Skill or Rule in the Draft:
+
+```json
+{"item": "skill:docs", "migrated": ["claude"], "kept": ["codex"], "assignment_error": null}
+```
+
+The copy is made by the Assignment's authority, never described by the
+caller: the Server when joined (`POST /api/machines/{id}/assignment/copy`
+with `{"from": "skill:pdf", "to": "skill:docs"}`, which this local API does
+not expose), the Daemon itself when standalone (skipping toggles for a
+Harness this Machine no longer has). In one transaction it checks that `from`
+is an item this Machine can have and `to` is the same kind and not one yet,
+then copies the current explicit toggles of `from` to `to`, logged like any
+change. A Harness where `to` already has an explicit toggle keeps it and is
+listed in `kept`; `migrated` lists only the Harnesses whose toggle was
+written. The Daemon always asks, even when it sees no toggles to copy, so a
+toggle set on the old name just before is not missed. `assignment_error` is
+always null; it stays for older clients.
+
+When the copy can't be made, nothing is renamed and the request fails with
+HTTP 409 and the reason: offline, the Server refused it, or the Server is
+older and has no copy endpoint (HTTP 404, reported as "Assignment copy is not
+supported by this Server"). When the copy's response is lost after it was
+sent, the Daemon reads the Machine's Assignment again: if the new name has
+exactly the old name's explicit toggles, the copy applied and the rename goes
+ahead; otherwise nothing is renamed, and the error says when the new name may
+already have copied toggles (they stay unused unless an item with that name
+appears). To rename anyway, send `"copy_assignment": false`: the new name then
+follows each Harness's default on this Machine.
+
+When the rename then moves nothing (the new name appeared since it was
+checked, say), the Daemon removes the toggles the copy applied again, with the
+copy's `expected` revision and registration, so that a toggle someone changed
+meanwhile is left alone; the error says whether they were removed or kept, and
+in which Harnesses. When the item moved but rewriting its frontmatter `name:`
+failed, the rename stands with its copied toggles and the error says so.
+Standalone, a saved Assignment counts as written even when applying it fails
+afterwards; that failure shows in the status.
+
+Other Machines' toggles are not copied: once the rename is pushed, the old
+name's are dropped (`item_removed`) and the new name follows their defaults.
+The old name's toggles on this Machine also stay until that push, so restoring
+both Draft items undoes the rename. Toggles copied to the new name before the
+rename reaches the Draft survive a push meanwhile only because a push sweeps
+just the items it removed from the Baseline (delta-only sweeps), which never
+include the new name.
+
+### Assignment writes
+
+`PUT /machines/{id}/assignment` (passed through to the Server when joined)
+also takes an optional `expected`: `{"revision": 7, "registration": "…"}`.
+The write applies only to that revision and, when given, that registration of
+the Machine; otherwise it fails with HTTP 409 and changes nothing. Standalone,
+a registration never matches.
+
+A 0.1.0 Server ignores it, and leaves `registration` out of `GET /fleet`, so the
+GUI offers matrix Undo only when it is there (or standalone). `GET /fleet` lists each Machine's
+`registration`, a random id that is new for every join, and the Server's
+`GET /machines/{id}/assignment` returns it too.

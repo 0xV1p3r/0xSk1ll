@@ -161,7 +161,7 @@ impl Daemon {
             let assignment = sk1ll_core::Assignment::load(&cfg.assignment)?;
             let previous = state::load_snapshot(&cfg.state.with_file_name("standalone-assignment.json"))?;
             let revision = previous.as_ref().map_or(1, |s| s.revision + u64::from(s.assignment != assignment));
-            Some(AssignmentSnapshot { revision, assignment })
+            Some(AssignmentSnapshot { revision, assignment, registration: None })
         } else {
             match state::load_snapshot(&cfg.snapshot_path()) {
                 Ok(Some(s)) => Some(s),
@@ -267,7 +267,7 @@ impl Daemon {
             return Ok(());
         }
         let revision = previous.as_ref().map_or(1, |s| s.revision + 1);
-        let snap = AssignmentSnapshot { revision, assignment };
+        let snap = AssignmentSnapshot { revision, assignment, registration: None };
         state::save_snapshot(&self.cfg.state.with_file_name("standalone-assignment.json"), &snap)?;
         *self.snapshot.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(snap));
         self.update(|v| {
@@ -290,6 +290,23 @@ impl Daemon {
         let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
         let skills: Vec<String> = repo.skills()?.into_iter().map(|s| s.name).collect();
         let rules: Vec<String> = repo.rules()?.into_iter().map(|r| r.name).collect();
+        // An edit made outside the daemon counts as a newer revision.
+        self.reload_local_assignment()?;
+        if let Some(expected) = &changes.expected {
+            let revision = self.snapshot().map_or(0, |s| s.revision);
+            if expected.registration.is_some() {
+                return Err(Error::Conflict(
+                    "this Machine is standalone now; reload its Assignment before changing it".into(),
+                ));
+            }
+            if revision != expected.revision {
+                return Err(Error::Conflict(format!(
+                    "the Assignment of `{}` changed since revision {} (now {revision}); reload it",
+                    self.ident.machine_id(),
+                    expected.revision
+                )));
+            }
+        }
         let mut assignment = sk1ll_core::Assignment::load(&self.cfg.assignment)?;
         for change in &changes.changes {
             if !harnesses.contains_key(&change.harness) {
@@ -331,12 +348,80 @@ impl Daemon {
         }
         // Assignment::save replaces the file atomically, like the direct CLI.
         assignment.save(&self.cfg.assignment)?;
-        self.refresh(eng)?;
+        self.saved_local_assignment(eng);
         let snap = self.snapshot().expect("standalone always has assignment");
         Ok(sk1ll_proto::AssignmentUpdate {
             revision: snap.revision,
             assignment: snap.assignment.clone(),
             entries: Vec::new(),
+        })
+    }
+
+    /// Publishes and applies a just saved local Assignment. The save is the
+    /// write: a failure from here on shows in the status, never as a failed write.
+    fn saved_local_assignment(&self, eng: &mut Engine) {
+        if let Err(e) = self.reload_local_assignment().and_then(|()| self.refresh(eng)) {
+            self.set_error(format!("applying the saved Assignment: {e}"));
+        }
+    }
+
+    /// The standalone counterpart of the Server's `POST
+    /// /api/machines/{id}/assignment/copy`, for renames only: copies the
+    /// local Assignment's explicit toggles of `copy.from` to `copy.to` in this
+    /// Machine's Harnesses, keeping a toggle `copy.to` already has.
+    fn copy_local_assignment(
+        &self,
+        eng: &mut Engine,
+        copy: &sk1ll_proto::AssignmentCopy,
+    ) -> Result<sk1ll_proto::AssignmentCopied> {
+        use sk1ll_proto::{ToggleChange, ToggleKind};
+        self.ensure_managed(eng)?;
+        self.lock_repo(eng)?;
+        let repo = Repo::open(Self::root(eng))?;
+        let (kind, from, to, items) = match (&copy.from, &copy.to) {
+            (ItemRef::Skill(f), ItemRef::Skill(t)) => {
+                (ToggleKind::Skill, f, t, repo.skills()?.into_iter().map(|s| s.name).collect::<Vec<_>>())
+            }
+            (ItemRef::Rule(f), ItemRef::Rule(t)) => {
+                (ToggleKind::Rule, f, t, repo.rules()?.into_iter().map(|r| r.name).collect())
+            }
+            _ => return Err(Error::BadRequest("a copy needs two items of the same kind".into())),
+        };
+        if !items.contains(from) {
+            return Err(Error::BadRequest(format!("unknown item `{from}`")));
+        }
+        if items.contains(to) {
+            return Err(Error::Conflict(format!("`{to}` is already an item of this Machine")));
+        }
+        let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
+        self.reload_local_assignment()?;
+        let mut assignment = sk1ll_core::Assignment::load(&self.cfg.assignment)?;
+        let (mut applied, mut skipped) = (Vec::new(), Vec::new());
+        // A Harness this Machine no longer has can't take a toggle.
+        for (harness, h) in assignment.harnesses.iter_mut().filter(|(h, _)| harnesses.contains_key(*h)) {
+            let toggles = if kind == ToggleKind::Skill { &mut h.skills } else { &mut h.rules };
+            let Some(&enabled) = toggles.get(from) else { continue };
+            let change =
+                ToggleChange { harness: harness.clone(), kind, name: Some(to.clone()), enabled: Some(enabled) };
+            if toggles.contains_key(to) {
+                skipped.push(change);
+            } else {
+                toggles.insert(to.clone(), enabled);
+                applied.push(change);
+            }
+        }
+        if !applied.is_empty() {
+            assignment.save(&self.cfg.assignment)?;
+            self.saved_local_assignment(eng);
+        }
+        let snap = self.snapshot().expect("standalone always has assignment");
+        Ok(sk1ll_proto::AssignmentCopied {
+            assignment: snap.assignment.clone(),
+            revision: snap.revision,
+            registration: None,
+            entries: Vec::new(),
+            applied,
+            skipped,
         })
     }
 
@@ -1297,6 +1382,7 @@ impl Daemon {
                             enabled: Some(true),
                         })
                         .collect(),
+                    ..Default::default()
                 };
                 self.set_local_assignment(eng, &changes)?;
                 sync::unmanaged::complete(&repo, &harnesses, &adoption)?;
@@ -1331,7 +1417,7 @@ impl Daemon {
             };
             self.apply_assignment(
                 eng,
-                AssignmentSnapshot { revision: update.revision, assignment: update.assignment },
+                AssignmentSnapshot { revision: update.revision, assignment: update.assignment, registration: None },
             )?;
             let mut adoption = adoption;
             let snapshot = self.snapshot();
@@ -1931,72 +2017,233 @@ impl Daemon {
         self.refresh(eng)?;
         Ok(deleted?)
     }
-    /// Renames in the Draft, then copies this machine's explicit toggles for the
-    /// old name to the new one. The old name's toggles stay until a push drops
-    /// them, so restoring both Draft items undoes the rename.
+    /// Copies this machine's explicit toggles for the old name to the new one,
+    /// then renames in the Draft. The authority (the Server, or the daemon
+    /// itself when standalone) copies the toggles it has, keeping any the new
+    /// name already has. When it can't, nothing is renamed, unless the
+    /// request opts out of the copy. When the rename then moves nothing, the
+    /// toggles the copy wrote are removed again, unless the Assignment changed
+    /// meanwhile. The old name's toggles stay until a push drops them, so
+    /// restoring both Draft items undoes the rename.
     pub(crate) fn rename_item(
         &self,
         eng: &mut Engine,
         req: crate::client::RenameItemRequest,
     ) -> Result<crate::client::RenameItemResponse> {
-        use sk1ll_proto::{AssignmentChanges, ToggleChange, ToggleKind};
+        use sk1ll_core::repo::RenameError;
+        use sk1ll_proto::{AssignmentChanges, AssignmentCopy, Expected, ToggleChange};
         self.ensure_managed(eng)?;
         self.lock_repo(eng)?;
-        let renamed = Repo::open(Self::root(eng))?.rename_item(&req.kind, &req.name, &req.to);
-        self.refresh(eng)?;
-        renamed?;
-        let (item, kind) = if req.kind == "skill" {
-            (ItemRef::Skill(req.to.clone()), ToggleKind::Skill)
+        let repo = Repo::open(Self::root(eng))?;
+        repo.check_rename(&req.kind, &req.name, &req.to)?;
+        let (old, item) = if req.kind == "skill" {
+            (ItemRef::Skill(req.name.clone()), ItemRef::Skill(req.to.clone()))
         } else {
-            (ItemRef::Rule(req.to.clone()), ToggleKind::Rule)
+            (ItemRef::Rule(req.name.clone()), ItemRef::Rule(req.to.clone()))
         };
-        let snapshot = self.snapshot();
-        let changes: Vec<ToggleChange> = snapshot
-            .iter()
-            .flat_map(|s| &s.assignment.harnesses)
-            .filter_map(|(harness, h)| {
-                let toggles = if kind == ToggleKind::Skill { &h.skills } else { &h.rules };
-                toggles.get(&req.name).map(|&enabled| ToggleChange {
-                    harness: harness.clone(),
+        let mut response = crate::client::RenameItemResponse {
+            item: item.clone(),
+            migrated: Vec::new(),
+            kept: Vec::new(),
+            assignment_error: None,
+        };
+        // Always asked, even with no toggles in view: one set just now isn't missed.
+        let copied = if req.copy_assignment {
+            let copied = self.copy_for_rename(eng, &AssignmentCopy { from: old.clone(), to: item.clone() }, &req)?;
+            response.migrated = copied.applied.iter().map(|c| c.harness.clone()).collect();
+            response.kept = copied.skipped.iter().map(|c| c.harness.clone()).collect();
+            self.event(Event::Fleet);
+            Some(copied)
+        } else {
+            None
+        };
+        let error = match repo.rename_item(&req.kind, &req.name, &req.to) {
+            Ok(()) => {
+                if let Err(e) = self.refresh(eng) {
+                    self.set_error(format!("refreshing after renaming {old} to {item}: {e}"));
+                }
+                return Ok(response);
+            }
+            Err(RenameError::Moved(e)) => {
+                let _ = self.refresh(eng);
+                let copied = if response.migrated.is_empty() { "" } else { "; its Assignment was copied" };
+                return Err(Error::Internal(anyhow::anyhow!(
+                    "`{}` was renamed to `{}`, but updating its frontmatter `name:` failed: {e}{copied}",
+                    req.name,
+                    req.to
+                )));
+            }
+            Err(RenameError::NotMoved(e)) => e,
+        };
+        let _ = self.refresh(eng);
+        let Some(copied) = copied.filter(|c| !c.applied.is_empty()) else {
+            return Err(error.into());
+        };
+        // Nothing moved, so the toggles this copy wrote are unused: removed
+        // only from the Assignment it left, under the same registration.
+        let undo = AssignmentChanges {
+            changes: copied.applied.iter().map(|c| ToggleChange { enabled: None, ..c.clone() }).collect(),
+            expected: Some(Expected { revision: copied.revision, registration: copied.registration.clone() }),
+        };
+        let cleaned = match self.write_assignment(eng, &old, &undo, "Rename") {
+            Ok(_) => format!("the Assignment toggles copied to `{}` were removed again", req.to),
+            Err(e) => {
+                let e = crate::auth::redact(&format!("{e:#}"));
+                tracing::warn!("keeping the toggles copied to {item} after a failed rename: {e}");
+                format!(
+                    "the Assignment toggles copied to `{}` were kept in {} ({e}); they stay unused unless an item \
+                     named `{}` appears",
+                    req.to,
+                    response.migrated.join(", "),
+                    req.to
+                )
+            }
+        };
+        self.event(Event::Fleet);
+        Err(match Error::from(error) {
+            Error::BadRequest(m) => Error::BadRequest(format!("{m}; {cleaned}")),
+            Error::Conflict(m) => Error::Conflict(format!("{m}; {cleaned}")),
+            e => Error::Internal(anyhow::anyhow!("{e}; {cleaned}")),
+        })
+    }
+
+    /// Has this machine's Assignment authority copy the toggles of a rename,
+    /// or refuses the rename (HTTP 409) with why.
+    fn copy_for_rename(
+        &self,
+        eng: &mut Engine,
+        copy: &sk1ll_proto::AssignmentCopy,
+        req: &crate::client::RenameItemRequest,
+    ) -> Result<sk1ll_proto::AssignmentCopied> {
+        use crate::server::CopyFailure;
+        let refused = |why: String| {
+            let why = crate::auth::redact(&why);
+            tracing::warn!("not renaming {} to {}: its Assignment could not be copied: {why}", copy.from, copy.to);
+            Error::Conflict(format!(
+                "`{}` was not renamed: its Assignment could not be copied to `{}`: {why}. Try again, or rename \
+                 without copying the Assignment",
+                req.name, req.to
+            ))
+        };
+        if self.is_standalone() {
+            return self.copy_local_assignment(eng, copy).map_err(|e| refused(e.to_string()));
+        }
+        if !self.is_connected() {
+            return Err(refused("offline: the Server is unreachable".into()));
+        }
+        let copied = match tokio::runtime::Handle::current().block_on(crate::server::copy_assignment(self, copy)) {
+            Ok(copied) => copied,
+            Err(CopyFailure::Unsupported) => {
+                return Err(refused("Assignment copy is not supported by this Server".into()));
+            }
+            Err(CopyFailure::Refused(e)) => return Err(refused(format!("{e:#}"))),
+            Err(CopyFailure::Lost(e)) => self.lost_copy(copy, &e).map_err(|why| match why {
+                Some(why) => refused(why),
+                None => Error::Conflict(format!(
+                    "`{}` was not renamed: the Server may have copied its Assignment to `{}`, but its response was \
+                     lost ({}). `{}` may already have copied toggles; they stay unused unless an item with that \
+                     name appears. Try again, or rename without copying the Assignment",
+                    req.name,
+                    req.to,
+                    crate::auth::redact(&format!("{e:#}")),
+                    req.to
+                )),
+            })?,
+        };
+        let snapshot =
+            AssignmentSnapshot { revision: copied.revision, assignment: copied.assignment.clone(), registration: None };
+        // The Server took it either way; a failed sync shows in the status.
+        if let Err(e) = self.apply_assignment(eng, snapshot) {
+            tracing::warn!("applying the assignment after copying it for a rename: {e:#}");
+        }
+        Ok(copied)
+    }
+
+    /// Whether a copy whose response was lost applied, read from the
+    /// Assignment the Server has now: it did when the new name has exactly
+    /// the old name's explicit toggles (none, when there was nothing to
+    /// copy). `Err(Some(why))` when it certainly didn't, `Err(None)` when
+    /// that can't be told.
+    fn lost_copy(
+        &self,
+        copy: &sk1ll_proto::AssignmentCopy,
+        error: &anyhow::Error,
+    ) -> std::result::Result<sk1ll_proto::AssignmentCopied, Option<String>> {
+        use sk1ll_proto::{ToggleChange, ToggleKind};
+        let snapshot =
+            tokio::runtime::Handle::current().block_on(crate::server::fetch_assignment(self)).map_err(|e| {
+                tracing::warn!("re-reading the Assignment after a lost copy response: {e:#}");
+                None
+            })?;
+        let toggles = |item: &ItemRef| -> BTreeMap<String, bool> {
+            let (kind, name) = match item {
+                ItemRef::Skill(name) => (ToggleKind::Skill, name),
+                ItemRef::Rule(name) => (ToggleKind::Rule, name),
+                _ => return BTreeMap::new(),
+            };
+            snapshot
+                .assignment
+                .harnesses
+                .iter()
+                .filter_map(|(harness, h)| {
+                    (if kind == ToggleKind::Skill { &h.skills } else { &h.rules })
+                        .get(name)
+                        .map(|&enabled| (harness.clone(), enabled))
+                })
+                .collect()
+        };
+        let (from, to) = (toggles(&copy.from), toggles(&copy.to));
+        if from != to {
+            return Err(to.is_empty().then(|| format!("{error:#}; the Server has not copied it")));
+        }
+        let (kind, name) = match &copy.to {
+            ItemRef::Skill(name) => (ToggleKind::Skill, name),
+            ItemRef::Rule(name) => (ToggleKind::Rule, name),
+            _ => return Err(None),
+        };
+        Ok(sk1ll_proto::AssignmentCopied {
+            applied: to
+                .into_iter()
+                .map(|(harness, enabled)| ToggleChange {
+                    harness,
                     kind,
-                    name: Some(req.to.clone()),
+                    name: Some(name.clone()),
                     enabled: Some(enabled),
                 })
-            })
-            .collect();
-        let mut response =
-            crate::client::RenameItemResponse { item: item.clone(), migrated: Vec::new(), assignment_error: None };
-        if changes.is_empty() {
-            return Ok(response);
-        }
-        let changes = AssignmentChanges { changes };
-        let result = if self.is_standalone() {
-            self.set_local_assignment(eng, &changes).map_err(|e| anyhow::anyhow!(e))
-        } else if self.is_connected() {
-            tokio::runtime::Handle::current()
-                .block_on(crate::server::assign_draft_item(self, &item, &changes, "Rename"))
-        } else {
-            Err(anyhow::anyhow!("offline: the Server is unreachable"))
-        };
-        match result {
-            Ok(update) => {
-                if !self.is_standalone() {
-                    self.apply_assignment(
-                        eng,
-                        AssignmentSnapshot { revision: update.revision, assignment: update.assignment },
-                    )?;
-                }
-                response.migrated = changes.changes.into_iter().map(|c| c.harness).collect();
-                self.event(Event::Fleet);
-            }
-            Err(error) => {
-                let message = crate::auth::redact(&format!("{error:#}"));
-                tracing::warn!("renamed {} to {item}, but its Assignment was not carried over: {message}", req.name);
-                response.assignment_error = Some(message);
-            }
-        }
-        Ok(response)
+                .collect(),
+            skipped: Vec::new(),
+            entries: Vec::new(),
+            revision: snapshot.revision,
+            registration: snapshot.registration.clone(),
+            assignment: snapshot.assignment,
+        })
     }
+
+    /// Writes `changes` to this machine's Assignment authority: the local
+    /// Assignment when standalone, else the Server, once it knows `item`
+    /// (see [`crate::server::assign_draft_item`]), applying what it accepted.
+    fn write_assignment(
+        &self,
+        eng: &mut Engine,
+        item: &ItemRef,
+        changes: &sk1ll_proto::AssignmentChanges,
+        action: &str,
+    ) -> anyhow::Result<sk1ll_proto::AssignmentUpdate> {
+        if self.is_standalone() {
+            return self.set_local_assignment(eng, changes).map_err(|e| anyhow::anyhow!(e));
+        }
+        anyhow::ensure!(self.is_connected(), "offline: the Server is unreachable");
+        let update = tokio::runtime::Handle::current()
+            .block_on(crate::server::assign_draft_item(self, item, changes, action))?;
+        let snapshot =
+            AssignmentSnapshot { revision: update.revision, assignment: update.assignment.clone(), registration: None };
+        // The Server took it either way; a failed sync shows in the status.
+        if let Err(e) = self.apply_assignment(eng, snapshot) {
+            tracing::warn!("applying the assignment after {action}: {e:#}");
+        }
+        Ok(update)
+    }
+
     pub(crate) async fn local_imports(self: &Arc<Self>, check: bool) -> Result<crate::client::ImportsView> {
         let (root, entries) = self
             .reading(|d| {
@@ -2318,6 +2565,7 @@ mod tests {
                                     ..Default::default()
                                 }),
                                 scope: Default::default(),
+                                registration: None,
                             }],
                         })
                     }),
@@ -2415,6 +2663,241 @@ mod tests {
                     std::fs::read_to_string(destination.join("SKILL.md")).unwrap(),
                     if scenario == "edit_repo" { "later edit" } else { "original" }
                 );
+            }
+            server.abort();
+        }
+    }
+
+    /// A joined daemon for machine `a` with Harness `h`, the Draft skill
+    /// `pdf` and a cached Assignment that turns it on, against a fake Server.
+    async fn fake_fleet_daemon(dir: &Path, app: axum::Router) -> (Arc<Daemon>, tokio::task::JoinHandle<()>) {
+        let root = dir.join("repo");
+        let repo = Repo::init(&root).unwrap();
+        repo.create_item("skill", "pdf", "PDF").unwrap();
+        let app = app.route(
+            "/api/fleet",
+            axum::routing::get(|| async {
+                axum::Json(sk1ll_proto::FleetView {
+                    baseline: None,
+                    machines: vec![sk1ll_proto::MachineRow {
+                        id: "a".into(),
+                        status: sk1ll_proto::MachineStatus::Drafting,
+                        connected: true,
+                        joined_at: 0,
+                        last_seen: None,
+                        report: Some(MachineReport {
+                            drafts: vec![ItemRef::Skill("pdf".into())],
+                            ..Default::default()
+                        }),
+                        scope: Default::default(),
+                        registration: Some("r1".into()),
+                    }],
+                })
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut cfg = Config::new().unwrap();
+        cfg.state = dir.join("state/daemon.json");
+        cfg.assignment = dir.join("assignment.json");
+        cfg.machine_config = dir.join("machine.toml");
+        std::fs::write(
+            &cfg.machine_config,
+            format!(
+                "[harnesses.h]\nskills = {:?}\nmode = \"copy\"\n\
+                 [harnesses.claude]\nenabled = false\n[harnesses.codex]\nenabled = false\n\
+                 [harnesses.opencode]\nenabled = false\n[harnesses.gemini]\nenabled = false\n",
+                dir.join("h")
+            ),
+        )
+        .unwrap();
+        let mut snap = AssignmentSnapshot { revision: 1, ..Default::default() };
+        snap.assignment.set_skill("h", "pdf", true);
+        state::save_snapshot(&cfg.snapshot_path(), &snap).unwrap();
+        let state = DaemonState {
+            machine_id: "a".into(),
+            token: "t".into(),
+            server_url: format!("http://{address}"),
+            repo: root,
+            revoked: false,
+        };
+        let d = Daemon::new(cfg, state).unwrap();
+        d.set_connection(Connection::Connected);
+        (d, server)
+    }
+
+    /// The Server's Assignment of `a` with `pdf` on in `h`, and `docs` as given.
+    fn fake_assignment(docs: Option<bool>) -> sk1ll_proto::Assignment {
+        let mut assignment = sk1ll_proto::Assignment::default();
+        assignment.set_skill("h", "pdf", true);
+        if let Some(docs) = docs {
+            assignment.set_skill("h", "docs", docs);
+        }
+        assignment
+    }
+
+    async fn rename_pdf(d: &Arc<Daemon>) -> Result<crate::client::RenameItemResponse> {
+        let req = crate::client::RenameItemRequest {
+            kind: "skill".into(),
+            name: "pdf".into(),
+            to: "docs".into(),
+            copy_assignment: true,
+        };
+        d.blocking(move |d, eng| d.rename_item(eng, req)).await
+    }
+
+    #[tokio::test]
+    async fn a_server_without_assignment_copies_refuses_the_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        // A 0.1.0 Server: no copy route.
+        let (d, server) = fake_fleet_daemon(dir.path(), axum::Router::new()).await;
+        let error = rename_pdf(&d).await.unwrap_err();
+        assert!(matches!(&error, Error::Conflict(m) if m.contains("not supported by this Server")), "{error}");
+        assert!(dir.path().join("repo/personal/pdf").is_dir() && !dir.path().join("repo/personal/docs").exists());
+        // Renaming without the copy still works.
+        let req = crate::client::RenameItemRequest {
+            kind: "skill".into(),
+            name: "pdf".into(),
+            to: "docs".into(),
+            copy_assignment: false,
+        };
+        let renamed = d.blocking(move |d, eng| d.rename_item(eng, req)).await.unwrap();
+        assert!(renamed.migrated.is_empty());
+        assert!(dir.path().join("repo/personal/docs").is_dir());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_lost_copy_response_is_resolved_from_the_servers_assignment() {
+        use axum::routing::{get, post};
+        for docs in [Some(true), Some(false), None] {
+            let dir = tempfile::tempdir().unwrap();
+            let committed = Arc::new(AtomicBool::new(false));
+            let app = axum::Router::new()
+                .route(
+                    "/api/machines/a/assignment/copy",
+                    post({
+                        let committed = committed.clone();
+                        move || async move {
+                            // The Server commits, then the connection drops mid-response.
+                            committed.store(true, Ordering::SeqCst);
+                            let chunks: Vec<std::io::Result<bytes::Bytes>> =
+                                vec![Ok("{".into()), Err(std::io::Error::other("dropped"))];
+                            axum::body::Body::from_stream(futures_util::stream::iter(chunks))
+                        }
+                    }),
+                )
+                .route(
+                    "/api/machines/a/assignment",
+                    get({
+                        let committed = committed.clone();
+                        move || async move {
+                            assert!(committed.load(Ordering::SeqCst));
+                            axum::Json(AssignmentSnapshot {
+                                revision: 2,
+                                assignment: fake_assignment(docs),
+                                registration: Some("r1".into()),
+                            })
+                        }
+                    }),
+                );
+            let (d, server) = fake_fleet_daemon(dir.path(), app).await;
+            let result = rename_pdf(&d).await;
+            let renamed = dir.path().join("repo/personal/docs").is_dir();
+            match docs {
+                // `docs` has exactly `pdf`'s toggles: the copy applied.
+                Some(true) => {
+                    assert_eq!(result.unwrap().migrated, ["h"]);
+                    assert!(renamed);
+                    assert_eq!(d.snapshot().unwrap().revision, 2);
+                }
+                // Something else: it can't be told, so nothing is renamed.
+                Some(false) => {
+                    let error = result.unwrap_err();
+                    assert!(
+                        matches!(&error, Error::Conflict(m) if m.contains("may already have copied toggles")),
+                        "{error}"
+                    );
+                    assert!(!renamed);
+                }
+                // Nothing on `docs`: the copy certainly didn't apply.
+                None => {
+                    let error = result.unwrap_err();
+                    assert!(matches!(&error, Error::Conflict(m) if m.contains("has not copied it")), "{error}");
+                    assert!(!renamed);
+                }
+            }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_destination_that_appears_after_the_copy_removes_only_its_toggles_under_a_guard() {
+        use axum::routing::{post, put};
+        use sk1ll_proto::{AssignmentChanges, AssignmentCopied, AssignmentUpdate, ToggleChange, ToggleKind};
+        for guard_holds in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let destination = dir.path().join("repo/personal/docs");
+            let cleanup = Arc::new(Mutex::new(None::<AssignmentChanges>));
+            let app = axum::Router::new()
+                .route(
+                    "/api/machines/a/assignment/copy",
+                    post({
+                        let destination = destination.clone();
+                        move || async move {
+                            // Another writer creates the destination before the rename.
+                            std::fs::create_dir_all(&destination).unwrap();
+                            axum::Json(AssignmentCopied {
+                                assignment: fake_assignment(Some(true)),
+                                revision: 2,
+                                registration: Some("r1".into()),
+                                entries: vec![],
+                                applied: vec![ToggleChange {
+                                    harness: "h".into(),
+                                    kind: ToggleKind::Skill,
+                                    name: Some("docs".into()),
+                                    enabled: Some(true),
+                                }],
+                                skipped: vec![],
+                            })
+                        }
+                    }),
+                )
+                .route(
+                    "/api/machines/a/assignment",
+                    put({
+                        let cleanup = cleanup.clone();
+                        move |axum::Json(body): axum::Json<AssignmentChanges>| async move {
+                            *cleanup.lock().unwrap() = Some(body);
+                            if !guard_holds {
+                                let error = sk1ll_proto::ErrorBody { error: "changed since revision 2".into() };
+                                return (axum::http::StatusCode::CONFLICT, serde_json::to_string(&error).unwrap());
+                            }
+                            let update =
+                                AssignmentUpdate { assignment: fake_assignment(None), revision: 3, entries: vec![] };
+                            (axum::http::StatusCode::OK, serde_json::to_string(&update).unwrap())
+                        }
+                    }),
+                );
+            let (d, server) = fake_fleet_daemon(dir.path(), app).await;
+            let error = rename_pdf(&d).await.unwrap_err();
+            assert!(dir.path().join("repo/personal/pdf").is_dir(), "nothing moved");
+            let cleanup = cleanup.lock().unwrap().take().expect("a cleanup write");
+            assert_eq!(cleanup.expected, Some(sk1ll_proto::Expected { revision: 2, registration: Some("r1".into()) }));
+            assert_eq!(
+                cleanup.changes,
+                [ToggleChange {
+                    harness: "h".into(),
+                    kind: ToggleKind::Skill,
+                    name: Some("docs".into()),
+                    enabled: None
+                }]
+            );
+            if guard_holds {
+                assert!(error.to_string().contains("were removed again"), "{error}");
+            } else {
+                assert!(error.to_string().contains("were kept in h"), "{error}");
             }
             server.abort();
         }

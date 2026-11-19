@@ -9,25 +9,44 @@ import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuGro
 import { Checkbox } from '@/components/ui/checkbox';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
-import { api } from './api';
-import { cellState, emptyHarness, itemStateLabel, mergeAssignments, splitItem, terms } from './model';
+import { api, errorMessage } from './api';
+import { cellState, emptyHarness, itemStateLabel, mergeAssignments, own, registrationOf, splitItem, stamped, terms } from './model';
+import type { StampedSnapshot } from './model';
 import { matrixCheckbox, useAssignmentWrites } from './assignments';
 import { useResource } from './hooks';
 import { toast } from './toast';
 import { cn } from '@/lib/utils';
 import { CheckboxSwatch, ErrorNotice, KindBadge, Loading, Nothing, Panel, PanelToolbar, Pending } from './shared';
-import type { CachedAssignmentSnapshot as AssignmentSnapshot, ItemView, StatusView, ToggleChange } from './types';
+import type { ItemView, MachineRow, StatusView, ToggleChange } from './types';
 
 const loadMatrix = async (status: StatusView) => {
-  const [fleet, items] = await Promise.all([status.mode === 'standalone' ? Promise.resolve({ baseline: status.report.baseline, machines: [{ id: status.machine_id, status: status.headline, connected: true, joined_at: 0, last_seen: null, report: status.report }] }) : api.fleet(), api.items()]);
-  const assignments: Record<string, AssignmentSnapshot> = Object.fromEntries(await Promise.all(fleet.machines.map(async machine =>
-    [machine.id, await api.assignment(machine.id)] as const)));
-  return { fleet, items, assignments };
+  const [fleet, items] = await Promise.all([status.mode === 'standalone' ? Promise.resolve({ baseline: status.report.baseline, machines: [{ id: status.machine_id, status: status.headline, connected: true, joined_at: 0, last_seen: null, report: status.report, registration: null }] }) : api.fleet(), api.items()]);
+  // Each Machine loads on its own: one that fails (removed meanwhile, say) leaves the others usable.
+  const results = await Promise.allSettled(fleet.machines.map(machine => loadAssignment(machine)));
+  const ids = fleet.machines.map(machine => machine.id);
+  const assignments: Record<string, StampedSnapshot> = Object.fromEntries(results.flatMap((result, i) => result.status === 'fulfilled' ? [[ids[i], result.value]] : []));
+  const failed: Record<string, string> = Object.fromEntries(results.flatMap((result, i) => result.status === 'rejected' ? [[ids[i], errorMessage(result.reason)]] : []));
+  return { fleet, items, assignments, failed };
 };
 type MatrixData = Awaited<ReturnType<typeof loadMatrix>>;
-const mergeMatrix = (previous: MatrixData | undefined, next: MatrixData): MatrixData => ({
-  ...next, assignments: mergeAssignments(previous?.assignments ?? {}, next.assignments),
-});
+// Tagged with the registration it was requested for. A reply for another one (the Machine joined again meanwhile) is refused.
+async function loadAssignment(machine: Pick<MachineRow, 'id' | 'registration' | 'joined_at'>) {
+  const snapshot = await stamped(() => api.assignment(machine.id));
+  if (machine.registration && snapshot.registration && snapshot.registration !== machine.registration) throw new Error(`${machine.id} joined the Fleet again meanwhile; refresh to load its Assignment`);
+  return { ...snapshot, registration: registrationOf(machine) };
+}
+const registrationIn = (data: MatrixData | undefined, machine: string) => {
+  const row = data?.fleet.machines.find(m => m.id === machine);
+  return row && registrationOf(row);
+};
+const without = (record: Record<string, string>, key: string) => Object.fromEntries(Object.entries(record).filter(([id]) => id !== key));
+// A Machine that left the Fleet, or joined again (a new registration starts its revisions over), keeps no cached snapshot.
+const mergeMatrix = (previous: MatrixData | undefined, next: MatrixData): MatrixData => {
+  const joined = new Map(next.fleet.machines.map(machine => [machine.id, registrationOf(machine)]));
+  const cached = Object.fromEntries(Object.entries(previous?.assignments ?? {}).filter(([id, snapshot]) => joined.has(id) && snapshot.registration === joined.get(id)));
+  return { ...next, assignments: mergeAssignments(cached, next.assignments) };
+};
+const sameSnapshot = (a: StampedSnapshot | undefined, b: StampedSnapshot) => !!a && a.revision === b.revision && JSON.stringify(a.assignment) === JSON.stringify(b.assignment);
 const readIds = (key: string) => {
   try {
     const stored: unknown = JSON.parse(localStorage.getItem(key) ?? 'null');
@@ -76,6 +95,26 @@ function AuthorityMatrix({ revision, status, target }: MatrixProps) {
   }, []);
   const resource = useResource(load, revision, mergeMatrix);
   const { pending, errors, write, assignment } = useAssignmentWrites(resource);
+  const latest = useRef(resource.data);
+  useEffect(() => { latest.current = resource.data; }, [resource.data]);
+  const [retrying, setRetrying] = useState<ReadonlySet<string>>(new Set());
+  const retry = async (machine: string) => {
+    setRetrying(old => new Set(old).add(machine));
+    // A Machine that left the Fleet or joined again meanwhile stays out.
+    const registration = registrationIn(latest.current, machine);
+    const member = (previous: MatrixData) => registration !== undefined && registrationIn(previous, machine) === registration;
+    try {
+      const row = latest.current?.fleet.machines.find(m => m.id === machine);
+      if (!row) return;
+      const snapshot = await loadAssignment(row);
+      if (active.current) resource.setData(previous => previous && member(previous) ? { ...previous,
+        assignments: mergeAssignments(previous.assignments, { [machine]: snapshot }), failed: without(previous.failed, machine) } : previous);
+    } catch (error) {
+      if (active.current) resource.setData(previous => previous && member(previous) ? { ...previous, failed: { ...previous.failed, [machine]: errorMessage(error) } } : previous);
+    } finally {
+      if (active.current) setRetrying(old => { const next = new Set(old); next.delete(machine); return next; });
+    }
+  };
   useEffect(() => {
     if (!target || visited.current === target || !destination.current) return;
     visited.current = target;
@@ -94,14 +133,15 @@ function AuthorityMatrix({ revision, status, target }: MatrixProps) {
     && (kindFilter === 'all' || splitItem(i.item).kind === kindFilter)
     && `${splitItem(i.item).name} ${i.description ?? ''}`.toLowerCase().includes(search.toLowerCase()));
   const selected = data.fleet.machines.filter(machine => standalone || machines === null || machines.includes(machine.id));
-  const groups = selected.map(machine => ({ machine, harnesses: [...new Set([
-    ...(machine.report?.harnesses ?? []), ...Object.keys(data.assignments[machine.id].assignment.harnesses),
-  ])].sort(), collapsed: collapsed.includes(machine.id), offline: !machine.connected || machine.status === 'offline' })).filter(g => g.harnesses.length);
+  // A Machine whose Assignment failed to load has no columns, only its error; nothing reads or writes its Assignment.
+  const groups = selected.map(machine => ({ machine, loaded: !!own(data.assignments, machine.id), harnesses: [...new Set([
+    ...(machine.report?.harnesses ?? []), ...Object.keys(own(data.assignments, machine.id)?.assignment.harnesses ?? {}),
+  ])].sort(), collapsed: collapsed.includes(machine.id), offline: !machine.connected || machine.status === 'offline' })).filter(g => g.harnesses.length || !g.loaded);
   const offline = new Set(groups.filter(g => g.offline).map(g => g.machine.id));
-  const columns = groups.flatMap(({ machine, harnesses, collapsed }) => collapsed ? [] : harnesses.map(harness => ({ machine: machine.id, harness })));
-  // A collapsed Machine keeps one summary column so it can be expanded again.
+  const columns = groups.flatMap(({ machine, harnesses, collapsed, loaded }) => collapsed || !loaded ? [] : harnesses.map(harness => ({ machine: machine.id, harness })));
+  // A collapsed or unloaded Machine keeps one summary column so it can be expanded or retried.
   const segments = <T,>(column: (c: (typeof columns)[number]) => T, summary: (g: (typeof groups)[number]) => T) =>
-    groups.flatMap(g => g.collapsed ? [summary(g)] : g.harnesses.map(harness => column({ machine: g.machine.id, harness })));
+    groups.flatMap(g => g.collapsed || !g.loaded ? [summary(g)] : g.harnesses.map(harness => column({ machine: g.machine.id, harness })));
   const cell = (item: ItemView, machine: string, harness: string) => {
     const state = cellState(assignment(machine), harness, item.item);
     const defaults = assignment(machine).harnesses[harness] ?? emptyHarness();
@@ -118,12 +158,12 @@ function AuthorityMatrix({ revision, status, target }: MatrixProps) {
       <Tooltip><TooltipTrigger render={<label className="inline-flex min-h-8 min-w-8 cursor-pointer items-center justify-center rounded-sm focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
         tabIndex={localOnly ? 0 : undefined} role={localOnly ? 'group' : undefined}
         aria-label={localOnly ? `${item.item} in ${machine} / ${harness}, unavailable` : undefined} aria-description={localOnly ? reason : undefined} />}>
-        <Checkbox ref={focused ? destination : undefined} className={matrixCheckbox(state.explicit, state.enabled)} checked={state.enabled} disabled={localOnly || pending[machine]}
+        <Checkbox ref={focused ? destination : undefined} className={matrixCheckbox(state.explicit, state.enabled)} checked={state.enabled} disabled={localOnly || !!pending.get(machine)}
           aria-label={`${item.item} in ${machine} / ${harness}, ${state.explicit ? 'explicit' : 'inherited'}`}
           aria-description={localOnly ? reason : note || undefined}
           onCheckedChange={enabled => void write(machine, [{ harness, kind: kind as 'skill' | 'rule', name, enabled }])} />
       </TooltipTrigger><TooltipContent className="max-w-64">{reason}</TooltipContent></Tooltip>
-      <span className="inline-flex size-6 shrink-0 items-center justify-center">{state.explicit && !localOnly && <Tooltip><TooltipTrigger render={<Button size="icon-xs" variant="ghost" disabled={pending[machine]}
+      <span className="inline-flex size-6 shrink-0 items-center justify-center">{state.explicit && !localOnly && <Tooltip><TooltipTrigger render={<Button size="icon-xs" variant="ghost" disabled={!!pending.get(machine)}
         aria-label={`Use default for ${item.item} in ${machine} / ${harness}`}
         onClick={() => void write(machine, [{ harness, kind: kind as 'skill' | 'rule', name, enabled: null }])} />}>
         <RotateCcw /></TooltipTrigger><TooltipContent>Inherit the Harness default</TooltipContent></Tooltip>}</span>
@@ -131,32 +171,59 @@ function AuthorityMatrix({ revision, status, target }: MatrixProps) {
   };
   // Writes once per Machine, then announces what the Server accepted.
   const bulk = async (selected: ItemView[], selectedColumns: typeof columns, enabled: boolean | null, title: (changes: number) => string) => {
-    const accepted = await Promise.all(groups.map(async ({ machine }) => {
+    const accepted = await Promise.all(groups.filter(g => g.loaded).map(async ({ machine }) => {
       const changes: ToggleChange[] = selectedColumns.filter(c => c.machine === machine.id).flatMap(c =>
         selected.filter(item => item.in_baseline || machine.id === status.machine_id).map(item => {
           const { kind, name } = splitItem(item.item);
           return { harness: c.harness, kind: kind as 'skill' | 'rule', name, enabled };
         }));
+      // The values shown, at the revision shown: the write applies only to that revision, so they are what Undo restores.
+      const shown = own(data.assignments, machine.id)!;
       const previous = changes.map(change => {
-        const state = cellState(assignment(machine.id), change.harness, `${change.kind}:${change.name}`);
+        const state = cellState(shown.assignment, change.harness, `${change.kind}:${change.name}`);
         return { ...change, enabled: state.explicit ? state.enabled : null };
       });
-      return await write(machine.id, changes) ? { machine: machine.id, changes: changes.length, previous } : null;
+      const expected = { revision: shown.revision, ...machine.registration && { registration: machine.registration } };
+      const snapshot = await write(machine.id, changes, { expected });
+      // Only an authority that checks `expected` can guard an Undo: the Daemon standalone, or a Server that reports registrations.
+      const guarded = standalone || !!machine.registration;
+      return snapshot ? { machine: machine.id, registration: registrationOf(machine), changes: changes.length, previous, snapshot, guarded } : null;
     }));
     if (!active.current) return;
     const done = accepted.filter(result => result !== null), later = done.filter(result => offline.has(result.machine)).map(result => result.machine);
+    const undoable = done.filter(result => result.guarded);
     if (done.length) toast({ title: title(done.reduce((sum, result) => sum + result.changes, 0)),
-      action: { label: 'Undo', run: () => {
-        if (!active.current) {
+      action: !undoable.length ? undefined : { label: 'Undo', run: () => {
+        // Checked now: only a Machine still in the Fleet, under the same registration, whose Assignment is still what this update left.
+        const now = active.current ? latest.current : undefined;
+        const current = now ? undoable.filter(result => registrationIn(now, result.machine) === result.registration
+          && sameSnapshot(own(now.assignments, result.machine), result.snapshot)) : [];
+        if (!current.length) {
           toast({ title: 'Undo is no longer available', description: 'The Machine or Fleet changed since this bulk update.' });
           return;
         }
+        const changed = undoable.length - current.length;
         void (async () => {
-        const results = await Promise.all(done.map(async result => ({ ...result, restored: await write(result.machine, result.previous) })));
+        // The authority checks again as it writes: a newer Assignment, or a new registration, refuses the Undo.
+        const results = await Promise.all(current.map(async result => {
+          let conflict = false;
+          const row = now!.fleet.machines.find(m => m.id === result.machine);
+          const expected = { revision: result.snapshot.revision, ...row?.registration && { registration: row.registration } };
+          const restored = !!await write(result.machine, result.previous, { expected, onConflict: () => { conflict = true; } });
+          return { ...result, restored, conflict };
+        }));
         if (!active.current) return;
+        const conflicts = results.filter(result => result.conflict).length;
+        if (conflicts === results.length) {
+          toast({ title: 'Undo is no longer available', description: 'The Assignment changed since this bulk update. The matrix shows the current one.' });
+          return;
+        }
         const restored = results.filter(result => result.restored).reduce((sum, result) => sum + result.changes, 0);
-        toast({ title: `Restored ${count(restored, 'Assignment', 'Assignments')}`, tone: results.every(result => result.restored) ? 'default' : 'destructive',
-          description: results.some(result => !result.restored) ? 'Some Assignments could not be restored. Check the Machine errors and retry.' : undefined });
+        const failed = results.some(result => !result.restored && !result.conflict);
+        const kept = changed + conflicts;
+        toast({ title: `Restored ${count(restored, 'Assignment', 'Assignments')}`, tone: !failed && !kept ? 'default' : 'destructive',
+          description: [failed && 'Some Assignments could not be restored. Check the Machine errors and retry.',
+            kept && `${count(kept, 'Machine', 'Machines')} changed since this bulk update and kept the current Assignment.`].filter(Boolean).join(' ') || undefined });
       })(); } },
       description: later.length ? `Applies when ${later.join(', ')} ${later.length === 1 ? 'reconnects' : 'reconnect'}.` : undefined });
   };
@@ -168,10 +235,13 @@ function AuthorityMatrix({ revision, status, target }: MatrixProps) {
   const columnBulk = (c: (typeof columns)[number], enabled: boolean) => void bulk(items, [c], enabled, n => `${verb(enabled)} ${count(n, 'item', 'items')} in ${c.machine} / ${c.harness}`);
   const rowBulk = (item: ItemView, enabled: boolean | null) => void bulk([item], columns, enabled,
     n => `${verb(enabled)} ${splitItem(item.item).name}${enabled === null ? ' to the default' : ''} in ${count(n, 'Harness', 'Harnesses')}`);
-  const saving = Object.entries(pending).filter(([, value]) => value).map(([id]) => id);
+  const saving = [...pending.keys()];
   return <>
-    <ErrorNotice error={resource.error} />{Object.entries(errors).filter(([, value]) => value).map(([id, error]) =>
+    <ErrorNotice error={resource.error} />{[...errors].map(([id, error]) =>
       <ErrorNotice key={id} error={`${id}: ${error}`} />)}
+    {/* A failed refresh keeps the last snapshot usable; a first load that failed shows in the Machine's column. */}
+    {Object.entries(data.failed).filter(([id]) => own(data.assignments, id)).map(([id, error]) =>
+      <ErrorNotice key={`refresh-${id}`} title="Could not refresh Assignment" error={`${id}: ${error}`} />)}
     <Panel>
     <PanelToolbar>
       <Input aria-label="Search items" placeholder={terms.search} value={search} onChange={event => setSearch(event.target.value)} className="h-8 w-52" />
@@ -199,11 +269,11 @@ function AuthorityMatrix({ revision, status, target }: MatrixProps) {
     {groups.length > 0 && <div className="overflow-hidden [&_[data-slot=table-container]]:max-h-[max(24rem,calc(100svh-9rem))] [&_[data-slot=table-container]]:scroll-pt-[4.5rem]"><Table aria-label="Assignment matrix" stickyFirstColumn>
       <TableHeader><TableRow className="bg-muted hover:bg-muted">
         <TableHead rowSpan={2} scope="col" className="sticky top-0 left-0 z-30! min-w-48 bg-muted align-bottom shadow-[inset_0_-1px_0_var(--color-border)] md:min-w-64">Skill / Rule</TableHead>
-        {groups.map(g => <TableHead key={g.machine.id} scope="colgroup" colSpan={g.collapsed ? 1 : g.harnesses.length}
+        {groups.map(g => <TableHead key={g.machine.id} scope="colgroup" colSpan={g.collapsed || !g.loaded ? 1 : g.harnesses.length}
           aria-label={[g.machine.id, g.machine.id === status.machine_id && 'This Machine', g.offline && 'Offline'].filter(Boolean).join(', ')} className={cn(headEdge, 'top-0 pl-1')}><div className="flex items-center gap-1.5">
-          <Button size="icon-xs" variant="ghost" className="text-muted-foreground aria-expanded:bg-transparent aria-expanded:text-muted-foreground aria-expanded:hover:bg-muted" aria-expanded={!g.collapsed} aria-label={`${g.machine.id} Harnesses`}
+          {g.loaded ? <Button size="icon-xs" variant="ghost" className="text-muted-foreground aria-expanded:bg-transparent aria-expanded:text-muted-foreground aria-expanded:hover:bg-muted" aria-expanded={!g.collapsed} aria-label={`${g.machine.id} Harnesses`}
             onClick={() => setCollapsed(old => g.collapsed ? old.filter(id => id !== g.machine.id) : [...old, g.machine.id])}>
-            <ChevronRight className={cn('transition-transform', !g.collapsed && 'rotate-90')} /></Button>
+            <ChevronRight className={cn('transition-transform', !g.collapsed && 'rotate-90')} /></Button> : <span aria-hidden className="size-6" />}
           {g.machine.id}{g.machine.id === status.machine_id && <Badge variant="outline" className="border-primary/20 bg-brand-soft text-brand-ink">This Machine</Badge>}
           {g.offline && <span className="inline-flex items-center gap-1.5 text-xs font-normal text-muted-foreground"><span aria-hidden className="size-2 rounded-full border-[1.5px] border-muted-foreground" />Offline</span>}
         </div></TableHead>)}
@@ -211,8 +281,12 @@ function AuthorityMatrix({ revision, status, target }: MatrixProps) {
         {segments(c => <TableHead key={`${c.machine}/${c.harness}`} scope="col" className={cn(headEdge, 'top-10 h-8 min-w-28 font-mono text-xs font-normal text-muted-foreground')}><div className="flex items-center justify-between gap-1">{c.harness}{menu(`Actions for ${c.machine} / ${c.harness}`, [
           { label: 'Enable all visible items', run: () => columnBulk(c, true) },
           { label: 'Disable all visible items', run: () => columnBulk(c, false) },
-        ], !!pending[c.machine] || !items.some(item => item.in_baseline || c.machine === status.machine_id))}</div></TableHead>,
-        g => <TableHead key={`${g.machine.id}/collapsed`} scope="col" className={cn(headEdge, 'top-10 h-8 text-xs font-normal text-muted-foreground')}>{count(g.harnesses.length, 'Harness', 'Harnesses')}</TableHead>)}
+        ], !!pending.get(c.machine) || !items.some(item => item.in_baseline || c.machine === status.machine_id))}</div></TableHead>,
+        g => g.loaded ? <TableHead key={`${g.machine.id}/collapsed`} scope="col" className={cn(headEdge, 'top-10 h-8 text-xs font-normal text-muted-foreground')}>{count(g.harnesses.length, 'Harness', 'Harnesses')}</TableHead>
+          : <TableHead key={`${g.machine.id}/unavailable`} scope="col" className={cn(headEdge, 'top-10 h-auto min-w-56 py-1.5 text-xs font-normal whitespace-normal')}>
+            <div role="alert" className="flex items-start justify-between gap-2"><span className="min-w-0 break-words text-destructive-foreground">Assignment not loaded: {own(data.failed, g.machine.id)}</span>
+              <Button size="xs" variant="outline" className="shrink-0" disabled={retrying.has(g.machine.id)} aria-label={`Retry loading the Assignment of ${g.machine.id}`}
+                onClick={() => void retry(g.machine.id)}><Pending pending={retrying.has(g.machine.id)}>Retry</Pending></Button></div></TableHead>)}
       </TableRow></TableHeader>
       <TableBody>
         {(['skill', 'rule'] as const).map(kind => <TableRow key={kind} className={cn('bg-muted/40 hover:bg-muted/40', kind === 'rule' && 'border-b-2')}>
@@ -223,11 +297,11 @@ function AuthorityMatrix({ revision, status, target }: MatrixProps) {
           {segments(c => <TableCell key={`${c.machine}/${c.harness}`} className="border-l"><label className="flex min-h-8 cursor-pointer items-center justify-center pr-7">
             <Switch.Root className="inline-flex h-[18px] w-8 shrink-0 cursor-pointer items-center rounded-full bg-control-border/45 p-0.5 transition-colors outline-none focus-visible:ring-3 focus-visible:ring-ring data-checked:bg-foreground/75 data-disabled:cursor-not-allowed data-disabled:opacity-50"
               checked={(assignment(c.machine).harnesses[c.harness] ?? emptyHarness())[kind === 'skill' ? 'new_skills_default' : 'new_rules_default']}
-              disabled={pending[c.machine]} aria-label={`Default for new ${kind}s in ${c.machine} / ${c.harness}`} aria-describedby="default-hint"
+              disabled={!!pending.get(c.machine)} aria-label={`Default for new ${kind}s in ${c.machine} / ${c.harness}`} aria-describedby="default-hint"
               onCheckedChange={enabled => void write(c.machine, [{ harness: c.harness,
                 kind: kind === 'skill' ? 'new_skills_default' : 'new_rules_default', enabled }])}>
               <Switch.Thumb className="size-3.5 rounded-full bg-card shadow-sm transition-transform data-checked:translate-x-3.5" /></Switch.Root></label></TableCell>,
-          g => <TableCell key={`${g.machine.id}/collapsed`} className="border-l" />)}
+          g => <TableCell key={`${g.machine.id}/${g.loaded ? 'collapsed' : 'unavailable'}`} className="border-l" />)}
         </TableRow>)}
         {items.map(item => <TableRow key={item.item}>
           <TableHead scope="row" className="sticky left-0 z-10 h-14 min-w-60 max-w-80 bg-background py-2 pr-9 font-normal whitespace-normal">
@@ -238,11 +312,12 @@ function AuthorityMatrix({ revision, status, target }: MatrixProps) {
                 { label: 'Enable in all visible Harnesses', run: () => rowBulk(item, true) },
                 { label: 'Disable in all visible Harnesses', run: () => rowBulk(item, false) },
                 { label: 'Reset all to default', run: () => rowBulk(item, null) },
-              ], !columns.length || columns.some(c => pending[c.machine]) || !columns.some(c => item.in_baseline || c.machine === status.machine_id))}</span>
+              ], !columns.length || columns.some(c => pending.get(c.machine)) || !columns.some(c => item.in_baseline || c.machine === status.machine_id))}</span>
               {itemStateLabel(item) && <Badge variant="info">{itemStateLabel(item)}</Badge>}</div>
             {item.description && <p className="mt-1 text-xs text-muted-foreground">{item.description}</p>}
           </TableHead>
           {segments(c => cell(item, c.machine, c.harness), g => {
+            if (!g.loaded) return <TableCell key={`${g.machine.id}/unavailable`} className="border-l" />;
             const on = g.harnesses.filter(harness => cellState(assignment(g.machine.id), harness, item.item).enabled).length;
             return <TableCell key={`${g.machine.id}/collapsed`} className="border-l text-center text-xs text-muted-foreground tabular-nums">
               <span aria-hidden>{on}/{g.harnesses.length}</span><span className="sr-only">Enabled in {on} of {count(g.harnesses.length, 'Harness', 'Harnesses')}</span></TableCell>;

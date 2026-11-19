@@ -16,10 +16,11 @@ use axum::http::StatusCode;
 use axum::http::request::Parts;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use rusqlite::Connection;
 use sk1ll_proto::{
-    Assignment, AssignmentChanges, AssignmentSnapshot, AssignmentUpdate, FleetView, ImportsView, JoinCode,
-    JoinCodeRequest, JoinRequest, JoinResponse, LogCause, LogEntry, LogFacets, LogQuery, MachineRow, REPO_PATH,
-    headline,
+    Assignment, AssignmentChanges, AssignmentCopied, AssignmentCopy, AssignmentSnapshot, AssignmentUpdate, FleetView,
+    ImportsView, JoinCode, JoinCodeRequest, JoinRequest, JoinResponse, LogCause, LogEntry, LogFacets, LogQuery,
+    MachineRow, REPO_PATH, ToggleChange, headline,
 };
 
 use crate::assign::{self, Change};
@@ -35,6 +36,7 @@ pub fn routes() -> Router<Arc<Server>> {
         .route("/fleet", get(fleet))
         .route("/machines/{id}", delete(remove_machine))
         .route("/machines/{id}/assignment", get(get_assignment).put(put_assignment))
+        .route("/machines/{id}/assignment/copy", post(copy_assignment))
         .route("/log", get(log))
         .route("/log/facets", get(log_facets))
         .route("/log/{id}/undo", post(undo))
@@ -174,6 +176,7 @@ async fn fleet(State(server): ServerState, _: Caller) -> Result<Json<FleetView>>
                 last_seen: m.last_seen,
                 report: m.report,
                 scope: m.scope,
+                registration: Some(m.registration),
                 id: m.id,
             }
         })
@@ -188,10 +191,22 @@ async fn get_assignment(
 ) -> Result<Json<AssignmentSnapshot>> {
     let machine = id.clone();
     server
-        .db(move |conn| db::snapshot(conn, &machine))
+        .db(move |conn| {
+            let registration = db::machine(conn, &machine)?.map(|m| m.registration);
+            Ok(db::snapshot(conn, &machine)?.map(|s| AssignmentSnapshot { registration, ..s }))
+        })
         .await?
         .map(Json)
         .ok_or_else(|| ApiError::NotFound(format!("no machine `{id}`")))
+}
+
+/// Whether `caller`, as the database has it now, may change `machine`'s
+/// assignment (ADR 0005): the admin and `fleet` machines any, a `self`
+/// machine only its own. Every assignment write calls it inside the
+/// transaction that writes, so a token removed or a machine joined again
+/// with another scope meanwhile can't use the old rights.
+fn authorize_assignment(conn: &Connection, caller: &Caller, machine: &str) -> Result<()> {
+    caller.current(conn)?.require_machine(machine)
 }
 
 async fn put_assignment(
@@ -200,19 +215,22 @@ async fn put_assignment(
     Path(id): Path<String>,
     Json(body): Json<AssignmentChanges>,
 ) -> Result<Json<AssignmentUpdate>> {
-    let changes: Vec<Change> = body
-        .changes
+    caller.require_machine(&id)?;
+    let AssignmentChanges { changes, expected } = body;
+    let changes: Vec<Change> = changes
         .into_iter()
         .map(|c| Change { harness: c.harness, kind: c.kind, name: c.name, after: c.enabled, cause: LogCause::Change })
         .collect();
-    caller.require_machine(&id)?;
     changes.iter().try_for_each(assign::validate)?;
     let (machine, author, now, items) = (id.clone(), caller.author().to_string(), now(), server.baseline_items());
     let applied = server
         .db(move |conn| {
             let tx = conn.transaction()?;
-            caller.current(&tx)?.require_machine(&machine)?;
+            authorize_assignment(&tx, &caller, &machine)?;
             let m = db::machine(&tx, &machine)?.ok_or_else(|| ApiError::NotFound(format!("no machine `{machine}`")))?;
+            if let Some(expected) = &expected {
+                assign::check_expected(&tx, &m, expected)?;
+            }
             let report = m.report.unwrap_or_default();
             assign::check_items(&changes, &items, &report.drafts, &report.unpushed)?;
             let applied = assign::apply(&tx, &machine, &author, changes, now, Some(&items))?;
@@ -221,6 +239,40 @@ async fn put_assignment(
         })
         .await?;
     Ok(Json(published(&server, &id, applied)))
+}
+
+/// Copies a machine's explicit toggles of one item to another, before a
+/// rename reaches its Draft, in one transaction. A toggle the new name
+/// already has is kept; the toggles copied are logged like any change.
+async fn copy_assignment(
+    State(server): ServerState,
+    caller: Caller,
+    Path(id): Path<String>,
+    Json(copy): Json<AssignmentCopy>,
+) -> Result<Json<AssignmentCopied>> {
+    caller.require_machine(&id)?;
+    let (machine, author, now, items) = (id.clone(), caller.author().to_string(), now(), server.baseline_items());
+    let (applied, registration, copied, skipped) = server
+        .db(move |conn| {
+            let tx = conn.transaction()?;
+            authorize_assignment(&tx, &caller, &machine)?;
+            let m = db::machine(&tx, &machine)?.ok_or_else(|| ApiError::NotFound(format!("no machine `{machine}`")))?;
+            let (changes, skipped) = assign::copy_changes(&m, &copy, &items)?;
+            let applied = assign::apply(&tx, &machine, &author, changes.clone(), now, None)?;
+            tx.commit()?;
+            Ok((applied, m.registration, changes, skipped))
+        })
+        .await?;
+    let toggle = |c: Change| ToggleChange { harness: c.harness, kind: c.kind, name: c.name, enabled: c.after };
+    let update = published(&server, &id, applied);
+    Ok(Json(AssignmentCopied {
+        assignment: update.assignment,
+        revision: update.revision,
+        registration: Some(registration),
+        entries: update.entries,
+        applied: copied.into_iter().map(toggle).collect(),
+        skipped: skipped.into_iter().map(toggle).collect(),
+    }))
 }
 
 /// Hands a changed assignment to the machine's session and builds the response.
@@ -313,6 +365,7 @@ mod tests {
                     name: None,
                     enabled: Some(true),
                 }],
+                expected: None,
             }),
         )
         .await
@@ -337,6 +390,13 @@ mod tests {
                     name: None,
                     enabled: Some(true),
                 }],
+                expected: None,
+            })
+        };
+        let copy = || {
+            Json(AssignmentCopy {
+                from: sk1ll_proto::ItemRef::Skill("pdf".into()),
+                to: sk1ll_proto::ItemRef::Skill("pdf-tools".into()),
             })
         };
         let unauthorized = |r: Result<()>| assert!(matches!(r, Err(ApiError::Unauthorized)), "{r:?}");
@@ -345,6 +405,7 @@ mod tests {
         // The old token is gone, whatever it asks for.
         unauthorized(create_join_code(s(), stale.clone(), Bytes::new()).await.map(drop));
         unauthorized(put_assignment(s(), stale.clone(), Path("other".into()), change()).await.map(drop));
+        unauthorized(copy_assignment(s(), stale.clone(), Path("other".into()), copy()).await.map(drop));
         unauthorized(undo(s(), stale.clone(), Path(other_entry)).await.map(drop));
         unauthorized(remove_machine(s(), stale.clone(), Path("other".into())).await.map(drop));
         // A fleet-scoped caller struct carrying the new token still gets the
@@ -353,6 +414,7 @@ mod tests {
         let widened = Caller::Machine { id, scope: Scope::Fleet, token_hash };
         forbidden(create_join_code(s(), widened.clone(), Bytes::new()).await.map(drop));
         forbidden(put_assignment(s(), widened.clone(), Path("other".into()), change()).await.map(drop));
+        forbidden(copy_assignment(s(), widened.clone(), Path("other".into()), copy()).await.map(drop));
         forbidden(undo(s(), widened.clone(), Path(other_entry)).await.map(drop));
         forbidden(remove_machine(s(), widened.clone(), Path("other".into())).await.map(drop));
         let (other, entries) = server
@@ -363,7 +425,10 @@ mod tests {
             .unwrap();
         assert!(!other.unwrap().harness("claude").new_rules_default);
         assert!(entries.iter().all(|e| e.machine != "other" || e.kind != ToggleKind::NewRulesDefault), "{entries:?}");
-        // Its own assignment is still its to change.
+        // Its own assignment is still its to change: the copy gets past the
+        // scope check and only fails on the unknown item.
+        let own = copy_assignment(s(), widened.clone(), Path("me".into()), copy()).await;
+        assert!(matches!(own, Err(ApiError::Unprocessable(_))), "{own:?}");
         assert_eq!(put_assignment(s(), widened, Path("me".into()), change()).await.unwrap().entries.len(), 1);
     }
 

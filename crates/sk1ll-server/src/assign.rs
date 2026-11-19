@@ -4,7 +4,10 @@
 use std::collections::BTreeSet;
 
 use rusqlite::Connection;
-use sk1ll_proto::{Assignment, AssignmentSnapshot, HarnessAssignment, ItemRef, LogCause, LogEntry, ToggleKind};
+use sk1ll_proto::{
+    Assignment, AssignmentCopy, AssignmentSnapshot, Expected, HarnessAssignment, ItemRef, LogCause, LogEntry,
+    ToggleKind,
+};
 
 use crate::db;
 use crate::error::{ApiError, Result};
@@ -122,8 +125,79 @@ pub struct Applied {
 
 impl Applied {
     pub fn snapshot(&self) -> AssignmentSnapshot {
-        AssignmentSnapshot { revision: self.revision, assignment: self.assignment.clone() }
+        AssignmentSnapshot { revision: self.revision, assignment: self.assignment.clone(), registration: None }
     }
+}
+
+/// Refuses a write meant for another state of `m`'s assignment: a later
+/// revision, or a later registration of the same machine id.
+pub fn check_expected(tx: &Connection, m: &db::MachineRecord, expected: &Expected) -> Result<()> {
+    if expected.registration.as_ref().is_some_and(|r| *r != m.registration) {
+        return Err(ApiError::Conflict(format!(
+            "machine `{}` joined the fleet again since; reload its assignment",
+            m.id
+        )));
+    }
+    let revision = db::snapshot(tx, &m.id)?.map_or(0, |s| s.revision);
+    if revision != expected.revision {
+        return Err(ApiError::Conflict(format!(
+            "the assignment of `{}` changed since revision {} (now {revision}); reload it",
+            m.id, expected.revision
+        )));
+    }
+    Ok(())
+}
+
+/// The changes that copy `m`'s explicit toggles of `copy.from` to `copy.to`,
+/// and those skipped because `copy.to` already has an explicit toggle there.
+/// `from` must be an item `m` can have and `to` the same kind of item, not
+/// yet one it can have: a known different item keeps its own toggles.
+pub fn copy_changes(
+    m: &db::MachineRecord,
+    copy: &AssignmentCopy,
+    baseline: &BTreeSet<ItemRef>,
+) -> Result<(Vec<Change>, Vec<Change>)> {
+    let (kind, from, to) = match (&copy.from, &copy.to) {
+        (ItemRef::Skill(from), ItemRef::Skill(to)) => (ToggleKind::Skill, from, to),
+        (ItemRef::Rule(from), ItemRef::Rule(to)) => (ToggleKind::Rule, from, to),
+        _ => {
+            return Err(ApiError::BadRequest(format!(
+                "`{}` and `{}` are not the same kind of item",
+                copy.from, copy.to
+            )));
+        }
+    };
+    crate::check_name("item name", from)?;
+    crate::check_name("item name", to)?;
+    if from == to {
+        return Err(ApiError::BadRequest("`from` and `to` are the same item".into()));
+    }
+    let report = m.report.clone().unwrap_or_default();
+    let known =
+        |item: &ItemRef| baseline.contains(item) || report.drafts.contains(item) || report.unpushed.contains(item);
+    if !known(&copy.from) {
+        return Err(ApiError::Unprocessable(format!(
+            "`{}` is absent from the baseline, this machine's draft and its unpushed commits",
+            copy.from
+        )));
+    }
+    if known(&copy.to) {
+        return Err(ApiError::Conflict(format!("`{}` is already an item of machine `{}`", copy.to, m.id)));
+    }
+    Ok(m.assignment
+        .harnesses
+        .iter()
+        .filter_map(|(harness, h)| {
+            let toggles = if kind == ToggleKind::Skill { &h.skills } else { &h.rules };
+            toggles.get(from).map(|&enabled| Change {
+                harness: harness.clone(),
+                kind,
+                name: Some(to.clone()),
+                after: Some(enabled),
+                cause: LogCause::Change,
+            })
+        })
+        .partition(|c| get(&m.assignment, &c.harness, kind, Some(to)).is_none()))
 }
 
 /// Applies `changes` to `machine` and logs each one that changed something,

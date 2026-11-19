@@ -10,7 +10,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { toast } from './toast';
-import { api } from './api';
+import { api, errorStatus } from './api';
 import { useMutation, useResource } from './hooks';
 import { ChangeBadge, Confirm, DiffLines, ErrorNotice, Loading, Nothing, Notice, Panel, PanelToolbar, Pending, SectionTitle } from './shared';
 import { terms } from './model';
@@ -93,6 +93,7 @@ export function Skills({ entries, revision, changed, reviewDraft, assignment, ad
               onClick={event => { event.stopPropagation(); if (value.type === 'unmanaged') setSelected({ key: keyFor(value), harness: name }); else if (value.item) assignment(value.item, name); }} />}>{value.type === 'unmanaged' ? `View in ${name}` : name}{value.type === 'unmanaged' ? <Eye className="size-3" /> : <LayoutGrid className="size-3" />}</Badge>)}
             {value.variants.length > 1 && <DiffersBadge count={value.variants.length} />}
             {value.clashes_with_repo && <Badge variant="warning">Clashes with repo</Badge>}
+            {value.variants.some(variant => variant.resumable) && <Badge variant="info">Adoption interrupted</Badge>}
           </div></TableCell>
         </TableRow>;
       })}</TableBody>
@@ -193,8 +194,9 @@ function SkillDetail({ entry, entries, close, initialHarness, revision, changed,
     const variant = entry.variants.find(value => value.locations.some(loc => loc.harness === initialHarness));
     return variant ? `${variant.hash}:${initialHarness}` : '';
   });
-  const choices = entry.variants.flatMap(variant => variant.locations.map(loc => ({ ...loc, hash: variant.hash, description: variant.description })));
-  const choice = choices.find(value => `${value.hash}:${value.harness}` === location) ?? choices[0];
+  const choices = entry.variants.flatMap(variant => variant.locations.map(loc => ({ ...loc, hash: variant.hash, description: variant.description, resumable: !!variant.resumable })));
+  // An interrupted Adopt can only be resumed with the variant its personal copy matches.
+  const choice = choices.find(value => `${value.hash}:${value.harness}` === location) ?? choices.find(value => value.resumable) ?? choices[0];
   const hash = choice?.hash, harness = choice?.harness;
   const item = keyFor(entry);
   const query = useCallback(() => ({ item, ...(hash ? { hash, harness } : {}) }), [item, hash, harness]);
@@ -203,6 +205,8 @@ function SkillDetail({ entry, entries, close, initialHarness, revision, changed,
   const [comparing, setComparing] = useState(false);
   const [renaming, setRenaming] = useState(false), [renameTo, setRenameTo] = useState(entry.name);
   const rename = useMutation();
+  // The Daemon refused the rename because this Machine's Assignment could not be copied first (HTTP 409).
+  const [copyRefused, setCopyRefused] = useState(false);
   const kind = entry.type === 'rule' ? 'rule' : 'skill';
   const renameError = !renameTo ? 'Enter a name' : (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(renameTo) || renameTo.includes('..')) ? 'Use letters, numbers, dots, underscores or hyphens; start with a letter or number.' : renameTo === entry.name ? 'Choose a different name.' : entries.some(value => (kind === 'rule' ? value.type === 'rule' : value.type !== 'rule') && value.name.toLowerCase() === renameTo.toLowerCase()) ? 'This name is already taken.' : '';
   const [confirmation, setConfirmation] = useState<{ editorId?: string }>();
@@ -212,13 +216,16 @@ function SkillDetail({ entry, entries, close, initialHarness, revision, changed,
   const preferred = editors.data?.editors.find(editor => editor.id === editors.data?.preferred_editor);
   const needsConversion = entry.type === 'import' || entry.type === 'unmanaged';
   const needsServer = entry.type === 'unmanaged' && connection !== 'connected' && connection !== 'standalone';
-  const canAdopt = !needsServer && !entry.clashes_with_repo && !!choice;
+  const resuming = !!choice?.resumable;
+  const clash = entry.clashes_with_repo || (!resuming && entry.variants.some(variant => variant.resumable));
+  const canAdopt = !needsServer && !clash && !!choice;
+  const adoptLabel = resuming ? 'Resume adoption' : 'Adopt';
   const execute = (editorId?: string) => void mutation.run(async () => {
     let destination = entry.item;
     if (entry.type === 'import') { await api.fork(entry.name); destination = `skill:${entry.name}`; }
     if (entry.type === 'unmanaged') {
       if (needsServer) throw new Error('Adopt needs a connection to the Server');
-      if (!choice || entry.clashes_with_repo) throw new Error('Choose a Harness variant with an available name before Adopt.');
+      if (!choice || clash) throw new Error('Choose a Harness variant with an available name before Adopt.');
       await api.adoptUnmanaged({ name: entry.name, harness: choice.harness }); destination = `skill:${entry.name}`;
     }
     if (needsConversion) {
@@ -233,8 +240,19 @@ function SkillDetail({ entry, entries, close, initialHarness, revision, changed,
       await editors.refresh();
     }
   });
-  const disabledReason = needsServer ? 'Needs a connection to the Server' : entry.clashes_with_repo ? 'Name clashes with a repo Skill' : !editors.data ? '' : !preferred ? 'No editors found' : '';
+  const disabledReason = needsServer ? 'Needs a connection to the Server' : entry.clashes_with_repo ? 'Name clashes with a repo Skill'
+    : clash ? 'This variant differs from the personal copy of an interrupted Adopt' : !editors.data ? '' : !preferred ? 'No editors found' : '';
   const edit = (editorId: string) => { if (needsConversion) setConfirmation({ editorId }); else execute(editorId); };
+  // The Daemon copies the Assignment first; without the copy, the new name follows the Harness defaults.
+  const submitRename = (copy: boolean) => void rename.run(async () => {
+    try { return await api.renameItem({ kind, name: entry.name, to: renameTo, ...!copy && { copy_assignment: false } }); }
+    catch (error) { setCopyRefused(copy && errorStatus(error) === 409); throw error; }
+  }, result => {
+    const kept = result.kept?.length ? ` ${result.kept.join(', ')} kept the Assignment ${renameTo} already had.` : '';
+    toast({ title: `Renamed to ${renameTo}`, description: copy ? kept.trim() || undefined : "This Machine's Assignment was not copied." });
+    setRenaming(false); setCopyRefused(false);
+    converted({ ...entry, name: renameTo, item: result.item, draft: 'added', in_baseline: false, enabled_harnesses: copy ? entry.enabled_harnesses : [] }); changed();
+  });
   return <>
     <div className="flex shrink-0 flex-wrap items-start justify-between gap-x-6 gap-y-3 border-b border-border px-5 py-4 pr-12">
       <DialogHeader className="min-w-0 flex-1 gap-1.5"><DialogTitle className="text-lg">{entry.name}</DialogTitle>
@@ -245,7 +263,7 @@ function SkillDetail({ entry, entries, close, initialHarness, revision, changed,
       </DialogHeader>
       <div className="flex flex-col items-end gap-1.5"><div className="flex flex-wrap justify-end gap-2">
         {(entry.type === 'personal' || entry.type === 'rule') && entry.draft !== 'deleted' && <>
-          <Button variant="outline" size="sm" onClick={() => { setRenameTo(entry.name); setRenaming(true); }}>Rename…</Button>
+          <Button variant="outline" size="sm" onClick={() => { setRenameTo(entry.name); setCopyRefused(false); setRenaming(true); }}>Rename…</Button>
           <Confirm label="Delete…" confirmLabel="Delete" triggerVariant="outline" title={`Delete ${entry.name}?`} description={connection === 'standalone' ? "This removes it from this Machine's Draft. Commit saves the deletion to the local repository." : "This removes it from this Machine's Draft. The deletion reaches other Machines after you commit and push it and they sync."} action={() => api.deleteItem({ kind, name: entry.name })} onDone={() => { toast({ title: `${entry.name} deleted in Draft` }); close(); changed(); }} />
         </>}
         {entry.draft && <Button ref={reviewButton} variant="outline" size="default" onClick={reviewDraft}>Review in Draft</Button>}
@@ -254,13 +272,13 @@ function SkillDetail({ entry, entries, close, initialHarness, revision, changed,
             <Button variant="outline" size="default" className="rounded-r-none" disabled={(entry.type !== 'unmanaged' && !preferred) || mutation.pending || (entry.type === 'unmanaged' && !canAdopt)}
               onClick={event => { confirmationTrigger.current = event.currentTarget; if (entry.type === 'unmanaged') setConfirmation({}); else if (preferred) edit(preferred.id); }}><Pending pending={mutation.pending}>
                 {!mutation.pending && entry.type !== 'import' && entry.type !== 'unmanaged' && preferred && <EditorIcon editor={preferred} />}
-                {entry.type === 'import' ? 'Fork to edit' : entry.type === 'unmanaged' ? 'Adopt into Draft' : `Open in ${preferred?.name ?? 'editor'}`}
+                {entry.type === 'import' ? 'Fork to edit' : entry.type === 'unmanaged' ? resuming ? 'Resume adoption' : 'Adopt into Draft' : `Open in ${preferred?.name ?? 'editor'}`}
               </Pending></Button>
             <DropdownMenu><DropdownMenuTrigger render={<Button variant="outline" size="icon" className="-ml-px rounded-l-none" ref={editorTrigger} aria-label="Choose editor" disabled={!editors.data?.editors.length || mutation.pending || (entry.type === 'unmanaged' && !canAdopt)} />}><ChevronDown /></DropdownMenuTrigger>
               <DropdownMenuContent align="end">{(['gui', 'terminal', 'system'] as const).map(kind => {
                 const choices = editors.data?.editors.filter(editor => editor.kind === kind) ?? [];
                 return choices.length > 0 && <DropdownMenuGroup key={kind}><DropdownMenuLabel>{kind === 'gui' ? 'GUI' : kind === 'terminal' ? 'Terminal' : 'System'}</DropdownMenuLabel>
-                  {choices.map(editor => <DropdownMenuItem key={editor.id} onClick={() => { confirmationTrigger.current = editorTrigger.current; edit(editor.id); }}><EditorIcon editor={editor} />{entry.type === 'unmanaged' ? `Adopt and open in ${editor.name}` : editor.name}</DropdownMenuItem>)}
+                  {choices.map(editor => <DropdownMenuItem key={editor.id} onClick={() => { confirmationTrigger.current = editorTrigger.current; edit(editor.id); }}><EditorIcon editor={editor} />{entry.type === 'unmanaged' ? `${adoptLabel} and open in ${editor.name}` : editor.name}</DropdownMenuItem>)}
                 </DropdownMenuGroup>;
               })}<DropdownMenuSeparator /><DropdownMenuGroup><DropdownMenuItem onClick={() => void editors.refresh()}>Refresh editors</DropdownMenuItem></DropdownMenuGroup></DropdownMenuContent>
             </DropdownMenu>
@@ -273,6 +291,8 @@ function SkillDetail({ entry, entries, close, initialHarness, revision, changed,
       <ErrorNotice error={editors.error || mutation.error} />
       {entry.draft === 'deleted' && <Notice title="Deleted in Draft">Browse the read-only Baseline files below.</Notice>}
       {entry.clashes_with_repo && <Notice title="Clashes with repo">A repo Skill already has this name. Adopt is unavailable.</Notice>}
+      {entry.type === 'unmanaged' && resuming && <Notice title="Adoption interrupted">An earlier Adopt copied this variant into the Draft but did not finish. Resume adoption enables it in the Harnesses where it was found and replaces their copies.</Notice>}
+      {entry.type === 'unmanaged' && clash && !entry.clashes_with_repo && <Notice title="Clashes with an interrupted adoption">The personal copy left by an interrupted Adopt matches another variant. Choose that variant to resume adoption; this one stays unmanaged.</Notice>}
       {entry.type === 'unmanaged' && choices.length > 1 && <Field><FieldLabel htmlFor="skill-variant">Harness location{entry.variants.length > 1 ? ' and variant' : ''}</FieldLabel>
         <NativeSelect className="w-full max-w-full" id="skill-variant" value={choice ? `${choice.hash}:${choice.harness}` : ''} onChange={event => setLocation(event.target.value)}>
           {choices.map(value => <NativeSelectOption key={`${value.hash}:${value.harness}`} value={`${value.hash}:${value.harness}`}>{value.harness}: {value.path}</NativeSelectOption>)}
@@ -285,20 +305,24 @@ function SkillDetail({ entry, entries, close, initialHarness, revision, changed,
         : <SkillBrowser key={`${item}:${hash}:${harness}`} query={query} revision={revision} />}
     </div>
     <Dialog open={renaming} onOpenChange={open => { if (!rename.pending) setRenaming(open); }}><DialogContent showCloseButton={!rename.pending}><DialogHeader><DialogTitle>Rename {entry.name}</DialogTitle><DialogDescription>Rename this item in Draft.</DialogDescription></DialogHeader>
-      <form className="flex flex-col gap-4" onSubmit={event => { event.preventDefault(); if (!renameError && !rename.pending) void rename.run(() => api.renameItem({ kind, name: entry.name, to: renameTo }), result => { toast({ title: `Renamed to ${renameTo}` }); if (result.assignment_error) toast({ title: `Renamed, but Assignments weren't copied: ${result.assignment_error}`, tone: 'destructive' }); setRenaming(false); converted({ ...entry, name: renameTo, item: result.item, draft: 'added', in_baseline: false, enabled_harnesses: result.assignment_error ? [] : entry.enabled_harnesses }); changed(); }); }}>
-        <FieldGroup><Field data-invalid={!!renameError}><FieldLabel htmlFor="rename-name">Name</FieldLabel><Input id="rename-name" value={renameTo} onChange={event => setRenameTo(event.target.value)} aria-invalid={!!renameError} aria-describedby="rename-error" />{renameError && <FieldError id="rename-error">{renameError}</FieldError>}</Field></FieldGroup>
+      <form className="flex flex-col gap-4" onSubmit={event => { event.preventDefault(); if (!renameError && !rename.pending) submitRename(true); }}>
+        <FieldGroup><Field data-invalid={!!renameError}><FieldLabel htmlFor="rename-name">Name</FieldLabel><Input id="rename-name" value={renameTo} onChange={event => { setRenameTo(event.target.value); setCopyRefused(false); }} aria-invalid={!!renameError} aria-describedby="rename-error" />{renameError && <FieldError id="rename-error">{renameError}</FieldError>}</Field></FieldGroup>
         <Notice title="Assignment changes">Assignment toggles carry over on this Machine only. Other Machines use each Harness's default for the new name after you Commit and Push.</Notice><ErrorNotice error={rename.error} />
-        <DialogFooter><Button type="button" variant="outline" disabled={rename.pending} onClick={() => setRenaming(false)}>Cancel</Button><Button type="submit" disabled={!!renameError || rename.pending}><Pending pending={rename.pending}>Rename</Pending></Button></DialogFooter>
+        {copyRefused && <Notice title="Rename without copying Assignment?" tone="destructive">Nothing was renamed. You can still rename, but this Machine's Assignment toggles stay with {entry.name}: {renameTo} follows each Harness's default here until you set them again.</Notice>}
+        <DialogFooter><Button type="button" variant="outline" disabled={rename.pending} onClick={() => setRenaming(false)}>Cancel</Button>
+          {copyRefused && <Button type="button" variant="destructive" disabled={!!renameError || rename.pending} onClick={() => submitRename(false)}>Rename without copying Assignment</Button>}
+          <Button type="submit" disabled={!!renameError || rename.pending}><Pending pending={rename.pending}>{copyRefused ? 'Try again' : 'Rename'}</Pending></Button></DialogFooter>
       </form></DialogContent></Dialog>
     <Dialog open={!!confirmation} onOpenChange={open => { if (!open && !mutation.pending) setConfirmation(undefined); }}>
-      <DialogContent finalFocus={() => needsConversion ? confirmationTrigger.current : reviewButton.current} showCloseButton={!mutation.pending}><DialogHeader><DialogTitle>{entry.type === 'import' ? 'Fork' : 'Adopt'} {entry.name}?</DialogTitle>
+      <DialogContent finalFocus={() => needsConversion ? confirmationTrigger.current : reviewButton.current} showCloseButton={!mutation.pending}><DialogHeader><DialogTitle>{entry.type === 'import' ? 'Fork' : resuming ? 'Resume adopting' : 'Adopt'} {entry.name}?</DialogTitle>
         <DialogDescription>{entry.type === 'import'
           ? 'Fork turns this Import into a Personal Skill in the Draft. It will no longer receive updates from its source.'
+          : resuming ? 'An earlier Adopt left this variant in the Draft as a Personal Skill. Resume adoption enables it in the Harnesses where this variant was found and replaces their copies. The originals are kept in recovery.'
           : `Adopt copies this Unmanaged skill into the Draft as a Personal Skill, enabled in the Harnesses where this variant was found. The original is kept in recovery when sync replaces it.${entry.variants.length > 1 ? ` Adopt uses the selected variant from ${choice?.harness}. Other variants stay unmanaged.` : ''}`}</DialogDescription>
       </DialogHeader><ErrorNotice error={mutation.error} /><DialogFooter>
         <Button variant="outline" disabled={mutation.pending} onClick={() => setConfirmation(undefined)}>Cancel</Button>
         <ServerRequired needed={needsServer}><Button disabled={mutation.pending || needsServer} onClick={() => execute(confirmation?.editorId)}><Pending pending={mutation.pending}>
-          {entry.type === 'import' ? 'Fork' : 'Adopt'}{confirmation?.editorId ? ' and open' : ' into Draft'}</Pending></Button></ServerRequired>
+          {entry.type === 'import' ? 'Fork' : adoptLabel}{confirmation?.editorId ? ' and open' : resuming ? '' : ' into Draft'}</Pending></Button></ServerRequired>
       </DialogFooter></DialogContent>
     </Dialog>
   </>;

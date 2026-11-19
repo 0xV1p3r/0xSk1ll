@@ -60,7 +60,7 @@ it('blocks taken, inventory, duplicate and invalid names', async () => {
   fireEvent.change(name, { target: { value: 'writing' } }); expect(confirm().disabled).toBe(false);
   fireEvent.click(screen.getByRole('checkbox', { name: 'Select writing' })); expect(confirm().disabled).toBe(true);
 });
-it('adds sequentially and stops at the first error without retrying', async () => {
+it('adds sequentially, attempts every selection after a failure and retries only the unresolved ones', async () => {
   let finish!: () => void;
   vi.mocked(api.addImport).mockImplementationOnce(() => new Promise(resolve => { finish = () => resolve({ name: 'one', old_commit: null, new_commit: 'abc', changed: true }); }))
     .mockRejectedValueOnce('Access denied');
@@ -70,18 +70,122 @@ it('adds sequentially and stops at the first error without retrying', async () =
   expect(api.addImport).toHaveBeenCalledTimes(1);
   expect((screen.getByRole('button', { name: 'Change source' }) as HTMLButtonElement).disabled).toBe(true);
   finish();
-  await screen.findByText(/Access denied.*Items listed as added stay/);
-  await waitFor(() => expect(api.addImport).toHaveBeenCalledTimes(2));
-  expect(screen.getByText('one added into Draft.')).toBeTruthy();
-  expect(screen.getByText('two may not have been added; check the Draft.')).toBeTruthy();
+  expect((await screen.findByRole('alert')).textContent).toContain('1 Skill not added.');
+  expect(vi.mocked(api.addImport).mock.calls.map(([request]) => request.name)).toEqual(['one', 'two', 'three']);
+  const results = screen.getByRole('list', { name: 'Import results' });
+  expect(within(results).getByText('one added into Draft.')).toBeTruthy();
+  expect(within(results).getByText(/^two not added: Access denied/)).toBeTruthy();
+  expect(within(results).getByText('three added into Draft.')).toBeTruthy();
   expect(changed).toHaveBeenCalledOnce();
+  expect(screen.queryByRole('button', { name: 'Change source' })).toBeNull();
+  expect((screen.getByLabelText('Name for one') as HTMLInputElement).disabled).toBe(true);
+  expect((screen.getByLabelText('Name for two') as HTMLInputElement).disabled).toBe(false);
+  fireEvent.click(screen.getByRole('button', { name: 'Retry 1 Skill' }));
+  await waitFor(() => expect(within(results).getByText('two added into Draft.')).toBeTruthy());
+  expect(api.addImport).toHaveBeenCalledTimes(4);
+  expect(vi.mocked(api.addImport).mock.calls[3][0].name).toBe('two');
+  expect(screen.queryByRole('button', { name: /^Retry/ })).toBeNull();
+  expect(screen.queryByRole('alert')).toBeNull();
+  expect(changed).toHaveBeenCalledTimes(2);
 });
-it('refreshes even when the first add fails, since its outcome is unknown', async () => {
-  vi.mocked(api.addImport).mockRejectedValueOnce('connection restore');
+it('reads back what landed when a failed response followed a successful write', async () => {
+  vi.mocked(api.addImport).mockRejectedValueOnce('connection reset');
   await resolve([candidate('pdf')]);
+  vi.mocked(api.imports).mockResolvedValue({ checked_at: null, updates: [], errors: [], imports: [{ name: 'pdf', source: 'github:test/repo', ref: 'main', path: 'pdf', locked: 'abcdef123456' }] });
   fireEvent.click(confirm());
-  await screen.findByText('pdf may not have been added; check the Draft.');
+  await screen.findByText('pdf added into Draft (confirmed after an error response).');
+  expect(screen.queryByRole('alert')).toBeNull();
+  expect(screen.queryByRole('button', { name: /^Retry/ })).toBeNull();
   expect(api.addImport).toHaveBeenCalledOnce(); expect(changed).toHaveBeenCalledOnce();
+});
+it.each([
+  ['source', { source: 'github:other/repo' }], ['path', { path: 'other' }], ['ref', { ref: 'dev' }], ['locked commit', { locked: 'fedcba654321' }],
+] as const)('does not count an Import with another %s as landed', async (_, differs) => {
+  vi.mocked(api.addImport).mockRejectedValueOnce('connection reset');
+  await resolve([candidate('pdf')]);
+  vi.mocked(api.imports).mockResolvedValue({ checked_at: null, updates: [], errors: [], imports: [{ name: 'pdf', source: 'github:test/repo', ref: 'main', path: 'pdf', locked: 'abcdef123456', ...differs }] });
+  fireEvent.click(confirm());
+  expect(await screen.findByText(/^pdf not added: connection reset/)).toBeTruthy();
+  expect(screen.queryByText(/confirmed after an error response/)).toBeNull();
+});
+it('still attempts the rest after the Daemon was unreachable for one', async () => {
+  vi.mocked(api.addImport).mockRejectedValueOnce({ message: 'cannot reach the daemon', status: null, unreachable: true });
+  await resolve([candidate('one'), candidate('two')]);
+  for (const name of ['one', 'two']) fireEvent.click(screen.getByRole('checkbox', { name: `Select ${name}` }));
+  fireEvent.click(confirm());
+  await screen.findByText('two added into Draft.');
+  expect(vi.mocked(api.addImport).mock.calls.map(([request]) => request.name)).toEqual(['one', 'two']);
+  expect(screen.queryByText(/not attempted/)).toBeNull();
+  expect(screen.getByRole('button', { name: 'Retry 1 Skill' })).toBeTruthy();
+});
+it('leaves the rest not attempted when the batch is stopped', async () => {
+  let finish!: () => void;
+  vi.mocked(api.addImport).mockImplementationOnce(() => new Promise(done => { finish = () => done({ name: 'one', old_commit: null, new_commit: 'abc', changed: true }); }));
+  await resolve([candidate('one'), candidate('two'), candidate('three')]);
+  for (const name of ['one', 'two', 'three']) fireEvent.click(screen.getByRole('checkbox', { name: `Select ${name}` }));
+  fireEvent.click(confirm());
+  fireEvent.click(await screen.findByRole('button', { name: 'Stop after this Skill' }));
+  finish();
+  await screen.findByText('three not attempted.');
+  expect(screen.getByText('two not attempted.')).toBeTruthy();
+  expect(api.addImport).toHaveBeenCalledOnce();
+  expect(screen.getByRole('button', { name: 'Retry 2 Skills' })).toBeTruthy();
+});
+it('checks names with the Daemon again before a retry and still adds the others', async () => {
+  vi.mocked(api.addImport).mockRejectedValueOnce('boom').mockRejectedValueOnce('boom');
+  await resolve([candidate('pdf'), candidate('csv')]);
+  for (const name of ['pdf', 'csv']) fireEvent.click(screen.getByRole('checkbox', { name: `Select ${name}` }));
+  fireEvent.click(confirm());
+  const retry = await screen.findByRole('button', { name: 'Retry 2 Skills' });
+  // Meanwhile another client took one name.
+  vi.mocked(api.items).mockResolvedValue([{ item: 'skill:pdf', in_baseline: false, draft: 'added', unpushed: false, description: null }]);
+  fireEvent.click(retry);
+  expect(await screen.findByText('csv added into Draft.')).toBeTruthy();
+  expect(screen.getByText('pdf not added: This name is taken now. Pick another, then retry.')).toBeTruthy();
+  expect(vi.mocked(api.addImport).mock.calls.map(([request]) => request.name)).toEqual(['pdf', 'csv', 'csv']);
+  expect(screen.getByText('This name is already taken.')).toBeTruthy();
+  // The remembered clash does not block the next retry, which checks again.
+  vi.mocked(api.items).mockResolvedValue([]);
+  const again = screen.getByRole('button', { name: 'Retry 1 Skill' }) as HTMLButtonElement;
+  expect(again.disabled).toBe(false);
+  fireEvent.click(again);
+  expect(await screen.findByText('pdf added into Draft.')).toBeTruthy();
+});
+it('confirms before a retry a Skill that landed although nothing could be read back', async () => {
+  vi.mocked(api.addImport).mockRejectedValueOnce('connection reset');
+  await resolve([candidate('pdf')]);
+  vi.mocked(api.items).mockRejectedValueOnce('cannot reach the daemon');
+  fireEvent.click(confirm());
+  const retry = await screen.findByRole('button', { name: 'Retry 1 Skill' });
+  vi.mocked(api.imports).mockResolvedValue({ checked_at: null, updates: [], errors: [], imports: [{ name: 'pdf', source: 'github:test/repo', ref: 'main', path: 'pdf', locked: 'abcdef123456' }] });
+  fireEvent.click(retry);
+  await screen.findByText('pdf added into Draft (confirmed after an error response).');
+  expect(api.addImport).toHaveBeenCalledOnce();
+  expect(screen.queryByRole('alert')).toBeNull();
+});
+it('asks to review the Draft when what landed cannot be read back', async () => {
+  vi.mocked(api.addImport).mockRejectedValueOnce('connection reset');
+  await resolve([candidate('pdf')]);
+  vi.mocked(api.items).mockRejectedValue('cannot reach the daemon');
+  fireEvent.click(confirm());
+  expect((await screen.findByRole('alert')).textContent).toContain('Could not check what reached the Draft; review it before retrying.');
+  expect(screen.getByRole('button', { name: 'Retry 1 Skill' })).toBeTruthy();
+});
+it('rechecks name clashes against the refreshed inventory before a retry', async () => {
+  vi.mocked(api.addImport).mockRejectedValueOnce('Name already exists');
+  await resolve([candidate('pdf')]);
+  vi.mocked(api.items).mockResolvedValue([{ item: 'skill:pdf', in_baseline: false, draft: 'added', unpushed: false, description: null }]);
+  fireEvent.click(confirm());
+  expect(await screen.findByText('This name is already taken.')).toBeTruthy();
+  // A clash remembered from the last check never disables Retry: it checks again.
+  const retry = screen.getByRole('button', { name: 'Retry 1 Skill' }) as HTMLButtonElement;
+  expect(retry.disabled).toBe(false);
+  fireEvent.click(retry);
+  expect(await screen.findByText('pdf not added: This name is taken now. Pick another, then retry.')).toBeTruthy();
+  expect(api.addImport).toHaveBeenCalledOnce();
+  fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'pdf-two' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Retry 1 Skill' }));
+  expect(await screen.findByText('pdf-two added into Draft.')).toBeTruthy();
 });
 it('lets a deleted Draft item\'s name be reused', async () => {
   vi.mocked(api.items).mockResolvedValue([{ item: 'skill:pdf', in_baseline: true, draft: 'deleted', unpushed: false, description: null }]);
@@ -352,10 +456,10 @@ it('submits both Import steps through forms and keeps name failures free of repo
   fireEvent.submit(link.closest('form')!);
   const name = await screen.findByLabelText('Name');
   fireEvent.submit(name.closest('form')!);
-  const error = await screen.findByRole('alert');
-  expect(error.textContent).toContain('Name already exists');
-  expect(error.textContent).not.toContain('credentials');
-  expect(screen.getByRole('list', { name: 'Import results' })).toBeTruthy();
+  await screen.findByRole('alert');
+  const results = screen.getByRole('list', { name: 'Import results' });
+  expect(results.textContent).toContain('Name already exists');
+  expect(results.textContent).not.toContain('credentials');
 });
 
 it.each([['Fetch failed', true], ['Invalid name', false]] as const)('adds repository guidance only for relevant resolve errors: %s', async (message, guidance) => {

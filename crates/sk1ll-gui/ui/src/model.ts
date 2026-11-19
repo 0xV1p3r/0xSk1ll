@@ -1,4 +1,4 @@
-import type { Assignment, CachedAssignmentSnapshot as AssignmentSnapshot, HarnessAssignment, ItemRef, ItemView, MachineReport, MachineStatus, ToggleChange } from './types';
+import type { Assignment, CachedAssignmentSnapshot as AssignmentSnapshot, HarnessAssignment, ItemRef, ItemView, MachineReport, MachineRow, MachineStatus, ToggleChange } from './types';
 
 export const statusOrder: MachineStatus[] = ['offline', 'blocked', 'conflict', 'behind', 'drafting', 'in_sync'];
 export const statusLabels: Record<MachineStatus, string> = {
@@ -63,12 +63,28 @@ export function applyToggle(assignment: Assignment, change: ToggleChange): Assig
 export const shortSha = (sha: string | null | undefined) => sha?.slice(0, 8) ?? 'None';
 export const time = (seconds: number | null) => seconds === null ? 'Never' : new Date(seconds * 1000).toLocaleString();
 
-export function mergeAssignments(current: Record<string, AssignmentSnapshot>, incoming: Record<string, AssignmentSnapshot>) {
-  const next = { ...incoming };
+// Machine ids are data: `constructor` or `__proto__` must not read or write the object's prototype.
+export const own = <T,>(record: Record<string, T>, key: string): T | undefined => Object.hasOwn(record, key) ? record[key] : undefined;
+// Which registration of a Machine this is: the Server's random id, else (from a 0.1.0 Server) the second it joined.
+export const registrationOf = (machine: Pick<MachineRow, 'registration' | 'joined_at'>) => machine.registration ?? `joined at ${machine.joined_at}`;
+// A snapshot with when its request was sent and answered, on one counter shared by every load and write.
+export type StampedSnapshot = AssignmentSnapshot & { sent?: number; received?: number };
+let clock = 0;
+export async function stamped<T extends AssignmentSnapshot>(request: () => Promise<T>): Promise<T & { sent: number; received: number }> {
+  const sent = ++clock, value = await request();
+  return { ...value, sent, received: ++clock };
+}
+// A cached snapshot stays only when its request overlapped the incoming one and it saw a later revision; a request
+// sent after the cached one was answered is fresher whatever its revision (a re-registered Machine starts over).
+const keeps = (cached: StampedSnapshot, incoming: StampedSnapshot) => cached.revision > incoming.revision
+  && !(incoming.sent !== undefined && cached.received !== undefined && incoming.sent > cached.received);
+export function mergeAssignments<S extends StampedSnapshot>(current: Record<string, S>, incoming: Record<string, S>): Record<string, S> {
+  const next = new Map(Object.entries(incoming));
   for (const [machine, snapshot] of Object.entries(current)) {
-    if (!next[machine] || next[machine].revision < snapshot.revision) next[machine] = snapshot;
+    const fresh = next.get(machine);
+    if (!fresh || keeps(snapshot, fresh)) next.set(machine, snapshot);
   }
-  return next;
+  return Object.fromEntries(next);
 }
 export function itemStateLabel(item: Pick<ItemView, 'in_baseline' | 'unpushed'>): string | undefined {
   return item.unpushed ? 'Unpushed' : !item.in_baseline ? 'Draft only' : undefined;

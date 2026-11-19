@@ -11,7 +11,6 @@ break compatibility.
 
 - macOS arm64 builds in CI and release archives with the unsigned desktop app,
   CLI and server. Setup and the desktop app can start the daemon through launchd.
-
 - Create a Rule from the desktop getting-started checklist and reopen the
   checklist from the command palette.
 - Copy diagnostics and ready-to-paste join commands from the desktop app.
@@ -45,7 +44,6 @@ break compatibility.
   a restart.
 - Every push, by any Machine, keeps toggles for items that were already absent
   before it; only the items it removed lose their toggles.
-
 - CLI setup explains how to join as the first machine and shows manual sync commands when the daemon is skipped.
 - `sk1ll sync --force` help lists managed instruction blocks, skill copies, and rule files.
 
@@ -54,7 +52,6 @@ break compatibility.
 - Starting the macOS daemon recreates its log directory and repairs generated
   LaunchAgents after the app moves. New agents include the Git directory found
   on PATH, and the desktop app shows start commands for the detected manager.
-
 - Machine entries in the desktop command palette open the selected Machine.
 - Desktop messages identify origin for standalone pushes, explain when Fleet
   deletions reach other Machines, and clarify how to join as the first Machine.
@@ -97,6 +94,51 @@ break compatibility.
   when the server confirms the scope.
 - Join codes are invalid from their `expires_at` second on, matching the
   reported expiry.
+- The Assignment matrix loads each Machine on its own. A Machine whose
+  Assignment fails to load shows the error and a Retry in its column instead
+  of failing the whole matrix, and bulk changes and undo skip it. Machine ids
+  such as `constructor` no longer break it, a Machine that left the Fleet or
+  joined again loses its cached Assignment, a newer load always replaces an
+  older cached one, and Undo skips a Machine that left or whose Assignment
+  changed since. Undo also sends the revision and registration it expects:
+  the Server (or the standalone Daemon) refuses it with HTTP 409 when the
+  Assignment changed meanwhile, and the matrix reloads and says Undo is no
+  longer available. `PUT /api/machines/{id}/assignment` takes an optional
+  `expected`.
+- Every Machine has a random `registration` id, new for every join, in
+  `GET /api/fleet` and `GET /api/machines/{id}/assignment` (Server database
+  migration 5 gives existing Machines one). The matrix ties each load, retry
+  and write to it, so a late reply for a Machine that left and joined again
+  within the same second no longer shows its old Assignment.
+- A batch Import tries every selected skill instead of stopping at the first
+  failure, even when the Daemon was unreachable for one, shows each as added,
+  not added or not attempted (after Stop), reads back what reached the Draft
+  and lets you retry only the rest. A failed response counts as added only
+  when the Import's source, path, ref and locked commit match, and a retry
+  checks the names with the Daemon first. A name taken since fails on its own
+  while the others are still added, and a clash remembered from the last
+  check never disables Retry.
+- An interrupted Adopt can be resumed from the Library. `GET /skills` marks
+  the unmanaged variant that matches the existing personal copy as
+  `resumable`; other variants stay blocked.
+- A rename has the Assignment's authority copy this Machine's toggles to the
+  new name before renaming: the Server through the new
+  `POST /api/machines/{id}/assignment/copy {from, to}`, which checks the
+  caller's scope like a `PUT`, checks both items and copies the current
+  explicit toggles of `from` in one transaction, or the Daemon itself when standalone. When the copy fails
+  (offline, an older Server without the endpoint, or a lost response the
+  Daemon can't resolve by reading the Assignment again), nothing is renamed
+  and `POST /items/rename` answers HTTP 409; `"copy_assignment": false`
+  renames anyway, and the Library offers it as Rename without copying
+  Assignment. The copy never overwrites a toggle the new name already has:
+  the response lists those Harnesses in `kept` instead of `migrated`. When
+  the rename then moves nothing, the toggles the copy applied are removed
+  again under its revision and registration, or the error says where they
+  were kept.
+- A bulk change in the Assignment matrix applies only to the revision shown,
+  so Undo restores the values it replaced. Undo is offered only when the
+  Server reports registrations (or standalone), as an older Server would
+  ignore its guard.
 
 ## [0.1.0] - 2026-11-17
 

@@ -97,6 +97,10 @@ pub struct AssignmentSnapshot {
     pub revision: u64,
     #[serde(flatten)]
     pub assignment: Assignment,
+    /// The machine's [`MachineRow::registration`] when the Server read it for
+    /// `GET /api/machines/{id}/assignment`; absent elsewhere and standalone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration: Option<String>,
 }
 
 /// What a daemon reports about its machine. Names only, never content.
@@ -196,6 +200,10 @@ pub struct MachineRow {
     /// older server sends none: all its machines manage the whole fleet.
     #[serde(default)]
     pub scope: Scope,
+    /// Random and new for every join, unlike `joined_at`, which two joins in
+    /// the same second share. A 0.1.0 Server leaves it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration: Option<String>,
 }
 
 /// What a machine that joined with a join code may manage (ADR 0005). The
@@ -267,9 +275,23 @@ pub struct ToggleChange {
 }
 
 /// `PUT /api/machines/{id}/assignment` body.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssignmentChanges {
     pub changes: Vec<ToggleChange>,
+    /// Apply only to this state of the assignment, checked in the same
+    /// transaction; otherwise the write fails with HTTP 409 and changes nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<Expected>,
+}
+
+/// A precondition of [`AssignmentChanges`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Expected {
+    /// The assignment's current revision.
+    pub revision: u64,
+    /// The machine's current [`MachineRow::registration`]; `None` skips the check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration: Option<String>,
 }
 
 /// `PUT /api/machines/{id}/assignment` response.
@@ -281,6 +303,36 @@ pub struct AssignmentUpdate {
     pub revision: u64,
     /// Log entries written, one per change that actually changed something.
     pub entries: Vec<LogEntry>,
+}
+
+/// `POST /api/machines/{id}/assignment/copy` body: copy the machine's
+/// explicit toggles of `from` to `to`, before a rename of `from` to `to`
+/// reaches its Draft. A 0.1.0 Server answers HTTP 404.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssignmentCopy {
+    /// An item the machine can have: in the baseline, its draft or its unpushed commits.
+    pub from: ItemRef,
+    /// The same kind of item, and none the machine can have yet.
+    pub to: ItemRef,
+}
+
+/// `POST /api/machines/{id}/assignment/copy` response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssignmentCopied {
+    pub assignment: Assignment,
+    /// The assignment's revision after the copy.
+    pub revision: u64,
+    /// The machine's [`MachineRow::registration`]; absent standalone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration: Option<String>,
+    /// Log entries written, one per toggle in `applied`.
+    pub entries: Vec<LogEntry>,
+    /// The toggles written for `to`, one per Harness where `from` had an
+    /// explicit toggle and `to` had none.
+    pub applied: Vec<ToggleChange>,
+    /// The toggles not written because `to` already had an explicit one,
+    /// which was kept.
+    pub skipped: Vec<ToggleChange>,
 }
 
 /// One append-only assignment log entry. For item toggles `None` means "no
@@ -502,7 +554,8 @@ mod tests {
     fn assignment_snapshots_carry_a_revision() {
         let mut a = Assignment::default();
         a.set_skill("claude", "pdf", true);
-        let m = ServerMessage::Assignment(AssignmentSnapshot { revision: 7, assignment: a.clone() });
+        let m =
+            ServerMessage::Assignment(AssignmentSnapshot { revision: 7, assignment: a.clone(), registration: None });
         let v = serde_json::to_value(&m).unwrap();
         assert_eq!(v["type"], "assignment");
         assert_eq!(v["revision"], 7);
@@ -524,7 +577,7 @@ mod tests {
         assert_eq!(serde_json::from_str::<DaemonMessage>(&text).unwrap(), status);
         let mut a = Assignment::default();
         a.set_skill("claude", "pdf", false);
-        let snapshot = AssignmentSnapshot { revision: 1, assignment: a };
+        let snapshot = AssignmentSnapshot { revision: 1, assignment: a, registration: None };
         for m in [
             ServerMessage::Assignment(snapshot),
             ServerMessage::Nudge { baseline: "abc".into() },

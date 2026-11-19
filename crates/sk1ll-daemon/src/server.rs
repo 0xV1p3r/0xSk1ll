@@ -372,7 +372,8 @@ pub async fn set_assignment_direct(
     let state = DaemonState::load(&cfg.state)?.context("this machine hasn't joined a fleet")?;
     let http = http_client().build().context("building the HTTP client")?;
     let update = change_assignment(&http, &state, changes).await?;
-    let snap = AssignmentSnapshot { revision: update.revision, assignment: update.assignment.clone() };
+    let snap =
+        AssignmentSnapshot { revision: update.revision, assignment: update.assignment.clone(), registration: None };
     crate::state::save_snapshot(&cfg.snapshot_path(), &snap)
         .context("Server accepted the assignment, but saving its authoritative snapshot failed")?;
     Ok(update)
@@ -414,6 +415,7 @@ pub(crate) async fn assign_adoption(
                 enabled: Some(true),
             })
             .collect(),
+        ..Default::default()
     };
     assign_draft_item(d, &sk1ll_proto::ItemRef::Skill(adoption.name.clone()), &changes, "Adopt").await
 }
@@ -425,6 +427,13 @@ pub(crate) async fn assign_draft_item(
     changes: &AssignmentChanges,
     action: &str,
 ) -> anyhow::Result<AssignmentUpdate> {
+    await_draft_report(d, item, action).await?;
+    change_assignment(&d.http, d.ident.joined()?, changes).await
+}
+
+/// Waits until the Server has this machine's latest report of `item`, when
+/// it is a draft or unpushed item.
+async fn await_draft_report(d: &Daemon, item: &sk1ll_proto::ItemRef, action: &str) -> anyhow::Result<()> {
     tokio::time::timeout(SEND_TIMEOUT, async {
         loop {
             anyhow::ensure!(d.is_connected(), "{action} needs a connection to the Server");
@@ -449,6 +458,59 @@ pub(crate) async fn assign_draft_item(
         Ok::<_, anyhow::Error>(())
     })
     .await
-    .map_err(|_| anyhow::anyhow!("{action} timed out waiting for the Server to receive the draft; try again"))??;
-    change_assignment(&d.http, d.ident.joined()?, changes).await
+    .map_err(|_| anyhow::anyhow!("{action} timed out waiting for the Server to receive the draft; try again"))?
+}
+
+/// Why [`copy_assignment`] has no result.
+#[derive(Debug)]
+pub(crate) enum CopyFailure {
+    /// The Server has no copy endpoint (0.1.0): nothing was copied.
+    Unsupported,
+    /// Nothing was copied: never sent, or refused.
+    Refused(anyhow::Error),
+    /// Sent, but the response was lost: the Server may have copied.
+    Lost(anyhow::Error),
+}
+
+/// Has the Server copy this machine's explicit toggles of `copy.from` to
+/// `copy.to`, once it has the machine's report of `copy.from`.
+pub(crate) async fn copy_assignment(
+    d: &Daemon,
+    copy: &sk1ll_proto::AssignmentCopy,
+) -> std::result::Result<sk1ll_proto::AssignmentCopied, CopyFailure> {
+    use anyhow::Context;
+    await_draft_report(d, &copy.from, "Rename").await.map_err(CopyFailure::Refused)?;
+    let state = d.ident.joined().map_err(|e| CopyFailure::Refused(e.into()))?;
+    if state.revoked {
+        return Err(CopyFailure::Refused(anyhow::anyhow!("this machine was removed from the fleet")));
+    }
+    let url = format!("{}/api/machines/{}/assignment/copy", state.server_url, state.machine_id);
+    let resp =
+        d.http.post(url).bearer_auth(&state.token).timeout(REQUEST_TIMEOUT).json(copy).send().await.map_err(|e| {
+            let error = anyhow::anyhow!(redact(&format!("offline: the server is unreachable ({e})")));
+            // Only a request that never connected certainly changed nothing.
+            if e.is_connect() { CopyFailure::Refused(error) } else { CopyFailure::Lost(error) }
+        })?;
+    let status = resp.status();
+    let body = resp.bytes().await.context("reading the Server's response").map_err(CopyFailure::Lost)?;
+    if !status.is_success() {
+        let error = serde_json::from_slice::<ErrorBody>(&body);
+        // Only this Server's own errors have a JSON body; an older Server's router has no route.
+        if status == StatusCode::NOT_FOUND && error.is_err() {
+            return Err(CopyFailure::Unsupported);
+        }
+        let message = error.map_or_else(|_| String::from_utf8_lossy(&body).into_owned(), |e| e.error);
+        return Err(CopyFailure::Refused(anyhow::anyhow!(
+            "Server refused the copy (HTTP {status}): {}",
+            redact(&message)
+        )));
+    }
+    serde_json::from_slice(&body).context("parsing the Server's response").map_err(CopyFailure::Lost)
+}
+
+/// This machine's Assignment as the Server has it now.
+pub(crate) async fn fetch_assignment(d: &Daemon) -> anyhow::Result<AssignmentSnapshot> {
+    let state = d.ident.joined()?;
+    let path = format!("/machines/{}/assignment", state.machine_id);
+    Ok(request(&d.http, state, Method::GET, &path, Bytes::new()).await?.error_for_status()?.json().await?)
 }

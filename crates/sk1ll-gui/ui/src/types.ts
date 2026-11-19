@@ -17,9 +17,10 @@ export interface StatusView {
 }
 // What a Machine may manage, from its join code: the whole Fleet, or only itself. Absent means `fleet`.
 export type Scope = 'fleet' | 'self';
+// `registration`: random and new for every join (two joins can share a `joined_at` second); absent from a 0.1.0 Server.
 export interface MachineRow {
   id: string; status: MachineStatus; connected: boolean; joined_at: number; last_seen: number | null;
-  report: MachineReport | null; scope?: Scope;
+  report: MachineReport | null; scope?: Scope; registration?: string | null;
 }
 export interface FleetView { baseline: string | null; machines: MachineRow[] }
 export interface HarnessAssignment {
@@ -29,9 +30,13 @@ export interface HarnessAssignment {
 export interface Assignment { harnesses: Record<string, HarnessAssignment> }
 export type ToggleKind = 'skill' | 'rule' | 'new_skills_default' | 'new_rules_default';
 export interface ToggleChange { harness: string; kind: ToggleKind; name?: string; enabled: boolean | null }
-export interface AssignmentChanges { changes: ToggleChange[] }
-export interface AssignmentSnapshot extends Assignment { revision: number }
-export interface CachedAssignmentSnapshot { assignment: Assignment; revision: number }
+// `expected`: apply only to this revision (and registration, when given), else HTTP 409 and nothing changes.
+export interface Expected { revision: number; registration?: string | null }
+export interface AssignmentChanges { changes: ToggleChange[]; expected?: Expected | null }
+// `registration` comes with a Server's GET of one Machine's Assignment.
+export interface AssignmentSnapshot extends Assignment { revision: number; registration?: string | null }
+// `registration`: which registration of the Machine it was read for (see `registrationOf`).
+export interface CachedAssignmentSnapshot { assignment: Assignment; revision: number; registration?: string | null }
 export interface AssignmentUpdate extends CachedAssignmentSnapshot { entries: LogEntry[] }
 export type LogCause = { type: 'change' | 'item_removed' | 'default_materialized' | 'machine_removed' | 'harness_added' }
   | { type: 'undo'; entry: number };
@@ -94,8 +99,9 @@ export interface ResolveRequest { link: string; path?: string }
 export interface AddImportRequest { name: string; source: string; path: string; ref: string; commit?: string }
 
 export type ContentType = 'personal' | 'import' | 'rule' | 'unmanaged';
+// `resumable`: identical to the existing personal copy, so Adopt resumes an interrupted adoption.
 export interface ContentVariant {
-  hash: string; description: string | null; locations: { harness: string; path: string }[];
+  hash: string; description: string | null; locations: { harness: string; path: string }[]; resumable?: boolean;
 }
 export interface ContentEntry {
   name: string; item: ItemRef | null; type: ContentType; description: string | null;
@@ -112,10 +118,13 @@ export interface PushResult { pushed: boolean }
 export interface CreateItemRequest { kind: 'skill' | 'rule'; name: string; description?: string }
 // Personal Skills and Rules only; Imports use removeImport. Both are Draft changes.
 export interface DeleteItemRequest { kind: 'skill' | 'rule'; name: string }
-export interface RenameItemRequest { kind: 'skill' | 'rule'; name: string; to: string }
-// The rename is in the Draft either way. `migrated` lists the Harnesses whose explicit toggles on this
-// Machine were copied to the new name; `assignment_error` says why they were not (e.g. offline).
-// Other Machines are not migrated: after the push, the old name's toggles are dropped and the new name follows their defaults.
-export interface RenameItemResponse { item: ItemRef; migrated: string[]; assignment_error: string | null }
+// The Assignment authority (the Server, or the Daemon when standalone) first copies this Machine's explicit toggles for
+// the old name to the new one. When it can't (offline, a Server without the copy, an unknown outcome) the rename is
+// refused with HTTP 409, unless `copy_assignment` is false: then it renames and the new name follows the defaults.
+export interface RenameItemRequest { kind: 'skill' | 'rule'; name: string; to: string; copy_assignment?: boolean }
+// `migrated`: Harnesses whose toggle was copied; `kept`: Harnesses where the new name already had its own explicit
+// toggle. `assignment_error` is always null now. Other Machines are not migrated: after the push, the old name's
+// toggles are dropped and the new name follows their defaults.
+export interface RenameItemResponse { item: ItemRef; migrated: string[]; kept?: string[]; assignment_error: string | null }
 export type ConflictDiffRequest = { harness: string; name: string; id?: never } | { id: string; harness?: never; name?: never };
 export interface ImportEntry { name: string; source: string; ref: string; path: string; locked: string | null }

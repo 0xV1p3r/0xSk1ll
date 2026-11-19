@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import type { Dispatch, SetStateAction } from 'react';
-import { api, errorMessage } from './api';
-import { applyToggle, mergeAssignments } from './model';
+import { api, errorMessage, errorStatus } from './api';
+import { applyToggle, mergeAssignments, own, stamped } from './model';
+import type { StampedSnapshot } from './model';
 import { cn } from '@/lib/utils';
-import type { CachedAssignmentSnapshot as AssignmentSnapshot, ToggleChange } from './types';
+import type { Assignment, Expected, ToggleChange } from './types';
 
 // Explicit: solid box with a pinned corner dot. Inherited: hollow dashed outline with a ghost tick. Shape alone tells them apart.
 export const matrixCheckbox = (explicit: boolean, enabled: boolean) => cn('size-[22px] rounded-[6px]', explicit
@@ -12,48 +13,52 @@ export const matrixCheckbox = (explicit: boolean, enabled: boolean) => cn('size-
   ? 'border-primary/70 data-checked:border-primary/70 data-checked:text-brand-ink dark:border-primary/60 dark:data-checked:border-primary/60'
   : 'border-control-border/80'));
 
-export function useAssignmentWrites<D extends { assignments: Record<string, AssignmentSnapshot> }>(resource: { data: D | undefined; setData: Dispatch<SetStateAction<D | undefined>>; refresh: () => Promise<void> }) {
+const withEntry = <V,>(map: ReadonlyMap<string, V>, key: string, value: V | undefined) => {
+  const next = new Map(map);
+  if (value === undefined) next.delete(key); else next.set(key, value);
+  return next;
+};
+export function useAssignmentWrites<D extends { assignments: Record<string, StampedSnapshot> }>(resource: { data: D | undefined; setData: Dispatch<SetStateAction<D | undefined>>; refresh: () => Promise<void> }) {
   const locks = useRef(new Set<string>());
-  const [pending, setPending] = useState<Record<string, boolean>>({});
-  const [errors, setErrors] = useState<Record<string, string>>({});
-  // Keep optimistic state separate from refreshes arriving while a write is in flight.
-  const [overrides, setOverrides] = useState<Record<string, AssignmentSnapshot & { saving?: boolean }>>({});
-  useEffect(() => {
-    if (!resource.data) return;
-    const accepted = resource.data.assignments;
-    setOverrides(old => Object.fromEntries(Object.entries(old).filter(([machine, override]) =>
-      override.saving || !accepted[machine] || accepted[machine].revision < override.revision)));
-  }, [resource.data]);
-  // Resolves true once the Server accepted the changes.
-  const write = async (machine: string, changes: ToggleChange[]) => {
-    if (!changes.length || !resource.data || locks.current.has(machine)) return false;
+  // A write started from an older render (an Undo, say) checks the data as it is now.
+  const latest = useRef(resource.data);
+  useEffect(() => { latest.current = resource.data; }, [resource.data]);
+  // Keyed by Machine id in Maps, so no id can collide with an object's own properties.
+  const [pending, setPending] = useState<ReadonlyMap<string, boolean>>(new Map());
+  const [errors, setErrors] = useState<ReadonlyMap<string, string>>(new Map());
+  // The optimistic state while a write is in flight, separate from refreshes arriving meanwhile.
+  const [overrides, setOverrides] = useState<ReadonlyMap<string, Assignment>>(new Map());
+  // Resolves to the accepted snapshot once the Server took the changes, otherwise null. A Machine whose Assignment never loaded (or left the Fleet) is never written.
+  // With `expected`, a write the authority refuses because the Assignment changed since (HTTP 409) calls `onConflict` instead of showing an error.
+  const write = async (machine: string, changes: ToggleChange[], options: { expected?: Expected; onConflict?: () => void } = {}) => {
+    const before = latest.current && own(latest.current.assignments, machine);
+    if (!changes.length || !before || locks.current.has(machine)) return null;
+    // The registration the write was meant for; a reply arriving after the Machine joined again is dropped.
+    const registration = before.registration;
     locks.current.add(machine);
-    setPending(p => ({ ...p, [machine]: true })); setErrors(e => ({ ...e, [machine]: '' }));
-    const before = overrides[machine] ?? resource.data.assignments[machine];
-    const clearOverride = () => setOverrides(old => { const next = { ...old }; delete next[machine]; return next; });
+    setPending(p => withEntry(p, machine, true)); setErrors(e => withEntry(e, machine, undefined));
     if (changes.some(change => change.kind === 'skill' || change.kind === 'rule')) {
-      setOverrides(old => ({ ...old, [machine]: { ...before, assignment: changes.reduce(applyToggle, before.assignment), saving: true } }));
+      setOverrides(old => withEntry(old, machine, changes.reduce(applyToggle, overrides.get(machine) ?? before.assignment)));
     }
     try {
-      const response = await api.setAssignment(machine, { changes });
-      // Accept each mutation directly, independently of superseded refresh generations.
-      resource.setData(previous => previous && { ...previous,
+      const response = { ...await stamped(() => api.setAssignment(machine, { changes, ...options.expected && { expected: options.expected } })), registration };
+      // Accept each mutation directly, independently of superseded refresh generations, unless the Machine left or joined again meanwhile.
+      resource.setData(previous => previous && own(previous.assignments, machine)?.registration === registration ? { ...previous,
         assignments: mergeAssignments(previous.assignments, { [machine]: response }),
-      });
-      setOverrides(old => ({ ...old, [machine]: response }));
-      return true;
+      } : previous);
+      return response;
     } catch (error) {
-      clearOverride(); setErrors(old => ({ ...old, [machine]: errorMessage(error) }));
-      return false;
+      if (options.expected && options.onConflict && errorStatus(error) === 409) options.onConflict();
+      else setErrors(old => withEntry(old, machine, errorMessage(error)));
+      return null;
     } finally {
-      locks.current.delete(machine); setPending(p => ({ ...p, [machine]: false }));
+      setOverrides(old => withEntry(old, machine, undefined));
+      locks.current.delete(machine); setPending(p => withEntry(p, machine, undefined));
       // useResource surfaces refresh failures while retaining accepted Assignment snapshots.
       void resource.refresh();
     }
   };
-  const assignment = (machine: string) => {
-    const override = overrides[machine], accepted = resource.data!.assignments[machine];
-    return override && (override.saving || override.revision > accepted.revision) ? override.assignment : accepted.assignment;
-  };
+  // Only for Machines with a loaded Assignment.
+  const assignment = (machine: string) => overrides.get(machine) ?? own(resource.data!.assignments, machine)!.assignment;
   return { pending, errors, write, assignment };
 }

@@ -1127,7 +1127,7 @@ mod tests {
         assignment.set_skill("h", "pdf", false);
         sk1ll_daemon::state::save_snapshot(
             &repo.0.join(".git/daemon-assignment.json"),
-            &sk1ll_proto::AssignmentSnapshot { revision: 7, assignment },
+            &sk1ll_proto::AssignmentSnapshot { revision: 7, assignment, registration: None },
         )
         .unwrap();
         repo.run(&["sync"]).unwrap();

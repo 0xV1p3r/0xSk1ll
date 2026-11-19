@@ -219,7 +219,7 @@ fn turn_everything_on(
     let harnesses: Vec<String> = MachineConfig::load(&cfg.machine_config)?.harnesses().into_keys().collect();
     let skills: Vec<String> = repo.skills()?.into_iter().map(|s| s.name).collect();
     let rules: Vec<String> = repo.rules()?.into_iter().map(|r| r.name).collect();
-    let changes = AssignmentChanges { changes: everything_on(&harnesses, &skills, &rules) };
+    let changes = AssignmentChanges { changes: everything_on(&harnesses, &skills, &rules), ..Default::default() };
     if !via_daemon {
         let lock = crate::lock_direct(&state.repo)?.context("the joined repo is not a git repo")?;
         rt.block_on(sk1ll_daemon::set_assignment_direct(cfg, &lock, &changes))?;

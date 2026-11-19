@@ -9,8 +9,9 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use sk1ll_proto::{
-    AssignmentSnapshot, AssignmentUpdate, DaemonMessage, FleetView, ImportsView, ItemRef, JoinCode, JoinResponse,
-    LogCause, LogEntry, MachineReport, MachineRow, MachineStatus, Scope, ServerMessage, ToggleKind,
+    AssignmentCopied, AssignmentSnapshot, AssignmentUpdate, DaemonMessage, FleetView, ImportsView, ItemRef, JoinCode,
+    JoinResponse, LogCause, LogEntry, MachineReport, MachineRow, MachineStatus, Scope, ServerMessage, ToggleChange,
+    ToggleKind,
 };
 use sk1ll_server::Config;
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
@@ -529,6 +530,107 @@ async fn join_codes_are_single_use() {
     let ids: Vec<_> = fleet.machines.iter().map(|m| m.id.as_str()).collect();
     assert_eq!(ids, ["desktop", "laptop"]);
     assert!(fleet.machines.iter().all(|m| m.status == MachineStatus::Offline && !m.connected));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_expected_revision_and_registration_guard_a_write() {
+    let server = start().await;
+    let token = server.join("ws", &["claude"]).await;
+    seed(&server, "ws", &token, &["personal/pdf/SKILL.md"]).await;
+    let put = |body: Value| {
+        let request = server.http.put(server.url("/machines/ws/assignment")).bearer_auth(ADMIN).json(&body);
+        async move { request.send().await.unwrap() }
+    };
+    let snapshot: AssignmentSnapshot = server.get_json(ADMIN, "/machines/ws/assignment").await;
+    let registration = snapshot.registration.clone().expect("a registration");
+    assert_eq!(server.machine_row("ws").await.unwrap().registration.as_ref(), Some(&registration));
+    let change = json!([{"harness": "claude", "kind": "skill", "name": "pdf", "enabled": false}]);
+    let expected = |revision: u64, registration: &str| json!({"changes": change, "expected": {"revision": revision, "registration": registration}});
+    let resp = put(expected(snapshot.revision, &registration)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let update: AssignmentUpdate = resp.json().await.unwrap();
+    // The write moved the revision on: the same precondition no longer holds.
+    let resp = put(expected(snapshot.revision, &registration)).await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert!(resp.text().await.unwrap().contains("changed since revision"));
+
+    // A new join of the same id is another registration, even within the second.
+    let resp = server.http.delete(server.url("/machines/ws")).bearer_auth(ADMIN).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    server.join("ws", &["claude"]).await;
+    let again: AssignmentSnapshot = server.get_json(ADMIN, "/machines/ws/assignment").await;
+    assert_ne!(again.registration.as_ref(), Some(&registration));
+    let resp = put(expected(again.revision, &registration)).await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert!(resp.text().await.unwrap().contains("joined the fleet again"));
+    let resp = put(expected(again.revision, again.registration.as_deref().unwrap())).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(update.revision < again.revision);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rename_copy_copies_the_source_toggles_and_keeps_explicit_ones() {
+    let server = start().await;
+    let token = server.join("ws", &["claude", "codex"]).await;
+    seed(&server, "ws", &token, &["personal/pdf/SKILL.md", "personal/csv/SKILL.md"]).await;
+    let request = |path: &str, body: Value| {
+        let request = server.http.post(server.url(path)).bearer_auth(&token).json(&body);
+        async move { request.send().await.unwrap() }
+    };
+    let copy = |from: &str, to: &str| request("/machines/ws/assignment/copy", json!({"from": from, "to": to}));
+    server
+        .put_assignment(
+            ADMIN,
+            "ws",
+            json!([
+                {"harness": "claude", "kind": "skill", "name": "pdf", "enabled": true},
+                {"harness": "codex", "kind": "skill", "name": "pdf", "enabled": true},
+                // Another client turned the new name off on codex first.
+                {"harness": "codex", "kind": "skill", "name": "docs", "enabled": false},
+            ]),
+        )
+        .await;
+    // A PUT can't turn on a name the machine can't have, whatever it claims.
+    let on = json!([{"harness": "claude", "kind": "skill", "name": "docs", "enabled": true}]);
+    let resp = server
+        .http
+        .put(server.url("/machines/ws/assignment"))
+        .bearer_auth(&token)
+        .json(&json!({"changes": on, "rename": {"from": "skill:pdf", "to": "skill:docs"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    assert_eq!(copy("skill:missing", "skill:docs").await.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(copy("rule:pdf", "skill:docs").await.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(copy("skill:pdf", "skill:pdf").await.status(), StatusCode::BAD_REQUEST);
+    // A known different item keeps its own toggles.
+    assert_eq!(copy("skill:pdf", "skill:csv").await.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        request("/machines/nope/assignment/copy", json!({"from": "skill:pdf", "to": "skill:docs"})).await.status(),
+        StatusCode::NOT_FOUND
+    );
+
+    let before: AssignmentSnapshot = server.get_json(ADMIN, "/machines/ws/assignment").await;
+    let resp = copy("skill:pdf", "skill:docs").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let copied: AssignmentCopied = resp.json().await.unwrap();
+    assert_eq!(copied.registration, before.registration);
+    assert_eq!(copied.revision, before.revision + 1);
+    let harnesses = |changes: &[ToggleChange]| changes.iter().map(|c| c.harness.clone()).collect::<Vec<_>>();
+    assert_eq!((harnesses(&copied.applied), harnesses(&copied.skipped)), (vec!["claude".into()], vec!["codex".into()]));
+    assert_eq!(copied.assignment.harness("claude").skills.get("docs"), Some(&true));
+    assert_eq!(copied.assignment.harness("codex").skills.get("docs"), Some(&false));
+    assert_eq!(copied.entries.len(), 1, "{:?}", copied.entries);
+    assert_eq!((copied.entries[0].cause.clone(), copied.entries[0].author.as_str()), (LogCause::Change, "ws"));
+    let after: AssignmentSnapshot = server.get_json(ADMIN, "/machines/ws/assignment").await;
+    assert_eq!((after.revision, after.assignment), (copied.revision, copied.assignment));
+
+    // Nothing to copy changes nothing.
+    let copied: AssignmentCopied = copy("skill:csv", "skill:tables").await.json().await.unwrap();
+    assert!(copied.applied.is_empty() && copied.skipped.is_empty() && copied.entries.is_empty());
+    assert_eq!(copied.revision, after.revision);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1091,6 +1193,19 @@ async fn self_scoped_machines_manage_only_themselves() {
     let mine = server.put_assignment(&me, "me", toggle.clone()).await;
     forbidden(server.try_put_assignment(&me, "other", toggle.clone()).await).await;
     forbidden(server.try_put_assignment(&me, "ghost", toggle.clone()).await).await;
+    // A rename's copy follows the same rule: its own gets past the scope
+    // check (and fails only on the unknown item), no one else's does.
+    let copy = |id: &str| {
+        let req = server
+            .http
+            .post(server.url(&format!("/machines/{id}/assignment/copy")))
+            .bearer_auth(&me)
+            .json(&json!({"from": "skill:pdf", "to": "skill:docs"}));
+        async move { req.send().await.unwrap() }
+    };
+    assert_eq!(copy("me").await.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    forbidden(copy("other").await).await;
+    forbidden(copy("ghost").await).await;
     let theirs = server.put_assignment(&other, "other", toggle.clone()).await;
     // A fleet machine still manages it.
     let by_other = server
@@ -1281,7 +1396,7 @@ async fn assignment_revisions_arrive_in_order() {
     assert!(revisions.windows(2).all(|w| w[0] < w[1]), "{revisions:?}");
     let stored: AssignmentSnapshot = server.get_json(&token, "/machines/ws/assignment").await;
     assert_eq!(stored.revision, last);
-    assert_eq!(latest, stored);
+    assert_eq!(latest, AssignmentSnapshot { registration: None, ..stored.clone() });
     assert_eq!(stored.assignment.harness("claude").skills.len(), 20);
     let log_before: Vec<LogEntry> = server.get_json(&token, "/log?machine=ws").await;
     let noop = server.put_assignment(&token, "ws", json!([])).await;
