@@ -2,6 +2,9 @@ import { invoke } from '@tauri-apps/api/core';
 import type * as T from './types';
 
 export const api = {
+  renderInstructions: (name: string) => invoke<T.InstructionPreview[]>('render_instructions', { name }),
+  previewSync: () => invoke<T.SyncResult>('preview_sync'),
+  syncNow: () => invoke<T.SyncResult>('sync_now'),
   init: () => invoke<void>('init'),
   push: () => invoke<T.PushResult>('push'),
   createItem: (request: T.CreateItemRequest) => invoke<void>('create_item', { request }),

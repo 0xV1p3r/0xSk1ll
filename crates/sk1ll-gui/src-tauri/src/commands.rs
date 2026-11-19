@@ -75,6 +75,9 @@ command!(discard_displaced(id: String) -> (), discard_displaced(&id));
 command!(harnesses() -> Vec<HarnessView>, harnesses());
 command!(setup_harnesses() -> Vec<HarnessChoice>, setup_harnesses());
 command!(set_setup_harness(name: String, enabled: bool) -> Vec<HarnessChoice>, set_setup_harness(&name, enabled));
+command!(render_instructions(name: String) -> Vec<InstructionPreview>, render_instructions(&name));
+command!(preview_sync() -> SyncResult, preview_sync());
+command!(sync_now() -> SyncResult, sync(&SyncRequest::default()));
 command!(harness_settings() -> HarnessSettings, harness_settings());
 command!(preview_harness(request: HarnessChangeRequest) -> HarnessPreview, preview_harness(&request));
 command!(

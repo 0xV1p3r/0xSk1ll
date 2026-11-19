@@ -123,7 +123,24 @@ export function installMock(scenario: string) {
     return { migrated, kept };
   };
 
+  let syncPending = !empty;
   mockIPC((cmd, args) => {
+    if (cmd === 'render_instructions') {
+      if (empty) return [];
+      const { name } = args as { name: string };
+      const path = name === 'claude' ? '/home/dev/.claude/CLAUDE.md' : '/home/dev/.codex/AGENTS.md';
+      const content = 'Use two spaces for indentation.\n';
+      const diff = '--- on-disk\n+++ next-sync\n@@ -1 +1 @@\n-Use tabs for indentation.\n+Use two spaces for indentation.';
+      return [{ path, format: 'block', content, next_content: content, differs: syncPending, diff: syncPending ? diff : '' }] satisfies T.InstructionPreview[];
+    }
+    if (cmd === 'preview_sync') return { conflicts, actions: syncPending ? [
+      { harness: 'claude', kind: 'update', item: 'instructions', name: 'style', dest: '/home/dev/.claude/CLAUDE.md', reason: null },
+      { harness: 'codex', kind: 'conflict', item: 'skill', name: 'code-review', dest: '/home/dev/.codex/skills/code-review', reason: conflicts[0]?.reason ?? null },
+    ] : [] } satisfies T.SyncResult;
+    if (cmd === 'sync_now') {
+      syncPending = false;
+      return { conflicts } satisfies T.SyncResult;
+    }
     const a = (args ?? {}) as Record<string, unknown>;
     if (cmd === 'daemon_service') return delay({ default_socket: true, binary: '/home/dev/.cargo/bin/sk1ll', manager: 'systemd', available: true, active: false, restartable: false, unit: null });
     if (cmd === 'start_daemon') { setTimeout(() => { running = true; }, 1500); return delay('systemd', 600); }
