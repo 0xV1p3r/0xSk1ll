@@ -91,6 +91,19 @@ break compatibility.
 
 ### Fixed
 
+- Daemon state writes use exclusive private staging files. Failed desktop
+  notifications are retried with backoff.
+- Harness-wide Assignment and rename-copy require a current Baseline inventory.
+  Harness-wide changes skip ineligible item names and sync locally before
+  Settings previews a disable again.
+- The Library keeps unsaved text through a Daemon disconnect and restores
+  keyboard focus when editing ends.
+- Harness changes, desktop Sync now, and Import updates detect changes made
+  after their previews. Settings can open `machine.toml` even when it fails to parse.
+- Assignment edits check revisions on supported authorities. The matrix warns
+  before unguarded bulk edits, and Copy Assignment can recover from a conflict
+  within the same dialog.
+
 - When local edits prevent an Import update, the desktop app offers to fork
   the Import or overwrite the edits after confirmation.
 - Starting the macOS daemon recreates its log directory and repairs generated

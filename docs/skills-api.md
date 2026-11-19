@@ -269,11 +269,15 @@ GUI offers matrix Undo only when it is there (or standalone). `GET /fleet` lists
 Send `POST /api/machines/{id}/assignment/harness/{harness}` with
 `{"enabled": false}` (or `true`) to set both defaults and every Baseline item,
 reported draft, and unpushed item for that Machine in one transaction.
-It uses the same scope, change log and response as the assignment PUT.
+It uses the same scope and change log as the assignment PUT. The response
+adds `skipped` for Skills and Rules with names the Server cannot accept as
+toggles. Both this endpoint and rename-copy return 503 if the current
+Baseline inventory cannot be read. Retry after the Server can read it.
 
 The local endpoint `POST /assignment/harness/{harness}` targets the
-Daemon's own Machine and returns the assignment update in `update`, with
-`warning` set to null. Standalone uses the local repo. If the Server returns
+Daemon's own Machine and returns the assignment update in `update`. It
+applies the Server's snapshot and syncs locally before replying. A non-null
+`warning` can list items skipped by the Server. Standalone uses the local repo. If the Server returns
 a 404 without a JSON body, the Daemon uses the local repo and returns a warning
 that unpulled items may stay on.
 
@@ -287,12 +291,23 @@ block). `differs` compares the proposed file with the file on disk. `diff`
 is a unified diff, or an empty string when the file matches. A diff can
 include proposed changes that sync will leave for conflict resolution.
 
-`POST /sync` with `{"dry_run":true}` returns `actions` and `conflicts`
+`POST /sync` with `{"dry_run":true}` returns `actions`, `conflicts` and a `fingerprint`
 without applying changes or running recovery. Each action has `harness`,
 `kind` (`create`, `update`, `remove`, or `conflict`), `item`, `name`,
 `dest`, and `reason`. `GET /sync` returns the same plan. Both endpoints accept
 an optional `force` boolean, which defaults to false. Use GET when a Daemon
 might predate dry-run support.
 
-A regular `POST /sync` replans and applies. It returns remaining `conflicts`
+A regular `POST /sync` replans and applies. Supply the preview’s `fingerprint` to apply a reviewed plan. If the plan changed, the Daemon returns 409 with the fresh preview. It returns remaining `conflicts`
 and includes `errors` if any placements fail.
+
+## Harness change and import update preconditions
+
+`POST /harnesses/preview` returns a `fingerprint` for the config snapshot.
+Supply it with the same `change` to `POST /harnesses/apply`. Apply returns
+409 if the file changed. `GET /harnesses/config/path` returns the configured
+path as a JSON string and works even when the file cannot be parsed.
+
+`POST /imports/{name}/update?expected={sha}` checks the upstream commit
+resolved during the fetch. It returns 409 if the commit differs. This also
+works with `force=true` when overwriting local edits.
