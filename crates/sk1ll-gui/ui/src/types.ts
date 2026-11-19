@@ -70,7 +70,26 @@ export interface HarnessView {
   name: string; origin: string;
   harness: { skills: string | null; instructions: string | null; instructions_format: 'block' | 'rules'; mode: 'symlink' | 'copy' };
 }
-export interface HarnessChoice { name: string; installed: boolean; enabled: boolean; harness: HarnessView['harness'] }
+// `preset`: built in (machine.toml can only override or disable it); `configured`: machine.toml has an entry;
+// `available`: an opt-in preset (added after 0.1.0) that machine.toml doesn't enable, or gemini without its opt-in
+// skills directory; enabling it takes that up (`harness` shows what it then syncs into).
+export interface HarnessChoice { name: string; installed: boolean; enabled: boolean; harness: HarnessView['harness']; preset?: boolean; configured?: boolean; available?: boolean; setup_warning?: string }
+export interface HarnessSettings { path: string; harnesses: HarnessChoice[] }
+export type HarnessChange = { op: 'enable' | 'disable' | 'remove'; name: string } | { op: 'set'; name: string; harness: HarnessView['harness'] };
+// Apply answers 409 if machine.toml changed while it was written; it never removes what sk1ll placed.
+export interface HarnessChangeRequest { change: HarnessChange }
+export interface PlacementView {
+  harness: string; kind: 'create' | 'update' | 'remove' | 'conflict'; item: 'skill' | 'rule' | 'instructions';
+  name: string; dest: string; reason: string | null;
+}
+// `placed`: what sk1ll placed where the change stops syncing, which stays there (`remove`: managed, `conflict`: edited
+// by hand); turning the Harness's items off first lets sync take it out. `sync`: what the sync after the change does.
+export interface HarnessPreview {
+  path: string; name: string; before: HarnessView['harness'] | null; after: HarnessView['harness'] | null;
+  placed: PlacementView[]; warnings?: string[]; sync: PlacementView[]; awaiting_assignment: boolean;
+}
+// `errors`: what the sync after the change failed to place; machine.toml changed either way.
+export interface HarnessApplied { harnesses: HarnessChoice[]; errors: string[] }
 // How the app can start the Daemon itself; not a Daemon type.
 export type ServiceManager = 'systemd' | 'launchd';
 export interface ServiceInfo { default_socket: boolean; binary: string | null; manager: ServiceManager; available: boolean; active: boolean; restartable: boolean; unit: string | null }

@@ -91,10 +91,23 @@ export function installMock(scenario: string) {
   const imports: T.ImportsView & { imports: T.ImportEntry[] } = { imports: empty ? [] : [{ name: 'pdf', source: 'github:example/skills', ref: 'main', path: 'skills/pdf', locked: '4e5f6a7b8c9d' }, { name: 'anthropic-skills', source: 'https://github.com/anthropics/skills', ref: 'main', path: '', locked: '4e5f6a7b8c9d' }, { name: 'internal-skills', source: 'github:example/internal-skills', ref: 'main', path: '', locked: '123456789abc' }], checked_at: now - 900, errors: empty ? [] : [{ name: 'internal-skills', message: 'git fetch failed: repository not found' }],
     updates: empty ? [] : [{ name: 'anthropic-skills', source: 'https://github.com/anthropics/skills', ref: 'main', locked: '4e5f6a7b8c9d', upstream: 'c0ffee123456' }] };
   const setupHarnesses: T.HarnessChoice[] = [
-    { name: 'claude', installed: true, enabled: true, harness: harnesses[0].harness },
-    { name: 'codex', installed: true, enabled: true, harness: harnesses[1].harness },
-    { name: 'gemini', installed: false, enabled: false, harness: { skills: null, instructions: '~/.gemini/GEMINI.md', instructions_format: 'block', mode: 'symlink' } },
+    { name: 'claude', installed: true, enabled: true, preset: true, configured: false, harness: harnesses[0].harness },
+    { name: 'codex', installed: true, enabled: true, preset: true, configured: true, harness: harnesses[1].harness },
+    { name: 'gemini', installed: false, enabled: false, preset: true, configured: false, harness: { skills: '~/.gemini/skills', instructions: '~/.gemini/GEMINI.md', instructions_format: 'block', mode: 'symlink' } },
+    { name: 'kiro', installed: true, enabled: false, preset: true, configured: false, available: true, harness: { skills: '~/.kiro/skills', instructions: '~/.kiro/steering', instructions_format: 'rules', mode: 'copy' } },
   ];
+  const machineConfig = '/home/dev/.config/sk1ll/machine.toml';
+  // Every enabled Harness got `code-review`; a change previews it as left in place or placed.
+  const harnessPreview = (change: T.HarnessChange): T.HarnessPreview => {
+    const choice = setupHarnesses.find(h => h.name === change.name);
+    const before = choice?.enabled ? choice.harness : null;
+    const after = change.op === 'set' ? change.harness
+      : change.op === 'disable' || (change.op === 'remove' && !choice?.preset) ? null : choice?.harness ?? null;
+    const placement = (h: T.HarnessView['harness'], kind: T.PlacementView['kind']): T.PlacementView[] => h.skills ? [{ harness: change.name, kind, item: 'skill', name: 'code-review', dest: `${h.skills}/code-review`, reason: null }] : [];
+    const moved = before && (!after || after.skills !== before.skills);
+    return { path: machineConfig, name: change.name, before, after, placed: moved ? placement(before, 'remove') : [],
+      warnings: [], sync: after && (!before || after.skills !== before.skills) ? placement(after, 'create') : [], awaiting_assignment: false };
+  };
   let running = scenario !== 'unreachable';
   const delay = <V,>(value: V, ms = 250) => new Promise<V>(resolve => setTimeout(() => resolve(value), ms));
   // The authority copies this Machine's toggles for `from` to the new name first, keeping toggles the new name already has; the rename is refused when it can't be asked.
@@ -267,6 +280,19 @@ export function installMock(scenario: string) {
         if (choice) choice.enabled = a.enabled as boolean;
         return delay(setupHarnesses);
       }
+      case 'harness_settings': return delay({ path: machineConfig, harnesses: setupHarnesses });
+      case 'preview_harness': return delay(harnessPreview((a.request as T.HarnessChangeRequest).change), 400);
+      case 'apply_harness': {
+        const { change } = a.request as T.HarnessChangeRequest;
+        const index = setupHarnesses.findIndex(h => h.name === change.name);
+        if (change.op === 'set') {
+          if (index < 0) setupHarnesses.push({ name: change.name, installed: true, enabled: true, preset: false, configured: true, harness: change.harness });
+          else Object.assign(setupHarnesses[index], { harness: change.harness, configured: true });
+        } else if (change.op === 'remove' && index >= 0 && !setupHarnesses[index].preset) setupHarnesses.splice(index, 1);
+        else if (index >= 0) Object.assign(setupHarnesses[index], change.op === 'remove' ? { configured: false, enabled: setupHarnesses[index].installed } : { enabled: change.op === 'enable', configured: true, available: change.op === 'enable' ? false : setupHarnesses[index].available });
+        return delay({ harnesses: setupHarnesses, errors: [] }, 600);
+      }
+      case 'open_machine_config': return delay(undefined);
       case 'imports': return delay(imports);
       // A tree/blob link resolves one Skill; a repository link resolves several.
       case 'resolve_import': {

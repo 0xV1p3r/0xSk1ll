@@ -22,9 +22,10 @@ use tokio::sync::broadcast::error::RecvError;
 
 use crate::client::{
     API_HEADER, API_VERSION, AddImportRequest, CommitMessage, CommitRequest, CommitResponse, ConflictTarget,
-    ConflictView, DiffView, DraftEntry, Event, HarnessChoice, HarnessView, ImportName, ImportUpdated, ItemView,
-    JoinApiRequest, PullResult, PushResult, ResolveImportRequest, ResolvedSource, RestoreRequest, RestoreResponse,
-    SetHarnessEnabled, StatusView, SyncRequest, SyncResult, UpdateImportsRequest,
+    ConflictView, DiffView, DraftEntry, Event, HarnessApplied, HarnessChangeRequest, HarnessChoice, HarnessPreview,
+    HarnessSettings, HarnessView, ImportName, ImportUpdated, ItemView, JoinApiRequest, PullResult, PushResult,
+    ResolveImportRequest, ResolvedSource, RestoreRequest, RestoreResponse, SetHarnessEnabled, StatusView, SyncRequest,
+    SyncResult, UpdateImportsRequest,
 };
 use crate::daemon::Daemon;
 use crate::error::{Error, Result};
@@ -55,6 +56,9 @@ pub(crate) fn router(d: Arc<Daemon>) -> Router {
         .route("/conflicts/adopt", post(adopt))
         .route("/conflicts/overwrite", post(overwrite))
         .route("/harnesses", get(harnesses))
+        .route("/harnesses/config", get(harness_settings))
+        .route("/harnesses/preview", post(preview_harness))
+        .route("/harnesses/apply", post(apply_harness))
         .route("/setup/harnesses", get(setup_harnesses))
         .route("/setup/harnesses/{name}", post(set_setup_harness))
         .route("/imports", get(imports))
@@ -320,6 +324,18 @@ async fn set_setup_harness(
     Json(req): Json<SetHarnessEnabled>,
 ) -> Result<Json<Vec<HarnessChoice>>> {
     Ok(Json(d.blocking(move |d, eng| d.set_setup_harness(eng, &name, req.enabled)).await?))
+}
+
+async fn harness_settings(State(d): St) -> Result<Json<HarnessSettings>> {
+    Ok(Json(d.reading(|d| d.harness_settings()).await?))
+}
+
+async fn preview_harness(State(d): St, Json(req): Json<HarnessChangeRequest>) -> Result<Json<HarnessPreview>> {
+    Ok(Json(d.reading(move |d| d.preview_harness(&req.change)).await?))
+}
+
+async fn apply_harness(State(d): St, Json(req): Json<HarnessChangeRequest>) -> Result<Json<HarnessApplied>> {
+    Ok(Json(d.blocking(move |d, eng| d.apply_harness(eng, req)).await?))
 }
 
 async fn update_import(State(d): St, UrlPath(name): UrlPath<String>) -> Result<Json<ImportUpdated>> {

@@ -26,6 +26,9 @@
 //! | GET | `/harnesses` | → `Vec<`[`HarnessView`]`>` |
 //! | GET | `/setup/harnesses` | → `Vec<`[`HarnessChoice`]`>` |
 //! | POST | `/setup/harnesses/{name}` | [`SetHarnessEnabled`] → `Vec<`[`HarnessChoice`]`>`; standalone without a repo only |
+//! | GET | `/harnesses/config` | → [`HarnessSettings`] |
+//! | POST | `/harnesses/preview` | [`HarnessChangeRequest`] → [`HarnessPreview`]; changes nothing |
+//! | POST | `/harnesses/apply` | [`HarnessChangeRequest`] → [`HarnessApplied`]; then syncs; never removes placed content; 409 if `machine.toml` changed while it was written |
 //! | POST | `/imports/{name}/update` | → [`ImportUpdated`] |
 //! | POST | `/imports/resolve` | [`ResolveImportRequest`] → [`ResolvedSource`] |
 //! | POST | `/imports/add` | [`AddImportRequest`] → [`ImportUpdated`] |
@@ -50,7 +53,9 @@
 //! `GET /imports`, `POST /join-codes`. Bodies are the server's (`sk1ll-proto`).
 //!
 //! Every request carries [`API_HEADER`]; a daemon of another [`API_VERSION`]
-//! answers 426 and says to restart it.
+//! answers 426 and says to restart it. A daemon older than the
+//! `/harnesses/config|preview|apply` routes answers them 404 without a body;
+//! the client reports that as a daemon to restart too.
 //!
 //! Errors are [`ErrorBody`] with a 4xx/5xx status.
 
@@ -64,8 +69,8 @@ use hyper_util::rt::TokioIo;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub use sk1ll_core::HarnessChoice;
 pub use sk1ll_core::content::{ContentEntry, ContentQuery, ContentType, FileContent, FileEntry, FileQuery};
+pub use sk1ll_core::{HarnessChange, HarnessChoice};
 pub use sk1ll_proto::{
     Assignment, AssignmentChanges, AssignmentSnapshot, AssignmentUpdate, ErrorBody, FleetView, ImportSkipped,
     ImportUpdate, ItemRef, JoinCode, JoinCodeRequest, LogEntry, LogFacets, LogQuery, MachineReport, MachineStatus,
@@ -80,6 +85,25 @@ pub const API_VERSION: u32 = 1;
 /// Request header carrying the client's [`API_VERSION`]. A daemon refuses a
 /// request that names another version (426); one without it is accepted.
 pub const API_HEADER: &str = "sk1ll-api";
+
+/// Routes added after the first release with this [`API_VERSION`]: a
+/// daemon started before them answers them 404 without a body.
+const NEWER_ROUTES: [&str; 3] = ["/harnesses/config", "/harnesses/preview", "/harnesses/apply"];
+
+/// What a failed response says: its error, or why there is none.
+fn failure_message(status: StatusCode, bytes: &[u8], method: &Method, path: &str) -> String {
+    let message = serde_json::from_slice::<ErrorBody>(bytes)
+        .map(|e| e.error)
+        .unwrap_or_else(|_| String::from_utf8_lossy(bytes).trim().to_string());
+    match message.is_empty() {
+        true if status == StatusCode::NOT_FOUND && bytes.is_empty() && NEWER_ROUTES.contains(&path) => format!(
+            "the running daemon doesn't know {method} {path}: it is older than this client; restart it so it \
+             runs the installed sk1ll (systemctl --user restart sk1ll-daemon)"
+        ),
+        true => status.to_string(),
+        false => message,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -286,6 +310,68 @@ pub struct HarnessView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetHarnessEnabled {
     pub enabled: bool,
+}
+
+/// `GET /harnesses/config`: every harness this machine can sync into, and
+/// the `machine.toml` they come from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessSettings {
+    /// The daemon's `machine.toml` (it may not exist yet).
+    pub path: PathBuf,
+    pub harnesses: Vec<HarnessChoice>,
+}
+
+/// `POST /harnesses/preview`, `POST /harnesses/apply`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessChangeRequest {
+    pub change: HarnessChange,
+}
+
+/// One thing sync placed, or would place, in a harness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementView {
+    pub harness: String,
+    /// `create`, `update`, `remove` or `conflict` (left alone). In
+    /// [`HarnessPreview::placed`], `remove` is managed content and
+    /// `conflict` a copy edited by hand.
+    pub kind: String,
+    /// `skill`, `rule` or `instructions` (a block).
+    pub item: String,
+    /// A skill name, a rule file, or the rules a block holds.
+    pub name: String,
+    pub dest: PathBuf,
+    pub reason: Option<String>,
+}
+
+/// `POST /harnesses/preview`: what a harness change would do.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessPreview {
+    pub path: PathBuf,
+    pub name: String,
+    /// The harness as synced into now (`None`: it isn't).
+    pub before: Option<sk1ll_core::Harness>,
+    /// The harness once the change is made (`None`: no longer synced into).
+    pub after: Option<sk1ll_core::Harness>,
+    /// Content sk1ll placed where the change stops syncing. The change
+    /// leaves it in place, unmanaged; to take it out, turn the harness's
+    /// items off in its assignment first and let sync remove them.
+    pub placed: Vec<PlacementView>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    /// What the sync after the change does in this harness.
+    pub sync: Vec<PlacementView>,
+    /// No assignment yet (a joined machine waiting for the server's), so
+    /// `sync` is empty and the harness is left alone until it arrives.
+    pub awaiting_assignment: bool,
+}
+
+/// `POST /harnesses/apply`: `machine.toml` was changed and the harnesses synced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessApplied {
+    pub harnesses: Vec<HarnessChoice>,
+    /// What the sync after the change failed to place; `machine.toml` was
+    /// changed either way.
+    pub errors: Vec<String>,
 }
 
 /// `POST /imports/{name}/update`: the import was re-vendored into the draft.
@@ -607,16 +693,13 @@ impl Client {
 
     /// Sends a request and returns the response body of a 2xx response.
     async fn raw(&self, method: Method, path: &str, body: Option<Vec<u8>>) -> Result<Bytes> {
-        let resp = self.send(method, path, body).await?;
+        let resp = self.send(method.clone(), path, body).await?;
         let status = resp.status();
         let bytes = resp.into_body().collect().await.map_err(ClientError::transport)?.to_bytes();
         if status.is_success() {
             return Ok(bytes);
         }
-        let message = serde_json::from_slice::<ErrorBody>(&bytes)
-            .map(|e| e.error)
-            .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).trim().to_string());
-        let message = if message.is_empty() { status.to_string() } else { message };
+        let message = failure_message(status, &bytes, &method, path);
         Err(ClientError { status: Some(status.as_u16()), message, not_running: false })
     }
 
@@ -740,6 +823,18 @@ impl Client {
 
     pub async fn set_setup_harness(&self, name: &str, enabled: bool) -> Result<Vec<HarnessChoice>> {
         self.post(&format!("/setup/harnesses/{}", encode(name)), &SetHarnessEnabled { enabled }).await
+    }
+
+    pub async fn harness_settings(&self) -> Result<HarnessSettings> {
+        self.get("/harnesses/config").await
+    }
+
+    pub async fn preview_harness(&self, req: &HarnessChangeRequest) -> Result<HarnessPreview> {
+        self.post("/harnesses/preview", req).await
+    }
+
+    pub async fn apply_harness(&self, req: &HarnessChangeRequest) -> Result<HarnessApplied> {
+        self.post("/harnesses/apply", req).await
     }
 
     pub async fn update_import(&self, name: &str) -> Result<ImportUpdated> {
@@ -953,6 +1048,34 @@ mod tests {
                 {"path": "", "default_name": "r", "description": null, "taken": true}]})
         );
         assert_eq!(serde_json::from_value::<ResolvedSource>(v).unwrap(), r);
+    }
+
+    #[test]
+    fn only_a_missing_harness_route_reads_as_an_old_daemon() {
+        let msg = |status, body: &[u8], path| failure_message(status, body, &Method::GET, path);
+        assert!(msg(StatusCode::NOT_FOUND, b"", "/harnesses/config").contains("older than this client"));
+        assert_eq!(msg(StatusCode::NOT_FOUND, b"", "/imports/x/update"), "404 Not Found");
+        assert_eq!(msg(StatusCode::NOT_FOUND, b"  ", "/harnesses/apply"), "404 Not Found", "a body, if blank");
+        assert_eq!(
+            msg(StatusCode::NOT_FOUND, br#"{"error":"no harness `x`"}"#, "/harnesses/preview"),
+            "no harness `x`"
+        );
+        assert_eq!(msg(StatusCode::BAD_GATEWAY, b"", "/harnesses/config"), "502 Bad Gateway");
+    }
+
+    /// The GUI's contract for harness changes.
+    #[test]
+    fn harness_changes_are_tagged_by_op() {
+        let json = serde_json::json!({"change": {"op": "set", "name": "agents", "harness": {
+            "skills": "~/.agents/skills", "instructions": null, "instructions_format": "block", "mode": "copy"}}});
+        let req: HarnessChangeRequest = serde_json::from_value(json).unwrap();
+        assert!(matches!(&req.change, HarnessChange::Set { name, harness } if name == "agents"
+            && harness.mode == sk1ll_core::LinkMode::Copy));
+        let disable = HarnessChangeRequest { change: HarnessChange::Disable { name: "codex".into() } };
+        assert_eq!(
+            serde_json::to_value(&disable).unwrap(),
+            serde_json::json!({"change": {"op": "disable", "name": "codex"}})
+        );
     }
 
     /// Absent and empty are different for `path`: `""` is the repo root.

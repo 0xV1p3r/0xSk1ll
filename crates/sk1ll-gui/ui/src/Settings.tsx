@@ -2,15 +2,14 @@ import { version as appVersion } from '../package.json';
 import { useCallback, useRef, useState } from 'react';
 import { LoaderCircle, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { Badge } from '@/components/ui/badge';
 import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog';
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Collapsible, CollapsibleTrigger, CollapsibleContent } from '@/components/ui/collapsible';
 import { NativeSelect } from '@/components/ui/native-select';
 import { time } from './model';
 import { toast } from './toast';
+import { HarnessPanel, Path } from './HarnessSettings';
 import { api } from './api';
 import { useMutation, useResource } from './hooks';
 import { Action, Details, ErrorNotice, Loading, Pending, Panel, PanelToolbar, SectionTitle, When } from './shared';
@@ -71,7 +70,6 @@ export function Settings({ revision, fleetRevision = revision, status, socket, c
   if (status.pending_discards > 0) diagnostics.push(['Pending Restore reports', status.pending_discards]);
   if (status.auth_rejected_since !== null) diagnostics.push(['Auth rejected since', time(status.auth_rejected_since)]);
   const fleet = useResource(api.fleet, fleetRevision, undefined, !standalone);
-  const harnesses = useResource(api.harnesses, revision);
   const saveEditor = useMutation();
   const [preferred, setPreferred] = useState<string>();
   const [refresh, setRefresh] = useState(0);
@@ -94,19 +92,8 @@ export function Settings({ revision, fleetRevision = revision, status, socket, c
       <div className="p-3.5"><Details rows={[
         ['Machine id', status.machine_id], ['Server', status.server_url || 'Not configured'], ['Connection', <span className="capitalize">{connection}</span>],
         ['Repo', <Path value={status.repo} />],
-      ]} /></div><div className="px-3.5"><h3 className="text-sm font-medium">Harnesses on this Machine</h3><p className="text-sm text-muted-foreground">Harnesses are configured in this Machine's <code className="font-mono">machine.toml</code>.</p></div>
-      <div className="flex flex-col gap-3 p-3.5"><ErrorNotice error={harnesses.error} />
-        {harnesses.loading && !harnesses.data && <Loading rows={2} />}
-        {harnesses.data && <div className="overflow-hidden rounded-lg border"><Table aria-label="Harnesses on this Machine"><TableHeader><TableRow className="bg-muted/50 hover:bg-muted/50">
-          {['Harness', 'Skills', 'Rules', 'Mode', 'Origin'].map(label => <TableHead key={label}>{label}</TableHead>)}
-        </TableRow></TableHeader><TableBody>{harnesses.data.map(h => <TableRow key={h.name}>
-          <TableCell className="font-medium">{h.name}</TableCell><TableCell><Path value={h.harness.skills} /></TableCell>
-          <TableCell><Path value={h.harness.instructions} />
-            <p className="text-xs text-muted-foreground">{h.harness.instructions && (h.harness.instructions_format === 'block' ? 'Single file' : 'Rule files')}</p></TableCell>
-          <TableCell>{h.harness.mode === 'symlink' ? 'Symbolic link' : 'Copy'}</TableCell><TableCell><Badge variant="secondary">{h.origin === 'detected' ? 'Detected' : h.origin === 'machine.toml' ? 'Machine configuration' : h.origin.replaceAll('_', ' ')}</Badge></TableCell>
-        </TableRow>)}</TableBody></Table></div>}
-      </div>
-
+      ]} /></div>
+      <HarnessPanel revision={revision} editorId={preferred ?? editorData.data?.preferred_editor} changed={changed} />
     </Panel>
     <Panel label="Fleet membership"><PanelToolbar><SectionTitle>Fleet membership</SectionTitle></PanelToolbar>
       {!standalone && <div className="border-b p-3.5"><h3 className="mb-1 text-sm font-medium">Join code for another Machine</h3><p className="mb-3 text-sm text-muted-foreground">Create a single-use code for another Machine. The code is shown once. Remove Machines from the Fleet screen.</p><JoinCodeButton label="Create join code" serverUrl={status.server_url} scope={ownScope(fleet.data, status.machine_id)} /></div>}
@@ -168,8 +155,4 @@ export function Settings({ revision, fleetRevision = revision, status, socket, c
       ])} />{status.last_error && <div className="mt-3"><ErrorNotice error={status.last_error} /></div>}</div></Panel>
 
   </>;
-}
-
-function Path({ value }: { value: string | null }) {
-  return value ? <code className="font-mono text-xs break-all">{value}</code> : <span className="text-muted-foreground">Not configured</span>;
 }

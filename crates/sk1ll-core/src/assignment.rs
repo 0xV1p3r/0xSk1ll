@@ -5,13 +5,12 @@
 //! cache file. A missing file means everything is enabled everywhere.
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::instructions::write_file;
-use crate::{Error, IoExt, Result};
+use crate::{Error, Result};
 
 pub const ASSIGNMENT_FILE: &str = "assignment.json";
 
@@ -71,11 +70,10 @@ impl Assignment {
 
     /// Loads `path`; a missing file is the all-enabled default.
     pub fn load(path: &Path) -> Result<Self> {
-        match fs::read_to_string(path) {
-            Ok(text) => serde_json::from_str(&text)
+        match crate::config_file::read_text(path, true)? {
+            Some(text) => serde_json::from_str(&text)
                 .map_err(|e| Error::Parse { path: path.to_path_buf(), message: e.to_string() }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(e).at(path),
+            None => Ok(Self::default()),
         }
     }
 
@@ -140,6 +138,7 @@ impl Assignment {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn materializing_preserves_existing_items_when_defaults_change() {

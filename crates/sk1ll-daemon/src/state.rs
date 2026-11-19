@@ -80,6 +80,10 @@ impl DaemonState {
 pub fn load_snapshot(path: &Path) -> anyhow::Result<Option<AssignmentSnapshot>> {
     match fs::read_to_string(path) {
         Ok(text) => Ok(Some(serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?)),
+        // A symlink to nowhere is a broken snapshot, not a missing one.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && fs::symlink_metadata(path).is_ok() => {
+            Err(e).with_context(|| format!("reading {}: a symlink to a missing file", path.display()))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
     }
@@ -101,6 +105,16 @@ pub fn load_assignment(cfg: &crate::Config) -> anyhow::Result<sk1ll_proto::Assig
         );
     }
     Ok(sk1ll_proto::Assignment::load(&cfg.assignment)?)
+}
+
+/// Like [`load_assignment`], except that a joined machine with no
+/// authoritative snapshot yet (still waiting for the server's) is `None`.
+/// Every other failure (an unreadable state, a corrupt snapshot) is an error.
+pub fn load_assignment_if_present(cfg: &crate::Config) -> anyhow::Result<Option<sk1ll_proto::Assignment>> {
+    if DaemonState::load(&cfg.state)?.is_some_and(|s| !s.revoked) {
+        return Ok(load_snapshot(&cfg.snapshot_path())?.map(|s| s.assignment));
+    }
+    Ok(Some(sk1ll_proto::Assignment::load(&cfg.assignment)?))
 }
 
 /// Persists direct-mode restore notifications for the daemon's next connection.
@@ -182,6 +196,17 @@ mod tests {
         assert_eq!(without_credentials("http://h/git/repo.git/"), "http://h/git/repo.git");
         assert!(has_credentials("https://ws:t0k@server.example/git/repo.git"));
         assert!(!has_credentials("https://server.example/git/a@b"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_snapshot_link_is_an_error_not_a_missing_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.json");
+        assert!(load_snapshot(&path).unwrap().is_none());
+        std::os::unix::fs::symlink(dir.path().join("gone.json"), &path).unwrap();
+        let err = load_snapshot(&path).unwrap_err();
+        assert!(format!("{err:#}").contains("symlink to a missing file"), "{err:#}");
     }
 
     #[test]

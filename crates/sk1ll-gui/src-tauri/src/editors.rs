@@ -248,6 +248,7 @@ pub(crate) fn terminal_prefix(kind: &str) -> Vec<OsString> {
 pub(crate) struct Target {
     pub folder: PathBuf,
     pub file: PathBuf,
+    /// A single file (a rule, or `machine.toml`): GUI editors open the file, not its folder.
     pub rule: bool,
 }
 pub(crate) fn validate_target(repo: &Path, path: &Path, rule: bool) -> Result<Target, String> {
@@ -268,6 +269,29 @@ pub(crate) fn validate_target(repo: &Path, path: &Path, rule: bool) -> Result<Ta
         return Err("Item file must exist inside the repo and cannot be an Import".into());
     }
     Ok(Target { folder, file, rule })
+}
+/// Opens `machine.toml` itself, never its folder, in GUI editors too.
+pub(crate) fn config_target(path: &Path) -> Result<Target, String> {
+    if !path.is_absolute() {
+        return Err("The machine configuration path must be absolute".into());
+    }
+    if std::fs::symlink_metadata(path).is_err() {
+        let parent = path.parent().ok_or("The machine configuration has no folder")?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create {}: {e}", parent.display()))?;
+        let header = "# This machine's harnesses: see docs/configuration.md in 0xSk1ll.\n";
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, header.as_bytes()))
+            .map_err(|e| format!("Cannot create {}: {e}", path.display()))?;
+    }
+    let file = path.canonicalize().map_err(|e| e.to_string())?;
+    if !file.is_file() {
+        return Err(format!("{} is not a file", path.display()));
+    }
+    let folder = file.parent().ok_or("The machine configuration has no folder")?.to_owned();
+    Ok(Target { folder, file, rule: true })
 }
 pub(crate) fn target_path<'a>(editor: &Editor, target: &'a Target) -> &'a Path {
     match editor.view.id.as_str() {

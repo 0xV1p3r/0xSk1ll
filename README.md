@@ -16,7 +16,7 @@
 - **Skills**: `SKILL.md` folders, either your own or imported from a git source and pinned to a commit.
 - **Rules**: project-agnostic instruction files ("for commits, use Conventional Commits").
 
-`sk1ll sync` places the skills and renders the rules into each agent tool on the machine. 0xSk1ll calls these tools harnesses: Claude Code, Codex, OpenCode, Gemini, or any directory you configure. It edits only files it placed and records their hashes. If you edit managed content inside a harness, sync reports a conflict and leaves your edit alone.
+`sk1ll sync` places the skills and renders the rules into each agent tool on the machine. 0xSk1ll calls these tools harnesses: Claude Code, Codex, OpenCode, Gemini, GitHub Copilot, Cursor, Amp, Kiro, Cline, Roo Code, or any directory you configure. It edits only files it placed and records their hashes. If you edit managed content inside a harness, sync reports a conflict and leaves your edit alone.
 
 For several machines, a self-hosted server acts as the git remote and holds the per-machine assignment. A daemon on each machine pulls as soon as another machine pushes.
 
@@ -96,9 +96,10 @@ Commands take a bare skill or rule name, or `skill:<name>`, `rule:<name>`, `mani
 | `status` | Import drift and pending sync actions |
 | `sync [--dry-run] [--force]` | Write skills and instructions into harnesses |
 | `render <harness>` | Print the instruction files a harness would receive |
-| `harnesses` | List this machine's harnesses |
+| `harnesses [--all] [enable\|disable\|add\|remove]` | List the harnesses sync writes into (`--all`: every other one too, including available opt-in presets), or change them in `machine.toml` after a preview of what stays in the harness |
 | `assign <harness> skill\|rule <name> on\|off` | Toggle an item for one harness |
 | `assign <harness> --default-skills on\|off` | Set the default for skills added later (`--default-rules` for rules) |
+| `assign <harness> --all on\|off` | Every skill and rule and both defaults, e.g. `--all off` before turning a harness off so sync takes out what it placed |
 | `conflicts` | List harness and recovery conflicts |
 | `adopt <harness> <name>` | Copy a hand edit or an unmanaged skill into the draft |
 | `recover list\|adopt\|discard` | Inspect content that sync moved aside |

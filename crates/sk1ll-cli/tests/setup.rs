@@ -67,6 +67,49 @@ fn setup_creates_a_standalone_repo_with_the_chosen_harnesses() {
     assert!(String::from_utf8_lossy(&again.stdout).contains("already has a skills repo"));
 }
 
+/// First-run setup offers the opt-in presets it finds as on, and enables
+/// the ones kept on in machine.toml.
+#[test]
+fn setup_offers_and_enables_opt_in_presets() {
+    let fixture = Fixture::new();
+    std::fs::create_dir_all(fixture.0.path().join("home/.kiro")).unwrap();
+    let out = fixture.setup("1\n\n\nn\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("Sync kiro (~/.kiro/skills, ~/.kiro/steering)? [Y/n]"), "{stdout}");
+    let config = std::fs::read_to_string(fixture.0.path().join("machine.toml")).unwrap();
+    assert!(config.starts_with("# my machine\n") && config.contains("[harnesses.kiro]\nenabled = true\n"), "{config}");
+    assert!(!fixture.0.path().join("presets.toml").exists());
+}
+
+/// `sk1ll init` on a machine that already has a machine.toml (set up with
+/// an older sk1ll, say) takes up no opt-in preset; on a new one it does.
+#[test]
+fn init_adopts_opt_in_presets_only_without_a_machine_toml() {
+    let fixture = Fixture::new();
+    let root = fixture.0.path();
+    std::fs::create_dir_all(root.join("home/.kiro")).unwrap();
+    let init = |config: &str, repo: &str| {
+        let out = Command::new(env!("CARGO_BIN_EXE_sk1ll"))
+            .arg("--machine-config")
+            .arg(root.join(config))
+            .args(["init"])
+            .arg(root.join(repo))
+            .env("HOME", root.join("home"))
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    };
+    let before = std::fs::read_to_string(root.join("machine.toml")).unwrap();
+    init("machine.toml", "repo");
+    assert_eq!(std::fs::read_to_string(root.join("machine.toml")).unwrap(), before);
+    init("new/machine.toml", "repo2");
+    let config = std::fs::read_to_string(root.join("new/machine.toml")).unwrap();
+    assert!(config.contains("[harnesses.kiro]\nenabled = true\n"), "{config}");
+}
+
 #[test]
 fn setup_reprompts_bad_answers_and_stops_without_input() {
     let fixture = Fixture::new();

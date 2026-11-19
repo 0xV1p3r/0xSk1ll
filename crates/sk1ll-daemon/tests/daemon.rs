@@ -2130,27 +2130,129 @@ async fn standalone_commits_locally_and_pushes_and_pulls_its_own_origin() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn setup_chooses_harnesses_only_before_the_repo_exists() {
     let mut m = Machine::new("solo");
-    std::fs::create_dir_all(m.home.path().join(".claude")).unwrap();
+    for d in [".claude", ".kiro", ".cursor"] {
+        std::fs::create_dir_all(m.home.path().join(d)).unwrap();
+    }
     m.start().await;
     let enabled = |choices: &[sk1ll_daemon::client::HarnessChoice], name: &str| {
         choices.iter().find(|c| c.name == name).map(|c| (c.installed, c.enabled))
     };
+    let path = m.home.path().join(".config/sk1ll/machine.toml");
+    let before = std::fs::read_to_string(&path).unwrap();
     let choices = m.client.setup_harnesses().await.unwrap();
     assert_eq!(enabled(&choices, "claude"), Some((true, true)));
+    // Opt-in presets found here are offered on; listing them writes nothing.
+    assert_eq!(enabled(&choices, "kiro"), Some((true, true)));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    m.client.set_setup_harness("cursor", false).await.unwrap();
     assert_eq!(enabled(&choices, HARNESS), Some((true, true)));
     assert_eq!(enabled(&choices, "codex"), Some((false, false)));
     let choices = m.client.set_setup_harness("claude", false).await.unwrap();
     assert_eq!(enabled(&choices, "claude"), Some((true, false)));
     assert!(m.client.harnesses().await.unwrap().iter().all(|h| h.name != "claude"));
-    let config = std::fs::read_to_string(m.home.path().join(CONFIG_DIR).join("sk1ll/machine.toml")).unwrap();
+    let config = std::fs::read_to_string(&path).unwrap();
     assert!(config.contains("instructions_format = \"rules\""), "{config}");
     assert_eq!(m.client.set_setup_harness("nope", false).await.unwrap_err().status, Some(404));
 
     m.client.init().await.unwrap();
+    // Setup ended: the opt-in presets it kept on are enabled in machine.toml.
+    let config = std::fs::read_to_string(&path).unwrap();
+    assert!(config.contains("[harnesses.kiro]\nenabled = true\n"), "{config}");
+    assert!(config.contains("[harnesses.cursor]\nenabled = false\n"), "{config}");
     let error = m.client.set_setup_harness("claude", true).await.unwrap_err();
     assert_eq!(error.status, Some(409));
     assert!(error.message.contains("first-run setup"), "{}", error.message);
     assert_eq!(enabled(&m.client.setup_harnesses().await.unwrap(), "claude"), Some((true, false)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn harnesses_change_after_setup_with_a_preview_of_what_stays() {
+    use sk1ll_daemon::client::{HarnessChange, HarnessChangeRequest};
+    let mut m = Machine::new("solo");
+    sk1ll_core::Repo::init(&m.repo()).unwrap();
+    m.write("personal/pdf/SKILL.md", "original");
+    write(&m.skills().join("mine"), "SKILL.md", "unmanaged");
+    m.start().await;
+    eventually(|| async { (m.harness_skill("pdf").as_deref() == Some("original")).then_some(()) }).await;
+    let settings = m.client.harness_settings().await.unwrap();
+    assert_eq!(settings.path, m.home.path().join(".config/sk1ll/machine.toml"));
+    assert!(settings.harnesses.iter().any(|c| c.name == HARNESS && c.configured && !c.preset));
+
+    // Adding a custom harness previews what it receives, then syncs it.
+    let extra = m.home.path().join("extra/skills");
+    let harness = sk1ll_core::Harness {
+        skills: Some(extra.to_string_lossy().into_owned()),
+        mode: sk1ll_core::LinkMode::Copy,
+        ..Default::default()
+    };
+    let add = HarnessChangeRequest { change: HarnessChange::Set { name: "extra".into(), harness } };
+    let preview = m.client.preview_harness(&add).await.unwrap();
+    assert!(preview.before.is_none() && preview.placed.is_empty());
+    assert_eq!(
+        preview.sync.iter().map(|p| (p.kind.as_str(), p.name.as_str())).collect::<Vec<_>>(),
+        [("create", "pdf")]
+    );
+    assert!(!extra.exists(), "a preview changes nothing");
+    let applied = m.client.apply_harness(&add).await.unwrap();
+    assert!(applied.errors.is_empty(), "{:?}", applied.errors);
+    assert!(extra.join("pdf/SKILL.md").is_file());
+
+    // Disabling shows what sk1ll placed, and leaves it.
+    let disable = HarnessChangeRequest { change: HarnessChange::Disable { name: "extra".into() } };
+    let preview = m.client.preview_harness(&disable).await.unwrap();
+    assert!(preview.after.is_none());
+    assert_eq!(
+        preview.placed.iter().map(|p| (p.kind.as_str(), p.name.as_str())).collect::<Vec<_>>(),
+        [("remove", "pdf")]
+    );
+    let applied = m.client.apply_harness(&disable).await.unwrap();
+    assert!(applied.errors.is_empty(), "{:?}", applied.errors);
+    assert!(extra.join("pdf/SKILL.md").is_file(), "left in place");
+    assert!(m.status().await.report.harnesses.iter().all(|h| h != "extra"));
+
+    // Turning a harness's items off first lets sync take them out; then disabling leaves nothing.
+    let off = |kind, name: Option<&str>| ToggleChange {
+        harness: HARNESS.into(),
+        kind,
+        name: name.map(String::from),
+        enabled: Some(false),
+    };
+    let changes = vec![
+        off(ToggleKind::NewSkillsDefault, None),
+        off(ToggleKind::NewRulesDefault, None),
+        off(ToggleKind::Skill, Some("pdf")),
+    ];
+    m.client.set_assignment("solo", &AssignmentChanges { changes, ..Default::default() }).await.unwrap();
+    eventually(|| async { m.harness_skill("pdf").is_none().then_some(()) }).await;
+    let disable = HarnessChangeRequest { change: HarnessChange::Disable { name: HARNESS.into() } };
+    assert!(m.client.preview_harness(&disable).await.unwrap().placed.is_empty());
+    m.client.apply_harness(&disable).await.unwrap();
+    assert_eq!(m.harness_skill("mine").as_deref(), Some("unmanaged"));
+    assert!(m.client.harnesses().await.unwrap().iter().all(|h| h.name != HARNESS));
+
+    // What the sync after a change fails to place is in the result, not just the log.
+    // A skills directory sync can read but not write into.
+    std::fs::create_dir_all(m.home.path().join("blocked/skills")).unwrap();
+    std::fs::set_permissions(m.home.path().join("blocked/skills"), std::os::unix::fs::PermissionsExt::from_mode(0o555))
+        .unwrap();
+    let blocked = sk1ll_core::Harness {
+        skills: Some(m.home.path().join("blocked/skills").to_string_lossy().into_owned()),
+        mode: sk1ll_core::LinkMode::Copy,
+        ..Default::default()
+    };
+    let add_blocked = HarnessChangeRequest { change: HarnessChange::Set { name: "blocked".into(), harness: blocked } };
+    let applied = m.client.apply_harness(&add_blocked).await.unwrap();
+    assert!(applied.errors.iter().any(|e| e.contains("blocked/skills")), "{:?}", applied.errors);
+    assert!(applied.harnesses.iter().any(|c| c.name == "blocked" && c.enabled), "machine.toml changed anyway");
+    let drop_blocked = HarnessChangeRequest { change: HarnessChange::Remove { name: "blocked".into() } };
+    m.client.apply_harness(&drop_blocked).await.unwrap();
+    std::fs::set_permissions(m.home.path().join("blocked/skills"), std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .unwrap();
+
+    let bad =
+        HarnessChangeRequest { change: HarnessChange::Set { name: "Bad Name".into(), harness: Default::default() } };
+    assert_eq!(m.client.preview_harness(&bad).await.unwrap_err().status, Some(400));
+    assert_eq!(m.client.apply_harness(&bad).await.unwrap_err().status, Some(400));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

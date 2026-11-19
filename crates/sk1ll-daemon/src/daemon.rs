@@ -35,19 +35,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError};
 
 use anyhow::Context;
-use sk1ll_core::imports;
 use sk1ll_core::sync::{self, Action, ActionKind, Item, PlanOptions};
 use sk1ll_core::{
-    EngineLock, HarnessOrigin, ItemRef, MachineConfig, PullOutcome, Repo, default_commit_message, machine_author,
+    EngineLock, HarnessChange, HarnessOrigin, ItemRef, MachineConfig, PullOutcome, Repo, default_commit_message,
+    machine_author,
 };
+use sk1ll_core::{harness_change, imports};
 use sk1ll_proto::{AssignmentSnapshot, ConflictRef, MachineReport, headline};
 use tokio::sync::{Notify, broadcast, watch};
 
 use crate::client::{
     AddImportRequest, ChangeKind, CommitMessage, CommitRequest, CommitResponse, ConflictTarget, ConflictView,
-    Connection, DaemonMode, DiffView, DraftEntry, Event, HarnessChoice, HarnessView, ImportUpdated, ItemView,
-    PullResult, PushResult, ResolveImportRequest, ResolvedSource, RestoreRequest, RestoreResponse, SkillCandidate,
-    StatusView, SyncResult, UpdateImportsRequest,
+    Connection, DaemonMode, DiffView, DraftEntry, Event, HarnessApplied, HarnessChangeRequest, HarnessChoice,
+    HarnessPreview, HarnessSettings, HarnessView, ImportUpdated, ItemView, PlacementView, PullResult, PushResult,
+    ResolveImportRequest, ResolvedSource, RestoreRequest, RestoreResponse, SkillCandidate, StatusView, SyncResult,
+    UpdateImportsRequest,
 };
 use crate::error::{Error, Result};
 use crate::join::{Joined, Registered};
@@ -253,6 +255,10 @@ impl Daemon {
             )));
         }
         std::fs::create_dir_all(root).context("creating repo directory")?;
+        // First-run setup ends here: take up the opt-in presets it kept on.
+        for warning in MachineConfig::adopt_detected_presets(&self.cfg.machine_config, root)? {
+            tracing::warn!("{warning}");
+        }
         Repo::init_committed(root)?;
         self.lock_repo(eng)?;
         self.refresh(eng)
@@ -715,8 +721,14 @@ impl Daemon {
     /// the last one skip it: see [`Daemon::pull_refreshed`], [`Daemon::nudge`]
     /// and [`Daemon::report_is_stale`].
     pub(crate) fn refresh(&self, eng: &mut Engine) -> Result<()> {
+        self.refresh_reporting(eng).map(drop)
+    }
+
+    /// [`Daemon::refresh`], returning what the sync failed to place (also
+    /// published as the last error).
+    fn refresh_reporting(&self, eng: &mut Engine) -> Result<Vec<String>> {
         if Self::idle(eng) {
-            return Ok(());
+            return Ok(Vec::new());
         }
         if self.is_standalone() {
             self.reload_local_assignment()?;
@@ -732,7 +744,7 @@ impl Daemon {
             });
             self.roots
                 .send_replace(vec![WatchRoot::new(root, true), WatchRoot::new(self.cfg.assignment.clone(), false)]);
-            return Ok(());
+            return Ok(Vec::new());
         }
         if !root.join(".git").exists() {
             return Err(Error::Conflict(format!("{} is not set up yet (the server was unreachable)", root.display())));
@@ -830,7 +842,7 @@ impl Daemon {
             changed
         });
         eng.stale = false;
-        Ok(())
+        Ok(errors)
     }
 
     /// Whether the published report can't be relied on (the last refresh
@@ -1503,18 +1515,24 @@ impl Daemon {
 
     /// A reader: no engine mutex.
     /// Every harness first-run setup can switch on or off.
+    /// During first-run setup, opt-in presets found here read as on: setup
+    /// takes them up when it ends (see [`MachineConfig::setup_choices`]).
+    /// Writes nothing.
     pub(crate) fn setup_harnesses(&self) -> Result<Vec<HarnessChoice>> {
+        if self.is_standalone() && !self.repo_root().join(".git").exists() {
+            return Ok(MachineConfig::setup_choices(&self.cfg.machine_config, self.repo_root())?);
+        }
         Ok(MachineConfig::load(&self.cfg.machine_config)?.choices())
     }
 
-    /// Only before setup ends: dropping a harness later would strand what
-    /// sync already placed there, and a joined machine registered its
-    /// harnesses with the server. Takes the engine so it can't race Init or
-    /// a join.
+    /// Only before setup ends, when sync hasn't placed anything yet. Later,
+    /// [`Daemon::apply_harness`] shows and handles what a change leaves
+    /// behind. Takes the engine so it can't race Init or a join.
     pub(crate) fn set_setup_harness(&self, _eng: &mut Engine, name: &str, enabled: bool) -> Result<Vec<HarnessChoice>> {
         if !self.is_standalone() || self.repo_root().join(".git").exists() {
             return Err(Error::Conflict(format!(
-                "harnesses can be chosen here only during first-run setup; edit {} instead",
+                "harnesses can be chosen here only during first-run setup; use POST /harnesses/apply \
+                 (Settings or `sk1ll harnesses`), or edit {}",
                 self.cfg.machine_config.display()
             )));
         }
@@ -1523,6 +1541,48 @@ impl Daemon {
         }
         MachineConfig::set_enabled(&self.cfg.machine_config, name, enabled)?;
         self.setup_harnesses()
+    }
+
+    /// A reader: no engine mutex.
+    pub(crate) fn harness_settings(&self) -> Result<HarnessSettings> {
+        let harnesses = MachineConfig::load(&self.cfg.machine_config)?.choices();
+        Ok(HarnessSettings { path: self.cfg.machine_config.clone(), harnesses })
+    }
+
+    /// A reader: plans the change without making it.
+    pub(crate) fn preview_harness(&self, change: &HarnessChange) -> Result<HarnessPreview> {
+        let repo = Repo::open(self.repo_root())?;
+        let snapshot = self.snapshot();
+        let plan =
+            harness_change::plan(&repo, &self.cfg.machine_config, change, snapshot.as_ref().map(|s| &s.assignment))?;
+        Ok(HarnessPreview {
+            path: self.cfg.machine_config.clone(),
+            name: change.name().to_string(),
+            before: plan.before,
+            after: plan.after,
+            placed: plan.placed.iter().map(placement_view).collect(),
+            warnings: plan.warnings,
+            sync: plan.sync.iter().map(placement_view).collect(),
+            awaiting_assignment: snapshot.is_none(),
+        })
+    }
+
+    /// Changes `machine.toml` and syncs; what sk1ll placed where the change
+    /// stops syncing stays. A joined machine reports its new set of
+    /// harnesses to the server with the next status.
+    pub(crate) fn apply_harness(&self, eng: &mut Engine, req: HarnessChangeRequest) -> Result<HarnessApplied> {
+        self.ensure_managed(eng)?;
+        self.lock_repo(eng)?;
+        let repo = Repo::open(Self::root(eng))?;
+        let lock = eng.lock.as_ref().ok_or_else(|| Error::Conflict("the repo is not locked".into()))?;
+        let plan = harness_change::apply(lock, &repo, &self.cfg.machine_config, &req.change)?;
+        tracing::info!("harness change {:?}: {} placed item(s) left in place", req.change, plan.placed.len());
+        let errors = match self.refresh_reporting(eng) {
+            Ok(failed) => failed,
+            Err(e) => vec![format!("sync: {e}")],
+        };
+        self.event(Event::Status);
+        Ok(HarnessApplied { harnesses: MachineConfig::load(&self.cfg.machine_config)?.choices(), errors })
     }
 
     pub(crate) fn harnesses(&self) -> Result<Vec<HarnessView>> {
@@ -1931,6 +1991,28 @@ fn displaced_item(entry: &sync::displaced::Entry) -> ItemRef {
         sync::displaced::Kind::Skill => ItemRef::Skill(name.into_owned()),
         sync::displaced::Kind::Rule => ItemRef::Rule(name.strip_suffix(".md").unwrap_or(&name).to_string()),
         sync::displaced::Kind::Instructions => ItemRef::Other(entry.dest.display().to_string()),
+    }
+}
+
+fn placement_view(a: &Action) -> PlacementView {
+    let (item, name) = match &a.item {
+        Item::Skill { name, .. } => ("skill", name.clone()),
+        Item::Rule { file, .. } => ("rule", file.clone()),
+        Item::Instructions { rules, .. } => ("instructions", rules.join(", ")),
+    };
+    let kind = match a.kind {
+        ActionKind::Create => "create",
+        ActionKind::Update => "update",
+        ActionKind::Remove => "remove",
+        ActionKind::Conflict => "conflict",
+    };
+    PlacementView {
+        harness: a.harness.clone(),
+        kind: kind.into(),
+        item: item.into(),
+        name,
+        dest: a.dest.clone(),
+        reason: a.reason.clone(),
     }
 }
 
@@ -2558,10 +2640,11 @@ mod tests {
                 &cfg.machine_config,
                 // The presets would find the developer's real harnesses.
                 format!(
-                    "[harnesses.h]\nskills = {:?}\nmode = \"copy\"\n\
-                     [harnesses.claude]\nenabled = false\n[harnesses.codex]\nenabled = false\n\
-                     [harnesses.opencode]\nenabled = false\n[harnesses.gemini]\nenabled = false\n",
-                    dir.path().join("h")
+                    "[harnesses.h]\nskills = {:?}\nmode = \"copy\"\n{}",
+                    dir.path().join("h"),
+                    sk1ll_core::machine::presets()
+                        .map(|p| format!("[harnesses.{p}]\nenabled = false\n"))
+                        .collect::<String>()
                 ),
             )
             .unwrap();

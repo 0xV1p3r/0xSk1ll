@@ -4,13 +4,14 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { Settings } from './Settings';
 import { api } from './api';
 import type { StatusView } from './types';
-vi.mock('./api', () => ({ api: { fleet: vi.fn(), join: vi.fn(), harnesses: vi.fn(), editors: vi.fn(), setPreferredEditor: vi.fn() }, errorMessage: String }));
+vi.mock('./api', () => ({ api: { fleet: vi.fn(), join: vi.fn(), harnessSettings: vi.fn(), editors: vi.fn(), setPreferredEditor: vi.fn(), openMachineConfig: vi.fn() }, errorMessage: String }));
 vi.mock('./toast', () => ({ toast: vi.fn() }));
 afterEach(cleanup);
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(api.fleet).mockResolvedValue({ baseline: null, machines: [{ id: 'desktop', status: 'in_sync', connected: true, joined_at: 1, last_seen: 1, report: null }] });
-  vi.mocked(api.harnesses).mockResolvedValue([]);
+  vi.mocked(api.harnessSettings).mockResolvedValue({ path: '/home/me/.config/sk1ll/machine.toml', harnesses: [] });
+  vi.mocked(api.openMachineConfig).mockResolvedValue();
   vi.mocked(api.editors).mockResolvedValue({ preferred_editor: 'code', editors: [
     { id: 'code', name: 'VS Code', kind: 'gui' }, { id: 'vim', name: 'Vim', kind: 'terminal' },
   ] });
@@ -72,9 +73,13 @@ it('shows an editor empty state and allows refreshing', async () => {
   fireEvent.click(screen.getByRole('button', { name: 'Refresh editors' })); await waitFor(() => expect(api.editors).toHaveBeenCalledWith(true));
 });
 it('uses readable Harness values and preserves path formatting', async () => {
-  vi.mocked(api.harnesses).mockResolvedValue([{ name: 'codex', origin: 'machine.toml', harness: { skills: null, instructions: '/rules', instructions_format: 'block', mode: 'symlink' } }]); mount();
+  vi.mocked(api.harnessSettings).mockResolvedValue({ path: '/cfg/machine.toml', harnesses: [{ name: 'codex', installed: true, enabled: true, preset: true, configured: true,
+    harness: { skills: null, instructions: '/rules', instructions_format: 'block', mode: 'symlink' } }] }); mount();
   expect((await screen.findByText('Not configured')).tagName).toBe('SPAN'); expect(screen.getByText('/rules').tagName).toBe('CODE');
-  expect(screen.getByText('Symbolic link')).toBeTruthy(); expect(screen.getByText('Machine configuration')).toBeTruthy();
+  expect(screen.getByText('Symbolic link')).toBeTruthy(); expect(screen.getByText('Preset, adjusted')).toBeTruthy();
+  expect(screen.getByText('/cfg/machine.toml').tagName).toBe('CODE');
+  fireEvent.click(screen.getByRole('button', { name: 'Open configuration' }));
+  await waitFor(() => expect(api.openMachineConfig).toHaveBeenCalledWith('code'));
 });
 
 it('keeps active diagnostic details with a keyboard-reachable timestamp', async () => {

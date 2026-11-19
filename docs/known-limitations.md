@@ -20,6 +20,21 @@ This only applies to rules files and block instruction files. Skills are
 directories and are placed without replacing. Closing the gap needs
 `RENAME_EXCHANGE`, which is Linux-only.
 
+## A save to machine.toml at the moment sk1ll writes it
+
+A harness change stages the new `machine.toml` in a file only it created,
+resolves the configured path again, and checks that it still points to the
+same file with the same bytes and permissions. It then renames the new file
+over that target. A symlink retargeted after the check can leave the write
+at the old target. A save that lands in the gap
+between that last check and the rename is replaced and lost, as described
+above for rules files. A save any earlier makes the change fail without
+writing. A missing `machine.toml` is created only while nothing is there
+(with a hard link, which never replaces); on a filesystem without hard links
+the change fails and says so. ACLs and extended attributes of `machine.toml`
+are not kept, and its owner and group only where the filesystem lets sk1ll
+set them.
+
 ## Directory placement without a no-replace rename
 
 On Linux, directories are placed with `renameat2(RENAME_NOREPLACE)`. On macOS

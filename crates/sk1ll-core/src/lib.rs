@@ -6,10 +6,12 @@
 
 pub mod assignment;
 pub mod bundled;
+pub mod config_file;
 pub mod content;
 pub mod draft;
 pub mod engine;
 pub mod git;
+pub mod harness_change;
 pub mod hash;
 pub mod imports;
 pub mod instructions;
@@ -36,7 +38,8 @@ pub use imports::{
 pub use instructions::Rule;
 pub use lock::{LockEntry, Lockfile};
 pub use machine::{
-    EffectiveHarness, Harness, HarnessChoice, HarnessEntry, HarnessOrigin, InstructionsFormat, LinkMode, MachineConfig,
+    EffectiveHarness, Harness, HarnessChange, HarnessChoice, HarnessEntry, HarnessOrigin, InstructionsFormat, LinkMode,
+    MachineConfig,
 };
 pub use manifest::{Import, Manifest};
 pub use repo::Repo;
@@ -57,6 +60,10 @@ pub enum Error {
     Git { args: String, stderr: String },
     #[error("{0}")]
     Invalid(String),
+    /// What an operation was planned from changed before it was made, so
+    /// nothing was done: look again (re-read, preview again) and retry.
+    #[error("{0}")]
+    Changed(String),
     /// Sync replaced or removed `dest`, but the content it displaced was
     /// written to while that happened. Nothing is lost: that content is kept,
     /// never pruned, in the recovery area at `kept` (see [`sync::displaced`])
