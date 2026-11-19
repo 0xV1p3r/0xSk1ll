@@ -118,7 +118,7 @@ describe('Assignment response cache', () => {
     await mount();
     fireEvent.click(screen.getByRole('switch', { name: 'Default for new skills in a / claude' }));
     expect(enabled('a')).toBe(false);
-    expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'new_skills_default', enabled: true }] });
+    expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'new_skills_default', enabled: true }], expected: { revision: 1, registration: 'r-a' } });
     const next = snapshot(false, 2); next.assignment.harnesses.claude.new_skills_default = true;
     vi.mocked(api.assignment).mockResolvedValue(next);
     await act(async () => { save.resolve(next); });
@@ -283,7 +283,7 @@ it('describes explicit values that override the Harness default and clears the n
   const inherited = await screen.findByRole('checkbox', { name: 'skill:pdf in a / claude, inherited' });
   expect(inherited.hasAttribute('aria-description')).toBe(false);
   expect(inherited.getAttribute('aria-checked')).toBe('false');
-  expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: null }] });
+  expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: null }], expected: { revision: 1, registration: 'r-a' } });
   const reset = snapshot(false, 2);
   reset.assignment.harnesses.claude.skills = {};
   vi.mocked(api.assignment).mockResolvedValue(reset);
@@ -415,7 +415,7 @@ it('assigns Draft-only items locally in standalone without requesting fleet', as
   vi.mocked(api.items).mockResolvedValue([{ item: 'skill:pdf', in_baseline: false, draft: 'added', unpushed: false, description: null }]);
   render(<Matrix revision={0} status={{ ...status, mode: 'standalone', report: { baseline: null, harnesses: ['claude'] } } as StatusView} />);
   fireEvent.click(await screen.findByRole('checkbox', { name: 'skill:pdf in a / claude, explicit' }));
-  await waitFor(() => expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: true }] }));
+  await waitFor(() => expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: true }], expected: { revision: 1 } }));
   expect(api.fleet).not.toHaveBeenCalled();
   expect(api.assignment).toHaveBeenCalledWith('a');
   expect(vi.mocked(api.assignment).mock.calls.every(([machine]) => machine === 'a')).toBe(true);
@@ -517,6 +517,7 @@ describe('Machine-indexed state', () => {
     fireEvent.click(cell('toString'));
     await waitFor(() => expect(api.setAssignment).toHaveBeenCalledWith('toString', expect.anything()));
     // Bulk changes skip the Machine that never loaded.
+    vi.spyOn(window, 'confirm').mockReturnValueOnce(true);
     fireEvent.click(screen.getByRole('button', { name: 'Actions for skill:pdf' }));
     fireEvent.click(await screen.findByRole('menuitem', { name: 'Disable in all visible Harnesses' }));
     await waitFor(() => expect(toast).toHaveBeenCalled());
@@ -592,6 +593,7 @@ describe('Machine-indexed state', () => {
     expect(vi.mocked(api.setAssignment).mock.calls.slice(2).map(([machine]) => machine)).toEqual(['b']);
   });
   it('offers no Undo against a Server that reports no registrations, which ignores `expected`', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValueOnce(true);
     // A 0.1.0 Server leaves `registration` out of the Fleet view.
     vi.mocked(api.fleet).mockResolvedValue(fleet([['a', 1], ['b', 1]]));
     vi.mocked(api.setAssignment).mockResolvedValue(snapshot(true, 2));
@@ -600,7 +602,8 @@ describe('Machine-indexed state', () => {
     fireEvent.click(await screen.findByRole('menuitem', { name: 'Enable in all visible Harnesses' }));
     await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Enabled pdf in 2 Harnesses' })));
     expect(vi.mocked(toast).mock.calls[0][0].action).toBeUndefined();
-    expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: true }], expected: { revision: 1 } });
+    expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: true }] });
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('may overwrite'));
   });
   it('refuses a bulk change when the Assignment changed since it was shown', async () => {
     vi.mocked(api.setAssignment).mockImplementation(async machine => {
@@ -614,4 +617,18 @@ describe('Machine-indexed state', () => {
     expect(api.setAssignment).toHaveBeenCalledWith('b', expect.objectContaining({ expected: { revision: 1, registration: 'r-b' } }));
     await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Enabled pdf in 1 Harness' })));
   });
+});
+
+it('refreshes after a single guarded edit conflicts', async () => {
+  const refreshed = snapshot(true, 2);
+  vi.mocked(api.setAssignment).mockImplementationOnce(async () => {
+    vi.mocked(api.assignment).mockResolvedValue(refreshed);
+    throw Object.assign(new Error('Assignment changed'), { status: 409 });
+  });
+  await mount();
+  fireEvent.click(cell('a'));
+  await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Assignment changed' })));
+  expect(api.setAssignment).toHaveBeenCalledWith('a', expect.objectContaining({ expected: { revision: 1, registration: 'r-a' } }));
+  await waitFor(() => expect(enabled('a')).toBe(true));
+  expect(vi.mocked(api.assignment).mock.calls.filter(([id]) => id === 'a')).toHaveLength(2);
 });

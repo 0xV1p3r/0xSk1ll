@@ -5,8 +5,9 @@ import { CopyAssignment } from './CopyAssignment';
 import { api } from './api';
 
 vi.mock('./api', () => ({
-  api: { previewAssignmentCopy: vi.fn(), copyMachineAssignment: vi.fn() },
+  api: { previewAssignmentCopy: vi.fn(), copyMachineAssignment: vi.fn(), assignment: vi.fn() },
   errorMessage: String,
+  errorStatus: (e: { status?: number }) => e?.status,
 }));
 
 afterEach(cleanup);
@@ -33,4 +34,25 @@ it('previews a mapped merge and confirms with both previewed registrations and r
   fireEvent.click(screen.getByRole('button', { name: 'Copy Assignment' }));
   await waitFor(() => expect(copied).toHaveBeenCalledWith(update));
   expect(api.copyMachineAssignment).toHaveBeenCalledWith('work', { ...body, source_expected: source });
+});
+
+it('reloads the target and requires a new preview in the same dialog after a conflict', async () => {
+  const source = { revision: 1, registration: 'source' };
+  const target = { revision: 1, registration: 'target' };
+  vi.mocked(api.previewAssignmentCopy).mockClear().mockResolvedValue({ count: 1, source, target });
+  vi.mocked(api.copyMachineAssignment).mockRejectedValueOnce(Object.assign(new Error('Assignment changed'), { status: 409 }));
+  vi.mocked(api.assignment).mockResolvedValue({ revision: 2, registration: 'target', assignment: {
+    harnesses: { codex: { skills: {}, rules: {}, new_skills_default: false, new_rules_default: false } },
+  } });
+  render(<CopyAssignment target="work" expected={target} targetHarnesses={['claude']}
+    sources={[{ id: 'home', harnesses: ['claude', 'codex'] }]} close={vi.fn()} copied={vi.fn()} />);
+  fireEvent.change(screen.getByLabelText('Source Machine'), { target: { value: 'home' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Preview changes' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Copy Assignment' }));
+  await screen.findByLabelText('Source Harness for codex');
+  expect(screen.queryByLabelText('Source Harness for claude')).toBeNull();
+  fireEvent.click(screen.getByRole('button', { name: 'Preview changes' }));
+  expect(api.previewAssignmentCopy).toHaveBeenLastCalledWith('work', expect.objectContaining({
+    expected: { ...target, revision: 2 }, harnesses: [{ from: 'codex', to: 'codex' }],
+  }));
 });

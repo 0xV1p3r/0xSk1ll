@@ -4,6 +4,7 @@ import { api, errorMessage, errorStatus } from './api';
 import { applyToggle, mergeAssignments, own, stamped } from './model';
 import type { StampedSnapshot } from './model';
 import { cn } from '@/lib/utils';
+import { toast } from './toast';
 import type { Assignment, Expected, ToggleChange } from './types';
 
 // Explicit: solid box with a pinned corner dot. Inherited: hollow dashed outline with a ghost tick. Shape alone tells them apart.
@@ -49,7 +50,10 @@ export function useAssignmentWrites<D extends { assignments: Record<string, Stam
       return response;
     } catch (error) {
       if (options.expected && options.onConflict && errorStatus(error) === 409) options.onConflict();
-      else setErrors(old => withEntry(old, machine, errorMessage(error)));
+      else {
+        setErrors(old => withEntry(old, machine, errorMessage(error)));
+        if (options.expected && errorStatus(error) === 409) toast({ title: 'Assignment changed', description: 'Review the refreshed Assignment and try again.' });
+      }
       return null;
     } finally {
       setOverrides(old => withEntry(old, machine, undefined));

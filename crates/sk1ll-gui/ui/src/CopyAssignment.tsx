@@ -3,7 +3,7 @@ import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogTitle } from '@/components/ui/dialog';
 import { Field, FieldGroup, FieldLabel } from '@/components/ui/field';
 import { NativeSelect } from '@/components/ui/native-select';
-import { api, errorMessage } from './api';
+import { api, errorMessage, errorStatus } from './api';
 import { ErrorNotice } from './shared';
 import type { AssignmentCopyPreview, AssignmentUpdate, Expected, MachineAssignmentCopy } from './types';
 
@@ -13,11 +13,14 @@ interface Props {
   targetHarnesses: string[];
   sources: { id: string; harnesses: string[] }[];
   close: () => void;
+  refreshed?: () => Promise<void>;
   copied: (update: AssignmentUpdate) => void;
 }
 
-export function CopyAssignment({ target, expected, targetHarnesses, sources, close, copied }: Props) {
+export function CopyAssignment({ target, expected, targetHarnesses, sources, close, copied, refreshed }: Props) {
   const id = useId();
+  const [latest, setLatest] = useState<{ expected: Expected; harnesses: string[] }>();
+  const currentHarnesses = latest?.harnesses ?? targetHarnesses;
   const [source, setSource] = useState('');
   const [mode, setMode] = useState<MachineAssignmentCopy['mode']>('replace');
   const [mapping, setMapping] = useState<Record<string, string>>({});
@@ -25,15 +28,15 @@ export function CopyAssignment({ target, expected, targetHarnesses, sources, clo
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
   const sourceHarnesses = sources.find(machine => machine.id === source)?.harnesses ?? [];
-  const fromFor = (to: string) => mapping[to] ?? (sourceHarnesses.includes(to) ? to : '');
+  const fromFor = (to: string) => mapping[to] !== undefined ? (sourceHarnesses.includes(mapping[to]) ? mapping[to] : '') : (sourceHarnesses.includes(to) ? to : '');
   const reset = () => { setPreview(undefined); setError(undefined); };
 
   const submit = async () => {
     setBusy(true);
     setError(undefined);
     const body: MachineAssignmentCopy = {
-      source, mode, expected,
-      harnesses: targetHarnesses.flatMap(to => {
+      source, mode, expected: latest?.expected ?? expected,
+      harnesses: currentHarnesses.flatMap(to => {
         const from = fromFor(to);
         return from ? [{ from, to }] : [];
       }),
@@ -46,6 +49,17 @@ export function CopyAssignment({ target, expected, targetHarnesses, sources, clo
     } catch (error) {
       setError(errorMessage(error));
       setPreview(undefined);
+      if (errorStatus(error) === 409) {
+        try {
+          const snapshot = await api.assignment(target);
+          await refreshed?.();
+          setLatest({ expected: { revision: snapshot.revision, registration: snapshot.registration },
+            harnesses: Object.keys(snapshot.assignment.harnesses).sort() });
+          setMapping({});
+        } catch (reloadError) {
+          setError(errorMessage(reloadError));
+        }
+      }
     } finally {
       setBusy(false);
     }
@@ -67,7 +81,7 @@ export function CopyAssignment({ target, expected, targetHarnesses, sources, clo
           <option value="replace">Replace</option><option value="merge">Merge</option>
         </NativeSelect>
       </Field>
-      {source && targetHarnesses.map(to => <Field key={to}><FieldLabel htmlFor={`${id}-harness-${to}`}>Source Harness for {to}</FieldLabel>
+      {source && currentHarnesses.map(to => <Field key={to}><FieldLabel htmlFor={`${id}-harness-${to}`}>Source Harness for {to}</FieldLabel>
         <NativeSelect id={`${id}-harness-${to}`} value={fromFor(to)} disabled={busy} onChange={event => {
           setMapping(old => ({ ...old, [to]: event.target.value }));
           reset();
@@ -81,7 +95,7 @@ export function CopyAssignment({ target, expected, targetHarnesses, sources, clo
       <ErrorNotice error={error} />
       <DialogFooter>
         <Button variant="outline" disabled={busy} onClick={close}>Cancel</Button>
-        <Button disabled={busy || !source || !targetHarnesses.some(fromFor) || preview?.result.count === 0}
+        <Button disabled={busy || !source || !currentHarnesses.some(fromFor) || preview?.result.count === 0}
           onClick={() => void submit()}>{preview ? 'Copy Assignment' : 'Preview changes'}</Button>
       </DialogFooter>
     </DialogContent>
