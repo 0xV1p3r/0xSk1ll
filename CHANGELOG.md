@@ -95,7 +95,7 @@ break compatibility.
   notifications keep their retry schedule across Daemon restarts.
 - Harness-wide Assignment and rename-copy require a current Baseline inventory.
   A structured inventory refusal tells rename-copy to retry. Harness-wide
-  changes report skipped names in standalone and direct CLI use. Settings
+  changes report skipped names, including when using an older Server. The CLI and Settings
   shows local placement errors after saving an Assignment, and retries sync
   even when the revision is unchanged.
 - The Library keeps unsaved text through a Daemon disconnect and restores

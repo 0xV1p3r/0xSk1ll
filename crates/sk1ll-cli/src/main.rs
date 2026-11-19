@@ -768,15 +768,32 @@ fn run(cli: Cli) -> Result<()> {
             let mut a = assignment()?;
             if let Some(s) = all {
                 let (skills, rules) = every_item(&repo)?;
+                let (skills, skipped_skills): (Vec<_>, Vec<_>) =
+                    skills.into_iter().partition(|name| sk1ll_core::imports::validate_name(name).is_ok());
+                let (rules, skipped_rules): (Vec<_>, Vec<_>) =
+                    rules.into_iter().partition(|name| sk1ll_core::imports::validate_name(name).is_ok());
+                if a.harness(&harness).new_skills_default != s.on() {
+                    a.materialize_skills(&harness, &skipped_skills);
+                }
+                if a.harness(&harness).new_rules_default != s.on() {
+                    a.materialize_rules(&harness, &skipped_rules);
+                }
                 for name in &skills {
                     a.set_skill(&harness, name, s.on());
                 }
                 for name in &rules {
                     a.set_rule(&harness, name, s.on());
                 }
+                for item in skipped_skills
+                    .into_iter()
+                    .map(sk1ll_core::ItemRef::Skill)
+                    .chain(skipped_rules.into_iter().map(sk1ll_core::ItemRef::Rule))
+                {
+                    eprintln!("warning: skipped {item} (ineligible name)");
+                }
                 a.set_new_skills_default(&harness, s.on());
                 a.set_new_rules_default(&harness, s.on());
-                println!("{harness}: every skill and rule {}, and both defaults", s.label());
+                println!("{harness}: eligible skills and rules {}, and both defaults", s.label());
             }
             if let Some((kind, name, state)) = assign_target(kind, name, state, default_skills, default_rules, all)? {
                 let label = check_exists(&repo, kind, &name)?;
