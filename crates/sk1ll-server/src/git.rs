@@ -1039,16 +1039,20 @@ mod tests {
         assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "the stub's TERM-resistant child must be gone");
     }
 
-    /// A stub git that starts a TERM-resistant child, records its pid in
-    /// `pid_file`, then runs `then`.
+    /// Run via /bin/sh so another test forking while the script is written
+    /// cannot leave an inherited write descriptor that prevents exec.
     #[cfg(unix)]
     fn stub_git(dir: &Path, pid_file: &Path, then: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let stub = dir.join("git");
-        let script =
-            format!("#!/bin/sh\nsh -c 'trap \"\" TERM; exec sleep 30' &\necho $! > '{}'\n{then}\n", pid_file.display());
+        let script = format!(
+            r#"sh -c 'trap "" TERM; printf "%s\n" "$$" > "$1.tmp"; mv "$1.tmp" "$1"; exec sleep 300' child '{}' &
+while ! test -f '{}'; do sleep 0.01; done
+{then}
+"#,
+            pid_file.display(),
+            pid_file.display(),
+        );
         std::fs::write(&stub, script).unwrap();
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
         stub
     }
 
@@ -1067,10 +1071,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("pid");
         let stub = stub_git(dir.path(), &pid_file, "exec yes");
-        let err =
-            inspect(stub.as_os_str(), dir.path(), &["ls-tree"], Duration::from_secs(10), 1 << 20).await.unwrap_err();
+        let err = inspect("/bin/sh".as_ref(), &stub, &["ls-tree"], Duration::from_secs(60), 4096).await.unwrap_err();
         assert!(err.to_string().contains("wrote more than"), "{err}");
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             while running(&pid_file) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -1087,11 +1090,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("pid");
         let stub = stub_git(dir.path(), &pid_file, "wait");
-        let mut budget = Budget(Duration::from_millis(300));
-        let read = inspect(stub.as_os_str(), dir.path(), &["rev-parse"], Duration::from_secs(30), INSPECT_OUTPUT);
-        assert!(budget.spend(read).await.is_none(), "the budget runs out first");
+        let mut read =
+            Box::pin(inspect("/bin/sh".as_ref(), &stub, &["rev-parse"], Duration::from_secs(300), INSPECT_OUTPUT));
+        let ready = async {
+            while !pid_file.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::select! {
+            result = &mut read => panic!("read completed before cancellation: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(60), ready) => result.expect("the child must start"),
+        }
+        assert!(running(&pid_file));
+
+        tokio::time::pause();
+        let mut budget = Budget(Duration::from_secs(1));
+        let cancelled = {
+            let mut spend = std::pin::pin!(budget.spend(read));
+            assert!(futures_util::poll!(&mut spend).is_pending());
+            tokio::time::advance(Duration::from_secs(1)).await;
+            spend.await
+        };
+        tokio::time::resume();
+        assert!(cancelled.is_none(), "the budget runs out first");
         assert_eq!(budget.0, Duration::ZERO);
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             while running(&pid_file) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
