@@ -9,6 +9,7 @@ import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuGro
 import { Checkbox } from '@/components/ui/checkbox';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { CopyAssignment } from './CopyAssignment';
 import { api, errorMessage } from './api';
 import { cellState, emptyHarness, itemStateLabel, mergeAssignments, own, registrationOf, splitItem, stamped, terms } from './model';
 import type { StampedSnapshot } from './model';
@@ -20,7 +21,7 @@ import { CheckboxSwatch, ErrorNotice, KindBadge, Loading, Nothing, Panel, PanelT
 import type { ItemView, MachineRow, StatusView, ToggleChange } from './types';
 
 const loadMatrix = async (status: StatusView) => {
-  const [fleet, items] = await Promise.all([status.mode === 'standalone' ? Promise.resolve({ baseline: status.report.baseline, machines: [{ id: status.machine_id, status: status.headline, connected: true, joined_at: 0, last_seen: null, report: status.report, registration: null }] }) : api.fleet(), api.items()]);
+  const [fleet, items] = await Promise.all([status.mode === 'standalone' ? Promise.resolve({ baseline: status.report.baseline, machines: [{ id: status.machine_id, status: status.headline, connected: true, joined_at: 0, last_seen: null, scope: undefined, report: status.report, registration: null }] }) : api.fleet(), api.items()]);
   // Each Machine loads on its own: one that fails (removed meanwhile, say) leaves the others usable.
   const results = await Promise.allSettled(fleet.machines.map(machine => loadAssignment(machine)));
   const ids = fleet.machines.map(machine => machine.id);
@@ -61,13 +62,13 @@ const verb = (enabled: boolean | null) => enabled === null ? 'Reset' : enabled ?
 const defaultHint = 'Changing a default for new Skills or Rules applies to items added later. Existing items keep their current value as an explicit Assignment.';
 // Sticky header cells leave the collapsed table borders behind, so they draw their own edges.
 const headEdge = 'sticky z-20 bg-muted shadow-[inset_1px_0_0_var(--color-border),inset_0_-1px_0_var(--color-border)]';
-type MatrixProps = { revision: number; status: StatusView; target?: { item: string; harness: string } };
+type MatrixProps = { revision: number; status: StatusView; openLog?: () => void; target?: { item: string; harness: string } };
 export function Matrix(props: MatrixProps) {
   const { mode, server_url, machine_id } = props.status;
   // Revisions and optimistic writes belong to one assignment authority.
   return <AuthorityMatrix key={JSON.stringify([mode, server_url, machine_id])} {...props} />;
 }
-function AuthorityMatrix({ revision, status, target }: MatrixProps) {
+function AuthorityMatrix({ revision, status, target, openLog }: MatrixProps) {
   const [search, setSearch] = useState('');
   const [kindFilter, setKindFilter] = useState('all');
   const [machines, setMachines] = useState<string[] | null>(() => readIds('assignment-matrix-machines'));
@@ -97,6 +98,7 @@ function AuthorityMatrix({ revision, status, target }: MatrixProps) {
   const { pending, errors, write, assignment } = useAssignmentWrites(resource);
   const latest = useRef(resource.data);
   useEffect(() => { latest.current = resource.data; }, [resource.data]);
+  const [copyTarget, setCopyTarget] = useState<{ id: string; snapshot: StampedSnapshot }>();
   const [retrying, setRetrying] = useState<ReadonlySet<string>>(new Set());
   const retry = async (machine: string) => {
     setRetrying(old => new Set(old).add(machine));
@@ -243,6 +245,22 @@ function AuthorityMatrix({ revision, status, target }: MatrixProps) {
     {Object.entries(data.failed).filter(([id]) => own(data.assignments, id)).map(([id, error]) =>
       <ErrorNotice key={`refresh-${id}`} title="Could not refresh Assignment" error={`${id}: ${error}`} />)}
     <Panel>
+    {copyTarget && <CopyAssignment target={copyTarget.id}
+      expected={{ revision: copyTarget.snapshot.revision, registration: copyTarget.snapshot.registration }}
+      targetHarnesses={Object.keys(copyTarget.snapshot.assignment.harnesses).sort()}
+      sources={data.fleet.machines.flatMap(machine => {
+        const snapshot = own(data.assignments, machine.id);
+        return machine.id !== copyTarget.id && snapshot ? [{ id: machine.id, harnesses: Object.keys(snapshot.assignment.harnesses).sort() }] : [];
+      })}
+      close={() => setCopyTarget(undefined)}
+      copied={update => {
+        setCopyTarget(undefined);
+        void retry(copyTarget.id);
+        toast({ title: `Copied Assignment to ${copyTarget.id}`,
+          description: `${count(update.entries.length, 'change', 'changes')}. Undo individual changes in the Assignment log.`,
+          action: openLog && { label: 'View log', run: openLog } });
+      }} />}
+
     <PanelToolbar>
       <Input aria-label="Search items" placeholder={terms.search} value={search} onChange={event => setSearch(event.target.value)} className="h-8 w-52" />
       <NativeSelect aria-label="Item kind" value={kindFilter} onChange={event => setKindFilter(event.target.value)}>
@@ -275,6 +293,12 @@ function AuthorityMatrix({ revision, status, target }: MatrixProps) {
             onClick={() => setCollapsed(old => g.collapsed ? old.filter(id => id !== g.machine.id) : [...old, g.machine.id])}>
             <ChevronRight className={cn('transition-transform', !g.collapsed && 'rotate-90')} /></Button> : <span aria-hidden className="size-6" />}
           {g.machine.id}{g.machine.id === status.machine_id && <Badge variant="outline" className="border-primary/20 bg-brand-soft text-brand-ink">This Machine</Badge>}
+          {!standalone && g.loaded && data.fleet.machines.length > 1 &&
+            (g.machine.id === status.machine_id || data.fleet.machines.find(machine => machine.id === status.machine_id)?.scope !== 'self') &&
+            menu(`Actions for ${g.machine.id}`, [{ label: 'Copy Assignment from…', run: () => {
+              const snapshot = own(data.assignments, g.machine.id);
+              if (snapshot) setCopyTarget({ id: g.machine.id, snapshot });
+            } }], !!pending.get(g.machine.id))}
           {g.offline && <span className="inline-flex items-center gap-1.5 text-xs font-normal text-muted-foreground"><span aria-hidden className="size-2 rounded-full border-[1.5px] border-muted-foreground" />Offline</span>}
         </div></TableHead>)}
       </TableRow><TableRow className="bg-muted hover:bg-muted">

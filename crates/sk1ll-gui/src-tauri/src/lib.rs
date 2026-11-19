@@ -72,6 +72,8 @@ pub fn run() {
             commands::force_update_import,
             commands::import_changes,
             commands::assignment,
+            commands::preview_assignment_copy,
+            commands::copy_machine_assignment,
             commands::set_assignment,
             commands::log,
             commands::log_facets,

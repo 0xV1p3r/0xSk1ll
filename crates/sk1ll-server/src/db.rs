@@ -290,6 +290,22 @@ pub fn append_log(conn: &Connection, entry: &mut LogEntry) -> Result<()> {
     Ok(())
 }
 
+// Store copy metadata alongside the tagged cause. Older API clients still
+// receive the same Change and Undo variants.
+pub fn mark_machine_copy(conn: &Connection, id: i64, registration: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE log SET cause = json_set(cause, '$.copy_registration', ?2) WHERE id = ?1",
+        params![id, registration],
+    )?;
+    Ok(())
+}
+
+pub fn copy_registration(conn: &Connection, id: i64) -> Result<Option<String>> {
+    Ok(conn.query_row("SELECT json_extract(cause, '$.copy_registration') FROM log WHERE id = ?1", [id], |row| {
+        row.get(0)
+    })?)
+}
+
 const LOG_COLS: &str = "id, at, author, machine, harness, kind, name, before, after, cause";
 
 type LogRow = (i64, i64, String, String, String, String, Option<String>, Option<bool>, Option<bool>, String);

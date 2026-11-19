@@ -2234,3 +2234,89 @@ async fn main_rejects_rewrites_and_deletion() {
         assert!(!out.status.success());
     }
 }
+
+#[tokio::test]
+async fn copy_machine_assignment_previews_merges_replaces_and_logs() {
+    let server = start().await;
+    let source = server.join_scoped("source", &["claude"], "self").await;
+    let target = server.join_scoped("target", &["claude", "codex"], "self").await;
+    server
+        .put_assignment(
+            ADMIN,
+            "source",
+            json!([
+                {"harness":"claude","kind":"skill","name":"private","enabled":false},
+                {"harness":"claude","kind":"rule","name":"shared","enabled":false},
+                {"harness":"claude","kind":"new_skills_default","enabled":true}
+            ]),
+        )
+        .await;
+    server
+        .put_assignment(
+            ADMIN,
+            "target",
+            json!([
+                {"harness":"claude","kind":"rule","name":"shared","enabled":false},
+                {"harness":"codex","kind":"skill","name":"old","enabled":false}
+            ]),
+        )
+        .await;
+    let path = "/machines/target/assignment/copy-from";
+    let post =
+        |token: &str, path: &str, body: Value| server.http.post(server.url(path)).bearer_auth(token).json(&body).send();
+    let merge = json!({"source":"source","mode":"merge"});
+    assert_eq!(post(&source, path, merge.clone()).await.unwrap().status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        post(&target, path, json!({"source":"missing","mode":"merge"})).await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        post(&target, path, json!({"source":"source","mode":"merge","expected":{"revision":0}}))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let update: AssignmentUpdate =
+        post(&target, path, merge).await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(update.entries.len(), 1);
+    assert_eq!(update.entries[0].name.as_deref(), Some("private"));
+    assert!(!update.assignment.harness("claude").new_skills_default);
+
+    let mut replace = json!({"source":"source","mode":"replace","harnesses":[{"from":"claude","to":"codex"}]});
+    let preview: Value = post(&target, &format!("{path}/preview"), replace.clone())
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(preview["count"], 4);
+    assert_eq!(
+        server.get_json::<AssignmentSnapshot>(ADMIN, "/machines/target/assignment").await.revision,
+        update.revision
+    );
+    replace["expected"] = preview["target"].clone();
+    replace["source_expected"] = preview["source"].clone();
+    let copied: AssignmentUpdate =
+        post(&target, path, replace.clone()).await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    let src: AssignmentSnapshot = server.get_json(ADMIN, "/machines/source/assignment").await;
+    assert_eq!(copied.assignment.harness("codex"), src.assignment.harness("claude"));
+    assert_eq!(copied.assignment.harness("claude"), update.assignment.harness("claude"));
+    assert_eq!(copied.entries.len(), 4);
+    assert_eq!(post(&target, path, replace).await.unwrap().status(), StatusCode::CONFLICT);
+    for entry in copied.entries.iter().rev() {
+        let restored: AssignmentUpdate = post(&target, &format!("/log/{}/undo", entry.id), json!(null))
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(restored.entries[0].cause, LogCause::Undo { entry: entry.id });
+    }
+    let restored: AssignmentSnapshot = server.get_json(ADMIN, "/machines/target/assignment").await;
+    assert_eq!(restored.assignment, update.assignment);
+}

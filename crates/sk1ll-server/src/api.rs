@@ -18,9 +18,9 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use rusqlite::Connection;
 use sk1ll_proto::{
-    Assignment, AssignmentChanges, AssignmentCopied, AssignmentCopy, AssignmentSnapshot, AssignmentUpdate, FleetView,
-    ImportsView, JoinCode, JoinCodeRequest, JoinRequest, JoinResponse, LogCause, LogEntry, LogFacets, LogQuery,
-    MachineRow, REPO_PATH, ToggleChange, headline,
+    Assignment, AssignmentChanges, AssignmentCopied, AssignmentCopy, AssignmentCopyPreview, AssignmentSnapshot,
+    AssignmentUpdate, Expected, FleetView, ImportsView, JoinCode, JoinCodeRequest, JoinRequest, JoinResponse, LogCause,
+    LogEntry, LogFacets, LogQuery, MachineAssignmentCopy, MachineRow, REPO_PATH, ToggleChange, headline,
 };
 
 use crate::assign::{self, Change};
@@ -38,6 +38,8 @@ pub fn routes() -> Router<Arc<Server>> {
         .route("/machines/{id}/assignment", get(get_assignment).put(put_assignment))
         .route("/machines/{id}/assignment/copy", post(copy_assignment))
         .route("/machines/{id}/assignment/harness/{harness}", post(set_harness_assignment))
+        .route("/machines/{id}/assignment/copy-from", post(copy_from))
+        .route("/machines/{id}/assignment/copy-from/preview", post(preview_copy_from))
         .route("/log", get(log))
         .route("/log/facets", get(log_facets))
         .route("/log/{id}/undo", post(undo))
@@ -282,6 +284,68 @@ async fn set_harness_assignment(
     Ok(Json(published(&server, &id, applied)))
 }
 
+fn plan_copy(
+    tx: &Connection,
+    caller: &Caller,
+    target: &str,
+    body: &MachineAssignmentCopy,
+) -> Result<(Vec<Change>, AssignmentCopyPreview)> {
+    authorize_assignment(tx, caller, target)?;
+    let load = |id: &str, expected: Option<&Expected>| -> Result<_> {
+        let m = db::machine(tx, id)?.ok_or_else(|| ApiError::NotFound(format!("no machine `{id}`")))?;
+        if let Some(expected) = expected {
+            assign::check_expected(tx, &m, expected)?;
+        }
+        let snap = db::snapshot(tx, id)?.expect("registered machine has assignment");
+        Ok((m.assignment, Expected { revision: snap.revision, registration: Some(m.registration) }))
+    };
+    let (destination, target_state) = load(target, body.expected.as_ref())?;
+    let (source, source_state) = load(&body.source, body.source_expected.as_ref())?;
+    let changes = assign::machine_copy_changes(&source, &destination, body)?;
+    let preview = AssignmentCopyPreview { count: changes.len(), target: target_state, source: source_state };
+    Ok((changes, preview))
+}
+
+async fn preview_copy_from(
+    State(server): ServerState,
+    caller: Caller,
+    Path(id): Path<String>,
+    Json(body): Json<MachineAssignmentCopy>,
+) -> Result<Json<AssignmentCopyPreview>> {
+    caller.require_machine(&id)?;
+    server
+        .db(move |conn| {
+            let tx = conn.transaction()?;
+            let (_, preview) = plan_copy(&tx, &caller, &id, &body)?;
+            Ok(Json(preview))
+        })
+        .await
+}
+
+async fn copy_from(
+    State(server): ServerState,
+    caller: Caller,
+    Path(id): Path<String>,
+    Json(body): Json<MachineAssignmentCopy>,
+) -> Result<Json<AssignmentUpdate>> {
+    caller.require_machine(&id)?;
+    let machine = id.clone();
+    let applied = server
+        .db(move |conn| {
+            let tx = conn.transaction()?;
+            let (changes, preview) = plan_copy(&tx, &caller, &machine, &body)?;
+            let registration = preview.target.registration.expect("registered Machine");
+            let applied = assign::apply(&tx, &machine, caller.author(), changes, now(), None)?;
+            for entry in &applied.entries {
+                db::mark_machine_copy(&tx, entry.id, &registration)?;
+            }
+            tx.commit()?;
+            Ok(applied)
+        })
+        .await?;
+    Ok(Json(published(&server, &id, applied)))
+}
+
 /// Copies a machine's explicit toggles of one item to another, before a
 /// rename reaches its Draft, in one transaction. A toggle the new name
 /// already has is kept; the toggles copied are logged like any change.
@@ -348,8 +412,20 @@ async fn undo(State(server): ServerState, caller: Caller, Path(id): Path<i64>) -
             let m = db::machine(&tx, &machine)?.ok_or_else(gone)?;
             let report = m.report.unwrap_or_default();
             let change = vec![change];
-            assign::check_items(&change, &items, &report.drafts, &report.unpushed)?;
-            let applied = assign::apply(&tx, &machine, &author, change, now, Some(&items))?;
+            let copy_registration = db::copy_registration(&tx, id)?;
+            if copy_registration.as_ref().is_some_and(|r| *r != m.registration) {
+                return Err(ApiError::Conflict(format!("machine `{machine}` joined the fleet again since this copy")));
+            }
+            let copy = copy_registration.is_some();
+            if !copy {
+                assign::check_items(&change, &items, &report.drafts, &report.unpushed)?;
+            }
+            let applied = assign::apply(&tx, &machine, &author, change, now, (!copy).then_some(&items))?;
+            if copy {
+                for entry in &applied.entries {
+                    db::mark_machine_copy(&tx, entry.id, &m.registration)?;
+                }
+            }
             tx.commit()?;
             Ok((machine, applied))
         })

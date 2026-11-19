@@ -275,6 +275,20 @@ enum FleetCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Copy a joined Machine's Assignment to another Machine
+    CopyAssignment {
+        source: String,
+        target: String,
+        /// Fill only unset toggles and keep the target defaults
+        #[arg(long)]
+        merge: bool,
+        /// Map a source Harness to a target Harness (repeatable)
+        #[arg(long = "map", value_name = "FROM=TO")]
+        maps: Vec<String>,
+        /// Apply without asking for confirmation
+        #[arg(long)]
+        yes: bool,
+    },
     /// Show the Assignment log, newest first
     Log {
         #[arg(long)]
@@ -1309,6 +1323,69 @@ mod tests {
         repo.run(&["sync"]).unwrap();
         assert!(!stage.exists(), "a real sync, under the lock, cleans up");
         assert_eq!(fs::read_to_string(skills.join("pdf/SKILL.md")).unwrap(), "PDFs.");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fleet_copy_assignment_confirms_with_preview_preconditions() {
+        use serde_json::{Value, json};
+        use std::io::{BufRead, Read, Write};
+
+        let repo = TestRepo::new();
+        let socket = repo.0.join(".git/copy.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let daemon = std::thread::spawn(move || {
+            let target = json!({"revision": 2, "registration": "target"});
+            let source = json!({"revision": 4, "registration": "source"});
+            let path = "/machines/work/assignment/copy-from";
+            for (path, expected, source_expected, response) in [
+                (
+                    format!("{path}/preview"),
+                    Value::Null,
+                    Value::Null,
+                    json!({"count":1,"target":target,"source":source}),
+                ),
+                (path.into(), target, source, json!({"revision":5,"assignment":{"harnesses":{}},"entries":[]})),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(3))).unwrap();
+                let mut reader = std::io::BufReader::new(&mut stream);
+                let mut headers = String::new();
+                while !headers.ends_with("\r\n\r\n") {
+                    assert_ne!(reader.read_line(&mut headers).unwrap(), 0);
+                }
+                assert!(headers.starts_with(&format!("POST {path} HTTP/1.1\r\n")), "{headers}");
+                let len = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                let mut body = vec![0; len];
+                reader.read_exact(&mut body).unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&body).unwrap(),
+                    json!({
+                        "source":"home","mode":"merge","harnesses":[{"from":"claude","to":"codex"}],
+                        "expected":expected,"source_expected":source_expected,
+                    })
+                );
+                let response = response.to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
+                    response.len()
+                )
+                .unwrap();
+            }
+        });
+        repo.run_on(
+            &socket,
+            &["fleet", "copy-assignment", "home", "work", "--merge", "--map", "claude=codex", "--yes"],
+        )
+        .unwrap();
+        daemon.join().unwrap();
     }
 
     /// Only "no socket" and "connection refused" mean no daemon runs; any

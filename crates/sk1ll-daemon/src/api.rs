@@ -84,6 +84,8 @@ pub(crate) fn router(d: Arc<Daemon>) -> Router {
         .route("/machines/{id}", delete(pass))
         .route("/machines/{id}/assignment", get(assignment).put(assignment))
         .route("/assignment/harness/{harness}", post(set_harness_assignment))
+        .route("/machines/{id}/assignment/copy-from", post(pass))
+        .route("/machines/{id}/assignment/copy-from/preview", post(pass))
         .route("/log", get(pass))
         .route("/log/facets", get(pass))
         .route("/log/{id}/undo", post(pass))

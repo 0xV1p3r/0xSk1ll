@@ -53,6 +53,10 @@ export const api = {
   forceUpdateImport: (name: string) => invoke<T.ImportUpdated>('force_update_import', { name }),
   importChanges: (name: string, upstream: string) => invoke<T.ImportChanges>('import_changes', { name, upstream }),
   updateImport: (name: string) => invoke<T.ImportUpdated>('update_import', { name }),
+  previewAssignmentCopy: (machine: string, copy: T.MachineAssignmentCopy) =>
+    invoke<T.AssignmentCopyPreview>('preview_assignment_copy', { machine, copy }),
+  copyMachineAssignment: (machine: string, copy: T.MachineAssignmentCopy) =>
+    invoke<T.AssignmentUpdate>('copy_machine_assignment', { machine, copy }),
   assignment: async (machine: string): Promise<T.CachedAssignmentSnapshot> => {
     const { revision, registration, ...assignment } = await invoke<T.AssignmentSnapshot>('assignment', { machine });
     return { assignment, revision, registration };

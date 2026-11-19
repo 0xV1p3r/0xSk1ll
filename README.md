@@ -110,6 +110,7 @@ Commands take a bare skill or rule name, or `skill:<name>`, `rule:<name>`, `mani
 | `fleet` | Show every machine in the fleet |
 | `fleet invite` | Create a single-use join code and print the join command and expiry; `--scope self` limits the new machine to managing itself |
 | `fleet remove <machine>` | Remove a machine after confirming its id. Use `--yes` in scripts |
+| `fleet copy-assignment <source> <target>` | Preview and copy a joined Machine's Assignment. Use `--merge`, repeat `--map from=to`, or pass `--yes` in scripts |
 | `fleet log`, `fleet undo <entry-id>` | Filter the Assignment log or undo an entry |
 | `completions <shell>` | Generate shell completions |
 
