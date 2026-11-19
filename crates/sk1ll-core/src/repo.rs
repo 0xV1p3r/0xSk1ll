@@ -35,6 +35,36 @@ pub struct Repo {
     pub lock: Lockfile,
 }
 
+/// Why [`Repo::rename_item`] failed.
+#[derive(Debug)]
+pub enum RenameError {
+    /// Nothing was renamed: the new name was taken (it may have appeared
+    /// since a [`Repo::check_rename`]), say.
+    NotMoved(Error),
+    /// The item has its new name, but rewriting its frontmatter `name:` failed.
+    Moved(Error),
+}
+
+impl std::fmt::Display for RenameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotMoved(e) => e.fmt(f),
+            Self::Moved(e) => write!(f, "renamed, but updating its frontmatter failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for RenameError {}
+
+impl From<RenameError> for Error {
+    fn from(e: RenameError) -> Self {
+        match e {
+            RenameError::NotMoved(e) => e,
+            RenameError::Moved(e) => Error::Invalid(format!("renamed, but updating its frontmatter failed: {e}")),
+        }
+    }
+}
+
 impl Repo {
     /// Creates a new personal Skill or Rule in the Draft.
     pub fn create_item(&self, kind: &str, name: &str, description: &str) -> Result<()> {
@@ -101,9 +131,15 @@ impl Repo {
         if kind == "skill" { fs::remove_dir_all(&path).at(&path) } else { fs::remove_file(&path).at(&path) }
     }
 
-    /// Renames a personal Skill or Rule in the Draft (the old name deleted, the
-    /// new one added) and updates a frontmatter `name:` that matched the old name.
-    pub fn rename_item(&self, kind: &str, name: &str, to: &str) -> Result<()> {
+    /// Checks that [`Repo::rename_item`] can rename `name` to `to`, without
+    /// changing anything.
+    pub fn check_rename(&self, kind: &str, name: &str, to: &str) -> Result<()> {
+        self.rename_paths(kind, name, to).map(drop)
+    }
+
+    /// The item to rename, its destination and the file whose frontmatter
+    /// names it.
+    fn rename_paths(&self, kind: &str, name: &str, to: &str) -> Result<(PathBuf, PathBuf, PathBuf)> {
         let from = self.personal_item(kind, name)?;
         crate::imports::validate_name(to)?;
         if name == to {
@@ -125,12 +161,20 @@ impl Repo {
         if dest.symlink_metadata().is_ok() {
             return Err(Error::Invalid(format!("name `{to}` is taken")));
         }
+        Ok((from, dest, file))
+    }
+
+    /// Renames a personal Skill or Rule in the Draft (the old name deleted, the
+    /// new one added) and updates a frontmatter `name:` that matched the old name.
+    /// A failure says whether the item had moved by then.
+    pub fn rename_item(&self, kind: &str, name: &str, to: &str) -> std::result::Result<(), RenameError> {
+        let (from, dest, file) = self.rename_paths(kind, name, to).map_err(RenameError::NotMoved)?;
         crate::sync::rename_noreplace(&from, &dest).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
+            RenameError::NotMoved(if e.kind() == std::io::ErrorKind::AlreadyExists {
                 Error::Invalid(format!("name `{to}` is taken"))
             } else {
                 Error::Io { path: dest.clone(), source: e }
-            }
+            })
         })?;
         // Only a regular file is rewritten: a symlinked SKILL.md points elsewhere.
         let Ok(meta) = file.symlink_metadata() else { return Ok(()) };
@@ -156,7 +200,7 @@ impl Repo {
         if staged.is_err() {
             let _ = fs::remove_file(&tmp);
         }
-        staged
+        staged.map_err(RenameError::Moved)
     }
 
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
@@ -519,6 +563,25 @@ mod create_tests {
         let skill = dir.path().join("personal/documents/SKILL.md");
         assert!(skill.symlink_metadata().unwrap().is_file());
         assert!(fs::read_to_string(skill).unwrap().contains("name: documents"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_rename_says_whether_the_item_moved() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repo::init(dir.path()).unwrap();
+        repo.create_item("skill", "pdf", "PDF").unwrap();
+        repo.create_item("skill", "other", "").unwrap();
+        assert!(matches!(repo.rename_item("skill", "pdf", "other"), Err(RenameError::NotMoved(_))));
+        // The directory moves, but its frontmatter can't be rewritten.
+        let skill = dir.path().join("personal/pdf");
+        fs::set_permissions(&skill, fs::Permissions::from_mode(0o555)).unwrap();
+        let moved = repo.rename_item("skill", "pdf", "documents");
+        let documents = dir.path().join("personal/documents");
+        fs::set_permissions(&documents, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(moved, Err(RenameError::Moved(_))), "{moved:?}");
+        assert!(documents.is_dir() && !skill.exists());
     }
 
     #[test]

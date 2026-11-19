@@ -496,21 +496,34 @@ pub struct DeleteItemRequest {
     pub kind: String,
     pub name: String,
 }
+/// Before renaming, the Assignment authority (the Server, or the daemon when
+/// standalone) copies this machine's explicit toggles for the old name to the
+/// new one. When that copy fails, nothing is renamed and the request fails
+/// with HTTP 409, unless `copy_assignment` is false: then the item is
+/// renamed without its toggles, and the new name follows each Harness's default.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenameItemRequest {
     pub kind: String,
     pub name: String,
     pub to: String,
+    #[serde(default = "yes")]
+    pub copy_assignment: bool,
 }
-/// The rename is in the Draft either way. This machine's explicit toggles for
-/// the old name are copied to the new one in `migrated` harnesses; when that
-/// fails (offline, Server refused), `assignment_error` says why. Other
-/// machines' toggles are not copied: once the rename is pushed, the old
-/// name's are dropped (`item_removed`) and the new name follows their defaults.
+fn yes() -> bool {
+    true
+}
+/// This machine's toggles were copied to the new name in `migrated`
+/// harnesses; in `kept` harnesses the new name already had its own explicit
+/// toggle, which was kept. Other machines' toggles are not copied: once the
+/// rename is pushed, the old name's are dropped (`item_removed`) and the new
+/// name follows their defaults. `assignment_error` is always null: a copy
+/// that fails refuses the rename instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RenameItemResponse {
     pub item: ItemRef,
     pub migrated: Vec<String>,
+    #[serde(default)]
+    pub kept: Vec<String>,
     pub assignment_error: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]

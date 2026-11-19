@@ -49,6 +49,17 @@ describe('revisioned Assignment snapshots', () => {
     expect(merged.b.revision).toBe(5);
     expect(mergeAssignments(merged, { b }).a).toBe(a);
   });
+  it('takes a snapshot requested after the cached one arrived, whatever its revision', () => {
+    const cached = { assignment, revision: 7, sent: 1, received: 2 };
+    expect(mergeAssignments({ a: cached }, { a: { assignment, revision: 1, sent: 3, received: 4 } }).a.revision).toBe(1);
+    // Overlapping requests: the later revision wins.
+    expect(mergeAssignments({ a: cached }, { a: { assignment, revision: 1, sent: 1.5, received: 4 } }).a).toBe(cached);
+  });
+  it('keeps prototype names as ordinary Machine ids', () => {
+    const merged = mergeAssignments({}, Object.fromEntries([['__proto__', { assignment, revision: 1 }], ['constructor', { assignment, revision: 2 }]]));
+    expect(Object.getPrototypeOf(merged)).toBe(Object.prototype);
+    expect(Object.keys(merged).sort()).toEqual(['__proto__', 'constructor']);
+  });
   it('labels unpushed content even when the item also exists in Baseline', () => {
     expect(itemStateLabel({ in_baseline: true, unpushed: true })).toBe('Unpushed');
     expect(itemStateLabel({ in_baseline: false, unpushed: false })).toBe('Draft only');

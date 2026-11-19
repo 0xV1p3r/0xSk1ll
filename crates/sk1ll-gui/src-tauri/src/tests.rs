@@ -480,7 +480,8 @@ async fn skill_commands_preserve_queries_payloads_and_errors() {
     let requests = Recorded::default();
     let inventory = json!([{"name":"pdf", "item":null, "type":"unmanaged", "description":"PDF",
         "draft":null, "in_baseline":false, "path":null, "enabled_harnesses":[], "clashes_with_repo":false,
-        "variants":[{"hash":"sha256:one", "description":"PDF", "locations":[{"harness":"claude", "path":"/tmp/pdf"}]}]}]);
+        "variants":[{"hash":"sha256:one", "description":"PDF", "locations":[{"harness":"claude", "path":"/tmp/pdf"}],
+        "resumable":false}]}]);
     let tree = json!([{"path":"SKILL.md", "kind":"file", "size":12}]);
     let file = json!({"path":"docs/a b.md", "text":"# PDF", "binary":false, "too_large":false, "size":5});
     let mut replies = Replies::new();
@@ -723,7 +724,12 @@ async fn new_commands_forward_typed_payloads() {
     );
     bridge.delete_item(DeleteItemRequest { kind: "rule".into(), name: "style".into() }).await.unwrap();
     let renamed = bridge
-        .rename_item(RenameItemRequest { kind: "skill".into(), name: "pdf".into(), to: "docs".into() })
+        .rename_item(RenameItemRequest {
+            kind: "skill".into(),
+            name: "pdf".into(),
+            to: "docs".into(),
+            copy_assignment: false,
+        })
         .await
         .unwrap();
     assert_eq!((renamed.item.to_string(), renamed.migrated), ("skill:docs".to_string(), vec!["claude".to_string()]));
@@ -742,7 +748,7 @@ async fn new_commands_forward_typed_payloads() {
     assert_eq!(requests[2].2, json!({"name":"pdf"}));
     assert_eq!(requests[4].2["id"], "recovered");
     assert_eq!(requests[5].2, json!({"kind":"rule","name":"style"}));
-    assert_eq!(requests[6].2, json!({"kind":"skill","name":"pdf","to":"docs"}));
+    assert_eq!(requests[6].2, json!({"kind":"skill","name":"pdf","to":"docs","copy_assignment":false}));
 }
 
 #[test]

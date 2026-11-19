@@ -83,8 +83,11 @@ pub(crate) fn assign_direct(cli: &Cli, repo: &Path, lock: Option<&sk1ll_core::En
         changes.push(toggle(ToggleKind::NewRulesDefault, None, s.on()));
     }
     let lock = lock.context("a fleet assignment change requires the engine lock")?;
-    let update =
-        runtime()?.block_on(sk1ll_daemon::set_assignment_direct(&cfg, lock, &AssignmentChanges { changes }))?;
+    let update = runtime()?.block_on(sk1ll_daemon::set_assignment_direct(
+        &cfg,
+        lock,
+        &AssignmentChanges { changes, ..Default::default() },
+    ))?;
     println!("fleet assignment of {} is now revision {}; run `sk1ll sync` to apply", state.machine_id, update.revision);
     Ok(true)
 }
@@ -583,7 +586,8 @@ impl Daemon {
                     changes.push(toggle(ToggleKind::NewRulesDefault, None, s.on()));
                 }
                 let machine = self.status.machine_id.clone();
-                let update = self.block(c.set_assignment(&machine, &AssignmentChanges { changes }))?;
+                let update =
+                    self.block(c.set_assignment(&machine, &AssignmentChanges { changes, ..Default::default() }))?;
                 if self.status.mode == DaemonMode::Standalone {
                     println!(
                         "local assignment of {machine} is now revision {}; the daemon applies it",

@@ -45,8 +45,8 @@ export const api = {
   addImport: (request: T.AddImportRequest) => invoke<T.ImportUpdated>('add_import', { request }),
   updateImport: (name: string) => invoke<T.ImportUpdated>('update_import', { name }),
   assignment: async (machine: string): Promise<T.CachedAssignmentSnapshot> => {
-    const { revision, ...assignment } = await invoke<T.AssignmentSnapshot>('assignment', { machine });
-    return { assignment, revision };
+    const { revision, registration, ...assignment } = await invoke<T.AssignmentSnapshot>('assignment', { machine });
+    return { assignment, revision, registration };
   },
   setAssignment: (machine: string, changes: T.AssignmentChanges) =>
     invoke<T.AssignmentUpdate>('set_assignment', { machine, changes }),
@@ -58,6 +58,12 @@ export const api = {
   removeMachine: (machine: string) => invoke<void>('remove_machine', { machine }),
   connectionInfo: () => invoke<string>('connection_info'),
 };
+
+// The Daemon's HTTP status, when the command reached it.
+export function errorStatus(error: unknown): number | undefined {
+  if (typeof error === 'object' && error && 'status' in error && typeof error.status === 'number') return error.status;
+  return undefined;
+}
 
 export function errorMessage(error: unknown): string {
   if (typeof error === 'object' && error && 'message' in error) return String(error.message);

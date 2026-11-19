@@ -14,12 +14,18 @@ pub struct Variant {
     pub hash: String,
     pub description: Option<String>,
     pub locations: Vec<Location>,
+    /// Identical to the existing personal copy: an interrupted Adopt of this
+    /// variant that Adopt can resume.
+    #[serde(default)]
+    pub resumable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnmanagedSkill {
     pub name: String,
     pub description: Option<String>,
+    /// A repo skill has this name and no variant is `resumable`. When one is,
+    /// only the resumable variants can be adopted.
     pub clashes_with_repo: bool,
     pub variants: Vec<Variant>,
 }
@@ -57,6 +63,7 @@ pub fn discover(repo: &Repo, harnesses: &BTreeMap<String, Harness>) -> Result<Ve
                     .ok()
                     .and_then(|t| crate::skill::frontmatter_field(&t, "description")),
                 locations: Vec::new(),
+                resumable: false,
             });
             variant.locations.push(Location { harness: harness.clone(), path });
         }
@@ -64,13 +71,18 @@ pub fn discover(repo: &Repo, harnesses: &BTreeMap<String, Harness>) -> Result<Ve
     Ok(found
         .into_iter()
         .map(|(name, variants)| {
-            let variants: Vec<_> = variants.into_values().collect();
+            let mut variants: Vec<_> = variants.into_values().collect();
             // An identical personal copy is an interrupted Adopt that can be retried.
             let dest = repo.personal_dir().join(&name);
-            let resumable = dest.symlink_metadata().is_ok_and(|m| m.is_dir())
-                && hash_dir(&dest).is_ok_and(|h| variants.iter().any(|v| v.hash == h))
+            let copy = (dest.symlink_metadata().is_ok_and(|m| m.is_dir())
                 && repo.imported_dir().join(&name).symlink_metadata().is_err()
-                && !repo.manifest.import.contains_key(&name);
+                && !repo.manifest.import.contains_key(&name))
+            .then(|| hash_dir(&dest).ok())
+            .flatten();
+            for variant in &mut variants {
+                variant.resumable = copy.as_ref() == Some(&variant.hash);
+            }
+            let resumable = variants.iter().any(|v| v.resumable);
             UnmanagedSkill {
                 description: variants.first().and_then(|v| v.description.clone()),
                 clashes_with_repo: !resumable && skills.iter().any(|s| s.name == name),
@@ -382,6 +394,27 @@ mod tests {
                 .any(|a| a.harness == "c" && a.kind == ActionKind::Conflict)
         );
         assert!(prepare(&repo, &hs, "a", "../outside").is_err());
+    }
+
+    #[test]
+    fn only_the_variant_matching_the_personal_copy_is_resumable() {
+        let (tmp, repo, hs) = setup();
+        write(&tmp.path().join("a/pdf/SKILL.md"), "same");
+        write(&tmp.path().join("b/pdf/SKILL.md"), "different");
+        assert!(discover(&repo, &hs).unwrap()[0].variants.iter().all(|v| !v.resumable));
+        // An Adopt interrupted after publishing leaves an identical personal copy.
+        prepare(&repo, &hs, "a", "pdf").unwrap();
+        let skill = discover(&repo, &hs).unwrap().remove(0);
+        assert!(!skill.clashes_with_repo);
+        let resumable: Vec<_> =
+            skill.variants.iter().filter(|v| v.resumable).flat_map(|v| &v.locations).map(|l| &l.harness).collect();
+        assert_eq!(resumable, ["a"]);
+        assert!(select(&repo, &hs, "a", "pdf").is_ok());
+        assert!(select(&repo, &hs, "b", "pdf").unwrap_err().to_string().contains("already exists"));
+        // An edited personal copy is a genuine clash.
+        write(&repo.personal_dir().join("pdf/SKILL.md"), "edited");
+        let skill = discover(&repo, &hs).unwrap().remove(0);
+        assert!(skill.clashes_with_repo && skill.variants.iter().all(|v| !v.resumable));
     }
 
     #[test]

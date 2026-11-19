@@ -9,7 +9,8 @@ import type { Assignment, AssignmentUpdate, StatusView } from './types';
 
 vi.mock('./api', () => ({ api: {
   fleet: vi.fn(), items: vi.fn(), assignment: vi.fn(), setAssignment: vi.fn(),
-}, errorMessage: (error: unknown) => error instanceof Error ? error.message : String(error) }));
+}, errorMessage: (error: unknown) => error instanceof Error ? error.message : String(error),
+errorStatus: (error: unknown) => (error as { status?: number }).status }));
 vi.mock('./toast', () => ({ toast: vi.fn() }));
 const status = { machine_id: 'a' } as StatusView;
 const assignment = (enabled = false): Assignment => ({ harnesses: { claude: {
@@ -27,7 +28,7 @@ beforeEach(() => {
   vi.resetAllMocks();
   localStorage.clear();
   vi.mocked(api.fleet).mockResolvedValue({ baseline: 'abc', machines: ['a', 'b'].map(id => ({
-    id, status: 'in_sync', connected: true, joined_at: 1, last_seen: 1, report: null,
+    id, status: 'in_sync', connected: true, joined_at: 1, last_seen: 1, report: null, registration: `r-${id}`,
   })) });
   vi.mocked(api.items).mockResolvedValue([{ item: 'skill:pdf', in_baseline: true, draft: null, unpushed: false, description: null }]);
   vi.mocked(api.assignment).mockResolvedValue(snapshot());
@@ -58,7 +59,8 @@ describe('Assignment response cache', () => {
       reads++;
       if (reads <= 2) return Promise.resolve(snapshot());
       if (reads <= 4) return machine === 'a' ? oldA.promise : oldB.promise;
-      return Promise.resolve(snapshot(machine === 'b', machine === 'b' ? 3 : 1));
+      // Sent after both writes were answered, so the Server has them.
+      return Promise.resolve(snapshot(true, machine === 'b' ? 3 : 2));
     });
     await mount();
     fireEvent.click(cell('a')); fireEvent.click(cell('b'));
@@ -95,7 +97,8 @@ describe('Assignment response cache', () => {
       return snapshot();
     });
     await mount(); fireEvent.click(cell('a'));
-    await screen.findByText('refresh unavailable');
+    await screen.findByText('a: refresh unavailable');
+    expect(screen.getByText('b: refresh unavailable')).toBeTruthy();
     expect(enabled('a')).toBe(true);
     await waitFor(() => expect(cell('a').hasAttribute('data-disabled')).toBe(false));
   });
@@ -115,6 +118,7 @@ describe('Assignment response cache', () => {
     expect(enabled('a')).toBe(false);
     expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'new_skills_default', enabled: true }] });
     const next = snapshot(false, 2); next.assignment.harnesses.claude.new_skills_default = true;
+    vi.mocked(api.assignment).mockResolvedValue(next);
     await act(async () => { save.resolve(next); });
     expect(screen.getByRole('switch', { name: 'Default for new skills in a / claude' }).getAttribute('aria-checked')).toBe('true');
     expect(enabled('a')).toBe(false);
@@ -151,6 +155,56 @@ it('focuses and highlights the requested local cell after loading without changi
   } finally { HTMLElement.prototype.scrollIntoView = previous; }
 });
 
+describe('a Machine whose Assignment fails to load', () => {
+  beforeEach(() => {
+    vi.mocked(api.assignment).mockImplementation(async machine => {
+      if (machine === 'b') throw new Error('Machine not found');
+      return snapshot();
+    });
+  });
+  it('keeps the other Machines usable and retries only its own column', async () => {
+    await mount();
+    expect(cell('a').hasAttribute('data-disabled')).toBe(false);
+    expect(screen.queryByRole('checkbox', { name: /in b \// })).toBeNull();
+    expect(screen.queryByRole('switch', { name: /in b \// })).toBeNull();
+    expect(screen.getByText('Assignment not loaded: Machine not found').closest('[role=alert]')).toBeTruthy();
+    vi.mocked(api.assignment).mockResolvedValue(snapshot(true, 2));
+    fireEvent.click(screen.getByRole('button', { name: 'Retry loading the Assignment of b' }));
+    await waitFor(() => expect(enabled('b')).toBe(true));
+    expect(api.assignment).toHaveBeenLastCalledWith('b');
+    expect(enabled('a')).toBe(false);
+    expect(screen.queryByText(/Assignment not loaded/)).toBeNull();
+  });
+  it('keeps the error when a retry fails again', async () => {
+    await mount();
+    vi.mocked(api.assignment).mockRejectedValueOnce(new Error('Server unreachable'));
+    fireEvent.click(screen.getByRole('button', { name: 'Retry loading the Assignment of b' }));
+    expect(await screen.findByText('Assignment not loaded: Server unreachable')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Retry loading the Assignment of b' }).hasAttribute('disabled')).toBe(false);
+  });
+  it('sends bulk changes and their undo only for loaded Machines', async () => {
+    vi.mocked(api.setAssignment).mockImplementation(async () => {
+      vi.mocked(api.assignment).mockImplementation(async machine => { if (machine === 'b') throw new Error('Machine not found'); return snapshot(true, 2); });
+      return snapshot(true, 2);
+    });
+    await mount();
+    expect(screen.queryByText('Mixed')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Actions for skill:pdf' }));
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Enable in all visible Harnesses' }));
+    await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Enabled pdf in 1 Harness' })));
+    expect(api.setAssignment).toHaveBeenCalledTimes(1);
+    expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: true }], expected: { revision: 1, registration: 'r-a' } });
+    await act(async () => { vi.mocked(toast).mock.calls[0][0].action!.run(); });
+    expect(api.setAssignment).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(api.setAssignment).mock.calls.every(([machine]) => machine === 'a')).toBe(true);
+  });
+  it('still shows a Machine without reported Harnesses so it can be retried', async () => {
+    await mount();
+    expect(screen.getByRole('columnheader', { name: 'b' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'b Harnesses' })).toBeNull();
+  });
+});
+
 it('filters by description and kind and shows friendly names', async () => {
   vi.mocked(api.items).mockResolvedValue([
     { item: 'skill:pdf', in_baseline: true, draft: null, unpushed: false, description: 'Read documents' },
@@ -180,7 +234,7 @@ it('marks mixed states and batches row changes once per machine', async () => {
   for (const machine of ['a', 'b']) expect(api.setAssignment).toHaveBeenCalledWith(machine, { changes: [
     { harness: 'claude', kind: 'skill', name: 'pdf', enabled: true },
     { harness: 'codex', kind: 'skill', name: 'pdf', enabled: true },
-  ] });
+  ], expected: { revision: 1, registration: `r-${machine}` } });
 });
 
 it('persists hidden machines and limits column bulk changes to filtered items', async () => {
@@ -193,7 +247,7 @@ it('persists hidden machines and limits column bulk changes to filtered items', 
   fireEvent.click(screen.getByRole('button', { name: 'Actions for a / claude' }));
   fireEvent.click(await screen.findByRole('menuitem', { name: 'Disable all visible items' }));
   await waitFor(() => expect(api.setAssignment).toHaveBeenCalledTimes(1));
-  expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: false }] });
+  expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: false }], expected: { revision: 1, registration: 'r-a' } });
 });
 
 it('resets row overrides optimistically and skips unavailable remote Draft items', async () => {
@@ -204,7 +258,7 @@ it('resets row overrides optimistically and skips unavailable remote Draft items
   fireEvent.click(screen.getByRole('button', { name: 'Actions for skill:pdf' }));
   fireEvent.click(await screen.findByRole('menuitem', { name: 'Reset all to default' }));
   expect(api.setAssignment).toHaveBeenCalledTimes(1);
-  expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: null }] });
+  expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: null }], expected: { revision: 1, registration: 'r-a' } });
   expect(screen.getByRole('checkbox', { name: 'skill:pdf in a / claude, inherited' }).className).toContain('border-dashed');
   await act(async () => { save.resolve(snapshot()); });
 });
@@ -284,9 +338,11 @@ it('undo restores explicit and inherited values only for accepted Machines', asy
   vi.mocked(api.assignment).mockImplementation(async () => {
     const next = snapshot(); next.assignment.harnesses.codex = emptyHarness(); return next;
   });
+  const written = () => { const next = snapshot(true, 2); next.assignment.harnesses.codex = { ...emptyHarness(), skills: { pdf: true } }; return next; };
   vi.mocked(api.setAssignment).mockImplementation(async machine => {
     if (machine === 'b') throw new Error('rejected');
-    return snapshot(true, 2);
+    vi.mocked(api.assignment).mockImplementation(async id => id === 'a' ? written() : snapshot());
+    return written();
   });
   await mount();
   fireEvent.click(screen.getByRole('button', { name: 'Actions for skill:pdf' }));
@@ -299,8 +355,48 @@ it('undo restores explicit and inherited values only for accepted Machines', asy
   expect(api.setAssignment).toHaveBeenLastCalledWith('a', { changes: [
     { harness: 'claude', kind: 'skill', name: 'pdf', enabled: false },
     { harness: 'codex', kind: 'skill', name: 'pdf', enabled: null },
-  ] });
+  ], expected: { revision: 2, registration: 'r-a' } });
   expect(toast).toHaveBeenLastCalledWith(expect.objectContaining({ title: 'Restored 2 Assignments', tone: 'default' }));
+});
+it('undo is refused by the authority when the Assignment changed meanwhile, then refreshes', async () => {
+  vi.mocked(api.fleet).mockResolvedValue({ baseline: 'abc', machines: [{ id: 'a', status: 'in_sync', connected: true, joined_at: 1, last_seen: 1, report: null, registration: 'r1' }] });
+  vi.mocked(api.setAssignment).mockResolvedValueOnce(snapshot(true, 2))
+    .mockRejectedValueOnce({ status: 409, message: 'the assignment of `a` changed since revision 2 (now 3); reload it' });
+  vi.mocked(api.assignment).mockResolvedValueOnce(snapshot()).mockResolvedValueOnce(snapshot(true, 2)).mockResolvedValue(snapshot(false, 3));
+  await mount();
+  fireEvent.click(screen.getByRole('button', { name: 'Actions for skill:pdf' }));
+  fireEvent.click(await screen.findByRole('menuitem', { name: 'Enable in all visible Harnesses' }));
+  await waitFor(() => expect(toast).toHaveBeenCalled());
+  await waitFor(() => expect(enabled('a')).toBe(true));
+  const reads = vi.mocked(api.assignment).mock.calls.length;
+  await act(async () => { vi.mocked(toast).mock.calls[0][0].action!.run(); });
+  await waitFor(() => expect(toast).toHaveBeenLastCalledWith(expect.objectContaining({ title: 'Undo is no longer available' })));
+  expect(api.setAssignment).toHaveBeenLastCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: false }], expected: { revision: 2, registration: 'r1' } });
+  // No Machine error: the matrix reloads instead.
+  expect(screen.queryByText(/changed since revision/)).toBeNull();
+  await waitFor(() => expect(vi.mocked(api.assignment).mock.calls.length).toBeGreaterThan(reads));
+});
+it('drops a write reply for a registration that joined again within the same second', async () => {
+  const row = (registration: string) => ({ id: 'a', status: 'in_sync' as const, connected: true, joined_at: 1, last_seen: 1, report: null, registration });
+  vi.mocked(api.fleet).mockResolvedValueOnce({ baseline: 'abc', machines: [row('r1')] }).mockResolvedValue({ baseline: 'abc', machines: [row('r2')] });
+  const reply = deferred<AssignmentUpdate>();
+  vi.mocked(api.setAssignment).mockReturnValue(reply.promise);
+  let reads = 0;
+  vi.mocked(api.assignment).mockImplementation(() => ++reads === 1 ? Promise.resolve(snapshot()) : reads === 2 ? Promise.resolve(snapshot(false, 5)) : new Promise(() => {}));
+  const view = await mount();
+  fireEvent.click(cell('a'));
+  view.rerender(<Matrix revision={1} status={status} />);
+  await waitFor(() => expect(reads).toBe(2));
+  await act(async () => { reply.resolve(snapshot(true, 99)); });
+  await waitFor(() => expect(api.setAssignment).toHaveBeenCalledOnce());
+  // The new registration's Assignment stays; the old one's late reply would have enabled pdf.
+  expect(enabled('a')).toBe(false);
+});
+it('refuses an Assignment read for another registration than the Fleet listed', async () => {
+  vi.mocked(api.fleet).mockResolvedValue({ baseline: 'abc', machines: [{ id: 'a', status: 'in_sync', connected: true, joined_at: 1, last_seen: 1, report: null, registration: 'r2' }] });
+  vi.mocked(api.assignment).mockResolvedValue({ ...snapshot(), registration: 'r1' });
+  render(<Matrix revision={0} status={status} />);
+  expect(await screen.findByText(/a joined the Fleet again meanwhile/)).toBeTruthy();
 });
 
 it('assigns Draft-only items locally in standalone without requesting fleet', async () => {
@@ -386,4 +482,121 @@ it('shows a six-second joined load while five-second status polling continues', 
       expect(api.fleet).toHaveBeenCalledTimes(1);
     } finally { clearInterval(poll); }
   } finally { vi.useRealTimers(); }
+});
+
+describe('Machine-indexed state', () => {
+  const fleet = (rows: [string, number][]) => ({ baseline: 'abc', machines: rows.map(([id, joined_at]) => ({
+    id, status: 'in_sync' as const, connected: true, joined_at, last_seen: 1, report: null,
+  })) });
+  it('treats ids like constructor and toString as plain Machine ids', async () => {
+    vi.mocked(api.fleet).mockResolvedValue(fleet([['a', 1], ['constructor', 1], ['toString', 1]]));
+    vi.mocked(api.assignment).mockImplementation(async machine => {
+      if (machine === 'constructor') throw new Error('Machine not found');
+      return snapshot();
+    });
+    await mount();
+    expect(screen.getByText('Assignment not loaded: Machine not found')).toBeTruthy();
+    expect(screen.queryByRole('checkbox', { name: /in constructor \// })).toBeNull();
+    expect(cell('toString').hasAttribute('data-disabled')).toBe(false);
+    vi.mocked(api.setAssignment).mockResolvedValue(snapshot(true, 2));
+    fireEvent.click(cell('toString'));
+    await waitFor(() => expect(api.setAssignment).toHaveBeenCalledWith('toString', expect.anything()));
+    // Bulk changes skip the Machine that never loaded.
+    fireEvent.click(screen.getByRole('button', { name: 'Actions for skill:pdf' }));
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Disable in all visible Harnesses' }));
+    await waitFor(() => expect(toast).toHaveBeenCalled());
+    expect(vi.mocked(api.setAssignment).mock.calls.some(([machine]) => machine === 'constructor')).toBe(false);
+  });
+  it('forgets a Machine that left the Fleet, so coming back unloaded shows its error', async () => {
+    vi.mocked(api.assignment).mockResolvedValue(snapshot(true, 5));
+    const view = await mount();
+    expect(enabled('b')).toBe(true);
+    vi.mocked(api.fleet).mockResolvedValue(fleet([['a', 1]]));
+    view.rerender(<Matrix revision={1} status={status} />);
+    await waitFor(() => expect(screen.queryByRole('columnheader', { name: 'b' })).toBeNull());
+    vi.mocked(api.fleet).mockResolvedValue(fleet([['a', 1], ['b', 1]]));
+    vi.mocked(api.assignment).mockImplementation(async machine => {
+      if (machine === 'b') throw new Error('Machine not found');
+      return snapshot(true, 5);
+    });
+    view.rerender(<Matrix revision={2} status={status} />);
+    expect(await screen.findByText('Assignment not loaded: Machine not found')).toBeTruthy();
+    expect(screen.queryByRole('checkbox', { name: /in b \// })).toBeNull();
+  });
+  it('drops the snapshot of a Machine that joined again', async () => {
+    vi.mocked(api.assignment).mockResolvedValue(snapshot(true, 5));
+    const view = await mount();
+    vi.mocked(api.fleet).mockResolvedValue(fleet([['a', 1], ['b', 2]]));
+    vi.mocked(api.assignment).mockImplementation(async machine => {
+      if (machine === 'b') throw new Error('not reachable');
+      return snapshot(true, 5);
+    });
+    view.rerender(<Matrix revision={1} status={status} />);
+    expect(await screen.findByText('Assignment not loaded: not reachable')).toBeTruthy();
+  });
+  it('lets a load sent after the cached snapshot win even with a lower revision', async () => {
+    vi.mocked(api.assignment).mockResolvedValue(snapshot(true, 5));
+    const view = await mount();
+    expect(enabled('a')).toBe(true);
+    vi.mocked(api.assignment).mockResolvedValue(snapshot(false, 1));
+    view.rerender(<Matrix revision={1} status={status} />);
+    await waitFor(() => expect(enabled('a')).toBe(false));
+    expect(enabled('b')).toBe(false);
+  });
+  const bulkEnable = async () => {
+    vi.mocked(api.setAssignment).mockImplementation(async () => {
+      vi.mocked(api.assignment).mockResolvedValue(snapshot(true, 2));
+      return snapshot(true, 2);
+    });
+    const view = await mount();
+    fireEvent.click(screen.getByRole('button', { name: 'Actions for skill:pdf' }));
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Enable in all visible Harnesses' }));
+    await waitFor(() => expect(toast).toHaveBeenCalled());
+    await waitFor(() => expect(cell('a').hasAttribute('data-disabled')).toBe(false));
+    return { view, undo: vi.mocked(toast).mock.calls[0][0].action! };
+  };
+  it('undoes only Machines whose Assignment is still what the update left', async () => {
+    const { view, undo } = await bulkEnable();
+    // Someone turned `pdf` off again on a.
+    vi.mocked(api.assignment).mockImplementation(async machine => machine === 'a' ? snapshot(false, 3) : snapshot(true, 2));
+    view.rerender(<Matrix revision={1} status={status} />);
+    await waitFor(() => expect(enabled('a')).toBe(false));
+    await act(async () => { undo.run(); });
+    await waitFor(() => expect(api.setAssignment).toHaveBeenCalledTimes(3));
+    expect(api.setAssignment).toHaveBeenLastCalledWith('b', expect.anything());
+    expect(toast).toHaveBeenLastCalledWith(expect.objectContaining({ title: 'Restored 1 Assignment', tone: 'destructive',
+      description: '1 Machine changed since this bulk update and kept the current Assignment.' }));
+  });
+  it('does not undo for a Machine that left the Fleet', async () => {
+    const { view, undo } = await bulkEnable();
+    vi.mocked(api.fleet).mockResolvedValue({ ...fleet([]), machines: fleet([['b', 1]]).machines.map(m => ({ ...m, registration: 'r-b' })) });
+    view.rerender(<Matrix revision={1} status={status} />);
+    await waitFor(() => expect(screen.queryByRole('columnheader', { name: /^a/ })).toBeNull());
+    await act(async () => { undo.run(); });
+    await waitFor(() => expect(api.setAssignment).toHaveBeenCalledTimes(3));
+    expect(vi.mocked(api.setAssignment).mock.calls.slice(2).map(([machine]) => machine)).toEqual(['b']);
+  });
+  it('offers no Undo against a Server that reports no registrations, which ignores `expected`', async () => {
+    // A 0.1.0 Server leaves `registration` out of the Fleet view.
+    vi.mocked(api.fleet).mockResolvedValue(fleet([['a', 1], ['b', 1]]));
+    vi.mocked(api.setAssignment).mockResolvedValue(snapshot(true, 2));
+    await mount();
+    fireEvent.click(screen.getByRole('button', { name: 'Actions for skill:pdf' }));
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Enable in all visible Harnesses' }));
+    await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Enabled pdf in 2 Harnesses' })));
+    expect(vi.mocked(toast).mock.calls[0][0].action).toBeUndefined();
+    expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: true }], expected: { revision: 1 } });
+  });
+  it('refuses a bulk change when the Assignment changed since it was shown', async () => {
+    vi.mocked(api.setAssignment).mockImplementation(async machine => {
+      if (machine === 'b') throw Object.assign(new Error('the assignment of `b` changed since revision 1 (now 2); reload it'), { status: 409 });
+      return snapshot(true, 2);
+    });
+    await mount();
+    fireEvent.click(screen.getByRole('button', { name: 'Actions for skill:pdf' }));
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Enable in all visible Harnesses' }));
+    await screen.findByText('b: the assignment of `b` changed since revision 1 (now 2); reload it');
+    expect(api.setAssignment).toHaveBeenCalledWith('b', expect.objectContaining({ expected: { revision: 1, registration: 'r-b' } }));
+    await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Enabled pdf in 1 Harness' })));
+  });
 });

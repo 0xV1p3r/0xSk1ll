@@ -24,12 +24,12 @@ export function installMock(scenario: string) {
     auth_rejected_since: scenario === 'auth' ? now - 600 : null, pending_discards: 0, report: local,
   };
   const machines: T.MachineRow[] = [
-    { id: 'workstation', status: status.headline, connected: true, joined_at: now - 86400 * 30, last_seen: now - 4, report: local },
-    { id: 'laptop', status: 'behind', connected: true, joined_at: now - 86400 * 12, last_seen: now - 40,
+    { id: 'workstation', registration: 'reg-workstation', status: status.headline, connected: true, joined_at: now - 86400 * 30, last_seen: now - 4, report: local },
+    { id: 'laptop', registration: 'reg-laptop', status: 'behind', connected: true, joined_at: now - 86400 * 12, last_seen: now - 40,
       report: report({ baseline: '1b2c3d4e5f60', behind: true, harnesses: ['claude'] }) },
-    { id: 'ci-runner', status: 'offline', connected: false, joined_at: now - 86400 * 3, last_seen: now - 7200,
+    { id: 'ci-runner', registration: 'reg-ci-runner', status: 'offline', connected: false, joined_at: now - 86400 * 3, last_seen: now - 7200,
       report: report({ harnesses: ['codex'] }) },
-    { id: 'build-box', status: 'blocked', connected: true, joined_at: now - 86400 * 8, last_seen: now - 12,
+    { id: 'build-box', registration: 'reg-build-box', status: 'blocked', connected: true, joined_at: now - 86400 * 8, last_seen: now - 12,
       report: report({ blocked: true, clashes: ['skill:deploy'], drafts: ['skill:deploy'] }) },
   ];
   const items: T.ItemView[] = empty ? [] : [
@@ -97,6 +97,18 @@ export function installMock(scenario: string) {
   ];
   let running = scenario !== 'unreachable';
   const delay = <V,>(value: V, ms = 250) => new Promise<V>(resolve => setTimeout(() => resolve(value), ms));
+  // The authority copies this Machine's toggles for `from` to the new name first, keeping toggles the new name already has; the rename is refused when it can't be asked.
+  const copyAssignment = (kind: string, from: string, to: string) => {
+    if (status.connection !== 'connected' && status.connection !== 'standalone') return null;
+    const harnesses = Object.entries(assignments[status.machine_id]?.harnesses ?? {}).filter(([, h]) => from in (kind === 'skill' ? h.skills : h.rules));
+    const migrated: string[] = [], kept: string[] = [];
+    for (const [name, h] of harnesses) {
+      const toggles = kind === 'skill' ? h.skills : h.rules;
+      if (Object.hasOwn(toggles, to)) kept.push(name); else { toggles[to] = toggles[from]; migrated.push(name); }
+    }
+    if (migrated.length) assignments[status.machine_id].revision++;
+    return { migrated, kept };
+  };
 
   mockIPC((cmd, args) => {
     const a = (args ?? {}) as Record<string, unknown>;
@@ -135,6 +147,8 @@ export function installMock(scenario: string) {
         const to = cmd === 'rename_item' ? `${r.kind}:${r.to}` : null;
         if (to && (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(r.to) || r.to.includes('..'))) return Promise.reject({ message: `invalid skill name \`${r.to}\`` });
         if (to && content.some(e => e.item === to || (r.kind === 'skill' && e.type === 'import' && e.name === r.to))) return Promise.reject({ message: `name \`${r.to}\` is taken` });
+        const copied = to && r.copy_assignment !== false ? copyAssignment(r.kind, r.name, r.to) : { migrated: [], kept: [] };
+        if (!copied) return Promise.reject({ status: 409, message: `\`${r.name}\` was not renamed: its Assignment could not be copied to \`${r.to}\`: offline: the Server is unreachable. Try again, or rename without copying the Assignment` });
         const path = (name: string) => r.kind === 'skill' ? `personal/${name}/SKILL.md` : `instructions/${name}.md`;
         const pending = draft.findIndex(d => d.item === item);
         // Deleting a never-committed item leaves nothing in the Draft.
@@ -152,14 +166,7 @@ export function installMock(scenario: string) {
         if (index >= 0) { if (added) items.splice(index, 1); else items[index].draft = 'deleted'; }
         items.push({ item: to, in_baseline: false, draft: 'added', unpushed: false, description: entry.description });
         draft.push({ item: to, change: 'added', paths: [path(r.to)], fingerprint: `renamed-${r.to}` }); local.drafts.push(to);
-        const migrated: string[] = [];
-        for (const [name, h] of Object.entries(assignments[status.machine_id]?.harnesses ?? {})) {
-          const toggles = r.kind === 'skill' ? h.skills : h.rules;
-          if (r.name in toggles) { toggles[r.to] = toggles[r.name]; migrated.push(name); }
-        }
-        if (migrated.length) assignments[status.machine_id].revision++;
-        const offline = status.connection !== 'connected' && status.connection !== 'standalone' && migrated.length > 0;
-        return delay({ item: to, migrated: offline ? [] : migrated, assignment_error: offline ? 'offline: the Server is unreachable' : null });
+        return delay({ item: to, ...copied, assignment_error: null });
       }
       case 'conflict_diff': {
         const r = a.request as T.ConflictDiffRequest;
@@ -213,10 +220,18 @@ export function installMock(scenario: string) {
         local.drafts.push(entry.item);
         return delay(undefined);
       }
-      case 'assignment': return delay(assignments[a.machine as string] ?? { revision: 0, harnesses: {} });
+      case 'assignment': {
+        const registration = machines.find(m => m.id === a.machine)?.registration;
+        return delay({ ...assignments[a.machine as string] ?? { revision: 0, harnesses: {} }, ...registration && { registration } });
+      }
       case 'set_assignment': {
         const snapshot = assignments[a.machine as string];
-        for (const change of (a.changes as T.AssignmentChanges).changes) {
+        const { changes, expected } = a.changes as T.AssignmentChanges;
+        const registration = machines.find(m => m.id === a.machine)?.registration;
+        if (expected && (expected.revision !== snapshot.revision || (expected.registration && expected.registration !== registration))) {
+          return Promise.reject({ status: 409, message: `the assignment of \`${a.machine}\` changed since revision ${expected.revision} (now ${snapshot.revision}); reload it` });
+        }
+        for (const change of changes) {
           const h = snapshot.harnesses[change.harness] ??= harness();
           if (change.kind === 'skill' || change.kind === 'rule') {
             const map = change.kind === 'skill' ? h.skills : h.rules;
@@ -283,7 +298,7 @@ export function installMock(scenario: string) {
         const distinct = (key: 'machine' | 'harness' | 'author') => [...new Set(log.map(e => e[key]))].sort();
         return delay({ machines: distinct('machine'), harnesses: distinct('harness'), authors: distinct('author') });
       }
-      case 'join_code': return delay({ code: 'sk1ll-join-7Q2M-XK9P-44RD-ZT8W', expires_at: Math.floor(Date.now() / 1000) + 86400, scope: (a as { scope: T.Scope }).scope });
+      case 'join_code': return delay({ code: 'sk1ll-join-7Q2M-XK9P-44RD-ZT8W', expires_at: Math.floor(Date.now() / 1000) + 86400, scope: (a as { scope?: T.Scope }).scope ?? 'fleet' });
       case 'connection_info': return delay('/run/user/1000/sk1ll/daemon.sock', 10);
       case 'adopt': case 'overwrite': case 'adopt_displaced': case 'discard_displaced': case 'undo':
       case 'remove_machine': return delay(undefined, 500);
