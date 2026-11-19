@@ -1,6 +1,6 @@
 name: Release
 
-# Push a tag like v0.1.0. This builds the Linux and macOS archives and the .deb, then
+# Push a tag like v0.1.0. This builds the Linux archives and the .deb, then
 # opens a draft GitHub release to review and publish. Publishing it builds the
 # server image (server-image.yml).
 #
@@ -109,51 +109,8 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  macos-arm64:
-    needs: verify
-    runs-on: macos-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v7.0.1
-        with:
-          persist-credentials: false
-      - name: Install the Rust toolchain (rust-toolchain.toml)
-        run: rustup toolchain install
-      - uses: pnpm/action-setup@v4.3.0
-        with:
-          package_json_file: crates/sk1ll-gui/ui/package.json
-      - uses: actions/setup-node@v5.0.0
-        with:
-          node-version: 24
-          package-manager-cache: false
-      - name: Build unsigned app and binaries
-        env:
-          SK1LL_COMMIT: ${{ github.sha }}
-        run: |
-          test "$(uname -m)" = arm64
-          export SK1LL_COMMIT="${SK1LL_COMMIT::10}"
-          (cd crates/sk1ll-gui/ui && pnpm install --frozen-lockfile)
-          cargo build --release --locked -p sk1ll-cli -p sk1ll-server
-          mkdir -p crates/sk1ll-gui/src-tauri/binaries
-          cp target/release/sk1ll crates/sk1ll-gui/src-tauri/binaries/sk1ll-aarch64-apple-darwin
-          (cd crates/sk1ll-gui/ui && pnpm tauri build --config src-tauri/tauri.macos-release.conf.json)
-      - name: Package
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          name="sk1ll-$version-aarch64-macos"
-          stage=$(mktemp -d)
-          mkdir -p "$stage/$name" dist
-          cp target/release/{sk1ll,sk1ll-server} LICENSE README.md CHANGELOG.md deploy/app.v1p3r.sk1ll.daemon.plist "$stage/$name/"
-          ditto target/release/bundle/macos/0xSk1ll.app "$stage/$name/0xSk1ll.app"
-          tar -C "$stage" -czf "dist/$name.tar.gz" "$name"
-      - uses: actions/upload-artifact@v7.0.2
-        with:
-          name: macos-arm64
-          path: dist/*
-          if-no-files-found: error
-
   release:
-    needs: [verify, linux-x86_64, linux-aarch64, macos-arm64]
+    needs: [verify, linux-x86_64, linux-aarch64]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
