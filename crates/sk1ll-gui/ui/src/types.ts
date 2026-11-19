@@ -152,3 +152,12 @@ export interface RenameItemRequest { kind: 'skill' | 'rule'; name: string; to: s
 export interface RenameItemResponse { item: ItemRef; migrated: string[]; kept?: string[]; assignment_error: string | null }
 export type ConflictDiffRequest = { harness: string; name: string; id?: never } | { id: string; harness?: never; name?: never };
 export interface ImportEntry { name: string; source: string; ref: string; path: string; locked: string | null }
+
+export interface MachineAssignmentCopy {
+  source: string;
+  mode: 'replace' | 'merge';
+  harnesses?: { from: string; to: string }[];
+  expected?: Expected;
+  source_expected?: Expected;
+}
+export interface AssignmentCopyPreview { count: number; target: Expected; source: Expected }

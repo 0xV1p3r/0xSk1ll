@@ -316,6 +316,37 @@ pub struct Expected {
     pub registration: Option<String>,
 }
 
+/// Copy a joined Machine's Assignment to another Machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineAssignmentCopy {
+    pub source: String,
+    pub harnesses: Option<Vec<HarnessMapping>>,
+    pub mode: CopyMode,
+    pub expected: Option<Expected>,
+    /// Bind confirmation to the source snapshot used by the preview.
+    pub source_expected: Option<Expected>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessMapping {
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CopyMode {
+    Replace,
+    Merge,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssignmentCopyPreview {
+    pub count: usize,
+    pub target: Expected,
+    pub source: Expected,
+}
+
 /// `PUT /api/machines/{id}/assignment` response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssignmentUpdate {

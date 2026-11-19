@@ -2070,7 +2070,16 @@ async fn standalone_starts_without_a_repo_and_init_creates_it() {
     let error = m.client.skills().await.unwrap_err();
     assert_eq!(error.status, Some(409));
     assert!(error.message.contains("no skills repo"));
+    let copy = sk1ll_proto::MachineAssignmentCopy {
+        source: "other".into(),
+        harnesses: None,
+        mode: sk1ll_proto::CopyMode::Replace,
+        expected: None,
+        source_expected: None,
+    };
     for error in [
+        m.client.copy_machine_assignment("solo", &copy).await.unwrap_err(),
+        m.client.preview_assignment_copy("solo", &copy).await.unwrap_err(),
         m.client.fleet().await.unwrap_err(),
         m.client.log(&Default::default()).await.unwrap_err(),
         m.client.log_facets().await.unwrap_err(),
@@ -2751,4 +2760,42 @@ async fn skill_file_writes_require_current_personal_or_rule_text() {
     request.content = "---\nharnesses: [claude]\n---\n# Valid".into();
     m.client.write_skill_file(&request).await.unwrap();
     assert_eq!(m.client.skill_file(&request.file).await.unwrap().text.as_deref(), Some(request.content.as_str()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn joined_daemon_proxies_machine_assignment_copy() {
+    use sk1ll_proto::{CopyMode, MachineAssignmentCopy};
+    let server = Server::start().await;
+    let mut target = Machine::new("target");
+    target.join(&server).await;
+    target.start_connected().await;
+    let source = Machine::new("source");
+    source.join(&server).await;
+    server
+        .http
+        .put(format!("{}/api/machines/source/assignment", server.url()))
+        .bearer_auth(ADMIN)
+        .json(&serde_json::json!({"changes":[{"harness":HARNESS,"kind":"new_rules_default","enabled":true}]}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let mut copy = MachineAssignmentCopy {
+        source: "source".into(),
+        harnesses: None,
+        mode: CopyMode::Replace,
+        expected: None,
+        source_expected: None,
+    };
+    let preview = target.client.preview_assignment_copy("target", &copy).await.unwrap();
+    assert_eq!(preview.count, 1);
+    copy.expected = Some(preview.target);
+    copy.source_expected = Some(preview.source);
+    let update = target.client.copy_machine_assignment("target", &copy).await.unwrap();
+    assert_eq!(update.entries.len(), 1);
+    assert!(update.assignment.harness(HARNESS).new_rules_default);
+    assert_eq!(target.client.copy_machine_assignment("target", &copy).await.unwrap_err().status, Some(409));
+    eventually(|| async { (target.status().await.assignment_revision == update.revision).then_some(()) }).await;
 }

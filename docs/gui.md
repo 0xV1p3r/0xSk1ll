@@ -18,6 +18,8 @@ After the wizard, the Library shows a getting-started checklist: add a skill or 
 
 ## Screens
 
+To copy an Assignment within a Fleet, open the target Machine's header menu in the Assignment matrix and choose **Copy Assignment from…**. Select a source Machine and confirm the Harness pairs. Matching names are selected by default. Replace copies defaults and explicit toggles, while Merge fills unset toggles and keeps the target defaults. Preview the change count before confirming. You can undo individual changes in the Assignment log.
+
 The header shows this machine's id, its headline status and whether the daemon and server are connected. If the daemon stops, the app shows a reconnecting screen with start instructions. Revoked machines and machines waiting for assignment get a banner. Fleet data refreshes on daemon events and every 15 seconds. Standalone machines hide Fleet and the assignment log. Their assignment belongs to this machine and is saved in `assignment.json`, with no log or undo.
 
 | Screen | What you can do |

@@ -103,6 +103,14 @@ sk1ll join http://server:7878 <code> --copy-from laptop   # start from laptop's 
 
 A new machine starts with everything off unless you pass `--copy-from`. `--id` sets the machine id, which otherwise comes from `machine.toml` or the hostname. The machine token is stored only in `~/.config/sk1ll/daemon.json` with mode 0600, and the server can revoke it per machine.
 
+## Copy an Assignment after joining
+
+Run `sk1ll fleet copy-assignment laptop workstation` to preview the changes and confirm them. Use `--yes` in scripts. The command needs a running, joined daemon. A Machine with `self` scope can copy to its own Assignment.
+
+Matching Harness names are paired by default. To choose the pairs explicitly, repeat `--map SOURCE=TARGET` for each pair to copy. Replace copies the source defaults and explicit toggles, clearing target-only toggles in those Harnesses. Use `--merge` to keep the target defaults and fill only unset item toggles. As at join time, explicit toggles carry over even if the target has yet to see the item.
+
+If either Assignment changes or either Machine rejoins after preview, preview again before applying. Each change appears in the Assignment log and can be undone there.
+
 ## Remove a machine
 
 Run `sk1ll fleet` to find the machine id. Run `sk1ll fleet remove <machine>` and type that id at the confirmation prompt. In a script, pass `--yes` to confirm removal. For an id that starts with `-`, put `--` before it: `sk1ll fleet remove --yes -- -lab`. The daemon must be running. Removal revokes the machine's credential.

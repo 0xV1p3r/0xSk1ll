@@ -332,7 +332,10 @@ pub(crate) async fn proxy(d: &Daemon, method: Method, path_and_query: &str, body
     let status = resp.status();
     let content_type = resp.headers().get(header::CONTENT_TYPE).cloned();
     let bytes = resp.bytes().await.map_err(|e| Error::Unavailable(format!("reading the server's response: {e}")))?;
-    if method != Method::GET && status.is_success() {
+    if method != Method::GET
+        && !path_and_query.split('?').next().is_some_and(|path| path.ends_with("/assignment/copy-from/preview"))
+        && status.is_success()
+    {
         d.event(Event::Fleet);
     }
     let mut out = Response::builder().status(status);

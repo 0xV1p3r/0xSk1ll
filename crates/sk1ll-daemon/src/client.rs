@@ -76,9 +76,9 @@ pub use sk1ll_core::content::{
 };
 pub use sk1ll_core::{HarnessChange, HarnessChoice};
 pub use sk1ll_proto::{
-    Assignment, AssignmentChanges, AssignmentSnapshot, AssignmentUpdate, ErrorBody, FleetView, ImportSkipped,
-    ImportUpdate, ItemRef, JoinCode, JoinCodeRequest, LogEntry, LogFacets, LogQuery, MachineReport, MachineStatus,
-    Scope,
+    Assignment, AssignmentChanges, AssignmentCopyPreview, AssignmentSnapshot, AssignmentUpdate, ErrorBody, FleetView,
+    ImportSkipped, ImportUpdate, ItemRef, JoinCode, JoinCodeRequest, LogEntry, LogFacets, LogQuery,
+    MachineAssignmentCopy, MachineReport, MachineStatus, Scope,
 };
 use tokio::net::UnixStream;
 
@@ -928,6 +928,23 @@ impl Client {
     /// The Server's current assignment and revision, read together.
     pub async fn assignment(&self, machine: &str) -> Result<AssignmentSnapshot> {
         self.get(&format!("/machines/{}/assignment", encode(machine))).await
+    }
+
+    pub async fn preview_assignment_copy(
+        &self,
+        machine: &str,
+        copy: &MachineAssignmentCopy,
+    ) -> Result<AssignmentCopyPreview> {
+        self.call(Method::POST, &format!("/machines/{}/assignment/copy-from/preview", encode(machine)), Some(copy))
+            .await
+    }
+
+    pub async fn copy_machine_assignment(
+        &self,
+        machine: &str,
+        copy: &MachineAssignmentCopy,
+    ) -> Result<AssignmentUpdate> {
+        self.call(Method::POST, &format!("/machines/{}/assignment/copy-from", encode(machine)), Some(copy)).await
     }
 
     pub async fn set_assignment(&self, machine: &str, changes: &AssignmentChanges) -> Result<AssignmentUpdate> {

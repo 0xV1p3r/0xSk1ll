@@ -5,8 +5,8 @@ use std::collections::BTreeSet;
 
 use rusqlite::Connection;
 use sk1ll_proto::{
-    Assignment, AssignmentCopy, AssignmentSnapshot, Expected, HarnessAssignment, ItemRef, LogCause, LogEntry,
-    ToggleKind,
+    Assignment, AssignmentCopy, AssignmentSnapshot, CopyMode, Expected, HarnessAssignment, HarnessMapping, ItemRef,
+    LogCause, LogEntry, MachineAssignmentCopy, ToggleKind,
 };
 
 use crate::db;
@@ -146,6 +146,61 @@ pub fn check_expected(tx: &Connection, m: &db::MachineRecord, expected: &Expecte
         )));
     }
     Ok(())
+}
+
+/// Join-time copying retains explicit toggles even for items the destination
+/// has yet to see. Use the same policy here.
+pub fn machine_copy_changes(
+    source: &Assignment,
+    target: &Assignment,
+    copy: &MachineAssignmentCopy,
+) -> Result<Vec<Change>> {
+    let mappings = copy.harnesses.clone().unwrap_or_else(|| {
+        source
+            .harnesses
+            .keys()
+            .filter(|name| target.harnesses.contains_key(*name))
+            .map(|name| HarnessMapping { from: name.clone(), to: name.clone() })
+            .collect()
+    });
+    let mut destinations = BTreeSet::new();
+    let mut changes = Vec::new();
+    for HarnessMapping { from, to } in mappings {
+        let src = source
+            .harnesses
+            .get(&from)
+            .ok_or_else(|| ApiError::BadRequest(format!("source has no Harness `{from}`")))?;
+        let dst =
+            target.harnesses.get(&to).ok_or_else(|| ApiError::BadRequest(format!("target has no Harness `{to}`")))?;
+        if !destinations.insert(to.clone()) {
+            return Err(ApiError::BadRequest(format!("target Harness `{to}` is mapped more than once")));
+        }
+        let mut add = |kind, name, before, after| {
+            if before != after {
+                changes.push(Change { harness: to.clone(), kind, name, after, cause: LogCause::Change });
+            }
+        };
+        if copy.mode == CopyMode::Replace {
+            add(ToggleKind::NewSkillsDefault, None, Some(dst.new_skills_default), Some(src.new_skills_default));
+            add(ToggleKind::NewRulesDefault, None, Some(dst.new_rules_default), Some(src.new_rules_default));
+        }
+        for (kind, src, dst) in
+            [(ToggleKind::Skill, &src.skills, &dst.skills), (ToggleKind::Rule, &src.rules, &dst.rules)]
+        {
+            for (name, value) in src {
+                let before = dst.get(name).copied();
+                if copy.mode == CopyMode::Replace || before.is_none() {
+                    add(kind, Some(name.clone()), before, Some(*value));
+                }
+            }
+            if copy.mode == CopyMode::Replace {
+                for (name, value) in dst.iter().filter(|(name, _)| !src.contains_key(*name)) {
+                    add(kind, Some(name.clone()), Some(*value), None);
+                }
+            }
+        }
+    }
+    Ok(changes)
 }
 
 /// The changes that copy `m`'s explicit toggles of `copy.from` to `copy.to`,

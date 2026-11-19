@@ -88,6 +88,14 @@ command!(imports() -> ImportsView, imports());
 command!(update_import(name: String) -> ImportUpdated, update_import(&name));
 command!(force_update_import(name: String) -> ImportUpdated, force_update_import(&name));
 command!(import_changes(name: String, upstream: String) -> ImportChanges, import_changes(&name, Some(&upstream)));
+command!(
+    preview_assignment_copy(machine: String, copy: MachineAssignmentCopy) -> AssignmentCopyPreview,
+    preview_assignment_copy(&machine, &copy)
+);
+command!(
+    copy_machine_assignment(machine: String, copy: MachineAssignmentCopy) -> AssignmentUpdate,
+    copy_machine_assignment(&machine, &copy)
+);
 command!(assignment(machine: String) -> AssignmentSnapshot, assignment(&machine));
 command!(
     set_assignment(machine: String, changes: AssignmentChanges) -> AssignmentUpdate,

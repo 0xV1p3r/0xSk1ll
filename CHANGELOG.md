@@ -13,6 +13,7 @@ break compatibility.
   before overwriting a concurrent disk edit and a link to review the Draft.
 - Choose a branch, tag or commit in Add Import. Preview upstream commits and
   changed files in Imports or with `sk1ll update <name> --dry-run`.
+- Copy a joined Machine's Assignment from the CLI or Assignment matrix, with a preview, optional Harness mappings, and per-change log undo.
 - macOS arm64 builds in CI and release archives with the unsigned desktop app,
   CLI and server. Setup and the desktop app can start the daemon through launchd.
 - Create a Rule from the desktop getting-started checklist and reopen the

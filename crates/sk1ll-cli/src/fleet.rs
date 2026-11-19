@@ -295,6 +295,43 @@ fn fleet(cli: &Cli, command: Option<&FleetCmd>) -> Result<()> {
             rt.block_on(client.remove_machine(machine)).map_err(fleet_error)?;
             println!("removed {machine} from the fleet");
         }
+        Some(FleetCmd::CopyAssignment { source, target, merge, maps, yes }) => {
+            use sk1ll_proto::{CopyMode, HarnessMapping, MachineAssignmentCopy};
+            let mappings = maps
+                .iter()
+                .map(|map| {
+                    let (from, to) = map
+                        .split_once('=')
+                        .filter(|(from, to)| !from.is_empty() && !to.is_empty() && !to.contains('='))
+                        .with_context(|| format!("invalid Harness mapping `{map}`; use FROM=TO"))?;
+                    Ok(HarnessMapping { from: from.into(), to: to.into() })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut copy = MachineAssignmentCopy {
+                source: source.clone(),
+                harnesses: (!mappings.is_empty()).then_some(mappings),
+                mode: if *merge { CopyMode::Merge } else { CopyMode::Replace },
+                expected: None,
+                source_expected: None,
+            };
+            let preview = rt.block_on(client.preview_assignment_copy(target, &copy)).map_err(fleet_error)?;
+            println!("{} Assignment changes on {target} (item toggles and defaults)", preview.count);
+            if preview.count == 0 {
+                return Ok(());
+            }
+            if !yes {
+                if !std::io::stdin().is_terminal() {
+                    bail!("copying an Assignment requires terminal confirmation or `--yes`");
+                }
+                if !confirm("Apply these changes?")? {
+                    bail!("Assignment copy aborted");
+                }
+            }
+            copy.expected = Some(preview.target);
+            copy.source_expected = Some(preview.source);
+            let update = rt.block_on(client.copy_machine_assignment(target, &copy)).map_err(fleet_error)?;
+            println!("copied Assignment to {target} at revision {}", update.revision);
+        }
         Some(FleetCmd::Log { machine, harness, author, item, before, limit }) => {
             let query = LogQuery {
                 machine: machine.clone(),
