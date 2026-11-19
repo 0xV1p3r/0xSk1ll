@@ -28,7 +28,7 @@ beforeEach(() => {
   vi.resetAllMocks();
   vi.stubGlobal('matchMedia', vi.fn().mockImplementation(() => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() })));
   vi.mocked(api.skillTree).mockResolvedValue([{ path: 'SKILL.md', kind: 'file', size: 100 }, { path: 'docs', kind: 'directory', size: 0 }, { path: 'docs/example.md', kind: 'file', size: 30 }]);
-  vi.mocked(api.skillFile).mockResolvedValue({ path: 'SKILL.md', text: markdown, binary: false, too_large: false, size: 100 });
+  vi.mocked(api.skillFile).mockResolvedValue({ path: 'SKILL.md', text: markdown, fingerprint: null, binary: false, too_large: false, size: 100 });
   vi.mocked(api.editors).mockResolvedValue({ preferred_editor: 'code', editors: [
     { id: 'code', name: 'VS Code', kind: 'gui' }, { id: 'nvim', name: 'Neovim', kind: 'terminal' }, { id: 'default-app', name: 'Default app', kind: 'system' },
   ] });
@@ -111,15 +111,15 @@ it('shows frontmatter separately and toggles Rendered and Raw without raw HTML',
 });
 it('browses a Rule single file and keeps deleted items read-only', async () => {
   vi.mocked(api.skillTree).mockResolvedValue([{ path: 'style.md', kind: 'file', size: 100 }]);
-  vi.mocked(api.skillFile).mockResolvedValue({ path: 'style.md', text: '# Style', binary: false, too_large: false, size: 100 });
+  vi.mocked(api.skillFile).mockResolvedValue({ path: 'style.md', text: '# Style', fingerprint: null, binary: false, too_large: false, size: 100 });
   mount([entry('style', 'rule', { draft: 'deleted' })]); fireEvent.click(screen.getByRole('row', { name: 'View Rule style' }));
   expect(await screen.findByRole('heading', { name: 'Style' })).toBeTruthy(); expect(api.skillFile).toHaveBeenCalledWith({ item: 'rule:style', path: 'style.md' });
   expect(screen.queryByRole('navigation', { name: 'Files' })).toBeNull();
   expect(screen.queryByRole('button', { name: 'Choose editor' })).toBeNull(); fireEvent.click(screen.getByRole('button', { name: 'Review in Draft' })); expect(reviewDraft).toHaveBeenCalledOnce();
 });
 it('shows binary and size notices and reloads on revision changes', async () => {
-  vi.mocked(api.skillFile).mockResolvedValueOnce({ path: 'SKILL.md', text: null, binary: true, too_large: false, size: 10 })
-    .mockResolvedValue({ path: 'SKILL.md', text: null, binary: false, too_large: true, size: 2000000 });
+  vi.mocked(api.skillFile).mockResolvedValueOnce({ path: 'SKILL.md', text: null, fingerprint: null, binary: true, too_large: false, size: 10 })
+    .mockResolvedValue({ path: 'SKILL.md', text: null, fingerprint: null, binary: false, too_large: true, size: 2000000 });
   const view = mount(); await select('pdf'); expect(await screen.findByText('Binary file')).toBeTruthy();
   view.rerender(<TooltipProvider><Skills {...props} revision={1} /></TooltipProvider>); expect(await screen.findByText('File too large')).toBeTruthy();
 });
@@ -149,14 +149,14 @@ it('refreshes the selected item Type and closes a removed item', async () => {
   await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
 });
 it('does not display the previous file when another file fails to load', async () => {
-  vi.mocked(api.skillFile).mockResolvedValueOnce({ path: 'SKILL.md', text: '# Original', binary: false, too_large: false, size: 10 })
+  vi.mocked(api.skillFile).mockResolvedValueOnce({ path: 'SKILL.md', text: '# Original', fingerprint: null, binary: false, too_large: false, size: 10 })
     .mockRejectedValueOnce('Cannot read file');
   mount(); await select('pdf'); await screen.findByRole('heading', { name: 'Original' });
   fireEvent.click(screen.getByRole('button', { name: 'example.md' }));
   await screen.findByText('Cannot read file'); expect(screen.queryByRole('heading', { name: 'Original' })).toBeNull();
 });
 it('does not keep another variant preview when reading the new variant fails', async () => {
-  vi.mocked(api.skillFile).mockResolvedValueOnce({ path: 'SKILL.md', text: '# First copy', binary: false, too_large: false, size: 10 })
+  vi.mocked(api.skillFile).mockResolvedValueOnce({ path: 'SKILL.md', text: '# First copy', fingerprint: null, binary: false, too_large: false, size: 10 })
     .mockRejectedValueOnce('Variant unavailable');
   mount(); await select('notes', 'Unmanaged'); await screen.findByRole('heading', { name: 'First copy' });
   fireEvent.change(screen.getByLabelText('Harness location and variant'), { target: { value: 'sha256:two:codex' } });
@@ -374,7 +374,9 @@ it('guards file navigation and saves with Ctrl+S, then offers Draft review', asy
   expect(screen.getByRole('textbox', { name: 'SKILL.md' })).toBe(textarea);
   fireEvent.keyDown(textarea, { key: 's', ctrlKey: true });
   expect(api.writeSkillFile).toHaveBeenCalledWith({ item: 'skill:writing', path: 'SKILL.md', content: '# After', expected: 'old' });
-  fireEvent.click(await screen.findByRole('button', { name: 'Review in Draft' }));
+  const review = await screen.findByRole('button', { name: 'Review in Draft' });
+  expect(document.activeElement).toBe(screen.getByRole('heading', { name: 'SKILL.md' }));
+  fireEvent.click(review);
   expect(changed).toHaveBeenCalledOnce();
   expect(reviewDraft).toHaveBeenCalledOnce();
 });

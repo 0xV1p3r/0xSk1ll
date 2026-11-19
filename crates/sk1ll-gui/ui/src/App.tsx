@@ -232,10 +232,11 @@ export function App() {
     void api.status().then(value => { if (alive) { setStatus(value); setReachable(true); } }).catch(() => {});
     return () => { alive = false; };
   }, [revisions.status]);
-  if (apiMismatch) return <TooltipProvider><ConnectionPage socket={socket} error={apiMismatch} apiMismatch /></TooltipProvider>;
+  const preserveEditor = fileEditState.current !== 'clean';
+  if (apiMismatch && !preserveEditor) return <TooltipProvider><ConnectionPage socket={socket} error={apiMismatch} apiMismatch /></TooltipProvider>;
   // Give the restart after a join time before offering to start the Daemon.
   if (joinedAt !== undefined && status?.mode !== 'joined') return <TooltipProvider><RestartingPage /></TooltipProvider>;
-  if (reachable === false) return <TooltipProvider><ConnectionPage socket={socket} error={error} /></TooltipProvider>;
+  if (reachable === false && !preserveEditor) return <TooltipProvider><ConnectionPage socket={socket} error={error} /></TooltipProvider>;
   if (!status) return <main className="grid min-h-svh place-items-center bg-muted/40 p-6"><div className="flex w-full max-w-sm flex-col items-start gap-3">
     <Wordmark /><p className="flex items-center gap-2 text-sm text-muted-foreground" role="status"><LoaderCircle aria-hidden className="size-4 animate-spin" />Connecting to the Daemon…</p><ErrorNotice error={error} /></div></main>;
   if (standalone && !status.repo_ready) return <TooltipProvider><SetupWizard status={status} onDone={setupDone} /></TooltipProvider>;
@@ -265,6 +266,9 @@ export function App() {
         <ThemeSelector />
       </header>
       <main data-library-search={skillsHandoff.search} id="main" tabIndex={-1} className="mx-auto flex w-full max-w-6xl min-w-0 flex-col gap-5 p-4 md:px-[18px] md:py-4">
+        {preserveEditor && (reachable === false || apiMismatch) && <Alert role="status">
+          {apiMismatch || 'Daemon disconnected. Your unsaved changes are still here. Reconnect before saving.'}
+        </Alert>}
         <div className="flex flex-col gap-1"><div className="flex items-center gap-2"><h1 ref={heading} tabIndex={-1} className="rounded-sm text-2xl font-semibold tracking-tight outline-none focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-ring">{screenLabel(screen, status)}</h1>
           {screen === 'Settings' && <Button className="ml-auto" size="sm" disabled={!canSync} onClick={() => setSyncOpen(true)}>Sync now</Button>}</div>
           <p className="text-sm text-muted-foreground">{screen === 'Draft' && status.revoked ? "This Machine's Draft is private. The Daemon has stopped managing its Harnesses until this Machine rejoins." : screen === 'Draft' && status.awaiting_assignment ? "This Machine's Draft is private. Harnesses stay unchanged until the Server sends an Assignment." : standalone && screen === 'Draft' ? 'Commit saves selected Draft items to the local repository.' : standalone && screen === 'Settings' ? 'Harnesses, local repository, and Fleet membership for this Machine.' : screens[screen].description}</p></div>
