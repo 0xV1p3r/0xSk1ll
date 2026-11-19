@@ -262,8 +262,13 @@ async fn set_harness_assignment(
             authorize_assignment(&tx, &caller, &machine)?;
             let m = db::machine(&tx, &machine)?.ok_or_else(|| ApiError::NotFound(format!("no machine `{machine}`")))?;
             let report = m.report.unwrap_or_default();
-            let known: std::collections::BTreeSet<_> =
-                items.iter().cloned().chain(report.drafts).chain(report.unpushed).collect();
+            let known: std::collections::BTreeSet<_> = items
+                .iter()
+                .cloned()
+                .chain(report.drafts)
+                .chain(report.unpushed)
+                .filter(|item| matches!(item, sk1ll_proto::ItemRef::Skill(_) | sk1ll_proto::ItemRef::Rule(_)))
+                .collect();
             let (eligible, skipped): (Vec<_>, Vec<_>) = known.into_iter().partition(|item| match item {
                 sk1ll_proto::ItemRef::Skill(name) | sk1ll_proto::ItemRef::Rule(name) => {
                     check_name("item name", name).is_ok()
@@ -575,7 +580,7 @@ mod tests {
             Err(ApiError::Unavailable(_))
         ));
         server.fail_listing.store(false, std::sync::atomic::Ordering::SeqCst);
-        copy_assignment(State(server.clone()), caller.clone(), Path("me".into()), Json(copy)).await.unwrap();
+        let _ = copy_assignment(State(server.clone()), caller.clone(), Path("me".into()), Json(copy)).await.unwrap();
         server
             .db(|conn| {
                 db::save_report(
