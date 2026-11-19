@@ -100,7 +100,7 @@ mod unix {
         unchanged: impl FnOnce() -> Result<bool, E>,
     ) -> io::Result<Result<bool, E>> {
         let mut stage = Stage::new(parent)?;
-        stage.write(bytes, Mode::from_raw_mode(mode), true)?;
+        stage.write(bytes, Mode::from_raw_mode((mode & 0o7777) as fd::RawMode), true)?;
         match unchanged() {
             Ok(true) => {
                 fd::renameat(&stage.directory, "file", parent, name)?;
