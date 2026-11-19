@@ -22,6 +22,7 @@ import { Conflicts } from './Conflicts';
 import { Imports } from './Imports';
 import { Log } from './Log';
 import { Skills, type SkillsHandoff } from './Skills';
+import { canLeaveFile, type FileEditState } from './SkillFile';
 import { useResource } from './hooks';
 import { eventTopics } from './invalidation';
 import { plural } from './model';
@@ -145,9 +146,10 @@ export function App() {
   };
   const heading = useRef<HTMLHeadingElement>(null);
   const navigated = useRef(false);
-  const navigate = useCallback((next: Screen, machine?: string) => { navigated.current = true; setMatrixTarget(undefined); setFleetTarget(previous => machine ? { id: machine, visit: (previous?.visit ?? 0) + 1 } : undefined); setOpenAdd(0); setSkillsHandoff({}); setScreen(next); window.location.hash = screenHash(next); }, []);
+  const fileEditState = useRef<FileEditState>('clean');
+  const navigate = useCallback((next: Screen, machine?: string) => { if (!canLeaveFile(fileEditState.current)) return false; navigated.current = true; setMatrixTarget(undefined); setFleetTarget(previous => machine ? { id: machine, visit: (previous?.visit ?? 0) + 1 } : undefined); setOpenAdd(0); setSkillsHandoff({}); setScreen(next); window.location.hash = screenHash(next); return true; }, []);
   useEffect(() => {
-    const hashchange = () => { const next = screenFromHash(window.location.hash); if (next !== screen) navigate(next); };
+    const hashchange = () => { const next = screenFromHash(window.location.hash); if (next !== screen && !navigate(next)) window.history.replaceState(null, '', screenHash(screen)); };
     window.addEventListener('hashchange', hashchange);
     return () => window.removeEventListener('hashchange', hashchange);
   }, [navigate, screen]);
@@ -278,7 +280,7 @@ export function App() {
         {screen === 'Library' && <GettingStarted key={checklist} reopened={checklistReopened} onDismiss={closeChecklist} status={status} entries={skills.data} machines={fleet.data?.machines.length} scope={ownScope(fleet.data, status.machine_id)}
           addImport={() => { navigate('Imports'); setOpenAdd(n => n + 1); }} newSkill={() => setSkillsHandoff({ create: 'skill' })}
           newRule={() => setSkillsHandoff({ create: 'rule' })} showUnmanaged={() => setSkillsHandoff({ filter: 'unmanaged' })} reviewDraft={() => navigate('Draft')} />}
-        {screen === 'Library' && <><ErrorNotice error={skills.error} />{skills.loading && !skills.data ? <Loading /> : <Skills handoff={skillsHandoff} connection={status.connection} entries={skills.data ?? []} revision={revision} changed={changed} reviewDraft={() => navigate('Draft')} assignment={(item, harness) => { navigate('Assignment matrix'); setMatrixTarget({ item, harness }); }} addImport={() => { navigate('Imports'); setOpenAdd(n => n + 1); }} />}</>}
+        {screen === 'Library' && <><ErrorNotice error={skills.error} />{skills.loading && !skills.data ? <Loading /> : <Skills fileEditState={fileEditState} handoff={skillsHandoff} connection={status.connection} entries={skills.data ?? []} revision={revision} changed={changed} reviewDraft={() => navigate('Draft')} assignment={(item, harness) => { navigate('Assignment matrix'); setMatrixTarget({ item, harness }); }} addImport={() => { navigate('Imports'); setOpenAdd(n => n + 1); }} />}</>}
         {screen === 'Fleet' && <Fleet key={fleetTarget?.visit} initialMachine={fleetTarget?.id} serverUrl={status.server_url} revision={revision + revisions.fleet} machineId={status.machine_id} localReport={status.report} unmanaged={skills.data?.filter(entry => entry.type === 'unmanaged')} discovery={{ loading: !skills.data && skills.loading, error: skills.error }} navigate={next => { navigate(next); if (next === 'Library') setSkillsHandoff({ filter: 'unmanaged' }); }} changed={changed} live={status.connection === 'connected'} />}
         {screen === 'Assignment matrix' && <Matrix revision={revision + revisions.fleet} status={status} target={matrixTarget} />}
         {screen === 'Draft' && <Draft revision={revision} status={status} changed={changed} />}
@@ -295,10 +297,10 @@ export function App() {
       { id: 'action-push', background: true, label: 'Action: Push', select: () => void runAction(async () => { const result = await api.push(); return { title: result.pushed ? 'Push complete' : standalone ? 'Push did not reach origin' : 'Push did not reach the Server', tone: result.pushed ? undefined : 'destructive' }; }) },
       ] : []),
       { id: 'action-check-imports', background: true, label: 'Action: Check Imports', select: () => void runAction(async () => { const result = await api.checkImports(); return { title: 'Import check complete', description: `${plural(result.updates.length, 'update')}, ${plural(result.errors.length, 'failed check')}`, tone: result.errors.length ? 'destructive' : undefined }; }) },
-      { id: 'action-getting-started', label: 'Action: Show getting started', select: () => { navigate('Library'); showGettingStarted(); setChecklistReopened(true); setChecklist(value => value + 1); } },
+      { id: 'action-getting-started', label: 'Action: Show getting started', select: () => { if (!navigate('Library')) return; showGettingStarted(); setChecklistReopened(true); setChecklist(value => value + 1); } },
       { id: 'action-add-import', label: 'Action: Add Import', select: () => { navigate('Imports'); setOpenAdd(n => n + 1); } },
-      ...(['Skill', 'Rule'] as const).map(type => ({ id: `action-new-${type.toLowerCase()}`, label: `Action: New ${type}`, select: () => { navigate('Library'); setSkillsHandoff({ create: type === 'Skill' ? 'skill' : 'rule' }); } })),
-      ...(skills.data ?? []).map((entry, index) => ({ id: `content-${index}`, label: `${entry.type === 'rule' ? 'Rule' : 'Skill'}: ${entry.name}`, select: () => { navigate('Library'); setSkillsHandoff({ search: entry.name }); } })),
+      ...(['Skill', 'Rule'] as const).map(type => ({ id: `action-new-${type.toLowerCase()}`, label: `Action: New ${type}`, select: () => { if (!navigate('Library')) return; setSkillsHandoff({ create: type === 'Skill' ? 'skill' : 'rule' }); } })),
+      ...(skills.data ?? []).map((entry, index) => ({ id: `content-${index}`, label: `${entry.type === 'rule' ? 'Rule' : 'Skill'}: ${entry.name}`, select: () => { if (!navigate('Library')) return; setSkillsHandoff({ search: entry.name }); } })),
     ]} />
   </SidebarProvider></TooltipProvider></ToastProvider>;
 }

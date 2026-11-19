@@ -41,7 +41,10 @@ pub(crate) fn router(d: Arc<Daemon>) -> Router {
         .route("/items", get(items))
         .route("/skills", get(skills))
         .route("/skills/tree", get(skill_tree))
-        .route("/skills/file", get(skill_file))
+        .route(
+            "/skills/file",
+            get(skill_file).post(write_skill_file).layer(axum::extract::DefaultBodyLimit::max(7 * 1024 * 1024)),
+        )
         .route("/skills/adopt", post(adopt))
         .route("/draft", get(draft))
         .route("/draft/diff", get(diff))
@@ -250,6 +253,11 @@ async fn skill_file(
     Query(q): Query<sk1ll_core::content::FileQuery>,
 ) -> Result<Json<sk1ll_core::content::FileContent>> {
     Ok(Json(d.reading(move |d| d.skill_file(&q)).await?))
+}
+
+async fn write_skill_file(State(d): St, Json(req): Json<crate::client::WriteFileRequest>) -> Result<StatusCode> {
+    d.blocking(move |d, eng| d.write_skill_file(eng, &req)).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]

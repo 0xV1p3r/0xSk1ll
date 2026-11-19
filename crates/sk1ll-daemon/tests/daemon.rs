@@ -2663,3 +2663,67 @@ async fn a_bundled_skill_is_created_as_a_personal_draft_skill() {
         assert_eq!(err.status, Some(400), "{kind} {name} from {from}: {err:?}");
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn skill_file_writes_require_current_personal_or_rule_text() {
+    use sk1ll_daemon::client::{ContentQuery, FileQuery, WriteFileRequest};
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let server = Server::start().await;
+    let mut m = Machine::new("file-writes");
+    m.join(&server).await;
+    m.start_connected().await;
+    let skill = "personal/writing/SKILL.md";
+    m.write(skill, "# Original");
+    m.write("instructions/style.md", "# Style");
+    m.write("imported/other/SKILL.md", "# Import");
+    std::fs::set_permissions(m.repo().join(skill), std::fs::Permissions::from_mode(0o640)).unwrap();
+
+    let file = |item: &str, path: &str| FileQuery {
+        content: ContentQuery { item: item.into(), hash: None, harness: None },
+        path: path.into(),
+    };
+    let edit = file("skill:writing", "SKILL.md");
+    let expected = m.client.skill_file(&edit).await.unwrap().fingerprint.unwrap();
+    let mut request = WriteFileRequest { file: edit, content: "# Saved".into(), expected };
+    m.client.write_skill_file(&request).await.unwrap();
+    assert_eq!(std::fs::read_to_string(m.repo().join(skill)).unwrap(), "# Saved");
+    assert_eq!(std::fs::metadata(m.repo().join(skill)).unwrap().permissions().mode() & 0o777, 0o640);
+    assert!(m.client.draft().await.unwrap().iter().any(|item| item.item.to_string() == "skill:writing"));
+
+    request.expected = m.client.skill_file(&request.file).await.unwrap().fingerprint.unwrap();
+    m.write(skill, "# External edit");
+    assert_eq!(m.client.write_skill_file(&request).await.unwrap_err().status, Some(409));
+    assert_eq!(std::fs::read_to_string(m.repo().join(skill)).unwrap(), "# External edit");
+
+    request.content = "x".repeat(1024 * 1024 + 1);
+    let error = m.client.write_skill_file(&request).await.unwrap_err();
+    assert_eq!(error.status, Some(400));
+    assert!(error.message.contains("1 MiB"));
+    request.content = "# Saved".into();
+
+    for (item, path, message) in [
+        ("skill:other", "SKILL.md", "Fork"),
+        ("unmanaged:other", "SKILL.md", "Adopt"),
+        ("skill:writing", "../SKILL.md", "stay inside"),
+        ("rule:style", "other.md", "escapes the Rule"),
+    ] {
+        request.file = file(item, path);
+        let error = m.client.write_skill_file(&request).await.unwrap_err();
+        assert_eq!(error.status, Some(400), "{error}");
+        assert!(error.message.contains(message), "{error}");
+    }
+    symlink(m.repo().join("instructions"), m.repo().join("personal/writing/link")).unwrap();
+    request.file = file("skill:writing", "link/style.md");
+    assert!(m.client.write_skill_file(&request).await.is_err());
+
+    request.file = file("rule:style", "style.md");
+    request.expected = m.client.skill_file(&request.file).await.unwrap().fingerprint.unwrap();
+    request.content = "---\nharnesses: [false]\n---\n# Invalid".into();
+    let error = m.client.write_skill_file(&request).await.unwrap_err();
+    assert_eq!(error.status, Some(400));
+    assert!(error.message.contains("Invalid Rule frontmatter"));
+    request.content = "---\nharnesses: [claude]\n---\n# Valid".into();
+    m.client.write_skill_file(&request).await.unwrap();
+    assert_eq!(m.client.skill_file(&request.file).await.unwrap().text.as_deref(), Some(request.content.as_str()));
+}

@@ -58,6 +58,7 @@ command!(items() -> Vec<ItemView>, items());
 command!(skills() -> Vec<ContentEntry>, skills());
 command!(skill_tree(query: ContentQuery) -> Vec<FileEntry>, skill_tree(&query));
 command!(skill_file(query: FileQuery) -> FileContent, skill_file(&query));
+command!(write_skill_file(request: WriteFileRequest) -> (), write_skill_file(&request));
 command!(adopt_unmanaged(target: ConflictTarget) -> (), adopt_unmanaged(&target));
 command!(fork(name: String) -> (), fork(&name));
 command!(diff(item: String) -> DiffView, diff(&item));

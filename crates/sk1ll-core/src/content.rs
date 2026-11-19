@@ -1,4 +1,4 @@
-//! Skill and Rule details and bounded, read-only content browsing.
+//! Skill and Rule details and bounded content browsing and editing.
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
@@ -80,7 +80,17 @@ pub struct FileEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteFileRequest {
+    #[serde(flatten)]
+    pub file: FileQuery,
+    pub content: String,
+    pub expected: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileContent {
+    #[serde(default)]
+    pub fingerprint: Option<String>,
     pub path: String,
     pub text: Option<String>,
     pub binary: bool,
@@ -389,7 +399,9 @@ fn relative(path: &str) -> Result<&Path> {
 
 pub fn file(repo: &Repo, harnesses: &BTreeMap<String, Harness>, query: &FileQuery) -> Result<FileContent> {
     let rel = relative(&query.path)?;
-    let (bytes, size) = match source(repo, harnesses, &query.content)? {
+    let source = source(repo, harnesses, &query.content)?;
+    let on_disk = matches!(source, Source::Disk(_));
+    let (bytes, size) = match source {
         #[cfg(unix)]
         Source::Disk(root) => {
             let pinned = pinned::Item::open(&root, query.content.item.starts_with("rule:"))?;
@@ -468,7 +480,60 @@ pub fn file(repo: &Repo, harnesses: &BTreeMap<String, Harness>, query: &FileQuer
     let too_large = size > MAX_FILE_BYTES;
     let text = if too_large { None } else { String::from_utf8(bytes).ok().filter(|s| !s.contains('\0')) };
     let binary = !too_large && text.is_none();
-    Ok(FileContent { path: query.path.clone(), text, binary, too_large, size })
+    let fingerprint = text.as_deref().filter(|_| on_disk).map(crate::hash::hash_str);
+    Ok(FileContent { fingerprint, path: query.path.clone(), text, binary, too_large, size })
+}
+
+/// Returns false when the loaded fingerprint no longer matches.
+pub fn write_file(repo: &Repo, request: &WriteFileRequest) -> Result<bool> {
+    if request.content.len() as u64 > MAX_FILE_BYTES || request.content.contains('\0') {
+        return Err(Error::Invalid("file content must be UTF-8 text of at most 1 MiB".into()));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = repo;
+        Err(Error::Invalid("in-app editing is unavailable on this platform".into()))
+    }
+    #[cfg(unix)]
+    {
+        let query = &request.file;
+        let rel = relative(&query.path)?;
+        if crate::source::is_staging_path(rel)
+            || rel
+                .components()
+                .any(|c| matches!(c.as_os_str().to_str(), Some(".git" | ".sk1ll-managed" | ".sk1ll-tmp")))
+        {
+            return Err(Error::Invalid("cannot edit a reserved file".into()));
+        }
+        if query.content.item.starts_with("unmanaged:") {
+            return Err(Error::Invalid("Adopt this Unmanaged skill before editing".into()));
+        }
+        let item: ItemRef = query.content.item.parse()?;
+        let name = item.name();
+        if relative(name)?.file_name().is_none_or(|leaf| leaf != name)
+            || matches!(name, ".git" | ".sk1ll-managed" | ".sk1ll-tmp")
+            || crate::source::is_staging_path(Path::new(name))
+        {
+            return Err(Error::Invalid("invalid item name".into()));
+        }
+        let (root, rule) = match item {
+            ItemRef::Skill(name) => {
+                let path = repo.root().join(crate::skill::PERSONAL_DIR).join(&name);
+                if !path.join("SKILL.md").is_file() {
+                    if repo.root().join(crate::skill::IMPORTED_DIR).join(&name).join("SKILL.md").is_file() {
+                        return Err(Error::Invalid("Fork this Import before editing".into()));
+                    }
+                    return Ok(false);
+                }
+                (path, false)
+            }
+            ItemRef::Rule(name) => {
+                (repo.root().join(crate::instructions::INSTRUCTIONS_DIR).join(format!("{name}.md")), true)
+            }
+            _ => return Err(Error::Invalid("only Personal Skills and Rules are writable".into())),
+        };
+        pinned::Item::open(&root, rule)?.replace(rel, request)
+    }
 }
 
 /// The editor destination for a personal Skill or Rule. Imports must be

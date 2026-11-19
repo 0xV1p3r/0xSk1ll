@@ -94,6 +94,12 @@ pub fn discover(root: &Path) -> Result<Vec<Rule>> {
         .collect()
 }
 
+pub(crate) fn validate_edit(text: &str, path: &Path) -> Result<()> {
+    parse_harnesses(text, path)?;
+    split_harnesses_key(split_frontmatter(text).0.unwrap_or_default(), path)?;
+    Ok(())
+}
+
 /// Parses only sk1ll's routing keys; other frontmatter belongs to the harness.
 fn parse_harnesses(text: &str, path: &Path) -> Result<Option<Vec<String>>> {
     let (frontmatter, _) = split_frontmatter(text);

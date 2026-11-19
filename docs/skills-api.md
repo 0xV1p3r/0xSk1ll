@@ -94,6 +94,7 @@ size zero. Tree browsing does not follow directory symlinks. Sk1ll markers and
 {
   "path": "SKILL.md",
   "text": "---\ndescription: Work with PDFs\n---\n...",
+  "fingerprint": "sha256:…",
   "binary": false,
   "too_large": false,
   "size": 123
@@ -115,6 +116,29 @@ and `text: null`; their binary status is not inspected.
 Repo reads use Draft content on disk. Fully deleted Draft items use their
 Baseline version from Git `HEAD`. Deleting only `SKILL.md` still exposes any
 remaining Draft files. Unmanaged reads use the selected Harness location.
+
+### Save a file
+
+`POST /skills/file` takes a JSON body with the item, relative path, new text
+and the fingerprint returned by the read:
+
+```json
+{
+  "item": "rule:git",
+  "path": "git.md",
+  "content": "# Git\n",
+  "expected": "sha256:…"
+}
+```
+
+The fingerprint is null for Baseline fallback and when there is no text preview. Saves require an
+existing UTF-8 text file of at most 1 MiB in a Personal Skill or Rule. Rule
+frontmatter must parse. Fork an Import or Adopt an Unmanaged skill before
+editing. The Daemon refuses symlink traversal on writes.
+
+A successful save returns `204 No Content` and refreshes the Draft and
+Harnesses. A stale fingerprint returns `409 Conflict`. To replace the new
+disk contents, read the file again and use its new fingerprint.
 
 ## Adopt and fork
 

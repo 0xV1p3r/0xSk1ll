@@ -9,6 +9,7 @@
 //! | GET | `/skills` | → `Vec<ContentEntry>` |
 //! | GET | `/skills/tree?item=skill:pdf` | → `Vec<FileEntry>` |
 //! | GET | `/skills/file?item=skill:pdf&path=SKILL.md` | → `FileContent` |
+//! | POST | `/skills/file` | `WriteFileRequest` → 204, or 409 if the file changed |
 //! | POST | `/skills/adopt` | `ConflictTarget` → 204; unmanaged Adopt needs a Server connection when joined |
 //! | POST | `/items/create` | [`CreateItemRequest`] → 204 |
 //! | POST | `/items/delete` | [`DeleteItemRequest`] → 204 (a Draft deletion) |
@@ -69,7 +70,9 @@ use hyper_util::rt::TokioIo;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub use sk1ll_core::content::{ContentEntry, ContentQuery, ContentType, FileContent, FileEntry, FileQuery};
+pub use sk1ll_core::content::{
+    ContentEntry, ContentQuery, ContentType, FileContent, FileEntry, FileQuery, WriteFileRequest,
+};
 pub use sk1ll_core::{HarnessChange, HarnessChoice};
 pub use sk1ll_proto::{
     Assignment, AssignmentChanges, AssignmentSnapshot, AssignmentUpdate, ErrorBody, FleetView, ImportSkipped,
@@ -773,6 +776,10 @@ impl Client {
 
     pub async fn skill_file(&self, query: &FileQuery) -> Result<FileContent> {
         self.get(&format!("/skills/file?{}&path={}", content_query(&query.content), encode(&query.path))).await
+    }
+
+    pub async fn write_skill_file(&self, request: &WriteFileRequest) -> Result<()> {
+        self.post_empty("/skills/file", request).await
     }
 
     pub async fn adopt_unmanaged(&self, target: &ConflictTarget) -> Result<()> {
