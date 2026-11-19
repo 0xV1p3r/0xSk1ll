@@ -14,7 +14,7 @@ import { api } from './api';
 import { ago, shortSha, splitItem, statusLabels, statusOrder, time } from './model';
 import { Action, Confirm, Details, ErrorNotice, Loading, Nothing, Notice, Panel, PanelToolbar, SectionTitle, StatusBadge, When } from './shared';
 import { FleetAssignments } from './FleetAssignments';
-import { JoinCodeButton } from './Settings';
+import { JoinCodeButton, ownScope, scopeSummary } from './Settings';
 import type { MachineReport, MachineRow, MachineStatus } from './types';
 
 const list = (values: string[] | undefined, none = 'None') => values?.length ? values.join(', ') : none;
@@ -39,8 +39,10 @@ function NextStep({ machine, navigate, changed }: {
 }
 function MachineDetails({ machine }: { machine: MachineRow }) {
   const report = machine.report;
+  const scope = machine.scope ?? 'fleet';
+  const scopeRow: [string, ReactNode] = ['Scope', <>{scope === 'fleet' ? 'Whole Fleet' : 'Only itself'} <span className="text-muted-foreground">· {scopeSummary[scope]}</span></>];
   if (!report) return <Details className="py-1" rows={[
-    ['Connection', machine.connected ? 'Connected' : 'Disconnected'], ['Joined', <When seconds={machine.joined_at} />],
+    ['Connection', machine.connected ? 'Connected' : 'Disconnected'], ['Joined', <When seconds={machine.joined_at} />], scopeRow,
     ['Last seen', <When seconds={machine.last_seen} />], ['Harnesses', 'None reported'], ['Report', 'Not reported. This Machine has not sent a report to the Server yet.'],
   ]} />;
   return <Details className="py-1 md:grid-cols-[max-content_minmax(0,1fr)_max-content_minmax(0,1fr)]" rows={[
@@ -48,6 +50,7 @@ function MachineDetails({ machine }: { machine: MachineRow }) {
     ['Joined', <When seconds={machine.joined_at} />],
     ['Harnesses', list(report?.harnesses, 'None reported')],
     ['Last seen', <When seconds={machine.last_seen} />],
+    scopeRow,
     ...(report.drafts.length ? [['Draft', list(report.drafts)] as [string, ReactNode]] : []),
     ...(report.unpushed.length ? [['Unpushed', list(report.unpushed)] as [string, ReactNode]] : []),
     ...(report.conflicts.length ? [['Conflicts', list(report.conflicts.map(c => `${c.item} in ${c.harness}`))] as [string, ReactNode]] : []),
@@ -72,6 +75,7 @@ export function Fleet({ revision, machineId, initialMachine, serverUrl = null, l
   const connected = machines.filter(m => m.connected).length;
   const health = healthOrder.map(status => ({ status, count: machines.filter(machine => machine.status === status).length }));
   const report = localReport ?? machines.find(machine => machine.id === machineId)?.report;
+  const scope = ownScope(data, machineId);
   const conflicts = report?.conflicts ?? [];
   const drafts = report?.drafts.length ?? 0, unpushed = report?.unpushed.length ?? 0;
   const queue = Number(conflicts.length > 0) + Number(drafts > 0) + Number(unpushed > 0) + Number(unmanaged.length > 0);
@@ -113,7 +117,7 @@ export function Fleet({ revision, machineId, initialMachine, serverUrl = null, l
                 {([{ value: 'all', label: 'All', count: machines.length }, { value: 'attention', label: 'Attention', count: attention }, { value: 'connected', label: 'Connected', count: connected }] as const).map(option =>
                   <Toggle key={option.value} value={option.value} aria-label={`Filter: ${option.label}`} className="flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring aria-pressed:bg-muted aria-pressed:text-foreground"><span>{option.label}</span><span className="text-[11px] text-muted-foreground tabular-nums">{option.count}</span></Toggle>)}
               </ToggleGroup></PanelToolbar>
-            <div className="border-b px-3.5 py-2.5"><JoinCodeButton label="Add Machine" serverUrl={serverUrl} /></div>
+            <div className="border-b px-3.5 py-2.5"><JoinCodeButton label="Add Machine" serverUrl={serverUrl} scope={scope} /></div>
             <div className="min-w-0 p-0">
       {visible.length > 0 ? <Table ref={table} aria-label="Machines" className="table-fixed">
         <TableHeader><TableRow className="hover:bg-transparent [&_th]:h-8 [&_th]:text-[11px] [&_th]:text-muted-foreground">
@@ -127,7 +131,7 @@ export function Fleet({ revision, machineId, initialMachine, serverUrl = null, l
           const expanded = open.includes(machine.id);
           return <Fragment key={machine.id}>
             <TableRow data-state={expanded ? 'selected' : undefined} className="h-14 cursor-pointer" onClick={() => toggle(machine.id)}>
-              <TableCell className="relative pl-4"><span aria-hidden className={cn('absolute inset-y-0 left-0 w-1', statusColor[machine.status])} /><div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5"><span className="max-w-full truncate font-medium" title={machine.id}>{machine.id}</span>{machine.id === machineId && <Badge variant="info" className="shrink-0">This Machine</Badge>}</div>
+              <TableCell className="relative pl-4"><span aria-hidden className={cn('absolute inset-y-0 left-0 w-1', statusColor[machine.status])} /><div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5"><span className="max-w-full truncate font-medium" title={machine.id}>{machine.id}</span>{machine.id === machineId && <Badge variant="info" className="shrink-0">This Machine</Badge>}{machine.scope === 'self' && <Badge variant="secondary" className="shrink-0" title={scopeSummary.self}>Self-only</Badge>}</div>
                 <p className="mt-0.5 line-clamp-2 whitespace-normal text-xs text-muted-foreground" title={guidance(machine, machine.id === machineId)}>{guidance(machine, machine.id === machineId)}</p></TableCell>
               <TableCell><StatusBadge status={machine.status} /></TableCell>
               <TableCell className="hidden @min-[620px]/machines:table-cell"><code className={cn('font-mono text-xs text-muted-foreground', machine.report && machine.report.baseline !== data.baseline && 'text-warning-foreground')}>{shortSha(machine.report?.baseline)}</code></TableCell>
@@ -141,9 +145,9 @@ export function Fleet({ revision, machineId, initialMachine, serverUrl = null, l
             {expanded && <TableRow id={`machine-${machine.id}`} className="bg-muted/30 hover:bg-muted/30">
               <TableCell colSpan={columns} className="relative whitespace-normal px-4"><span aria-hidden className={cn('absolute inset-y-0 left-0 w-1', statusColor[machine.status])} /><div className="flex min-w-0 flex-col gap-3 py-2"><MachineDetails machine={machine} />
                 {machine.id === machineId && <NextStep machine={machine} navigate={navigate} changed={changed} />}
-                <div><Confirm label="Remove Machine" ariaLabel={`Remove ${machine.id} from the Fleet`} title={`Remove ${machine.id} from the Fleet?`} typed={machine.id}
+                {(scope !== 'self' || machine.id === machineId) && <div><Confirm label="Remove Machine" ariaLabel={`Remove ${machine.id} from the Fleet`} title={`Remove ${machine.id} from the Fleet?`} typed={machine.id}
                   description={machine.id === machineId ? "This removes THIS Machine, revokes its credential, and removes its Assignment. The Daemon will stop managing its Harnesses. Content in the Baseline is kept." : "This revokes the Machine's credential and removes its Assignment. Content in the Baseline is kept."}
-                  action={() => api.removeMachine(machine.id)} onDone={() => { toast({ title: 'Machine removed' }); changed(); }} /></div></div></TableCell>
+                  action={() => api.removeMachine(machine.id)} onDone={() => { toast({ title: 'Machine removed' }); changed(); }} /></div>}</div></TableCell>
             </TableRow>}
           </Fragment>;
         })}</TableBody>

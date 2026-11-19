@@ -192,6 +192,46 @@ pub struct MachineRow {
     pub last_seen: Option<i64>,
     /// Last report, if any.
     pub report: Option<MachineReport>,
+    /// What the machine may manage, from the join code it joined with. An
+    /// older server sends none: all its machines manage the whole fleet.
+    #[serde(default)]
+    pub scope: Scope,
+}
+
+/// What a machine that joined with a join code may manage (ADR 0005). The
+/// admin token may always manage the whole fleet.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Scope {
+    /// Create join codes, change any machine's assignment, undo any log
+    /// entry and remove any machine.
+    #[default]
+    Fleet,
+    /// Only itself: its own assignment, undoing entries for it, and
+    /// removing itself. It can still read the fleet view and the log.
+    #[serde(rename = "self")]
+    SelfOnly,
+}
+
+impl Scope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fleet => "fleet",
+            Self::SelfOnly => "self",
+        }
+    }
+}
+
+impl std::str::FromStr for Scope {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "fleet" => Ok(Self::Fleet),
+            "self" => Ok(Self::SelfOnly),
+            _ => Err(format!("unknown scope `{s}`; use fleet or self")),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -338,10 +378,26 @@ pub struct JoinResponse {
     pub revision: u64,
 }
 
+/// `POST /api/join-codes` body. An empty body or `null` (older clients)
+/// asks for the defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinCodeRequest {
+    /// What the machine that joins with the code may manage.
+    #[serde(default)]
+    pub scope: Scope,
+}
+
 /// `POST /api/join-codes` response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinCode {
     pub code: String,
+    /// When the code stops working; `None` from an older server.
+    #[serde(default)]
+    pub expires_at: Option<i64>,
+    /// The scope the code grants; `None` from an older server, which ignores
+    /// the request's scope and always grants [`Scope::Fleet`].
+    #[serde(default)]
+    pub scope: Option<Scope>,
 }
 
 // ---------------------------------------------------------------------------
@@ -366,6 +422,17 @@ pub struct ImportsView {
     pub updates: Vec<ImportUpdate>,
     /// Imports that couldn't be checked, e.g. unreachable sources.
     pub errors: Vec<ImportError>,
+    /// Imports the server didn't check on purpose (its import check
+    /// settings); empty from an older server.
+    #[serde(default)]
+    pub skipped: Vec<ImportSkipped>,
+}
+
+/// An import the server's settings kept it from checking.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportSkipped {
+    pub name: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -467,6 +534,24 @@ mod tests {
             assert_eq!(serde_json::from_str::<ServerMessage>(&text).unwrap(), m);
         }
         assert_eq!(serde_json::to_string(&ServerMessage::Revoked).unwrap(), r#"{"type":"revoked"}"#);
+    }
+
+    #[test]
+    fn scopes_are_additive() {
+        assert_eq!(serde_json::to_value(Scope::SelfOnly).unwrap(), "self");
+        assert_eq!("fleet".parse::<Scope>().unwrap(), Scope::Fleet);
+        assert!("admin".parse::<Scope>().is_err());
+        // An older server's bodies: no scope, expiry or skipped imports.
+        let code: JoinCode = serde_json::from_str(r#"{"code":"ABCDE-FGHJK"}"#).unwrap();
+        assert_eq!((code.expires_at, code.scope), (None, None));
+        let row: MachineRow = serde_json::from_str(
+            r#"{"id":"m","status":"in_sync","connected":true,"joined_at":0,"last_seen":null,"report":null}"#,
+        )
+        .unwrap();
+        assert_eq!(row.scope, Scope::Fleet);
+        let view: ImportsView = serde_json::from_str(r#"{"checked_at":null,"updates":[],"errors":[]}"#).unwrap();
+        assert!(view.skipped.is_empty());
+        assert_eq!(serde_json::from_str::<JoinCodeRequest>("{}").unwrap().scope, Scope::Fleet);
     }
 
     #[test]

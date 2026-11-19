@@ -1,17 +1,25 @@
 //! REST API under `/api`. Everything except `POST /join` needs
-//! `Authorization: Bearer <token>` (a machine token or the admin token); any
-//! joined machine may manage the whole fleet.
+//! `Authorization: Bearer <token>` (a machine token or the admin token).
+//! Every caller may read the fleet view, assignments, the log and imports.
+//! Changes need a scope (ADR 0005): the admin token and machines that joined
+//! with a `fleet` code may manage the whole fleet; a `self` machine may only
+//! change its own assignment, undo log entries for itself and remove itself.
+//! Each write checks the caller's token and scope again inside its database
+//! transaction, so a request that was authenticated before its machine was
+//! removed or joined again with another scope can't act on the old one.
 
 use std::sync::Arc;
 
+use axum::body::Bytes;
 use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::StatusCode;
 use axum::http::request::Parts;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use sk1ll_proto::{
-    Assignment, AssignmentChanges, AssignmentSnapshot, AssignmentUpdate, FleetView, ImportsView, JoinCode, JoinRequest,
-    JoinResponse, LogCause, LogEntry, LogFacets, LogQuery, MachineRow, REPO_PATH, headline,
+    Assignment, AssignmentChanges, AssignmentSnapshot, AssignmentUpdate, FleetView, ImportsView, JoinCode,
+    JoinCodeRequest, JoinRequest, JoinResponse, LogCause, LogEntry, LogFacets, LogQuery, MachineRow, REPO_PATH,
+    headline,
 };
 
 use crate::assign::{self, Change};
@@ -69,12 +77,36 @@ fn normalize_code(code: &str) -> String {
     code.chars().filter(|c| c.is_ascii_alphanumeric()).map(|c| c.to_ascii_uppercase()).collect()
 }
 
-async fn create_join_code(State(server): ServerState, caller: Caller) -> Result<(StatusCode, Json<JoinCode>)> {
+/// The code lifetime in seconds.
+fn join_code_ttl(server: &Server) -> i64 {
+    server.config.join_code_ttl.as_secs().min(i64::MAX as u64) as i64
+}
+
+/// Body: a [`JoinCodeRequest`], or nothing (or `null`, which older daemons
+/// send) for a `fleet` code.
+async fn create_join_code(
+    State(server): ServerState,
+    caller: Caller,
+    body: Bytes,
+) -> Result<(StatusCode, Json<JoinCode>)> {
+    caller.require_fleet("create join codes")?;
+    let req: JoinCodeRequest = match serde_json::from_slice::<Option<JoinCodeRequest>>(&body) {
+        _ if body.iter().all(u8::is_ascii_whitespace) => JoinCodeRequest::default(),
+        Ok(req) => req.unwrap_or_default(),
+        Err(e) => return Err(ApiError::BadRequest(format!("invalid join code request: {e}"))),
+    };
     let code = new_join_code();
-    let (code_hash, author, now) = (hash(&normalize_code(&code)), caller.author().to_string(), now());
-    server.db(move |conn| db::insert_join_code(conn, &code_hash, &author, now)).await?;
-    tracing::info!("{} created a join code", caller.author());
-    Ok((StatusCode::CREATED, Json(JoinCode { code })))
+    let (code_hash, author, now, scope) = (hash(&normalize_code(&code)), caller.author().to_string(), now(), req.scope);
+    let check = caller.clone();
+    server
+        .db(move |conn| {
+            check.current(conn)?.require_fleet("create join codes")?;
+            db::insert_join_code(conn, &code_hash, &author, now, scope)
+        })
+        .await?;
+    tracing::info!("{} created a join code with scope {}", caller.author(), scope.as_str());
+    let expires_at = now.saturating_add(join_code_ttl(&server));
+    Ok((StatusCode::CREATED, Json(JoinCode { code, expires_at: Some(expires_at), scope: Some(scope) })))
 }
 
 async fn join(State(server): ServerState, Json(req): Json<JoinRequest>) -> Result<(StatusCode, Json<JoinResponse>)> {
@@ -87,18 +119,20 @@ async fn join(State(server): ServerState, Json(req): Json<JoinRequest>) -> Resul
     }
     let token = crate::hex(&random_bytes::<32>());
     let token_hash = hash(&token);
-    let ttl = server.config.join_code_ttl.as_secs().min(i64::MAX as u64) as i64;
+    let ttl = join_code_ttl(&server);
     let req2 = req.clone();
-    let (assignment, revision) = server
+    let (assignment, revision, scope) = server
         .db(move |conn| {
             let req = req2;
             let tx = conn.transaction()?;
             // The code first, so callers without one learn nothing about machine ids;
-            // any later refusal rolls its consumption back.
+            // any later refusal rolls its consumption back. A rejoined machine
+            // (removed, then joined again) gets the new code's scope.
             let now = now();
-            if !db::consume_join_code(&tx, &hash(&normalize_code(&req.code)), &req.machine_id, now, ttl)? {
-                return Err(ApiError::Forbidden("invalid or already used join code".into()));
-            }
+            let Some(scope) = db::consume_join_code(&tx, &hash(&normalize_code(&req.code)), &req.machine_id, now, ttl)?
+            else {
+                return Err(ApiError::Forbidden("invalid, expired or already used join code".into()));
+            };
             let mut assignment = match &req.copy_from {
                 Some(src) => db::assignment(&tx, src)?
                     .ok_or_else(|| ApiError::BadRequest(format!("copy_from: no machine `{src}`")))?,
@@ -110,12 +144,12 @@ async fn join(State(server): ServerState, Json(req): Json<JoinRequest>) -> Resul
             if db::machine(&tx, &req.machine_id)?.is_some() {
                 return Err(ApiError::Conflict(format!("machine `{}` already joined", req.machine_id)));
             }
-            let revision = db::insert_machine(&tx, &req.machine_id, &token_hash, now, &assignment)?;
+            let revision = db::insert_machine(&tx, &req.machine_id, &token_hash, now, &assignment, scope)?;
             tx.commit()?;
-            Ok((assignment, revision))
+            Ok((assignment, revision, scope))
         })
         .await?;
-    tracing::info!("machine {} joined", req.machine_id);
+    tracing::info!("machine {} joined with scope {}", req.machine_id, scope.as_str());
     Ok((
         StatusCode::CREATED,
         Json(JoinResponse { machine_id: req.machine_id, token, repo_path: REPO_PATH.into(), assignment, revision }),
@@ -139,6 +173,7 @@ async fn fleet(State(server): ServerState, _: Caller) -> Result<Json<FleetView>>
                 joined_at: m.joined_at,
                 last_seen: m.last_seen,
                 report: m.report,
+                scope: m.scope,
                 id: m.id,
             }
         })
@@ -170,11 +205,13 @@ async fn put_assignment(
         .into_iter()
         .map(|c| Change { harness: c.harness, kind: c.kind, name: c.name, after: c.enabled, cause: LogCause::Change })
         .collect();
+    caller.require_machine(&id)?;
     changes.iter().try_for_each(assign::validate)?;
     let (machine, author, now, items) = (id.clone(), caller.author().to_string(), now(), server.baseline_items());
     let applied = server
         .db(move |conn| {
             let tx = conn.transaction()?;
+            caller.current(&tx)?.require_machine(&machine)?;
             let m = db::machine(&tx, &machine)?.ok_or_else(|| ApiError::NotFound(format!("no machine `{machine}`")))?;
             let report = m.report.unwrap_or_default();
             assign::check_items(&changes, &items, &report.drafts, &report.unpushed)?;
@@ -209,7 +246,8 @@ async fn undo(State(server): ServerState, caller: Caller, Path(id): Path<i64>) -
     let (machine, applied) = server
         .db(move |conn| {
             let tx = conn.transaction()?;
-            let (machine, change) = assign::undo_change(&tx, id)?;
+            let caller = caller.current(&tx)?;
+            let (machine, change) = assign::undo_change(&tx, id, |machine| caller.require_machine(machine))?;
             let gone = || ApiError::Conflict(format!("machine `{machine}` is no longer in the fleet"));
             let m = db::machine(&tx, &machine)?.ok_or_else(gone)?;
             let report = m.report.unwrap_or_default();
@@ -225,10 +263,11 @@ async fn undo(State(server): ServerState, caller: Caller, Path(id): Path<i64>) -
 
 /// Revokes the machine's token and deletes its assignment (logged). Its files
 /// are untouched; its daemon stops managing them when told `Revoked`.
+/// A `self` machine may remove itself: leaving only touches its own
+/// assignment and token, and coming back needs a code from a `fleet` caller.
 async fn remove_machine(State(server): ServerState, caller: Caller, Path(id): Path<String>) -> Result<StatusCode> {
-    let (machine, author, now) = (id.clone(), caller.author().to_string(), now());
-    server.db(move |conn| assign::remove_machine(conn, &machine, &author, now)).await?;
-    server.revoke(&id);
+    caller.require_machine(&id)?;
+    server.remove_machine(caller.clone(), id.clone()).await?;
     tracing::info!("{} removed machine {id}", caller.author());
     Ok(StatusCode::NO_CONTENT)
 }
@@ -240,6 +279,93 @@ async fn imports(State(server): ServerState, _: Caller) -> Json<ImportsView> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use sk1ll_proto::{Scope, ToggleChange, ToggleKind};
+
+    use crate::Config;
+
+    /// Joins `id` with a fresh code of `scope`; returns its token.
+    async fn join_with(server: &Arc<Server>, id: &str, scope: Scope) -> String {
+        let code = new_join_code();
+        let code_hash = hash(&normalize_code(&code));
+        server.db(move |conn| db::insert_join_code(conn, &code_hash, "admin", now(), scope)).await.unwrap();
+        let req = JoinRequest { code, machine_id: id.into(), harnesses: vec!["claude".into()], copy_from: None };
+        join(State(server.clone()), Json(req)).await.unwrap().1.0.token
+    }
+
+    /// Review finding: a request authenticated as a `fleet` machine, then
+    /// paused while that machine is removed and joins again as `self`, must
+    /// not write with the old scope or token.
+    #[tokio::test]
+    async fn writes_recheck_the_callers_token_and_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::open(Config::new(dir.path().join("data"))).await.unwrap();
+        let token = join_with(&server, "me", Scope::Fleet).await;
+        join_with(&server, "other", Scope::Fleet).await;
+        let other_entry = put_assignment(
+            State(server.clone()),
+            Caller::Admin,
+            Path("other".into()),
+            Json(AssignmentChanges {
+                changes: vec![ToggleChange {
+                    harness: "claude".into(),
+                    kind: ToggleKind::NewSkillsDefault,
+                    name: None,
+                    enabled: Some(true),
+                }],
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .entries[0]
+            .id;
+        // Authenticated now, as each handler's extractor does ...
+        let stale = server.authenticate(&token).await.unwrap();
+        assert!(matches!(&stale, Caller::Machine { scope: Scope::Fleet, .. }));
+        // ... then the machine is removed and joins again with a self code.
+        let (now, removed) = (now(), "me".to_string());
+        server.db(move |conn| assign::remove_machine(conn, &removed, "admin", now)).await.unwrap();
+        let rejoined = join_with(&server, "me", Scope::SelfOnly).await;
+        let fresh = server.authenticate(&rejoined).await.unwrap();
+
+        let change = || {
+            Json(AssignmentChanges {
+                changes: vec![ToggleChange {
+                    harness: "claude".into(),
+                    kind: ToggleKind::NewRulesDefault,
+                    name: None,
+                    enabled: Some(true),
+                }],
+            })
+        };
+        let unauthorized = |r: Result<()>| assert!(matches!(r, Err(ApiError::Unauthorized)), "{r:?}");
+        let forbidden = |r: Result<()>| assert!(matches!(r, Err(ApiError::Forbidden(_))), "{r:?}");
+        let s = || State(server.clone());
+        // The old token is gone, whatever it asks for.
+        unauthorized(create_join_code(s(), stale.clone(), Bytes::new()).await.map(drop));
+        unauthorized(put_assignment(s(), stale.clone(), Path("other".into()), change()).await.map(drop));
+        unauthorized(undo(s(), stale.clone(), Path(other_entry)).await.map(drop));
+        unauthorized(remove_machine(s(), stale.clone(), Path("other".into())).await.map(drop));
+        // A fleet-scoped caller struct carrying the new token still gets the
+        // new, narrower scope from the database.
+        let Caller::Machine { id, token_hash, .. } = fresh else { panic!("{fresh:?}") };
+        let widened = Caller::Machine { id, scope: Scope::Fleet, token_hash };
+        forbidden(create_join_code(s(), widened.clone(), Bytes::new()).await.map(drop));
+        forbidden(put_assignment(s(), widened.clone(), Path("other".into()), change()).await.map(drop));
+        forbidden(undo(s(), widened.clone(), Path(other_entry)).await.map(drop));
+        forbidden(remove_machine(s(), widened.clone(), Path("other".into())).await.map(drop));
+        let (other, entries) = server
+            .db(|conn| {
+                Ok((db::machine(conn, "other")?.map(|m| m.assignment), db::log_entries(conn, &LogQuery::default())?))
+            })
+            .await
+            .unwrap();
+        assert!(!other.unwrap().harness("claude").new_rules_default);
+        assert!(entries.iter().all(|e| e.machine != "other" || e.kind != ToggleKind::NewRulesDefault), "{entries:?}");
+        // Its own assignment is still its to change.
+        assert_eq!(put_assignment(s(), widened, Path("me".into()), change()).await.unwrap().entries.len(), 1);
+    }
 
     #[test]
     fn join_codes_normalize() {

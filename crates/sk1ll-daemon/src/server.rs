@@ -16,7 +16,9 @@
 //! pull) never stalls reading.
 //!
 //! Servers without acknowledgement support leave entries pending; they are
-//! replayed once per connection until an upgraded server confirms them.
+//! replayed once per connection until an upgraded server confirms them. A
+//! server that can't apply them yet closes with code 1013 (try again later);
+//! the reconnect backoff then keeps growing instead of starting over.
 //!
 //! An HTTP 401 on connecting is not a revocation (a proxy may send it too):
 //! the machine is marked auth-rejected, keeps being managed, and the
@@ -35,6 +37,7 @@ use sk1ll_proto::{
     PROTOCOL_VERSION, ServerMessage,
 };
 use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::{self, Message, client::IntoClientRequest};
 
 use crate::auth::redact;
@@ -57,6 +60,11 @@ enum ConnectError {
     Other(String),
 }
 
+/// The server closed the session with code 1013: come back later.
+#[derive(Debug, thiserror::Error)]
+#[error("the server asked to try again later: {0}")]
+struct RetryLater(String);
+
 pub(crate) async fn run(d: Arc<Daemon>) {
     let Ok(state) = d.ident.joined() else {
         return;
@@ -67,10 +75,13 @@ pub(crate) async fn run(d: Arc<Daemon>) {
     while !d.is_revoked() {
         match connect(&d).await {
             Ok(ws) => {
-                backoff = d.cfg.reconnect_min;
+                let grown = std::mem::replace(&mut backoff, d.cfg.reconnect_min);
                 tracing::info!("connected to {}", state.server_url);
                 if let Err(e) = session(&d, ws, &inbox_tx).await {
                     tracing::info!("server connection lost: {}", redact(&format!("{e:#}")));
+                    if e.is::<RetryLater>() {
+                        backoff = grown;
+                    }
                 }
                 d.set_connection(Connection::Offline);
             }
@@ -256,6 +267,9 @@ async fn session(d: &Arc<Daemon>, ws: Ws, inbox: &mpsc::UnboundedSender<ServerMe
                     }
                     Err(e) => tracing::warn!("bad server message: {e}"),
                 },
+                Some(Ok(Message::Close(Some(frame)))) if frame.code == CloseCode::Again => {
+                    return Err(RetryLater(frame.reason.to_string()).into());
+                }
                 Some(Ok(Message::Close(_))) | None => return Ok(()),
                 // Pings are answered by tungstenite as we keep reading.
                 Some(Ok(_)) => {}

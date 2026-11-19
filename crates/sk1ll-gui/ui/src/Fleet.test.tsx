@@ -106,9 +106,21 @@ it('preserves Machine details, local actions, timestamps, and removal confirmati
   expect(screen.getByText(/This removes THIS Machine/)).toBeTruthy();
 });
 it('creates an Add Machine join code through the existing flow', async () => {
-  vi.mocked(api.fleet).mockResolvedValue({ baseline: null, machines: [] }); vi.mocked(api.joinCode).mockResolvedValue({ code: 'fleet-join-code' });
+  vi.mocked(api.fleet).mockResolvedValue({ baseline: null, machines: [] }); vi.mocked(api.joinCode).mockResolvedValue({ code: 'fleet-join-code', expires_at: null, scope: null });
   renderFleet(); fireEvent.click(await screen.findByRole('button', { name: 'Add Machine' }));
   expect(await screen.findByRole('dialog', { name: 'Join code' })).toBeTruthy(); expect(screen.getByText('fleet-join-code')).toBeTruthy();
+});
+it('shows each Machine\'s scope and lets a Self-only Machine remove only itself', async () => {
+  vi.mocked(api.fleet).mockResolvedValue({ baseline: null, machines: [machineRow({ scope: 'self' }), machineRow({ id: 'other' })] });
+  renderFleet();
+  expect(await screen.findByText('Self-only')).toBeTruthy();
+  expect(screen.getByText(/joined with a Self-only join code/)).toBeTruthy();
+  expect(screen.queryByRole('button', { name: 'Add Machine' })).toBeNull();
+  fireEvent.click(screen.getByRole('button', { name: 'Show details for local' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Show details for other' }));
+  expect(screen.getByText('Only itself')).toBeTruthy(); expect(screen.getByText('Whole Fleet')).toBeTruthy();
+  expect(screen.getByRole('button', { name: 'Remove local from the Fleet' })).toBeTruthy();
+  expect(screen.queryByRole('button', { name: 'Remove other from the Fleet' })).toBeNull();
 });
 it('handles an empty Fleet and a filter with no matches', async () => {
   vi.mocked(api.fleet).mockResolvedValue({ baseline: null, machines: [] }); renderFleet();

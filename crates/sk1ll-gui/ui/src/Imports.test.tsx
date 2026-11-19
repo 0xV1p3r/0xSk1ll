@@ -206,7 +206,7 @@ it('opens Add Import directly when requested from Skills', async () => {
   await waitFor(() => expect(document.activeElement).toBe(screen.getByLabelText('Link')));
 });
 it('returns focus to Create join code on close', async () => {
-  vi.mocked(api.joinCode).mockResolvedValue({ code: 'single-use' });
+  vi.mocked(api.joinCode).mockResolvedValue({ code: 'single-use', expires_at: null, scope: null });
   render(<JoinCodeButton label="Create join code" serverUrl="https://example.com" />);
   const trigger = screen.getByRole('button', { name: 'Create join code' });
   trigger.focus(); fireEvent.click(trigger);
@@ -215,6 +215,32 @@ it('returns focus to Create join code on close', async () => {
   expect(within(dialog).getByText(/expires after 24 hours by default/)).toBeTruthy();
   fireEvent.keyDown(dialog, { key: 'Escape' });
   await waitFor(() => expect(document.activeElement).toBe(trigger));
+});
+it('creates a Self-only join code and shows its exact expiry', async () => {
+  vi.mocked(api.joinCode).mockResolvedValue({ code: 'just-me', expires_at: 1_800_000_000, scope: 'self' });
+  render(<JoinCodeButton label="Create join code" serverUrl="https://example.com" />);
+  expect(screen.getByText(/Whole Fleet: the new Machine can create join codes/)).toBeTruthy();
+  fireEvent.change(screen.getByLabelText('New Machine may manage'), { target: { value: 'self' } });
+  expect(screen.getByText(/Only itself: the new Machine can change only its own Assignment/)).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: 'Create join code' }));
+  const dialog = await screen.findByRole('dialog');
+  expect(api.joinCode).toHaveBeenCalledWith('self');
+  expect(within(dialog).getByText(new RegExp(`expires ${new Date(1_800_000_000_000).toLocaleString().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))).toBeTruthy();
+  expect(within(dialog).getByText('Only itself.')).toBeTruthy();
+  expect(within(dialog).queryByText(/24 hours by default/)).toBeNull();
+});
+it('tells a Self-only Machine it cannot create join codes', () => {
+  render(<JoinCodeButton label="Create join code" serverUrl="https://example.com" scope="self" />);
+  expect(screen.queryByRole('button', { name: 'Create join code' })).toBeNull();
+  expect(screen.getByText(/joined with a Self-only join code/)).toBeTruthy();
+});
+it('shows Imports the Server skipped, with the reason', async () => {
+  vi.mocked(api.imports).mockResolvedValue({ checked_at: 1, updates: [], errors: [], imports: [{ name: 'pdf', source: 'https://gitlab.example/x', ref: 'main', path: '', locked: 'abc' }],
+    skipped: [{ name: 'pdf', reason: "host `gitlab.example` is not in the server's SK1LL_SERVER_IMPORT_HOSTS" }] });
+  render(<Imports revision={0} changed={changed} reviewDraft={reviewDraft} />);
+  expect(await screen.findByText('Not checked by Server')).toBeTruthy();
+  expect(screen.getByText(/gitlab\.example` is not in the server's SK1LL_SERVER_IMPORT_HOSTS/)).toBeTruthy();
+  expect(screen.queryByText('Up to date')).toBeNull();
 });
 it('confirms Restore and guards repeated requests while pending', async () => {
   let finish!: () => void;

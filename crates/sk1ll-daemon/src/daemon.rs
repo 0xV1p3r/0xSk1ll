@@ -2027,6 +2027,8 @@ impl Daemon {
             if check {
                 view.updates.clear();
                 view.errors.clear();
+                // This machine checks every import itself.
+                view.skipped.clear();
             }
             if check {
                 for i in &view.imports {
@@ -2315,6 +2317,7 @@ mod tests {
                                     drafts: vec![ItemRef::Skill("pdf".into())],
                                     ..Default::default()
                                 }),
+                                scope: Default::default(),
                             }],
                         })
                     }),

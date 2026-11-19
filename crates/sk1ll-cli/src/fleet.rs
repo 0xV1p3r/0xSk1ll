@@ -11,11 +11,11 @@ use sk1ll_daemon::client::{
 };
 use sk1ll_daemon::service::Manager;
 use sk1ll_daemon::{Config, DaemonState};
-use sk1ll_proto::{AssignmentChanges, LogQuery, ToggleChange, ToggleKind};
+use sk1ll_proto::{AssignmentChanges, LogQuery, Scope, ToggleChange, ToggleKind};
 
 use crate::{
-    Cli, Cmd, FleetCmd, Kind, assign_target, bundled_fallback, check_exists, confirm, fetch_hint, names, print_bundled,
-    print_update, short,
+    Cli, Cmd, FleetCmd, InviteScope, Kind, assign_target, bundled_fallback, check_exists, confirm, fetch_hint, names,
+    print_bundled, print_update, short,
 };
 
 /// Sets up this process's environment, before any thread starts: the
@@ -220,12 +220,24 @@ fn fleet(cli: &Cli, command: Option<&FleetCmd>) -> Result<()> {
     let client = client(cli)?;
     let rt = runtime()?;
     match command {
-        Some(FleetCmd::Invite) => {
+        Some(FleetCmd::Invite { scope }) => {
             let status = rt.block_on(client.status()).map_err(fleet_error)?;
             let url = status.server_url.context("this machine hasn't joined a fleet")?;
-            let code = rt.block_on(client.join_code()).map_err(fleet_error)?.code;
-            println!("{code}");
-            println!("sk1ll join {} {}", shell_arg(&url), shell_arg(&code));
+            let scope = match scope {
+                InviteScope::Fleet => Scope::Fleet,
+                InviteScope::SelfOnly => Scope::SelfOnly,
+            };
+            let code = rt.block_on(client.join_code(scope)).map_err(fleet_error)?;
+            println!("{}", code.code);
+            println!("sk1ll join {} {}", shell_arg(&url), shell_arg(&code.code));
+            match code.expires_at {
+                Some(t) => println!("expires {}", utc(t)),
+                None => println!("expires after the Server's SK1LL_SERVER_JOIN_CODE_TTL (default 24h)"),
+            }
+            match scope {
+                Scope::Fleet => println!("scope fleet: the Machine may manage the whole Fleet"),
+                Scope::SelfOnly => println!("scope self: the Machine may manage only itself"),
+            }
         }
         Some(FleetCmd::Remove { machine, yes }) => {
             if !yes {
@@ -342,8 +354,27 @@ fn print_fleet(fleet: sk1ll_proto::FleetView) {
                 notes.push(format!("{} unpushed", r.unpushed.len()));
             }
         }
+        if m.scope == Scope::SelfOnly {
+            notes.push("manages only itself".into());
+        }
         println!("{:<20} {:<9} seen {:<10} {}", m.id, status, seen, notes.join(", "));
     }
+}
+
+/// Unix seconds as `YYYY-MM-DD HH:MM:SS UTC`.
+fn utc(secs: i64) -> String {
+    let (days, rest) = (secs.div_euclid(86400), secs.rem_euclid(86400));
+    // Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02} UTC", rest / 3600, rest % 3600 / 60, rest % 60)
 }
 
 fn ago(secs: i64) -> String {
@@ -582,5 +613,18 @@ impl Daemon {
             _ => unreachable!("not a mutating command"),
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::utc;
+
+    #[test]
+    fn utc_dates() {
+        assert_eq!(utc(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(utc(1_700_086_400), "2023-11-15 22:13:20 UTC");
+        assert_eq!(utc(951_782_400), "2000-02-29 00:00:00 UTC");
+        assert_eq!(utc(-1), "1969-12-31 23:59:59 UTC");
     }
 }

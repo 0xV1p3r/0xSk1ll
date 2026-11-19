@@ -1,11 +1,14 @@
 //! SQLite storage: machines (token hash, last report, assignment as JSON),
-//! join codes (hashed, single use) and the append-only assignment log.
+//! join codes (hashed, single use, each with the scope it grants), the
+//! append-only assignment log.
 
 use std::path::Path;
 
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, Row, params};
-use sk1ll_proto::{Assignment, AssignmentSnapshot, LogCause, LogEntry, LogFacets, LogQuery, MachineReport, ToggleKind};
+use sk1ll_proto::{
+    Assignment, AssignmentSnapshot, LogCause, LogEntry, LogFacets, LogQuery, MachineReport, Scope, ToggleKind,
+};
 
 use crate::error::Result;
 
@@ -51,6 +54,9 @@ const MIGRATIONS: &[&str] = &[
 ",
     "CREATE INDEX log_harness ON log (harness);
     CREATE INDEX log_author ON log (author);",
+    // Machines and codes from before scopes managed the whole fleet.
+    "ALTER TABLE machines ADD COLUMN scope TEXT NOT NULL DEFAULT 'fleet';
+    ALTER TABLE join_codes ADD COLUMN scope TEXT NOT NULL DEFAULT 'fleet';",
 ];
 
 pub fn open(path: &Path) -> anyhow::Result<Connection> {
@@ -78,6 +84,7 @@ pub struct MachineRecord {
     pub last_seen: Option<i64>,
     pub report: Option<MachineReport>,
     pub assignment: Assignment,
+    pub scope: Scope,
 }
 
 fn json<T: serde::de::DeserializeOwned>(text: &str, what: &str) -> Result<T> {
@@ -88,18 +95,23 @@ fn to_json<T: serde::Serialize>(value: &T) -> String {
     serde_json::to_string(value).expect("serializing plain data")
 }
 
-const MACHINE_COLS: &str = "id, joined_at, last_seen, report, assignment";
+const MACHINE_COLS: &str = "id, joined_at, last_seen, report, assignment, scope";
 
-type MachineRow = (String, i64, Option<i64>, Option<String>, String);
+type MachineRow = (String, i64, Option<i64>, Option<String>, String, String);
 
 fn machine_row(row: &Row) -> rusqlite::Result<MachineRow> {
-    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
 }
 
-fn machine_record((id, joined_at, last_seen, report, assignment): MachineRow) -> Result<MachineRecord> {
+fn parse_scope(s: &str) -> Result<Scope> {
+    Ok(s.parse::<Scope>().map_err(anyhow::Error::msg).context("corrupt scope in server.db")?)
+}
+
+fn machine_record((id, joined_at, last_seen, report, assignment, scope): MachineRow) -> Result<MachineRecord> {
     Ok(MachineRecord {
         report: report.map(|r| json(&r, "report")).transpose()?,
         assignment: json(&assignment, "assignment")?,
+        scope: parse_scope(&scope)?,
         id,
         joined_at,
         last_seen,
@@ -118,16 +130,27 @@ pub fn machine(conn: &Connection, id: &str) -> Result<Option<MachineRecord>> {
     row.map(machine_record).transpose()
 }
 
-pub fn machine_for_token(conn: &Connection, token_hash: &str) -> Result<Option<String>> {
-    Ok(conn.query_row("SELECT id FROM machines WHERE token_hash = ?1", [token_hash], |r| r.get(0)).optional()?)
+/// The machine a token belongs to, and its scope.
+pub fn machine_for_token(conn: &Connection, token_hash: &str) -> Result<Option<(String, Scope)>> {
+    let row: Option<(String, String)> = conn
+        .query_row("SELECT id, scope FROM machines WHERE token_hash = ?1", [token_hash], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    row.map(|(id, scope)| Ok((id, parse_scope(&scope)?))).transpose()
 }
 
 /// Inserts a machine; returns its assignment's revision.
-pub fn insert_machine(conn: &Connection, id: &str, token_hash: &str, now: i64, a: &Assignment) -> Result<u64> {
+pub fn insert_machine(
+    conn: &Connection,
+    id: &str,
+    token_hash: &str,
+    now: i64,
+    a: &Assignment,
+    scope: Scope,
+) -> Result<u64> {
     let revision = next_revision(conn)?;
     conn.execute(
-        "INSERT INTO machines (id, token_hash, joined_at, assignment, revision) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![id, token_hash, now, to_json(a), revision as i64],
+        "INSERT INTO machines (id, token_hash, joined_at, assignment, revision, scope) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![id, token_hash, now, to_json(a), revision as i64, scope.as_str()],
     )?;
     Ok(revision)
 }
@@ -178,26 +201,43 @@ pub fn touch(conn: &Connection, id: &str, token_hash: &str, now: i64) -> Result<
     Ok(())
 }
 
+/// The hash of `id`'s token, `None` if there is no such machine.
+pub fn token_hash(conn: &Connection, id: &str) -> Result<Option<String>> {
+    Ok(conn.query_row("SELECT token_hash FROM machines WHERE id = ?1", [id], |r| r.get(0)).optional()?)
+}
+
 pub fn delete_machine(conn: &Connection, id: &str) -> Result<()> {
     conn.execute("DELETE FROM machines WHERE id = ?1", [id])?;
     Ok(())
 }
 
-pub fn insert_join_code(conn: &Connection, code_hash: &str, created_by: &str, now: i64) -> Result<()> {
+pub fn insert_join_code(conn: &Connection, code_hash: &str, created_by: &str, now: i64, scope: Scope) -> Result<()> {
     conn.execute(
-        "INSERT INTO join_codes (code_hash, created_by, created_at) VALUES (?1, ?2, ?3)",
-        params![code_hash, created_by, now],
+        "INSERT INTO join_codes (code_hash, created_by, created_at, scope) VALUES (?1, ?2, ?3, ?4)",
+        params![code_hash, created_by, now, scope.as_str()],
     )?;
     Ok(())
 }
 
-/// Marks an unused code as used by `machine`; false if it doesn't exist or was used.
-pub fn consume_join_code(conn: &Connection, code_hash: &str, machine: &str, now: i64, ttl: i64) -> Result<bool> {
-    let n = conn.execute(
-        "UPDATE join_codes SET used_by = ?2, used_at = ?3 WHERE code_hash = ?1 AND used_at IS NULL AND created_at >= ?4",
-        params![code_hash, machine, now, now.saturating_sub(ttl)],
-    )?;
-    Ok(n == 1)
+/// Marks an unused, unexpired code as used by `machine` and returns the scope
+/// it grants; `None` if it doesn't exist, was used or expired. A code expires
+/// at `created_at + ttl`: from that second on it is invalid.
+pub fn consume_join_code(
+    conn: &Connection,
+    code_hash: &str,
+    machine: &str,
+    now: i64,
+    ttl: i64,
+) -> Result<Option<Scope>> {
+    let scope: Option<String> = conn
+        .query_row(
+            "UPDATE join_codes SET used_by = ?2, used_at = ?3
+             WHERE code_hash = ?1 AND used_at IS NULL AND created_at > ?4 RETURNING scope",
+            params![code_hash, machine, now, now.saturating_sub(ttl)],
+            |r| r.get(0),
+        )
+        .optional()?;
+    scope.map(|s| parse_scope(&s)).transpose()
 }
 
 fn kind_str(kind: ToggleKind) -> &'static str {
@@ -385,12 +425,48 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let conn = open(&dir.path().join("server.db")).unwrap();
         let a = Assignment::default();
-        let r1 = insert_machine(&conn, "m", "t1", 0, &a).unwrap();
+        let r1 = insert_machine(&conn, "m", "t1", 0, &a, Scope::Fleet).unwrap();
         let r2 = save_assignment(&conn, "m", &a).unwrap();
         assert!(r2 > r1);
         assert_eq!(snapshot(&conn, "m").unwrap().unwrap().revision, r2);
         delete_machine(&conn, "m").unwrap();
-        let r3 = insert_machine(&conn, "m", "t2", 0, &a).unwrap();
+        let r3 = insert_machine(&conn, "m", "t2", 0, &a, Scope::SelfOnly).unwrap();
         assert!(r3 > r2, "a re-joined machine never goes back");
+        assert_eq!(machine(&conn, "m").unwrap().unwrap().scope, Scope::SelfOnly);
+    }
+
+    /// A database from before scopes: its machines and unused codes keep
+    /// managing the whole fleet.
+    #[test]
+    fn scopes_migrate_to_fleet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.db");
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            let tx = conn.transaction().unwrap();
+            for sql in &MIGRATIONS[..3] {
+                tx.execute_batch(sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 3).unwrap();
+            tx.execute(
+                "INSERT INTO machines (id, token_hash, joined_at, assignment) VALUES ('old', 'h', 0, '{\"harnesses\":{}}')",
+                [],
+            )
+            .unwrap();
+            tx.execute("INSERT INTO join_codes (code_hash, created_by, created_at) VALUES ('c', 'admin', 10)", [])
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        let conn = open(&path).unwrap();
+        assert_eq!(machine(&conn, "old").unwrap().unwrap().scope, Scope::Fleet);
+        assert_eq!(machine_for_token(&conn, "h").unwrap(), Some(("old".into(), Scope::Fleet)));
+        assert_eq!(consume_join_code(&conn, "c", "new", 20, 100).unwrap(), Some(Scope::Fleet));
+        assert_eq!(consume_join_code(&conn, "c", "new", 20, 100).unwrap(), None, "single use");
+        insert_join_code(&conn, "s", "old", 30, Scope::SelfOnly).unwrap();
+        assert_eq!(consume_join_code(&conn, "s", "x", 200, 100).unwrap(), None, "expired");
+        assert_eq!(consume_join_code(&conn, "s", "x", 130, 100).unwrap(), None, "expired at `created_at + ttl`");
+        assert_eq!(consume_join_code(&conn, "s", "x", 129, 100).unwrap(), Some(Scope::SelfOnly), "valid just before");
+        insert_join_code(&conn, "t", "old", 30, Scope::SelfOnly).unwrap();
+        assert_eq!(consume_join_code(&conn, "t", "x", 40, 100).unwrap(), Some(Scope::SelfOnly));
     }
 }

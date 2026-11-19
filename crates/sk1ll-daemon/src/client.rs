@@ -67,8 +67,9 @@ use serde::{Deserialize, Serialize};
 pub use sk1ll_core::HarnessChoice;
 pub use sk1ll_core::content::{ContentEntry, ContentQuery, ContentType, FileContent, FileEntry, FileQuery};
 pub use sk1ll_proto::{
-    Assignment, AssignmentChanges, AssignmentSnapshot, AssignmentUpdate, ErrorBody, FleetView, ImportUpdate, ItemRef,
-    JoinCode, LogEntry, LogFacets, LogQuery, MachineReport, MachineStatus,
+    Assignment, AssignmentChanges, AssignmentSnapshot, AssignmentUpdate, ErrorBody, FleetView, ImportSkipped,
+    ImportUpdate, ItemRef, JoinCode, JoinCodeRequest, LogEntry, LogFacets, LogQuery, MachineReport, MachineStatus,
+    Scope,
 };
 use tokio::net::UnixStream;
 
@@ -464,6 +465,9 @@ pub struct ImportsView {
     pub checked_at: Option<i64>,
     pub updates: Vec<ImportUpdate>,
     pub errors: Vec<sk1ll_proto::ImportError>,
+    /// Imports the server's settings kept it from checking, with the reason.
+    #[serde(default)]
+    pub skipped: Vec<ImportSkipped>,
     #[serde(default)]
     pub imports: Vec<ImportEntry>,
 }
@@ -811,8 +815,19 @@ impl Client {
         self.get("/imports").await
     }
 
-    pub async fn join_code(&self) -> Result<JoinCode> {
-        self.post("/join-codes", &()).await
+    /// A join code granting `scope`. Fails (501) if the server granted
+    /// another scope: an older server ignores the request's and grants `fleet`.
+    pub async fn join_code(&self, scope: Scope) -> Result<JoinCode> {
+        let code: JoinCode = self.post("/join-codes", &JoinCodeRequest { scope }).await?;
+        if code.scope.unwrap_or_default() != scope {
+            let message = format!(
+                "the Server is too old to create {} join codes; upgrade it (the code it created instead was not \
+                 shown and expires unused)",
+                scope.as_str()
+            );
+            return Err(ClientError { status: Some(501), message, not_running: false });
+        }
+        Ok(code)
     }
 
     /// Subscribes to `GET /events`.

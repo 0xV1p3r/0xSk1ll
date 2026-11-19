@@ -283,7 +283,7 @@ export function installMock(scenario: string) {
         const distinct = (key: 'machine' | 'harness' | 'author') => [...new Set(log.map(e => e[key]))].sort();
         return delay({ machines: distinct('machine'), harnesses: distinct('harness'), authors: distinct('author') });
       }
-      case 'join_code': return delay({ code: 'sk1ll-join-7Q2M-XK9P-44RD-ZT8W' });
+      case 'join_code': return delay({ code: 'sk1ll-join-7Q2M-XK9P-44RD-ZT8W', expires_at: Math.floor(Date.now() / 1000) + 86400, scope: (a as { scope: T.Scope }).scope });
       case 'connection_info': return delay('/run/user/1000/sk1ll/daemon.sock', 10);
       case 'adopt': case 'overwrite': case 'adopt_displaced': case 'discard_displaced': case 'undo':
       case 'remove_machine': return delay(undefined, 500);

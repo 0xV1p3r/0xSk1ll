@@ -87,7 +87,7 @@ command!(log(query: LogQuery) -> Vec<LogEntry>, log(&query));
 command!(log_facets() -> LogFacets, log_facets());
 command!(undo(entry: i64) -> AssignmentUpdate, undo(entry));
 command!(join(request: JoinApiRequest) -> Joined, join(&request));
-command!(join_code() -> JoinCode, join_code());
+command!(join_code(scope: Scope) -> JoinCode, join_code(scope));
 command!(remove_machine(machine: String) -> (), remove_machine(&machine));
 
 #[derive(Debug, Serialize)]

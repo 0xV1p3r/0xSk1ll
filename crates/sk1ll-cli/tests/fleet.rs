@@ -97,7 +97,10 @@ async fn respond(State(requests): State<Requests>, request: Request) -> Response
             "has_origin": true, "repo_ready": true, "repo": "/repo", "headline": "offline",
             "connection": "offline", "revoked": false, "assignment_revision": 7, "report": {}
         }),
-        ("POST", "/join-codes") => json!({"code": "ONCE"}),
+        ("POST", "/join-codes") => {
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            json!({"code": "ONCE", "expires_at": 1700086400, "scope": request["scope"]})
+        }
         ("GET", "/log") => json!([{
             "id": 41, "at": 1700000000, "machine": "box", "harness": "claude", "author": "admin",
             "kind": "skill", "name": "pdf", "before": false, "after": true, "cause": {"type": "change"}
@@ -128,8 +131,21 @@ fn fleet_lists_machines_and_baseline() {
 #[test]
 fn fleet_invite_prints_code_and_join_command() {
     let daemon = FakeDaemon::start();
-    assert_eq!(stdout(daemon.run(&["invite"])), "ONCE\nsk1ll join https://fleet.example ONCE\n");
-    daemon.assert_requests(&[("GET", "/status", &[], ""), ("POST", "/join-codes", &[], "null")]);
+    assert_eq!(
+        stdout(daemon.run(&["invite"])),
+        "ONCE\nsk1ll join https://fleet.example ONCE\nexpires 2023-11-15 22:13:20 UTC\n\
+         scope fleet: the Machine may manage the whole Fleet\n"
+    );
+    daemon.assert_requests(&[("GET", "/status", &[], ""), ("POST", "/join-codes", &[], r#"{"scope":"fleet"}"#)]);
+}
+
+#[test]
+fn fleet_invite_can_limit_the_scope() {
+    let daemon = FakeDaemon::start();
+    let out = stdout(daemon.run(&["invite", "--scope", "self"]));
+    assert!(out.ends_with("scope self: the Machine may manage only itself\n"), "{out}");
+    daemon.assert_requests(&[("GET", "/status", &[], ""), ("POST", "/join-codes", &[], r#"{"scope":"self"}"#)]);
+    assert!(!daemon.run(&["invite", "--scope", "admin"]).status.success());
 }
 
 #[test]
