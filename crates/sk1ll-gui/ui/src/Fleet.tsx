@@ -74,7 +74,8 @@ export function Fleet({ revision, machineId, initialMachine, serverUrl = null, l
   const attention = machines.filter(m => ['offline', 'blocked', 'conflict'].includes(m.status)).length;
   const connected = machines.filter(m => m.connected).length;
   const health = healthOrder.map(status => ({ status, count: machines.filter(machine => machine.status === status).length }));
-  const report = localReport ?? machines.find(machine => machine.id === machineId)?.report;
+  const local = machines.find(machine => machine.id === machineId);
+  const report = localReport ?? local?.report;
   const scope = ownScope(data, machineId);
   const conflicts = report?.conflicts ?? [];
   const drafts = report?.drafts.length ?? 0, unpushed = report?.unpushed.length ?? 0;
@@ -154,7 +155,7 @@ export function Fleet({ revision, machineId, initialMachine, serverUrl = null, l
       </Table> : <Nothing className="rounded-none border-0" title={filter ? "No matching Machines" : "No Machines"} action={filter ? <Button variant="outline" size="sm" aria-label="Clear Machine filter" onClick={() => setFilter(null)}>Show all Machines</Button> : undefined}>{filter ? "Clear the filter to see all Machines." : "Use Add Machine to create a join code for another Machine."}</Nothing>}
             </div>
           </Panel>
-          <FleetAssignments registration={machines.find(machine => machine.id === machineId)?.registration} key={machineId} revision={revision} machineId={machineId} harnesses={report?.harnesses ?? []} navigate={navigate} />
+          <FleetAssignments registration={local?.registration} key={JSON.stringify([machineId, local?.registration])} revision={revision} machineId={machineId} harnesses={report?.harnesses ?? []} navigate={navigate} />
         </div>
         <Panel label="Up next" className="min-w-0 gap-0 border py-0 ring-0">
           <PanelToolbar><SectionTitle id="fleet-next-title">Up next</SectionTitle>{queue > 0 && <Badge variant="secondary" className="ml-auto tabular-nums">{queue}</Badge>}</PanelToolbar>

@@ -7,7 +7,7 @@ import { Fleet } from './Fleet';
 import { App, AppSidebar } from './App';
 import { api } from './api';
 import type { FleetView, MachineReport, MachineRow, StatusView } from './types';
-vi.mock('./api', () => ({ api: { items: vi.fn().mockResolvedValue([]), assignment: vi.fn().mockResolvedValue({ assignment: { harnesses: {} }, revision: 0 }), setAssignment: vi.fn(), push: vi.fn(), fleet: vi.fn(), status: vi.fn(), skills: vi.fn(), connectionInfo: vi.fn(), joinCode: vi.fn(), pull: vi.fn(), removeMachine: vi.fn(), conflicts: vi.fn().mockResolvedValue([]), recovered: vi.fn().mockResolvedValue([]) }, errorMessage: String }));
+vi.mock('./api', () => ({ api: { items: vi.fn().mockResolvedValue([]), assignment: vi.fn().mockResolvedValue({ assignment: { harnesses: {} }, revision: 0 }), setAssignment: vi.fn(), push: vi.fn(), fleet: vi.fn(), status: vi.fn(), skills: vi.fn(), connectionInfo: vi.fn(), joinCode: vi.fn(), pull: vi.fn(), removeMachine: vi.fn(), conflicts: vi.fn().mockResolvedValue([]), recovered: vi.fn().mockResolvedValue([]) }, errorMessage: String, errorStatus: (error: { status?: number }) => error?.status }));
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn().mockResolvedValue(() => {}) }));
 beforeEach(() => { window.location.hash = ''; vi.stubGlobal('matchMedia', vi.fn(() => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }))); });
 afterEach(() => { cleanup(); localStorage.clear(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
@@ -247,15 +247,16 @@ it('counts queue entries, adopts in Library, and hides Push without unpushed ite
   expect(next.getByText('1 unmanaged skill · notes')).toBeTruthy(); fireEvent.click(next.getByRole('button', { name: 'Adopt unmanaged skills' })); expect(navigate).toHaveBeenCalledWith('Library');
 });
 it('renders local assignments, toggles a cell and opens the matrix', async () => {
+  vi.mocked(api.fleet).mockResolvedValue({ baseline: null, machines: [machineRow({ registration: 'local-reg' })] });
   vi.mocked(api.items).mockResolvedValue([{ item: 'skill:review', in_baseline: true, draft: null, unpushed: false, description: null }]);
-  const snapshot = { assignment: { harnesses: { codex: { new_skills_default: true, new_rules_default: true, skills: {}, rules: {} } } }, revision: 1 };
+  const snapshot = { assignment: { harnesses: { codex: { new_skills_default: true, new_rules_default: true, skills: {}, rules: {} } } }, revision: 1, registration: 'local-reg' };
   const updated = { assignment: { harnesses: { codex: { new_skills_default: true, new_rules_default: true, skills: { review: false }, rules: {} } } }, revision: 2 };
   vi.mocked(api.assignment).mockClear().mockResolvedValueOnce(snapshot).mockResolvedValue(updated); vi.mocked(api.setAssignment).mockResolvedValue({ ...updated, entries: [] });
   const navigate = vi.fn(); renderFleet({ navigate });
   const cell = await screen.findByRole('checkbox', { name: 'skill:review in local / codex, Inherited' });
   expect(cell.getAttribute('aria-checked')).toBe('true'); fireEvent.click(cell);
   expect(screen.getByRole('checkbox', { name: 'skill:review in local / codex, Explicit' }).getAttribute('aria-checked')).toBe('false');
-  await waitFor(() => expect(api.setAssignment).toHaveBeenCalledWith('local', { changes: [{ harness: 'codex', kind: 'skill', name: 'review', enabled: false }] }));
+  await waitFor(() => expect(api.setAssignment).toHaveBeenCalledWith('local', { changes: [{ harness: 'codex', kind: 'skill', name: 'review', enabled: false }], expected: { revision: 1, registration: 'local-reg' } }));
   await waitFor(() => expect(api.assignment).toHaveBeenCalledTimes(2));
   expect(screen.getByRole('checkbox', { name: 'skill:review in local / codex, Explicit' }).getAttribute('aria-checked')).toBe('false');
   fireEvent.click(screen.getByRole('button', { name: 'Open matrix' })); expect(navigate).toHaveBeenCalledWith('Assignment matrix');
