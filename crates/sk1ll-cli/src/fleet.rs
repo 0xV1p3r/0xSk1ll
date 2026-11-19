@@ -678,6 +678,13 @@ impl Daemon {
                 } else {
                     self.block(c.set_assignment(&machine, &AssignmentChanges { changes, ..Default::default() }))?
                 };
+                if all.is_some() && !update.errors.is_empty() {
+                    println!("Assignment of {machine} was saved at revision {}.", update.revision);
+                    for error in &update.errors {
+                        eprintln!("{error}");
+                    }
+                    bail!("Could not apply all placements");
+                }
                 if self.status.mode == DaemonMode::Standalone {
                     println!(
                         "local assignment of {machine} is now revision {}; the daemon applies it",

@@ -21,6 +21,7 @@ struct RecordedRequest {
 }
 
 type Requests = Arc<Mutex<Vec<RecordedRequest>>>;
+type FakeState = (Requests, sk1ll_daemon::client::DaemonMode);
 
 struct FakeDaemon {
     _runtime: Runtime,
@@ -30,9 +31,13 @@ struct FakeDaemon {
 
 impl FakeDaemon {
     fn start() -> Self {
+        Self::start_in_mode(sk1ll_daemon::client::DaemonMode::Joined)
+    }
+
+    fn start_in_mode(mode: sk1ll_daemon::client::DaemonMode) -> Self {
         let directory = tempfile::Builder::new().prefix("sk-").tempdir_in("/var/tmp").unwrap();
         let requests = Requests::default();
-        let router = Router::new().fallback(respond).with_state(requests.clone());
+        let router = Router::new().fallback(respond).with_state((requests.clone(), mode));
         let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
         let listener = {
             let _guard = runtime.enter();
@@ -72,7 +77,7 @@ impl FakeDaemon {
     }
 }
 
-async fn respond(State(requests): State<Requests>, request: Request) -> Response {
+async fn respond(State((requests, mode)): State<FakeState>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
     let body = axum::body::to_bytes(body, 1024).await.unwrap();
     let mut query: Vec<_> =
@@ -92,6 +97,10 @@ async fn respond(State(requests): State<Requests>, request: Request) -> Response
 
     let reply = match (parts.method.as_str(), parts.uri.path()) {
         ("GET", "/harnesses") => json!([{"name": "claude", "harness": {}, "origin": "local"}]),
+        ("POST", "/assignment/harness/claude") if body.as_ref() == br#"{"enabled":true}"# => json!({
+            "update": {"assignment": {"harnesses": {}}, "revision": 9, "entries": [],
+                "errors": ["could not place pdf", "could not place style"]}
+        }),
         ("POST", "/assignment/harness/claude") => json!({
             "update": {"assignment": {"harnesses": {}}, "revision": 8, "entries": []},
             "warning": "Unpulled items may stay on."
@@ -101,7 +110,7 @@ async fn respond(State(requests): State<Requests>, request: Request) -> Response
             "machines": [{"id": "box", "status": "offline", "connected": false, "joined_at": 1700000000}]
         }),
         ("GET", "/status") => json!({
-            "machine_id": "box", "server_url": "https://fleet.example", "mode": "joined",
+            "machine_id": "box", "server_url": "https://fleet.example", "mode": mode,
             "has_origin": true, "repo_ready": true, "repo": "/repo", "headline": "offline",
             "connection": "offline", "revoked": false, "assignment_revision": 7, "report": {}
         }),
@@ -251,4 +260,18 @@ fn assign_all_uses_the_harness_endpoint_and_displays_legacy_warning() {
         ("GET", "/harnesses", &[], ""),
         ("POST", "/assignment/harness/claude", &[], r#"{"enabled":false}"#),
     ]);
+}
+
+#[test]
+fn assign_all_reports_saved_revision_and_placement_failures() {
+    use sk1ll_daemon::client::DaemonMode;
+
+    for mode in [DaemonMode::Joined, DaemonMode::Standalone] {
+        let daemon = FakeDaemon::start_in_mode(mode);
+        let out = daemon.run_cli(&["--repo", "/repo", "assign", "claude", "--all", "on"]);
+        assert!(!out.status.success());
+        assert!(String::from_utf8(out.stdout).unwrap().contains("Assignment of box was saved at revision 9"));
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(stderr.contains("could not place pdf") && stderr.contains("could not place style"));
+    }
 }
