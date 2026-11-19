@@ -101,7 +101,7 @@ sk1ll join http://server:7878 <code>                  # clones the repo into ~/.
 sk1ll join http://server:7878 <code> --copy-from laptop   # start from laptop's assignment
 ```
 
-A new machine starts with everything off unless you pass `--copy-from`. `--id` sets the machine id, which otherwise comes from `machine.toml` or the hostname. The machine token is stored only in `~/.config/sk1ll/daemon.json` with mode 0600, and the server can revoke it per machine.
+A new machine starts with everything off unless you pass `--copy-from`. `--id` sets the machine id, which otherwise comes from `machine.toml` or the hostname. The daemon stores the machine token in `daemon.json` with mode 0600. On Linux the file is under `$XDG_CONFIG_HOME/sk1ll`, which defaults to `~/.config/sk1ll`. On macOS it is under `~/Library/Application Support/sk1ll`. The server can revoke each machine’s token.
 
 ## Copy an Assignment after joining
 
@@ -160,7 +160,7 @@ The table lists Linux paths. On macOS, config and data use `~/Library/Applicatio
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SK1LL_DAEMON_STATE` | `~/.config/sk1ll/daemon.json` | Machine id, server URL, token and repo path |
+| `SK1LL_DAEMON_STATE` | Platform config directory’s `sk1ll/daemon.json` | Machine id, server URL, token and repo path |
 | `SK1LL_DAEMON_SOCKET` | `$XDG_RUNTIME_DIR/sk1ll/daemon.sock` | Local API socket |
 | `SK1LL_MACHINE_CONFIG` | `~/.config/sk1ll/machine.toml` | Harness configuration |
 | `SK1LL_ASSIGNMENT` | `~/.cache/sk1ll/assignment.json` | Local assignment in standalone; server mirror when joined |
