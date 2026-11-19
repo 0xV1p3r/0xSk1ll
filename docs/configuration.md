@@ -119,11 +119,11 @@ sk1ll harnesses disable kiro    # nothing is left behind now
 
 With a Fleet, both actions set every Baseline item and the Machine’s reported drafts and unpushed items. An older Server uses the local item list instead and warns that unpulled items may stay on.
 
-In Settings, **Turn off this Harness's items first** in the preview does the same in the Assignment (on the server for a joined machine).
+In Settings, **Turn off this Harness's items first** in the preview does the same in the Assignment and waits for local sync before previewing again. A joined machine writes to the Server first.
 
 The change is then applied and the harnesses synced. It goes through the daemon when one manages the repo. The CLI asks for confirmation on a terminal. Pass `--yes` in scripts. Assignment is left unchanged, so turning a harness back on restores its toggles. A joined machine reports its new set of harnesses to the server with its next status.
 
-`machine.toml` is read once for a change and written only if it is still exactly what sk1ll read (same file, bytes and permissions); otherwise nothing is written and the change fails (409 from the daemon), so you can retry. sk1ll writes the new text to a temporary file only it created, next to the file (a symlinked `machine.toml` stays a link, and its target gets the new text), with the file's permissions (0600 for a new file) and, where allowed, its owner and group, then renames it into place. ACLs and extended attributes are not kept. A save that lands in the instant between that last check and the rename is lost; see [Known limitations](known-limitations.md).
+Apply checks that `machine.toml` still matches the file, bytes and permissions seen at preview. If the check fails, preview again before applying. **Open configuration** in Settings works even if the file contains invalid TOML. If the file is missing, it creates it with mode 0600. sk1ll writes the new text to a temporary file only it created, next to the file (a symlinked `machine.toml` stays a link, and its target gets the new text), with the file's permissions (0600 for a new file) and, where allowed, its owner and group, then renames it into place. ACLs and extended attributes are not kept. A save that lands in the instant between that last check and the rename is lost; see [Known limitations](known-limitations.md).
 
 If the sync after the change can't place something, the change itself still stands. The CLI lists each failure and exits nonzero, and Settings lists them before closing.
 

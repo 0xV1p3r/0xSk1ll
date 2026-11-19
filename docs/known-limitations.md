@@ -29,7 +29,7 @@ the one for rules files above.
 
 ## A save to machine.toml at the moment sk1ll writes it
 
-A harness change stages the new `machine.toml` in a file only it created,
+Apply first checks the file seen at preview. A harness change stages the new `machine.toml` in a file only it created,
 resolves the configured path again, and checks that it still points to the
 same file with the same bytes and permissions. It then renames the new file
 over that target. A symlink retargeted after the check can leave the write
@@ -136,3 +136,10 @@ storage or a lock can hold startup until git gives up. The server decides the
 baseline branch from HEAD once at startup and writes `hooks/pre-receive` over
 on every start. Changing HEAD while it runs isn't supported, and pushes keep
 going to the branch it started with until it restarts.
+
+## Assignment edits on older Servers
+
+Servers that omit Machine registrations do not enforce the Assignment
+revision precondition. The desktop matrix warns before a bulk edit on those
+Servers because it can overwrite an intervening change. Bulk Undo requires
+a Server that checks revisions or the standalone Daemon.
