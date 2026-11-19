@@ -12,7 +12,6 @@ import { toast } from './toast';
 import { api } from './api';
 import { useMutation, useResource } from './hooks';
 import { ErrorNotice, Loading, Pending } from './shared';
-import { everythingOff } from './model';
 import type { HarnessChange, HarnessChoice, HarnessView, PlacementView } from './types';
 
 type HarnessPaths = HarnessView['harness'];
@@ -117,6 +116,7 @@ export function ChangeDialog({ change, onClose, onApplied }: { change: HarnessCh
   const preview = useResource(load, 0);
   const [failed, setFailed] = useState<string[]>();
   const apply = useMutation();
+  const [warning, setWarning] = useState<string | null>(null);
   const turnOff = useMutation(() => void preview.refresh());
   const managed = preview.data?.placed.filter(p => p.kind === 'remove').length ?? 0;
   const edited = preview.data?.placed.filter(p => p.kind === 'conflict').length ?? 0;
@@ -134,11 +134,12 @@ export function ChangeDialog({ change, onClose, onApplied }: { change: HarnessCh
             <Placements rows={preview.data.placed} placed />
             {managed > 0 && preview.data.before && <div className="mt-2 flex flex-col items-start gap-1">
               <Button variant="outline" size="sm" disabled={busy} onClick={() => void turnOff.run(async () => {
-                const [status, items] = await Promise.all([api.status(), api.items()]);
-                await api.setAssignment(status.machine_id, { changes: everythingOff(change.name, items) });
+                const result = await api.setHarnessAssignment(change.name, false);
+                setWarning(result.warning);
                 toast({ title: `Turned off ${change.name}'s items`, description: 'Sync removes what it placed there; copies edited by hand stay.' });
               })}><Pending pending={turnOff.pending}>Turn off this Harness's items first</Pending></Button>
               <p className="text-xs text-muted-foreground">Sets every Skill and Rule off for {change.name} in the Assignment, so sync takes out what it placed. Then preview again.</p></div>}</>}
+          {warning && <p role="status" className="text-sm text-muted-foreground">{warning}</p>}
           <ErrorNotice error={turnOff.error} />
         </section>
         <section aria-label="Then sync"><h3 className="text-sm font-medium">Then sync</h3>

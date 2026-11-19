@@ -107,6 +107,8 @@ A new machine starts with everything off unless you pass `--copy-from`. `--id` s
 
 Run `sk1ll fleet` to find the machine id. Run `sk1ll fleet remove <machine>` and type that id at the confirmation prompt. In a script, pass `--yes` to confirm removal. For an id that starts with `-`, put `--` before it: `sk1ll fleet remove --yes -- -lab`. The daemon must be running. Removal revokes the machine's credential.
 
+Use `sk1ll assign <harness> --all on|off` to change both defaults and every Baseline item, even if this Machine has yet to pull it. The operation also includes this Machine’s reported drafts and unpushed items. Older Servers use the local item list and warn that unpulled items may stay on.
+
 Use `sk1ll fleet log` to see recent Assignment changes, newest first. Filter with `--machine`, `--harness`, `--author`, or `--item`. Use `--limit` to set the page size and `--before <entry-id>` to page back. To undo a change, run `sk1ll fleet undo <entry-id>`.
 
 ## Run the daemon

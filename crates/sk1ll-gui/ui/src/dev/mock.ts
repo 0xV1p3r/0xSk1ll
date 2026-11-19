@@ -237,6 +237,20 @@ export function installMock(scenario: string) {
         const registration = machines.find(m => m.id === a.machine)?.registration;
         return delay({ ...assignments[a.machine as string] ?? { revision: 0, harnesses: {} }, ...registration && { registration } });
       }
+      case 'set_harness_assignment': {
+        const snapshot = assignments[status.machine_id];
+        const enabled = Boolean(a.enabled);
+        const h = snapshot.harnesses[a.harness as string] ??= harness();
+        h.new_skills_default = enabled;
+        h.new_rules_default = enabled;
+        for (const { item } of items) {
+          const [kind, name] = item.split(':');
+          (kind === 'rule' ? h.rules : h.skills)[name] = enabled;
+        }
+        snapshot.revision++;
+        const { revision, ...assignment } = snapshot;
+        return delay({ update: { revision, assignment: structuredClone(assignment), entries: [] }, warning: null });
+      }
       case 'set_assignment': {
         const snapshot = assignments[a.machine as string];
         const { changes, expected } = a.changes as T.AssignmentChanges;

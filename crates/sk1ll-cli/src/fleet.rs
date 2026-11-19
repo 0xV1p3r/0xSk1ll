@@ -69,6 +69,17 @@ pub(crate) fn assign_direct(cli: &Cli, repo: &Path, lock: Option<&sk1ll_core::En
     let toggle = |kind, name, on: bool| ToggleChange { harness: harness.clone(), kind, name, enabled: Some(on) };
     let target = assign_target(*kind, name.clone(), *enabled, *default_skills, *default_rules, *all)?;
     if let Some(s) = all {
+        let lock = lock.context("a fleet assignment change requires the engine lock")?;
+        if let Some(update) =
+            runtime()?.block_on(sk1ll_daemon::set_harness_assignment_direct(&cfg, lock, harness, s.on()))?
+        {
+            println!(
+                "fleet assignment of {} is now revision {}; run `sk1ll sync` to apply",
+                state.machine_id, update.revision
+            );
+            return Ok(true);
+        }
+        eprintln!("warning: {}", sk1ll_daemon::client::LEGACY_HARNESS_ASSIGNMENT_WARNING);
         changes.extend(every_toggle(&sk1ll_core::Repo::open(repo)?, harness, s.on())?);
     }
     if let Some((kind, name, enabled)) = target {
@@ -600,9 +611,6 @@ impl Daemon {
                 let toggle =
                     |kind, name, on: bool| ToggleChange { harness: harness.clone(), kind, name, enabled: Some(on) };
                 let target = assign_target(kind, name, state, default_skills, default_rules, all)?;
-                if let Some(s) = all {
-                    changes.extend(every_toggle(&sk1ll_core::Repo::open(repo)?, &harness, s.on())?);
-                }
                 if let Some((kind, name, state)) = target {
                     check_exists(&sk1ll_core::Repo::open(repo)?, kind, &name)?;
                     let kind = match kind {
@@ -618,8 +626,15 @@ impl Daemon {
                     changes.push(toggle(ToggleKind::NewRulesDefault, None, s.on()));
                 }
                 let machine = self.status.machine_id.clone();
-                let update =
-                    self.block(c.set_assignment(&machine, &AssignmentChanges { changes, ..Default::default() }))?;
+                let update = if let Some(s) = all {
+                    let result = self.block(c.set_harness_assignment(&harness, s.on()))?;
+                    if let Some(warning) = result.warning {
+                        eprintln!("warning: {warning}");
+                    }
+                    result.update
+                } else {
+                    self.block(c.set_assignment(&machine, &AssignmentChanges { changes, ..Default::default() }))?
+                };
                 if self.status.mode == DaemonMode::Standalone {
                     println!(
                         "local assignment of {machine} is now revision {}; the daemon applies it",

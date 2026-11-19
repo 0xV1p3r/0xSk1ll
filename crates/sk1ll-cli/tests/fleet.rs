@@ -43,12 +43,15 @@ impl FakeDaemon {
     }
 
     fn run(&self, args: &[&str]) -> Output {
+        self.run_cli(&[&["fleet"], args].concat())
+    }
+
+    fn run_cli(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_sk1ll"))
             .arg("--daemon-socket")
             .arg(self.directory.path().join("d.sock"))
             .arg("--daemon-state")
             .arg(self.directory.path().join("state.json"))
-            .arg("fleet")
             .args(args)
             .stdin(Stdio::null())
             .output()
@@ -88,6 +91,11 @@ async fn respond(State(requests): State<Requests>, request: Request) -> Response
     }
 
     let reply = match (parts.method.as_str(), parts.uri.path()) {
+        ("GET", "/harnesses") => json!([{"name": "claude", "harness": {}, "origin": "local"}]),
+        ("POST", "/assignment/harness/claude") => json!({
+            "update": {"assignment": {"harnesses": {}}, "revision": 8, "entries": []},
+            "warning": "Unpulled items may stay on."
+        }),
         ("GET", "/fleet") => json!({
             "baseline": "0123456789abcdef",
             "machines": [{"id": "box", "status": "offline", "connected": false, "joined_at": 1700000000}]
@@ -230,4 +238,17 @@ fn bash_completions_include_fleet_commands() {
     for name in ["invite", "remove", "log", "undo"] {
         assert!(stdout.contains(&format!("__fleet__subcmd__{name}")), "{name} missing from Bash completions");
     }
+}
+
+#[test]
+fn assign_all_uses_the_harness_endpoint_and_displays_legacy_warning() {
+    let daemon = FakeDaemon::start();
+    let out = daemon.run_cli(&["--repo", "/repo", "assign", "claude", "--all", "off"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("warning: Unpulled items may stay on."));
+    stdout(out);
+    daemon.assert_requests(&[
+        ("GET", "/status", &[], ""),
+        ("GET", "/harnesses", &[], ""),
+        ("POST", "/assignment/harness/claude", &[], r#"{"enabled":false}"#),
+    ]);
 }

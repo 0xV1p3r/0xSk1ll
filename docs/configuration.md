@@ -96,6 +96,8 @@ sk1ll sync                      # not needed when the daemon runs
 sk1ll harnesses disable kiro    # nothing is left behind now
 ```
 
+With a Fleet, both actions set every Baseline item and the Machine’s reported drafts and unpushed items. An older Server uses the local item list instead and warns that unpulled items may stay on.
+
 In Settings, **Turn off this Harness's items first** in the preview does the same in the Assignment (on the server for a joined machine).
 
 The change is then applied and the harnesses synced. It goes through the daemon when one manages the repo. The CLI asks for confirmation on a terminal. Pass `--yes` in scripts. Assignment is left unchanged, so turning a harness back on restores its toggles. A joined machine reports its new set of harnesses to the server with its next status.

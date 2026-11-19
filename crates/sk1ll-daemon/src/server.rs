@@ -373,14 +373,68 @@ pub async fn set_assignment_direct(
     let state = DaemonState::load(&cfg.state)?.context("this machine hasn't joined a fleet")?;
     let http = http_client().build().context("building the HTTP client")?;
     let update = change_assignment(&http, &state, changes).await?;
-    let snap =
-        AssignmentSnapshot { revision: update.revision, assignment: update.assignment.clone(), registration: None };
-    crate::state::save_snapshot(&cfg.snapshot_path(), &snap)
-        .context("Server accepted the assignment, but saving its authoritative snapshot failed")?;
+    save_direct_update(cfg, &update)?;
     Ok(update)
 }
 
-async fn change_assignment(
+pub async fn set_harness_assignment_direct(
+    cfg: &Config,
+    _lock: &sk1ll_core::EngineLock,
+    harness: &str,
+    enabled: bool,
+) -> anyhow::Result<Option<AssignmentUpdate>> {
+    use anyhow::Context;
+    let state = DaemonState::load(&cfg.state)?.context("this machine hasn't joined a fleet")?;
+    let http = http_client().build().context("building the HTTP client")?;
+    let update = set_harness_assignment(&http, &state, harness, sk1ll_proto::SetHarnessAssignment { enabled }).await?;
+    if let Some(update) = &update {
+        save_direct_update(cfg, update)?;
+    }
+    Ok(update)
+}
+
+fn save_direct_update(cfg: &Config, update: &AssignmentUpdate) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let snap =
+        AssignmentSnapshot { revision: update.revision, assignment: update.assignment.clone(), registration: None };
+    crate::state::save_snapshot(&cfg.snapshot_path(), &snap)
+        .context("Server accepted the assignment, but saving its authoritative snapshot failed")
+}
+
+pub(crate) async fn set_harness_assignment(
+    http: &reqwest::Client,
+    state: &DaemonState,
+    harness: &str,
+    body: sk1ll_proto::SetHarnessAssignment,
+) -> Result<Option<AssignmentUpdate>> {
+    if harness.starts_with('.') {
+        return Err(Error::BadRequest(format!("invalid harness `{harness}`")));
+    }
+    let harness = crate::client::encode(harness);
+    let machine = crate::client::encode(&state.machine_id);
+    let path = format!("/machines/{machine}/assignment/harness/{harness}");
+    let payload = serde_json::to_vec(&body).map_err(|e| Error::Internal(e.into()))?;
+    let response = request(http, state, Method::POST, &path, payload.into()).await?;
+    let status = response.status();
+    let body = response.bytes().await.map_err(|e| Error::Unavailable(format!("reading the Server's response: {e}")))?;
+    if status.is_success() {
+        return serde_json::from_slice(&body)
+            .map(Some)
+            .map_err(|e| Error::Unavailable(format!("reading the Server's assignment response: {e}")));
+    }
+    if status == StatusCode::NOT_FOUND && serde_json::from_slice::<serde_json::Value>(&body).is_err() {
+        return Ok(None);
+    }
+    Err(Error::Upstream(
+        status,
+        redact(
+            &serde_json::from_slice::<ErrorBody>(&body)
+                .map_or_else(|_| String::from_utf8_lossy(&body).into_owned(), |error| error.error),
+        ),
+    ))
+}
+
+pub(crate) async fn change_assignment(
     http: &reqwest::Client,
     state: &DaemonState,
     changes: &AssignmentChanges,

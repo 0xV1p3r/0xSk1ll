@@ -284,6 +284,20 @@ impl Daemon {
         Ok(())
     }
 
+    pub(crate) fn harness_assignment_changes(
+        &self,
+        eng: &mut Engine,
+        harness: &str,
+        body: sk1ll_proto::SetHarnessAssignment,
+    ) -> Result<sk1ll_proto::AssignmentChanges> {
+        self.ensure_managed(eng)?;
+        self.lock_repo(eng)?;
+        let repo = Repo::open(Self::root(eng))?;
+        let skills = repo.skills()?.into_iter().map(|skill| sk1ll_proto::ItemRef::Skill(skill.name));
+        let rules = repo.rules()?.into_iter().map(|rule| sk1ll_proto::ItemRef::Rule(rule.name));
+        Ok(body.changes(harness, skills.chain(rules)))
+    }
+
     pub(crate) fn set_local_assignment(
         &self,
         eng: &mut Engine,

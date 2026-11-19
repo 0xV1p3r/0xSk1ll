@@ -76,6 +76,10 @@ command!(setup_harnesses() -> Vec<HarnessChoice>, setup_harnesses());
 command!(set_setup_harness(name: String, enabled: bool) -> Vec<HarnessChoice>, set_setup_harness(&name, enabled));
 command!(harness_settings() -> HarnessSettings, harness_settings());
 command!(preview_harness(request: HarnessChangeRequest) -> HarnessPreview, preview_harness(&request));
+command!(
+    set_harness_assignment(harness: String, enabled: bool) -> HarnessAssignmentUpdate,
+    set_harness_assignment(&harness, enabled)
+);
 command!(apply_harness(request: HarnessChangeRequest) -> HarnessApplied, apply_harness(&request));
 command!(resolve_import(request: ResolveImportRequest) -> ResolvedSource, resolve_import(&request));
 command!(add_import(request: AddImportRequest) -> ImportUpdated, add_import(&request));

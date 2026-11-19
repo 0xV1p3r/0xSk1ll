@@ -58,6 +58,7 @@ pub fn run() {
             commands::harness_settings,
             commands::preview_harness,
             commands::apply_harness,
+            commands::set_harness_assignment,
             commands::open_machine_config,
             commands::daemon_service,
             commands::start_daemon,
