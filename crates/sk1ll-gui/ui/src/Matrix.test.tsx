@@ -38,6 +38,8 @@ afterEach(cleanup);
 const mount = async () => {
   const view = render(<Matrix revision={0} status={status} />);
   await screen.findByRole('checkbox', { name: 'skill:pdf in a / claude, explicit' });
+  // The write hook records the loaded snapshot in a passive effect.
+  await act(async () => {});
   return view;
 };
 
@@ -416,17 +418,21 @@ it.each([
   { mode: 'joined', server_url: 'https://fleet.example', machine_id: 'b' },
 ] as const)('resets cached revisions and pending writes when authority becomes %j', async identity => {
   const previous = { ...status, mode: identity.mode === 'joined' && identity.server_url === 'https://fleet.example' && identity.machine_id === 'a' ? 'standalone' : 'joined', server_url: 'https://fleet.example', report: { baseline: null, harnesses: ['claude'] } } as StatusView;
-  vi.mocked(api.assignment).mockResolvedValue(snapshot(false, 10));
+  const initial = deferred<AssignmentUpdate>();
+  vi.mocked(api.assignment).mockReturnValue(initial.promise);
   const save = deferred<AssignmentUpdate>();
   vi.mocked(api.setAssignment).mockReturnValue(save.promise);
   const view = render(<Matrix revision={0} status={previous} />);
-  await screen.findByRole('checkbox', { name: 'skill:pdf in a / claude, explicit' });
+  await act(async () => { initial.resolve(snapshot(false, 10)); });
   fireEvent.click(cell('a'));
+  expect(api.setAssignment).toHaveBeenCalledTimes(1);
   expect(enabled('a')).toBe(true);
   expect(cell('a').hasAttribute('data-disabled')).toBe(true);
-  vi.mocked(api.assignment).mockResolvedValue(snapshot(false, 1));
+  const replacement = deferred<AssignmentUpdate>();
+  vi.mocked(api.assignment).mockReturnValue(replacement.promise);
   view.rerender(<Matrix revision={1} status={{ ...previous, ...identity }} />);
-  await waitFor(() => expect(cell('a').hasAttribute('data-disabled')).toBe(false));
+  await act(async () => { replacement.resolve(snapshot(false, 1)); });
+  expect(cell('a').hasAttribute('data-disabled')).toBe(false);
   expect(enabled('a')).toBe(false);
   // A response from the previous authority must not restore its optimistic edit.
   await act(async () => { save.resolve(snapshot(true, 11)); });

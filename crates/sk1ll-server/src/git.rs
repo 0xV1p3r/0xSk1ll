@@ -1019,24 +1019,31 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_stuck_git_read_times_out_and_is_stopped_with_its_children() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("pid");
-        let stub = dir.path().join("git");
-        let script =
-            format!("#!/bin/sh\nsh -c 'trap \"\" TERM; exec sleep 30' &\necho $! > '{}'\nwait\n", pid_file.display());
-        std::fs::write(&stub, script).unwrap();
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let stub = stub_git(dir.path(), &pid_file, "wait");
+        let deadline = Duration::from_secs(60);
+        let read = inspect("/bin/sh".as_ref(), &stub, &["rev-parse", "HEAD"], deadline, INSPECT_OUTPUT);
+        tokio::pin!(read);
+
+        // Start the read and let the child install its signal handler before
+        // advancing the deadline. Keep real time for process cleanup.
+        tokio::select! {
+            result = &mut read => panic!("git exited before its child was ready: {result:?}"),
+            ready = tokio::time::timeout(Duration::from_secs(30), async {
+                while !pid_file.is_file() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }) => ready.expect("the stub's child never started"),
+        }
         let start = std::time::Instant::now();
-        let err =
-            inspect(stub.as_os_str(), dir.path(), &["rev-parse", "HEAD"], Duration::from_millis(300), INSPECT_OUTPUT)
-                .await
-                .unwrap_err();
+        tokio::time::pause();
+        tokio::time::advance(deadline).await;
+        tokio::time::resume();
+        let err = read.await.unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
         assert!(start.elapsed() < Duration::from_secs(5), "took {:?}", start.elapsed());
-        let pid: libc::pid_t = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
-        // SAFETY: signal 0 only checks whether the process exists.
-        assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "the stub's TERM-resistant child must be gone");
+        assert!(!running(&pid_file), "the stub's TERM-resistant child must be gone");
     }
 
     /// Run via /bin/sh so another test forking while the script is written
