@@ -86,6 +86,8 @@ command!(resolve_import(request: ResolveImportRequest) -> ResolvedSource, resolv
 command!(add_import(request: AddImportRequest) -> ImportUpdated, add_import(&request));
 command!(imports() -> ImportsView, imports());
 command!(update_import(name: String) -> ImportUpdated, update_import(&name));
+command!(force_update_import(name: String) -> ImportUpdated, force_update_import(&name));
+command!(import_changes(name: String, upstream: String) -> ImportChanges, import_changes(&name, Some(&upstream)));
 command!(assignment(machine: String) -> AssignmentSnapshot, assignment(&machine));
 command!(
     set_assignment(machine: String, changes: AssignmentChanges) -> AssignmentUpdate,

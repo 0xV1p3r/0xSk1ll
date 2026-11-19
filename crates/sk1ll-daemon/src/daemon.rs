@@ -1655,15 +1655,33 @@ impl Daemon {
     }
 
     /// Re-vendors one import into the draft.
-    pub(crate) async fn update_import(self: &Arc<Self>, name: String) -> Result<ImportUpdated> {
-        let req = UpdateImportsRequest { name: Some(name), force: false };
+    pub(crate) async fn update_import(self: &Arc<Self>, name: String, force: bool) -> Result<ImportUpdated> {
+        let req = UpdateImportsRequest { name: Some(name), force };
         self.update_imports(req).await?.into_iter().next().context("no update report").map_err(Error::Internal)
+    }
+
+    pub(crate) async fn import_changes(
+        self: &Arc<Self>,
+        name: String,
+        upstream: Option<String>,
+    ) -> Result<imports::ImportChanges> {
+        let (root, targets) = self
+            .blocking(move |d, eng| {
+                let root = d.import_root(eng)?;
+                let targets = Repo::open(&root)?.update_targets(Some(&name), true)?;
+                Ok((root, targets))
+            })
+            .await?;
+        unlocked(move || imports::fetch_changes(&root, targets, upstream.as_deref())).await
     }
 
     /// What a link leads to; only the import cache is written.
     pub(crate) async fn resolve_import(self: &Arc<Self>, req: ResolveImportRequest) -> Result<ResolvedSource> {
         let root = self.blocking(|d, eng| d.import_root(eng)).await?;
-        let fetched = unlocked(move || imports::fetch_link(&root, &req.link, given(&req.path), None, None)).await?;
+        let fetched = unlocked(move || {
+            imports::fetch_link(&root, &req.link, given(&req.path), given(&req.git_ref), None)?.inspect()
+        })
+        .await?;
         // `taken` reflects the repo after the fetch, not before it.
         let r = self
             .blocking(move |d, eng| {
@@ -1679,6 +1697,8 @@ impl Daemon {
                 default_name: c.default_name,
                 description: c.description,
                 taken: c.taken,
+                total_bytes: c.total_bytes,
+                warnings: c.warnings,
             })
             .collect();
         Ok(ResolvedSource { source: r.source, git_ref: r.git_ref, commit: r.commit, candidates })

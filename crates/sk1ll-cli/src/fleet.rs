@@ -15,7 +15,7 @@ use sk1ll_proto::{AssignmentChanges, LogQuery, Scope, ToggleChange, ToggleKind};
 
 use crate::{
     Cli, Cmd, FleetCmd, InviteScope, Kind, assign_target, bundled_fallback, check_exists, confirm, every_item,
-    fetch_hint, names, print_bundled, print_update, short,
+    fetch_hint, names, print_bundled, print_import_changes, print_update, short,
 };
 
 /// Sets up this process's environment, before any thread starts: the
@@ -588,7 +588,10 @@ impl Daemon {
                     }
                 }
             }
-            Cmd::Update { name, force } => {
+            Cmd::Update { name: Some(name), dry_run: true, .. } => {
+                print_import_changes(&name, self.block(c.import_changes(&name, None))?);
+            }
+            Cmd::Update { name, force, .. } => {
                 for r in self.block(c.update_imports(&UpdateImportsRequest { name, force }))? {
                     print_update(&r.name, r.old_commit.as_deref(), &r.new_commit, r.changed);
                 }

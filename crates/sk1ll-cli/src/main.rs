@@ -143,6 +143,9 @@ enum Cmd {
         /// Overwrite local edits to vendored imports
         #[arg(long)]
         force: bool,
+        /// Show upstream commits and changed files for one import
+        #[arg(long, requires = "name", conflicts_with = "force")]
+        dry_run: bool,
     },
     /// Remove an import
     Remove { name: String },
@@ -327,7 +330,6 @@ impl Cmd {
         match self {
             Self::Recover { .. }
             | Self::Conflicts
-            | Self::Update { .. }
             | Self::Remove { .. }
             | Self::Fork { .. }
             | Self::Commit { .. }
@@ -336,7 +338,7 @@ impl Cmd {
             | Self::Pull
             | Self::Adopt { .. }
             | Self::Assign { .. } => true,
-            Self::Sync { dry_run, .. } => !dry_run,
+            Self::Sync { dry_run, .. } | Self::Update { dry_run, .. } => !dry_run,
             Self::Add { list, .. } => !list,
             Self::Init { .. }
             | Self::List { .. }
@@ -459,14 +461,13 @@ fn run(cli: Cli) -> Result<()> {
     // A daemon managing this repo does every change, so that changes never
     // interleave and it pushes, reports status and tells the server. Without one,
     // a change holds the engine lock (which fails if a daemon holds it).
-    let lock = if cli.cmd.mutates() {
-        if let Some(daemon) = fleet::connect(&cli, &repo_path)? {
-            return daemon.run(cli.cmd, &repo_path);
-        }
-        lock_direct(&repo_path)?
-    } else {
-        None
-    };
+    let mutates = cli.cmd.mutates();
+    if (mutates || matches!(cli.cmd, Cmd::Update { dry_run: true, .. }))
+        && let Some(daemon) = fleet::connect(&cli, &repo_path)?
+    {
+        return daemon.run(cli.cmd, &repo_path);
+    }
+    let lock = if mutates { lock_direct(&repo_path)? } else { None };
     if matches!(cli.cmd, Cmd::Assign { .. }) && fleet::assign_direct(&cli, &repo_path, lock.as_ref())? {
         return Ok(());
     }
@@ -543,6 +544,11 @@ fn run(cli: Cli) -> Result<()> {
                 let path = if c.path.is_empty() { "." } else { &c.path };
                 let taken = if c.taken { "taken" } else { "" };
                 println!("{path:<32} {:<24} {taken:<5} {}", c.default_name, c.description.unwrap_or_default());
+                println!("  {} bytes total", c.total_bytes);
+                for warning in c.warnings {
+                    let kinds: Vec<_> = warning.kinds.into_iter().map(|kind| kind.label()).collect();
+                    println!("  {:?}: {}", warning.path, kinds.join(", "));
+                }
             }
         }
         Cmd::Add { source, path, git_ref, name, list: false } => {
@@ -557,7 +563,11 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Cmd::Update { name, force } => {
+        Cmd::Update { name: Some(name), dry_run: true, .. } => {
+            let targets = repo.update_targets(Some(&name), true)?;
+            print_import_changes(&name, sk1ll_core::imports::fetch_changes(repo.root(), targets, None)?);
+        }
+        Cmd::Update { name, force, .. } => {
             for r in repo.update(name.as_deref(), force)? {
                 print_update(&r.name, r.old_commit.as_deref(), &r.new_commit, r.changed);
             }
@@ -831,6 +841,27 @@ fn check_exists(repo: &Repo, kind: Kind, name: &str) -> Result<&'static str> {
     Ok(label)
 }
 
+fn print_import_changes(name: &str, changes: sk1ll_core::imports::ImportChanges) {
+    println!("{name}: {} → {}", short(&changes.locked), short(&changes.upstream));
+    println!("Upstream commits:");
+    if changes.commits.is_empty() {
+        println!("  None");
+    }
+    for commit in changes.commits {
+        println!("  {} {} {}", commit.sha, commit.date, commit.subject);
+    }
+    if changes.truncated {
+        println!("  Showing the first 50 commits");
+    }
+    println!("Changed files:");
+    if changes.files.is_empty() {
+        println!("  None");
+    }
+    for file in changes.files {
+        println!("  {file:?}");
+    }
+}
+
 fn print_update(name: &str, old: Option<&str>, new: &str, changed: bool) {
     match (old, changed) {
         (_, false) => println!("{name:<24} up to date"),
@@ -1018,6 +1049,14 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    fn import_dry_run_requires_a_name_and_rejects_force() {
+        assert!(Cli::try_parse_from(["sk1ll", "update", "--dry-run"]).is_err());
+        assert!(Cli::try_parse_from(["sk1ll", "update", "pdf", "--dry-run", "--force"]).is_err());
+        let cli = Cli::try_parse_from(["sk1ll", "update", "pdf", "--dry-run"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Update { name: Some(name), dry_run: true, force: false } if name == "pdf"));
     }
 
     #[test]

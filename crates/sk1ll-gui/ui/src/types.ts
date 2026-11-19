@@ -112,9 +112,13 @@ export interface ItemView {
   item: ItemRef; in_baseline: boolean; draft: DraftEntry['change'] | null; unpushed: boolean; description: string | null;
 }
 
-export interface SkillCandidate { path: string; default_name: string; description: string | null; taken: boolean }
+export interface SkillCandidate { path: string; default_name: string; description: string | null; taken: boolean; total_bytes?: number; warnings?: { path: string; kinds: ('executable' | 'script' | 'binary' | 'large')[] }[] }
 export interface ResolvedSource { source: string; git_ref: string; commit: string; candidates: SkillCandidate[] }
-export interface ResolveRequest { link: string; path?: string }
+export interface ResolveRequest { link: string; path?: string; ref?: string }
+export interface ImportChanges {
+  locked: string; upstream: string; truncated: boolean; files: string[];
+  commits: { sha: string; date: string; subject: string }[];
+}
 export interface AddImportRequest { name: string; source: string; path: string; ref: string; commit?: string }
 
 export type ContentType = 'personal' | 'import' | 'rule' | 'unmanaged';

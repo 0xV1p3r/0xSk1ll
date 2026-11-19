@@ -1406,7 +1406,7 @@ async fn imports_resolve_links_and_add_one_skill() {
     let link = source.to_string_lossy().into_owned();
     m.start().await;
 
-    let req = ResolveImportRequest { link: link.clone(), path: String::new() };
+    let req = ResolveImportRequest { link: link.clone(), path: String::new(), git_ref: String::new() };
     let r = m.client.resolve_import(&req).await.unwrap();
     assert_eq!((r.source.as_str(), r.git_ref.as_str()), (link.as_str(), "HEAD"));
     let found: Vec<_> = r.candidates.iter().map(|c| (c.path.as_str(), c.default_name.as_str(), c.taken)).collect();
@@ -1441,6 +1441,23 @@ async fn imports_resolve_links_and_add_one_skill() {
     })
     .await;
     assert!(draft.iter().any(|d| d.item == ItemRef::Skill("pdf".into())), "{draft:?}");
+
+    let selected_ref = m.client.resolve_import(&ResolveImportRequest { git_ref: "main".into(), ..req }).await.unwrap();
+    assert_eq!(selected_ref.git_ref, "main");
+    let local = m.repo().join("imported/pdf/SKILL.md");
+    std::fs::write(&local, "my edits").unwrap();
+    let preview = m.client.import_changes("pdf", Some(&selected_ref.commit)).await.unwrap();
+    assert_eq!(preview.locked, r.commit);
+    assert_eq!(preview.commits[0].subject, "v2");
+    assert_eq!(preview.files, ["skills/pdf/SKILL.md"]);
+    let error = m.client.update_import("pdf").await.unwrap_err();
+    assert_eq!(error.status, Some(400));
+    assert!(error.message.contains("locally modified imports: pdf"), "{}", error.message);
+    assert!(error.message.contains("fork") && error.message.contains("overwrite"), "{}", error.message);
+    assert_eq!(std::fs::read_to_string(&local).unwrap(), "my edits");
+    let updated = m.client.force_update_import("pdf").await.unwrap();
+    assert_eq!(updated.new_commit, selected_ref.commit);
+    assert!(std::fs::read_to_string(&local).unwrap().contains("v2"));
 }
 
 /// A GitHub folder link with an explicit `ref` and an explicit root `path`
@@ -1464,7 +1481,11 @@ async fn an_explicit_root_path_overrides_a_folder_link() {
     m.start().await;
 
     let link = "https://github.com/o/r/tree/main/sub/pdf";
-    let r = m.client.resolve_import(&ResolveImportRequest { link: link.into(), path: String::new() }).await.unwrap();
+    let r = m
+        .client
+        .resolve_import(&ResolveImportRequest { link: link.into(), path: String::new(), git_ref: String::new() })
+        .await
+        .unwrap();
     assert_eq!((r.source.as_str(), r.git_ref.as_str()), ("github:o/r", "main"));
     assert_eq!(r.candidates.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(), ["sub/pdf"]);
 
@@ -1496,7 +1517,11 @@ async fn a_hanging_fetch_blocks_no_other_call() {
     m.start().await;
 
     let client = m.client.clone();
-    let req = ResolveImportRequest { link: "ssh://sk1ll.invalid/slow.git".into(), path: String::new() };
+    let req = ResolveImportRequest {
+        link: "ssh://sk1ll.invalid/slow.git".into(),
+        path: String::new(),
+        git_ref: String::new(),
+    };
     let stuck = tokio::spawn(async move { client.resolve_import(&req).await });
     eventually(|| async { pidfile.exists().then_some(()) }).await;
 

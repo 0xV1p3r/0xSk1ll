@@ -293,7 +293,7 @@ async fn draft_bridge_adds_fingerprints_and_preserves_daemon_entries() {
 async fn import_resolve_and_add_forward_once_with_payloads() {
     let requests = Recorded::default();
     let resolved = json!({"source":"github:example/skills", "git_ref":"main", "commit":"abcdef",
-        "candidates":[{"path":"skills/pdf", "default_name":"pdf", "description":"Read PDFs", "taken":false}]});
+        "candidates":[{"path":"skills/pdf", "default_name":"pdf", "description":"Read PDFs", "taken":false,"total_bytes":0,"warnings":[]}]});
     let mut replies = Replies::new();
     replies.insert("POST /imports/resolve".into(), (StatusCode::OK, resolved.clone()));
     replies.insert("POST /imports/add".into(), (StatusCode::CONFLICT, json!({"error":"Import name already exists"})));
@@ -303,6 +303,7 @@ async fn import_resolve_and_add_forward_once_with_payloads() {
         .resolve_import(ResolveImportRequest {
             link: "https://github.com/example/skills/tree/main/skills/pdf".into(),
             path: "".into(),
+            git_ref: String::new(),
         })
         .await
         .unwrap();

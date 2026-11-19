@@ -583,6 +583,73 @@ pub(crate) fn skill_dirs(cache: &Path, commit: &str, path: &str) -> Result<Vec<S
     Ok(dirs)
 }
 
+pub(crate) fn file_warnings(cache: &Path, commit: &str, path: &str) -> Result<(u64, Vec<crate::imports::FileWarning>)> {
+    use crate::imports::{FileWarning, WarningKind};
+    let mut cmd = Git::new(cache).literal().args(["ls-tree", "-rz", commit]);
+    if !path.is_empty() {
+        cmd = cmd.args(["--", path]);
+    }
+    let rows = cmd.run()?;
+    let mut total = 0;
+    let mut warnings = Vec::new();
+    for row in rows.split(|b| *b == 0).filter(|row| !row.is_empty()) {
+        let row = String::from_utf8_lossy(row);
+        let Some((meta, file)) = row.split_once('\t') else { continue };
+        let mut fields = meta.split_whitespace();
+        let (Some(mode), Some("blob"), Some(oid)) = (fields.next(), fields.next(), fields.next()) else {
+            continue;
+        };
+        let content = Git::new(cache).args(["cat-file", "blob", oid]).run()?;
+        total += content.len() as u64;
+        let mut kinds = Vec::new();
+        if mode == "100755" {
+            kinds.push(WarningKind::Executable);
+        }
+        let file = file.strip_prefix(path).and_then(|p| p.strip_prefix('/')).unwrap_or(file);
+        let extension = Path::new(file).extension().and_then(|s| s.to_str()).unwrap_or_default().to_ascii_lowercase();
+        if content.starts_with(b"#!")
+            || matches!(extension.as_str(), "sh" | "py" | "js" | "ts" | "ps1" | "rb" | "pl" | "bat" | "cmd")
+        {
+            kinds.push(WarningKind::Script);
+        }
+        if std::str::from_utf8(&content).is_err() {
+            kinds.push(WarningKind::Binary);
+        }
+        if content.len() > 1024 * 1024 {
+            kinds.push(WarningKind::Large);
+        }
+        if !kinds.is_empty() {
+            warnings.push(FileWarning { path: file.to_string(), kinds });
+        }
+    }
+    Ok((total, warnings))
+}
+
+pub(crate) fn changes(cache: &Path, locked: &str, upstream: &str, path: &str) -> Result<crate::imports::ImportChanges> {
+    use crate::imports::{ImportChanges, ImportCommit};
+    const LIMIT: usize = 50;
+    let range = format!("{locked}..{upstream}");
+    let log = Git::new(cache)
+        .args(["log", "--no-notes", "--no-show-signature", "--max-count=51", "--format=%h%x00%cs%x00%s", &range, "--"])
+        .text()?;
+    let mut commits: Vec<_> = log
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\0');
+            Some(ImportCommit { sha: parts.next()?.into(), date: parts.next()?.into(), subject: parts.next()?.into() })
+        })
+        .collect();
+    let truncated = commits.len() > LIMIT;
+    commits.truncate(LIMIT);
+    let mut diff =
+        Git::new(cache).literal().args(["diff", "--name-only", "--no-renames", "-z", locked, upstream, "--"]);
+    if !path.is_empty() {
+        diff = diff.arg(path);
+    }
+    let files = crate::git::split_paths(&diff.run()?).map(|file| file.to_string_lossy().into_owned()).collect();
+    Ok(ImportChanges { locked: locked.into(), upstream: upstream.into(), commits, truncated, files })
+}
+
 /// Explains why `path` at `commit` holds no skills when it isn't a folder:
 /// a `tree/` link can point at a file, or at something that isn't there.
 pub(crate) fn check_folder(cache: &Path, commit: &str, git_ref: &str, path: &str) -> Result<()> {
