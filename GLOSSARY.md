@@ -40,6 +40,12 @@ _Avoid_: Profile, selection, enablement
 The self-hosted fleet server: the fleet's git remote, which also holds its assignments and machine status and tells machines when to pull. Always means this one; the daemon's endpoint is its **local API**.
 _Avoid_: Hub, relay, coordinator
 
+**Opt-in preset**:
+A built-in Harness configuration that needs explicit enablement in `machine.toml` before sync uses it. Gemini’s skills directory is also opt-in.
+
+**Registration**:
+A Machine’s membership instance in the Fleet. Each join gets a new registration ID, even when the Machine ID is reused. Assignment writes can check that ID to guard against a concurrent rejoin.
+
 ## State
 
 **Baseline**:

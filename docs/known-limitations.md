@@ -20,6 +20,13 @@ This only applies to rules files and block instruction files. Skills are
 directories and are placed without replacing. Closing the gap needs
 `RENAME_EXCHANGE`, which is Linux-only.
 
+## A concurrent save in the Library editor
+
+The Daemon stages the editor's new text before checking the file's fingerprint
+again. If another process writes to the file between that final check and the
+rename, the editor's save replaces that write. This is the same timing gap as
+the one for rules files above.
+
 ## A save to machine.toml at the moment sk1ll writes it
 
 A harness change stages the new `machine.toml` in a file only it created,
@@ -61,8 +68,8 @@ use a path traversal that could follow a concurrent symlink replacement.
 
 ## Filesystems without hard links
 
-Updating a rules or block instruction file, and creating any file, relies on
-`link(2)`. On filesystems without hard links, such as FAT, these operations
+Sync relies on `link(2)` to update or create a Rule file or block instructions
+file. On filesystems without hard links, such as FAT, these operations
 fail and leave the original in place. They never fall back to an unsafe write.
 
 ## The recovery size cap
@@ -113,9 +120,9 @@ in their assignments, and in `GET /machines/{id}/assignment`: other machines'
 toggles for items a `self` machine removed, toggles kept for a draft or
 unpushed commit that has since gone, toggles for items that were already
 absent before a push (servers before ADR 0005 dropped those on any push),
-and toggles a cleanup failed, timed out or gave up reading the repo, or a
-restart skipped. They do nothing while the item is absent, and apply again
-when an item of the same kind and name is pushed, even if it's a new item
+and toggles left behind when cleanup failed, ran out of time reading the repo
+or was interrupted by a restart. They do nothing while the item is absent,
+and apply again when an item of the same kind and name is pushed, even if it's a new item
 that only shares the name. A `fleet` machine or the admin can clear them by
 setting the toggles.
 

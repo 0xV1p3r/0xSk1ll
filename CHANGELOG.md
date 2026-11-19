@@ -13,58 +13,48 @@ break compatibility.
   before overwriting a concurrent disk edit and a link to review the Draft.
 - Choose a branch, tag or commit in Add Import. Preview upstream commits and
   changed files in Imports or with `sk1ll update <name> --dry-run`.
-- Copy a joined Machine's Assignment from the CLI or Assignment matrix, with a preview, optional Harness mappings, and per-change log undo.
+- Copy a joined Machine's Assignment from the CLI or Assignment matrix.
+  Preview the changes, map Harnesses and undo individual changes in the log.
 - Preview a Harness's rendered instructions and on-disk diff in Settings.
   **Sync now** shows a dry-run plan before applying from Settings or the
   command palette.
 - Desktop notifications for Machine states that need attention, with an opt-out
   in Settings and `machine.toml`.
-
 - macOS arm64 builds in CI and release archives with the unsigned desktop app,
   CLI and server. Setup and the desktop app can start the daemon through launchd.
 - Create a Rule from the desktop getting-started checklist and reopen the
   checklist from the command palette.
 - Copy diagnostics and ready-to-paste join commands from the desktop app.
-  Join code entry points explain Fleet permissions and the dialog shows the
-  default expiry.
 - Restart a systemd user Daemon from the desktop app after a local API mismatch.
-- CLI commands to create join codes, remove machines, and view or undo Assignment log entries.
+- CLI commands to create join codes, remove Machines, and view or undo
+  Assignment log entries.
 - Shell completion generation with `sk1ll completions <shell>`.
-- Join-code scopes: a `self` code limits the joining Machine to its own
-  Assignment, its own log entries and removing itself; `fleet` (the default)
-  keeps today's rights. `sk1ll fleet invite --scope self|fleet`, a scope choice
-  in the desktop app, and each Machine's scope in the Fleet view. Existing
-  Machines keep `fleet` scope (ADR 0005).
-- Join-code responses include `expires_at` and `scope`; `sk1ll fleet invite`
-  and the desktop app show the exact expiry.
+- Join-code scopes. A `self` code limits the new Machine to its own
+  Assignment, log entries and membership. `fleet` is the default and keeps
+  existing Machines' access (ADR 0005). The CLI and app show when the code
+  expires, and the Fleet screen shows each Machine's scope.
 - Server settings for import checks: `SK1LL_SERVER_IMPORT_CHECKS=off` and the
   host allowlist `SK1LL_SERVER_IMPORT_HOSTS`. Skipped Imports are reported with
   a reason and shown on the desktop Imports screen.
-- Harnesses can be changed at any time, not only during first-run setup.
-  Settings and `sk1ll harnesses enable|disable|add|remove` turn harnesses on
-  and off and add, edit or remove custom harnesses and preset overrides in
-  `machine.toml`. Comments and layout are kept. Each change previews what
-  sk1ll already placed where it stops syncing, which stays there, and what
-  the next sync does. A change never removes anything. Failed placements
-  are reported, and the CLI exits nonzero. The local API adds
-  `GET /harnesses/config`, `POST /harnesses/preview` and
-  `POST /harnesses/apply` (409 if `machine.toml` changed while it was
-  written). A client talking to a daemon too old for these routes says to
-  restart the daemon.
-- `sk1ll assign <harness> --all on|off` sets every skill and rule and both
-  defaults. Turning a harness's items off before turning it off lets sync
-  take out what it placed; the preview says so, and Settings offers
-  **Turn off this Harness's items first**.
+- Change Harnesses after setup in Settings or with
+  `sk1ll harnesses enable|disable|add|remove`. Preview which placements
+  stay behind and what the next sync will place. Changes preserve
+  `machine.toml` comments and report failed placements.
+- `sk1ll assign <harness> --all on|off` sets every Skill and Rule and both
+  defaults, including Baseline items the joined Machine has yet to pull.
+  Settings offers to turn off the items before disabling a Harness so sync
+  can remove managed placements. Older Servers use the local item list and
+  warn that unpulled items may stay on.
 - Opt-in presets for GitHub Copilot CLI (`copilot`), Cursor (`cursor`), Amp
-  (`amp`), Kiro (`kiro`), Cline (`cline`) and Roo Code (`roo`), and gemini's
+  (`amp`), Kiro (`kiro`), Cline (`cline`) and Roo Code (`roo`), and Gemini's
   skills directory (`~/.gemini/skills`). They sync only while
   `machine.toml` enables them (`enabled = true`; for gemini,
   `skills = "~/.gemini/skills"`), so an upgraded machine syncs only where it
   did before. First-run setup enables the ones it finds and you keep;
   elsewhere they are listed as available. An existing custom harness with
   such a name keeps its own paths.
-- `sk1ll harnesses --all` also lists every harness that is off: turned
-  off, available, or not found on this machine.
+- `sk1ll harnesses --all` also lists disabled Harnesses, available presets
+  and presets that were not detected.
 - Settings shows the resolved `machine.toml` path and opens it in the
   preferred editor.
 
@@ -72,7 +62,6 @@ break compatibility.
 
 - Add Import and `sk1ll add --list` show file sizes and warn about scripts,
   executable files, binaries and files over 1 MiB.
-
 - Machines that joined with a `self` join code get `403` for creating join
   codes or managing other Machines.
 - The server accepts pushes only to the baseline branch, the one HEAD names
@@ -83,8 +72,6 @@ break compatibility.
 - The server refuses to start when the repo's HEAD is detached or names
   something outside `refs/heads/`, and says how to fix it. Changing HEAD needs
   a restart.
-- Every push, by any Machine, keeps toggles for items that were already absent
-  before it; only the items it removed lose their toggles.
 - CLI setup explains how to join as the first machine and shows manual sync commands when the daemon is skipped.
 - `sk1ll sync --force` help lists managed instruction blocks, skill copies, and rule files.
 - `machine.toml` is written through a temporary file only sk1ll created,
@@ -104,9 +91,6 @@ break compatibility.
 
 ### Fixed
 
-- In Fleet mode, `sk1ll assign <harness> --all on|off` and the Settings
-  turn-off button include Baseline items the Machine has yet to pull.
-  Older Servers use the local item list and show a warning.
 - When local edits prevent an Import update, the desktop app offers to fork
   the Import or overwrite the edits after confirmation.
 - Starting the macOS daemon recreates its log directory and repairs generated
@@ -122,11 +106,11 @@ break compatibility.
 - A push queued behind its Machine's removal is refused with `401`, and a
   removal waits for a push in progress. A delayed WebSocket upgrade or
   revocation for a removed token can't end a rejoined Machine's session.
-- A push whose tree the server can't list, or that times out listing it,
-  drops no toggles, and a later push no longer drops toggles for what it
-  removed. Server reads of the repo have a deadline and a 64 MiB output cap,
-  each push and draft discard a total budget for its reads, and a read that
-  misses them or is cancelled stops its git process group.
+- If the Server cannot list either tree for a push, that push drops no
+  toggles. Later pushes leave those toggles alone. Repo reads have a
+  deadline and a 64 MiB output cap. Each push and Draft discard also has
+  a total read budget. A cancelled or timed-out read stops its git process
+  group.
 - A draft discard reads the baseline branch itself instead of the HEAD cached
   after the last push, so a push whose HEAD read failed can't make it drop a
   toggle for an item in the baseline. A failed read is no longer taken for an
@@ -154,22 +138,12 @@ break compatibility.
   when the server confirms the scope.
 - Join codes are invalid from their `expires_at` second on, matching the
   reported expiry.
-- The Assignment matrix loads each Machine on its own. A Machine whose
-  Assignment fails to load shows the error and a Retry in its column instead
-  of failing the whole matrix, and bulk changes and undo skip it. Machine ids
-  such as `constructor` no longer break it, a Machine that left the Fleet or
-  joined again loses its cached Assignment, a newer load always replaces an
-  older cached one, and Undo skips a Machine that left or whose Assignment
-  changed since. Undo also sends the revision and registration it expects:
-  the Server (or the standalone Daemon) refuses it with HTTP 409 when the
-  Assignment changed meanwhile, and the matrix reloads and says Undo is no
-  longer available. `PUT /api/machines/{id}/assignment` takes an optional
-  `expected`.
-- Every Machine has a random `registration` id, new for every join, in
-  `GET /api/fleet` and `GET /api/machines/{id}/assignment` (Server database
-  migration 5 gives existing Machines one). The matrix ties each load, retry
-  and write to it, so a late reply for a Machine that left and joined again
-  within the same second no longer shows its old Assignment.
+- The Assignment matrix loads and retries each Machine independently.
+  Bulk changes apply only at the displayed revision. Undo checks the
+  revision and registration again, and skips Machines that left, rejoined
+  or changed. The Server assigns a new registration ID at each join so
+  the matrix can discard late replies from a prior membership. Older
+  Servers without registration IDs do not offer guarded Undo.
 - A batch Import tries every selected skill instead of stopping at the first
   failure, even when the Daemon was unreachable for one, shows each as added,
   not added or not attempted (after Stop), reads back what reached the Draft
@@ -181,24 +155,12 @@ break compatibility.
 - An interrupted Adopt can be resumed from the Library. `GET /skills` marks
   the unmanaged variant that matches the existing personal copy as
   `resumable`; other variants stay blocked.
-- A rename has the Assignment's authority copy this Machine's toggles to the
-  new name before renaming: the Server through the new
-  `POST /api/machines/{id}/assignment/copy {from, to}`, which checks the
-  caller's scope like a `PUT`, checks both items and copies the current
-  explicit toggles of `from` in one transaction, or the Daemon itself when standalone. When the copy fails
-  (offline, an older Server without the endpoint, or an uncertain response), nothing is renamed
-  and `POST /items/rename` answers HTTP 409. An uncertain response leaves
-  any copied toggles in place and reports that they may exist. `"copy_assignment": false`
-  renames anyway, and the Library offers it as Rename without copying
-  Assignment. The copy never overwrites a toggle the new name already has:
-  the response lists those Harnesses in `kept` instead of `migrated`. When
-  the rename then moves nothing, the toggles the copy applied are removed
-  again under its revision and registration, or the error says where they
-  were kept.
-- A bulk change in the Assignment matrix applies only to the revision shown,
-  so Undo restores the values it replaced. Undo is offered only when the
-  Server reports registrations (or standalone), as an older Server would
-  ignore its guard.
+- Renaming a Personal Skill or Rule copies this Machine's explicit toggles
+  to the new name first. The Server handles the copy for joined Machines,
+  and the Daemon handles it in standalone mode. Existing destination toggles
+  are preserved. If the copy fails or its outcome is uncertain, the Library
+  offers **Rename without copying Assignment**. If the copy succeeds and the
+  rename moves nothing, cleanup uses the copy's revision and registration.
 
 ## [0.1.0] - 2026-11-17
 

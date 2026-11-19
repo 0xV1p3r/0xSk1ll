@@ -22,7 +22,7 @@ For several machines, a self-hosted server acts as the git remote and holds the 
 
 ## Install
 
-Releases ship Linux and Apple silicon macOS builds. Each [release](https://github.com/0xV1p3r/0xSk1ll/releases) has:
+Release builds target Linux and Apple silicon macOS. The [release page](https://github.com/0xV1p3r/0xSk1ll/releases) lists available archives:
 
 - `sk1ll-<version>-x86_64-linux.tar.gz` with `sk1ll`, the desktop app `sk1ll-gui`, `sk1ll-server` and the systemd unit, and an `aarch64` archive without the app,
 - `sk1ll-<version>-aarch64-macos.tar.gz` with `sk1ll`, `sk1ll-server`, `0xSk1ll.app` and the launchd plist,
@@ -69,7 +69,7 @@ The repo lives in `~/.local/share/sk1ll/repo` (`$XDG_DATA_HOME/sk1ll/repo`) on L
 
 ## Draft and baseline
 
-The committed `HEAD`, pushed to the server, is the **baseline**. Uncommitted changes are this machine's **draft**. Sync applies the draft to the harnesses right away, so you can try an edit before other machines get it.
+The pushed state of the Fleet repo is the **Baseline**. Local commits stay on this Machine until pushed. Uncommitted changes are this machine's **draft**. Sync applies the draft to the harnesses right away, so you can try an edit before other machines get it.
 
 ```sh
 sk1ll draft                          # draft items: A(dded), M(odified), D(eleted)
@@ -87,7 +87,7 @@ Commands take a bare skill or rule name, or `skill:<name>`, `rule:<name>`, `mani
 |---|---|
 | `setup` | Set up this machine step by step: a standalone repo, joining a fleet or starting one, harnesses and the daemon service |
 | `init [path]` | Create a skills repo |
-| `add <link>` | Import a skill (`--path`, `--ref`, `--name`). Use `--list` to preview candidates, total sizes and file warnings |
+| `add <link>` | Import a skill (`--path`, `--name`). Use `--ref` to select a branch, tag or commit and `--list` to show candidates, sizes and warnings about scripts, executables, binaries and large files |
 | `update [name] [--force]` | Re-fetch imports. Local edits require `--force` |
 | `update <name> --dry-run` | Preview upstream commits and changed files for one Import |
 | `remove <name>` | Remove an import |
@@ -97,10 +97,10 @@ Commands take a bare skill or rule name, or `skill:<name>`, `rule:<name>`, `mani
 | `status` | Import drift and pending sync actions |
 | `sync [--dry-run] [--force]` | Write skills and instructions into harnesses |
 | `render <harness>` | Print the instruction files a harness would receive |
-| `harnesses [--all] [enable\|disable\|add\|remove]` | List the harnesses sync writes into (`--all`: every other one too, including available opt-in presets), or change them in `machine.toml` after a preview of what stays in the harness |
+| `harnesses [--all] [enable\|disable\|add\|remove]` | List the harnesses sync writes into and use `--all` to include disabled Harnesses and opt-in presets. The subcommands change `machine.toml` after previewing what stays in each Harness |
 | `assign <harness> skill\|rule <name> on\|off` | Toggle an item for one harness |
 | `assign <harness> --default-skills on\|off` | Set the default for skills added later (`--default-rules` for rules) |
-| `assign <harness> --all on\|off` | Every skill and rule and both defaults, e.g. `--all off` before turning a harness off so sync takes out what it placed |
+| `assign <harness> --all on\|off` | Set every Skill and Rule and both defaults. With a Fleet, this includes Baseline items the Machine has yet to pull |
 | `conflicts` | List harness and recovery conflicts |
 | `adopt <harness> <name>` | Copy a hand edit or an unmanaged skill into the draft |
 | `recover list\|adopt\|discard` | Inspect content that sync moved aside |
@@ -111,7 +111,7 @@ Commands take a bare skill or rule name, or `skill:<name>`, `rule:<name>`, `mani
 | `fleet invite` | Create a single-use join code and print the join command and expiry; `--scope self` limits the new machine to managing itself |
 | `fleet remove <machine>` | Remove a machine after confirming its id. Use `--yes` in scripts |
 | `fleet copy-assignment <source> <target>` | Preview and copy a joined Machine's Assignment. Use `--merge`, repeat `--map from=to`, or pass `--yes` in scripts |
-| `fleet log`, `fleet undo <entry-id>` | Filter the Assignment log or undo an entry |
+| `fleet log`, `fleet undo <entry-id>` | Filter the Assignment log by Machine, Harness, author or item, or undo one entry |
 | `completions <shell>` | Generate shell completions |
 
 `sk1ll <command> --help` lists every flag.
