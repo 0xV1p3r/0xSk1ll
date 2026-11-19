@@ -8,7 +8,7 @@ import { toast } from './toast';
 vi.mock('./toast', () => ({ toast: vi.fn() }));
 import type { ContentEntry, ContentType } from './types';
 
-vi.mock('./api', () => ({ api: { skills: vi.fn(), skillTree: vi.fn(), skillFile: vi.fn(), editors: vi.fn(),
+vi.mock('./api', () => ({ api: { skills: vi.fn(), skillTree: vi.fn(), skillFile: vi.fn(), writeSkillFile: vi.fn(), editors: vi.fn(),
   fork: vi.fn(), adoptUnmanaged: vi.fn(), openInEditor: vi.fn(), setPreferredEditor: vi.fn(), createItem: vi.fn(), deleteItem: vi.fn(), renameItem: vi.fn() },
   errorMessage: (error: unknown) => typeof error === 'object' && error && 'message' in error ? String(error.message) : String(error),
   errorStatus: (error: unknown) => typeof error === 'object' && error && 'status' in error ? error.status : undefined }));
@@ -358,4 +358,44 @@ it('applies each handoff: a content handoff clears an earlier Type filter, and a
   expect((screen.getByLabelText('Search by name') as HTMLInputElement).value).toBe('pdf');
   view.rerender(<TooltipProvider><Skills {...props} handoff={{ create: 'rule' }} /></TooltipProvider>);
   expect(await screen.findByRole('dialog', { name: 'New Rule' })).toBeTruthy();
+});
+
+it('guards file navigation and saves with Ctrl+S, then offers Draft review', async () => {
+  vi.stubGlobal('confirm', vi.fn(() => false));
+  vi.mocked(api.skillFile).mockResolvedValue({ path: 'SKILL.md', text: '# Before', fingerprint: 'old', binary: false, too_large: false, size: 8 });
+  vi.mocked(api.writeSkillFile).mockResolvedValue();
+  mount();
+  await select('writing', 'Personal');
+  fireEvent.click(await screen.findByRole('button', { name: 'Edit' }));
+  const textarea = screen.getByRole('textbox', { name: 'SKILL.md' });
+  fireEvent.change(textarea, { target: { value: '# After' } });
+  fireEvent.click(screen.getByRole('button', { name: 'example.md' }));
+  expect(window.confirm).toHaveBeenCalled();
+  expect(screen.getByRole('textbox', { name: 'SKILL.md' })).toBe(textarea);
+  fireEvent.keyDown(textarea, { key: 's', ctrlKey: true });
+  expect(api.writeSkillFile).toHaveBeenCalledWith({ item: 'skill:writing', path: 'SKILL.md', content: '# After', expected: 'old' });
+  fireEvent.click(await screen.findByRole('button', { name: 'Review in Draft' }));
+  expect(changed).toHaveBeenCalledOnce();
+  expect(reviewDraft).toHaveBeenCalledOnce();
+});
+
+it('shows the disk diff before overwriting and handles another concurrent edit', async () => {
+  const file = { path: 'SKILL.md', text: '# Before', fingerprint: 'old', binary: false, too_large: false, size: 8 };
+  vi.mocked(api.skillFile).mockResolvedValueOnce(file)
+    .mockResolvedValueOnce({ ...file, text: '# Disk edit', fingerprint: 'disk' })
+    .mockResolvedValueOnce({ ...file, text: '# Later edit', fingerprint: 'later' });
+  vi.mocked(api.writeSkillFile).mockRejectedValue({ status: 409, message: 'File changed on disk' });
+  mount();
+  await select('writing', 'Personal');
+  fireEvent.click(await screen.findByRole('button', { name: 'Edit' }));
+  fireEvent.change(screen.getByRole('textbox', { name: 'SKILL.md' }), { target: { value: '# My edit' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+  expect(await screen.findByText('File changed on disk')).toBeTruthy();
+  expect(await screen.findByText(/# Disk edit/)).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: 'Overwrite' }));
+  expect(api.writeSkillFile).toHaveBeenLastCalledWith({ item: 'skill:writing', path: 'SKILL.md', content: '# My edit', expected: 'disk' });
+  expect(await screen.findByText(/# Later edit/)).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: 'Reload' }));
+  expect((screen.getByRole('textbox', { name: 'SKILL.md' }) as HTMLTextAreaElement).value).toBe('# Later edit');
+  expect(screen.queryByText('File changed on disk')).toBeNull();
 });

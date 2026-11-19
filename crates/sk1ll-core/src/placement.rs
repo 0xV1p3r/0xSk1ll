@@ -81,16 +81,7 @@ mod unix {
         pub fn create_file(&self, path: &Path, bytes: &[u8], executable: bool) -> io::Result<()> {
             let (parent, name) = self.parent(path, true)?;
             let mut stage = Stage::new(&parent)?;
-            let file = fd::openat(
-                &stage.directory,
-                "file",
-                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::from_raw_mode(if executable { 0o755 } else { 0o644 }),
-            )?;
-            stage.file_created = true;
-            let mut file = File::from(file);
-            file.write_all(bytes)?;
-            file.sync_all()?;
+            stage.write(bytes, Mode::from_raw_mode(if executable { 0o755 } else { 0o644 }), false)?;
             fd::linkat(&stage.directory, "file", &parent, &name, AtFlags::empty())?;
             Ok(())
         }
@@ -98,6 +89,42 @@ mod unix {
         pub fn create_symlink(&self, path: &Path, target: &OsStr) -> io::Result<()> {
             let (parent, name) = self.parent(path, true)?;
             Ok(fd::symlinkat(target, &parent, &name)?)
+        }
+    }
+
+    pub(crate) fn replace_file<E>(
+        parent: &OwnedFd,
+        name: &OsStr,
+        bytes: &[u8],
+        mode: u32,
+        unchanged: impl FnOnce() -> Result<bool, E>,
+    ) -> io::Result<Result<bool, E>> {
+        let mut stage = Stage::new(parent)?;
+        stage.write(bytes, Mode::from_raw_mode(mode), true)?;
+        match unchanged() {
+            Ok(true) => {
+                fd::renameat(&stage.directory, "file", parent, name)?;
+                Ok(Ok(true))
+            }
+            result => Ok(result),
+        }
+    }
+
+    impl Stage<'_> {
+        fn write(&mut self, bytes: &[u8], mode: Mode, preserve_mode: bool) -> io::Result<()> {
+            let file = fd::openat(
+                &self.directory,
+                "file",
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                if preserve_mode { Mode::RUSR | Mode::WUSR } else { mode },
+            )?;
+            self.file_created = true;
+            let mut file = File::from(file);
+            file.write_all(bytes)?;
+            if preserve_mode {
+                fd::fchmod(&file, mode)?;
+            }
+            file.sync_all()
         }
     }
 
@@ -134,7 +161,7 @@ mod unix {
 #[cfg(unix)]
 pub use unix::Directory;
 #[cfg(unix)]
-pub(crate) use unix::{DIRECTORY, open_directory};
+pub(crate) use unix::{DIRECTORY, open_directory, replace_file};
 
 // New writes fail closed where descriptor-relative traversal isn't available.
 #[cfg(not(unix))]

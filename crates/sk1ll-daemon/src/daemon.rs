@@ -1503,6 +1503,15 @@ impl Daemon {
         )?)
     }
 
+    pub(crate) fn write_skill_file(&self, eng: &mut Engine, req: &crate::client::WriteFileRequest) -> Result<()> {
+        self.ensure_managed(eng)?;
+        self.lock_repo(eng)?;
+        if !sk1ll_core::content::write_file(&Repo::open(Self::root(eng))?, req)? {
+            return Err(Error::Conflict("File changed on disk".into()));
+        }
+        self.refresh(eng)
+    }
+
     /// Replaces the harness's content with what the draft says: a forced plan,
     /// applied for this one item only.
     pub(crate) fn overwrite(&self, eng: &mut Engine, t: ConflictTarget) -> Result<()> {

@@ -483,7 +483,7 @@ async fn skill_commands_preserve_queries_payloads_and_errors() {
         "variants":[{"hash":"sha256:one", "description":"PDF", "locations":[{"harness":"claude", "path":"/tmp/pdf"}],
         "resumable":false}]}]);
     let tree = json!([{"path":"SKILL.md", "kind":"file", "size":12}]);
-    let file = json!({"path":"docs/a b.md", "text":"# PDF", "binary":false, "too_large":false, "size":5});
+    let file = json!({"path":"docs/a b.md", "text":"# PDF", "binary":false, "too_large":false, "size":5, "fingerprint":"sha256:loaded"});
     let mut replies = Replies::new();
     for (route, value) in [
         ("GET /skills", inventory.clone()),
@@ -494,6 +494,7 @@ async fn skill_commands_preserve_queries_payloads_and_errors() {
     }
     replies.insert("POST /skills/adopt".into(), (StatusCode::NO_CONTENT, Value::Null));
     replies.insert("POST /imports/fork".into(), (StatusCode::CONFLICT, json!({"error":"Skill changed"})));
+    replies.insert("POST /skills/file".into(), (StatusCode::CONFLICT, json!({"error":"File changed on disk"})));
     let daemon = FakeDaemon::start(Router::new().fallback(respond).with_state((requests.clone(), replies))).await;
     let bridge = Bridge::new(daemon.client.clone());
     assert_eq!(serde_json::to_value(bridge.skills().await.unwrap()).unwrap(), inventory);
@@ -511,10 +512,27 @@ async fn skill_commands_preserve_queries_payloads_and_errors() {
     let error = bridge.fork("pdf".into()).await.unwrap_err();
     assert_eq!(error.status, Some(409));
     assert_eq!(error.message, "Skill changed");
+    let error = bridge
+        .write_skill_file(WriteFileRequest {
+            file: FileQuery {
+                content: ContentQuery { item: "rule:style".into(), hash: None, harness: None },
+                path: "style.md".into(),
+            },
+            content: "# Updated".into(),
+            expected: "sha256:loaded".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.status, Some(409));
     let requests = requests.lock().unwrap();
-    assert_eq!(requests.len(), 5, "mutations are never retried");
+    assert_eq!(requests.len(), 6, "mutations are never retried");
     assert_eq!(requests[3].2, json!({"harness":"claude", "name":"pdf"}));
     assert_eq!(requests[4].2, json!({"name":"pdf"}));
+    assert_eq!(
+        requests[5].2,
+        json!({"item":"rule:style", "harness":null, "hash":null, "path":"style.md",
+        "content":"# Updated", "expected":"sha256:loaded"})
+    );
 }
 
 #[tokio::test]

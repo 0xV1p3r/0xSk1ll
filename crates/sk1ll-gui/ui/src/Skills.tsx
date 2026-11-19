@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode, type RefObject } from 'react';
 import { ArrowDown, ArrowUp, ChevronDown, Code, Eye, File, Folder, LayoutGrid, SquareTerminal } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -14,7 +14,7 @@ import { api, errorStatus } from './api';
 import { useMutation, useResource } from './hooks';
 import { ChangeBadge, Confirm, DiffLines, ErrorNotice, Loading, Nothing, Notice, Panel, PanelToolbar, Pending, SectionTitle } from './shared';
 import { terms } from './model';
-import { SkillFile } from './SkillFile';
+import { SkillFile, canLeaveFile, type FileEditState } from './SkillFile';
 import { unifiedDiff } from './textDiff';
 import type { ContentEntry, ContentQuery, ContentType, ContentVariant, Editor, StatusView } from './types';
 
@@ -39,8 +39,8 @@ function DraftBadge({ entry }: { entry: ContentEntry }) {
 // A request from another screen; every new object is applied, even when the Library is already open.
 export type SkillsHandoff = { search?: string; filter?: ContentType; create?: 'skill' | 'rule' };
 const noHandoff: SkillsHandoff = {};
-export function Skills({ entries, revision, changed, reviewDraft, assignment, addImport, connection, handoff = noHandoff }: {
-  handoff?: SkillsHandoff; connection: StatusView['connection']; entries: ContentEntry[]; revision: number; changed: () => void; reviewDraft: () => void; assignment: (item: string, harness: string) => void; addImport: () => void;
+export function Skills({ fileEditState, entries, revision, changed, reviewDraft, assignment, addImport, connection, handoff = noHandoff }: {
+  fileEditState?: RefObject<FileEditState>; handoff?: SkillsHandoff; connection: StatusView['connection']; entries: ContentEntry[]; revision: number; changed: () => void; reviewDraft: () => void; assignment: (item: string, harness: string) => void; addImport: () => void;
 }) {
   const [filter, setFilter] = useState<string>(handoff.filter ?? 'all');
   const [search, setSearch] = useState(handoff.search ?? '');
@@ -56,6 +56,15 @@ export function Skills({ entries, revision, changed, reviewDraft, assignment, ad
   }, [handoff]);
   const [sort, setSort] = useState<{ column: 'name' | 'type'; descending: boolean }>({ column: 'name', descending: false });
   const [selected, setSelected] = useState<{ key: string; harness?: string; optimistic?: { entry: ContentEntry; inventory: ContentEntry[] } }>();
+  const localEditState = useRef<FileEditState>('clean');
+  const editState = fileEditState ?? localEditState;
+  const guard = useCallback((state: FileEditState) => { editState.current = state; }, [editState]);
+  const canLeave = () => canLeaveFile(editState.current);
+  const leave = (action: () => void) => {
+    if (!canLeave()) return;
+    guard('clean');
+    action();
+  };
   const sheet = useRef<HTMLDivElement>(null);
   const current = entries.find(value => keyFor(value) === selected?.key);
   const entry = selected?.optimistic?.inventory === entries ? selected.optimistic.entry : current;
@@ -105,27 +114,29 @@ export function Skills({ entries, revision, changed, reviewDraft, assignment, ad
       <p className="text-sm text-muted-foreground">{creating === 'rule' ? "New Rules follow each Harness's default for new Rules; change it in the Assignment matrix." : "New Skills follow each Harness's default for new Skills; change it in the Assignment matrix."}</p><ErrorNotice error={creation.error} />
       <DialogFooter><Button type="button" variant="outline" disabled={creation.pending} onClick={() => setCreating(undefined)}>Cancel</Button><Button type="submit" disabled={!!nameError || creation.pending}>Create</Button></DialogFooter></form></DialogContent>
     </Dialog>
-    <Dialog open={!!entry} onOpenChange={open => { if (!open) setSelected(undefined); }}>
+    <Dialog open={!!entry} onOpenChange={open => { if (!open && canLeave()) setSelected(undefined); }}>
       <DialogContent ref={sheet} initialFocus={sheet} className="flex h-[calc(100dvh-2rem)] flex-col gap-0 overflow-hidden p-0 sm:h-[calc(100dvh-4rem)] sm:max-w-[min(72rem,calc(100%-4rem))]">
-        {entry && <SkillDetail key={`${entry.type === 'rule' ? 'rule' : 'skill'}:${entry.name}`} entry={entry} entries={entries} close={() => setSelected(undefined)} initialHarness={selected?.harness} connection={connection} revision={revision} changed={changed} reviewDraft={() => { setSelected(undefined); reviewDraft(); }}
-          assignment={assignment} converted={next => setSelected({ key: keyFor(next), optimistic: { entry: next, inventory: entries } })} />}
+        {entry && <SkillDetail key={`${entry.type === 'rule' ? 'rule' : 'skill'}:${entry.name}`} entry={entry} entries={entries} guard={guard} canLeave={canLeave} close={() => setSelected(undefined)} initialHarness={selected?.harness} connection={connection} revision={revision} changed={changed} reviewDraft={() => leave(() => { setSelected(undefined); reviewDraft(); })}
+          assignment={(item, harness) => leave(() => assignment(item, harness))} converted={next => setSelected({ key: keyFor(next), optimistic: { entry: next, inventory: entries } })} />}
       </DialogContent>
     </Dialog>
   </div>;
 }
 
-function SkillFilePreview({ query, path, revision }: { query: () => ContentQuery; path: string; revision: number }) {
+type BrowserEditor = { writable: boolean; changed: () => void; guard: (state: FileEditState) => void };
+function SkillFilePreview({ query, path, revision, editor }: { query: () => ContentQuery; path: string; revision: number; editor?: BrowserEditor & { setEditing: (editing: boolean) => void } }) {
   const file = useResource(useCallback(() => api.skillFile({ ...query(), path }), [query, path]), revision);
-  return <><ErrorNotice error={file.error} />{file.loading ? <Loading /> : file.data && <SkillFile file={file.data} />}</>;
+  return <><ErrorNotice error={file.error} />{file.data ? <SkillFile file={file.data} editor={editor && { ...editor, query: query(), reload: file.setData }} /> : file.loading && <Loading />}</>;
 }
 
-function SkillBrowser({ query, revision }: { query: () => ContentQuery; revision: number }) {
-  const tree = useResource(useCallback(() => api.skillTree(query()), [query]), revision);
+function SkillBrowser({ query, revision, editor, canLeave }: { query: () => ContentQuery; revision: number; editor?: BrowserEditor; canLeave: () => boolean }) {
+  const [editing, setEditing] = useState(false);
+  const tree = useResource(useCallback(() => api.skillTree(query()), [query]), revision, undefined, !editing);
   const [selectedPath, setSelectedPath] = useState('');
   const path = tree.data?.some(file => file.path === selectedPath && file.kind !== 'directory') ? selectedPath
     : tree.data?.find(file => file.path === 'SKILL.md')?.path ?? tree.data?.find(file => file.kind !== 'directory')?.path;
   const multiple = (tree.data?.filter(file => file.kind !== 'directory').length ?? 0) > 1;
-  if (tree.loading) return <Loading rows={2} />;
+  if (tree.loading && !tree.data) return <Loading rows={2} />;
   if (!tree.data?.length) return <><ErrorNotice error={tree.error} />{!tree.error && <p className="text-sm text-muted-foreground">No files.</p>}</>;
   return <>
       <ErrorNotice error={tree.error} />
@@ -134,9 +145,9 @@ function SkillBrowser({ query, revision }: { query: () => ContentQuery; revision
           {tree.data.map(value => value.kind === 'directory'
             ? <span key={value.path} title={value.path} className="flex h-8 items-center gap-1.5 text-sm text-muted-foreground" style={{ paddingLeft: 8 + (value.path.split('/').length - 1) * 12 }}><Folder className="size-4 shrink-0" /><span className="truncate">{value.path.split('/').pop()}</span></span>
             : <Button key={value.path} variant={path === value.path ? 'secondary' : 'ghost'} size="default" className="justify-start" aria-current={path === value.path ? 'page' : undefined}
-              style={{ paddingLeft: 8 + (value.path.split('/').length - 1) * 12 }} title={value.path} onClick={() => setSelectedPath(value.path)}><File data-icon="inline-start" /><span className="truncate">{value.path.split('/').pop()}</span></Button>)}
+              style={{ paddingLeft: 8 + (value.path.split('/').length - 1) * 12 }} title={value.path} onClick={() => { if (value.path !== path && canLeave()) setSelectedPath(value.path); }}><File data-icon="inline-start" /><span className="truncate">{value.path.split('/').pop()}</span></Button>)}
         </nav>}
-        <div className="min-w-0">{path && <SkillFilePreview key={path} query={query} path={path} revision={revision} />}</div>
+        <div className="min-w-0">{path && <SkillFilePreview key={path} editor={editor && { ...editor, setEditing }} query={query} path={path} revision={revision} />}</div>
       </div>
   </>;
 }
@@ -187,8 +198,8 @@ function ServerRequired({ needed, children }: { needed: boolean; children: React
     <TooltipContent>Needs a connection to the Server</TooltipContent></Tooltip> : children;
 }
 
-function SkillDetail({ entry, entries, close, initialHarness, revision, changed, reviewDraft, converted, connection, assignment }: {
-  entries: ContentEntry[]; close: () => void; assignment: (item: string, harness: string) => void; connection: StatusView['connection']; entry: ContentEntry; initialHarness?: string; revision: number; changed: () => void; reviewDraft: () => void; converted: (entry: ContentEntry) => void;
+function SkillDetail({ entry, entries, close, initialHarness, revision, changed, reviewDraft, converted, connection, assignment, guard, canLeave }: {
+  guard: BrowserEditor['guard']; canLeave: () => boolean; entries: ContentEntry[]; close: () => void; assignment: (item: string, harness: string) => void; connection: StatusView['connection']; entry: ContentEntry; initialHarness?: string; revision: number; changed: () => void; reviewDraft: () => void; converted: (entry: ContentEntry) => void;
 }) {
   const [location, setLocation] = useState(() => {
     const variant = entry.variants.find(value => value.locations.some(loc => loc.harness === initialHarness));
@@ -202,6 +213,7 @@ function SkillDetail({ entry, entries, close, initialHarness, revision, changed,
   const query = useCallback(() => ({ item, ...(hash ? { hash, harness } : {}) }), [item, hash, harness]);
   const editors = useResource(loadEditors, revision);
   const mutation = useMutation();
+  const [fileSaved, setFileSaved] = useState(false);
   const [comparing, setComparing] = useState(false);
   const [renaming, setRenaming] = useState(false), [renameTo, setRenameTo] = useState(entry.name);
   const rename = useMutation();
@@ -263,10 +275,10 @@ function SkillDetail({ entry, entries, close, initialHarness, revision, changed,
       </DialogHeader>
       <div className="flex flex-col items-end gap-1.5"><div className="flex flex-wrap justify-end gap-2">
         {(entry.type === 'personal' || entry.type === 'rule') && entry.draft !== 'deleted' && <>
-          <Button variant="outline" size="sm" onClick={() => { setRenameTo(entry.name); setCopyRefused(false); setRenaming(true); }}>Rename…</Button>
-          <Confirm label="Delete…" confirmLabel="Delete" triggerVariant="outline" title={`Delete ${entry.name}?`} description={connection === 'standalone' ? "This removes it from this Machine's Draft. Commit saves the deletion to the local repository." : "This removes it from this Machine's Draft. The deletion reaches other Machines after you commit and push it and they sync."} action={() => api.deleteItem({ kind, name: entry.name })} onDone={() => { toast({ title: `${entry.name} deleted in Draft` }); close(); changed(); }} />
+          <Button variant="outline" size="sm" onClick={() => { if (!canLeave()) return; setRenameTo(entry.name); setCopyRefused(false); setRenaming(true); }}>Rename…</Button>
+          <Confirm label="Delete…" confirmLabel="Delete" triggerVariant="outline" title={`Delete ${entry.name}?`} description={connection === 'standalone' ? "This removes it from this Machine's Draft. Commit saves the deletion to the local repository." : "This removes it from this Machine's Draft. The deletion reaches other Machines after you commit and push it and they sync."} action={async () => { if (!canLeave()) throw new Error('Save or cancel your edits before deleting this item.'); await api.deleteItem({ kind, name: entry.name }); }} onDone={() => { toast({ title: `${entry.name} deleted in Draft` }); close(); changed(); }} />
         </>}
-        {entry.draft && <Button ref={reviewButton} variant="outline" size="default" onClick={reviewDraft}>Review in Draft</Button>}
+        {(entry.draft || fileSaved) && <Button ref={reviewButton} variant="outline" size="default" onClick={reviewDraft}>Review in Draft</Button>}
         {entry.draft !== 'deleted' && <>
           <ServerRequired needed={needsServer}><div className="flex" role="group" aria-label="Edit Skill">
             <Button variant="outline" size="default" className="rounded-r-none" disabled={(entry.type !== 'unmanaged' && !preferred) || mutation.pending || (entry.type === 'unmanaged' && !canAdopt)}
@@ -302,7 +314,7 @@ function SkillDetail({ entry, entries, close, initialHarness, revision, changed,
         <Button size="default" variant={comparing ? 'secondary' : 'ghost'} aria-pressed={comparing} onClick={() => setComparing(true)}>Compare variants</Button>
       </div>}
       {comparing && hash && harness ? <VariantCompare item={item} base={{ hash, harness }} variants={entry.variants} revision={revision} />
-        : <SkillBrowser key={`${item}:${hash}:${harness}`} query={query} revision={revision} />}
+        : <SkillBrowser canLeave={canLeave} editor={(entry.type === 'personal' || entry.type === 'rule') ? { writable: entry.draft !== 'deleted', changed: () => { setFileSaved(true); changed(); }, guard } : undefined} key={`${item}:${hash}:${harness}`} query={query} revision={revision} />}
     </div>
     <Dialog open={renaming} onOpenChange={open => { if (!rename.pending) setRenaming(open); }}><DialogContent showCloseButton={!rename.pending}><DialogHeader><DialogTitle>Rename {entry.name}</DialogTitle><DialogDescription>Rename this item in Draft.</DialogDescription></DialogHeader>
       <form className="flex flex-col gap-4" onSubmit={event => { event.preventDefault(); if (!renameError && !rename.pending) submitRename(true); }}>

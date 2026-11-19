@@ -13,6 +13,7 @@ export const api = {
   setPreferredEditor: (editorId: string) => invoke<void>('set_preferred_editor', { editorId }),
   skills: () => invoke<T.ContentEntry[]>('skills'),
   skillTree: (query: T.ContentQuery) => invoke<T.FileEntry[]>('skill_tree', { query }),
+  writeSkillFile: (request: T.WriteFileRequest) => invoke<void>('write_skill_file', { request }),
   skillFile: (query: T.ContentQuery & { path: string }) => invoke<T.FileContent>('skill_file', { query }),
   adoptUnmanaged: (target: T.ConflictTarget) => invoke<void>('adopt_unmanaged', { target }),
   fork: (name: string) => invoke<void>('fork', { name }),

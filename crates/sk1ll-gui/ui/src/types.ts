@@ -129,7 +129,8 @@ export interface ContentEntry {
 }
 export interface ContentQuery { item: string; hash?: string; harness?: string }
 export interface FileEntry { path: string; kind: 'file' | 'directory' | 'symlink'; size: number }
-export interface FileContent { path: string; text: string | null; binary: boolean; too_large: boolean; size: number }
+export type WriteFileRequest = ContentQuery & { path: string; content: string; expected: string };
+export interface FileContent { fingerprint?: string | null; path: string; text: string | null; binary: boolean; too_large: boolean; size: number }
 export interface Editor { id: string; name: string; kind: 'gui' | 'terminal' | 'system' }
 export interface EditorsView { editors: Editor[]; preferred_editor: string }
 

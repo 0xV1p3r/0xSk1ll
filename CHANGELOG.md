@@ -9,6 +9,8 @@ break compatibility.
 
 ### Added
 
+- Edit Personal Skill text files and Rules in the desktop Library, with a diff
+  before overwriting a concurrent disk edit and a link to review the Draft.
 - macOS arm64 builds in CI and release archives with the unsigned desktop app,
   CLI and server. Setup and the desktop app can start the daemon through launchd.
 - Create a Rule from the desktop getting-started checklist and reopen the

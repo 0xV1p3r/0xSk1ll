@@ -26,6 +26,61 @@ impl Item {
     }
 
     pub(super) fn file(&self, relative: &Path) -> Result<fs::File> {
+        let (directory, name) = self.parent(relative)?;
+        self.open_file(&directory, &name)
+    }
+
+    fn open_file(&self, directory: &OwnedFd, name: &std::ffi::OsStr) -> Result<fs::File> {
+        Ok(open_at(
+            directory,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            &self.path,
+        )?
+        .into())
+    }
+
+    pub(super) fn replace(&self, relative: &Path, request: &WriteFileRequest) -> Result<bool> {
+        use std::os::unix::fs::MetadataExt;
+
+        let (directory, name) = self.parent(relative)?;
+        let original = match self.open_file(&directory, &name) {
+            Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            opened => opened?,
+        };
+        let meta = original.metadata().at(&self.path)?;
+        if !meta.is_file() {
+            return Err(Error::Invalid("path is not a regular file".into()));
+        }
+        let matches = |file: fs::File| -> Result<bool> {
+            let mut bytes = Vec::new();
+            file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes).at(&self.path)?;
+            Ok(bytes.len() as u64 <= MAX_FILE_BYTES
+                && std::str::from_utf8(&bytes)
+                    .is_ok_and(|text| !text.contains('\0') && crate::hash::hash_str(text) == request.expected))
+        };
+        if !matches(original)? {
+            return Ok(false);
+        }
+        if self.rule.is_some() {
+            crate::instructions::validate_edit(&request.content, &self.path)
+                .map_err(|e| Error::Invalid(format!("Invalid Rule frontmatter: {e}")))?;
+        }
+        crate::placement::replace_file(&directory, &name, request.content.as_bytes(), meta.mode(), || {
+            let Ok(current) = self.open_file(&directory, &name) else {
+                return Ok(false);
+            };
+            let now = current.metadata().at(&self.path)?;
+            Ok(now.is_file()
+                && now.dev() == meta.dev()
+                && now.ino() == meta.ino()
+                && now.mode() == meta.mode()
+                && matches(current)?)
+        })
+        .at(&self.path)?
+    }
+
+    fn parent(&self, relative: &Path) -> Result<(OwnedFd, OsString)> {
         if let Some(name) = &self.rule
             && relative != Path::new(name)
         {
@@ -35,13 +90,7 @@ impl Item {
         let mut components = relative.components().peekable();
         while let Some(Component::Normal(name)) = components.next() {
             if components.peek().is_none() {
-                return Ok(open_at(
-                    &directory,
-                    name,
-                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-                    &self.path,
-                )?
-                .into());
+                return Ok((directory, name.to_owned()));
             }
             directory = open_at(&directory, name, DIRECTORY, &self.path)?;
         }
