@@ -36,6 +36,8 @@
 //! | POST | `/imports/add` | [`AddImportRequest`] → [`ImportUpdated`] |
 //! | POST | `/imports/update` | [`UpdateImportsRequest`] → `Vec<`[`ImportUpdated`]`>` |
 //! | POST | `/imports/remove`, `/imports/fork` | [`ImportName`] → 204 |
+//! | GET | `/harnesses/{name}/render` | [`InstructionPreview`] list |
+//! | GET | `/sync` | [`SyncResult`] plan |
 //! | POST | `/sync` | [`SyncRequest`] → [`SyncResult`] |
 //! | POST | `/push` | → [`PushResult`] |
 //! | POST | `/init` | → 204; standalone without a repo only |
@@ -483,6 +485,8 @@ pub struct ImportName {
 /// `POST /sync`: re-sync the harnesses now.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncRequest {
+    #[serde(default)]
+    pub dry_run: bool,
     /// Also overwrite hand edits sk1ll would otherwise report as conflicts
     /// (content it doesn't manage is still never replaced).
     #[serde(default)]
@@ -493,6 +497,23 @@ pub struct SyncRequest {
 pub struct SyncResult {
     /// Conflicts left after the sync.
     pub conflicts: Vec<ConflictView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actions: Option<Vec<PlacementView>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
+}
+
+/// One instruction file in a harness's render preview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstructionPreview {
+    pub path: PathBuf,
+    pub format: sk1ll_core::machine::InstructionsFormat,
+    /// Rendered rules, as printed by the CLI.
+    pub content: String,
+    /// Complete proposed file, including any surrounding user content.
+    pub next_content: String,
+    pub differs: bool,
+    pub diff: String,
 }
 
 /// `POST /push`.
@@ -908,7 +929,22 @@ impl Client {
         self.post_empty("/imports/fork", &ImportName { name: name.into() }).await
     }
 
+    pub async fn render_instructions(&self, name: &str) -> Result<Vec<InstructionPreview>> {
+        self.get(&format!("/harnesses/{}/render", encode(name))).await
+    }
+
+    // An older daemon ignores unknown POST fields and would apply the sync.
+    pub async fn preview_sync(&self) -> Result<SyncResult> {
+        self.get("/sync").await
+    }
+
     pub async fn sync(&self, req: &SyncRequest) -> Result<SyncResult> {
+        if req.dry_run && !req.force {
+            return self.preview_sync().await;
+        }
+        if req.dry_run {
+            return self.get("/sync?force=true").await;
+        }
         self.post("/sync", req).await
     }
 

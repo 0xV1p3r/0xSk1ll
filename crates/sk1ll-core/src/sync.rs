@@ -191,6 +191,24 @@ pub fn render_instructions(
     })
 }
 
+/// Read the destination and construct the complete file sync would write.
+pub fn instruction_file_text(file: &RenderedFile, format: InstructionsFormat) -> Result<(Option<String>, String)> {
+    let before = instructions::read_optional(&file.path)?;
+    let next = match format {
+        InstructionsFormat::Rules => file.content.clone(),
+        InstructionsFormat::Block => {
+            let text = before.as_deref().unwrap_or_default();
+            let block = instructions::find_block(text, &file.path)?;
+            if block.as_ref().is_some_and(|block| block.inner == file.content) {
+                text.to_string()
+            } else {
+                instructions::splice(text, block.as_ref(), Some(&file.content))
+            }
+        }
+    };
+    Ok((before, next))
+}
+
 /// What sk1ll placed in `harness`: each managed skill, rule file and
 /// instructions block as the Remove sync would make of it were it turned
 /// off, or as a Conflict when it was edited by hand. Content sk1ll doesn't

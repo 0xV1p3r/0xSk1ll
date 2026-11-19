@@ -26,6 +26,7 @@ import { canLeaveFile, type FileEditState } from './SkillFile';
 import { useResource } from './hooks';
 import { eventTopics } from './invalidation';
 import { plural } from './model';
+import { SyncDialog } from './SyncDialogs';
 import { Settings, ownScope } from './Settings';
 import { ConnectionPage, GettingStarted, RestartingPage, SetupWizard, StartingAssignment, Wordmark, showGettingStarted, type SetupResult } from './Setup';
 import { ErrorNotice, Loading, Notice } from './shared';
@@ -83,6 +84,7 @@ export function AppSidebar({ screen, setScreen, status, unmanagedCount, recovere
 
 export function App() {
   const [requestedScreen, setScreen] = useState<Screen>(() => screenFromHash(window.location.hash));
+  const [syncOpen, setSyncOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const sidebarPreference = useRef(storedSidebar());
   const [sidebarOpen, setSidebarOpen] = useState(() => sidebarPreference.current ?? window.innerWidth >= 1000);
@@ -239,6 +241,7 @@ export function App() {
   if (standalone && !status.repo_ready) return <TooltipProvider><SetupWizard status={status} onDone={setupDone} /></TooltipProvider>;
   if (startingAssignment && status.mode === 'joined') return <TooltipProvider><StartingAssignment status={status} onDone={() => { setStartingAssignment(false); changed(); }}
     openMatrix={() => { setStartingAssignment(false); navigate('Assignment matrix'); }} /></TooltipProvider>;
+  const canSync = ready && !status.revoked && !status.awaiting_assignment;
   const serverConnected = !standalone && status.connection === 'connected';
   const conflict = status.report.conflicts[0];
   const server = status.server_url?.replace(/^https?:\/\//, '').replace(/\/$/, '') || 'Server';
@@ -262,7 +265,8 @@ export function App() {
         <ThemeSelector />
       </header>
       <main data-library-search={skillsHandoff.search} id="main" tabIndex={-1} className="mx-auto flex w-full max-w-6xl min-w-0 flex-col gap-5 p-4 md:px-[18px] md:py-4">
-        <div className="flex flex-col gap-1"><div className="flex items-center gap-2"><h1 ref={heading} tabIndex={-1} className="rounded-sm text-2xl font-semibold tracking-tight outline-none focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-ring">{screenLabel(screen, status)}</h1></div>
+        <div className="flex flex-col gap-1"><div className="flex items-center gap-2"><h1 ref={heading} tabIndex={-1} className="rounded-sm text-2xl font-semibold tracking-tight outline-none focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-ring">{screenLabel(screen, status)}</h1>
+          {screen === 'Settings' && <Button className="ml-auto" size="sm" disabled={!canSync} onClick={() => setSyncOpen(true)}>Sync now</Button>}</div>
           <p className="text-sm text-muted-foreground">{screen === 'Draft' && status.revoked ? "This Machine's Draft is private. The Daemon has stopped managing its Harnesses until this Machine rejoins." : screen === 'Draft' && status.awaiting_assignment ? "This Machine's Draft is private. Harnesses stay unchanged until the Server sends an Assignment." : standalone && screen === 'Draft' ? 'Commit saves selected Draft items to the local repository.' : standalone && screen === 'Settings' ? 'Harnesses, local repository, and Fleet membership for this Machine.' : screens[screen].description}</p></div>
         {status.revoked && <Notice title="Machine revoked" tone="destructive">This Machine was removed from the Fleet. The Daemon has stopped managing its Harnesses.
           <div><Button variant="outline" size="sm" className="mt-2" onClick={() => navigate('Settings')}>Rejoin in Settings</Button></div></Notice>}
@@ -290,12 +294,14 @@ export function App() {
         {screen === 'Settings' && <Settings fleetRevision={revisions.fleet} revision={revision} status={status} socket={socket} changed={changed} />}
       </main>
     </SidebarInset>
+    {syncOpen && <SyncDialog onClose={() => setSyncOpen(false)} changed={changed} />}
     <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} commands={[
       ...visibleScreens(status).map(name => ({ id: `screen-${name.replaceAll(' ', '-')}`, label: `Go to: ${screenLabel(name, status)}`, select: () => navigate(name) })),
       ...(!standalone ? fleet.data?.machines ?? [] : []).map(machine => ({ id: `machine-${machine.id}`, label: `Machine: ${machine.id}`, select: () => navigate('Fleet', machine.id) })),
       ...(!standalone || status.has_origin ? [{ id: 'action-pull', background: true, label: 'Action: Pull Baseline', select: () => void runAction(async () => { const result = await api.pull(); return { title: result.state === 'blocked' ? 'Pull blocked' : result.state === 'up_to_date' ? 'Baseline is up to date' : 'Pull complete' }; }) },
       { id: 'action-push', background: true, label: 'Action: Push', select: () => void runAction(async () => { const result = await api.push(); return { title: result.pushed ? 'Push complete' : standalone ? 'Push did not reach origin' : 'Push did not reach the Server', tone: result.pushed ? undefined : 'destructive' }; }) },
       ] : []),
+      ...(canSync ? [{ id: 'action-sync', label: 'Action: Sync now', select: () => setSyncOpen(true) }] : []),
       { id: 'action-check-imports', background: true, label: 'Action: Check Imports', select: () => void runAction(async () => { const result = await api.checkImports(); return { title: 'Import check complete', description: `${plural(result.updates.length, 'update')}, ${plural(result.errors.length, 'failed check')}`, tone: result.errors.length ? 'destructive' : undefined }; }) },
       { id: 'action-getting-started', label: 'Action: Show getting started', select: () => { if (!navigate('Library')) return; showGettingStarted(); setChecklistReopened(true); setChecklist(value => value + 1); } },
       { id: 'action-add-import', label: 'Action: Add Import', select: () => { navigate('Imports'); setOpenAdd(n => n + 1); } },

@@ -78,6 +78,10 @@ export interface HarnessSettings { path: string; harnesses: HarnessChoice[] }
 export type HarnessChange = { op: 'enable' | 'disable' | 'remove'; name: string } | { op: 'set'; name: string; harness: HarnessView['harness'] };
 // Apply answers 409 if machine.toml changed while it was written; it never removes what sk1ll placed.
 export interface HarnessChangeRequest { change: HarnessChange }
+export interface InstructionPreview {
+  path: string; format: 'block' | 'rules'; content: string; next_content: string; differs: boolean; diff: string;
+}
+export interface SyncResult { conflicts: ConflictView[]; actions?: PlacementView[]; errors?: string[] }
 export interface PlacementView {
   harness: string; kind: 'create' | 'update' | 'remove' | 'conflict'; item: 'skill' | 'rule' | 'instructions';
   name: string; dest: string; reason: string | null;

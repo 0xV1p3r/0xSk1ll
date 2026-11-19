@@ -836,3 +836,22 @@ async fn a_daemon_without_a_route_is_reported_as_too_old() {
     assert_eq!(error.status, Some(404));
     assert!(!error.message.contains("older than this client"), "{}", error.message);
 }
+
+#[tokio::test]
+async fn sync_commands_forward_preview_and_apply_separately() {
+    let requests = Recorded::default();
+    let replies = Replies::from([
+        ("GET /harnesses/codex/render".into(), (StatusCode::OK, json!([]))),
+        ("GET /sync".into(), (StatusCode::OK, json!({"conflicts": [], "actions": []}))),
+        ("POST /sync".into(), (StatusCode::OK, json!({"conflicts": []}))),
+    ]);
+    let daemon = FakeDaemon::start(Router::new().fallback(respond).with_state((requests.clone(), replies))).await;
+    let bridge = Bridge::new(daemon.client.clone());
+    assert!(bridge.render_instructions("codex".into()).await.unwrap().is_empty());
+    assert_eq!(bridge.preview_sync().await.unwrap().actions, Some(vec![]));
+    assert!(bridge.sync_now().await.unwrap().conflicts.is_empty());
+    let recorded = requests.lock().unwrap();
+    assert_eq!(recorded[0].1, "/harnesses/codex/render");
+    assert_eq!(recorded[1], ("GET".into(), "/sync".into(), Value::Null));
+    assert_eq!(recorded[2], ("POST".into(), "/sync".into(), json!({"dry_run": false, "force": false})));
+}

@@ -274,3 +274,23 @@ Daemon's own Machine and returns the assignment update in `update`, with
 `warning` set to null. Standalone uses the local repo. If the Server returns
 a 404 without a JSON body, the Daemon uses the local repo and returns a warning
 that unpulled items may stay on.
+
+## Sync and instruction previews
+
+`GET /harnesses/{name}/render` uses this Machine's Draft and Assignment.
+It returns an array of files with `path`, `format` (`block` or `rules`),
+`content` (the rendered rules that `sk1ll render` prints), and
+`next_content` (the complete proposed file, including text outside a managed
+block). `differs` compares the proposed file with the file on disk. `diff`
+is a unified diff, or an empty string when the file matches. A diff can
+include proposed changes that sync will leave for conflict resolution.
+
+`POST /sync` with `{"dry_run":true}` returns `actions` and `conflicts`
+without applying changes or running recovery. Each action has `harness`,
+`kind` (`create`, `update`, `remove`, or `conflict`), `item`, `name`,
+`dest`, and `reason`. `GET /sync` returns the same plan. Both endpoints accept
+an optional `force` boolean, which defaults to false. Use GET when a Daemon
+might predate dry-run support.
+
+A regular `POST /sync` replans and applies. It returns remaining `conflicts`
+and includes `errors` if any placements fail.

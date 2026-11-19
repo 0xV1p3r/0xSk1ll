@@ -47,9 +47,9 @@ use tokio::sync::{Notify, broadcast, watch};
 use crate::client::{
     AddImportRequest, ChangeKind, CommitMessage, CommitRequest, CommitResponse, ConflictTarget, ConflictView,
     Connection, DaemonMode, DiffView, DraftEntry, Event, HarnessApplied, HarnessChangeRequest, HarnessChoice,
-    HarnessPreview, HarnessSettings, HarnessView, ImportUpdated, ItemView, PlacementView, PullResult, PushResult,
-    ResolveImportRequest, ResolvedSource, RestoreRequest, RestoreResponse, SkillCandidate, StatusView, SyncResult,
-    UpdateImportsRequest,
+    HarnessPreview, HarnessSettings, HarnessView, ImportUpdated, InstructionPreview, ItemView, PlacementView,
+    PullResult, PushResult, ResolveImportRequest, ResolvedSource, RestoreRequest, RestoreResponse, SkillCandidate,
+    StatusView, SyncResult, UpdateImportsRequest,
 };
 use crate::error::{Error, Result};
 use crate::join::{Joined, Registered};
@@ -1339,6 +1339,53 @@ impl Daemon {
         Ok(result)
     }
 
+    fn current_assignment(&self) -> Result<sk1ll_core::Assignment> {
+        if self.is_standalone() {
+            return Ok(sk1ll_core::Assignment::load(&self.cfg.assignment)?);
+        }
+        self.snapshot().map(|snap| snap.assignment.clone()).ok_or_else(|| {
+            Error::Conflict("waiting for the server's assignment; the harnesses are left alone until it arrives".into())
+        })
+    }
+
+    pub(crate) fn preview_sync(&self, force: bool) -> Result<SyncResult> {
+        if self.view().revoked {
+            return Err(Error::Conflict(
+                "this machine was removed from the fleet; the daemon no longer manages it".into(),
+            ));
+        }
+        let repo = Repo::open(self.repo_root())?;
+        let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
+        let actions = sync::plan(&repo, &harnesses, &self.current_assignment()?, PlanOptions { force })?;
+        Ok(SyncResult {
+            conflicts: actions.iter().filter(|a| a.kind == ActionKind::Conflict).map(conflict_view).collect(),
+            actions: Some(actions.iter().map(placement_view).collect()),
+            errors: Vec::new(),
+        })
+    }
+
+    pub(crate) fn render_instructions(&self, name: &str) -> Result<Vec<InstructionPreview>> {
+        let repo = Repo::open(self.repo_root())?;
+        let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
+        let files = sync::render_instructions(&repo, &harnesses, &self.current_assignment()?, name)?;
+        let format = harnesses[name].instructions_format;
+        files
+            .into_iter()
+            .map(|file| {
+                let (before, next_content) = sync::instruction_file_text(&file, format)?;
+                let diff = gitx::diff_text(before.as_deref(), &next_content)?;
+                Ok(InstructionPreview {
+                    path: file.path,
+                    format,
+                    content: file.content,
+                    differs: before.as_deref() != Some(&next_content),
+                    next_content,
+                    diff,
+                })
+            })
+            .collect()
+    }
+
     /// `POST /sync`: re-syncs now; `force` also overwrites what a forced plan
     /// may overwrite (hand edits inside managed blocks).
     pub(crate) fn sync(&self, eng: &mut Engine, force: bool) -> Result<SyncResult> {
@@ -1350,8 +1397,9 @@ impl Daemon {
                 sync::apply(&repo, a)?;
             }
         }
-        self.refresh(eng)?;
-        Ok(SyncResult { conflicts: self.conflicts()? })
+        let errors = self.refresh_reporting(eng)?;
+        self.event(Event::Status);
+        Ok(SyncResult { conflicts: self.conflicts()?, actions: None, errors })
     }
 
     pub(crate) fn resolve_displaced(&self, eng: &mut Engine, id: &str, adopt: bool) -> Result<()> {

@@ -9,6 +9,7 @@ import { Collapsible, CollapsibleTrigger, CollapsibleContent } from '@/component
 import { NativeSelect } from '@/components/ui/native-select';
 import { time } from './model';
 import { toast } from './toast';
+import { InstructionsDialog } from './SyncDialogs';
 import { HarnessPanel, Path } from './HarnessSettings';
 import { api } from './api';
 import { useMutation, useResource } from './hooks';
@@ -60,6 +61,7 @@ export function JoinCodeButton({ label, serverUrl, variant = 'outline', scope: o
 export function Settings({ revision, fleetRevision = revision, status, socket, changed }: {
   status: StatusView; socket: string; fleetRevision?: number; revision: number; changed: () => void;
 }) {
+  const [previewHarness, setPreviewHarness] = useState<string>();
   const standalone = status.mode === 'standalone';
   const diagnostics: [string, string | number][] = [
     ['Mode', standalone ? 'Standalone' : 'Joined'], ['App version', appVersion],
@@ -93,7 +95,9 @@ export function Settings({ revision, fleetRevision = revision, status, socket, c
         ['Machine id', status.machine_id], ['Server', status.server_url || 'Not configured'], ['Connection', <span className="capitalize">{connection}</span>],
         ['Repo', <Path value={status.repo} />],
       ]} /></div>
-      <HarnessPanel revision={revision} editorId={preferred ?? editorData.data?.preferred_editor} changed={changed} />
+      <HarnessPanel revision={revision} editorId={preferred ?? editorData.data?.preferred_editor} changed={changed}
+        actions={h => h.enabled && h.harness.instructions && <Button size="sm" variant="ghost" onClick={() => setPreviewHarness(h.name)}>Preview instructions</Button>} />
+      {previewHarness && <InstructionsDialog harness={previewHarness} onClose={() => setPreviewHarness(undefined)} />}
     </Panel>
     <Panel label="Fleet membership"><PanelToolbar><SectionTitle>Fleet membership</SectionTitle></PanelToolbar>
       {!standalone && <div className="border-b p-3.5"><h3 className="mb-1 text-sm font-medium">Join code for another Machine</h3><p className="mb-3 text-sm text-muted-foreground">Create a single-use code for another Machine. The code is shown once. Remove Machines from the Fleet screen.</p><JoinCodeButton label="Create join code" serverUrl={status.server_url} scope={ownScope(fleet.data, status.machine_id)} /></div>}

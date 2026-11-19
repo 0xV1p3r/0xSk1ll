@@ -50,6 +50,27 @@ fn failed(args: &[&str], out: &Output) -> anyhow::Error {
     anyhow::anyhow!("`git {}` failed: {}", redact(&args.join(" ")), redact(String::from_utf8_lossy(&out.stderr).trim()))
 }
 
+/// Diff two text snapshots using Git's unified diff, without touching the repo.
+pub(crate) fn diff_text(before: Option<&str>, after: &str) -> anyhow::Result<String> {
+    if before == Some(after) {
+        return Ok(String::new());
+    }
+    let scratch = tempfile::tempdir()?;
+    let old = if let Some(before) = before {
+        std::fs::write(scratch.path().join("on-disk"), before)?;
+        "on-disk"
+    } else {
+        "/dev/null"
+    };
+    std::fs::write(scratch.path().join("next-sync"), after)?;
+    let args = ["diff", "--no-index", "--no-color", "--no-ext-diff", "--no-textconv", "--text", "--", old, "next-sync"];
+    let out = output(scratch.path(), &args, &[])?;
+    if !matches!(out.status.code(), Some(0 | 1)) {
+        return Err(failed(&args, &out));
+    }
+    Ok(String::from_utf8(out.stdout)?)
+}
+
 /// Runs git; non-zero is an error. Returns trimmed stdout.
 pub(crate) fn run(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
     run_env(dir, args, &[])

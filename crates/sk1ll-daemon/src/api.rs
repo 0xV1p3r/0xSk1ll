@@ -23,9 +23,9 @@ use tokio::sync::broadcast::error::RecvError;
 use crate::client::{
     API_HEADER, API_VERSION, AddImportRequest, CommitMessage, CommitRequest, CommitResponse, ConflictTarget,
     ConflictView, DiffView, DraftEntry, Event, HarnessApplied, HarnessChangeRequest, HarnessChoice, HarnessPreview,
-    HarnessSettings, HarnessView, ImportName, ImportUpdated, ItemView, JoinApiRequest, PullResult, PushResult,
-    ResolveImportRequest, ResolvedSource, RestoreRequest, RestoreResponse, SetHarnessEnabled, StatusView, SyncRequest,
-    SyncResult, UpdateImportsRequest,
+    HarnessSettings, HarnessView, ImportName, ImportUpdated, InstructionPreview, ItemView, JoinApiRequest, PullResult,
+    PushResult, ResolveImportRequest, ResolvedSource, RestoreRequest, RestoreResponse, SetHarnessEnabled, StatusView,
+    SyncRequest, SyncResult, UpdateImportsRequest,
 };
 use crate::daemon::Daemon;
 use crate::error::{Error, Result};
@@ -77,7 +77,8 @@ pub(crate) fn router(d: Arc<Daemon>) -> Router {
         .route("/imports/update", post(update_imports))
         .route("/imports/remove", post(remove_import))
         .route("/imports/fork", post(fork))
-        .route("/sync", post(sync))
+        .route("/harnesses/{name}/render", get(render_instructions))
+        .route("/sync", get(preview_sync).post(sync))
         .route("/push", post(push))
         .route("/join", post(join))
         .route("/fleet", get(pass))
@@ -395,7 +396,24 @@ async fn fork(State(d): St, Json(req): Json<ImportName>) -> Result<StatusCode> {
 }
 
 async fn sync(State(d): St, Json(req): Json<SyncRequest>) -> Result<Json<SyncResult>> {
+    if req.dry_run {
+        return Ok(Json(d.reading(move |d| d.preview_sync(req.force)).await?));
+    }
     Ok(Json(d.blocking(move |d, eng| d.sync(eng, req.force)).await?))
+}
+
+#[derive(Deserialize)]
+struct SyncPreviewQuery {
+    #[serde(default)]
+    force: bool,
+}
+
+async fn preview_sync(State(d): St, Query(query): Query<SyncPreviewQuery>) -> Result<Json<SyncResult>> {
+    Ok(Json(d.reading(move |d| d.preview_sync(query.force)).await?))
+}
+
+async fn render_instructions(State(d): St, UrlPath(name): UrlPath<String>) -> Result<Json<Vec<InstructionPreview>>> {
+    Ok(Json(d.reading(move |d| d.render_instructions(&name)).await?))
 }
 
 async fn push(State(d): St) -> Result<Json<PushResult>> {

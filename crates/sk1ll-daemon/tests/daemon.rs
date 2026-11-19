@@ -2799,3 +2799,53 @@ async fn joined_daemon_proxies_machine_assignment_copy() {
     assert_eq!(target.client.copy_machine_assignment("target", &copy).await.unwrap_err().status, Some(409));
     eventually(|| async { (target.status().await.assignment_revision == update.revision).then_some(()) }).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn render_and_dry_run_use_the_current_draft_without_writing() {
+    use sk1ll_daemon::client::{API_VERSION, SyncResult};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut m = Machine::new("preview").with_env("SK1LL_DEBOUNCE", "60s");
+    let repo = sk1ll_core::Repo::init(&m.repo()).unwrap();
+    m.start().await;
+    let draft = "---\nharnesses: [agent]\n---\n\nKeep functions short.\n";
+    m.write("instructions/style.md", draft);
+    m.write("instructions/other.md", "---\nharnesses: [elsewhere]\n---\n\nSkip this.\n");
+    let path = m.home.path().join("agent/rules/style.md");
+    let config = sk1ll_core::MachineConfig::load(&m.home.path().join(CONFIG_DIR).join("sk1ll/machine.toml")).unwrap();
+    let assignment = Assignment::load(&m.cache_path()).unwrap();
+    let cli_files = sk1ll_core::sync::render_instructions(&repo, &config.harnesses(), &assignment, HARNESS).unwrap();
+
+    let files = m.client.render_instructions(HARNESS).await.unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, path);
+    assert_eq!(files[0].path, cli_files[0].path);
+    assert_eq!(files[0].content, cli_files[0].content);
+    assert_eq!(files[0].content, "Keep functions short.\n");
+    assert!(files[0].differs && files[0].diff.contains("+Keep functions short."));
+
+    let body = r#"{"dry_run":true}"#;
+    let request = format!(
+        "POST /sync HTTP/1.1\r\nHost: localhost\r\nsk1ll-api: {API_VERSION}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let mut stream = tokio::net::UnixStream::connect(m.client.socket()).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let plan: SyncResult = serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(plan, m.client.preview_sync().await.unwrap());
+    let actions = plan.actions.unwrap();
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].kind, "create");
+    assert_eq!(actions[0].dest, path);
+    assert!(!path.parent().unwrap().exists());
+    assert_eq!(std::fs::read_to_string(m.repo().join("instructions/style.md")).unwrap(), draft);
+
+    let applied = m.client.sync(&Default::default()).await.unwrap();
+    assert!(applied.errors.is_empty());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), files[0].next_content);
+    let files = m.client.render_instructions(HARNESS).await.unwrap();
+    assert!(!files[0].differs && files[0].diff.is_empty());
+}

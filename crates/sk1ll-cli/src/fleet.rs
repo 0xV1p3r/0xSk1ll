@@ -591,7 +591,7 @@ impl Daemon {
                 ),
             },
             Cmd::Sync { dry_run: _, force } => {
-                let result = self.block(c.sync(&SyncRequest { force }))?;
+                let result = self.block(c.sync(&SyncRequest { force, dry_run: false }))?;
                 if result.conflicts.is_empty() {
                     println!("harnesses in sync");
                 }
