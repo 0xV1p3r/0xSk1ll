@@ -180,19 +180,20 @@ async fn flush_outbox(
         });
         tokio::pin!(refresh);
         let (report, entry) = loop {
+            // A new receiver starts with the current report already seen.
+            // Send it even if a rename is holding the engine while it waits
+            // for the Server to see that draft.
+            let report = view.borrow_and_update().report.clone();
+            if report != *sent {
+                send(sink, &DaemonMessage::Status(report.clone())).await?;
+                *sent = report;
+            }
             tokio::select! {
                 result = &mut refresh => break result.map_err(|e| {
                     d.set_error(format!("refreshing before replaying discards: {e}"));
                     e
                 })?,
-                changed = view.changed() => {
-                    changed?;
-                    let report = view.borrow_and_update().report.clone();
-                    if report != *sent {
-                        send(sink, &DaemonMessage::Status(report.clone())).await?;
-                        *sent = report;
-                    }
-                }
+                changed = view.changed() => { changed?; }
             }
         };
         if report != *sent {
@@ -509,4 +510,77 @@ pub(crate) async fn copy_assignment(
         )));
     }
     serde_json::from_slice(&body).context("parsing the Server's response").map_err(CopyFailure::Lost)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sk1ll_core::repo::Repo;
+    use sk1ll_proto::ItemRef;
+
+    #[tokio::test]
+    async fn outbox_flush_sends_an_already_published_draft_while_the_engine_is_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        let repo = Repo::init(&root).unwrap();
+        let mut cfg = Config::new().unwrap();
+        cfg.state = dir.path().join("daemon.json");
+        cfg.assignment = dir.path().join("assignment.json");
+        cfg.machine_config = dir.path().join("machine.toml");
+        std::fs::write(&cfg.machine_config, "").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let d = Daemon::new(
+            cfg,
+            DaemonState {
+                machine_id: "test".into(),
+                token: "test".into(),
+                server_url: format!("http://{address}"),
+                repo: root,
+                revoked: false,
+            },
+        )
+        .unwrap();
+        let mut sent = d.view().report;
+        let (published, ready) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let busy = tokio::spawn({
+            let d = d.clone();
+            async move {
+                d.blocking(move |d, eng| {
+                    repo.create_item("skill", "pdf", "PDF")?;
+                    d.refresh(eng)?;
+                    published.send(()).unwrap();
+                    let _ = held.recv_timeout(Duration::from_secs(10));
+                    Ok(())
+                })
+                .await
+            }
+        });
+        let peer = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            ws.next().await.unwrap().unwrap()
+        });
+        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{address}")).await.unwrap();
+        let (mut sink, _stream) = ws.split();
+        ready.await.unwrap();
+        let report = d.view().report;
+        assert!(report.drafts.contains(&ItemRef::Skill("pdf".into())), "{report:?}");
+        let mut pending = Default::default();
+        let flush = flush_outbox(&d, &mut sink, &mut sent, false, &mut pending);
+        tokio::pin!(flush);
+        let received = tokio::select! {
+            message = tokio::time::timeout(Duration::from_secs(2), peer) => message,
+            result = &mut flush => panic!("flush completed while the engine was busy: {result:?}"),
+        };
+        release.send(()).unwrap();
+        busy.await.unwrap().unwrap();
+        let message = received.unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(message.to_text().unwrap()).unwrap(),
+            DaemonMessage::Status(report)
+        );
+        flush.await.unwrap();
+    }
 }
