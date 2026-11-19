@@ -61,3 +61,20 @@ it('requires a second confirmation when the daemon returns a changed plan', asyn
   await waitFor(() => expect(close).toHaveBeenCalledOnce());
   expect(api.syncNow).toHaveBeenLastCalledWith('new');
 });
+
+it('shows completed placements and errors when a reviewed apply stops partway', async () => {
+  const action = { harness: 'codex', kind: 'create', item: 'skill', name: 'pdf', dest: '/skills/pdf', reason: null } as const;
+  const completed = { ...action, name: 'style', dest: '/skills/style' };
+  vi.mocked(api.previewSync).mockResolvedValue({ fingerprint: 'first', conflicts: [], actions: [completed, action] });
+  vi.mocked(api.syncNow).mockResolvedValue({ fingerprint: 'remaining', conflicts: [], actions: [action],
+    completed: [completed], changed: action, errors: ['Could not place notes'] });
+  const changed = vi.fn(), close = vi.fn();
+  render(<SyncDialog changed={changed} onClose={close} />);
+  await screen.findByText('/skills/style');
+  fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+  expect(await screen.findByText('1 change was applied, then pdf changed — review the remaining plan.')).toBeTruthy();
+  expect(screen.getByText('Could not place notes')).toBeTruthy();
+  expect(screen.queryByText('/skills/style')).toBeNull();
+  expect(changed).toHaveBeenCalledOnce();
+  expect(close).not.toHaveBeenCalled();
+});

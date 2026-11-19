@@ -14,8 +14,6 @@ pub enum Error {
     /// The machine's state forbids it (e.g. it was removed from the fleet).
     #[error("{0}")]
     Conflict(String),
-    #[error("{0}")]
-    ReviewedPlacementChanged(String),
     /// The server is unreachable.
     #[error("{0}")]
     Unavailable(String),
@@ -47,7 +45,7 @@ impl IntoResponse for Error {
         let status = match &self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
-            Self::Conflict(_) | Self::ReviewedPlacementChanged(_) => StatusCode::CONFLICT,
+            Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Upstream(status, _) => *status,
             Self::Internal(e) => {

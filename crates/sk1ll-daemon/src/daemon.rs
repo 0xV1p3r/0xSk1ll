@@ -134,6 +134,13 @@ struct PullState {
 
 type ReviewedSync = (Repo, Vec<(Action, Option<String>)>);
 
+#[derive(Default)]
+struct RefreshOutcome {
+    errors: Vec<String>,
+    completed: Vec<PlacementView>,
+    changed: Option<PlacementView>,
+}
+
 /// Mutable state, only touched with the engine mutex held.
 pub(crate) struct Engine {
     state: Mode,
@@ -766,14 +773,14 @@ impl Daemon {
     /// [`Daemon::refresh`], returning what the sync failed to place (also
     /// published as the last error).
     fn refresh_reporting(&self, eng: &mut Engine) -> Result<Vec<String>> {
-        let result = self.refresh_with_plan(eng, None);
+        let result = self.refresh_with_plan(eng, None).map(|outcome| outcome.errors);
         eng.assignment_placement_failed = result.as_ref().map_or(true, |errors| !errors.is_empty());
         result
     }
 
-    fn refresh_with_plan(&self, eng: &mut Engine, reviewed: Option<ReviewedSync>) -> Result<Vec<String>> {
+    fn refresh_with_plan(&self, eng: &mut Engine, reviewed: Option<ReviewedSync>) -> Result<RefreshOutcome> {
         if Self::idle(eng) {
-            return Ok(Vec::new());
+            return Ok(RefreshOutcome::default());
         }
         if self.is_standalone() {
             self.reload_local_assignment()?;
@@ -789,7 +796,7 @@ impl Daemon {
             });
             self.roots
                 .send_replace(vec![WatchRoot::new(root, true), WatchRoot::new(self.cfg.assignment.clone(), false)]);
-            return Ok(Vec::new());
+            return Ok(RefreshOutcome::default());
         }
         if !root.join(".git").exists() {
             return Err(Error::Conflict(format!("{} is not set up yet (the server was unreachable)", root.display())));
@@ -802,7 +809,8 @@ impl Daemon {
             sync::recover(lock, &harnesses)?;
             Self::recover_imports(&root)?;
         }
-        let mut errors = Vec::new();
+        let mut outcome = RefreshOutcome::default();
+        let is_reviewed = reviewed.is_some();
         let mut conflicts: Vec<ConflictRef> = Vec::new();
         let snapshot = self.snapshot();
         if let Some(snap) = &snapshot {
@@ -814,27 +822,36 @@ impl Daemon {
             });
             match planned {
                 Ok((repo, actions)) => {
-                    for (a, digest) in &actions {
-                        if a.kind == ActionKind::Conflict {
-                            for item in conflict_items(a) {
-                                let c = ConflictRef { item, harness: a.harness.clone() };
-                                if !conflicts.contains(&c) {
-                                    conflicts.push(c);
-                                }
+                    for (action, digest) in &actions {
+                        if action.kind == ActionKind::Conflict {
+                            continue;
+                        }
+                        match sync::apply_reviewed(&repo, action, digest.as_deref()) {
+                            Ok(()) if is_reviewed => outcome.completed.push(placement_view(action)),
+                            Ok(()) | Err(sk1ll_core::Error::Displaced { .. }) => {}
+                            Err(sk1ll_core::Error::Changed(_)) if digest.is_some() => {
+                                outcome.changed = Some(placement_view(action));
+                                break;
                             }
-                        } else if let Err(e) = sync::apply_reviewed(&repo, a, digest.as_deref())
-                            && !matches!(e, sk1ll_core::Error::Displaced { .. })
-                        {
-                            if digest.is_some()
-                                && let sk1ll_core::Error::Changed(message) = e
-                            {
-                                return Err(Error::ReviewedPlacementChanged(message));
+                            Err(e) => outcome.errors.push(format!("sync {}: {e}", action.dest.display())),
+                        }
+                    }
+
+                    let remaining = if outcome.changed.is_some() {
+                        sync::plan(&repo, &harnesses, &snap.assignment, PlanOptions::default())?
+                    } else {
+                        actions.into_iter().map(|(action, _)| action).collect()
+                    };
+                    for action in remaining.iter().filter(|a| a.kind == ActionKind::Conflict) {
+                        for item in conflict_items(action) {
+                            let conflict = ConflictRef { item, harness: action.harness.clone() };
+                            if !conflicts.contains(&conflict) {
+                                conflicts.push(conflict);
                             }
-                            errors.push(format!("sync {}: {e}", a.dest.display()));
                         }
                     }
                 }
-                Err(e) => errors.push(format!("sync: {e}")),
+                Err(e) => outcome.errors.push(format!("sync: {e}")),
             }
         }
 
@@ -869,11 +886,11 @@ impl Daemon {
             v.report = report;
             v.server_baseline = server_baseline;
             v.awaiting_assignment = awaiting;
-            if let Some(e) = errors.first() {
+            if let Some(e) = outcome.errors.first() {
                 v.last_error = Some(crate::auth::redact(e));
             }
         });
-        for e in &errors {
+        for e in &outcome.errors {
             tracing::warn!("{}", crate::auth::redact(e));
         }
 
@@ -896,7 +913,7 @@ impl Daemon {
             changed
         });
         eng.stale = false;
-        Ok(errors)
+        Ok(outcome)
     }
 
     /// Whether the published report can't be relied on (the last refresh
@@ -1424,6 +1441,8 @@ impl Daemon {
             fingerprint: Some(sk1ll_core::hash::hash_str(&serialized)),
             conflicts: actions.iter().filter(|a| a.kind == ActionKind::Conflict).map(conflict_view).collect(),
             actions: Some(actions.iter().map(placement_view).collect()),
+            completed: Vec::new(),
+            changed: None,
             errors: Vec::new(),
         })
     }
@@ -1489,12 +1508,23 @@ impl Daemon {
                 sync::apply(&repo, a)?;
             }
         }
-        let errors = match self.refresh_with_plan(eng, reviewed) {
-            Err(Error::ReviewedPlacementChanged(_)) => return self.preview_sync(force),
-            result => result?,
-        };
+        let RefreshOutcome { errors, completed, changed } = self.refresh_with_plan(eng, reviewed)?;
         self.event(Event::Status);
-        Ok(SyncResult { fingerprint: None, conflicts: self.conflicts()?, actions: None, errors })
+        if changed.is_some() {
+            let mut preview = self.preview_sync(force)?;
+            preview.errors = errors;
+            preview.completed = completed;
+            preview.changed = changed;
+            return Ok(preview);
+        }
+        Ok(SyncResult {
+            fingerprint: None,
+            conflicts: self.conflicts()?,
+            actions: None,
+            errors,
+            completed: Vec::new(),
+            changed: None,
+        })
     }
 
     pub(crate) fn resolve_displaced(&self, eng: &mut Engine, id: &str, adopt: bool) -> Result<()> {
@@ -2735,7 +2765,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reviewed_sync_returns_a_fresh_plan_when_the_source_changes_after_comparison() {
+    async fn reviewed_sync_reports_partial_progress_and_stops_on_digest_mismatch() {
         use crate::client::{Client, SyncRequest};
 
         let dir = tempfile::tempdir().unwrap();
@@ -2744,6 +2774,12 @@ mod tests {
         let source = repo.personal_dir().join("pdf/SKILL.md");
         std::fs::create_dir_all(source.parent().unwrap()).unwrap();
         std::fs::write(&source, "reviewed").unwrap();
+        for name in ["a-success", "b-io-error", "z-later"] {
+            let skill = repo.personal_dir().join(name);
+            std::fs::create_dir_all(&skill).unwrap();
+            std::fs::write(skill.join("SKILL.md"), name).unwrap();
+        }
+        let failing_source = repo.personal_dir().join("b-io-error");
         let cfg = Config {
             repo: Some(root),
             state: dir.path().join("state/daemon.json"),
@@ -2765,16 +2801,30 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&cfg.socket).unwrap();
         let daemon = Daemon::standalone(cfg).unwrap();
         lock(&daemon.engine).after_sync_review = Some(Box::new(move || {
+            std::fs::remove_dir_all(failing_source).unwrap();
             std::fs::write(source, "changed after the fingerprint matched").unwrap();
         }));
+        let mut events = daemon.subscribe_events();
+        let served = daemon.clone();
         let server = tokio::spawn(async move {
-            axum::serve(listener, crate::api::router(daemon)).await.unwrap();
+            axum::serve(listener, crate::api::router(served)).await.unwrap();
         });
         let reviewed = client.preview_sync().await.unwrap().fingerprint.unwrap();
         let returned = client.apply_sync_preview(reviewed.clone()).await.unwrap();
         let fresh = returned.fingerprint.unwrap();
         assert_ne!(fresh, reviewed);
-        assert_eq!(returned.actions.unwrap()[0].name, "pdf");
+        let remaining: Vec<_> = returned.actions.unwrap().into_iter().map(|action| action.name).collect();
+        assert_eq!(remaining, ["pdf", "z-later"]);
+        assert_eq!(returned.completed.len(), 1);
+        assert_eq!(returned.completed[0].name, "a-success");
+        assert_eq!(returned.changed.unwrap().name, "pdf");
+        assert_eq!(returned.errors.len(), 1);
+        assert!(returned.errors[0].contains("b-io-error"));
+        assert_eq!(daemon.view().last_error.as_ref(), returned.errors.first());
+        assert!(!Daemon::report_is_stale(&lock(&daemon.engine)));
+        assert!(matches!(events.try_recv().unwrap(), Event::Status));
+        assert!(skills.join("a-success/SKILL.md").is_file());
+        assert!(!skills.join("z-later").exists());
         assert_eq!(client.preview_sync().await.unwrap().fingerprint.as_deref(), Some(fresh.as_str()));
         assert!(!skills.join("pdf").exists());
         let error = client.sync(&SyncRequest { fingerprint: Some(reviewed), ..Default::default() }).await.unwrap_err();

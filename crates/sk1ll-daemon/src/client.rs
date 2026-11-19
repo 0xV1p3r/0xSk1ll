@@ -518,6 +518,12 @@ pub struct SyncResult {
     pub conflicts: Vec<ConflictView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actions: Option<Vec<PlacementView>>,
+    /// Placements completed before a reviewed apply stopped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completed: Vec<PlacementView>,
+    /// The placement whose staged copy no longer matched the reviewed digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed: Option<PlacementView>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<String>,
 }
