@@ -248,7 +248,7 @@ export function installMock(scenario: string) {
       }
       case 'skill_file': {
         const query = a.query as T.ContentQuery & { path: string };
-        const edited = editedFiles.get(JSON.stringify([query.item, query.path]));
+        const edited = query.hash ? undefined : editedFiles.get(JSON.stringify([query.item, query.path]));
         if (edited) return delay({ path: query.path, ...edited, binary: false, too_large: false, size: new TextEncoder().encode(edited.text).length });
         return delay({ fingerprint: query.hash || !content.some(entry => entry.item === query.item && (entry.type === 'personal' || entry.type === 'rule')) ? null : "mock-file", path: query.path, text: `---\nname: ${query.item.split(':')[1]}\ndescription: ${query.hash === 'sha256:two' ? 'Collect detailed notes.' : 'Work with this Skill.'}\n---\n# Instructions\n\nUse **careful review** before making changes.\n\n- Read the files.\n- Check the result.`, binary: false, too_large: false, size: 120 });
       }

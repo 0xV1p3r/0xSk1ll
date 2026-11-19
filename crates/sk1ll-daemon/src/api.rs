@@ -73,6 +73,7 @@ pub(crate) fn router(d: Arc<Daemon>) -> Router {
         .route("/items/rename", post(rename_item))
         .route("/conflicts/diff", post(conflict_diff))
         .route("/imports/{name}/update", post(update_import))
+        .route("/imports/{name}/update-reviewed", post(update_reviewed_import))
         .route("/imports/{name}/changes", get(import_changes))
         .route("/imports/resolve", post(resolve_import))
         .route("/imports/add", post(add_import))
@@ -371,8 +372,22 @@ async fn apply_harness(State(d): St, Json(req): Json<HarnessChangeRequest>) -> R
 }
 
 #[derive(serde::Deserialize)]
+struct ReviewedImportUpdate {
+    expected: String,
+    force: bool,
+}
+
+async fn update_reviewed_import(
+    State(d): St,
+    UrlPath(name): UrlPath<String>,
+    Json(body): Json<ReviewedImportUpdate>,
+) -> Result<Json<ImportUpdated>> {
+    Ok(Json(d.update_import(name, body.force, Some(body.expected)).await?))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpdateImportQuery {
-    expected: Option<String>,
     #[serde(default)]
     force: bool,
 }
@@ -382,7 +397,7 @@ async fn update_import(
     UrlPath(name): UrlPath<String>,
     Query(q): Query<UpdateImportQuery>,
 ) -> Result<Json<ImportUpdated>> {
-    Ok(Json(d.update_import(name, q.force, q.expected).await?))
+    Ok(Json(d.update_import(name, q.force, None).await?))
 }
 
 async fn import_changes(
@@ -521,29 +536,22 @@ async fn set_harness_assignment(
 ) -> Result<Json<crate::client::HarnessAssignmentUpdate>> {
     use crate::client::{HarnessAssignmentUpdate, LEGACY_HARNESS_ASSIGNMENT_WARNING};
     if d.is_standalone() {
-        let update = d
+        let (update, skipped) = d
             .blocking(move |d, eng| {
-                let changes = d.harness_assignment_changes(eng, &harness, body)?;
-                d.set_local_assignment(eng, &changes)
+                let (changes, skipped) = d.harness_assignment_changes(eng, &harness, body)?;
+                Ok((d.set_local_assignment(eng, &changes)?, skipped))
             })
             .await?;
-        return Ok(Json(HarnessAssignmentUpdate { update, warning: None }));
+        return Ok(Json(HarnessAssignmentUpdate { update, warning: skipped_warning(&skipped), skipped }));
     }
     let state = d.ident.joined()?;
-    let (update, warning) = match server::set_harness_assignment(&d.http, state, &harness, body).await? {
-        Some(result) => {
-            let warning = (!result.skipped.is_empty()).then(|| {
-                format!(
-                    "Skipped items with ineligible names: {}",
-                    result.skipped.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
-                )
-            });
-            (result.update, warning)
-        }
+    let (mut update, warning, skipped) = match server::set_harness_assignment(&d.http, state, &harness, body).await? {
+        Some(result) => (result.update, skipped_warning(&result.skipped), result.skipped),
         None => {
-            let changes = d.blocking(move |d, eng| d.harness_assignment_changes(eng, &harness, body)).await?;
+            let (changes, skipped) =
+                d.blocking(move |d, eng| d.harness_assignment_changes(eng, &harness, body)).await?;
             let update = server::change_assignment(&d.http, state, &changes).await.map_err(Error::Internal)?;
-            (update, Some(LEGACY_HARNESS_ASSIGNMENT_WARNING.into()))
+            (update, Some(LEGACY_HARNESS_ASSIGNMENT_WARNING.into()), skipped)
         }
     };
     let snapshot = sk1ll_proto::AssignmentSnapshot {
@@ -551,9 +559,21 @@ async fn set_harness_assignment(
         assignment: update.assignment.clone(),
         registration: None,
     };
-    d.blocking(move |d, eng| d.apply_assignment(eng, snapshot)).await?;
+    update.errors = d
+        .blocking(move |d, eng| d.apply_assignment(eng, snapshot))
+        .await
+        .unwrap_or_else(|e| vec![crate::auth::redact(&format!("applying the saved Assignment: {e}"))]);
     d.event(crate::client::Event::Fleet);
-    Ok(Json(HarnessAssignmentUpdate { update, warning }))
+    Ok(Json(HarnessAssignmentUpdate { update, warning, skipped }))
+}
+
+fn skipped_warning(skipped: &[sk1ll_proto::ItemRef]) -> Option<String> {
+    (!skipped.is_empty()).then(|| {
+        format!(
+            "Skipped items with ineligible names: {}",
+            skipped.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+        )
+    })
 }
 
 /// Server pass-through: same path and query under the server's `/api`.

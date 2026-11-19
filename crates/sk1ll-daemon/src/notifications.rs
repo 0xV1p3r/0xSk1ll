@@ -335,6 +335,33 @@ mod tests {
     }
 
     #[test]
+    fn failed_notification_schedule_survives_restart_and_success_resets_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("alerts.json");
+        let kind = Kind::Conflict;
+        let active = || items(&["conflict"]);
+        let mut alert = Alert::default();
+        assert!(alert.observe(kind, active(), 0));
+        let mut now = 0;
+        for delay in [60, 300, 600, 600] {
+            alert.delivered(now, false);
+            save(&path, &History::from([(kind, alert)])).unwrap();
+            alert = load(&path).remove(&kind).unwrap();
+            assert!(!alert.observe(kind, active(), now + delay - 1));
+            now += delay;
+            assert!(alert.observe(kind, active(), now));
+        }
+        alert.delivered(now, true);
+        save(&path, &History::from([(kind, alert)])).unwrap();
+        alert = load(&path).remove(&kind).unwrap();
+        assert_eq!(alert.failures, 0);
+        assert_eq!(alert.retry_at, None);
+        assert_eq!(alert.sent_at, Some(now));
+        alert.delivered(now + 600, false);
+        assert_eq!(alert.retry_at, Some(now + 660));
+    }
+
+    #[test]
     fn escapes_applescript_string_literals() {
         assert_eq!(
             applescript("a\\b", "say \"hi\"\r\nnext"),

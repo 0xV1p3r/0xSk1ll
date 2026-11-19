@@ -140,6 +140,9 @@ export function ChangeDialog({ change, onClose, onApplied }: { change: HarnessCh
               <Button variant="outline" size="sm" disabled={busy} onClick={() => void turnOff.run(async () => {
                 const result = await api.setHarnessAssignment(change.name, false);
                 setWarning(result.warning);
+                if (result.update.errors?.length) {
+                  throw new Error(`Assignment saved, but sync failed: ${result.update.errors.join('\n')}`);
+                }
                 toast({ title: `Turned off ${change.name}'s items`, description: 'Sync removes what it placed there; copies edited by hand stay.' });
               })}><Pending pending={turnOff.pending}>Turn off this Harness's items first</Pending></Button>
               <p className="text-xs text-muted-foreground">Sets every Skill and Rule off for {change.name} in the Assignment, so sync takes out what it placed. Then preview again.</p></div>}</>}

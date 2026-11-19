@@ -276,10 +276,13 @@ Baseline inventory cannot be read. Retry after the Server can read it.
 
 The local endpoint `POST /assignment/harness/{harness}` targets the
 Daemon's own Machine and returns the assignment update in `update`. It
-applies the Server's snapshot and syncs locally before replying. A non-null
-`warning` can list items skipped by the Server. Standalone uses the local repo. If the Server returns
-a 404 without a JSON body, the Daemon uses the local repo and returns a warning
-that unpulled items may stay on.
+applies the Server's snapshot and syncs locally before replying. The response
+lists ineligible item names in `skipped`, including in standalone mode. The
+`update.errors` list describes local sync failures after the Assignment was
+saved. A retry also attempts sync when the Assignment revision is unchanged
+and the previous placement failed. Standalone Assignment PUT also returns
+placement errors in `errors`. If the Server returns a 404 without a JSON body,
+the Daemon uses the local repo and warns that unpulled items may stay on.
 
 ## Sync and instruction previews
 
@@ -298,16 +301,22 @@ without applying changes or running recovery. Each action has `harness`,
 an optional `force` boolean, which defaults to false. Use GET when a Daemon
 might predate dry-run support.
 
-A regular `POST /sync` replans and applies. Supply the preview’s `fingerprint` to apply a reviewed plan. The Daemon checks it under the engine lock after recovering interrupted writes. If the plan changed, it returns 409 with the fresh preview. It returns remaining `conflicts`
-and includes `errors` if any placements fail.
+A regular `POST /sync` replans and applies. Supply the preview’s `fingerprint` to apply a reviewed plan. The Daemon checks it under the engine lock after recovering interrupted writes. If the plan changed, it returns 409 with the fresh preview. Copy-mode placements
+are hashed after staging. A mismatched copy stays unpublished and also returns
+409 with a fresh preview. Earlier placements may already have applied.
+A completed sync returns remaining `conflicts` and any placement `errors`.
 
 ## Harness change and import update preconditions
 
 `POST /harnesses/preview` returns a `fingerprint` for the config snapshot.
 Supply it with the same `change` to `POST /harnesses/apply`. Apply returns
-409 if the file changed. `GET /harnesses/config/path` returns the configured
-path as a JSON string and works even when the file cannot be parsed.
+409 if the file changed and 400 with an update prompt if the client omits the
+fingerprint. `GET /harnesses/config/path` returns the configured path as a JSON
+string and works even when the file cannot be parsed.
 
-`POST /imports/{name}/update?expected={sha}` checks the upstream commit
-resolved during the fetch. It returns 409 if the commit differs. This also
-works with `force=true` when overwriting local edits.
+Send `POST /imports/{name}/update-reviewed` with `{"expected":"<sha>","force":false}`
+to check the upstream commit resolved during the fetch. It returns 409 if the
+commit differs. Set `force` to `true` to overwrite local edits. Clients require
+this route for reviewed updates and prompt for a Daemon restart if the route
+is missing. Regular updates use `POST /imports/{name}/update` and can take
+`?force=true`.

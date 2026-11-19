@@ -43,6 +43,10 @@ it('provides reviewed dev workflows and rejects unknown commands', async () => {
     await run('write_skill_file', { request: { ...query, expected: file.fingerprint, content: 'Edited text' } });
     await expect(run('skill_file', { query })).resolves.toMatchObject({ text: 'Edited text', fingerprint: expect.any(String) });
 
+    const historical = await run<T.FileContent>('skill_file', { query: { ...query, hash: 'sha256:two' } });
+    expect(historical.text).toContain('Collect detailed notes.');
+    expect(historical.fingerprint).toBeNull();
+
     const change = { op: 'disable', name: 'claude' };
     const harness = await run<T.HarnessPreview>('preview_harness', { request: { change } });
     expect(harness.fingerprint).toBeTruthy();

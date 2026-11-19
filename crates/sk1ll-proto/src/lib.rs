@@ -356,6 +356,9 @@ pub struct AssignmentUpdate {
     pub revision: u64,
     /// Log entries written, one per change that actually changed something.
     pub entries: Vec<LogEntry>,
+    /// Errors applying this update to local placements, when applied by a daemon.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
 }
 
 /// Result of setting all items and defaults for a harness.

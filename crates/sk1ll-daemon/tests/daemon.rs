@@ -507,6 +507,22 @@ async fn harness_assignment_passes_through_to_the_fleet_and_reaches_sync() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn standalone_harness_assignment_skips_ineligible_names() {
+    let mut m = Machine::new("solo");
+    sk1ll_core::Repo::init(&m.repo()).unwrap();
+    m.write("personal/pdf/SKILL.md", "valid");
+    m.write("personal/old name/SKILL.md", "legacy item");
+    m.start().await;
+
+    let result = m.client.set_harness_assignment(HARNESS, false).await.unwrap();
+    assert_eq!(result.skipped, [ItemRef::Skill("old name".into())]);
+    assert!(result.warning.as_deref().is_some_and(|warning| warning.contains("skill:old name")));
+    assert!(result.update.errors.is_empty());
+    assert!(!result.update.assignment.skill_enabled(HARNESS, "pdf"));
+    assert!(result.update.assignment.skill_enabled(HARNESS, "old name"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn harness_assignment_applies_the_http_snapshot_without_websocket_delivery() {
     use axum::{Json, Router, routing::post};
 
@@ -518,8 +534,9 @@ async fn harness_assignment_applies_the_http_snapshot_without_websocket_delivery
                     assignment: snapshot(2, &[]).assignment,
                     revision: 2,
                     entries: vec![],
+                    errors: Vec::new(),
                 },
-                skipped: vec![],
+                skipped: vec![ItemRef::Skill("legacy name".into())],
             })
         }),
     );
@@ -530,11 +547,29 @@ async fn harness_assignment_applies_the_http_snapshot_without_websocket_delivery
     m.start().await;
     eventually(|| async { m.harness_skill("x").is_some().then_some(()) }).await;
 
+    let config = Machine::machine_config(m.home.path());
+    let original = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, "broken = [").unwrap();
+    let failed = m.client.set_harness_assignment(HARNESS, false).await.unwrap();
+    assert_eq!(failed.update.revision, 2);
+    assert!(failed.update.errors.iter().any(|error| error.contains("machine.toml")));
+    assert!(m.harness_skill("x").is_some());
+    assert_eq!(m.status().await.assignment_revision, 2);
+
+    std::fs::write(&config, original).unwrap();
     let result = m.client.set_harness_assignment(HARNESS, false).await.unwrap();
 
     assert_eq!(result.update.revision, 2);
+    assert!(result.update.errors.is_empty());
     assert!(m.harness_skill("x").is_none());
     assert_eq!(m.status().await.assignment_revision, 2);
+
+    m.stop();
+    let cfg = sk1ll_daemon::Config { state: m.state_path(), ..sk1ll_daemon::Config::new().unwrap() };
+    let lock = sk1ll_core::EngineLock::acquire(&m.repo()).unwrap();
+    let direct = sk1ll_daemon::set_harness_assignment_direct(&cfg, &lock, HARNESS, false).await.unwrap().unwrap();
+    assert_eq!(direct.skipped, [ItemRef::Skill("legacy name".into())]);
+    assert_eq!(direct.update.revision, 2);
     server.abort();
 }
 
@@ -565,6 +600,7 @@ async fn harness_assignment_falls_back_only_for_a_missing_legacy_route() {
                     assignment: snapshot(2, &[]).assignment,
                     revision: 2,
                     entries: vec![],
+                    errors: Vec::new(),
                 })
             }),
         );
@@ -2328,6 +2364,21 @@ async fn harnesses_change_after_setup_with_a_preview_of_what_stays() {
         mode: sk1ll_core::LinkMode::Copy,
         ..Default::default()
     };
+    let mut stream = tokio::net::UnixStream::connect(m.client.socket()).await.unwrap();
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let body = r#"{"change":{"op":"disable","name":"agent"}}"#;
+    let request = format!(
+        "POST /harnesses/apply HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n{}: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        sk1ll_daemon::client::API_HEADER,
+        sk1ll_daemon::client::API_VERSION,
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    assert!(response.contains("this client is older than the daemon; update it"), "{response}");
+
     let mut add =
         HarnessChangeRequest { fingerprint: None, change: HarnessChange::Set { name: "extra".into(), harness } };
     let preview = m.client.preview_harness(&add).await.unwrap();
@@ -2407,12 +2458,18 @@ async fn harnesses_change_after_setup_with_a_preview_of_what_stays() {
     std::fs::set_permissions(m.home.path().join("blocked/skills"), std::os::unix::fs::PermissionsExt::from_mode(0o755))
         .unwrap();
 
-    let bad = HarnessChangeRequest {
+    let mut bad = HarnessChangeRequest {
         fingerprint: None,
         change: HarnessChange::Set { name: "Bad Name".into(), harness: Default::default() },
     };
     assert_eq!(m.client.preview_harness(&bad).await.unwrap_err().status, Some(400));
-    assert_eq!(m.client.apply_harness(&bad).await.unwrap_err().status, Some(400));
+    // Without a reviewed preview the client refuses before asking the daemon.
+    let unreviewed = m.client.apply_harness(&bad).await.unwrap_err();
+    assert_eq!(unreviewed.status, None);
+    assert!(unreviewed.message.contains("reviewed preview is required"), "{}", unreviewed.message);
+    // A preview of a bad name fails, so any fingerprint sent with it is stale.
+    bad.fingerprint = Some("stale".into());
+    assert_eq!(m.client.apply_harness(&bad).await.unwrap_err().status, Some(409));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

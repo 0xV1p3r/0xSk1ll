@@ -407,7 +407,12 @@ fn published(server: &Server, machine: &str, applied: assign::Applied) -> Assign
     if !applied.entries.is_empty() {
         server.publish_assignment(machine, applied.snapshot());
     }
-    AssignmentUpdate { assignment: applied.assignment, revision: applied.revision, entries: applied.entries }
+    AssignmentUpdate {
+        assignment: applied.assignment,
+        revision: applied.revision,
+        entries: applied.entries,
+        errors: Vec::new(),
+    }
 }
 
 async fn log(State(server): ServerState, _: Caller, Query(q): Query<LogQuery>) -> Result<Json<Vec<LogEntry>>> {

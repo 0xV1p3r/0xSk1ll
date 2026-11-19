@@ -37,7 +37,7 @@ export interface AssignmentChanges { changes: ToggleChange[]; expected?: Expecte
 export interface AssignmentSnapshot extends Assignment { revision: number; registration?: string | null }
 // `registration`: which registration of the Machine it was read for (see `registrationOf`).
 export interface CachedAssignmentSnapshot { assignment: Assignment; revision: number; registration?: string | null }
-export interface AssignmentUpdate extends Omit<CachedAssignmentSnapshot, 'registration'> { entries: LogEntry[] }
+export interface AssignmentUpdate extends Omit<CachedAssignmentSnapshot, 'registration'> { entries: LogEntry[]; errors?: string[] }
 export type LogCause = { type: 'change' | 'item_removed' | 'default_materialized' | 'machine_removed' | 'harness_added' }
   | { type: 'undo'; entry: number };
 export interface LogEntry {
