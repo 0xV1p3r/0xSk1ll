@@ -115,6 +115,8 @@ pub(crate) struct Daemon {
     /// Signals the server session that the outbox has something new.
     pub(crate) outbox_ready: Notify,
     connected: AtomicBool,
+    /// A pull has confirmed that the Machine is clear of baseline clashes.
+    pub(crate) pull_cleared_blocked: AtomicBool,
     revoked: AtomicBool,
     /// Since when (Unix seconds) the server has been rejecting the token.
     auth_rejected: Mutex<Option<i64>>,
@@ -227,6 +229,7 @@ impl Daemon {
             outbox: Mutex::new(outbox),
             outbox_ready: Notify::new(),
             connected: AtomicBool::new(false),
+            pull_cleared_blocked: AtomicBool::new(false),
             auth_rejected: Mutex::new(None),
             roots: watch::channel(Vec::new()).0,
             http: crate::server::http_client().build().context("building the HTTP client")?,
@@ -1000,6 +1003,9 @@ impl Daemon {
         };
         if let Some(remote) = gitx::remote_head(&root)? {
             eng.server_baseline = Some(remote);
+        }
+        if eng.blocked.is_none() {
+            self.pull_cleared_blocked.store(true, Ordering::Relaxed);
         }
         Ok(result)
     }

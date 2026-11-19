@@ -73,6 +73,8 @@ export function Settings({ revision, fleetRevision = revision, status, socket, c
   if (status.auth_rejected_since !== null) diagnostics.push(['Auth rejected since', time(status.auth_rejected_since)]);
   const fleet = useResource(api.fleet, fleetRevision, undefined, !standalone);
   const saveEditor = useMutation();
+  const notifications = useResource(api.notificationsEnabled, revision);
+  const saveNotifications = useMutation();
   const [preferred, setPreferred] = useState<string>();
   const [refresh, setRefresh] = useState(0);
   const loadEditors = useCallback(() => api.editors(refresh > 0), [refresh]);
@@ -95,6 +97,15 @@ export function Settings({ revision, fleetRevision = revision, status, socket, c
         ['Machine id', status.machine_id], ['Server', status.server_url || 'Not configured'], ['Connection', <span className="capitalize">{connection}</span>],
         ['Repo', <Path value={status.repo} />],
       ]} /></div>
+      <div className="border-t p-3.5">
+        <label className="flex items-center gap-2 text-sm">
+          <input type="checkbox" checked={notifications.data ?? false}
+            disabled={notifications.data === undefined || notifications.loading || saveNotifications.pending}
+            onChange={event => { const enabled = event.target.checked; void saveNotifications.run(() => api.setNotifications(enabled), notifications.setData); }} />
+          Desktop notifications
+        </label>
+        <ErrorNotice error={notifications.error || saveNotifications.error} />
+      </div>
       <HarnessPanel revision={revision} editorId={preferred ?? editorData.data?.preferred_editor} changed={changed}
         actions={h => h.enabled && h.harness.instructions && <Button size="sm" variant="ghost" onClick={() => setPreviewHarness(h.name)}>Preview instructions</Button>} />
       {previewHarness && <InstructionsDialog harness={previewHarness} onClose={() => setPreviewHarness(undefined)} />}

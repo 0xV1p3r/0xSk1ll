@@ -49,6 +49,9 @@ The Imports screen marks Imports the Server didn't check under its [import check
 
 When an upgrade leaves the app and Daemon on different local API versions, the connection screen offers **Restart daemon** for a running systemd user service on the default socket. It shows terminal instructions for other setups.
 
+In Settings → This machine, use **Desktop notifications** to control alerts
+from the Daemon while the app is open or closed.
+
 ## Run it
 
 Install Rust, pnpm and the Tauri v2 prerequisites. On Linux that includes GTK3 and WebKitGTK 4.1. On macOS install the Xcode Command Line Tools with `xcode-select --install`. The app uses the system WebKit. Then start the daemon (or let the app start it) and the app:

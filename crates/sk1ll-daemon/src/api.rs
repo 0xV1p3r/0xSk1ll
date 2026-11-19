@@ -59,6 +59,7 @@ pub(crate) fn router(d: Arc<Daemon>) -> Router {
         .route("/conflicts/adopt", post(adopt))
         .route("/conflicts/overwrite", post(overwrite))
         .route("/harnesses", get(harnesses))
+        .route("/notifications", get(notifications_enabled).post(set_notifications))
         .route("/harnesses/config", get(harness_settings))
         .route("/harnesses/preview", post(preview_harness))
         .route("/harnesses/apply", post(apply_harness))
@@ -339,6 +340,19 @@ async fn set_setup_harness(
     Ok(Json(d.blocking(move |d, eng| d.set_setup_harness(eng, &name, req.enabled)).await?))
 }
 
+async fn notifications_enabled(State(d): St) -> Result<Json<bool>> {
+    Ok(Json(
+        d.reading(|d| Ok(sk1ll_core::machine::MachineConfig::load(&d.cfg.machine_config)?.notifications.enabled))
+            .await?,
+    ))
+}
+
+async fn set_notifications(State(d): St, Json(enabled): Json<bool>) -> Result<Json<bool>> {
+    d.blocking(move |d, _| Ok(sk1ll_core::machine::MachineConfig::set_notifications(&d.cfg.machine_config, enabled)?))
+        .await?;
+    Ok(Json(enabled))
+}
+
 async fn harness_settings(State(d): St) -> Result<Json<HarnessSettings>> {
     Ok(Json(d.reading(|d| d.harness_settings()).await?))
 }
@@ -564,9 +578,13 @@ async fn conflict_diff(State(d): St, Json(req): Json<crate::client::ConflictDiff
 }
 
 async fn imports(State(d): St) -> Result<Json<crate::client::ImportsView>> {
-    let mut view = d.local_imports(false).await?;
+    let view = d.local_imports(false).await?;
+    Ok(Json(import_checks(&d, view).await))
+}
+
+pub(crate) async fn import_checks(d: &Daemon, mut view: crate::client::ImportsView) -> crate::client::ImportsView {
     if !d.is_standalone()
-        && let Ok(response) = server::proxy(&d, Method::GET, "/imports", Bytes::new()).await
+        && let Ok(response) = server::proxy(d, Method::GET, "/imports", Bytes::new()).await
         && response.status().is_success()
         && let Ok(bytes) = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024).await
         && let Ok(remote) = serde_json::from_slice::<sk1ll_proto::ImportsView>(&bytes)
@@ -580,7 +598,7 @@ async fn imports(State(d): St) -> Result<Json<crate::client::ImportsView>> {
     view.updates.retain(|u| view.imports.iter().any(|i| i.name == u.name && i.locked.as_ref() == Some(&u.locked)));
     view.errors.retain(|e| view.imports.iter().any(|i| i.name == e.name));
     view.skipped.retain(|s| view.imports.iter().any(|i| i.name == s.name));
-    Ok(Json(view))
+    view
 }
 
 async fn check_imports(State(d): St) -> Result<Json<crate::client::ImportsView>> {

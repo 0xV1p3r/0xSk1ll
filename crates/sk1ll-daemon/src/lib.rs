@@ -20,6 +20,7 @@ mod daemon;
 mod error;
 pub mod gitx;
 pub mod join;
+mod notifications;
 mod outbox;
 mod server;
 pub mod service;
@@ -101,10 +102,12 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             tokio::spawn(periodic_pull(d.clone()));
         }
     }
+    let notifications = tokio::spawn(notifications::run(d.clone()));
     let served = tokio::select! {
         r = axum::serve(listener, api::router(d)) => r.context("serving the local API"),
         () = shutdown() => Ok(()),
     };
+    notifications.abort();
     let _ = std::fs::remove_file(&socket);
     served
 }

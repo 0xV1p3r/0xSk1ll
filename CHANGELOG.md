@@ -17,6 +17,9 @@ break compatibility.
 - Preview a Harness's rendered instructions and on-disk diff in Settings.
   **Sync now** shows a dry-run plan before applying from Settings or the
   command palette.
+- Desktop notifications for Machine states that need attention, with an opt-out
+  in Settings and `machine.toml`.
+
 - macOS arm64 builds in CI and release archives with the unsigned desktop app,
   CLI and server. Setup and the desktop app can start the daemon through launchd.
 - Create a Rule from the desktop getting-started checklist and reopen the

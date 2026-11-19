@@ -97,6 +97,7 @@ export function installMock(scenario: string) {
     { name: 'kiro', installed: true, enabled: false, preset: true, configured: false, available: true, harness: { skills: '~/.kiro/skills', instructions: '~/.kiro/steering', instructions_format: 'rules', mode: 'copy' } },
   ];
   const machineConfig = '/home/dev/.config/sk1ll/machine.toml';
+  let notificationsEnabled = true;
   // Every enabled Harness got `code-review`; a change previews it as left in place or placed.
   const harnessPreview = (change: T.HarnessChange): T.HarnessPreview => {
     const choice = setupHarnesses.find(h => h.name === change.name);
@@ -311,6 +312,8 @@ export function installMock(scenario: string) {
         if (choice) choice.enabled = a.enabled as boolean;
         return delay(setupHarnesses);
       }
+      case 'notifications_enabled': return delay(notificationsEnabled);
+      case 'set_notifications': notificationsEnabled = Boolean(a.enabled); return delay(notificationsEnabled);
       case 'harness_settings': return delay({ path: machineConfig, harnesses: setupHarnesses });
       case 'preview_harness': return delay(harnessPreview((a.request as T.HarnessChangeRequest).change), 400);
       case 'apply_harness': {
