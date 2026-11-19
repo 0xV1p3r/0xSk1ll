@@ -634,6 +634,61 @@ async fn a_rename_copy_copies_the_source_toggles_and_keeps_explicit_ones() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_push_before_the_rename_report_keeps_the_copied_toggles() {
+    let server = start().await;
+    let token = server.join("renamer", &["claude"]).await;
+    let pusher = server.join("pusher", &[]).await;
+    seed(&server, "renamer", &token, &["personal/pdf/SKILL.md", "personal/obsolete/SKILL.md"]).await;
+    let push_dir = clone(&server, "pusher", &pusher).await;
+    server
+        .put_assignment(
+            &token,
+            "renamer",
+            json!([
+                {"harness": "claude", "kind": "skill", "name": "pdf", "enabled": true},
+                {"harness": "claude", "kind": "skill", "name": "obsolete", "enabled": false},
+            ]),
+        )
+        .await;
+    let mut ws = ws_connect(&server, &token).await;
+    let before = MachineReport { harnesses: vec!["claude".into()], ..Default::default() };
+    ws_send(&mut ws, &DaemonMessage::Status(before.clone())).await;
+    server.reported("renamer", &before).await;
+
+    let copied: AssignmentCopied = server
+        .http
+        .post(server.url("/machines/renamer/assignment/copy"))
+        .bearer_auth(&token)
+        .json(&json!({"from": "skill:pdf", "to": "skill:docs"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(copied.applied.len(), 1);
+
+    let repo = push_dir.path().join("repo");
+    std::fs::remove_dir_all(repo.join("personal/obsolete")).unwrap();
+    commit_push(&server, &repo, "remove obsolete skill").await;
+    let path = "/machines/renamer/assignment";
+    let after = eventually(|| async {
+        let snapshot: AssignmentSnapshot = server.get_json(&token, path).await;
+        (!snapshot.assignment.harness("claude").skills.contains_key("obsolete")).then_some(snapshot)
+    })
+    .await;
+    assert_eq!(after.assignment.harness("claude").skills.get("docs"), Some(&true));
+
+    let renamed = MachineReport { drafts: vec![ItemRef::Skill("docs".into())], ..before };
+    ws_send(&mut ws, &DaemonMessage::Status(renamed.clone())).await;
+    server.reported("renamer", &renamed).await;
+    let after: AssignmentSnapshot = server.get_json(&token, path).await;
+    assert_eq!(after.assignment.harness("claude").skills.get("docs"), Some(&true));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn assignment_changes_are_logged_and_undoable() {
     let server = start().await;
     let token = server.join("ws", &["claude"]).await;
