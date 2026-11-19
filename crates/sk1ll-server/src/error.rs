@@ -17,7 +17,7 @@ pub enum ApiError {
     #[error("{0}")]
     BadRequest(String),
     #[error("{0}")]
-    Unavailable(String),
+    InventoryUnavailable(String),
     /// Well-formed but not applicable, e.g. a toggle for an unknown item.
     #[error("{0}")]
     Unprocessable(String),
@@ -36,7 +36,7 @@ impl ApiError {
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
-            Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::InventoryUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Db(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -47,12 +47,13 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status();
+        let code = matches!(self, Self::InventoryUnavailable(_)).then(|| sk1ll_proto::INVENTORY_UNAVAILABLE.into());
         let error = if matches!(self, Self::Db(_) | Self::Internal(_)) {
             tracing::error!("{self:#}");
             "internal error".to_string()
         } else {
             self.to_string()
         };
-        (status, Json(ErrorBody { error })).into_response()
+        (status, Json(ErrorBody { error, code })).into_response()
     }
 }

@@ -272,7 +272,9 @@ reported draft, and unpushed item for that Machine in one transaction.
 It uses the same scope and change log as the assignment PUT. The response
 adds `skipped` for Skills and Rules with names the Server cannot accept as
 toggles. Both this endpoint and rename-copy return 503 if the current
-Baseline inventory cannot be read. Retry after the Server can read it.
+Baseline inventory cannot be read. The error body includes
+`"code": "inventory_unavailable"` for this refusal before any Assignment changes.
+Retry after the Server can read the inventory.
 
 The local endpoint `POST /assignment/harness/{harness}` targets the
 Daemon's own Machine and returns the assignment update in `update`. It

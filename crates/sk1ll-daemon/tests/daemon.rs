@@ -587,7 +587,9 @@ async fn harness_assignment_falls_back_only_for_a_missing_legacy_route() {
     let app = Router::new()
         .route(
             "/api/machines/box/assignment/harness/absent",
-            post(|| async { (StatusCode::NOT_FOUND, Json(sk1ll_proto::ErrorBody { error: "machine absent".into() })) }),
+            post(|| async {
+                (StatusCode::NOT_FOUND, Json(sk1ll_proto::ErrorBody { error: "machine absent".into(), code: None }))
+            }),
         )
         .route(
             "/api/machines/box/assignment",

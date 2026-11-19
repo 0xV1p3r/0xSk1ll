@@ -3135,7 +3135,8 @@ mod tests {
                         move |axum::Json(body): axum::Json<AssignmentChanges>| async move {
                             *cleanup.lock().unwrap() = Some(body);
                             if !guard_holds {
-                                let error = sk1ll_proto::ErrorBody { error: "changed since revision 2".into() };
+                                let error =
+                                    sk1ll_proto::ErrorBody { error: "changed since revision 2".into(), code: None };
                                 return (axum::http::StatusCode::CONFLICT, serde_json::to_string(&error).unwrap());
                             }
                             let update = AssignmentUpdate {

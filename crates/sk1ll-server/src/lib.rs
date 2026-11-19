@@ -471,7 +471,7 @@ async fn check_protocol(request: Request, next: Next) -> Response {
         Some(v) if v != PROTOCOL_VERSION.to_string() => {
             let error = sk1ll_proto::protocol_mismatch(&v);
             tracing::warn!("{error}");
-            (StatusCode::UPGRADE_REQUIRED, axum::Json(ErrorBody { error })).into_response()
+            (StatusCode::UPGRADE_REQUIRED, axum::Json(ErrorBody { error, code: None })).into_response()
         }
         _ => next.run(request).await,
     }
