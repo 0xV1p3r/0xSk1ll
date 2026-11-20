@@ -1190,6 +1190,9 @@ pub mod displaced {
     //! extension), next to `entry.json`. A `.gitignore` keeps the area out of
     //! any git repo the holder is in (dotfiles).
     //!
+    //! Pull keeps what it replaces in the skills repo's working tree the same
+    //! way, as [`Kind::Draft`] entries whose holder is the repo's git directory.
+    //!
     //! The state directory ([`root`]) holds an index of where each entry is,
     //! so [`list`] finds them all; [`super::recover`] lists again any entry
     //! of a harness the index lost. Entries older versions kept in the state
@@ -1244,7 +1247,14 @@ pub mod displaced {
         Rule,
         /// A whole block instructions file (the target's content, if it is linked).
         Instructions,
+        /// A file or symlink in the skills repo's working tree that pull
+        /// replaced or removed (see [`crate::Repo::pull`]). Its entry is in
+        /// the repo's git directory, and its harness is [`PULL`].
+        Draft,
     }
+
+    /// The harness [`Kind::Draft`] entries are recorded under.
+    pub const PULL: &str = "pull";
 
     #[derive(Debug, Serialize, Deserialize)]
     struct Meta {
@@ -1362,6 +1372,7 @@ pub mod displaced {
             Kind::Skill => copy_into_repo(repo, &entry.path, &name)?,
             Kind::Rule => rule_into_repo(repo, &name, &read_text(&entry.path)?)?,
             Kind::Instructions => restore_instructions(&entry)?,
+            Kind::Draft => crate::draft::adopt_displaced(repo, &entry)?,
         }
         discard(id)
     }
@@ -1499,7 +1510,7 @@ pub mod displaced {
 
     /// Lists in the index every entry in `holder`'s area it lacks (the state
     /// directory was lost or moved, say).
-    pub(super) fn reindex(holder: &Path) -> Result<()> {
+    pub(crate) fn reindex(holder: &Path) -> Result<()> {
         let area = area(holder);
         let names = read_dir_names(&area)?;
         if names.is_empty() {
@@ -1661,7 +1672,26 @@ pub mod displaced {
                 Ok(crate::config_file::read_regular(path, false)?
                     .map(|bytes| hash_str(&String::from_utf8_lossy(&bytes))))
             }
+            Kind::Draft => match fs::symlink_metadata(path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e).at(path),
+                Ok(m) if m.file_type().is_symlink() => {
+                    Ok(Some(leaf_fingerprint(true, &crate::git::path_bytes(&fs::read_link(path).at(path)?))))
+                }
+                Ok(m) if m.is_file() => {
+                    Ok(crate::config_file::read_regular(path, false)?.map(|bytes| leaf_fingerprint(false, &bytes)))
+                }
+                Ok(_) => Ok(Some("not a file".into())),
+            },
         }
+    }
+
+    /// What a [`Kind::Draft`] entry is compared by: whether it is a symlink,
+    /// and its exact bytes (a symlink's target).
+    pub(crate) fn leaf_fingerprint(link: bool, bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let kind = if link { "link" } else { "file" };
+        format!("{kind}:{}", crate::hash::hex(&Sha256::digest(bytes)))
     }
 
     pub(super) fn same_file(a: &Path, b: &Path) -> bool {
@@ -1689,7 +1719,7 @@ pub mod displaced {
 
     /// Moves `aside` (left behind by an interrupted sync, in `holder`) into
     /// a new entry for `dest`, and returns it.
-    pub(super) fn rescue(
+    pub(crate) fn rescue(
         kind: Kind,
         harness: &str,
         dest: &Path,
@@ -1717,7 +1747,7 @@ pub mod displaced {
     }
 
     /// One displacement in progress (see the module docs).
-    pub(super) struct Displacing {
+    pub(crate) struct Displacing {
         id: String,
         root: PathBuf,
         /// The entry's directory.
@@ -1731,7 +1761,7 @@ pub mod displaced {
     impl Displacing {
         /// Creates the entry in `holder`'s area (and prunes old ones).
         /// Nothing is displaced yet.
-        pub(super) fn begin(
+        pub(crate) fn begin(
             kind: Kind,
             harness: &str,
             dest: &Path,
@@ -1793,7 +1823,8 @@ pub mod displaced {
             fs::write(&path, body).at(&path)
         }
 
-        fn content(&self) -> PathBuf {
+        /// Where the displaced content is (or goes) in the entry.
+        pub(crate) fn content(&self) -> PathBuf {
             self.dir.join(CONTENT)
         }
 
@@ -1817,8 +1848,59 @@ pub mod displaced {
             Ok(true)
         }
 
+        /// [`take`](Self::take) for `name` in the directory `parent`,
+        /// never following a symlink to it; `false` if nothing is there.
+        #[cfg(unix)]
+        pub(crate) fn take_at(&mut self, parent: &std::os::fd::OwnedFd, name: &std::ffi::OsStr) -> Result<bool> {
+            let content = self.content();
+            match rustix::fs::renameat(parent, name, rustix::fs::CWD, &content) {
+                Ok(()) => self.held = Some(Held::Moved),
+                Err(rustix::io::Errno::NOENT) => return Ok(false),
+                Err(e) => return Err(std::io::Error::from(e)).at(&self.dest),
+            }
+            Ok(true)
+        }
+
+        /// [`link`](Self::link) for `name` in the directory `parent`: a
+        /// symlink there is linked itself, never its target.
+        #[cfg(unix)]
+        pub(crate) fn link_at(&mut self, parent: &std::os::fd::OwnedFd, name: &std::ffi::OsStr) -> Result<bool> {
+            let content = self.content();
+            match rustix::fs::linkat(parent, name, rustix::fs::CWD, &content, rustix::fs::AtFlags::empty()) {
+                Ok(()) => self.held = Some(Held::Linked),
+                Err(rustix::io::Errno::NOENT) => return Ok(false),
+                Err(e) => return Err(std::io::Error::from(e)).at(&self.dest),
+            }
+            Ok(true)
+        }
+
+        /// [`put_back`](Self::put_back) to `name` in the directory `parent`,
+        /// for a file or symlink.
+        #[cfg(unix)]
+        pub(crate) fn put_back_at(self, parent: &std::os::fd::OwnedFd, name: &std::ffi::OsStr) -> Result<()> {
+            use rustix::fs::{AtFlags, CWD, linkat, symlinkat};
+            if self.held != Some(Held::Moved) {
+                self.abandon();
+                return Ok(());
+            }
+            let content = self.content();
+            let placed = match fs::symlink_metadata(&content) {
+                Ok(m) if m.file_type().is_symlink() => fs::read_link(&content)
+                    .and_then(|target| symlinkat(&target, parent, name).map_err(std::io::Error::from)),
+                Ok(m) if m.is_file() => linkat(CWD, &content, parent, name, AtFlags::empty()).map_err(Into::into),
+                Ok(_) => Err(std::io::ErrorKind::Unsupported.into()),
+                Err(e) => Err(e),
+            };
+            if placed.is_ok() && fs::remove_file(&content).is_ok() {
+                self.abandon();
+                return Ok(());
+            }
+            self.keep()?;
+            Err(self.displaced_error())
+        }
+
         /// Whether the displaced content still matches what was expected.
-        pub(super) fn intact(&self) -> Result<bool> {
+        pub(crate) fn intact(&self) -> Result<bool> {
             let at = if self.held.is_some() { self.content() } else { self.dest.clone() };
             Ok(!self.expected.is_empty() && fingerprint(self.kind, &at)?.unwrap_or_default() == self.expected)
         }
@@ -1853,7 +1935,7 @@ pub mod displaced {
         /// Drops the entry, unless it holds content that was moved here: a
         /// hard link can go (the original is still in place), that can't, so
         /// it is kept instead.
-        pub(super) fn abandon(self) {
+        pub(crate) fn abandon(self) {
             if self.held == Some(Held::Moved) && fs::symlink_metadata(self.content()).is_ok() {
                 let _ = self.keep();
                 return;
@@ -1864,7 +1946,7 @@ pub mod displaced {
         /// After the swap: checks the content one last time.
         /// `Some(Error::Displaced)` if it changed; otherwise the entry is
         /// left for [`prune`].
-        pub(super) fn finish(self) -> Result<Option<Error>> {
+        pub(crate) fn finish(self) -> Result<Option<Error>> {
             Ok((!self.intact()?).then(|| self.displaced_error()))
         }
 

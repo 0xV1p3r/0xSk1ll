@@ -856,7 +856,7 @@ impl Daemon {
         }
 
         for entry in sync::displaced::changed()? {
-            let c = ConflictRef { item: displaced_item(&entry), harness: entry.harness.clone() };
+            let c = ConflictRef { item: displaced_item(&entry, &root), harness: entry.harness.clone() };
             if !conflicts.contains(&c) {
                 conflicts.push(c);
             }
@@ -1381,7 +1381,8 @@ impl Daemon {
 
     /// A reader: no engine mutex.
     pub(crate) fn recovered(&self) -> Result<Vec<ConflictView>> {
-        Ok(sync::displaced::list()?.into_iter().map(displaced_view).collect())
+        let root = self.repo_root();
+        Ok(sync::displaced::list()?.into_iter().map(|entry| displaced_view(entry, root)).collect())
     }
 
     /// A reader: no engine mutex, and so no recovery of interrupted imports
@@ -1393,8 +1394,9 @@ impl Daemon {
         } else {
             Vec::new()
         };
+        let root = self.repo_root();
         for entry in sync::displaced::changed()? {
-            result.push(displaced_view(entry));
+            result.push(displaced_view(entry, root));
         }
         Ok(result)
     }
@@ -2214,8 +2216,8 @@ fn conflict_items(a: &Action) -> Vec<ItemRef> {
     }
 }
 
-fn displaced_view(entry: sync::displaced::Entry) -> ConflictView {
-    let item = displaced_item(&entry);
+fn displaced_view(entry: sync::displaced::Entry, root: &Path) -> ConflictView {
+    let item = displaced_item(&entry, root);
     ConflictView {
         kind: Some("displaced".into()),
         id: Some(entry.id),
@@ -2232,12 +2234,20 @@ fn displaced_view(entry: sync::displaced::Entry) -> ConflictView {
     }
 }
 
-fn displaced_item(entry: &sync::displaced::Entry) -> ItemRef {
+/// `root`: the skills repo, which a pull's entries are from.
+fn displaced_item(entry: &sync::displaced::Entry, root: &Path) -> ItemRef {
     let name = entry.dest.file_name().unwrap_or_default().to_string_lossy();
     match entry.kind {
         sync::displaced::Kind::Skill => ItemRef::Skill(name.into_owned()),
         sync::displaced::Kind::Rule => ItemRef::Rule(name.strip_suffix(".md").unwrap_or(&name).to_string()),
         sync::displaced::Kind::Instructions => ItemRef::Other(entry.dest.display().to_string()),
+        sync::displaced::Kind::Draft => {
+            let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+            match entry.dest.strip_prefix(&root) {
+                Ok(path) => ItemRef::for_path(path),
+                Err(_) => ItemRef::Other(entry.dest.display().to_string()),
+            }
+        }
     }
 }
 

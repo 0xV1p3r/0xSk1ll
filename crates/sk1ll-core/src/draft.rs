@@ -253,6 +253,14 @@ impl Repo {
         }
         // A commit is only useful if it can be pushed, and that needs the fleet branch.
         self.on_fleet_branch()?;
+        // It would move the branch a pull that stopped half-way still has to move.
+        if self.pull_pending()? {
+            return Err(Error::Invalid(
+                "a pull stopped half-way and has to finish first: restore what blocks it (copy edits you want to \
+                 keep aside first), then run `sk1ll pull`"
+                    .into(),
+            ));
+        }
         let (selected, st) = self.select(items, "committed")?;
         let paths: Vec<&PathBuf> = selected.iter().flat_map(|d| &d.paths).collect();
 
@@ -365,15 +373,36 @@ impl Repo {
     /// changes and the outcome is [`PullOutcome::Blocked`]. A baseline with no
     /// commit in common with `HEAD` (unrelated histories), unpushed merge
     /// commits, submodules and sparse checkouts are an [`Error::Invalid`];
-    /// that also changes nothing. If the switch fails half-way, pull puts back
-    /// what it changed before returning the error.
+    /// that also changes nothing. So is a pull that would change files on a
+    /// platform other than Unix.
+    ///
+    /// Once it starts changing files, pull only goes forward: if anything
+    /// stops it half-way (an error, a crash, or a draft change that appears in
+    /// a path it is about to update, which is [`PullOutcome::Blocked`]), the
+    /// next pull or [`finish_pull`](Self::finish_pull) finishes it first.
+    /// `HEAD` stays on the branch throughout. A file written to while pull
+    /// replaces it keeps that version in the recovery area (see
+    /// [`crate::sync::displaced`]); the pull still finishes, then returns
+    /// the [`Error::Displaced`] that says so.
     ///
     /// The baseline is [`REMOTE`]'s [`FLEET_BRANCH`], which must also be
     /// checked out here. A remote without that branch is an error too, unless
     /// it has no branches at all (an empty server, which only older servers start
     /// as): then there is nothing to pull yet, and the first push creates it.
     pub fn pull(&self) -> Result<PullOutcome> {
-        pull::run(self, &mut |_| {})
+        pull::run(self, &mut |_| Ok(()))
+    }
+
+    /// Whether a [`pull`](Self::pull) stopped half-way and has yet to finish.
+    pub fn pull_pending(&self) -> Result<bool> {
+        pull::pending(self)
+    }
+
+    /// Finishes a [`pull`](Self::pull) that stopped half-way, without
+    /// fetching: `None` if there is none. Blocked if a draft change is still
+    /// in the way.
+    pub fn finish_pull(&self) -> Result<Option<PullOutcome>> {
+        pull::finish(self, &mut |_| Ok(()))
     }
 
     /// [`pull`](Self::pull), running `f` once when it reaches `point`.
@@ -386,6 +415,16 @@ impl Repo {
             {
                 f();
             }
+            Ok(())
+        })
+    }
+
+    /// [`pull`](Self::pull), stopping at `point` as a crash would.
+    #[cfg(test)]
+    fn pull_crashing_at(&self, point: pull::Before) -> Result<PullOutcome> {
+        pull::run(self, &mut |at| match at == point {
+            true => Err(Error::Invalid(format!("crashed at {at:?}"))),
+            false => Ok(()),
         })
     }
 
@@ -508,6 +547,11 @@ impl Repo {
             .collect();
         Ok(Status { head, head_paths, changed })
     }
+}
+
+/// Puts back a working-tree file pull displaced (see [`sync::displaced::adopt`](crate::sync::displaced::adopt)).
+pub(crate) fn adopt_displaced(repo: &Repo, entry: &crate::sync::displaced::Entry) -> Result<()> {
+    pull::adopt(repo, entry)
 }
 
 /// The paths `git status` reports as changed under `pathspec` (everything
@@ -1022,6 +1066,14 @@ mod tests {
         assert!(f.b.join("personal/new/SKILL.md").is_file());
     }
 
+    fn pending(repo: &Repo) -> bool {
+        pull::pending(repo).unwrap()
+    }
+
+    fn head_ref(root: &Path) -> String {
+        git(root, &["symbolic-ref", "HEAD"])
+    }
+
     fn commit_all(root: &Path, message: &str) {
         git(root, &["add", "-A"]);
         git(root, &["commit", "--quiet", "-m", message]);
@@ -1098,10 +1150,10 @@ mod tests {
     }
 
     /// An ignored file that appears in the way during the pull is caught by
-    /// pull's last checks, or else by checkout itself, on the fast-forward
-    /// path and when rebasing.
+    /// pull's last checks, or else when the new file goes in (which never
+    /// replaces anything), on the fast-forward path and when rebasing.
     #[test]
-    fn pull_protects_an_ignored_file_created_before_checkout() {
+    fn pull_protects_an_ignored_file_created_during_the_pull() {
         let f = Fleet::new();
         let (a, b) = (repo(&f.a), repo(&f.b));
         write(&f.b.join(".git/info/exclude"), "private.txt\n");
@@ -1115,10 +1167,11 @@ mod tests {
                 write(&f.b.join("instructions/style.md"), "b committed\n");
                 b.commit(&[item("rule:style")], "style", None).unwrap();
             }
-            for point in [Before::Checks, Before::Checkout] {
+            for point in [Before::Checks, Before::Journal, Before::File(0)] {
                 let before = snapshot(&f.b);
                 assert_eq!(b.pull_at(point, || write(&path, "mine\n")).unwrap(), blocked, "{point:?}");
                 assert_eq!(read(&path), "mine\n");
+                assert!(!pending(&b), "nothing was changed, so nothing is left to finish");
                 fs::remove_file(&path).unwrap();
                 assert_eq!(snapshot(&f.b), before);
             }
@@ -1147,9 +1200,10 @@ mod tests {
             b.restore(&[item("skill:pdf")]).unwrap();
             assert_eq!(snapshot(&f.b), before);
         }
-        // Checkout's own check covers the paths it changes.
-        assert_eq!(b.pull_at(Before::Checkout, || write(&skill, "saved\n")).unwrap(), blocked);
+        // Each path is checked again right before it is updated.
+        assert_eq!(b.pull_at(Before::File(0), || write(&skill, "saved\n")).unwrap(), blocked);
         assert_eq!(read(&skill), "saved\n");
+        assert!(!pending(&b));
     }
 
     #[test]
@@ -1715,6 +1769,18 @@ mod tests {
         let seed = git(&f.a, &["rev-parse", "HEAD"]);
         let gitlink = format!("160000,{seed},vendor/lib");
         let as_b = ["-c", "user.name=Machine B", "-c", "user.email=b@example.com"];
+        // Only in the index, with nothing to pull, and with something.
+        git(&f.b, &["update-index", "--add", "--cacheinfo", &gitlink]);
+        let before = snapshot(&f.b);
+        assert!(invalid(b.pull()).contains("submodules aren't supported"));
+        assert_eq!(snapshot(&f.b), before);
+        write(&f.a.join("instructions/git.md"), "git v2\n");
+        a.commit(&[item("rule:git")], "git v2", None).unwrap();
+        a.push().unwrap();
+        assert!(invalid(b.pull()).contains("submodules aren't supported"));
+        assert_eq!(snapshot(&f.b), before);
+        git(&f.b, &["update-index", "--force-remove", "vendor/lib"]);
+        assert!(matches!(b.pull().unwrap(), PullOutcome::Updated { .. }));
         // In HEAD.
         git(&f.b, &["update-index", "--add", "--cacheinfo", &gitlink]);
         git(&f.b, &[&as_b[..], &["commit", "--quiet", "-m", "submodule"]].concat());
@@ -1818,78 +1884,336 @@ mod tests {
         assert_eq!(git(&f.b, &["show", "HEAD:instructions/style.md"]), "b committed");
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn pull_puts_back_a_checkout_that_fails_half_way() {
-        // SAFETY: geteuid has no preconditions.
-        if unsafe { libc::geteuid() } == 0 {
-            return; // root can write into the read-only directory below
-        }
-        let f = Fleet::new();
-        let (a, b) = (repo(&f.a), repo(&f.b));
-        // Git removes first, then writes in path order: it gets to `imported/`
-        // and fails at `instructions/`.
-        write(&f.a.join("imported/web/SKILL.md"), "web v2\n");
-        write(&f.a.join("imported/web/extra.md"), "added\n");
-        fs::remove_file(f.a.join("personal/pdf/ref.md")).unwrap();
+    /// Upstream changes for the tests of pulls that stop half-way: in pull's
+    /// order, a removal, then a modification, an addition and an
+    /// executable change in three items. `b` gets a draft pull carries:
+    /// a staged new file, a staged and then edited rule, an untracked
+    /// skill. Returns the new baseline.
+    fn half_way_setup(f: &Fleet) -> String {
+        fs::remove_dir_all(f.a.join("imported/web")).unwrap();
         write(&f.a.join("instructions/git.md"), "git v2\n");
-        commit_all(&f.a, "everything");
-        a.push().unwrap();
-        write(&f.b.join("instructions/style.md"), "b draft\n");
+        write(&f.a.join("personal/pdf/SKILL.md"), "---\nname: pdf\n---\nPDFs v2.\n");
+        write(&f.a.join("personal/pdf/extra.md"), "added\n");
+        #[cfg(unix)]
+        chmod(&f.a.join("personal/pdf/ref.md"), 0o755);
+        commit_all(&f.a, "upstream");
+        git(&f.a, &["push", "--quiet", REMOTE, "main"]);
         write(&f.b.join("notes.txt"), "staged\n");
-        git(&f.b, &["add", "notes.txt"]);
+        write(&f.b.join("instructions/style.md"), "staged style\n");
+        git(&f.b, &["add", "notes.txt", "instructions/style.md"]);
+        write(&f.b.join("instructions/style.md"), "unstaged style\n");
         write(&f.b.join("personal/mine/SKILL.md"), "untracked\n");
-        std::os::unix::fs::symlink("SKILL.md", f.b.join("personal/mine/link.md")).unwrap();
-        let draft = b.draft().unwrap();
-        let before = snapshot(&f.b);
-
-        chmod(&f.b.join("instructions"), 0o555);
-        let result = b.pull();
-        chmod(&f.b.join("instructions"), 0o755);
-        match result {
-            Err(Error::Git { args, stderr }) => {
-                assert!(args.starts_with("checkout"), "{args}");
-                assert!(stderr.contains("instructions/git.md") && stderr.contains("put back"), "{stderr}");
-            }
-            other => panic!("expected a checkout error, got {other:?}"),
-        }
-        assert_eq!(snapshot(&f.b), before);
-        assert_eq!(b.draft().unwrap(), draft);
-
-        // A save to a file checkout already wrote must survive the rollback.
-        let changed = "imported/web/SKILL.md";
-        chmod(&f.b.join("instructions"), 0o555);
-        let result = b.pull_at(Before::CheckoutFailed, || {
-            assert_eq!(read(&f.b.join(changed)), "web v2\n");
-            write(&f.b.join(changed), "saved while checkout failed\n");
-        });
-        chmod(&f.b.join("instructions"), 0o755);
-        let error = result.unwrap_err().to_string();
-        assert!(error.contains(changed) && error.contains("left these changes in place"), "{error}");
-        assert_eq!(read(&f.b.join(changed)), "saved while checkout failed\n");
-        b.restore(&[item("skill:web")]).unwrap();
-        assert_eq!(snapshot(&f.b), before);
-
-        assert!(matches!(b.pull().unwrap(), PullOutcome::Updated { .. }));
-        assert_eq!(read(&f.b.join("instructions/git.md")), "git v2\n");
-        assert_eq!(read(&f.b.join("imported/web/extra.md")), "added\n");
-        assert_eq!(b.draft().unwrap(), draft);
+        git(&f.a, &["rev-parse", "HEAD"])
     }
 
+    fn assert_at_upstream(f: &Fleet) {
+        assert!(!f.b.join("imported/web").exists());
+        assert_eq!(read(&f.b.join("instructions/git.md")), "git v2\n");
+        assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "---\nname: pdf\n---\nPDFs v2.\n");
+        assert_eq!(read(&f.b.join("personal/pdf/extra.md")), "added\n");
+        assert!(!cfg!(unix) || executable(&f.b.join("personal/pdf/ref.md")));
+        assert_eq!(git(&f.b, &["show", ":notes.txt"]), "staged");
+        assert_eq!(git(&f.b, &["show", ":instructions/style.md"]), "staged style");
+        assert_eq!(read(&f.b.join("instructions/style.md")), "unstaged style\n");
+        assert_eq!(read(&f.b.join("personal/mine/SKILL.md")), "untracked\n");
+        assert_eq!(head_ref(&f.b), "refs/heads/main");
+        let anchor = Git::new(&f.b).args(["rev-parse", "--verify", "--quiet", "refs/worktree/sk1ll-pull"]);
+        assert!(!anchor.succeeds().unwrap(), "the target's anchor is gone with the journal");
+        assert_eq!(crate::sync::displaced::changed().unwrap(), []);
+    }
+
+    /// A pull that stops anywhere once it has written its journal (killed,
+    /// say) is finished by the next pull, or by [`Repo::finish_pull`] (the
+    /// daemon's refresh), in a new process: nothing of it is only in memory.
     #[test]
-    fn pull_puts_back_a_switch_whose_branch_moved() {
+    fn a_pull_that_stopped_half_way_is_finished_later() {
+        let points = [Before::File(0), Before::File(2), Before::Swap, Before::Index, Before::UpdateRef, Before::Done];
+        for point in points {
+            for (rebase, by_pull) in [(false, true), (false, false), (true, true), (true, false)] {
+                let case =
+                    format!("{point:?}, rebase {rebase}, finished by {}", if by_pull { "pull" } else { "refresh" });
+                let f = Fleet::new();
+                let b = repo(&f.b);
+                let remote = half_way_setup(&f);
+                if rebase {
+                    write(&f.b.join("sk1ll.toml"), "# b committed\n");
+                    b.commit(&[ItemRef::Manifest], "manifest from b", None).unwrap();
+                }
+                let old = git(&f.b, &["rev-parse", "HEAD"]);
+                let draft = b.draft().unwrap();
+                let crashed = b.pull_crashing_at(point).unwrap_err().to_string();
+                assert!(crashed.contains("crashed"), "{case}: {crashed}");
+                assert!(pending(&b), "{case}");
+                assert_eq!(head_ref(&f.b), "refs/heads/main", "{case}");
+                let anchor = git(&f.b, &["rev-parse", "refs/worktree/sk1ll-pull"]);
+
+                let b = repo(&f.b);
+                let outcome = if by_pull { b.pull().unwrap() } else { b.finish_pull().unwrap().unwrap() };
+                let target = git(&f.b, &["rev-parse", "refs/heads/main"]);
+                assert_eq!(outcome, PullOutcome::Updated { from: old, to: target.clone() }, "{case}");
+                assert_eq!(anchor, target, "{case}: the anchor kept the target's objects");
+                assert_eq!(git(&f.b, &["rev-parse", if rebase { "HEAD~1" } else { "HEAD" }]), remote, "{case}");
+                assert!(!pending(&b), "{case}");
+                assert_at_upstream(&f);
+                assert_eq!(b.draft().unwrap(), draft, "{case}");
+                assert_eq!(b.finish_pull().unwrap(), None, "{case}");
+                assert_eq!(b.pull().unwrap(), PullOutcome::UpToDate, "{case}");
+            }
+        }
+    }
+
+    /// A save that lands while pull replaces a file is never lost: the swap
+    /// stands and the save is kept in the recovery area, from where it can
+    /// be adopted back as a draft change.
+    #[cfg(unix)]
+    #[test]
+    fn a_save_during_a_file_swap_is_kept_in_recovery() {
         let f = Fleet::new();
         let (a, b) = (repo(&f.a), repo(&f.b));
-        write(&f.b.join("instructions/git.md"), "b draft\n");
-        write(&f.b.join("personal/mine/SKILL.md"), "untracked\n");
-        let draft = b.draft().unwrap();
+        let path = f.b.join("personal/pdf/SKILL.md");
+        type Save<'a> = (&'a str, Box<dyn Fn() + 'a>);
+        let mut saves: Vec<Save> = vec![(
+            "saved in place\n",
+            Box::new(|| {
+                // Through the file being replaced, as most editors save.
+                let mut file = fs::OpenOptions::new().write(true).truncate(true).open(&path).unwrap();
+                std::io::Write::write_all(&mut file, b"saved in place\n").unwrap();
+            }),
+        )];
+        // A new file renamed into place: only an exchange brings it back.
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        saves.push((
+            "saved by rename\n",
+            Box::new(|| {
+                let tmp = f.b.join("personal/pdf/.SKILL.md.swp");
+                fs::write(&tmp, "saved by rename\n").unwrap();
+                fs::rename(&tmp, &path).unwrap();
+            }),
+        ));
+        for (n, (saved, save)) in saves.into_iter().enumerate() {
+            let upstream = format!("v{n}\n");
+            write(&f.a.join("personal/pdf/SKILL.md"), &upstream);
+            let remote = a.commit(&[item("skill:pdf")], "pdf", None).unwrap();
+            a.push().unwrap();
+            let old = git(&f.b, &["rev-parse", "HEAD"]);
+            match b.pull_at(Before::Swap, save) {
+                Err(Error::Displaced { kept, id, .. }) => {
+                    assert_eq!(read(&kept), saved);
+                    let entry = crate::sync::displaced::get(&id).unwrap();
+                    assert!(entry.changed && entry.kind == crate::sync::displaced::Kind::Draft, "{entry:?}");
+                    assert_eq!(entry.dest, f.b.canonicalize().unwrap().join("personal/pdf/SKILL.md"));
+                    // The pull is done all the same.
+                    assert_eq!(read(&path), upstream);
+                    assert_eq!(git(&f.b, &["rev-parse", "HEAD"]), remote);
+                    assert_ne!(remote, old);
+                    assert!(!pending(&b) && b.draft().unwrap().is_empty());
+                    crate::sync::displaced::adopt(&b, &id).unwrap();
+                    assert_eq!(read(&path), saved);
+                    assert_eq!(items(&b), [("skill:pdf".into(), Change::Modified)]);
+                    b.restore(&[item("skill:pdf")]).unwrap();
+                }
+                other => panic!("expected the save to be displaced, got {other:?}"),
+            }
+        }
+        assert!(
+            crate::sync::displaced::changed().unwrap().is_empty(),
+            "adopted entries are gone; the content adopt replaced was the baseline's"
+        );
+    }
+
+    /// A draft change that appears, after the last checks, in a path pull
+    /// has yet to update stops it there as Blocked. The pull already updated
+    /// other paths, so its journal stays until that item is committed or
+    /// restored; then the next pull finishes.
+    #[test]
+    fn a_draft_change_after_the_checks_blocks_the_rest_of_the_pull() {
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        write(&f.a.join("imported/web/SKILL.md"), "web v2\n");
+        write(&f.a.join("personal/pdf/SKILL.md"), "pdf v2\n");
+        commit_all(&f.a, "web and pdf");
+        a.push().unwrap();
+        let remote = git(&f.a, &["rev-parse", "HEAD"]);
+        let old = git(&f.b, &["rev-parse", "HEAD"]);
+        let pdf = f.b.join("personal/pdf/SKILL.md");
+        let outcome = b.pull_at(Before::File(1), || write(&pdf, "draft edit\n")).unwrap();
+        assert_eq!(outcome, PullOutcome::Blocked { baseline: remote.clone(), items: vec![item("skill:pdf")] });
+        assert_eq!(read(&pdf), "draft edit\n");
+        assert_eq!(read(&f.b.join("imported/web/SKILL.md")), "web v2\n");
+        assert!(pending(&b));
+        assert_eq!((head_ref(&f.b), git(&f.b, &["rev-parse", "HEAD"])), ("refs/heads/main".into(), old.clone()));
+        // Still Blocked, and nothing else can move the branch meanwhile.
+        assert_eq!(b.finish_pull().unwrap().unwrap(), outcome);
+        assert!(invalid(b.commit(&[item("skill:pdf")], "m", None)).contains("half-way"));
+
+        b.restore(&[item("skill:pdf")]).unwrap();
+        assert_eq!(b.pull().unwrap(), PullOutcome::Updated { from: old, to: remote });
+        assert_eq!(read(&pdf), "pdf v2\n");
+        assert!(!pending(&b) && b.draft().unwrap().is_empty());
+    }
+
+    /// Item-level protection ends at the last checks: a save after them to
+    /// a file of a changed item that the new baseline leaves alone is no
+    /// clash, and stays as a draft change on top of it.
+    #[test]
+    fn a_save_to_an_untouched_file_of_a_changed_item_stays_in_the_draft() {
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        write(&f.a.join("personal/pdf/SKILL.md"), "pdf v2\n");
+        let remote = a.commit(&[item("skill:pdf")], "pdf", None).unwrap();
+        a.push().unwrap();
+        let sibling = f.b.join("personal/pdf/ref.md");
+        let outcome = b.pull_at(Before::File(0), || write(&sibling, "saved after the checks\n")).unwrap();
+        assert!(matches!(outcome, PullOutcome::Updated { to, .. } if to == remote));
+        assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "pdf v2\n");
+        assert_eq!(read(&sibling), "saved after the checks\n");
+        assert_eq!(items(&b), [("skill:pdf".into(), Change::Modified)]);
+    }
+
+    /// Another Git process holding the index lock is an error, with git's
+    /// message, never Blocked. Before the journal, nothing changes; after
+    /// the files, the next pull finishes.
+    #[test]
+    fn an_index_lock_is_an_error_not_a_clash() {
+        let f = Fleet::new();
+        let b = repo(&f.b);
+        let remote = half_way_setup(&f);
+        let old = git(&f.b, &["rev-parse", "HEAD"]);
+        let lock = f.b.join(".git/index.lock");
+        write(&lock, "");
+        let before = snapshot(&f.b);
+        match b.pull() {
+            Err(Error::Git { stderr, .. }) => assert!(stderr.contains("index.lock"), "{stderr}"),
+            other => panic!("expected git's error, got {other:?}"),
+        }
+        assert_eq!(snapshot(&f.b), before);
+        assert!(!pending(&b));
+        fs::remove_file(&lock).unwrap();
+
+        match b.pull_at(Before::Index, || write(&lock, "")) {
+            Err(Error::Git { args, stderr }) => {
+                assert!(args.contains("read-tree") && stderr.contains("index.lock"), "{args}: {stderr}")
+            }
+            other => panic!("expected git's error, got {other:?}"),
+        }
+        assert!(pending(&b));
+        fs::remove_file(&lock).unwrap();
+        assert_eq!(b.pull().unwrap(), PullOutcome::Updated { from: old, to: remote });
+        assert_at_upstream(&f);
+    }
+
+    /// Files are compared and written as git converts them, so a pull that
+    /// stopped after writing a converted file tells it from a draft change.
+    #[test]
+    fn a_pull_resumes_over_converted_line_endings() {
+        // Conversion from config.
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        git(&f.b, &["config", "core.autocrlf", "true"]);
+        write(&f.a.join("instructions/git.md"), "git v2\n");
+        write(&f.a.join("personal/pdf/SKILL.md"), "pdf v2\n");
+        commit_all(&f.a, "two files");
+        a.push().unwrap();
+        b.pull_crashing_at(Before::File(1)).unwrap_err();
+        assert_eq!(fs::read(f.b.join("instructions/git.md")).unwrap(), b"git v2\r\n");
+        assert!(matches!(repo(&f.b).pull().unwrap(), PullOutcome::Updated { .. }));
+        assert_eq!(fs::read(f.b.join("personal/pdf/SKILL.md")).unwrap(), b"pdf v2\r\n");
+        assert_eq!(git(&f.b, &["status", "--porcelain"]), "");
+
+        // Conversion from `.gitattributes` the pull itself adds: each side
+        // is read with its own commit's, whatever the working tree has yet.
+        let f = Fleet::new();
+        let b = repo(&f.b);
+        write(&f.a.join(".gitattributes"), "*.md text eol=crlf\n");
+        write(&f.a.join("instructions/git.md"), "git v2\n");
+        write(&f.a.join("personal/pdf/SKILL.md"), "pdf v2\n");
+        commit_all(&f.a, "crlf");
+        git(&f.a, &["push", "--quiet", REMOTE, "main"]);
+        b.pull_crashing_at(Before::File(2)).unwrap_err();
+        assert_eq!(fs::read(f.b.join("instructions/git.md")).unwrap(), b"git v2\r\n");
+        assert_eq!(fs::read(f.b.join("personal/pdf/SKILL.md")).unwrap(), b"---\nname: pdf\n---\nPDFs.\n");
+        assert!(matches!(repo(&f.b).pull().unwrap(), PullOutcome::Updated { .. }));
+        assert_eq!(fs::read(f.b.join("personal/pdf/SKILL.md")).unwrap(), b"pdf v2\r\n");
+        assert_eq!(git(&f.b, &["status", "--porcelain"]), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pull_keeps_permissions_and_sets_the_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        let mode = |path: &str| fs::metadata(f.b.join(path)).unwrap().permissions().mode() & 0o7777;
+        write(&f.a.join("personal/pdf/run.sh"), "#!/bin/sh\n");
+        chmod(&f.a.join("personal/pdf/run.sh"), 0o755);
+        commit_all(&f.a, "a script");
+        a.push().unwrap();
+        assert!(matches!(b.pull().unwrap(), PullOutcome::Updated { .. }));
+        assert!(executable(&f.b.join("personal/pdf/run.sh")));
+
+        chmod(&f.b.join("personal/pdf/SKILL.md"), 0o600);
+        chmod(&f.b.join("personal/pdf/run.sh"), 0o700);
+        chmod(&f.b.join("instructions/git.md"), 0o640);
+        assert!(b.draft().unwrap().is_empty());
         write(&f.a.join("personal/pdf/SKILL.md"), "v2\n");
-        write(&f.a.join("personal/pdf/new.md"), "added\n");
+        write(&f.a.join("personal/pdf/run.sh"), "#!/bin/sh\necho v2\n");
+        write(&f.a.join("instructions/git.md"), "git v2\n");
+        chmod(&f.a.join("instructions/git.md"), 0o755);
+        commit_all(&f.a, "changes");
+        a.push().unwrap();
+        assert!(matches!(b.pull().unwrap(), PullOutcome::Updated { .. }));
+        assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "v2\n");
+        assert_eq!(mode("personal/pdf/SKILL.md"), 0o600);
+        assert_eq!(mode("personal/pdf/run.sh"), 0o700);
+        assert_eq!(mode("instructions/git.md"), 0o750);
+        assert_eq!(git(&f.b, &["status", "--porcelain"]), "");
+
+        chmod(&f.a.join("instructions/git.md"), 0o644);
+        commit_all(&f.a, "not executable");
+        a.push().unwrap();
+        assert!(matches!(b.pull().unwrap(), PullOutcome::Updated { .. }));
+        assert_eq!(mode("instructions/git.md"), 0o640);
+    }
+
+    /// Another Git command that switches branches while pull runs stops it
+    /// with an error: pull changes nothing more, on either branch. Back on
+    /// the branch, the next pull finishes.
+    #[test]
+    fn pull_stops_when_another_command_switches_branches() {
+        for (n, point) in [Before::File(1), Before::UpdateRef].into_iter().enumerate() {
+            let f = Fleet::new();
+            let b = repo(&f.b);
+            let remote = half_way_setup(&f);
+            let old = git(&f.b, &["rev-parse", "HEAD"]);
+            let other = format!("other-{n}");
+            let error = invalid(b.pull_at(point, || {
+                git(&f.b, &["switch", "--quiet", "-c", &other]);
+            }));
+            assert!(error.contains("switched") && error.contains(&format!("refs/heads/{other}")), "{error}");
+            assert_eq!(head_ref(&f.b), format!("refs/heads/{other}"));
+            assert_eq!(git(&f.b, &["rev-parse", "main", &other]), format!("{old}\n{old}"));
+            if point == Before::File(1) {
+                // Only the first path was updated, before the switch.
+                assert_eq!(read(&f.b.join("instructions/git.md")), "Use Conventional Commits.\n");
+            }
+            assert!(pending(&b));
+            git(&f.b, &["switch", "--quiet", "main"]);
+            assert_eq!(b.pull().unwrap(), PullOutcome::Updated { from: old.clone(), to: remote });
+            assert_at_upstream(&f);
+            assert_eq!(git(&f.b, &["rev-parse", &other]), old);
+        }
+    }
+
+    /// Another Git command that moves the branch while pull runs makes
+    /// pull stop with an error, and every later pull too: it only ever
+    /// moves the branch from where it was, and says what is left.
+    #[test]
+    fn pull_stops_when_another_command_moves_the_branch() {
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        write(&f.a.join("personal/pdf/SKILL.md"), "v2\n");
         a.commit(&[item("skill:pdf")], "v2", None).unwrap();
         a.push().unwrap();
-        let (files, _, index, stash) = snapshot(&f.b);
-        // Another git command moves the branch (to a commit with the same
-        // tree) right before pull does.
         let head = git(&f.b, &["rev-parse", "HEAD"]);
         let tree = format!("{head}^{{tree}}");
         let moved =
@@ -1900,60 +2224,76 @@ mod tests {
         match result {
             Err(Error::Git { args, stderr }) => {
                 assert!(args.starts_with("update-ref"), "{args}");
-                assert!(stderr.contains("put back") && stderr.contains("moved"), "{stderr}");
+                assert!(stderr.contains("moved refs/heads/main"), "{stderr}");
             }
             other => panic!("expected an update-ref error, got {other:?}"),
         }
-        assert_eq!(git(&f.b, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+        assert_eq!(head_ref(&f.b), "refs/heads/main");
         assert_eq!(git(&f.b, &["rev-parse", "HEAD"]), moved);
-        let (files_now, _, index_now, stash_now) = snapshot(&f.b);
-        assert_eq!((files_now, index_now, stash_now), (files, index, stash));
-        assert_eq!(b.draft().unwrap(), draft);
+        assert!(pending(&b));
+        let before = snapshot(&f.b);
+        for result in [b.pull(), b.finish_pull().map(|_| PullOutcome::UpToDate)] {
+            let error = invalid(result);
+            assert!(error.contains("another Git command moved it") && error.contains("sk1ll-pull.json"), "{error}");
+            assert_eq!(snapshot(&f.b), before);
+        }
     }
 
     #[cfg(unix)]
     #[test]
-    fn pull_rolls_back_when_git_cannot_remove_a_file() {
+    fn a_failed_write_rolls_forward_on_the_next_pull() {
         // SAFETY: geteuid has no preconditions.
         if unsafe { libc::geteuid() } == 0 {
-            return;
+            return; // root can write into the read-only directory below
         }
         let f = Fleet::new();
-        let (a, b) = (repo(&f.a), repo(&f.b));
-        fs::remove_file(f.a.join("instructions/git.md")).unwrap();
-        write(&f.a.join("imported/web/SKILL.md"), "web v2\n");
-        commit_all(&f.a, "remove a rule and update a skill");
-        a.push().unwrap();
-        let before = snapshot(&f.b);
-
+        let b = repo(&f.b);
+        let remote = half_way_setup(&f);
+        let old = git(&f.b, &["rev-parse", "HEAD"]);
+        let draft = b.draft().unwrap();
+        // The removal goes first, `instructions/git.md` next.
         chmod(&f.b.join("instructions"), 0o555);
         let result = b.pull();
         chmod(&f.b.join("instructions"), 0o755);
-        let error = result.unwrap_err().to_string();
-        assert!(error.contains("instructions/git.md") && error.contains("put back"), "{error}");
-        assert_eq!(snapshot(&f.b), before);
+        match result {
+            Err(Error::Io { path, .. }) => assert!(path.ends_with("instructions/git.md"), "{}", path.display()),
+            other => panic!("expected the write to fail, got {other:?}"),
+        }
+        assert!(pending(&b));
+        assert!(!f.b.join("imported/web/SKILL.md").exists(), "rolled forward, never back");
+        assert_eq!(git(&f.b, &["rev-parse", "HEAD"]), old);
+
+        // A save to a path pull already updated is a draft change now.
+        let web = f.b.join("imported/web/SKILL.md");
+        write(&web, "saved meanwhile\n");
+        let outcome = b.pull().unwrap();
+        assert_eq!(outcome, PullOutcome::Blocked { baseline: remote.clone(), items: vec![item("skill:web")] });
+        assert_eq!(read(&web), "saved meanwhile\n");
+        fs::remove_dir_all(f.b.join("imported/web")).unwrap();
+        assert_eq!(b.pull().unwrap(), PullOutcome::Updated { from: old, to: remote });
+        assert_at_upstream(&f);
+        assert_eq!(b.draft().unwrap(), draft);
     }
 
+    /// Recovery entries of what pull replaced are in the git directory,
+    /// never in the working tree, and nothing is left staged.
     #[test]
-    fn pull_rolls_back_the_branch_if_head_cannot_reattach() {
+    fn pull_keeps_the_working_tree_free_of_its_own_files() {
         let f = Fleet::new();
-        let (a, b) = (repo(&f.a), repo(&f.b));
-        write(&f.a.join("personal/pdf/SKILL.md"), "v2\n");
-        let target = a.commit(&[item("skill:pdf")], "v2", None).unwrap();
-        a.push().unwrap();
-        write(&f.b.join("instructions/git.md"), "b draft\n");
-        let head = git(&f.b, &["rev-parse", "HEAD"]);
-        let before = snapshot(&f.b);
-        let lock = f.b.join(".git/HEAD.lock");
-        let result = b.pull_at(Before::Attach, || {
-            assert_eq!(git(&f.b, &["rev-parse", "refs/heads/main"]), target);
-            write(&lock, "concurrent HEAD lock\n");
-        });
-        let error = result.unwrap_err().to_string();
-        assert!(error.contains("symbolic-ref") && error.contains("couldn't reattach HEAD"), "{error}");
-        fs::remove_file(&lock).unwrap();
-        assert_eq!(git(&f.b, &["rev-parse", "refs/heads/main"]), head);
-        git(&f.b, &["symbolic-ref", "HEAD", "refs/heads/main"]);
-        assert_eq!(snapshot(&f.b), before);
+        let b = repo(&f.b);
+        half_way_setup(&f);
+        assert!(matches!(b.pull().unwrap(), PullOutcome::Updated { .. }));
+        let names: Vec<String> = WalkDir::new(&f.b)
+            .into_iter()
+            .filter_entry(|e| e.file_name() != ".git")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into())
+            .collect();
+        assert!(names.iter().all(|n| !n.starts_with(".sk1ll")), "{names:?}");
+        let entries = crate::sync::displaced::list().unwrap();
+        assert!(
+            !entries.is_empty() && entries.iter().all(|e| e.path.starts_with(f.b.join(".git").canonicalize().unwrap()))
+        );
+        assert!(!f.b.join(".git/sk1ll-pull-stage").exists());
     }
 }

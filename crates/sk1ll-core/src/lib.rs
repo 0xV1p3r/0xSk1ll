@@ -64,12 +64,12 @@ pub enum Error {
     /// nothing was done: look again (re-read, preview again) and retry.
     #[error("{0}")]
     Changed(String),
-    /// Sync replaced or removed `dest`, but the content it displaced was
-    /// written to while that happened. Nothing is lost: that content is kept,
-    /// never pruned, in the recovery area at `kept` (see [`sync::displaced`])
-    /// until it is adopted or discarded by `id`.
+    /// Sync (or pull, in the skills repo) replaced or removed `dest`, but the
+    /// content it displaced was written to while that happened. Nothing is
+    /// lost: that content is kept, never pruned, in the recovery area at
+    /// `kept` (see [`sync::displaced`]) until it is adopted or discarded by `id`.
     #[error(
-        "{} was written to while sync replaced it; that version is kept at {} (adopt or discard displaced \
+        "{} was written to while sk1ll replaced it; that version is kept at {} (adopt or discard displaced \
          entry `{id}`)",
         dest.display(),
         kept.display()
