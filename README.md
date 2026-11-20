@@ -95,7 +95,7 @@ Commands take a bare skill or rule name, or `skill:<name>`, `rule:<name>`, `mani
 | `remove <name>` | Remove an import |
 | `fork <name>` | Turn an import into a personal skill you can edit |
 | `edit <name>` | Open a personal skill or rule in `$VISUAL` or `$EDITOR` |
-| `list [--unmanaged]` | List repo content, or skills in harnesses that sk1ll doesn't manage |
+| `list` | List repo content. Use `--json` to include Item IDs or `--unmanaged` to list unmanaged skills |
 | `status` | Import drift and pending sync actions |
 | `sync [--dry-run] [--force]` | Write skills and instructions into harnesses |
 | `render <harness>` | Print the instruction files a harness would receive |

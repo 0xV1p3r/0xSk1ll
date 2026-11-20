@@ -5,7 +5,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use toml_edit::{DocumentMut, Item, Table, value};
 
-use crate::{Error, IoExt, Result};
+use crate::{Error, IoExt, ItemId, Result};
 
 pub const MANIFEST_FILE: &str = "sk1ll.toml";
 
@@ -21,6 +21,8 @@ pub struct Manifest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Import {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<ItemId>,
     /// Git URL, local path, or `github:owner/repo`.
     pub source: String,
     /// Subdirectory within the source repo containing `SKILL.md`.
@@ -30,11 +32,21 @@ pub struct Import {
     pub git_ref: String,
 }
 
+impl Import {
+    pub fn item_id(&self, name: &str) -> ItemId {
+        self.id.clone().unwrap_or_else(|| ItemId::derived("import", name))
+    }
+}
+
 fn default_ref() -> String {
     "HEAD".into()
 }
 
 impl Manifest {
+    pub(crate) fn import_id(&self, name: &str) -> ItemId {
+        self.import.get(name).map_or_else(|| ItemId::derived("import", name), |import| import.item_id(name))
+    }
+
     pub fn load(root: &Path) -> Result<Self> {
         let path = root.join(MANIFEST_FILE);
         let text = fs::read_to_string(&path).at(&path)?;
@@ -83,6 +95,9 @@ pub(crate) fn write_import(root: &Path, name: &str, import: &Import) -> Result<(
             t["path"] = value(import.path.as_str());
         }
         t["ref"] = value(import.git_ref.as_str());
+        if let Some(id) = &import.id {
+            t["id"] = value(id.to_string());
+        }
         imports.insert(name, Item::Table(t));
         Ok(())
     })

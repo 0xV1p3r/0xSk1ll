@@ -201,6 +201,8 @@ pub enum ChangeKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ItemView {
     pub item: ItemRef,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<sk1ll_core::ItemId>,
     pub in_baseline: bool,
     pub draft: Option<ChangeKind>,
     pub unpushed: bool,

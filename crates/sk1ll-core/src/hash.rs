@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::git::path_bytes;
-use crate::sync::MARKER;
+use crate::sync::COPY_SKIP;
 use crate::{IoExt, Result};
 
 /// Stable content hash of a skill directory (file paths + contents), ignoring
@@ -35,7 +35,7 @@ fn hash_dir_buffered(dir: &Path, buf: &mut [u8]) -> Result<String> {
     let walker = WalkDir::new(dir)
         .sort_by_file_name()
         .into_iter()
-        .filter_entry(|e| e.depth() == 0 || (e.file_name() != ".git" && e.file_name() != MARKER));
+        .filter_entry(|e| e.depth() == 0 || !COPY_SKIP.iter().any(|name| e.file_name() == *name));
     for entry in walker {
         let entry = entry.map_err(std::io::Error::from).at(dir)?;
         let rel = entry.path().strip_prefix(dir).unwrap_or(entry.path());
@@ -129,7 +129,7 @@ mod tests {
         let walker = WalkDir::new(dir)
             .sort_by_file_name()
             .into_iter()
-            .filter_entry(|e| e.depth() == 0 || (e.file_name() != ".git" && e.file_name() != MARKER));
+            .filter_entry(|e| e.depth() == 0 || !COPY_SKIP.iter().any(|name| e.file_name() == *name));
         for entry in walker {
             let entry = entry.unwrap();
             let rel = entry.path().strip_prefix(dir).unwrap().to_string_lossy().replace('\\', "/");
@@ -175,7 +175,7 @@ mod tests {
         let dir = tmp.path();
         write(&dir.join("SKILL.md"), "---\nname: pdf\n---\n");
         write(&dir.join("refs/deep/é.md"), "x\n");
-        write(&dir.join(MARKER), "ignored\n");
+        write(&dir.join(crate::sync::MARKER), "ignored\n");
         #[cfg(unix)]
         std::os::unix::fs::symlink("refs/deep", dir.join("link")).unwrap();
         assert_eq!(hash_dir(dir).unwrap(), legacy_hash_dir(dir));

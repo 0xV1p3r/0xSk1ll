@@ -16,12 +16,13 @@ use crate::assignment::Assignment;
 use crate::hash::{hash_dir, hash_str};
 use crate::instructions::{self, Rule};
 use crate::machine::{Harness, InstructionsFormat, LinkMode};
-use crate::skill::Skill;
-use crate::{Error, IoExt, Repo, Result};
+use crate::skill::{ID_FILE, Origin, Skill};
+use crate::{Error, IoExt, ItemId, Repo, Result};
 
 /// Written inside copied skill directories (holds the content hash) and in
 /// rules directories (holds the index of managed rule files).
 pub const MARKER: &str = ".sk1ll-managed";
+pub(crate) const COPY_SKIP: &[&str] = &[".git", MARKER, ID_FILE];
 
 /// Ownership of skill symlinks, stored next to the skill directories.
 const LINK_INDEX: &str = ".sk1ll-managed-links";
@@ -565,7 +566,7 @@ fn apply_skill(repo: &Repo, action: &Action, adopted: bool, reviewed_digest: Opt
                     LinkMode::Copy => {
                         #[cfg(test)]
                         hook(Hook::BeforeCopy, src);
-                        copy_dir(src, &stage, &[".git", MARKER])?;
+                        copy_dir(src, &stage, COPY_SKIP)?;
                         let digest = hash_dir(&stage)?;
                         if reviewed_digest.is_some_and(|expected| expected != digest) {
                             return Err(Error::Changed(format!("{} changed since the sync preview", src.display())));
@@ -1108,14 +1109,14 @@ fn adopt_skill(repo: &Repo, src: &Path, name: &str) -> Result<()> {
             "`{name}` is an unmanaged skill and cannot replace an existing repo skill"
         )));
     }
-    copy_into_repo(repo, src, name)?;
+    copy_into_repo(repo, src, name, false)?;
     let marker = src.join(MARKER);
     fs::write(&marker, hash_dir(src)?).at(&marker)
 }
 
 /// Replaces the repo's skill `name` (a new personal one if there is none)
-/// with the copied skill directory `src`, minus its marker.
-fn copy_into_repo(repo: &Repo, src: &Path, name: &str) -> Result<()> {
+/// with the copied skill directory `src`, keeping its identity metadata.
+fn copy_into_repo(repo: &Repo, src: &Path, name: &str, recovered: bool) -> Result<()> {
     let meta = fs::symlink_metadata(src).at(src)?;
     if !meta.is_dir() {
         return Err(Error::Invalid(format!(
@@ -1123,23 +1124,35 @@ fn copy_into_repo(repo: &Repo, src: &Path, name: &str) -> Result<()> {
             src.display()
         )));
     }
-    let dest = repo
-        .skills()?
-        .into_iter()
-        .find(|s| s.name == name)
-        .map(|s| s.path)
-        .unwrap_or_else(|| repo.personal_dir().join(name));
+    let existing = repo.skills()?.into_iter().find(|s| s.name == name);
+    let dest = existing.as_ref().map_or_else(|| repo.personal_dir().join(name), |s| s.path.clone());
+    let id = match existing.as_ref().map(|skill| skill.origin) {
+        Some(Origin::Imported) => None,
+        Some(Origin::Personal) => {
+            recovered.then(|| ItemId::read_skill(src)).flatten().or_else(|| ItemId::read_skill(&dest))
+        }
+        None => Some(recovered.then(|| ItemId::read_skill(src)).flatten().unwrap_or_else(ItemId::generate)),
+    };
     let parent = dest.parent().ok_or_else(|| Error::Invalid(format!("{} has no parent", dest.display())))?;
     // Stage next to the target (`.sk1ll-stage-*` is git-ignored), then swap.
     let stage = parent.join(format!(".sk1ll-stage-{name}"));
     if stage.exists() {
         fs::remove_dir_all(&stage).at(&stage)?;
     }
-    copy_dir(src, &stage, &[".git", MARKER])?;
-    if dest.exists() {
-        fs::remove_dir_all(&dest).at(&dest)?;
+    let copied = (|| {
+        copy_dir(src, &stage, COPY_SKIP)?;
+        if let Some(id) = id {
+            id.write_skill(&stage)?;
+        }
+        if dest.exists() {
+            fs::remove_dir_all(&dest).at(&dest)?;
+        }
+        fs::rename(&stage, &dest).at(&dest)
+    })();
+    if copied.is_err() {
+        let _ = fs::remove_dir_all(&stage);
     }
-    fs::rename(&stage, &dest).at(&dest)
+    copied
 }
 
 fn adopt_rule(repo: &Repo, src: &Path, file: &str) -> Result<()> {
@@ -1154,12 +1167,12 @@ fn adopt_rule(repo: &Repo, src: &Path, file: &str) -> Result<()> {
 }
 
 /// Writes the rule file `file`'s `text` into the repo's rule, keeping
-/// the rule's `harnesses:` key.
+/// metadata stripped when the rule was rendered.
 fn rule_into_repo(repo: &Repo, file: &str, text: &str) -> Result<()> {
     let name = file.strip_suffix(".md").unwrap_or(file);
     let original = repo.rules()?.into_iter().find(|f| f.name == name);
     let content = match &original {
-        Some(f) => instructions::restore_harnesses(f, text),
+        Some(f) => instructions::restore_metadata(f, text),
         None => text.to_string(),
     };
     let dest = original.map(|f| f.path).unwrap_or_else(|| repo.root().join(instructions::INSTRUCTIONS_DIR).join(file));
@@ -1359,7 +1372,7 @@ pub mod displaced {
                     "displaced entry `{id}` is a skill link, which holds no content of its own; discard it"
                 )));
             }
-            Kind::Skill => copy_into_repo(repo, &entry.path, &name)?,
+            Kind::Skill => copy_into_repo(repo, &entry.path, &name, true)?,
             Kind::Rule => rule_into_repo(repo, &name, &read_text(&entry.path)?)?,
             Kind::Instructions => restore_instructions(&entry)?,
         }
@@ -2184,6 +2197,23 @@ mod tests {
     }
 
     #[test]
+    fn skill_id_is_ignored_in_hashes_and_copies_but_visible_through_links() {
+        for mode in [LinkMode::Copy, LinkMode::Symlink] {
+            let (_tmp, repo, harnesses) = skill_setup(mode);
+            let src = repo.personal_dir().join("pdf");
+            let hash = hash_dir(&src).unwrap();
+            ItemId::generate().write_skill(&src).unwrap();
+            assert_eq!(hash_dir(&src).unwrap(), hash);
+            let plan_now = || plan(&repo, &harnesses, &Assignment::default(), PlanOptions::default()).unwrap();
+            let actions = plan_now();
+            apply(&repo, &actions[0]).unwrap();
+            assert_eq!(actions[0].dest.join(ID_FILE).is_file(), mode == LinkMode::Symlink);
+            ItemId::generate().write_skill(&src).unwrap();
+            assert!(plan_now().is_empty());
+        }
+    }
+
+    #[test]
     fn reviewed_copies_reject_source_edits_before_and_during_staging() {
         for point in [Hook::BeforeCopy, Hook::CopyEntry] {
             let (_tmp, repo, harnesses) = skill_setup(LinkMode::Copy);
@@ -2756,7 +2786,12 @@ mod tests {
         write(&root.join("sk1ll.toml"), "");
         write(&root.join("personal/pdf/SKILL.md"), "---\nname: pdf\n---\n");
         write(&root.join("personal/pdf/ref.md"), "ref\n");
-        write(&root.join("instructions/git.md"), "---\nharnesses: [h, b]\ndescription: Git\n---\nUse CC.\n");
+        let id = ItemId::generate();
+        id.write_skill(&root.join("personal/pdf")).unwrap();
+        write(
+            &root.join("instructions/git.md"),
+            "---\nharnesses: [h, b]\nid: git-rule\ndescription: Git\n---\nUse CC.\n",
+        );
         for args in [
             &["init", "-q"][..],
             &["add", "-A"],
@@ -2782,6 +2817,9 @@ mod tests {
             apply(&repo, &a).unwrap();
         }
         assert!(plan_now(false).is_empty());
+        for path in ["rules/git.md", "AGENTS.md"] {
+            assert!(!fs::read_to_string(out.join(path)).unwrap().contains("id:"));
+        }
 
         write(&out.join("skills/pdf/SKILL.md"), "---\nname: pdf\n---\nEdited.\n");
         write(&out.join("skills/pdf/extra.md"), "extra\n");
@@ -2804,10 +2842,11 @@ mod tests {
         }
         assert!(matches!(adopt(&repo, &forced[0]), Err(Error::Invalid(_))));
         assert_eq!(fs::read_to_string(root.join("personal/pdf/SKILL.md")).unwrap(), "---\nname: pdf\n---\nEdited.\n");
+        assert_eq!(ItemId::read_skill(&root.join("personal/pdf")), Some(id));
         assert!(root.join("personal/pdf/extra.md").is_file() && !root.join("personal/pdf").join(MARKER).exists());
         assert_eq!(
             fs::read_to_string(root.join("instructions/git.md")).unwrap(),
-            "---\nharnesses: [h, b]\ndescription: Git\n---\n\nUse CC always.\n"
+            "---\nharnesses: [h, b]\nid: git-rule\ndescription: Git\n---\n\nUse CC always.\n"
         );
         let draft: Vec<(ItemRef, Change)> = repo.draft().unwrap().into_iter().map(|d| (d.item, d.change)).collect();
         assert_eq!(
@@ -2951,9 +2990,12 @@ mod tests {
                     }
                     assert!(sk1ll_leftovers(&tmp.path().join("skills")).is_empty(), "{case}");
 
+                    let id = ItemId::generate();
+                    id.write_skill(&entry.path).unwrap();
                     displaced::adopt(&repo, &entry.id).unwrap();
                     let adopted = fs::read_to_string(repo.personal_dir().join("pdf/SKILL.md")).unwrap();
                     assert_eq!(adopted, kept, "{case}");
+                    assert_eq!(ItemId::read_skill(&repo.personal_dir().join("pdf")), Some(id));
                     assert!(!repo.personal_dir().join("pdf").join(MARKER).exists());
                     assert!(displaced::list().unwrap().is_empty(), "{case}");
                 }

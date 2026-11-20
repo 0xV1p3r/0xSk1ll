@@ -113,6 +113,9 @@ enum Cmd {
         /// List unmanaged skills in this machine's harnesses
         #[arg(long)]
         unmanaged: bool,
+        /// Print repo Skills and Rules as JSON
+        #[arg(long, conflicts_with = "unmanaged")]
+        json: bool,
     },
     /// Open a personal Skill or Rule in $VISUAL or $EDITOR
     Edit { name: String },
@@ -505,7 +508,7 @@ fn run(cli: Cli) -> Result<()> {
         | Cmd::Daemon
         | Cmd::Fleet { .. }
         | Cmd::Completions { .. } => unreachable!(),
-        Cmd::List { unmanaged: true } => {
+        Cmd::List { unmanaged: true, .. } => {
             for skill in sync::unmanaged::discover(&repo, &machine()?.harnesses())? {
                 let harnesses: std::collections::BTreeSet<_> =
                     skill.variants.iter().flat_map(|v| v.locations.iter().map(|l| l.harness.as_str())).collect();
@@ -535,7 +538,11 @@ fn run(cli: Cli) -> Result<()> {
                 bail!("editor exited with {status}");
             }
         }
-        Cmd::List { unmanaged: false } => {
+        Cmd::List { unmanaged: false, json: true } => {
+            let content = serde_json::json!({ "skills": repo.skills()?, "rules": repo.rules()? });
+            println!("{}", serde_json::to_string_pretty(&content)?);
+        }
+        Cmd::List { unmanaged: false, json: false } => {
             for s in repo.skills()? {
                 let origin = match s.origin {
                     Origin::Personal if s.shadows_import => "personal*",

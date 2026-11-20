@@ -191,10 +191,11 @@ pub fn publish(repo: &Repo, adoption: &Adoption) -> Result<()> {
     let stage = crate::source::unique(&parent);
     fs::create_dir(&stage).at(&stage)?;
     let copied = (|| {
-        copy_dir(&canonical, &stage, &[".git", MARKER])?;
+        copy_dir(&canonical, &stage, COPY_SKIP)?;
         if hash_dir(&stage)? != adoption.hash {
             return Err(Error::Invalid("skill changed while being adopted; retry".into()));
         }
+        ItemId::generate().write_skill(&stage)?;
         // Persist the complete copy before making it visible in the draft.
         durable_tree(&stage)?;
         #[cfg(test)]
@@ -359,9 +360,14 @@ mod tests {
         for h in ["a", "b"] {
             write(&tmp.path().join(h).join("pdf/SKILL.md"), "same");
         }
+        write(&tmp.path().join("a/pdf/.sk1ll-id"), "from-elsewhere\n");
         write(&tmp.path().join("c/pdf/SKILL.md"), "different");
         let adoption = prepare(&repo, &hs, "a", "pdf").unwrap();
         assert_eq!(adoption.locations.len(), 2);
+        let id = ItemId::read_skill(&repo.personal_dir().join("pdf")).unwrap();
+        assert!(ulid::Ulid::from_string(&id.to_string()).is_ok());
+        prepare(&repo, &hs, "a", "pdf").unwrap();
+        assert_eq!(ItemId::read_skill(&repo.personal_dir().join("pdf")), Some(id));
         // The identical draft copy is a retryable Adopt, not a clash.
         assert!(!discover(&repo, &hs).unwrap()[0].clashes_with_repo);
         let mut assignment = Assignment::default();

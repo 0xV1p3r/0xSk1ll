@@ -1226,8 +1226,14 @@ impl Daemon {
         let baseline_paths = paths(baseline.as_deref())?;
         let head_paths = paths(head.as_deref())?;
         let mut inventory = BTreeMap::<ItemRef, ItemView>::new();
-        let entry =
-            |item: ItemRef| ItemView { item, in_baseline: false, draft: None, unpushed: false, description: None };
+        let entry = |item: ItemRef| ItemView {
+            item,
+            id: None,
+            in_baseline: false,
+            draft: None,
+            unpushed: false,
+            description: None,
+        };
         for path in &baseline_paths {
             let item = ItemRef::for_path(Path::new(path));
             if matches!(item, ItemRef::Skill(_) | ItemRef::Rule(_)) {
@@ -1293,7 +1299,14 @@ impl Daemon {
             let contents = batch.map(|out| parse_batch(&out, wanted.len(), DESCRIPTION_CAP)).unwrap_or_default();
             blobs.extend(wanted.into_iter().zip(contents).filter_map(|(object, bytes)| Some((object, bytes?))));
         }
+        let manifest = sk1ll_core::Manifest::load(root).unwrap_or_default();
         for value in inventory.values_mut() {
+            value.id = sk1ll_core::content::item_id_on_disk(root, &manifest, &value.item).or_else(|| {
+                [head.as_deref(), baseline.as_deref().filter(|rev| Some(*rev) != head.as_deref())]
+                    .into_iter()
+                    .flatten()
+                    .find_map(|rev| sk1ll_core::content::item_id_at(root, rev, &value.item))
+            });
             let ItemRef::Skill(name) = &value.item else { continue };
             for directory in SKILL_DIRS {
                 let path = format!("{directory}/{name}/SKILL.md");
@@ -2299,7 +2312,7 @@ fn modified_at(path: &Path) -> Option<u64> {
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir).ok()?.flatten() {
             budget = budget.checked_sub(1)?;
-            if entry.file_name() == sync::MARKER || entry.file_name() == ".git" {
+            if [sync::MARKER, ".git", sk1ll_core::skill::ID_FILE].iter().any(|name| entry.file_name() == *name) {
                 continue;
             }
             let Ok(meta) = entry.metadata() else { continue };
@@ -2656,7 +2669,7 @@ fn copy_authored(from: &Path, to: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
         let name = entry.file_name();
-        if name == sync::MARKER || name == ".git" {
+        if [sync::MARKER, ".git", sk1ll_core::skill::ID_FILE].iter().any(|skip| name == *skip) {
             continue;
         }
         let kind = entry.file_type()?;
@@ -2695,8 +2708,10 @@ mod tests {
         git(&["init", "-q", "-b", "main"]);
         git(&["config", "user.name", "test"]);
         git(&["config", "user.email", "test@example.invalid"]);
+        write("sk1ll.toml", "");
         write("personal/base/SKILL.md", "---\ndescription: Baseline description\n---\nbase\n");
-        write("instructions/git.md", "baseline rule\n");
+        write("personal/base/.sk1ll-id", "base-skill\n");
+        write("instructions/git.md", "---\nid: git-rule\n---\nbaseline rule\n");
         write("imported/vendored/SKILL.md", "---\ndescription: Imported description\n---\n");
         write("personal/my skill/SKILL.md", "---\ndescription: 'Spaced'\n---\n\x00\nbody\n");
         write("personal/huge/SKILL.md", &format!("---\ndescription: Too big\n---\n{}", "x".repeat(DESCRIPTION_CAP)));
@@ -2718,6 +2733,7 @@ mod tests {
         assert!(find("skill:base").in_baseline);
         assert_eq!(find("skill:base").draft, Some(ChangeKind::Modified));
         assert_eq!(find("skill:base").description.as_deref(), Some("Draft description"));
+        assert_eq!(find("skill:base").id.as_ref().unwrap().to_string(), "base-skill");
         // Descriptions of items without a draft are read from git, in one batch.
         assert_eq!(find("skill:vendored").description.as_deref(), Some("Imported description"));
         assert_eq!(find("skill:my skill").description.as_deref(), Some("Spaced"));
@@ -2727,6 +2743,7 @@ mod tests {
         assert_eq!(find("skill:local").description, None);
         assert!(find("rule:git").in_baseline, "deleted Draft item still comes from the git tree");
         assert_eq!(find("rule:git").draft, Some(ChangeKind::Deleted));
+        assert_eq!(find("rule:git").id.as_ref().unwrap().to_string(), "git-rule");
         assert!(!find("skill:queued").in_baseline);
         assert!(find("skill:queued").unpushed);
         assert!(!find("skill:local").in_baseline);

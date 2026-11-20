@@ -22,7 +22,7 @@ use serde::Serialize;
 use crate::hash::hash_str;
 use crate::skill::{frontmatter_field, split_frontmatter};
 use crate::sync::MARKER;
-use crate::{Error, IoExt, Result};
+use crate::{Error, IoExt, ItemId, Result};
 
 pub const INSTRUCTIONS_DIR: &str = "instructions";
 
@@ -31,12 +31,14 @@ const END: &str = "<!-- 0xSk1ll:end -->";
 /// Rule frontmatter keys restricting which harnesses get it; `targets` is
 /// the deprecated spelling.
 const FRONTMATTER_KEYS: [&str; 2] = ["harnesses", "targets"];
+const METADATA_KEYS: [&str; 3] = ["harnesses", "targets", "id"];
 const NOTE: &str = "<!-- Managed by 0xSk1ll: edit instructions/ in your skills repo, then run `sk1ll sync`. -->";
 
 /// One `instructions/<name>.md` file. Rules are rendered in file-name
 /// order, so numeric prefixes (`10-git.md`) control ordering.
 #[derive(Debug, Clone, Serialize)]
 pub struct Rule {
+    pub id: ItemId,
     pub name: String,
     pub path: PathBuf,
     pub description: Option<String>,
@@ -48,7 +50,7 @@ pub struct Rule {
     #[serde(skip)]
     rule_frontmatter: String,
     #[serde(skip)]
-    routing_source: String,
+    metadata_source: String,
 }
 
 impl Rule {
@@ -79,15 +81,16 @@ pub fn discover(root: &Path) -> Result<Vec<Rule>> {
             let harnesses = parse_harnesses(&text, &path)?;
             // Prepare this while errors can still be returned, before sync writes
             // any rules. Rendering only uses these validated source slices.
-            let (rule_frontmatter, routing_source) =
-                split_harnesses_key(split_frontmatter(&text).0.unwrap_or_default(), &path)?;
+            let (rule_frontmatter, metadata_source) =
+                split_metadata(split_frontmatter(&text).0.unwrap_or_default(), &path, &METADATA_KEYS)?;
             Ok(Rule {
+                id: explicit_id(&text, &path)?.unwrap_or_else(|| ItemId::derived("rule", &name)),
                 name,
                 description: frontmatter_field(&text, "description"),
                 harnesses,
                 body: split_frontmatter(&text).1.trim().to_string(),
                 rule_frontmatter,
-                routing_source,
+                metadata_source,
                 path,
             })
         })
@@ -96,7 +99,8 @@ pub fn discover(root: &Path) -> Result<Vec<Rule>> {
 
 pub(crate) fn validate_edit(text: &str, path: &Path) -> Result<()> {
     parse_harnesses(text, path)?;
-    split_harnesses_key(split_frontmatter(text).0.unwrap_or_default(), path)?;
+    explicit_id(text, path)?;
+    split_metadata(split_frontmatter(text).0.unwrap_or_default(), path, &METADATA_KEYS)?;
     Ok(())
 }
 
@@ -139,7 +143,7 @@ pub fn render(rules: &[&Rule]) -> Option<String> {
 
 /// File name and content of a rule in the `rules` format. Frontmatter is
 /// kept (e.g. Claude's `paths:` for path-scoped rules) minus 0xSk1ll's own
-/// `harnesses`/`targets` key.
+/// `harnesses`, `targets` and `id` keys.
 pub fn render_rule(rule: &Rule) -> (String, String) {
     let file_name = format!("{}.md", rule.name);
     let kept = &rule.rule_frontmatter;
@@ -163,22 +167,22 @@ fn frontmatter_mapping(text: &str, path: &Path) -> Result<serde_yaml_ng::Mapping
 /// nested mappings and block scalar content. Parsing prefixes also handles
 /// escaped quotes, multiline flow lists and indentless block sequences without
 /// maintaining a second, incomplete YAML lexer.
-fn split_harnesses_key(frontmatter: &str, path: &Path) -> Result<(String, String)> {
+fn split_metadata(frontmatter: &str, path: &Path, keys: &[&str]) -> Result<(String, String)> {
     let mapping = frontmatter_mapping(frontmatter, path)?;
     let mut expected = mapping.clone();
-    let mut routing = serde_yaml_ng::Mapping::new();
-    for key in FRONTMATTER_KEYS {
+    let mut metadata = serde_yaml_ng::Mapping::new();
+    for &key in keys {
         let key = serde_yaml_ng::Value::String(key.into());
         if let Some(value) = expected.remove(&key) {
-            routing.insert(key, value);
+            metadata.insert(key, value);
         }
     }
-    if routing.is_empty() {
+    if metadata.is_empty() {
         return Ok((frontmatter.to_string(), String::new()));
     }
     let unsafe_extent = || Error::Parse {
         path: path.to_path_buf(),
-        message: "cannot safely strip harnesses/targets source ranges; use single-line keys in a block mapping".into(),
+        message: "cannot safely strip sk1ll frontmatter; use single-line keys in a block mapping".into(),
     };
     let mut entries = Vec::new();
     let mut offset = 0;
@@ -207,7 +211,7 @@ fn split_harnesses_key(frontmatter: &str, path: &Path) -> Result<(String, String
     let mut removed = String::new();
     let mut cursor = 0;
     for (index, (start, key)) in entries.iter().enumerate() {
-        if !routing.contains_key(key) {
+        if !metadata.contains_key(key) {
             continue;
         }
         let next = entries.get(index + 1).map_or(frontmatter.len(), |(start, _)| *start);
@@ -236,9 +240,9 @@ fn split_harnesses_key(frontmatter: &str, path: &Path) -> Result<(String, String
         return Err(unsafe_extent());
     }
     // Aliases to retained metadata need a standalone representation when
-    // routing is later restored, potentially ahead of their anchor definitions.
-    if frontmatter_mapping(&removed, path).ok().as_ref() != Some(&routing) {
-        removed = serde_yaml_ng::to_string(&routing)
+    // metadata is later restored, potentially ahead of their anchor definitions.
+    if frontmatter_mapping(&removed, path).ok().as_ref() != Some(&metadata) {
+        removed = serde_yaml_ng::to_string(&metadata)
             .map_err(|e| Error::Parse { path: path.to_path_buf(), message: e.to_string() })?;
     }
     Ok((kept, removed))
@@ -259,29 +263,88 @@ fn mapping_key(line: &str) -> Option<serde_yaml_ng::Value> {
     })
 }
 
-/// A rule file's `text` as rule source: puts back the `harnesses:` key
-/// that [`render_rule`] stripped from `rule`, unless `text` has its own.
-pub(crate) fn restore_harnesses(rule: &Rule, text: &str) -> String {
-    let key = &rule.routing_source;
-    let (frontmatter, body) = split_frontmatter(text);
+/// The optional Item ID in the Rule's frontmatter.
+pub(crate) fn explicit_id(text: &str, path: &Path) -> Result<Option<ItemId>> {
+    let (frontmatter, _) = split_frontmatter(text);
+    let Some(frontmatter) = frontmatter else { return Ok(None) };
+    let mapping = frontmatter_mapping(frontmatter, path)?;
+    mapping
+        .get("id")
+        .map(|value| {
+            value.as_str().and_then(ItemId::from_text).ok_or_else(|| Error::Parse {
+                path: path.into(),
+                message: "id must be a nonempty, single-line string".into(),
+            })
+        })
+        .transpose()
+}
+
+/// Adds an Item ID to a Rule that does not already have one.
+pub(crate) fn with_id(text: &str, path: &Path, id: &ItemId) -> Result<String> {
+    let (frontmatter, _) = split_frontmatter(text);
+    let newline = if text.starts_with("---\r\n") { "\r\n" } else { "\n" };
+    let value = serde_json::to_string(&id.to_string()).expect("string");
+    let Some(frontmatter) = frontmatter else {
+        return Ok(format!("---{newline}id: {value}{newline}---{newline}{text}"));
+    };
+    let mut expected = frontmatter_mapping(frontmatter, path)?;
+    expected.insert("id".into(), id.to_string().into());
+    let indent = frontmatter.lines().find_map(|line| {
+        let start = line.trim_start();
+        (!start.is_empty() && !start.starts_with('#')).then(|| &line[..line.len() - start.len()])
+    });
+    let mut updated = format!("{}id: {value}{newline}{frontmatter}", indent.unwrap_or_default());
+    if frontmatter_mapping(&updated, path).ok().as_ref() != Some(&expected)
+        || split_metadata(&updated, path, &METADATA_KEYS).is_err()
+    {
+        // Flow or explicit mapping keys need block form to strip the ID safely.
+        updated = serde_yaml_ng::to_string(&expected)
+            .map_err(|e| Error::Parse { path: path.into(), message: e.to_string() })?
+            .replace('\n', newline);
+        split_metadata(&updated, path, &METADATA_KEYS)?;
+    }
+    let start = 3 + newline.len();
+    Ok(format!("{}{updated}{}", &text[..start], &text[start + frontmatter.len()..]))
+}
+
+/// Puts back the metadata stripped by `render_rule`, keeping the adopted
+/// content's own Item ID or harness routing where present.
+pub(crate) fn restore_metadata(rule: &Rule, text: &str) -> String {
+    let key = &rule.metadata_source;
     if key.is_empty() {
         return text.to_string();
     }
-    if let Some(f) = frontmatter {
-        let Ok(mapping) = frontmatter_mapping(f, &rule.path) else {
-            return text.to_string();
-        };
-        if FRONTMATTER_KEYS.iter().any(|key| mapping.contains_key(serde_yaml_ng::Value::String((*key).into()))) {
-            return text.to_string();
+    let (frontmatter, body) = split_frontmatter(text);
+    let filtered;
+    let key = if let Some(f) = frontmatter {
+        let Ok(mapping) = frontmatter_mapping(f, &rule.path) else { return text.to_string() };
+        let mut keep = Vec::new();
+        if FRONTMATTER_KEYS.iter().all(|k| !mapping.contains_key(*k)) {
+            keep.extend(FRONTMATTER_KEYS);
         }
+        if !mapping.contains_key("id") {
+            keep.push("id");
+        }
+        let Ok((_, metadata)) = split_metadata(key, &rule.path, &keep) else { return text.to_string() };
+        filtered = metadata;
+        &filtered
+    } else {
+        key
+    };
+    if key.is_empty() {
+        return text.to_string();
     }
     let restored = match frontmatter {
         Some(f) => format!("---\n{key}{f}---\n{body}"),
         None => format!("---\n{key}---\n{text}"),
     };
-    // Adoption's existing infallible API must not manufacture invalid YAML
-    // when the edited rule uses a different mapping style or invalid input.
+    // An edited rule may use a different mapping style or invalid input.
     if frontmatter_mapping(split_frontmatter(&restored).0.unwrap_or_default(), &rule.path).is_err() {
+        if frontmatter_mapping(key, &rule.path).is_ok_and(|mapping| mapping.contains_key("id"))
+            && let Ok(with_id) = with_id(text, &rule.path, &rule.id)
+        {
+            return with_id;
+        }
         return text.to_string();
     }
     restored
@@ -420,16 +483,17 @@ mod tests {
 
     fn rule(raw: &str) -> Rule {
         let path = Path::new("r.md");
-        let (rule_frontmatter, routing_source) =
-            split_harnesses_key(split_frontmatter(raw).0.unwrap_or_default(), path).unwrap();
+        let (rule_frontmatter, metadata_source) =
+            split_metadata(split_frontmatter(raw).0.unwrap_or_default(), path, &METADATA_KEYS).unwrap();
         Rule {
+            id: explicit_id(raw, path).unwrap().unwrap_or_else(|| ItemId::derived("rule", "r")),
             name: "r".into(),
             path: path.into(),
             description: None,
             harnesses: parse_harnesses(raw, path).unwrap(),
             body: split_frontmatter(raw).1.trim().into(),
             rule_frontmatter,
-            routing_source,
+            metadata_source,
         }
     }
 
@@ -442,7 +506,7 @@ mod tests {
         let expected: serde_yaml_ng::Value = serde_yaml_ng::from_str(metadata).unwrap();
         assert_eq!(actual, expected);
 
-        let restored = restore_harnesses(&rule, &rendered);
+        let restored = restore_metadata(&rule, &rendered);
         let original = frontmatter_mapping(split_frontmatter(raw).0.unwrap(), &rule.path).unwrap();
         let restored_mapping = frontmatter_mapping(split_frontmatter(&restored).0.unwrap(), &rule.path).unwrap();
         assert_eq!(restored_mapping, original);
@@ -509,7 +573,7 @@ mod tests {
                     let rendered = render_rule(&rule).1;
                     assert_eq!(rendered, "Body.\n");
                     assert_eq!(
-                        parse_harnesses(&restore_harnesses(&rule, &rendered), &rule.path).unwrap(),
+                        parse_harnesses(&restore_metadata(&rule, &rendered), &rule.path).unwrap(),
                         rule.harnesses
                     );
                 }
@@ -553,7 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_routing_source_ranges_are_discovery_errors() {
+    fn unsafe_metadata_source_ranges_are_discovery_errors() {
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir(tmp.path().join(INSTRUCTIONS_DIR)).unwrap();
         let path = tmp.path().join("instructions/scoped.md");
@@ -612,7 +676,7 @@ mod tests {
                         assert_eq!(rule.applies_to("other"), routing.is_empty());
                         let rendered = render_rule(rule).1;
                         assert_eq!(rendered, format!("---\n{metadata}---\n\nScoped.\n"));
-                        let restored = restore_harnesses(rule, &rendered);
+                        let restored = restore_metadata(rule, &rendered);
                         fs::write(&path, &restored).unwrap();
                         assert_eq!(discover(tmp.path()).unwrap()[0].harnesses, rule.harnesses);
                         assert!(restored.contains(metadata));
@@ -706,9 +770,9 @@ mod tests {
 
         let f = frag("---\nharnesses:\n  - claude\npaths: [x]\n---\nDo X.\n");
         let edited = "---\npaths: [x]\n---\n\nDo X better.\n";
-        assert_eq!(restore_harnesses(&f, edited), "---\nharnesses:\n  - claude\npaths: [x]\n---\n\nDo X better.\n");
-        assert_eq!(restore_harnesses(&f, "Plain.\n"), "---\nharnesses:\n  - claude\n---\nPlain.\n");
-        assert_eq!(restore_harnesses(&frag("Plain."), edited), edited);
+        assert_eq!(restore_metadata(&f, edited), "---\nharnesses:\n  - claude\npaths: [x]\n---\n\nDo X better.\n");
+        assert_eq!(restore_metadata(&f, "Plain.\n"), "---\nharnesses:\n  - claude\n---\nPlain.\n");
+        assert_eq!(restore_metadata(&frag("Plain."), edited), edited);
     }
 
     #[test]

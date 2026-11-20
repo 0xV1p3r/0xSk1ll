@@ -8,7 +8,7 @@ use crate::hash::hash_dir;
 use crate::lock::LockEntry;
 use crate::manifest::{self, Import};
 use crate::skill::IMPORTED_DIR;
-use crate::{Error, IoExt, Repo, Result, skill, source};
+use crate::{Error, IoExt, ItemId, Repo, Result, skill, source};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct UpdateReport {
@@ -107,8 +107,9 @@ impl Repo {
     /// Fetches and vendors a new import, then records it in manifest + lock.
     /// Like [`add_fetched`](Self::add_fetched), the name is checked again
     /// after staging, and the install never replaces anything.
-    pub fn add_import(&mut self, name: &str, import: Import) -> Result<UpdateReport> {
+    pub fn add_import(&mut self, name: &str, mut import: Import) -> Result<UpdateReport> {
         self.check_free(name)?;
+        import.id.get_or_insert_with(ItemId::generate);
         let cache = source::fetch(&import.source, self.root())?;
         let commit = source::resolve_commit(&cache, &import.git_ref)?;
         let staged = source::stage(&cache, &commit, &import, self.root(), &self.imported_dir())?;
@@ -174,7 +175,9 @@ impl Repo {
         // it, and the install never replaces anything that appeared since.
         fetched.stage()?;
         self.check_free(&name)?;
-        let (import, staged) = (fetched.import()?, fetched.staged.take().expect("staged above"));
+        let mut import = fetched.import()?;
+        import.id = Some(ItemId::generate());
+        let staged = fetched.staged.take().expect("staged above");
         staged.install_new(&self.imported_dir().join(&name))?;
         let report = self.lock_vendored(&name, &import, fetched.resolved.commit.clone())?;
         self.record_import(&name, import)?;
@@ -356,7 +359,12 @@ impl Repo {
         if to.exists() {
             return Err(Error::Invalid(format!("personal skill `{name}` already exists")));
         }
-        fs::rename(&from, &to).at(&to)?;
+        let id = self.manifest.import_id(name);
+        crate::sync::rename_noreplace(&from, &to).at(&to)?;
+        if let Err(error) = id.write_skill(&to) {
+            crate::sync::rename_noreplace(&to, &from).at(&from)?;
+            return Err(error);
+        }
         self.manifest.import.remove(name);
         manifest::remove_import(self.root(), name)?;
         self.lock.skills.remove(name);
@@ -436,7 +444,7 @@ impl FetchedLink {
 
     fn import(&self) -> Result<Import> {
         let r = &self.resolved;
-        Ok(Import { source: r.source.clone(), path: self.skill()?.path.clone(), git_ref: r.git_ref.clone() })
+        Ok(Import { id: None, source: r.source.clone(), path: self.skill()?.path.clone(), git_ref: r.git_ref.clone() })
     }
 
     /// Checks the one skill out of the cache into a staging directory, ready
@@ -586,7 +594,7 @@ mod tests {
         let mut repo = src.repo();
         repo.manifest.import.insert(
             "../personal".into(),
-            Import { source: "unused".into(), path: String::new(), git_ref: "HEAD".into() },
+            Import { id: None, source: "unused".into(), path: String::new(), git_ref: "HEAD".into() },
         );
         fs::write(repo.root().join("sk1ll.toml"), toml::to_string(&repo.manifest).unwrap()).unwrap();
         fs::write(repo.personal_dir().join("keep.txt"), "personal content").unwrap();
@@ -785,7 +793,7 @@ mod tests {
         fs::write(orphan.join("notes.md"), "mine\n").unwrap();
         let err = repo.add_link(None, &src.origin(), Some("skills/pdf"), None, None).unwrap_err().to_string();
         assert!(err.contains("not a recorded import"), "{err}");
-        let import = Import { source: src.origin(), path: "skills/pdf".into(), git_ref: "HEAD".into() };
+        let import = Import { id: None, source: src.origin(), path: "skills/pdf".into(), git_ref: "HEAD".into() };
         assert!(repo.add_import("pdf", import.clone()).is_err());
         assert_eq!(fs::read_to_string(orphan.join("notes.md")).unwrap(), "mine\n");
         assert!(repo.manifest.import.is_empty());
@@ -828,6 +836,29 @@ mod tests {
             assert!(err.to_string().contains(why), "{bad}: {err}");
         }
         assert!(!repo.manifest.import.contains_key("x"));
+    }
+
+    #[test]
+    fn add_records_an_id_and_fork_carries_it_into_the_personal_skill() {
+        let src = Source::new();
+        let mut repo = src.repo();
+        let origin = src.tmp.path().join("origin");
+        fs::write(origin.join("skills/pdf/.sk1ll-id"), "upstream file\n").unwrap();
+        commit_all(&origin);
+        repo.add_link(None, &src.origin(), Some("skills/pdf"), None, None).unwrap();
+
+        let mut repo = src.repo();
+        let id = repo.manifest.import["pdf"].id.clone().unwrap();
+        assert!(ulid::Ulid::from_string(&id.to_string()).is_ok());
+        assert_eq!(repo.skills().unwrap()[0].id, id);
+        assert_eq!(fs::read(repo.imported_dir().join("pdf/.sk1ll-id")).unwrap(), b"upstream file\n");
+
+        repo.fork("pdf").unwrap();
+        let skill = repo.skills().unwrap().remove(0);
+        assert_eq!(skill.origin, crate::Origin::Personal);
+        assert_eq!(skill.id, id);
+        assert_eq!(ItemId::read_skill(&skill.path), Some(id));
+        assert!(!repo.manifest.import.contains_key("pdf"));
     }
 
     /// Bad input is refused before anything is fetched.
@@ -1090,7 +1121,7 @@ mod tests {
         let dest = repo.imported_dir().join("pdf");
         let appear = format!("sh -c 'mkdir -p \"{0}\" && echo mine > \"{0}/notes.md\"; cat'", dest.display());
         let _filter = smudge(&appear);
-        let import = Import { source: src.origin(), path: "skills/pdf".into(), git_ref: "HEAD".into() };
+        let import = Import { id: None, source: src.origin(), path: "skills/pdf".into(), git_ref: "HEAD".into() };
         let err = repo.add_import("pdf", import).unwrap_err().to_string();
         assert!(err.contains("not a recorded import"), "{err}");
         assert_eq!(fs::read_to_string(dest.join("notes.md")).unwrap(), "mine\n");

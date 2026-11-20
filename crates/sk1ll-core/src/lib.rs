@@ -15,6 +15,7 @@ pub mod harness_change;
 pub mod hash;
 pub mod imports;
 pub mod instructions;
+mod item_id;
 pub mod lock;
 pub mod machine;
 pub mod manifest;
@@ -36,6 +37,7 @@ pub use imports::{
     FetchedLink, FetchedUpdates, ImportState, ImportStatus, ResolvedSource, SkillCandidate, UpdateReport, UpdateTargets,
 };
 pub use instructions::Rule;
+pub use item_id::ItemId;
 pub use lock::{LockEntry, Lockfile};
 pub use machine::{
     EffectiveHarness, Harness, HarnessChange, HarnessChoice, HarnessEntry, HarnessOrigin, InstructionsFormat, LinkMode,

@@ -4,10 +4,11 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::{IoExt, Result};
+use crate::{IoExt, ItemId, Manifest, Result};
 
 pub const PERSONAL_DIR: &str = "personal";
 pub const IMPORTED_DIR: &str = "imported";
+pub const ID_FILE: &str = ".sk1ll-id";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -18,6 +19,7 @@ pub enum Origin {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Skill {
+    pub id: ItemId,
     pub name: String,
     pub origin: Origin,
     pub path: PathBuf,
@@ -28,6 +30,12 @@ pub struct Skill {
 
 /// All skills in the repo, by name. Personal skills take precedence.
 pub fn discover(root: &Path) -> Result<Vec<Skill>> {
+    let manifest =
+        if root.join(crate::manifest::MANIFEST_FILE).is_file() { Manifest::load(root)? } else { Manifest::default() };
+    discover_with(root, &manifest)
+}
+
+pub(crate) fn discover_with(root: &Path, manifest: &Manifest) -> Result<Vec<Skill>> {
     let mut skills = BTreeMap::new();
     for (origin, sub) in [(Origin::Imported, IMPORTED_DIR), (Origin::Personal, PERSONAL_DIR)] {
         let dir = root.join(sub);
@@ -48,7 +56,11 @@ pub fn discover(root: &Path) -> Result<Vec<Skill>> {
             };
             let description = fs::read_to_string(&skill_md).ok().and_then(|t| frontmatter_field(&t, "description"));
             let shadows_import = origin == Origin::Personal && skills.contains_key(&name);
-            skills.insert(name.clone(), Skill { name, origin, path, description, shadows_import });
+            let id = match origin {
+                Origin::Personal => ItemId::read_skill(&path).unwrap_or_else(|| ItemId::derived("skill", &name)),
+                Origin::Imported => manifest.import_id(&name),
+            };
+            skills.insert(name.clone(), Skill { id, name, origin, path, description, shadows_import });
         }
     }
     Ok(skills.into_values().collect())

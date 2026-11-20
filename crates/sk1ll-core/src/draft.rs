@@ -214,8 +214,13 @@ impl Repo {
     pub fn diff(&self, item: &ItemRef) -> Result<String> {
         let (draft, st) = self.draft_with_status()?;
         let selected = pick(&draft, std::slice::from_ref(item))?;
-        let (untracked, tracked): (Vec<&PathBuf>, Vec<&PathBuf>) =
-            selected[0].paths.iter().partition(|p| st.changed.get(*p).copied().unwrap_or(false));
+        let (untracked, tracked): (Vec<&PathBuf>, Vec<&PathBuf>) = selected[0]
+            .paths
+            .iter()
+            .filter(|p| {
+                !matches!(item, ItemRef::Skill(_)) || !p.components().any(|c| c.as_os_str() == crate::skill::ID_FILE)
+            })
+            .partition(|p| st.changed.get(*p).copied().unwrap_or(false));
         let mut out = String::new();
         if !tracked.is_empty() {
             let base = match &st.head {

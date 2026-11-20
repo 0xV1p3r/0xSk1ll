@@ -12,7 +12,7 @@ mod pinned;
 
 use crate::git::Git;
 use crate::sync::unmanaged::{self, Variant};
-use crate::{Assignment, Change, Error, Harness, IoExt, ItemRef, Origin, Repo, Result};
+use crate::{Assignment, Change, Error, Harness, IoExt, ItemId, ItemRef, Manifest, Origin, Repo, Result};
 
 #[cfg(test)]
 thread_local! {
@@ -42,6 +42,8 @@ pub enum ContentType {
 pub struct ContentEntry {
     pub name: String,
     pub item: Option<ItemRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<ItemId>,
     #[serde(rename = "type")]
     pub kind: ContentType,
     pub description: Option<String>,
@@ -102,6 +104,79 @@ fn git(root: &Path) -> Git {
     Git::new(root).env("GIT_OPTIONAL_LOCKS", "0")
 }
 
+/// Reads an inventory Item ID without loading a Skill's description or a
+/// Rule's full body.
+pub fn item_id_on_disk(root: &Path, manifest: &Manifest, item: &ItemRef) -> Option<ItemId> {
+    match item {
+        ItemRef::Skill(name) => {
+            let personal = root.join(crate::skill::PERSONAL_DIR).join(name);
+            let imported = root.join(crate::skill::IMPORTED_DIR).join(name);
+            if personal.join("SKILL.md").is_file() {
+                Some(ItemId::read_skill(&personal).unwrap_or_else(|| ItemId::derived("skill", name)))
+            } else if imported.join("SKILL.md").is_file() {
+                Some(manifest.import_id(name))
+            } else {
+                None
+            }
+        }
+        ItemRef::Rule(name) => {
+            let path = root.join(crate::instructions::INSTRUCTIONS_DIR).join(format!("{name}.md"));
+            let crate::config_file::Entry::File(file, _) = crate::config_file::open_entry(&path).ok()? else {
+                return None;
+            };
+            let mut bytes = Vec::new();
+            file.take(MAX_FILE_BYTES).read_to_end(&mut bytes).ok()?;
+            let text = String::from_utf8_lossy(&bytes);
+            let id = crate::instructions::explicit_id(&text, &path).ok()?;
+            Some(id.unwrap_or_else(|| ItemId::derived("rule", name)))
+        }
+        _ => None,
+    }
+}
+
+/// Reads the Item ID from a commit for an inventory entry missing on disk.
+pub fn item_id_at(root: &Path, revision: &str, item: &ItemRef) -> Option<ItemId> {
+    let object = |path: &str| format!("{revision}:{path}");
+    let small_blob = |path: &str| {
+        let object = object(path);
+        let size = git(root).args(["cat-file", "-s", &object]).text().ok()?.parse::<u64>().ok()?;
+        if size > MAX_FILE_BYTES {
+            return None;
+        }
+        String::from_utf8(git(root).args(["cat-file", "blob", &object]).run().ok()?).ok()
+    };
+    match item {
+        ItemRef::Skill(name) => {
+            let exists = |dir: &str| {
+                git(root)
+                    .args(["cat-file", "-e", &object(&format!("{dir}/{name}/SKILL.md"))])
+                    .succeeds()
+                    .unwrap_or(false)
+            };
+            if exists("personal") {
+                let id = small_blob(&format!("personal/{name}/{}", crate::skill::ID_FILE))
+                    .as_deref()
+                    .and_then(ItemId::from_text);
+                Some(id.unwrap_or_else(|| ItemId::derived("skill", name)))
+            } else if exists("imported") {
+                let id = small_blob(crate::manifest::MANIFEST_FILE)
+                    .and_then(|text| toml::from_str::<Manifest>(&text).ok())
+                    .map(|manifest| manifest.import_id(name));
+                Some(id.unwrap_or_else(|| ItemId::derived("import", name)))
+            } else {
+                None
+            }
+        }
+        ItemRef::Rule(name) => {
+            let path = format!("instructions/{name}.md");
+            let text = small_blob(&path)?;
+            let id = crate::instructions::explicit_id(&text, Path::new(&path)).ok()?;
+            Some(id.unwrap_or_else(|| ItemId::derived("rule", name)))
+        }
+        _ => None,
+    }
+}
+
 fn tracked(root: &Path, revision: &str) -> Result<Vec<(String, String, String)>> {
     if !git(root).args(["rev-parse", "--verify", "--quiet", revision]).succeeds()? {
         return Ok(Vec::new());
@@ -137,7 +212,7 @@ pub fn list(
     let drafts: BTreeMap<_, _> = repo.draft()?.into_iter().map(|d| (d.item, d.change)).collect();
     let rules = repo.rules()?;
     let mut entries = BTreeMap::new();
-    let mut insert = |name: String, item: ItemRef, kind, path: PathBuf, description| {
+    let mut insert = |name: String, item: ItemRef, id, kind, path: PathBuf, description| {
         entries.insert(
             item.clone(),
             ContentEntry {
@@ -145,6 +220,7 @@ pub fn list(
                 draft: drafts.get(&item).copied(),
                 in_baseline: baseline.contains(&item),
                 item: Some(item),
+                id: Some(id),
                 kind,
                 description,
                 path: Some(path),
@@ -158,13 +234,21 @@ pub fn list(
         insert(
             s.name.clone(),
             ItemRef::Skill(s.name),
+            s.id,
             if s.origin == Origin::Personal { ContentType::Personal } else { ContentType::Import },
             s.path,
             s.description,
         );
     }
     for f in &rules {
-        insert(f.name.clone(), ItemRef::Rule(f.name.clone()), ContentType::Rule, f.path.clone(), f.description.clone());
+        insert(
+            f.name.clone(),
+            ItemRef::Rule(f.name.clone()),
+            f.id.clone(),
+            ContentType::Rule,
+            f.path.clone(),
+            f.description.clone(),
+        );
     }
     for (path, _, oid) in &head {
         if !is_item(path) {
@@ -197,6 +281,7 @@ pub fn list(
             ContentEntry {
                 name: item.name().into(),
                 item: Some(item.clone()),
+                id: item_id_at(repo.root(), "HEAD", &item),
                 kind,
                 path: Some(absolute),
                 description,
@@ -228,6 +313,7 @@ pub fn list(
         entries.push(ContentEntry {
             name: skill.name,
             item: None,
+            id: None,
             kind: ContentType::Unmanaged,
             description: skill.description,
             draft: None,
@@ -316,6 +402,10 @@ fn source(repo: &Repo, harnesses: &BTreeMap<String, Harness>, query: &ContentQue
     }))
 }
 
+fn hidden(name: &std::ffi::OsStr) -> bool {
+    name == ".sk1ll-tmp" || crate::sync::COPY_SKIP.iter().any(|skip| name == *skip)
+}
+
 pub fn tree(repo: &Repo, harnesses: &BTreeMap<String, Harness>, query: &ContentQuery) -> Result<Vec<FileEntry>> {
     match source(repo, harnesses, query)? {
         #[cfg(unix)]
@@ -329,12 +419,10 @@ pub fn tree(repo: &Repo, harnesses: &BTreeMap<String, Harness>, query: &ContentQ
         Source::Disk(root) => {
             let base = if root.is_file() { root.parent().unwrap() } else { &root };
             let mut files = Vec::new();
-            let walker = WalkDir::new(&root).sort_by_file_name().into_iter().filter_entry(|e| {
-                e.depth() == 0
-                    || (e.file_name() != ".git"
-                        && e.file_name() != crate::sync::MARKER
-                        && e.file_name() != ".sk1ll-tmp")
-            });
+            let walker = WalkDir::new(&root)
+                .sort_by_file_name()
+                .into_iter()
+                .filter_entry(|e| e.depth() == 0 || !hidden(e.file_name()));
             #[cfg(test)]
             before_access();
             for entry in walker {
@@ -363,7 +451,10 @@ pub fn tree(repo: &Repo, harnesses: &BTreeMap<String, Harness>, query: &ContentQ
             let mut files = Vec::new();
             for (path, mode, oid) in tracked(repo.root(), "HEAD")? {
                 let path = Path::new(&path);
-                if !path.starts_with(&root) || path == base {
+                if !path.starts_with(&root)
+                    || path == base
+                    || path.strip_prefix(base).unwrap().components().any(|c| hidden(c.as_os_str()))
+                {
                     continue;
                 }
                 let size = if mode == "040000" {
@@ -602,6 +693,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = Repo::init(tmp.path()).unwrap();
         write(&repo.personal_dir().join("pdf/SKILL.md"), "---\ndescription: baseline\n---\nold");
+        let skill_id = ItemId::generate();
+        skill_id.write_skill(&repo.personal_dir().join("pdf")).unwrap();
         write(&repo.imported_dir().join("remote/SKILL.md"), "import");
         write(&repo.root().join("instructions/git.md"), "---\ndescription: Git conventions\n---\nold rule");
         commit(&repo);
@@ -613,6 +706,9 @@ mod tests {
         assert_eq!(pdf.description.as_deref(), Some("draft"));
         assert_eq!(pdf.draft, Some(Change::Modified));
         assert!(pdf.in_baseline);
+        assert_eq!(pdf.id.as_ref(), Some(&skill_id));
+        let files = tree(&repo, &BTreeMap::new(), &query("skill:pdf")).unwrap();
+        assert_eq!(files.iter().map(|file| file.path.as_str()).collect::<Vec<_>>(), ["SKILL.md"]);
         let new = items.iter().find(|s| s.name == "new").unwrap();
         assert_eq!(new.draft, Some(Change::Added));
         assert!(!new.in_baseline);
@@ -624,7 +720,9 @@ mod tests {
         fs::remove_dir_all(repo.personal_dir().join("pdf")).unwrap();
         assert!(read(&repo, "skill:pdf", "SKILL.md").unwrap().text.unwrap().ends_with("old"));
         let tree = tree(&repo, &BTreeMap::new(), &query("skill:pdf")).unwrap();
-        assert_eq!(tree[0].path, "SKILL.md");
+        assert_eq!(tree.iter().map(|file| file.path.as_str()).collect::<Vec<_>>(), ["SKILL.md"]);
+        let items = list(&repo, &BTreeMap::new(), &Assignment::default(), Some("HEAD")).unwrap();
+        assert_eq!(items.iter().find(|s| s.name == "pdf").unwrap().id.as_ref(), Some(&skill_id));
         assert!(
             editable_path(&repo, &BTreeMap::new(), "remote").unwrap_err().to_string().contains("sk1ll fork remote")
         );
