@@ -713,6 +713,12 @@ fn run(cli: Cli) -> Result<()> {
             PullOutcome::Updated { from, to } => {
                 println!("baseline {} -> {}; run `sk1ll sync` to apply", short(&from), short(&to));
             }
+            PullOutcome::Blocked { baseline, items } if repo.pull_pending()? => bail!(
+                "blocked half-way to baseline {}: {} changed after pull started; restore them (copy edits you want \
+                 to keep aside first), then pull again to finish",
+                short(&baseline),
+                names(&items)
+            ),
             PullOutcome::Blocked { baseline, items } => bail!(
                 "blocked: baseline {} clashes with {}; commit or restore them, then pull again",
                 short(&baseline),
