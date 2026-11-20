@@ -131,13 +131,13 @@ impl Selection {
 
     fn skills_for(&self, assignment: &Assignment, harness: &str) -> Vec<&Skill> {
         let a = assignment.harness(harness);
-        self.skills.iter().filter(|s| a.skill_enabled(&s.name)).collect()
+        self.skills.iter().filter(|s| a.skill_enabled(&s.id)).collect()
     }
 
-    /// Assignment picks rules; a rule's own `harnesses:` restricts further.
+    /// Assignment picks rules by Item ID; a rule's own `harnesses:` restricts further.
     fn rules_for(&self, assignment: &Assignment, harness: &str) -> Vec<&Rule> {
         let a = assignment.harness(harness);
-        self.rules.iter().filter(|f| a.rule_enabled(&f.name) && f.applies_to(harness)).collect()
+        self.rules.iter().filter(|f| a.rule_enabled(&f.id) && f.applies_to(harness)).collect()
     }
 }
 
@@ -2161,6 +2161,58 @@ mod tests {
         (tmp, repo, BTreeMap::from([("h".to_string(), harness)]))
     }
 
+    /// Toggles follow Item IDs (ADR 0006): a rename keeps them, an item made
+    /// through sk1ll and re-created under the same name doesn't inherit them,
+    /// and a hand-made one (derived id) does.
+    #[test]
+    fn toggles_follow_item_ids_through_renames_and_recreation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::init(&tmp.path().join("repo")).unwrap();
+        repo.create_item("skill", "made", "").unwrap();
+        repo.create_item_with("rule", "made", "Made.\n").unwrap();
+        write(&repo.personal_dir().join("hand/SKILL.md"), "Hand-made.\n");
+        let harness = Harness {
+            skills: Some(tmp.path().join("skills").to_string_lossy().into_owned()),
+            instructions: Some(tmp.path().join("AGENTS.md").to_string_lossy().into_owned()),
+            ..Harness::default()
+        };
+        let harnesses = BTreeMap::from([("h".to_string(), harness)]);
+        let mut assignment = Assignment::default();
+        for (item, id) in Repo::open(repo.root()).unwrap().item_ids().unwrap() {
+            match item {
+                crate::ItemRef::Skill(_) => assignment.set_skill("h", &id, false),
+                _ => assignment.set_rule("h", &id, false),
+            }
+        }
+        let planned = |repo: &Repo| -> Vec<String> {
+            let repo = Repo::open(repo.root()).unwrap();
+            let actions = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
+            let mut names: Vec<String> = actions
+                .iter()
+                .flat_map(|a| match &a.item {
+                    Item::Skill { name, .. } => vec![name.clone()],
+                    Item::Instructions { rules, .. } => rules.clone(),
+                    Item::Rule { file, .. } => vec![file.clone()],
+                })
+                .collect();
+            names.sort();
+            names
+        };
+        assert!(planned(&repo).is_empty());
+
+        repo.rename_item("skill", "made", "renamed").unwrap();
+        repo.rename_item("rule", "made", "renamed").unwrap();
+        repo.rename_item("skill", "hand", "handier").unwrap();
+        assert!(planned(&repo).is_empty(), "renamed items keep their toggles");
+
+        repo.delete_item("skill", "renamed").unwrap();
+        repo.delete_item("rule", "renamed").unwrap();
+        repo.create_item("skill", "renamed", "").unwrap();
+        repo.create_item_with("rule", "renamed", "Made again.\n").unwrap();
+        write(&repo.personal_dir().join("hand/SKILL.md"), "Hand-made again.\n");
+        assert_eq!(planned(&repo), ["renamed", "renamed"], "new ids start from the defaults");
+    }
+
     #[test]
     #[ignore = "sync planning benchmark"]
     fn sync_plan_no_change() {
@@ -2248,7 +2300,7 @@ mod tests {
                 apply(&repo, &actions[0]).unwrap();
                 write(&repo.personal_dir().join("pdf/SKILL.md"), "Updated source.\n");
                 if remove {
-                    assignment.set_skill("h", "pdf", false);
+                    assignment.set_skill("h", &ItemId::derived("skill", "pdf"), false);
                 }
                 let actions = plan(&repo, &harnesses, &assignment, PlanOptions { force }).unwrap();
                 assert_eq!(actions[0].kind, if remove { ActionKind::Remove } else { ActionKind::Update });
@@ -2375,7 +2427,7 @@ mod tests {
             // Copy: refresh from a changed source. Symlink: replace the copy with a link.
             write(&repo.personal_dir().join("pdf/SKILL.md"), "Updated source.\n");
             harnesses.get_mut("h").unwrap().mode = mode;
-            assignment.set_skill("h", "pdf", !remove);
+            assignment.set_skill("h", &ItemId::derived("skill", "pdf"), !remove);
             let actions = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
             assert!(matches!(actions[0].kind, ActionKind::Update | ActionKind::Remove), "{actions:?}");
             let edit = |dest: &Path| write(&dest.join("SKILL.md"), "Late edit.\n");
@@ -2443,7 +2495,7 @@ mod tests {
         apply(&repo, &initial[0]).unwrap();
         fs::remove_file(dir.join("git.md")).unwrap();
         assert!(placed(&repo, "h", &harnesses["h"]).unwrap().is_empty());
-        assignment.set_rule("h", "git", false);
+        assignment.set_rule("h", &ItemId::derived("rule", "git"), false);
         let cleanup = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
         assert_eq!(cleanup[0].kind, ActionKind::Remove);
         apply(&repo, &cleanup[0]).unwrap();
@@ -2552,7 +2604,7 @@ mod tests {
         apply(&repo, &actions[0]).unwrap();
         let dir = tmp.path().join("skills");
         let index = fs::read(dir.join(LINK_INDEX)).unwrap();
-        assignment.set_skill("h", "pdf", false);
+        assignment.set_skill("h", &ItemId::derived("skill", "pdf"), false);
         let actions = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
         fs::remove_file(dir.join("pdf")).unwrap();
         // Same canonical target and ownership, but a different observed link.
@@ -2664,7 +2716,7 @@ mod tests {
         fs::create_dir(&dir).unwrap();
         std::os::unix::fs::symlink(repo.personal_dir().join("pdf"), dir.join("manual")).unwrap();
         let mut assignment = Assignment::default();
-        assignment.set_skill("h", "pdf", false);
+        assignment.set_skill("h", &ItemId::derived("skill", "pdf"), false);
         let actions = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].kind, ActionKind::Conflict);
@@ -2673,12 +2725,12 @@ mod tests {
 
         // Legacy links are adopted only for the exact, currently assigned skill.
         std::os::unix::fs::symlink("../repo/personal/./pdf", dir.join("pdf")).unwrap();
-        assignment.set_skill("h", "pdf", true);
+        assignment.set_skill("h", &ItemId::derived("skill", "pdf"), true);
         let actions = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
         let action = actions.iter().find(|a| a.dest == dir.join("pdf")).unwrap();
         assert_eq!(action.kind, ActionKind::Update);
         apply(&repo, action).unwrap();
-        assignment.set_skill("h", "pdf", false);
+        assignment.set_skill("h", &ItemId::derived("skill", "pdf"), false);
         let actions = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
         let action = actions.iter().find(|a| a.dest == dir.join("pdf")).unwrap();
         assert_eq!(action.kind, ActionKind::Remove);
@@ -2745,8 +2797,8 @@ mod tests {
         };
         let harnesses = BTreeMap::from([("h".to_string(), harness)]);
         let mut assignment = Assignment::default();
-        assignment.set_skill("h", "pdf", false);
-        assignment.set_rule("h", "30-off", false);
+        assignment.set_skill("h", &ItemId::derived("skill", "pdf"), false);
+        assignment.set_rule("h", &ItemId::derived("rule", "30-off"), false);
 
         let actions = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
         let created: Vec<&str> = actions
@@ -2769,7 +2821,7 @@ mod tests {
         for a in &actions {
             apply(&repo, a).unwrap();
         }
-        assignment.set_skill("h", "git", false);
+        assignment.set_skill("h", &ItemId::derived("skill", "git"), false);
         let actions = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].kind, ActionKind::Remove);
@@ -2973,7 +3025,7 @@ mod tests {
                     let mut assignment = Assignment::default();
                     apply(&repo, &plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap()[0]).unwrap();
                     write(&repo.personal_dir().join("pdf/SKILL.md"), "Updated source.\n");
-                    assignment.set_skill("h", "pdf", !remove);
+                    assignment.set_skill("h", &ItemId::derived("skill", "pdf"), !remove);
                     let actions = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
                     let dest = tmp.path().join("skills/pdf");
                     // Opened before sync starts; written after every check.
@@ -3132,7 +3184,7 @@ mod tests {
                     let (tmp, repo, harnesses) = skill_setup(mode);
                     synced(&repo, &harnesses, &assignment);
                     write(&repo.personal_dir().join("pdf/SKILL.md"), "Updated source.\n");
-                    assignment.set_skill("h", "pdf", !remove);
+                    assignment.set_skill("h", &ItemId::derived("skill", "pdf"), !remove);
                     let dest = tmp.path().join("skills/pdf");
                     let (file, holder) = (dest.join("SKILL.md"), tmp.path().join("skills"));
                     Self { tmp, repo, harnesses, assignment, dest, file, holder }
@@ -3142,7 +3194,7 @@ mod tests {
                     let (tmp, repo, harnesses, path) = instructions_setup(format);
                     synced(&repo, &harnesses, &assignment);
                     write(&repo.root().join("instructions/git.md"), "Use CC always.\n");
-                    assignment.set_rule("h", "git", !remove);
+                    assignment.set_rule("h", &ItemId::derived("rule", "git"), !remove);
                     let dest = if kind == "rule" { path.join("git.md") } else { path.clone() };
                     let holder = dest.parent().unwrap().to_path_buf();
                     Self { tmp, repo, harnesses, assignment, file: dest.clone(), dest, holder }

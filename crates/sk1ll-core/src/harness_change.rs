@@ -154,8 +154,8 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::LinkMode;
     use crate::sync::ActionKind;
+    use crate::{ItemId, LinkMode};
 
     fn write(path: &Path, text: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -262,8 +262,8 @@ mod tests {
         let (tmp, repo, config, lock) = setup();
         sync_all(&repo, &config, &Assignment::default());
         let mut off = Assignment::default();
-        off.set_skill("h", "pdf", false);
-        off.set_rule("h", "git", false);
+        off.set_skill("h", &ItemId::derived("skill", "pdf"), false);
+        off.set_rule("h", &ItemId::derived("rule", "git"), false);
         off.set_new_skills_default("h", false);
         off.set_new_rules_default("h", false);
         sync_all(&repo, &config, &off);

@@ -297,11 +297,11 @@ pub fn list(
     for entry in &mut entries {
         entry.enabled_harnesses = harnesses
             .iter()
-            .filter(|(h, config)| match &entry.item {
-                Some(ItemRef::Skill(n)) => config.skills_dir().is_some() && assignment.skill_enabled(h, n),
-                Some(ItemRef::Rule(n)) => {
+            .filter(|(h, config)| match (&entry.item, &entry.id) {
+                (Some(ItemRef::Skill(_)), Some(id)) => config.skills_dir().is_some() && assignment.skill_enabled(h, id),
+                (Some(ItemRef::Rule(n)), Some(id)) => {
                     config.instructions_file().is_some()
-                        && assignment.rule_enabled(h, n)
+                        && assignment.rule_enabled(h, id)
                         && rules.iter().find(|f| f.name == *n).is_none_or(|f| f.applies_to(h))
                 }
                 _ => false,

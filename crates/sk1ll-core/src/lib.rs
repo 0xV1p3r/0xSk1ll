@@ -15,7 +15,7 @@ pub mod harness_change;
 pub mod hash;
 pub mod imports;
 pub mod instructions;
-mod item_id;
+pub mod item_id;
 pub mod lock;
 pub mod machine;
 pub mod manifest;
