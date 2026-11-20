@@ -329,6 +329,18 @@ impl Drop for Machine {
     }
 }
 
+fn assert_indexed_copy(dir: &Path, name: &str) {
+    let bytes = std::fs::read(dir.join(sk1ll_core::sync::INDEX_PATH)).unwrap();
+    let index: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        index[name],
+        serde_json::json!({
+            "kind": "copy",
+            "hash": sk1ll_core::hash::hash_dir(&dir.join(name)).unwrap(),
+        })
+    );
+}
+
 fn write(dir: &Path, file: &str, body: &str) {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(dir.join(file), body).unwrap();
@@ -1747,15 +1759,15 @@ async fn skills_api_browses_content_and_adopts_only_while_connected() {
     }
     assert!(!m.repo().join("personal/pdf").exists());
     assert!(!m.outbox_path().exists());
-    assert!(!m.skills().join("pdf/.sk1ll-managed").exists());
+    assert!(!m.skills().join(sk1ll_core::sync::INDEX_PATH).exists());
     assert!(m.harness_skill("pdf").unwrap().ends_with("same"));
     server.launch().await;
     eventually(|| async { (m.status().await.connection == Connection::Connected).then_some(()) }).await;
     m.client.adopt_unmanaged(&target).await.unwrap();
     assert!(m.repo().join("personal/pdf/SKILL.md").is_file());
     assert!(!m.outbox_path().exists());
-    assert!(m.skills().join("pdf/.sk1ll-managed").is_file());
-    assert!(m.home.path().join("second/pdf/.sk1ll-managed").is_file());
+    assert_indexed_copy(&m.skills(), "pdf");
+    assert_indexed_copy(&m.home.path().join("second"), "pdf");
     // The entire operation may have completed before the local response was
     // lost. Repeating it must still succeed and keep its explicit Assignment.
     m.client.adopt_unmanaged(&target).await.unwrap();
@@ -1813,12 +1825,12 @@ async fn unmanaged_adoption_retries_after_crash_between_publication_and_assignme
     // no intent or startup reconciliation; the original is still unmanaged.
     sk1ll_core::sync::unmanaged::prepare(&repo, &hs, HARNESS, "pdf").unwrap();
     m.start_connected().await;
-    assert!(!m.skills().join("pdf/.sk1ll-managed").exists());
+    assert!(!m.skills().join(sk1ll_core::sync::INDEX_PATH).exists());
     let target = ConflictTarget { harness: HARNESS.into(), name: "pdf".into() };
     m.client.adopt(&target).await.unwrap();
     let snap: AssignmentSnapshot = server.get(&format!("/machines/{}/assignment", m.id)).await;
     assert!(snap.assignment.skill_enabled(HARNESS, "pdf"));
-    assert!(m.skills().join("pdf/.sk1ll-managed").is_file());
+    assert_indexed_copy(&m.skills(), "pdf");
     assert_eq!(m.harness_skill("pdf").unwrap(), "original user content");
 }
 
@@ -1892,7 +1904,7 @@ async fn gui_creation_import_inventory_check_and_conflict_diff() {
         .unwrap();
     assert!(diff.diff.contains("-Harness edit"), "{}", diff.diff);
     assert!(diff.diff.contains("+x"), "{}", diff.diff);
-    assert!(!diff.diff.contains(".sk1ll-managed"), "{}", diff.diff);
+    assert!(!diff.diff.contains(".sk1ll-state"), "{}", diff.diff);
     m.client.remove_import("external").await.unwrap();
     assert!(m.client.imports().await.unwrap().imports.is_empty());
     assert!(!m.repo().join("imported/external").exists());
@@ -2265,7 +2277,7 @@ async fn standalone_adopts_unmanaged_skills_with_local_assignment() {
         .unwrap();
     assert_eq!(std::fs::read_to_string(m.repo().join("personal/pdf/SKILL.md")).unwrap(), "unmanaged");
     assert_eq!(m.harness_skill("pdf").as_deref(), Some("unmanaged"));
-    assert!(m.skills().join("pdf/.sk1ll-managed").is_file());
+    assert_indexed_copy(&m.skills(), "pdf");
     assert!(Assignment::load(&m.cache_path()).unwrap().skill_enabled(HARNESS, "pdf"));
     assert!(m.client.draft().await.unwrap().iter().any(|d| d.item == ItemRef::Skill("pdf".into())));
     assert!(!m.outbox_path().exists());

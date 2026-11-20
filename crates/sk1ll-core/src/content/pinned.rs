@@ -113,7 +113,7 @@ impl Item {
         for entry in entries {
             let entry = entry.map_err(std::io::Error::from).at(&self.path)?;
             let name = std::ffi::OsStr::from_bytes(entry.file_name().to_bytes());
-            if [".", "..", ".git", crate::sync::MARKER, ".sk1ll-tmp"].iter().any(|s| name == *s) {
+            if name == "." || name == ".." || super::reserved_name(name) {
                 continue;
             }
             names.push(name.to_owned());

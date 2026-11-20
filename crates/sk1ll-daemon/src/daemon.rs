@@ -2286,8 +2286,8 @@ fn conflict_view(a: &Action) -> ConflictView {
 }
 
 /// Newest mtime of `path` and everything under it (directories too, so a
-/// deleted file counts), without following symlinks; the management marker
-/// and `.git` are skipped. Bounded, so a huge tree can't stall `/conflicts`.
+/// deleted file counts), without following symlinks. Bounded, so a huge
+/// tree can't stall `/conflicts`.
 fn modified_at(path: &Path) -> Option<u64> {
     let seconds =
         |m: &std::fs::Metadata| m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs());
@@ -2299,7 +2299,7 @@ fn modified_at(path: &Path) -> Option<u64> {
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir).ok()?.flatten() {
             budget = budget.checked_sub(1)?;
-            if entry.file_name() == sync::MARKER || entry.file_name() == ".git" {
+            if sync::SKILL_CONTENT_EXCLUSIONS.iter().any(|name| entry.file_name() == *name) {
                 continue;
             }
             let Ok(meta) = entry.metadata() else { continue };
@@ -2625,7 +2625,7 @@ impl Daemon {
             left = temp.path().join("Harness");
             std::fs::write(&left, content).map_err(anyhow::Error::from)?;
         } else if left.is_dir() {
-            // Diff only authored files: the harness copy carries the management marker.
+            // Diff only skill content.
             let copy = temp.path().join("Harness");
             copy_authored(&left, &copy).map_err(anyhow::Error::from)?;
             left = copy;
@@ -2656,7 +2656,7 @@ fn copy_authored(from: &Path, to: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
         let name = entry.file_name();
-        if name == sync::MARKER || name == ".git" {
+        if sync::SKILL_CONTENT_EXCLUSIONS.iter().any(|excluded| name == *excluded) {
             continue;
         }
         let kind = entry.file_type()?;
@@ -2789,6 +2789,7 @@ mod tests {
                 mode: sk1ll_core::LinkMode::Copy,
                 source: Some(source.into()),
                 expected: None,
+                expected_index: None,
             },
             reason: None,
         };
@@ -3024,14 +3025,16 @@ mod tests {
                 std::fs::read_to_string(source.join("SKILL.md")).unwrap(),
                 if scenario == "edit_source" { "later edit" } else { "original" }
             );
-            assert!(!source.join(".sk1ll-managed").exists());
+            assert!(!source.parent().unwrap().join(sync::INDEX_PATH).exists());
             if scenario == "new" {
                 assert!(!destination.exists());
                 accept.store(true, Ordering::SeqCst);
                 d.blocking(|d, eng| d.adopt(eng, ConflictTarget { harness: "h".into(), name: "pdf".into() }))
                     .await
                     .unwrap();
-                assert!(source.join(".sk1ll-managed").is_file());
+                let index = std::fs::read(source.parent().unwrap().join(sync::INDEX_PATH)).unwrap();
+                let index: serde_json::Value = serde_json::from_slice(&index).unwrap();
+                assert_eq!(index["pdf"]["kind"], "copy");
             } else {
                 assert_eq!(
                     std::fs::read_to_string(destination.join("SKILL.md")).unwrap(),

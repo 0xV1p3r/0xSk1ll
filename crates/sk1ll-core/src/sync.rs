@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::assignment::Assignment;
@@ -19,12 +19,11 @@ use crate::machine::{Harness, InstructionsFormat, LinkMode};
 use crate::skill::Skill;
 use crate::{Error, IoExt, Repo, Result};
 
-/// Written inside copied skill directories (holds the content hash) and in
-/// rules directories (holds the index of managed rule files).
-pub const MARKER: &str = ".sk1ll-managed";
+const INDEX_DIR: &str = ".sk1ll-state";
+pub const INDEX_PATH: &str = ".sk1ll-state/index.json";
 
-/// Ownership of skill symlinks, stored next to the skill directories.
-const LINK_INDEX: &str = ".sk1ll-managed-links";
+/// Names excluded from skill content hashes and copies.
+pub const SKILL_CONTENT_EXCLUSIONS: &[&str] = &[".git", INDEX_DIR];
 
 const EDITED: &str = "edited by hand in the harness; `sk1ll adopt` it into the repo or use --force";
 const BLOCK_EDITED: &str =
@@ -48,8 +47,9 @@ pub enum Item {
         name: String,
         mode: LinkMode,
         source: Option<PathBuf>,
-        /// Destination hash or link identity observed while planning (`None`: absent).
+        /// Destination content hash or link identity observed while planning (`None`: absent).
         expected: Option<String>,
+        expected_index: Option<IndexEntry>,
     },
     Instructions {
         rules: Vec<String>,
@@ -65,6 +65,7 @@ pub enum Item {
         content: Option<String>,
         /// Hash of the file as seen when planning (`None`: absent).
         expected: Option<String>,
+        expected_index: Option<IndexEntry>,
     },
 }
 
@@ -96,6 +97,15 @@ enum Existing {
     ManagedLink(PathBuf),
     ManagedCopy(String),
     Unmanaged(String),
+}
+
+/// Ownership recorded for a harness entry in its directory's index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+pub enum IndexEntry {
+    Link { hash: String, target: PathBuf },
+    Copy { hash: String },
+    Rule { hash: String },
 }
 
 pub mod unmanaged;
@@ -220,10 +230,18 @@ pub fn placed(repo: &Repo, hname: &str, harness: &Harness) -> Result<Vec<Action>
     plan_skills(repo, hname, harness, &sel, &[], opts, &mut skills)?;
     let mut actions = Vec::new();
     for a in skills {
-        // A symlink sk1ll doesn't own is a sync conflict, but was never sk1ll's.
-        if a.kind != ActionKind::Conflict || !matches!(classify(repo.root(), &a.dest, None)?, Existing::Unmanaged(_)) {
-            actions.push(a);
+        let Item::Skill { expected, expected_index, .. } = &a.item else {
+            unreachable!("skill planning produces skill actions");
+        };
+        if a.kind == ActionKind::Remove && expected.is_none() {
+            continue;
         }
+        if a.kind == ActionKind::Conflict
+            && matches!(classify(repo.root(), &a.dest, None, expected_index.as_ref())?, Existing::Unmanaged(_))
+        {
+            continue;
+        }
+        actions.push(a);
     }
     if let Some(path) = harness.instructions_file() {
         match harness.instructions_format {
@@ -245,7 +263,9 @@ pub fn apply_reviewed(repo: &Repo, action: &Action, reviewed_digest: Option<&str
         Item::Instructions { content, expected, .. } => {
             apply_instructions(action, content.as_deref(), expected.as_deref())
         }
-        Item::Rule { file, content, expected } => apply_rule(action, file, content.as_deref(), expected.as_deref()),
+        Item::Rule { file, content, expected, expected_index } => {
+            apply_rule(action, file, content.as_deref(), expected.as_deref(), expected_index.as_ref())
+        }
     }
 }
 
@@ -265,6 +285,7 @@ fn plan_skills(
     // `seen` is the one observation of the destination that the action was
     // chosen from; it becomes the precondition `apply` checks. Observing again
     // here would accept an edit made meanwhile without ever judging it.
+    let index = load_index(dir)?;
     let action = |name: &str, kind, source: Option<&Path>, seen: Observed, reason: Option<String>| Action {
         harness: hname.to_string(),
         kind,
@@ -274,24 +295,26 @@ fn plan_skills(
             mode: harness.mode,
             source: source.map(Path::to_path_buf),
             expected: if kind == ActionKind::Conflict { None } else { seen.state },
+            expected_index: index.get(name).cloned(),
         },
         reason,
     };
-    let links = load_links_index(dir)?;
-
     let edited = || Some((ActionKind::Conflict, Some(format!("copied skill {EDITED}"))));
-    let mut desired = BTreeSet::new();
+    let mut seen_names = BTreeSet::new();
     for skill in skills {
-        desired.insert(skill.name.as_str());
+        if skill.name == INDEX_DIR {
+            continue;
+        }
+        seen_names.insert(skill.name.clone());
         let dest = dir.join(&skill.name);
         let seen = observe_skill(&dest)?;
-        let kind = match classify(repo.root(), &dest, Some(&skill.path))? {
+        let recorded = index.get(&skill.name);
+        let kind = match classify(repo.root(), &dest, Some(&skill.path), recorded)? {
             Existing::Missing => Some((ActionKind::Create, None)),
             Existing::ManagedLink(to)
                 if harness.mode == LinkMode::Symlink && to == skill.path.canonicalize().at(&skill.path)? =>
             {
-                // Persist ownership when migrating an exact legacy link.
-                (links.get(&skill.name) != Some(&to)).then_some((ActionKind::Update, None))
+                recorded.is_none().then_some((ActionKind::Update, None))
             }
             Existing::ManagedCopy(rec) => {
                 // Changed from a copy since observed: never matches `rec`.
@@ -302,7 +325,7 @@ fn plan_skills(
                 let copy = harness.mode == LinkMode::Copy;
                 if copy && current == rec && rec == want {
                     None
-                } else if current != rec && !opts.force && !(copy && current == want) {
+                } else if current != rec && !opts.force {
                     edited()
                 } else {
                     Some((ActionKind::Update, None))
@@ -320,13 +343,17 @@ fn plan_skills(
         for entry in fs::read_dir(dir).at(dir)? {
             let entry = entry.at(dir)?;
             let name = entry.file_name().to_string_lossy().into_owned();
-            // sk1ll's own entries: the links index, and scratch or leftovers
+            // sk1ll's own entries: the index, and scratch or leftovers
             // of an interrupted sync (see `recover`), never skills.
-            if name.starts_with(".sk1ll-") || desired.contains(name.as_str()) {
+            if name.starts_with(".sk1ll-") || !seen_names.insert(name.clone()) {
+                continue;
+            }
+            let recorded = index.get(&name);
+            if recorded.is_none() && !entry.file_type().at(entry.path())?.is_symlink() {
                 continue;
             }
             let seen = observe_skill(&entry.path())?;
-            match classify(repo.root(), &entry.path(), None)? {
+            match classify(repo.root(), &entry.path(), None, recorded)? {
                 Existing::ManagedCopy(rec) if seen.copy_hash.as_ref() != Some(&rec) && !opts.force => {
                     let (kind, reason) = edited().expect("conflict");
                     actions.push(action(&name, kind, None, seen, reason));
@@ -339,6 +366,11 @@ fn plan_skills(
                 }
                 _ => {}
             }
+        }
+    }
+    for (name, entry) in &index {
+        if !name.starts_with(".sk1ll-") && !seen_names.contains(name) && !matches!(entry, IndexEntry::Rule { .. }) {
+            actions.push(action(name, ActionKind::Remove, None, Observed { state: None, copy_hash: None }, None));
         }
     }
     Ok(())
@@ -380,12 +412,12 @@ fn plan_instructions(
 }
 
 fn plan_rules(hname: &str, dir: &Path, rules: &[&Rule], opts: PlanOptions, actions: &mut Vec<Action>) -> Result<()> {
-    let index = instructions::load_rules_index(dir)?;
+    let index = load_index(dir)?;
     let action = |file: &str, kind, content: Option<String>, expected: Option<String>, reason: Option<String>| Action {
         harness: hname.to_string(),
         kind,
         dest: dir.join(file),
-        item: Item::Rule { file: file.to_string(), content, expected },
+        item: Item::Rule { file: file.to_string(), content, expected, expected_index: index.get(file).cloned() },
         reason,
     };
     let current_hash = |file: &str| rule_state(&dir.join(file));
@@ -396,7 +428,11 @@ fn plan_rules(hname: &str, dir: &Path, rules: &[&Rule], opts: PlanOptions, actio
         let (file, content) = instructions::render_rule(rule);
         let want = hash_str(&content);
         let current = current_hash(&file)?;
-        let (kind, reason) = match (&current, index.get(&file)) {
+        let recorded = match index.get(&file) {
+            Some(IndexEntry::Rule { hash }) => Some(hash),
+            _ => None,
+        };
+        let (kind, reason) = match (&current, recorded) {
             (None, _) => (ActionKind::Create, None),
             (Some(cur), _) if cur.starts_with(NOT_A_FILE) => (ActionKind::Conflict, foreign()),
             (Some(cur), Some(rec)) if *cur == want && *rec == want => {
@@ -415,6 +451,7 @@ fn plan_rules(hname: &str, dir: &Path, rules: &[&Rule], opts: PlanOptions, actio
     }
 
     for (file, recorded) in &index {
+        let IndexEntry::Rule { hash: recorded } = recorded else { continue };
         if desired.contains(file) {
             continue;
         }
@@ -429,13 +466,21 @@ fn plan_rules(hname: &str, dir: &Path, rules: &[&Rule], opts: PlanOptions, actio
     Ok(())
 }
 
-fn apply_rule(action: &Action, file: &str, content: Option<&str>, expected: Option<&str>) -> Result<()> {
+fn apply_rule(
+    action: &Action,
+    file: &str,
+    content: Option<&str>,
+    expected: Option<&str>,
+    expected_index: Option<&IndexEntry>,
+) -> Result<()> {
     if action.kind == ActionKind::Conflict {
         return Ok(());
     }
     let dest = &action.dest;
     let dir = dest.parent().ok_or_else(|| Error::Invalid(format!("{} has no parent", dest.display())))?;
-    recover_rules_dir(&action.harness, dir)?;
+    let ownership = Ownership { dest, dir, name: file, expected: expected_index };
+    ownership.check()?;
+    recover_dir(&action.harness, dir, DirectoryKind::Rules)?;
     let current = rule_state(dest)?;
     if current.as_deref() != expected {
         return Err(changed_since_plan(dest));
@@ -449,30 +494,28 @@ fn apply_rule(action: &Action, file: &str, content: Option<&str>, expected: Opti
             false => Err(changed_since_plan(dest)),
         }
     };
-    let mut index = instructions::load_rules_index(dir)?;
-    let displaced = match content {
+    let displace =
+        Displace { kind: displaced::Kind::Rule, harness: &action.harness, expected, ownership: Some(&ownership) };
+    let (displaced, entry) = match content {
         Some(content) => {
-            let displace = Displace { kind: displaced::Kind::Rule, harness: &action.harness, expected };
             let displaced = replace_file(dest, content, unchanged, displace)?;
-            index.insert(file.to_string(), hash_str(content));
-            displaced
+            (displaced, Some(IndexEntry::Rule { hash: hash_str(content) }))
         }
         None => {
             let displaced = match current {
                 Some(_) => {
                     #[cfg(test)]
                     hook(Hook::BeforeSwap, dest);
-                    remove_displacing(displaced::Kind::Rule, &action.harness, dest, expected)?
+                    remove_displacing(dest, displace)?
                 }
                 None => None,
             };
-            index.remove(file);
-            displaced
+            (displaced, None)
         }
     };
     // The harness changed either way, so the index must say so before any
     // displaced edit is reported.
-    instructions::save_rules_index(dir, &index)?;
+    ownership.record(entry)?;
     displaced.map_or(Ok(()), Err)
 }
 
@@ -494,13 +537,18 @@ fn apply_instructions(action: &Action, content: Option<&str>, expected: Option<&
         false => Err(changed_since_plan(dest)),
     };
     let whole = hash_str(&text);
-    let displace = Displace { kind: displaced::Kind::Instructions, harness: &action.harness, expected: Some(&whole) };
+    let displace = Displace {
+        kind: displaced::Kind::Instructions,
+        harness: &action.harness,
+        expected: Some(&whole),
+        ownership: None,
+    };
     let spliced = instructions::splice(&text, block.as_ref(), content);
     replace_file(dest, &spliced, unchanged, displace)?.map_or(Ok(()), Err)
 }
 
 fn apply_skill(repo: &Repo, action: &Action, adopted: bool, reviewed_digest: Option<&str>) -> Result<()> {
-    let Item::Skill { name, mode, source, expected } = &action.item else {
+    let Item::Skill { name, mode, source, expected, expected_index } = &action.item else {
         unreachable!("only skill placements reach apply_skill");
     };
     let (name, mode, source, expected) = (name.as_str(), *mode, source.as_deref(), expected.as_deref());
@@ -509,12 +557,13 @@ fn apply_skill(repo: &Repo, action: &Action, adopted: bool, reviewed_digest: Opt
     }
     let dest = &action.dest;
     let dir = dest.parent().ok_or_else(|| Error::Invalid(format!("{} has no parent", dest.display())))?;
-    recover_skills_dir(&action.harness, dir)?;
-    let unchanged = |at: &Path| -> Result<bool> { Ok(observe_skill(at)?.state.as_deref() == expected) };
-    if !unchanged(dest)? {
+    let ownership = Ownership { dest, dir, name, expected: expected_index.as_ref() };
+    ownership.check()?;
+    recover_dir(&action.harness, dir, DirectoryKind::Skills)?;
+    if observe_skill(dest)?.state.as_deref() != expected {
         return Err(changed_since_plan(dest));
     }
-    let existing = classify(repo.root(), dest, source)?;
+    let existing = classify(repo.root(), dest, source, expected_index.as_ref())?;
     let managed = match &existing {
         Existing::Unmanaged(_) if adopted => true,
         Existing::Missing => false,
@@ -523,21 +572,21 @@ fn apply_skill(repo: &Repo, action: &Action, adopted: bool, reviewed_digest: Opt
             return Err(Error::Invalid(format!("refusing to touch {}: {why}", dest.display())));
         }
     };
-    let mut links = load_links_index(dir)?;
-    let displaced = match action.kind {
+    let displace =
+        Displace { kind: displaced::Kind::Skill, harness: &action.harness, expected, ownership: Some(&ownership) };
+    let (displaced, entry) = match action.kind {
         ActionKind::Conflict => unreachable!(),
         ActionKind::Remove => {
             let displaced = if managed {
                 #[cfg(test)]
                 hook(Hook::BeforeSwap, dest);
-                let displaced = remove_displacing(displaced::Kind::Skill, &action.harness, dest, expected);
+                let displaced = remove_displacing(dest, displace);
                 remove_empty_tmp(dir);
                 displaced?
             } else {
                 None
             };
-            links.remove(name);
-            displaced
+            (displaced, None)
         }
         ActionKind::Create | ActionKind::Update => {
             let src = source.ok_or_else(|| Error::Invalid(format!("no source for {name}")))?;
@@ -546,10 +595,14 @@ fn apply_skill(repo: &Repo, action: &Action, adopted: bool, reviewed_digest: Opt
             if mode == LinkMode::Symlink && !canonical.starts_with(repo.root()) {
                 return Err(Error::Invalid(format!("{} resolves outside the repo", src.display())));
             }
-            // An exact legacy link only needs its ownership recorded.
+            // An exact existing link only needs its ownership recorded.
             if mode == LinkMode::Symlink && matches!(&existing, Existing::ManagedLink(to) if *to == canonical) {
-                links.insert(name.to_string(), canonical);
-                return save_links_index(dir, &links);
+                if observe_skill(dest)?.state.as_deref() != expected {
+                    return Err(changed_since_plan(dest));
+                }
+                ownership.check()?;
+                let hash = expected.ok_or_else(|| changed_since_plan(dest))?.to_string();
+                return ownership.record(Some(IndexEntry::Link { hash, target: canonical }));
             }
             // Build the replacement in the skills dir's own scratch directory
             // (same filesystem, never discovered as a skill), then swap it in.
@@ -561,39 +614,32 @@ fn apply_skill(repo: &Repo, action: &Action, adopted: bool, reviewed_digest: Opt
                     remove_entry(&stage)?; // left over from an interrupted sync
                 }
                 match mode {
-                    LinkMode::Symlink => symlink_dir(src, &stage).at(&stage),
+                    LinkMode::Symlink => {
+                        symlink_dir(src, &stage).at(&stage)?;
+                        let hash = link_identity(&fs::read_link(&stage).at(&stage)?);
+                        Ok(IndexEntry::Link { hash, target: canonical })
+                    }
                     LinkMode::Copy => {
                         #[cfg(test)]
                         hook(Hook::BeforeCopy, src);
-                        copy_dir(src, &stage, &[".git", MARKER])?;
+                        copy_dir(src, &stage)?;
                         let digest = hash_dir(&stage)?;
                         if reviewed_digest.is_some_and(|expected| expected != digest) {
                             return Err(Error::Changed(format!("{} changed since the sync preview", src.display())));
                         }
-                        let marker = stage.join(MARKER);
-                        fs::write(&marker, digest).at(&marker)
+                        Ok(IndexEntry::Copy { hash: digest })
                     }
                 }
             })();
-            let swap = Swap { harness: &action.harness, managed, expected };
-            let swapped = built.and_then(|()| swap_in(&stage, dest, swap, unchanged));
+            let swapped = built.and_then(|entry| Ok((swap_in(&stage, dest, managed, displace)?, Some(entry))));
             if swapped.is_err() && fs::symlink_metadata(&stage).is_ok() {
                 let _ = remove_entry(&stage);
             }
             remove_empty_tmp(dir);
-            let displaced = swapped?;
-            match mode {
-                LinkMode::Symlink => {
-                    links.insert(name.to_string(), canonical);
-                }
-                LinkMode::Copy => {
-                    links.remove(name);
-                }
-            }
-            displaced
+            swapped?
         }
     };
-    save_links_index(dir, &links)?;
+    ownership.record(entry)?;
     displaced.map_or(Ok(()), Err)
 }
 
@@ -620,8 +666,8 @@ fn rule_state(path: &Path) -> Result<Option<String>> {
 
 /// One look at a skill destination.
 struct Observed {
-    /// The entry's identity (link target, or content hash and marker), the
-    /// precondition `apply` checks; `None`: absent.
+    /// The entry's identity (link target or content hash), checked alongside
+    /// its ownership record. Recovery compares just this fingerprint.
     state: Option<String>,
     /// For a directory, its content hash, taken in the same pass as `state`.
     copy_hash: Option<String>,
@@ -635,11 +681,10 @@ fn observe_skill(dest: &Path) -> Result<Observed> {
         Err(e) => return Err(e).at(dest),
     };
     let (state, copy_hash) = if meta.file_type().is_symlink() {
-        (format!("link:{:?}", fs::read_link(dest).at(dest)?), None)
+        (link_identity(&fs::read_link(dest).at(dest)?), None)
     } else if meta.is_dir() {
-        let marker = instructions::read_optional(&dest.join(MARKER))?;
         let hash = hash_dir(dest)?;
-        (format!("copy:{hash}:{marker:?}"), Some(hash))
+        (format!("copy:{hash}"), Some(hash))
     } else {
         ("unmanaged".to_string(), None)
     };
@@ -673,16 +718,7 @@ fn remove_empty_tmp(dir: &Path) {
     let _ = fs::remove_dir(dir.join(TMP_DIR));
 }
 
-/// What [`swap_in`] needs to know about the skill it replaces.
-struct Swap<'a> {
-    harness: &'a str,
-    /// Something sk1ll manages is at the destination (else it is absent).
-    managed: bool,
-    expected: Option<&'a str>,
-}
-
-/// Swaps the staged `stage` in at `dest`. `unchanged(path)` tells whether
-/// the entry at `path` still matches the plan's precondition: it is checked
+/// Swaps the staged `stage` in at `dest`. The destination is checked
 /// right before the swap, and again once the old entry has been moved into
 /// the recovery area, putting it back if an edit slipped in between.
 ///
@@ -694,20 +730,21 @@ struct Swap<'a> {
 /// where nothing is (see [`place`]): whatever appears at `dest` meanwhile
 /// stays, and the swap is called off. On error, `stage` is left for the
 /// caller to remove.
-fn swap_in(stage: &Path, dest: &Path, swap: Swap, unchanged: impl Fn(&Path) -> Result<bool>) -> Result<Option<Error>> {
+fn swap_in(stage: &Path, dest: &Path, managed: bool, displace: Displace) -> Result<Option<Error>> {
     #[cfg(test)]
     hook(Hook::BeforeSwap, dest);
-    if !unchanged(dest)? {
+    if observe_skill(dest)?.state.as_deref() != displace.expected {
         return Err(changed_since_plan(dest));
     }
     #[cfg(test)]
     hook(Hook::AfterCheck, dest);
-    if !swap.managed {
+    displace.check_ownership()?;
+    if !managed {
         // Absent when planned (and just now); if something appeared since, it stays.
         return place_at(stage, dest).map(|()| None);
     }
     let holder = dest.parent().unwrap_or(dest);
-    let mut held = displaced::Displacing::begin(displaced::Kind::Skill, swap.harness, dest, swap.expected, holder)?;
+    let mut held = displaced::Displacing::begin(displace.kind, displace.harness, dest, displace.expected, holder)?;
     if let Err(e) = held.take(dest) {
         held.abandon();
         return Err(e);
@@ -716,7 +753,7 @@ fn swap_in(stage: &Path, dest: &Path, swap: Swap, unchanged: impl Fn(&Path) -> R
     #[cfg(test)]
     hook(Hook::AfterAside, dest);
     let swapped = match intact {
-        Ok(true) => place_at(stage, dest),
+        Ok(true) => displace.check_ownership().and_then(|()| place_at(stage, dest)),
         Ok(false) => Err(changed_since_plan(dest)),
         Err(e) => Err(e),
     };
@@ -733,14 +770,10 @@ fn swap_in(stage: &Path, dest: &Path, swap: Swap, unchanged: impl Fn(&Path) -> R
 /// plan: it is moved into the recovery area first, and put back if it no
 /// longer matches `expected` there. Once removed, the moved entry is checked
 /// once more, like the old entry in [`swap_in`].
-fn remove_displacing(
-    kind: displaced::Kind,
-    harness: &str,
-    dest: &Path,
-    expected: Option<&str>,
-) -> Result<Option<Error>> {
+fn remove_displacing(dest: &Path, displace: Displace) -> Result<Option<Error>> {
+    displace.check_ownership()?;
     let holder = dest.parent().unwrap_or(dest);
-    let mut held = displaced::Displacing::begin(kind, harness, dest, expected, holder)?;
+    let mut held = displaced::Displacing::begin(displace.kind, displace.harness, dest, displace.expected, holder)?;
     if let Err(e) = held.take(dest) {
         held.abandon();
         return Err(e);
@@ -748,15 +781,17 @@ fn remove_displacing(
     let intact = held.intact();
     #[cfg(test)]
     hook(Hook::AfterAside, dest);
-    match intact {
-        Ok(true) => {
+    let checked =
+        intact.and_then(|intact| if intact { displace.check_ownership() } else { Err(changed_since_plan(dest)) });
+    match checked {
+        Ok(()) => {
             #[cfg(test)]
             hook(Hook::AfterSwap, dest);
             held.finish()
         }
-        verdict => {
+        Err(e) => {
             held.put_back()?;
-            Err(verdict.err().unwrap_or_else(|| changed_since_plan(dest)))
+            Err(e)
         }
     }
 }
@@ -768,6 +803,13 @@ struct Displace<'a> {
     /// The fingerprint the replaced content should have (`None`: there
     /// should be none, so any content found is someone else's).
     expected: Option<&'a str>,
+    ownership: Option<&'a Ownership<'a>>,
+}
+
+impl Displace<'_> {
+    fn check_ownership(&self) -> Result<()> {
+        self.ownership.map_or(Ok(()), Ownership::check)
+    }
 }
 
 /// Like [`instructions::write_file`] (atomic, through symlinks), but the new
@@ -806,13 +848,14 @@ fn replace_file(
     }
     #[cfg(test)]
     hook(Hook::AfterCheck, path);
-    let Displace { kind, harness, expected } = displace;
+    let Displace { kind, harness, expected, .. } = displace;
     let mut held = match displaced::Displacing::begin(kind, harness, path, expected, holder) {
         Ok(held) => held,
         Err(e) => return fail(e),
     };
     let verdict = match held.link(&real) {
         Ok(true) => held.intact().map(Some),
+        Ok(false) if kind == displaced::Kind::Rule && expected.is_some() => Ok(Some(false)),
         Ok(false) => Ok(None),
         Err(e) => Err(e),
     };
@@ -831,11 +874,11 @@ fn replace_file(
     };
     #[cfg(test)]
     hook(Hook::AfterAside, path);
-    let swapped = match held {
+    let swapped = displace.check_ownership().and_then(|()| match held {
         // The old file is held in recovery under a second name: replacing it loses nothing.
         Some(_) => fs::rename(&tmp, &real).at(&real),
         None => place_at(&tmp, &real),
-    };
+    });
     if let Err(e) = swapped {
         if let Some(held) = held {
             held.abandon();
@@ -952,13 +995,13 @@ pub fn recover(_lock: &crate::EngineLock, harnesses: &BTreeMap<String, Harness>)
     let mut rescued = Vec::new();
     for (hname, harness) in harnesses {
         if let Some(dir) = harness.skills_dir() {
-            rescued.extend(recover_skills_dir(hname, &dir)?);
+            rescued.extend(recover_dir(hname, &dir, DirectoryKind::Skills)?);
             displaced::reindex(&dir)?;
         }
         if let Some(path) = harness.instructions_file() {
             rescued.extend(match harness.instructions_format {
                 InstructionsFormat::Block => recover_file_siblings(hname, &path)?,
-                InstructionsFormat::Rules => recover_rules_dir(hname, &path)?,
+                InstructionsFormat::Rules => recover_dir(hname, &path, DirectoryKind::Rules)?,
             });
             let holder = match harness.instructions_format {
                 InstructionsFormat::Block => real_file(&path).and_then(|real| real.parent().map(Path::to_path_buf)),
@@ -996,66 +1039,74 @@ fn read_dir_names(dir: &Path) -> Result<Vec<String>> {
     }
 }
 
-fn recover_skills_dir(harness: &str, dir: &Path) -> Result<Vec<displaced::Entry>> {
-    let mut rescued = Vec::new();
-    let mut leftovers = Vec::new();
-    for name in read_dir_names(dir)? {
-        if name.starts_with(LEGACY_STAGE_PREFIX) {
-            remove_entry(&dir.join(&name))?;
-        } else if let Some(skill) = name.strip_prefix(LEGACY_OLD_PREFIX) {
-            leftovers.push((dir.join(&name), skill.to_string()));
+#[derive(Clone, Copy)]
+enum DirectoryKind {
+    Skills,
+    Rules,
+}
+
+/// Discard staged replacements and preserve any content left aside. The
+/// index records the fingerprint of the last placement at its original name.
+fn recover_dir(harness: &str, dir: &Path, directory: DirectoryKind) -> Result<Vec<displaced::Entry>> {
+    let index = index_path(dir)?;
+    let state = index.parent().expect("index has a parent");
+    let staging = sibling(&index, "sk1ll-tmp");
+    let staging = staging.file_name().expect("staging file has a name").to_string_lossy();
+    let numbered = format!("{staging}-");
+    for name in read_dir_names(state)? {
+        if name == staging
+            || name.strip_prefix(&numbered).is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        {
+            fs::remove_file(state.join(name)).at(state)?;
         }
     }
     let tmp = dir.join(TMP_DIR);
-    for name in read_dir_names(&tmp)? {
-        if name.starts_with("stage-") {
-            remove_entry(&tmp.join(&name))?;
-        } else if let Some(skill) = name.strip_prefix("old-") {
-            leftovers.push((tmp.join(&name), skill.to_string()));
-        }
-    }
-    for (aside, skill) in leftovers {
-        // What sk1ll last wrote there: a link is as it was made; a copy
-        // matches its own marker unless it was edited.
-        let expected = match fs::symlink_metadata(&aside) {
-            Ok(m) if m.file_type().is_symlink() => observe_skill(&aside)?.state,
-            Ok(m) if m.is_dir() => instructions::read_optional(&aside.join(MARKER))?
-                .map(|raw| format!("copy:{}:{:?}", raw.trim(), Some(&raw))),
-            _ => None,
-        };
-        let kind = displaced::Kind::Skill;
-        rescued.push(displaced::rescue(kind, harness, &dir.join(&skill), &aside, expected.as_deref(), dir)?);
-    }
-    remove_empty_tmp(dir);
-    Ok(rescued)
-}
-
-fn recover_rules_dir(harness: &str, dir: &Path) -> Result<Vec<displaced::Entry>> {
-    let mut rescued = Vec::new();
-    let mut index = None;
+    let mut leftovers = Vec::new();
     for name in read_dir_names(dir)? {
-        if name == TMP_DIR {
-            continue; // the recovery area, which ends in `.sk1ll-tmp` too
-        }
         let path = dir.join(&name);
-        let file = if let Some(file) = name.strip_prefix(LEGACY_OLD_PREFIX) {
-            file
-        } else if let Some(file) = name.strip_prefix('.').and_then(|n| n.strip_suffix(".sk1ll-old")) {
-            file
-        } else {
-            if name.starts_with('.') && name.ends_with(".sk1ll-tmp") {
-                remove_entry(&path)?;
-            }
-            continue;
-        };
-        if index.is_none() {
-            index = Some(instructions::load_rules_index(dir)?);
+        if let Some(entry) = name.strip_prefix(LEGACY_OLD_PREFIX) {
+            leftovers.push((path, entry.to_string()));
+        } else if let Some(entry) = name.strip_prefix('.').and_then(|n| n.strip_suffix(".sk1ll-old"))
+            && matches!(directory, DirectoryKind::Rules)
+        {
+            leftovers.push((path, entry.to_string()));
+        } else if match directory {
+            DirectoryKind::Skills => name.starts_with(LEGACY_STAGE_PREFIX),
+            DirectoryKind::Rules => name != TMP_DIR && name.starts_with('.') && name.ends_with(".sk1ll-tmp"),
+        } {
+            remove_entry(&path)?;
         }
-        let expected = index.as_ref().and_then(|i| i.get(file)).cloned();
-        let kind = displaced::Kind::Rule;
-        rescued.push(displaced::rescue(kind, harness, &dir.join(file), &path, expected.as_deref(), dir)?);
     }
-    Ok(rescued)
+    if matches!(directory, DirectoryKind::Skills) {
+        for name in read_dir_names(&tmp)? {
+            if name.starts_with("stage-") {
+                remove_entry(&tmp.join(&name))?;
+            } else if let Some(entry) = name.strip_prefix("old-") {
+                leftovers.push((tmp.join(&name), entry.to_string()));
+            }
+        }
+        remove_empty_tmp(dir);
+    }
+    if leftovers.is_empty() {
+        return Ok(Vec::new());
+    }
+    let index = load_index(dir)?;
+    let kind = match directory {
+        DirectoryKind::Skills => displaced::Kind::Skill,
+        DirectoryKind::Rules => displaced::Kind::Rule,
+    };
+    leftovers
+        .into_iter()
+        .map(|(aside, name)| {
+            let expected = match (directory, index.get(&name)) {
+                (DirectoryKind::Skills, Some(IndexEntry::Link { hash, .. }))
+                | (DirectoryKind::Rules, Some(IndexEntry::Rule { hash })) => Some(hash.clone()),
+                (DirectoryKind::Skills, Some(IndexEntry::Copy { hash })) => Some(format!("copy:{hash}")),
+                _ => None,
+            };
+            displaced::rescue(kind, harness, &dir.join(&name), &aside, expected.as_deref(), dir)
+        })
+        .collect()
 }
 
 /// Leftovers next to a block instructions file (its target, if linked).
@@ -1082,7 +1133,7 @@ fn recover_file_siblings(harness: &str, path: &Path) -> Result<Vec<displaced::En
 
 /// Resolves a conflict the other way round: copies the harness's content back
 /// into the repo, where it becomes a draft change. Works for copied skill
-/// directories (into the skill's repo directory, without the marker) and
+/// directories (into the skill's repo directory) and
 /// `rules` files (into `instructions/<name>.md`, keeping the rule's
 /// `harnesses:` key). The harness copy is then recorded as managed, so the
 /// next plan has no conflict for it.
@@ -1102,20 +1153,22 @@ pub fn adopt(repo: &Repo, action: &Action) -> Result<()> {
 }
 
 fn adopt_skill(repo: &Repo, src: &Path, name: &str) -> Result<()> {
-    let source = repo.skills()?.into_iter().find(|s| s.name == name).map(|s| s.path);
-    if matches!(classify(repo.root(), src, source.as_deref())?, Existing::Unmanaged(_)) {
+    let dir = src.parent().ok_or_else(|| Error::Invalid(format!("{} has no parent", src.display())))?;
+    let recorded = index_entry(src)?;
+    if !matches!(recorded, Some(IndexEntry::Copy { .. })) {
         return Err(Error::Invalid(format!(
             "`{name}` is an unmanaged skill and cannot replace an existing repo skill"
         )));
     }
-    copy_into_repo(repo, src, name)?;
-    let marker = src.join(MARKER);
-    fs::write(&marker, hash_dir(src)?).at(&marker)
+    let ownership = Ownership { dest: src, dir, name, expected: recorded.as_ref() };
+    let hash = copy_into_repo(repo, src, name)?;
+    ownership.check()?;
+    ownership.record(Some(IndexEntry::Copy { hash }))
 }
 
 /// Replaces the repo's skill `name` (a new personal one if there is none)
-/// with the copied skill directory `src`, minus its marker.
-fn copy_into_repo(repo: &Repo, src: &Path, name: &str) -> Result<()> {
+/// with the copied skill directory `src` and returns the copied content's hash.
+fn copy_into_repo(repo: &Repo, src: &Path, name: &str) -> Result<String> {
     let meta = fs::symlink_metadata(src).at(src)?;
     if !meta.is_dir() {
         return Err(Error::Invalid(format!(
@@ -1135,22 +1188,25 @@ fn copy_into_repo(repo: &Repo, src: &Path, name: &str) -> Result<()> {
     if stage.exists() {
         fs::remove_dir_all(&stage).at(&stage)?;
     }
-    copy_dir(src, &stage, &[".git", MARKER])?;
+    copy_dir(src, &stage)?;
+    let hash = hash_dir(&stage)?;
     if dest.exists() {
         fs::remove_dir_all(&dest).at(&dest)?;
     }
-    fs::rename(&stage, &dest).at(&dest)
+    fs::rename(&stage, &dest).at(&dest)?;
+    Ok(hash)
 }
 
 fn adopt_rule(repo: &Repo, src: &Path, file: &str) -> Result<()> {
     let Some(text) = crate::config_file::read_text(src, false)? else {
         return Err(Error::Invalid(format!("{} no longer exists; nothing to adopt", src.display())));
     };
-    rule_into_repo(repo, file, &text)?;
     let dir = src.parent().ok_or_else(|| Error::Invalid(format!("{} has no parent", src.display())))?;
-    let mut index = instructions::load_rules_index(dir)?;
-    index.insert(file.to_string(), hash_str(&text));
-    instructions::save_rules_index(dir, &index)
+    let recorded = index_entry(src)?;
+    let ownership = Ownership { dest: src, dir, name: file, expected: recorded.as_ref() };
+    rule_into_repo(repo, file, &text)?;
+    ownership.check()?;
+    ownership.record(Some(IndexEntry::Rule { hash: hash_str(&text) }))
 }
 
 /// Writes the rule file `file`'s `text` into the repo's rule, keeping
@@ -1359,7 +1415,9 @@ pub mod displaced {
                     "displaced entry `{id}` is a skill link, which holds no content of its own; discard it"
                 )));
             }
-            Kind::Skill => copy_into_repo(repo, &entry.path, &name)?,
+            Kind::Skill => {
+                copy_into_repo(repo, &entry.path, &name)?;
+            }
             Kind::Rule => rule_into_repo(repo, &name, &read_text(&entry.path)?)?,
             Kind::Instructions => restore_instructions(&entry)?,
         }
@@ -1389,7 +1447,8 @@ pub mod displaced {
             false => Err(changed_since_plan(dest)),
         };
         let expected = hash_str(&current);
-        let displace = Displace { kind: Kind::Instructions, harness: &entry.harness, expected: Some(&expected) };
+        let displace =
+            Displace { kind: Kind::Instructions, harness: &entry.harness, expected: Some(&expected), ownership: None };
         replace_file(dest, &text, unchanged, displace)?.map_or(Ok(()), Err)
     }
 
@@ -1596,7 +1655,7 @@ pub mod displaced {
         }
     }
 
-    fn remove_if_there(path: &Path) -> Result<()> {
+    pub(super) fn remove_if_there(path: &Path) -> Result<()> {
         match fs::remove_file(path) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e).at(path),
             _ => Ok(()),
@@ -1979,29 +2038,99 @@ fn hook(point: Hook, dest: &Path) {
     }
 }
 
-type LinksIndex = BTreeMap<String, PathBuf>;
+type OwnershipIndex = BTreeMap<String, IndexEntry>;
 
-fn load_links_index(dir: &Path) -> Result<LinksIndex> {
-    let path = dir.join(LINK_INDEX);
-    match instructions::read_optional(&path)? {
-        Some(text) => toml::from_str(&text).map_err(|e| Error::Parse { path, message: e.to_string() }),
-        None => Ok(LinksIndex::new()),
+fn index_path(dir: &Path) -> Result<PathBuf> {
+    let state = dir.join(INDEX_DIR);
+    match fs::symlink_metadata(&state) {
+        Ok(meta) if !meta.is_dir() => {
+            return Err(Error::Invalid(format!("{} is not a plain directory", state.display())));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).at(&state),
     }
+    Ok(dir.join(INDEX_PATH))
 }
 
-fn save_links_index(dir: &Path, index: &LinksIndex) -> Result<()> {
-    let path = dir.join(LINK_INDEX);
+fn load_index(dir: &Path) -> Result<OwnershipIndex> {
+    let path = index_path(dir)?;
+    let Some(text) = crate::config_file::read_text(&path, false)? else {
+        return Ok(OwnershipIndex::new());
+    };
+    let index: OwnershipIndex =
+        serde_json::from_str(&text).map_err(|e| Error::Parse { path: path.clone(), message: e.to_string() })?;
+    if let Some(name) = index.keys().find(|n| Path::new(n).file_name() != Some(n.as_str().as_ref())) {
+        return Err(Error::Parse { path, message: format!("invalid entry name {name:?}") });
+    }
+    Ok(index)
+}
+
+fn index_entry(dest: &Path) -> Result<Option<IndexEntry>> {
+    let dir = dest.parent().ok_or_else(|| Error::Invalid(format!("{} has no parent", dest.display())))?;
+    let name = dest.file_name().unwrap_or_default().to_string_lossy();
+    Ok(load_index(dir)?.remove(name.as_ref()))
+}
+
+fn save_index(dir: &Path, index: &OwnershipIndex) -> Result<()> {
+    let path = index_path(dir)?;
     if index.is_empty() {
-        return match fs::remove_file(&path) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e).at(&path),
-            _ => Ok(()),
-        };
+        return displaced::remove_if_there(&path);
     }
-    let body = toml::to_string(index).map_err(|e| Error::Parse { path: path.clone(), message: e.to_string() })?;
-    instructions::write_file(&path, &format!("# Skill links managed by 0xSk1ll. Do not edit.\n{body}"))
+    let body =
+        serde_json::to_vec_pretty(index).map_err(|e| Error::Parse { path: path.clone(), message: e.to_string() })?;
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    fs::create_dir_all(dir).at(dir)?;
+    let state = dir.join(INDEX_DIR);
+    builder.create(&state).at(&state)?;
+    crate::config_file::Staged::write(&path, &body, crate::config_file::existing_mode(&path))?.replace()
 }
 
-fn classify(repo_root: &Path, dest: &Path, assigned_source: Option<&Path>) -> Result<Existing> {
+/// Checks just the action's entry. Other actions in the same plan can
+/// update the same index while this entry still matches the plan.
+struct Ownership<'a> {
+    dest: &'a Path,
+    dir: &'a Path,
+    name: &'a str,
+    expected: Option<&'a IndexEntry>,
+}
+
+impl Ownership<'_> {
+    fn check(&self) -> Result<()> {
+        match load_index(self.dir) {
+            Ok(index) if index.get(self.name) == self.expected => Ok(()),
+            Ok(_) | Err(Error::Parse { .. } | Error::Invalid(_)) => Err(changed_since_plan(self.dest)),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn record(&self, entry: Option<IndexEntry>) -> Result<()> {
+        let mut index = load_index(self.dir)?;
+        match entry {
+            Some(entry) => {
+                index.insert(self.name.to_string(), entry);
+            }
+            None => {
+                index.remove(self.name);
+            }
+        }
+        save_index(self.dir, &index)
+    }
+}
+
+fn link_identity(path: &Path) -> String {
+    format!("link:{path:?}")
+}
+
+fn classify(
+    repo_root: &Path,
+    dest: &Path,
+    assigned_source: Option<&Path>,
+    recorded: Option<&IndexEntry>,
+) -> Result<Existing> {
     let meta = match fs::symlink_metadata(dest) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Existing::Missing),
@@ -2013,35 +2142,34 @@ fn classify(repo_root: &Path, dest: &Path, assigned_source: Option<&Path>) -> Re
             Some(parent) if to.is_relative() => parent.join(&to),
             _ => to,
         };
-        let dir = dest.parent().ok_or_else(|| Error::Invalid(format!("{} has no parent", dest.display())))?;
-        let links = load_links_index(dir)?;
-        let name = dest.file_name().unwrap_or_default().to_string_lossy();
-        let recorded = links.get(name.as_ref());
+        let target = match recorded {
+            Some(IndexEntry::Link { target, .. }) => Some(target),
+            _ => None,
+        };
         let canonical = match abs.canonicalize() {
             Ok(path) => Some(path),
             // A removed repo skill leaves a dangling managed link. Resolve
             // relative targets lexically so `..` and `.` still match the
-            // canonical target recorded during migration, without following
-            // the missing source. Unknown dangling links stay unmanaged.
+            // recorded canonical target even when the source is missing.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                recorded.filter(|p| lexical_normalize(p) == lexical_normalize(&abs)).cloned()
+                target.filter(|p| lexical_normalize(p) == lexical_normalize(&abs)).cloned()
             }
             Err(e) => return Err(e).at(&abs),
         };
         if let Some(canonical) = canonical {
-            let owned = recorded == Some(&canonical);
-            let legacy = recorded.is_none()
+            let owned = target == Some(&canonical);
+            let exact = recorded.is_none()
                 && assigned_source.map(|p| p.canonicalize().at(p)).transpose()?.as_ref() == Some(&canonical);
-            if canonical.starts_with(repo_root) && (owned || legacy) {
+            if canonical.starts_with(repo_root) && (owned || exact) {
                 return Ok(Existing::ManagedLink(canonical));
             }
         }
         return Ok(Existing::Unmanaged(format!("symlink to {} not managed by sk1ll", abs.display())));
     }
     if meta.is_dir() {
-        return Ok(match fs::read_to_string(dest.join(MARKER)) {
-            Ok(hash) => Existing::ManagedCopy(hash.trim().to_string()),
-            Err(_) => Existing::Unmanaged("existing directory not managed by sk1ll".into()),
+        return Ok(match recorded {
+            Some(IndexEntry::Copy { hash }) => Existing::ManagedCopy(hash.clone()),
+            _ => Existing::Unmanaged("existing directory not managed by sk1ll".into()),
         });
     }
     Ok(Existing::Unmanaged("existing file".into()))
@@ -2075,12 +2203,13 @@ fn remove_entry(path: &Path) -> Result<()> {
 }
 
 /// Reject unsupported entries before creating or replacing any output.
-fn validate_copy(src: &Path, skip: &[&str]) -> Result<()> {
+fn validate_copy(src: &Path) -> Result<()> {
     if !fs::symlink_metadata(src).at(src)?.is_dir() {
         return Err(Error::Invalid(format!("{} is not a skill directory", src.display())));
     }
-    let walker =
-        WalkDir::new(src).into_iter().filter_entry(|e| e.depth() == 0 || !skip.iter().any(|s| e.file_name() == *s));
+    let walker = WalkDir::new(src)
+        .into_iter()
+        .filter_entry(|e| e.depth() == 0 || !SKILL_CONTENT_EXCLUSIONS.iter().any(|s| e.file_name() == *s));
     for entry in walker {
         let entry = entry.map_err(std::io::Error::from).at(src)?;
         let ft = entry.file_type();
@@ -2091,10 +2220,11 @@ fn validate_copy(src: &Path, skip: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn copy_dir(src: &Path, dest: &Path, skip: &[&str]) -> Result<()> {
-    validate_copy(src, skip)?;
-    let walker =
-        WalkDir::new(src).into_iter().filter_entry(|e| e.depth() == 0 || !skip.iter().any(|s| e.file_name() == *s));
+fn copy_dir(src: &Path, dest: &Path) -> Result<()> {
+    validate_copy(src)?;
+    let walker = WalkDir::new(src)
+        .into_iter()
+        .filter_entry(|e| e.depth() == 0 || !SKILL_CONTENT_EXCLUSIONS.iter().any(|s| e.file_name() == *s));
     for entry in walker {
         let entry = entry.map_err(std::io::Error::from).at(src)?;
         let rel = entry.path().strip_prefix(src).unwrap_or(entry.path());
@@ -2149,6 +2279,144 @@ mod tests {
     }
 
     #[test]
+    fn ownership_index_round_trips_each_kind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("repo/personal/pdf");
+        let index = OwnershipIndex::from([
+            ("link".into(), IndexEntry::Link { hash: link_identity(&target), target }),
+            ("copy".into(), IndexEntry::Copy { hash: "sha256:1".into() }),
+            ("rule.md".into(), IndexEntry::Rule { hash: "sha256:2".into() }),
+        ]);
+        assert!(load_index(tmp.path()).unwrap().is_empty());
+        save_index(tmp.path(), &index).unwrap();
+        assert_eq!(load_index(tmp.path()).unwrap(), index);
+        let bytes = fs::read(tmp.path().join(INDEX_PATH)).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["link"]["kind"], "link");
+        assert_eq!(json["copy"], serde_json::json!({"kind": "copy", "hash": "sha256:1"}));
+        assert_eq!(json["rule.md"], serde_json::json!({"kind": "rule", "hash": "sha256:2"}));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bookkeeping_writes_never_follow_a_planted_temp_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("victim");
+        write(&victim, "victim\n");
+        let path = tmp.path().join(INDEX_PATH);
+        fs::create_dir(path.parent().unwrap()).unwrap();
+        let planted = sibling(&path, "sk1ll-tmp");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        let index = OwnershipIndex::from([("git.md".into(), IndexEntry::Rule { hash: "sha256:1".into() })]);
+        save_index(tmp.path(), &index).unwrap();
+        assert_eq!(load_index(tmp.path()).unwrap(), index);
+        assert!(fs::symlink_metadata(path).unwrap().file_type().is_file());
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "victim\n");
+        assert!(fs::symlink_metadata(&planted).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn a_hand_edit_conflicts_even_when_it_matches_the_source() {
+        let (tmp, repo, harnesses) = skill_setup(LinkMode::Copy);
+        let assignment = Assignment::default();
+        apply(&repo, &plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap()[0]).unwrap();
+        let dest = tmp.path().join("skills/pdf/SKILL.md");
+        write(&dest, "Edited in the harness.\n");
+        for source in ["PDFs.\n", "Edited in the harness.\n"] {
+            write(&repo.personal_dir().join("pdf/SKILL.md"), source);
+            let actions = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
+            assert_eq!(actions.len(), 1);
+            assert_eq!(actions[0].kind, ActionKind::Conflict);
+            apply(&repo, &actions[0]).unwrap();
+            assert_eq!(fs::read_to_string(&dest).unwrap(), "Edited in the harness.\n");
+        }
+    }
+
+    #[test]
+    fn an_unindexed_copy_is_unmanaged_and_never_removed() {
+        let (tmp, repo, harnesses) = skill_setup(LinkMode::Copy);
+        let mut assignment = Assignment::default();
+        write(&repo.personal_dir().join("notes/SKILL.md"), "Notes.\n");
+        for action in plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap() {
+            apply(&repo, &action).unwrap();
+        }
+        let dir = tmp.path().join("skills");
+        let mut index = load_index(&dir).unwrap();
+        assert!(index.remove("pdf").is_some());
+        assert!(index.contains_key("notes"));
+        save_index(&dir, &index).unwrap();
+        assert_eq!(unmanaged::discover(&repo, &harnesses).unwrap()[0].name, "pdf");
+        let placements = placed(&repo, "h", &harnesses["h"]).unwrap();
+        assert_eq!(placements.len(), 1);
+        assert_eq!(placements[0].dest, dir.join("notes"));
+        let opts = PlanOptions { force: true };
+        let actions = plan(&repo, &harnesses, &assignment, opts).unwrap();
+        assert_eq!(actions[0].kind, ActionKind::Conflict);
+        assignment.set_skill("h", "pdf", false);
+        assert!(plan(&repo, &harnesses, &assignment, opts).unwrap().is_empty());
+        assert_eq!(fs::read_to_string(dir.join("pdf/SKILL.md")).unwrap(), "PDFs.\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unindexed_link_is_unmanaged_until_sync_records_it() {
+        let (tmp, repo, harnesses) = skill_setup(LinkMode::Symlink);
+        let dir = tmp.path().join("skills");
+        let dest = dir.join("pdf");
+        fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(repo.personal_dir().join("pdf"), &dest).unwrap();
+        assert_eq!(unmanaged::discover(&repo, &harnesses).unwrap()[0].name, "pdf");
+        assert!(placed(&repo, "h", &harnesses["h"]).unwrap().is_empty());
+        let actions = plan(&repo, &harnesses, &Assignment::default(), PlanOptions::default()).unwrap();
+        assert_eq!(actions[0].kind, ActionKind::Update);
+        apply(&repo, &actions[0]).unwrap();
+        assert!(unmanaged::discover(&repo, &harnesses).unwrap().is_empty());
+        assert!(matches!(index_entry(&dest).unwrap(), Some(IndexEntry::Link { .. })));
+    }
+
+    #[test]
+    fn stale_index_entries_refuse_skill_and_rule_updates() {
+        for case in ["skill update", "skill removal", "rule update", "rule removal"] {
+            for point in [None, Some(Hook::BeforeSwap), Some(Hook::AfterAside)] {
+                let d = Displacement::new(case);
+                let _root = displaced::test_root(&d.tmp.path().join("recovery"));
+                let action = d.action();
+                let before = fs::read(&d.file).unwrap();
+                let holder = d.holder.clone();
+                let name = d.dest.file_name().unwrap().to_string_lossy().into_owned();
+                let mut index = load_index(&holder).unwrap();
+                assert!(index.remove(&name).is_some());
+                let edit = move |_: &Path| save_index(&holder, &index).unwrap();
+                let result = match point {
+                    Some(point) => with_hook(point, edit, || apply(&d.repo, &action)),
+                    None => {
+                        edit(&d.dest);
+                        apply(&d.repo, &action)
+                    }
+                };
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    changed_since_plan(&d.dest).to_string(),
+                    "{case} {point:?}"
+                );
+                assert_eq!(fs::read(&d.file).unwrap(), before);
+                assert_eq!(index_entry(&d.dest).unwrap(), None);
+                assert!(displaced::list().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn a_partially_written_index_invalidates_the_plan() {
+        let d = Displacement::new("skill update");
+        let action = d.action();
+        write(&d.holder.join(INDEX_PATH), "{");
+        assert_eq!(apply(&d.repo, &action).unwrap_err().to_string(), changed_since_plan(&d.dest).to_string());
+        assert_eq!(fs::read_to_string(&d.file).unwrap(), "PDFs.\n");
+        assert_eq!(fs::read_to_string(d.holder.join(INDEX_PATH)).unwrap(), "{");
+    }
+
+    #[test]
     fn reviewed_copies_reject_source_edits_before_and_during_staging() {
         for point in [Hook::BeforeCopy, Hook::CopyEntry] {
             let (_tmp, repo, harnesses) = skill_setup(LinkMode::Copy);
@@ -2169,7 +2437,11 @@ mod tests {
             assert!(matches!(error, Error::Changed(_)), "{point:?}: {error}");
             assert!(!action.dest.exists());
             apply(&repo, action).unwrap();
-            assert_eq!(fs::read_to_string(action.dest.join(MARKER)).unwrap(), hash_dir(&action.dest).unwrap());
+            assert_eq!(
+                index_entry(&action.dest).unwrap(),
+                Some(IndexEntry::Copy { hash: hash_dir(&action.dest).unwrap() })
+            );
+            assert_eq!(fs::read_dir(&action.dest).unwrap().count(), 1);
         }
     }
 
@@ -2190,10 +2462,11 @@ mod tests {
                 let dest = tmp.path().join("skills/pdf");
                 write(&dest.join("SKILL.md"), "Late harness edit.\n");
                 let before = hash_dir(&dest).unwrap();
-                let marker = fs::read(dest.join(MARKER)).unwrap();
+                let path = dest.parent().unwrap().join(INDEX_PATH);
+                let index = fs::read(&path).unwrap();
                 assert!(apply(&repo, &actions[0]).is_err());
                 assert_eq!(hash_dir(&dest).unwrap(), before);
-                assert_eq!(fs::read(dest.join(MARKER)).unwrap(), marker);
+                assert_eq!(fs::read(path).unwrap(), index);
             }
         }
     }
@@ -2320,7 +2593,7 @@ mod tests {
             let leftovers: Vec<_> = fs::read_dir(tmp.path().join("skills"))
                 .unwrap()
                 .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-                .filter(|n| n.starts_with(".sk1ll-"))
+                .filter(|n| n.starts_with(".sk1ll-") && n != INDEX_DIR)
                 .collect();
             assert!(leftovers.is_empty(), "{leftovers:?}");
         }
@@ -2382,7 +2655,7 @@ mod tests {
         let cleanup = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
         assert_eq!(cleanup[0].kind, ActionKind::Remove);
         apply(&repo, &cleanup[0]).unwrap();
-        assert!(instructions::load_rules_index(&dir).unwrap().is_empty());
+        assert!(load_index(&dir).unwrap().is_empty());
     }
 
     #[cfg(unix)]
@@ -2415,14 +2688,15 @@ mod tests {
         let incoming = rules_dir.join("new.md");
         let adopted = repo.root().join("instructions/new.md");
         write(&incoming, "A local rule.\n");
-        let links = LinksIndex::from([("pdf".into(), "personal/pdf".into())]);
+        let target = repo.personal_dir().join("pdf");
+        let links = OwnershipIndex::from([("pdf".into(), IndexEntry::Link { hash: link_identity(&target), target })]);
         let save = || {
             Assignment::default().save(&assignment_path).unwrap();
             adopt_rule(&repo, &incoming, "new.md").unwrap();
-            save_links_index(&links_dir, &links).unwrap();
+            save_index(&links_dir, &links).unwrap();
         };
         save();
-        let files = [assignment_path.clone(), adopted, links_dir.join(LINK_INDEX), rules_dir.join(MARKER)];
+        let files = [assignment_path.clone(), adopted, links_dir.join(INDEX_PATH), rules_dir.join(INDEX_PATH)];
         for file in &files {
             assert_eq!(fs::metadata(file).unwrap().permissions().mode() & 0o777, 0o600, "{file:?}");
             fs::set_permissions(file, fs::Permissions::from_mode(0o640)).unwrap();
@@ -2486,7 +2760,7 @@ mod tests {
         let actions = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
         apply(&repo, &actions[0]).unwrap();
         let dir = tmp.path().join("skills");
-        let index = fs::read(dir.join(LINK_INDEX)).unwrap();
+        let index = fs::read(dir.join(INDEX_PATH)).unwrap();
         assignment.set_skill("h", "pdf", false);
         let actions = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
         fs::remove_file(dir.join("pdf")).unwrap();
@@ -2494,7 +2768,7 @@ mod tests {
         std::os::unix::fs::symlink("../repo/personal/pdf", dir.join("pdf")).unwrap();
         assert!(apply(&repo, &actions[0]).is_err());
         assert_eq!(fs::read_link(dir.join("pdf")).unwrap(), Path::new("../repo/personal/pdf"));
-        assert_eq!(fs::read(dir.join(LINK_INDEX)).unwrap(), index);
+        assert_eq!(fs::read(dir.join(INDEX_PATH)).unwrap(), index);
     }
 
     #[cfg(unix)]
@@ -2529,7 +2803,7 @@ mod tests {
         assert_eq!(actions[0].kind, ActionKind::Remove);
         apply(&repo, &actions[0]).unwrap();
         assert!(!tmp.path().join("skills/pdf").is_symlink());
-        assert!(!tmp.path().join("skills").join(LINK_INDEX).exists());
+        assert!(!tmp.path().join("skills").join(INDEX_PATH).exists());
     }
 
     #[cfg(unix)]
@@ -2546,7 +2820,7 @@ mod tests {
         assert_eq!(actions[0].kind, ActionKind::Update);
         apply(&repo, &actions[0]).unwrap();
         assert_eq!(fs::read_link(dir.join("pdf")).unwrap(), target);
-        assert!(dir.join(LINK_INDEX).is_file());
+        assert!(dir.join(INDEX_PATH).is_file());
         assert!(plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap().is_empty());
 
         fs::remove_dir_all(repo.personal_dir().join("pdf")).unwrap();
@@ -2560,7 +2834,7 @@ mod tests {
             apply(&repo, action).unwrap();
         }
         assert!(!dir.join("pdf").is_symlink());
-        assert!(!dir.join(LINK_INDEX).exists());
+        assert!(!dir.join(INDEX_PATH).exists());
         assert_eq!(fs::read_link(dir.join("manual")).unwrap(), target);
     }
 
@@ -2769,7 +3043,7 @@ mod tests {
         }
         assert!(matches!(adopt(&repo, &forced[0]), Err(Error::Invalid(_))));
         assert_eq!(fs::read_to_string(root.join("personal/pdf/SKILL.md")).unwrap(), "---\nname: pdf\n---\nEdited.\n");
-        assert!(root.join("personal/pdf/extra.md").is_file() && !root.join("personal/pdf").join(MARKER).exists());
+        assert!(root.join("personal/pdf/extra.md").is_file() && !root.join("personal/pdf").join(INDEX_DIR).exists());
         assert_eq!(
             fs::read_to_string(root.join("instructions/git.md")).unwrap(),
             "---\nharnesses: [h, b]\ndescription: Git\n---\n\nUse CC always.\n"
@@ -2911,15 +3185,24 @@ mod tests {
                     assert_eq!(kept, "PDFs.\nWritten through an open file.\n", "{case}");
                     assert_eq!(entry.kind, displaced::Kind::Skill);
                     match remove {
-                        false => assert_eq!(fs::read_to_string(dest.join("SKILL.md")).unwrap(), "Updated source.\n"),
-                        true => assert!(fs::symlink_metadata(&dest).is_err(), "{case}"),
+                        false => {
+                            assert_eq!(fs::read_to_string(dest.join("SKILL.md")).unwrap(), "Updated source.\n");
+                            assert_eq!(
+                                index_entry(&dest).unwrap(),
+                                Some(IndexEntry::Copy { hash: hash_dir(&dest).unwrap() })
+                            );
+                        }
+                        true => {
+                            assert!(fs::symlink_metadata(&dest).is_err(), "{case}");
+                            assert_eq!(index_entry(&dest).unwrap(), None);
+                        }
                     }
                     assert!(sk1ll_leftovers(&tmp.path().join("skills")).is_empty(), "{case}");
 
                     displaced::adopt(&repo, &entry.id).unwrap();
                     let adopted = fs::read_to_string(repo.personal_dir().join("pdf/SKILL.md")).unwrap();
                     assert_eq!(adopted, kept, "{case}");
-                    assert!(!repo.personal_dir().join("pdf").join(MARKER).exists());
+                    assert!(!repo.personal_dir().join("pdf").join(INDEX_DIR).exists());
                     assert!(displaced::list().unwrap().is_empty(), "{case}");
                 }
             }
@@ -2977,21 +3260,27 @@ mod tests {
             // was moved aside and the replacement never went in.
             let skills = tmp.path().join("skills");
             fs::rename(skills.join("pdf"), skills.join(".sk1ll-old-pdf")).unwrap();
-            copy_dir(&repo.personal_dir().join("pdf"), &skills.join(".sk1ll-stage-pdf"), &[]).unwrap();
-            fs::write(skills.join(".sk1ll-stage-pdf").join(MARKER), "sha256:x").unwrap();
-            copy_dir(&repo.personal_dir().join("pdf"), &skills.join(".sk1ll-tmp/stage-pdf"), &[]).unwrap();
-            copy_dir(&skills.join(".sk1ll-old-pdf"), &skills.join(".sk1ll-tmp/old-gone"), &[]).unwrap();
-            let marker = fs::read_to_string(skills.join(".sk1ll-old-pdf").join(MARKER)).unwrap();
-            fs::write(skills.join(".sk1ll-tmp/old-gone").join(MARKER), &marker).unwrap();
+            copy_dir(&repo.personal_dir().join("pdf"), &skills.join(".sk1ll-stage-pdf")).unwrap();
+            copy_dir(&repo.personal_dir().join("pdf"), &skills.join(".sk1ll-tmp/stage-pdf")).unwrap();
+            copy_dir(&skills.join(".sk1ll-old-pdf"), &skills.join(".sk1ll-tmp/old-gone")).unwrap();
+            let mut index = load_index(&skills).unwrap();
+            index.insert("gone".into(), index["pdf"].clone());
+            save_index(&skills, &index).unwrap();
             write(&skills.join(".sk1ll-tmp/old-gone/SKILL.md"), "Edited before the crash.\n");
             fs::rename(rules.join("git.md"), rules.join(".sk1ll-old-git.md")).unwrap();
             write(&rules.join(".git.md.sk1ll-tmp"), "staged\n");
+            let index_stage = sibling(&skills.join(INDEX_PATH), "sk1ll-tmp-1");
+            write(&index_stage, "interrupted index write\n");
 
             let actions = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
             let summary: Vec<_> = actions.iter().map(|a| (a.kind, a.dest.clone())).collect();
             assert_eq!(
                 summary,
-                [(ActionKind::Create, skills.join("pdf")), (ActionKind::Create, rules.join("git.md"))],
+                [
+                    (ActionKind::Create, skills.join("pdf")),
+                    (ActionKind::Remove, skills.join("gone")),
+                    (ActionKind::Create, rules.join("git.md")),
+                ],
                 "explicit={explicit}"
             );
             if explicit {
@@ -3012,9 +3301,10 @@ mod tests {
             assert_eq!(fs::read_to_string(skills.join("pdf/SKILL.md")).unwrap(), "Updated source.\n");
             let mut names: Vec<_> = fs::read_dir(&skills).unwrap().map(|e| e.unwrap().file_name()).collect();
             names.sort();
-            assert_eq!(names, [TMP_DIR, "pdf"], "explicit={explicit}");
+            assert_eq!(names, [INDEX_DIR, TMP_DIR, "pdf"], "explicit={explicit}");
             assert!(sk1ll_leftovers(&skills).is_empty(), "only recovery entries are kept");
             assert!(sk1ll_leftovers(&rules).is_empty());
+            assert!(!index_stage.exists());
             let changed = displaced::changed().unwrap();
             assert_eq!(changed.len(), 1, "{changed:?}");
             assert_eq!(fs::read_to_string(changed[0].path.join("SKILL.md")).unwrap(), "Edited before the crash.\n");

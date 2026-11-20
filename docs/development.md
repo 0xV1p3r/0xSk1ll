@@ -13,10 +13,9 @@
 
 `sync::plan` has no side effects. `sync::apply` checks the filesystem again before it changes anything. Sync only modifies:
 
-- skill symlinks listed in the skills directory's `.sk1ll-managed-links` index,
-- skill copies marked with `.sk1ll-managed`,
+- skill symlinks and copies listed in the skills directory's `.sk1ll-state/index.json`,
 - its own block in instruction files,
-- rule files listed in a rules directory's `.sk1ll-managed` index.
+- rule files listed in the rules directory's `.sk1ll-state/index.json`.
 
 An existing skill symlink enters the index only when its canonical target is the repo skill currently assigned to that harness.
 

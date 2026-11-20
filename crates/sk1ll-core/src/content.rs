@@ -316,6 +316,10 @@ fn source(repo: &Repo, harnesses: &BTreeMap<String, Harness>, query: &ContentQue
     }))
 }
 
+fn reserved_name(name: &std::ffi::OsStr) -> bool {
+    crate::sync::SKILL_CONTENT_EXCLUSIONS.iter().any(|excluded| name == *excluded) || name == ".sk1ll-tmp"
+}
+
 pub fn tree(repo: &Repo, harnesses: &BTreeMap<String, Harness>, query: &ContentQuery) -> Result<Vec<FileEntry>> {
     match source(repo, harnesses, query)? {
         #[cfg(unix)]
@@ -329,12 +333,10 @@ pub fn tree(repo: &Repo, harnesses: &BTreeMap<String, Harness>, query: &ContentQ
         Source::Disk(root) => {
             let base = if root.is_file() { root.parent().unwrap() } else { &root };
             let mut files = Vec::new();
-            let walker = WalkDir::new(&root).sort_by_file_name().into_iter().filter_entry(|e| {
-                e.depth() == 0
-                    || (e.file_name() != ".git"
-                        && e.file_name() != crate::sync::MARKER
-                        && e.file_name() != ".sk1ll-tmp")
-            });
+            let walker = WalkDir::new(&root)
+                .sort_by_file_name()
+                .into_iter()
+                .filter_entry(|e| e.depth() == 0 || !reserved_name(e.file_name()));
             #[cfg(test)]
             before_access();
             for entry in walker {
@@ -498,11 +500,7 @@ pub fn write_file(repo: &Repo, request: &WriteFileRequest) -> Result<bool> {
     {
         let query = &request.file;
         let rel = relative(&query.path)?;
-        if crate::source::is_staging_path(rel)
-            || rel
-                .components()
-                .any(|c| matches!(c.as_os_str().to_str(), Some(".git" | ".sk1ll-managed" | ".sk1ll-tmp")))
-        {
+        if crate::source::is_staging_path(rel) || rel.components().any(|c| reserved_name(c.as_os_str())) {
             return Err(Error::Invalid("cannot edit a reserved file".into()));
         }
         if query.content.item.starts_with("unmanaged:") {
@@ -511,7 +509,7 @@ pub fn write_file(repo: &Repo, request: &WriteFileRequest) -> Result<bool> {
         let item: ItemRef = query.content.item.parse()?;
         let name = item.name();
         if relative(name)?.file_name().is_none_or(|leaf| leaf != name)
-            || matches!(name, ".git" | ".sk1ll-managed" | ".sk1ll-tmp")
+            || reserved_name(name.as_ref())
             || crate::source::is_staging_path(Path::new(name))
         {
             return Err(Error::Invalid("invalid item name".into()));

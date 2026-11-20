@@ -85,8 +85,8 @@ resumable variants can be adopted. Repo entries always have an empty
 ```
 
 `kind` is `file`, `directory`, or `symlink`. Sizes are bytes; directories have
-size zero. Tree browsing does not follow directory symlinks. Sk1ll markers and
-`.git` directories are omitted from working-tree results.
+size zero. Tree browsing does not follow directory symlinks. Working-tree
+results omit `.git`, `.sk1ll-state` and `.sk1ll-tmp`.
 
 `GET /skills/file?item=skill:pdf&path=SKILL.md` returns:
 

@@ -41,6 +41,7 @@ pub fn discover(repo: &Repo, harnesses: &BTreeMap<String, Harness>) -> Result<Ve
         if !dir.is_dir() {
             continue;
         }
+        let index = load_index(&dir)?;
         for entry in fs::read_dir(&dir).at(&dir)? {
             let entry = entry.at(&dir)?;
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -51,8 +52,7 @@ pub fn discover(repo: &Repo, harnesses: &BTreeMap<String, Harness>) -> Result<Ve
             if !path.join("SKILL.md").is_file() {
                 continue;
             }
-            let source = skills.iter().find(|s| s.name == name).map(|s| s.path.as_path());
-            if !matches!(classify(repo.root(), &path, source)?, Existing::Unmanaged(_)) {
+            if !matches!(classify(repo.root(), &path, None, index.get(&name))?, Existing::Unmanaged(_)) {
                 continue;
             }
             let canonical = path.canonicalize().at(&path)?;
@@ -122,8 +122,10 @@ pub fn adopted(
     let Some(path) = harnesses.get(harness).and_then(|h| h.skills_dir()).map(|p| p.join(name)) else {
         return Ok(None);
     };
-    if !matches!(classify(repo.root(), &path, Some(&skill.path))?, Existing::ManagedCopy(_) | Existing::ManagedLink(_))
-    {
+    if !matches!(
+        classify(repo.root(), &path, None, index_entry(&path)?.as_ref())?,
+        Existing::ManagedCopy(_) | Existing::ManagedLink(_)
+    ) {
         return Ok(None);
     }
     let hash = hash_dir(&skill.path)?;
@@ -191,7 +193,7 @@ pub fn publish(repo: &Repo, adoption: &Adoption) -> Result<()> {
     let stage = crate::source::unique(&parent);
     fs::create_dir(&stage).at(&stage)?;
     let copied = (|| {
-        copy_dir(&canonical, &stage, &[".git", MARKER])?;
+        copy_dir(&canonical, &stage)?;
         if hash_dir(&stage)? != adoption.hash {
             return Err(Error::Invalid("skill changed while being adopted; retry".into()));
         }
@@ -219,7 +221,7 @@ pub fn rollback(repo: &Repo, adoption: &Adoption) -> Result<bool> {
     }
     if walkdir::WalkDir::new(&dest)
         .into_iter()
-        .any(|entry| entry.map_or(true, |e| e.file_name() == ".git" || e.file_name() == MARKER))
+        .any(|entry| entry.map_or(true, |e| SKILL_CONTENT_EXCLUSIONS.iter().any(|name| e.file_name() == *name)))
         || hash_dir(&dest)? != adoption.hash
     {
         return Ok(false);
@@ -235,7 +237,9 @@ pub fn rollback(repo: &Repo, adoption: &Adoption) -> Result<bool> {
         if hash_dir(&dest)? != adoption.hash {
             return Ok(false);
         }
-        if let Some(error) = remove_displacing(displaced::Kind::Skill, "adopt", &dest, expected.as_deref())? {
+        let displace =
+            Displace { kind: displaced::Kind::Skill, harness: "adopt", expected: expected.as_deref(), ownership: None };
+        if let Some(error) = remove_displacing(&dest, displace)? {
             return Err(error);
         }
     }
@@ -277,7 +281,8 @@ pub fn complete(repo: &Repo, harnesses: &BTreeMap<String, Harness>, adoption: &A
         if dest != location.path {
             continue;
         }
-        if !matches!(classify(repo.root(), &dest, Some(&source))?, Existing::Unmanaged(_)) {
+        let expected_index = index_entry(&dest)?;
+        if !matches!(classify(repo.root(), &dest, None, expected_index.as_ref())?, Existing::Unmanaged(_)) {
             continue;
         }
         let canonical = dest.canonicalize().at(&dest)?;
@@ -297,6 +302,7 @@ pub fn complete(repo: &Repo, harnesses: &BTreeMap<String, Harness>, adoption: &A
                 mode: config.mode,
                 source: Some(source.clone()),
                 expected,
+                expected_index,
             },
             reason: None,
         };
@@ -341,7 +347,11 @@ mod tests {
         write(&tmp.path().join("c/pdf/SKILL.md"), "two");
         write(&tmp.path().join("a/rule.md"), "not a skill");
         write(&tmp.path().join("a/marked/SKILL.md"), "managed");
-        write(&tmp.path().join("a/marked/.sk1ll-managed"), "hash");
+        save_index(
+            &tmp.path().join("a"),
+            &OwnershipIndex::from([("marked".into(), IndexEntry::Copy { hash: "sha256:1".into() })]),
+        )
+        .unwrap();
         let items = discover(&repo, &hs).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].variants.len(), 2);
@@ -375,8 +385,14 @@ mod tests {
         for action in plan(&repo, &hs, &assignment, PlanOptions::default()).unwrap() {
             apply(&repo, &action).unwrap();
         }
-        assert!(tmp.path().join("a/pdf/.sk1ll-managed").is_file());
-        assert!(tmp.path().join("b/pdf/.sk1ll-managed").is_file());
+        assert_eq!(
+            index_entry(&tmp.path().join("a/pdf")).unwrap(),
+            Some(IndexEntry::Copy { hash: adoption.hash.clone() })
+        );
+        assert_eq!(
+            index_entry(&tmp.path().join("b/pdf")).unwrap(),
+            Some(IndexEntry::Copy { hash: adoption.hash.clone() })
+        );
         assert_eq!(fs::read_to_string(tmp.path().join("c/pdf/SKILL.md")).unwrap(), "different");
         assert!(!tmp.path().join("d/pdf").exists());
         let recovery = displaced::list().unwrap();
@@ -435,7 +451,7 @@ mod tests {
         let adoption = prepare(&repo, &hs, "a", "pdf").unwrap();
         write(&tmp.path().join("a/pdf/SKILL.md"), "edited meanwhile");
         complete(&repo, &hs, &adoption).unwrap();
-        assert!(!tmp.path().join("a/pdf/.sk1ll-managed").exists());
+        assert_eq!(index_entry(&tmp.path().join("a/pdf")).unwrap(), None);
         assert_eq!(fs::read_to_string(tmp.path().join("a/pdf/SKILL.md")).unwrap(), "edited meanwhile");
     }
 
@@ -470,7 +486,10 @@ mod tests {
         let adoption = prepare(&repo, &hs, "a", "pdf").unwrap();
         complete(&repo, &hs, &adoption).unwrap();
         assert_eq!(fs::read_to_string(tmp.path().join("external/SKILL.md")).unwrap(), "linked");
-        assert!(tmp.path().join("a/pdf/.sk1ll-managed").is_file());
+        assert_eq!(
+            index_entry(&tmp.path().join("a/pdf")).unwrap(),
+            Some(IndexEntry::Copy { hash: adoption.hash.clone() })
+        );
         assert_eq!(displaced::list().unwrap().len(), 2);
     }
 }

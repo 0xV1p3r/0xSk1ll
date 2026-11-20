@@ -6,11 +6,11 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::git::path_bytes;
-use crate::sync::MARKER;
+use crate::sync::SKILL_CONTENT_EXCLUSIONS;
 use crate::{IoExt, Result};
 
 /// Stable content hash of a skill directory (file paths + contents), ignoring
-/// `.git` and sk1ll's own marker file.
+/// the names in [`SKILL_CONTENT_EXCLUSIONS`].
 ///
 /// Paths and symlink targets are hashed as their exact bytes on Unix, where
 /// `\` is an ordinary file-name character; only on Windows do `\` separators
@@ -18,11 +18,7 @@ use crate::{IoExt, Result};
 /// a `\` and whose symlink targets are valid UTF-8 (all but a handful of real
 /// trees), this is byte-for-byte the input of the
 /// earlier algorithm (lossy UTF-8, `\` always read as `/`), so the hashes in
-/// existing `.sk1ll-managed` markers and `sk1ll.lock` stay valid without a
-/// version prefix. The trees whose hash does change are exactly those the
-/// old hash couldn't tell apart from another tree (`a\b` vs `a/b`), so an old
-/// marker for one is ambiguous and showing it as a conflict is the safe
-/// reading.
+/// `sk1ll.lock` stay valid without a version prefix for ordinary trees.
 pub fn hash_dir(dir: &Path) -> Result<String> {
     hash_dir_buffered(dir, &mut [0; BUFFER])
 }
@@ -35,7 +31,7 @@ fn hash_dir_buffered(dir: &Path, buf: &mut [u8]) -> Result<String> {
     let walker = WalkDir::new(dir)
         .sort_by_file_name()
         .into_iter()
-        .filter_entry(|e| e.depth() == 0 || (e.file_name() != ".git" && e.file_name() != MARKER));
+        .filter_entry(|e| e.depth() == 0 || !SKILL_CONTENT_EXCLUSIONS.iter().any(|name| e.file_name() == *name));
     for entry in walker {
         let entry = entry.map_err(std::io::Error::from).at(dir)?;
         let rel = entry.path().strip_prefix(dir).unwrap_or(entry.path());
@@ -123,13 +119,13 @@ mod tests {
     use super::*;
 
     /// The algorithm before paths were hashed byte-exactly, kept to prove that
-    /// markers and lock entries it wrote still verify.
+    /// lock entries it wrote still verify.
     fn legacy_hash_dir(dir: &Path) -> String {
         let mut hasher = Sha256::new();
         let walker = WalkDir::new(dir)
             .sort_by_file_name()
             .into_iter()
-            .filter_entry(|e| e.depth() == 0 || (e.file_name() != ".git" && e.file_name() != MARKER));
+            .filter_entry(|e| e.depth() == 0 || !SKILL_CONTENT_EXCLUSIONS.iter().any(|name| e.file_name() == *name));
         for entry in walker {
             let entry = entry.unwrap();
             let rel = entry.path().strip_prefix(dir).unwrap().to_string_lossy().replace('\\', "/");
@@ -175,7 +171,11 @@ mod tests {
         let dir = tmp.path();
         write(&dir.join("SKILL.md"), "---\nname: pdf\n---\n");
         write(&dir.join("refs/deep/é.md"), "x\n");
-        write(&dir.join(MARKER), "ignored\n");
+        let before = hash_dir(dir).unwrap();
+        for name in SKILL_CONTENT_EXCLUSIONS {
+            write(&dir.join(name), "ignored\n");
+        }
+        assert_eq!(hash_dir(dir).unwrap(), before);
         #[cfg(unix)]
         std::os::unix::fs::symlink("refs/deep", dir.join("link")).unwrap();
         assert_eq!(hash_dir(dir).unwrap(), legacy_hash_dir(dir));

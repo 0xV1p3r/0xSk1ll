@@ -20,6 +20,13 @@ This only applies to rules files and block instruction files. Skills are
 directories and are placed without replacing. Closing the gap needs
 `RENAME_EXCHANGE`, which is Linux-only.
 
+## An interruption before the ownership index is written
+
+Sync writes `.sk1ll-state/index.json` after placing or removing skills or
+rule files. If sync stops between those operations, the index can retain the
+old hash or lack an entry for the new content. The next sync can report a
+conflict in that case. Content moved aside is still in the recovery area.
+
 ## A concurrent save in the Library editor
 
 The Daemon stages the editor's new text before checking the file's fingerprint
