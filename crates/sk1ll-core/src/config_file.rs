@@ -168,13 +168,13 @@ fn set_mode(_: &File, _: u32) -> std::io::Result<()> {
 
 /// Makes a rename or link to `path` durable.
 #[cfg(unix)]
-fn sync_dir(path: &Path) -> Result<()> {
+pub(crate) fn sync_dir(path: &Path) -> Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     File::open(dir).and_then(|d| d.sync_all()).at(dir)
 }
 
 #[cfg(not(unix))]
-fn sync_dir(_: &Path) -> Result<()> {
+pub(crate) fn sync_dir(_: &Path) -> Result<()> {
     Ok(())
 }
 

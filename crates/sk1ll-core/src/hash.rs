@@ -6,11 +6,12 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::git::path_bytes;
-use crate::sync::SKILL_CONTENT_EXCLUSIONS;
+use crate::sync::excluded_from_skill;
 use crate::{IoExt, Result};
 
-/// Stable content hash of a skill directory (file paths + contents), ignoring
-/// the names in [`SKILL_CONTENT_EXCLUSIONS`].
+/// Stable content hash of a skill directory (file paths + contents), without
+/// what [`excluded_from_skill`] leaves out: `.git`, and the placement marker
+/// at the root of a harness copy.
 ///
 /// Paths and symlink targets are hashed as their exact bytes on Unix, where
 /// `\` is an ordinary file-name character; only on Windows do `\` separators
@@ -31,7 +32,7 @@ fn hash_dir_buffered(dir: &Path, buf: &mut [u8]) -> Result<String> {
     let walker = WalkDir::new(dir)
         .sort_by_file_name()
         .into_iter()
-        .filter_entry(|e| e.depth() == 0 || !SKILL_CONTENT_EXCLUSIONS.iter().any(|name| e.file_name() == *name));
+        .filter_entry(|e| e.depth() == 0 || !excluded_from_skill(e.depth(), e.file_name()));
     for entry in walker {
         let entry = entry.map_err(std::io::Error::from).at(dir)?;
         let rel = entry.path().strip_prefix(dir).unwrap_or(entry.path());
@@ -107,7 +108,11 @@ fn target_bytes(to: &Path) -> Vec<u8> {
 }
 
 pub fn hash_str(text: &str) -> String {
-    format!("sha256:{}", hex(&Sha256::digest(text.as_bytes())))
+    hash_bytes(text.as_bytes())
+}
+
+pub(crate) fn hash_bytes(bytes: &[u8]) -> String {
+    format!("sha256:{}", hex(&Sha256::digest(bytes)))
 }
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
@@ -118,14 +123,15 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    /// The algorithm before paths were hashed byte-exactly, kept to prove that
-    /// lock entries it wrote still verify.
+    /// The algorithm before paths were hashed byte-exactly, with the names
+    /// it left out at any depth, kept to prove that lock entries it wrote
+    /// for ordinary trees still verify.
     fn legacy_hash_dir(dir: &Path) -> String {
         let mut hasher = Sha256::new();
         let walker = WalkDir::new(dir)
             .sort_by_file_name()
             .into_iter()
-            .filter_entry(|e| e.depth() == 0 || !SKILL_CONTENT_EXCLUSIONS.iter().any(|name| e.file_name() == *name));
+            .filter_entry(|e| e.depth() == 0 || (e.file_name() != ".git" && e.file_name() != ".sk1ll-managed"));
         for entry in walker {
             let entry = entry.unwrap();
             let rel = entry.path().strip_prefix(dir).unwrap().to_string_lossy().replace('\\', "/");
@@ -171,14 +177,31 @@ mod tests {
         let dir = tmp.path();
         write(&dir.join("SKILL.md"), "---\nname: pdf\n---\n");
         write(&dir.join("refs/deep/é.md"), "x\n");
-        let before = hash_dir(dir).unwrap();
-        for name in SKILL_CONTENT_EXCLUSIONS {
-            write(&dir.join(name), "ignored\n");
-        }
-        assert_eq!(hash_dir(dir).unwrap(), before);
+        write(&dir.join("refs/.git/HEAD"), "ignored\n");
         #[cfg(unix)]
         std::os::unix::fs::symlink("refs/deep", dir.join("link")).unwrap();
         assert_eq!(hash_dir(dir).unwrap(), legacy_hash_dir(dir));
+    }
+
+    /// Only `.git` and the placement marker at the root are left out: sk1ll's
+    /// other names below a skill's root are its own content.
+    #[test]
+    fn only_git_and_the_root_placement_marker_are_left_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        write(&dir.join("SKILL.md"), "---\nname: pdf\n---\n");
+        let before = hash_dir(dir).unwrap();
+        write(&dir.join(crate::sync::PLACEMENT_MARKER), "token\n");
+        write(&dir.join(".git/HEAD"), "ref\n");
+        write(&dir.join("refs/.git/HEAD"), "ref\n");
+        assert_eq!(hash_dir(dir).unwrap(), before);
+        for content in [".sk1ll-state/index.json", "refs/.sk1ll-state/f", "refs/.sk1ll-placement", ".sk1ll-tmp/x"] {
+            let path = dir.join(content);
+            write(&path, "content\n");
+            assert_ne!(hash_dir(dir).unwrap(), before, "{content}");
+            fs::remove_file(&path).unwrap();
+            fs::remove_dir(path.parent().unwrap()).ok();
+        }
     }
 
     #[test]

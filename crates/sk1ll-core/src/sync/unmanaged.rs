@@ -41,7 +41,7 @@ pub fn discover(repo: &Repo, harnesses: &BTreeMap<String, Harness>) -> Result<Ve
         if !dir.is_dir() {
             continue;
         }
-        let index = load_index(&dir)?;
+        let index = load_index(&dir)?.owned(&dir)?;
         for entry in fs::read_dir(&dir).at(&dir)? {
             let entry = entry.at(&dir)?;
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -221,7 +221,7 @@ pub fn rollback(repo: &Repo, adoption: &Adoption) -> Result<bool> {
     }
     if walkdir::WalkDir::new(&dest)
         .into_iter()
-        .any(|entry| entry.map_or(true, |e| SKILL_CONTENT_EXCLUSIONS.iter().any(|name| e.file_name() == *name)))
+        .any(|entry| entry.map_or(true, |e| e.depth() > 0 && excluded_from_skill(e.depth(), e.file_name())))
         || hash_dir(&dest)? != adoption.hash
     {
         return Ok(false);
@@ -246,7 +246,7 @@ pub fn rollback(repo: &Repo, adoption: &Adoption) -> Result<bool> {
     Ok(unchanged_source)
 }
 
-fn durable_tree(path: &Path) -> Result<()> {
+pub(super) fn durable_tree(path: &Path) -> Result<()> {
     for entry in walkdir::WalkDir::new(path).contents_first(true) {
         let entry = entry.map_err(std::io::Error::from).at(path)?;
         if entry.file_type().is_file() || (cfg!(unix) && entry.file_type().is_dir()) {
@@ -347,11 +347,11 @@ mod tests {
         write(&tmp.path().join("c/pdf/SKILL.md"), "two");
         write(&tmp.path().join("a/rule.md"), "not a skill");
         write(&tmp.path().join("a/marked/SKILL.md"), "managed");
-        save_index(
-            &tmp.path().join("a"),
-            &OwnershipIndex::from([("marked".into(), IndexEntry::Copy { hash: "sha256:1".into() })]),
-        )
-        .unwrap();
+        let dest = tmp.path().join("a/marked");
+        write(&dest.join(PLACEMENT_MARKER), &new_token().unwrap());
+        let mut index = Index::default();
+        index.set("marked", Some(copy_entry(&dest)), None);
+        save_index(&tmp.path().join("a"), &index).unwrap();
         let items = discover(&repo, &hs).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].variants.len(), 2);
@@ -385,14 +385,11 @@ mod tests {
         for action in plan(&repo, &hs, &assignment, PlanOptions::default()).unwrap() {
             apply(&repo, &action).unwrap();
         }
-        assert_eq!(
-            index_entry(&tmp.path().join("a/pdf")).unwrap(),
-            Some(IndexEntry::Copy { hash: adoption.hash.clone() })
-        );
-        assert_eq!(
-            index_entry(&tmp.path().join("b/pdf")).unwrap(),
-            Some(IndexEntry::Copy { hash: adoption.hash.clone() })
-        );
+        for h in ["a", "b"] {
+            let dest = tmp.path().join(h).join("pdf");
+            assert_eq!(index_entry(&dest).unwrap(), Some(copy_entry(&dest)));
+            assert_eq!(hash_dir(&dest).unwrap(), adoption.hash);
+        }
         assert_eq!(fs::read_to_string(tmp.path().join("c/pdf/SKILL.md")).unwrap(), "different");
         assert!(!tmp.path().join("d/pdf").exists());
         let recovery = displaced::list().unwrap();
@@ -486,10 +483,9 @@ mod tests {
         let adoption = prepare(&repo, &hs, "a", "pdf").unwrap();
         complete(&repo, &hs, &adoption).unwrap();
         assert_eq!(fs::read_to_string(tmp.path().join("external/SKILL.md")).unwrap(), "linked");
-        assert_eq!(
-            index_entry(&tmp.path().join("a/pdf")).unwrap(),
-            Some(IndexEntry::Copy { hash: adoption.hash.clone() })
-        );
+        let dest = tmp.path().join("a/pdf");
+        assert_eq!(index_entry(&dest).unwrap(), Some(copy_entry(&dest)));
+        assert_eq!(hash_dir(&dest).unwrap(), adoption.hash);
         assert_eq!(displaced::list().unwrap().len(), 2);
     }
 }

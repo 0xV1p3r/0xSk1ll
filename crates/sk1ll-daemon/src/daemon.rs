@@ -806,7 +806,7 @@ impl Daemon {
         let harnesses = machine.harnesses();
         let lock = eng.lock.as_ref().ok_or_else(|| Error::Conflict(format!("{} is not locked", root.display())))?;
         if reviewed.is_none() {
-            sync::recover(lock, &harnesses)?;
+            sync::recover(Some(lock), &harnesses)?;
             Self::recover_imports(&root)?;
         }
         let mut outcome = RefreshOutcome::default();
@@ -1499,7 +1499,7 @@ impl Daemon {
             let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
             // Recovery may restore a source or change a placement. Compare the
             // plan for the recovered state, before applying any placements.
-            sync::recover(lock, &harnesses)?;
+            sync::recover(Some(lock), &harnesses)?;
             Self::recover_imports(root)?;
             let repo = Repo::open(root)?;
             let actions = sync::plan(&repo, &harnesses, &snapshot.assignment, PlanOptions { force })?;
@@ -2286,26 +2286,26 @@ fn conflict_view(a: &Action) -> ConflictView {
 }
 
 /// Newest mtime of `path` and everything under it (directories too, so a
-/// deleted file counts), without following symlinks. Bounded, so a huge
-/// tree can't stall `/conflicts`.
+/// deleted file counts), without following symlinks or looking at what a
+/// skill's hash leaves out. Bounded, so a huge tree can't stall `/conflicts`.
 fn modified_at(path: &Path) -> Option<u64> {
     let seconds =
         |m: &std::fs::Metadata| m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs());
     let meta = std::fs::symlink_metadata(path).ok()?;
     let (mut newest, mut stack, mut budget) = (seconds(&meta), Vec::new(), 10_000usize);
     if meta.is_dir() {
-        stack.push(path.to_path_buf());
+        stack.push((path.to_path_buf(), 1));
     }
-    while let Some(dir) = stack.pop() {
+    while let Some((dir, depth)) = stack.pop() {
         for entry in std::fs::read_dir(&dir).ok()?.flatten() {
             budget = budget.checked_sub(1)?;
-            if sync::SKILL_CONTENT_EXCLUSIONS.iter().any(|name| entry.file_name() == *name) {
+            if sync::excluded_from_skill(depth, &entry.file_name()) {
                 continue;
             }
             let Ok(meta) = entry.metadata() else { continue };
             newest = newest.max(seconds(&meta));
             if meta.is_dir() {
-                stack.push(entry.path());
+                stack.push((entry.path(), depth + 1));
             }
         }
     }
@@ -2627,7 +2627,7 @@ impl Daemon {
         } else if left.is_dir() {
             // Diff only skill content.
             let copy = temp.path().join("Harness");
-            copy_authored(&left, &copy).map_err(anyhow::Error::from)?;
+            copy_authored(&left, &copy, 1).map_err(anyhow::Error::from)?;
             left = copy;
         }
         if !right.exists() {
@@ -2651,17 +2651,19 @@ impl Daemon {
     }
 }
 
-fn copy_authored(from: &Path, to: &Path) -> std::io::Result<()> {
+/// Copies the skill content of `from`, whose entries are `depth` levels
+/// below the skill's root, into `to`.
+fn copy_authored(from: &Path, to: &Path, depth: usize) -> std::io::Result<()> {
     std::fs::create_dir_all(to)?;
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
         let name = entry.file_name();
-        if sync::SKILL_CONTENT_EXCLUSIONS.iter().any(|excluded| name == *excluded) {
+        if sync::excluded_from_skill(depth, &name) {
             continue;
         }
         let kind = entry.file_type()?;
         if kind.is_dir() {
-            copy_authored(&entry.path(), &to.join(&name))?;
+            copy_authored(&entry.path(), &to.join(&name), depth + 1)?;
         } else if kind.is_file() {
             std::fs::copy(entry.path(), to.join(&name))?;
         }
@@ -3034,7 +3036,9 @@ mod tests {
                     .unwrap();
                 let index = std::fs::read(source.parent().unwrap().join(sync::INDEX_PATH)).unwrap();
                 let index: serde_json::Value = serde_json::from_slice(&index).unwrap();
-                assert_eq!(index["pdf"]["kind"], "copy");
+                assert_eq!(index["entries"]["pdf"]["kind"], "copy");
+                let token = std::fs::read_to_string(source.join(sync::PLACEMENT_MARKER)).unwrap();
+                assert_eq!(index["entries"]["pdf"]["token"], token);
             } else {
                 assert_eq!(
                     std::fs::read_to_string(destination.join("SKILL.md")).unwrap(),

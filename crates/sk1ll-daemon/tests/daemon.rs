@@ -332,13 +332,17 @@ impl Drop for Machine {
 fn assert_indexed_copy(dir: &Path, name: &str) {
     let bytes = std::fs::read(dir.join(sk1ll_core::sync::INDEX_PATH)).unwrap();
     let index: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let copy = dir.join(name);
+    let token = std::fs::read_to_string(copy.join(sk1ll_core::sync::PLACEMENT_MARKER)).unwrap();
     assert_eq!(
-        index[name],
+        index["entries"][name],
         serde_json::json!({
             "kind": "copy",
-            "hash": sk1ll_core::hash::hash_dir(&dir.join(name)).unwrap(),
+            "hash": sk1ll_core::hash::hash_dir(&copy).unwrap(),
+            "token": token,
         })
     );
+    assert_eq!(index["pending"], serde_json::json!({}));
 }
 
 fn write(dir: &Path, file: &str, body: &str) {
@@ -1463,7 +1467,7 @@ async fn displaced_conflicts_report_to_server_and_resolve() {
             "entry.json",
             &serde_json::json!({
                 "harness": HARNESS, "kind": "skill", "dest": m.skills().join("x"),
-                "expected": "", "displaced_at": 0
+                "version": 1, "expected": "", "displaced_at": 0
             })
             .to_string(),
         );
@@ -1904,7 +1908,7 @@ async fn gui_creation_import_inventory_check_and_conflict_diff() {
         .unwrap();
     assert!(diff.diff.contains("-Harness edit"), "{}", diff.diff);
     assert!(diff.diff.contains("+x"), "{}", diff.diff);
-    assert!(!diff.diff.contains(".sk1ll-state"), "{}", diff.diff);
+    assert!(!diff.diff.contains(sk1ll_core::sync::PLACEMENT_MARKER), "{}", diff.diff);
     m.client.remove_import("external").await.unwrap();
     assert!(m.client.imports().await.unwrap().imports.is_empty());
     assert!(!m.repo().join("imported/external").exists());

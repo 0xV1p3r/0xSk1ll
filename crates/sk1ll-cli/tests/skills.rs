@@ -73,13 +73,17 @@ fn unmanaged_list_and_adopt_preserve_differing_variants_and_assignment() {
         let dir = root.join(harness);
         let bytes = std::fs::read(dir.join(sk1ll_core::sync::INDEX_PATH)).unwrap();
         let index: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let copy = dir.join("pdf");
+        let token = std::fs::read_to_string(copy.join(sk1ll_core::sync::PLACEMENT_MARKER)).unwrap();
         assert_eq!(
-            index["pdf"],
+            index["entries"]["pdf"],
             serde_json::json!({
                 "kind": "copy",
-                "hash": sk1ll_core::hash::hash_dir(&dir.join("pdf")).unwrap(),
+                "hash": sk1ll_core::hash::hash_dir(&copy).unwrap(),
+                "token": token,
             })
         );
+        assert_eq!(index["pending"], serde_json::json!({}));
     }
     assert_eq!(std::fs::read_to_string(root.join("c/pdf/SKILL.md")).unwrap(), "different");
     assert!(error(fixture.command(&["adopt", "c", "pdf"]).output().unwrap()).contains("already exists"));

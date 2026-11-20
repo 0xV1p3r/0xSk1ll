@@ -149,7 +149,7 @@ pub(crate) fn run(mut cli: Cli, repo: &Path, machine_path: &Path, assignment_pat
         None => println!("no assignment yet; the harnesses sync once the daemon has the server's"),
         Some(assignment) => {
             let harnesses = MachineConfig::load(machine_path)?.harnesses();
-            sync::recover(&lock, &harnesses)?;
+            sync::recover(Some(&lock), &harnesses)?;
             repo.recover_imports()?;
             for a in sync::plan(&repo, &harnesses, &assignment, PlanOptions::default())? {
                 if a.kind != ActionKind::Conflict

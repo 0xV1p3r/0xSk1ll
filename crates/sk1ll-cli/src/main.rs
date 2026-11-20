@@ -608,9 +608,8 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Sync { dry_run, force } => {
             let harnesses = machine()?.harnesses();
-            // Recovery moves and deletes; only a real sync, holding the lock, may run it.
-            if !dry_run && let Some(lock) = &lock {
-                sync::recover(lock, &harnesses)?;
+            if !dry_run {
+                sync::recover(lock.as_ref(), &harnesses)?;
             }
             // An import an interrupted update set aside is put back first, so
             // the sync doesn't remove it from the harnesses.

@@ -13,19 +13,22 @@ Some editors save by writing a temporary file and renaming it over the
 original. This is not the default in vim, VS Code or emacs. JetBrains does it
 on some save paths, and emacs does it with `file-precious-flag`. If such a save
 renames its file into place in the millisecond gap after sync's last check and
-before sync's own rename, sync's rename replaces the editor's file. The
+before sync's own rename, sync's rename replaces the editor's file. For
+rules, sync checks the file's identity just before that rename. The
 editor's content is lost. The version before it is kept in recovery.
 
 This only applies to rules files and block instruction files. Skills are
 directories and are placed without replacing. Closing the gap needs
 `RENAME_EXCHANGE`, which is Linux-only.
 
-## An interruption before the ownership index is written
+## Changes to placement metadata
 
-Sync writes `.sk1ll-state/index.json` after placing or removing skills or
-rule files. If sync stops between those operations, the index can retain the
-old hash or lack an entry for the new content. The next sync can report a
-conflict in that case. Content moved aside is still in the recovery area.
+The next sync resolves interrupted placements using the identity recorded
+before each swap. A copied skill whose root `.sk1ll-placement` file has been
+deleted or changed becomes unmanaged. Copying the entire directory with
+its token and putting the clone back under the same name makes it look like
+the original placement. Rule files also look like the original if the
+filesystem reuses their device and inode and supplies no birth time.
 
 ## A concurrent save in the Library editor
 

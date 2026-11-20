@@ -11,13 +11,14 @@
 | `sk1ll-proto` | Wire types shared by the server, daemon, CLI and GUI, with no I/O |
 | `sk1ll-gui/src-tauri` | The desktop app, see [Desktop GUI](gui.md) |
 
-`sync::plan` has no side effects. `sync::apply` checks the filesystem again before it changes anything. Sync only modifies:
+`sync::plan` has no side effects. `sync::apply` checks the filesystem and the index entry again before it changes anything. Sync only modifies existing harness content that it owns.
 
-- skill symlinks and copies listed in the skills directory's `.sk1ll-state/index.json`,
-- its own block in instruction files,
-- rule files listed in the rules directory's `.sk1ll-state/index.json`.
+- A skill symlink must resolve to the target recorded in the skills directory's `.sk1ll-state/index.json`.
+- A copied skill must have the recorded token in its root `.sk1ll-placement` file.
+- A rule file must match the file identity in the rules directory's `.sk1ll-state/index.json`.
+- In block-format instructions, sync owns its marked block.
 
-An existing skill symlink enters the index only when its canonical target is the repo skill currently assigned to that harness.
+An existing skill symlink enters the index only when its canonical target is the repo skill currently assigned to that harness. Sync locks each managed directory while it recovers or writes placements. It records a pending placement or removal before changing the destination. Recovery settles that entry by checking which object is at the destination. A read-only plan makes the same check in memory.
 
 ## Isolated dev fleet
 
