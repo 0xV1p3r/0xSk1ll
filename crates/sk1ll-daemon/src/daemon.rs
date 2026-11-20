@@ -810,6 +810,18 @@ impl Daemon {
             Self::recover_imports(&root)?;
         }
         let mut outcome = RefreshOutcome::default();
+        // A pull that stopped half-way goes on before anything reads the repo.
+        match Repo::open_git_only(&root).and_then(|repo| repo.finish_pull()) {
+            Ok(None) => {}
+            Ok(Some(PullOutcome::Blocked { items, .. })) => eng.blocked = Some(items),
+            // Displaced: done, with a save that is now a recovery conflict.
+            Ok(Some(_)) | Err(sk1ll_core::Error::Displaced { .. }) => {
+                tracing::info!("finished a pull that had stopped half-way");
+                eng.blocked = None;
+                self.pull_cleared_blocked.store(true, Ordering::Relaxed);
+            }
+            Err(e) => outcome.errors.push(format!("pull: {e}")),
+        }
         let is_reviewed = reviewed.is_some();
         let mut conflicts: Vec<ConflictRef> = Vec::new();
         let snapshot = self.snapshot();
@@ -1039,20 +1051,32 @@ impl Daemon {
                 }
             }
         } else {
-            match Repo::open_git_only(&root)?.pull()? {
-                PullOutcome::UpToDate => {
+            let head = gitx::rev(&root, "HEAD")?;
+            match Repo::open_git_only(&root)?.pull() {
+                Ok(PullOutcome::UpToDate) => {
                     eng.blocked = None;
                     PullResult::UpToDate
                 }
-                PullOutcome::Updated { from, to } => {
+                Ok(PullOutcome::Updated { from, to }) => {
                     eng.blocked = None;
                     PullResult::Updated { from: Some(from), to }
                 }
-                PullOutcome::Blocked { baseline, items } => {
+                Ok(PullOutcome::Blocked { baseline, items }) => {
                     tracing::warn!("blocked: baseline {baseline} clashes with the draft");
                     eng.blocked = Some(items.clone());
                     PullResult::Blocked { baseline, items }
                 }
+                // The pull went through; a save made to a file it replaced
+                // is in the recovery area, which the report lists as a conflict.
+                Err(e @ sk1ll_core::Error::Displaced { .. }) => {
+                    tracing::warn!("{e}");
+                    eng.blocked = None;
+                    match gitx::rev(&root, "HEAD")? {
+                        Some(to) if Some(&to) != head.as_ref() => PullResult::Updated { from: head, to },
+                        _ => PullResult::UpToDate,
+                    }
+                }
+                Err(e) => return Err(e.into()),
             }
         };
         if let Some(remote) = gitx::remote_head(&root)? {
