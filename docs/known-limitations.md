@@ -68,16 +68,9 @@ use a path traversal that could follow a concurrent symlink replacement.
 
 ## A save during Pull's checkout
 
-Pull leaves disjoint Draft files in place, including while it rebases unpushed
-commits. Git checks and updates the paths changed by the new Baseline. A save
-to one of those paths can still land between Git's check and its write. When
-Pull rebases, it also checks for ignored files immediately before checkout.
-Git can overwrite an ignored file that appears at an affected path after
-that check.
-
-When Pull rebases, it updates the branch only after Git updates the checkout.
-If another Git command moves the branch in between, Pull reports an error
-and leaves the checked-out changes in place.
+Pull leaves disjoint Draft files in place. Git's checkout checks the paths
+the new Baseline changes before writing them. A save to one of those paths
+in the gap between the check and the write can be overwritten.
 
 ## Filesystems without hard links
 

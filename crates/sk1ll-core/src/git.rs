@@ -52,6 +52,25 @@ impl Git {
         Self { cmd, args: Vec::new(), stdin: None, timeout: None }
     }
 
+    /// `git -C <dir>` for pull, which checks and undoes its own steps: no
+    /// hooks (`no_hooks` is an empty directory), no autostash, no submodule
+    /// recursion, submodule changes never hidden, and no fsmonitor daemon
+    /// standing in for the file system.
+    pub(crate) fn for_pull(dir: &Path, no_hooks: &Path) -> Self {
+        let mut hooks = OsString::from("core.hooksPath=");
+        hooks.push(no_hooks);
+        let config = [
+            "merge.autoStash=false",
+            "rebase.autoStash=false",
+            "submodule.recurse=false",
+            "diff.ignoreSubmodules=none",
+            "core.fsmonitor=false",
+            "core.ignoreStat=false",
+            "core.quotePath=true",
+        ];
+        Self::new(dir).args(config.iter().flat_map(|c| ["-c", c])).arg("-c").arg(hooks)
+    }
+
     /// Takes pathspecs literally, so file names are never globs. Only for
     /// commands given file paths: it also changes git's internal pathspecs
     /// (e.g. `stash -u` would no longer remove untracked files).

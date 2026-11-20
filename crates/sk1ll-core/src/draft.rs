@@ -19,6 +19,8 @@ use crate::manifest::MANIFEST_FILE;
 use crate::skill::{IMPORTED_DIR, PERSONAL_DIR};
 use crate::{Error, IoExt, Repo, Result, machine};
 
+mod pull;
+
 /// The only remote: the server (see ADR 0002).
 pub const REMOTE: &str = "origin";
 
@@ -359,205 +361,37 @@ impl Repo {
     /// Fetches [`REMOTE`] and moves to its baseline, carrying the draft on
     /// top. Committed but unpushed commits are rebased onto it. If the new
     /// baseline touches an item the draft also changes (or the rebase
-    /// conflicts), nothing changes and the outcome is
-    /// [`PullOutcome::Blocked`]. A baseline with no commit in common with
-    /// `HEAD` (unrelated histories) is an [`Error::Invalid`]; that
-    /// also changes nothing.
+    /// conflicts, or local files the draft leaves out are in the way), nothing
+    /// changes and the outcome is [`PullOutcome::Blocked`]. A baseline with no
+    /// commit in common with `HEAD` (unrelated histories), unpushed merge
+    /// commits, submodules and sparse checkouts are an [`Error::Invalid`];
+    /// that also changes nothing. If the switch fails half-way, pull puts back
+    /// what it changed before returning the error.
     ///
     /// The baseline is [`REMOTE`]'s [`FLEET_BRANCH`], which must also be
     /// checked out here. A remote without that branch is an error too, unless
     /// it has no branches at all (an empty server, which only older servers start
     /// as): then there is nothing to pull yet, and the first push creates it.
     pub fn pull(&self) -> Result<PullOutcome> {
-        self.pull_with(|| {})
+        pull::run(self, &mut |_| {})
     }
 
-    fn pull_with(&self, before_switch: impl FnOnce()) -> Result<PullOutcome> {
-        let branch = self.on_fleet_branch()?;
-        let all = format!("+refs/heads/*:refs/remotes/{REMOTE}/*");
-        self.git().args(["fetch", "--quiet", "--prune", REMOTE, &all]).run()?;
-        let Some(remote) = self.rev(&format!("refs/remotes/{REMOTE}/{FLEET_BRANCH}"))? else {
-            let prefix = format!("refs/remotes/{REMOTE}/");
-            let refs = self.git().args(["for-each-ref", "--format=%(refname)", &prefix]).text()?;
-            let others: Vec<&str> =
-                refs.lines().filter_map(|r| r.strip_prefix(prefix.as_str())).filter(|b| *b != "HEAD").collect();
-            if others.is_empty() {
-                return Ok(PullOutcome::UpToDate);
+    /// [`pull`](Self::pull), running `f` once when it reaches `point`.
+    #[cfg(test)]
+    fn pull_at(&self, point: pull::Before, f: impl FnOnce()) -> Result<PullOutcome> {
+        let mut f = Some(f);
+        pull::run(self, &mut |at| {
+            if at == point
+                && let Some(f) = f.take()
+            {
+                f();
             }
-            return Err(Error::Invalid(format!(
-                "{REMOTE} has no `{FLEET_BRANCH}` branch (it has {}), so there is no baseline to pull; the fleet's \
-                 baseline must be on `{FLEET_BRANCH}`",
-                others.join(", ")
-            )));
-        };
-        let Some(head) = self.rev("HEAD")? else {
-            return Err(Error::Invalid(format!("`{branch}` has no commits yet; clone the repo from {REMOTE} instead")));
-        };
-        if self.is_ancestor(&remote, &head)? {
-            return Ok(PullOutcome::UpToDate);
-        }
-        let Some(base) = self.merge_base(&head, &remote)? else {
-            return Err(unrelated_histories(self.root(), &branch, &head, &remote));
-        };
-        let upstream = self.changed_items(&base, &remote)?;
-        let (draft, st) = self.draft_with_status()?;
-        let clashing = |changed: &BTreeSet<ItemRef>| -> Vec<ItemRef> {
-            draft.iter().filter(|d| changed.contains(&d.item)).map(|d| d.item.clone()).collect()
-        };
-        let items = clashing(&upstream);
-        if !items.is_empty() {
-            return Ok(PullOutcome::Blocked { baseline: remote, items });
-        }
-        // Local files the draft doesn't cover (ignored ones), which git would overwrite.
-        let obstructed = self.obstructions(&base, &remote, &st.head_paths)?;
-        if !obstructed.is_empty() {
-            return Ok(PullOutcome::Blocked { baseline: remote, items: obstructed.into_iter().collect() });
-        }
-
-        let to = if base == head {
-            remote.clone()
-        } else if let Some(to) = self.rebased_head(&head, &base, &remote)? {
-            to
-        } else {
-            let ours = self.changed_items(&base, &head)?;
-            let both: Vec<ItemRef> = ours.intersection(&upstream).cloned().collect();
-            let items = if both.is_empty() { ours.into_iter().collect() } else { both };
-            return Ok(PullOutcome::Blocked { baseline: remote, items });
-        };
-
-        before_switch();
-        if base != head {
-            // A replayed rename can bring the upstream change to a different path.
-            let items = clashing(&self.changed_items(&head, &to)?);
-            if !items.is_empty() {
-                return Ok(PullOutcome::Blocked { baseline: remote, items });
-            }
-            let obstructed = self.obstructions(&head, &to, &st.head_paths)?;
-            if !obstructed.is_empty() {
-                return Ok(PullOutcome::Blocked { baseline: remote, items: obstructed.into_iter().collect() });
-            }
-        }
-        self.on_fleet_branch()?;
-        if self.rev("HEAD")?.as_deref() != Some(&head) {
-            return Err(Error::Invalid("HEAD changed during pull; try again".into()));
-        }
-        if base == head {
-            // Unlike read-tree, this checks for ignored obstructions during checkout.
-            self.git().args(["merge", "--ff-only", "--no-overwrite-ignore", "--quiet", &remote]).run()?;
-        } else {
-            // Refresh stat information as merge would, then let the two-tree
-            // merge carry disjoint index and working-tree changes forward.
-            self.git().args(["update-index", "-q", "--refresh"]).run()?;
-            self.git().args(["read-tree", "-m", "-u", &head, &to]).run()?;
-            let branch_ref = format!("refs/heads/{branch}");
-            self.git().args(["update-ref", "-m", "sk1ll: pull (rebase)", &branch_ref, &to, &head]).run()?;
-        }
-        Ok(PullOutcome::Updated { from: head, to })
+        })
     }
 
     /// Whether git has a configured `user.name` and `user.email`.
     pub fn has_git_identity(&self) -> Result<bool> {
-        Ok(self.git().args(["config", "user.name"]).succeeds()?
-            && self.git().args(["config", "user.email"]).succeeds()?)
-    }
-
-    /// Replays the unpushed commits `base..head` onto `remote` in the object
-    /// store. Returns the new tip, or `None` if a commit conflicts.
-    fn rebased_head(&self, head: &str, base: &str, remote: &str) -> Result<Option<String>> {
-        let commits = self.git().args(["rev-list", "--parents", "--reverse", &format!("{base}..{head}")]).text()?;
-        if commits.lines().any(|line| line.split_whitespace().count() != 2) {
-            return Err(Error::Invalid("can't pull with merge commits among the unpushed commits".into()));
-        }
-        let committer = self.committer_env()?;
-        let tree_of = |commit| self.git().args(["rev-parse", &format!("{commit}^{{tree}}")]).text();
-        let mut tip = remote.to_string();
-        let mut tip_tree = tree_of(remote)?;
-        for (commit, parent) in commits.lines().filter_map(|line| line.split_once(' ')) {
-            let args = ["merge-tree", "--write-tree", "--merge-base", parent, &tip, commit];
-            let out = self.git().args(args).output()?;
-            let tree = match out.status.code() {
-                Some(0) => String::from_utf8_lossy(&out.stdout).trim().to_string(),
-                Some(1) => return Ok(None),
-                Some(129) => {
-                    return Err(Error::Invalid(
-                        "rebasing unpushed commits during pull requires Git 2.40 or later".into(),
-                    ));
-                }
-                _ => {
-                    return Err(Error::Git {
-                        args: args.join(" "),
-                        stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
-                    });
-                }
-            };
-            // Like git rebase, drop commits that become empty and keep ones
-            // that were empty to begin with.
-            if tree == tip_tree && tree_of(commit)? != tree_of(parent)? {
-                continue;
-            }
-            let original = self
-                .git()
-                .args([
-                    "show",
-                    "-s",
-                    "--no-notes",
-                    "--no-show-signature",
-                    "--encoding=UTF-8",
-                    "--format=format:%an%x00%ae%x00%ai%x00%B",
-                    commit,
-                ])
-                .run()?;
-            let fields: Vec<&[u8]> = original.splitn(4, |b| *b == 0).collect();
-            let [name, email, date, message] = fields.as_slice() else {
-                return Err(Error::Invalid(format!("can't read commit metadata for {commit}")));
-            };
-            let identity = |value| {
-                std::str::from_utf8(value).map_err(|_| Error::Invalid(format!("invalid author in commit {commit}")))
-            };
-            tip = self
-                .git()
-                .args(["-c", "i18n.commitEncoding=UTF-8", "commit-tree", &tree, "-p", &tip])
-                .envs(&committer)
-                .env("GIT_AUTHOR_NAME", identity(*name)?)
-                .env("GIT_AUTHOR_EMAIL", identity(*email)?)
-                .env("GIT_AUTHOR_DATE", identity(*date)?)
-                .stdin(message.to_vec())
-                .text()?;
-            tip_tree = tree;
-        }
-        Ok(Some(tip))
-    }
-
-    /// Items with paths `from..to` adds or changes that local files the
-    /// baseline doesn't track are in the way of (ignored files, say): git
-    /// would overwrite or delete them.
-    fn obstructions(&self, from: &str, to: &str, head_paths: &BTreeSet<PathBuf>) -> Result<BTreeSet<ItemRef>> {
-        let args = ["diff", "--name-only", "-z", "--no-renames", "--relative", "--diff-filter=AMT", from, to];
-        let out = self.git().args(args).run()?;
-        let root = self.root();
-        let tracked = |abs: &Path| abs.strip_prefix(root).is_ok_and(|p| head_paths.contains(p));
-        let untracked_at = |rel: &Path| match fs::symlink_metadata(root.join(rel)) {
-            Err(_) => false,
-            Ok(m) if m.is_dir() => WalkDir::new(root.join(rel))
-                .min_depth(1)
-                .into_iter()
-                .filter_map(|e| e.ok())
-                .any(|e| !e.file_type().is_dir() && !tracked(e.path())),
-            Ok(_) => !head_paths.contains(rel),
-        };
-        let mut items = BTreeSet::new();
-        for rel in split_paths(&out) {
-            // The path itself, or a file where the new baseline needs a directory.
-            let file_in_the_way = rel
-                .ancestors()
-                .skip(1)
-                .filter(|a| !a.as_os_str().is_empty())
-                .any(|a| fs::symlink_metadata(root.join(a)).is_ok_and(|m| !m.is_dir()) && !head_paths.contains(a));
-            if file_in_the_way || untracked_at(&rel) {
-                items.insert(ItemRef::for_path(&rel));
-            }
-        }
-        Ok(items)
+        has_git_identity(|| self.git())
     }
 
     /// Ignored, untracked files under the repo root, relative to it.
@@ -571,68 +405,13 @@ impl Repo {
         Git::new(self.root())
     }
 
-    fn rev(&self, spec: &str) -> Result<Option<String>> {
-        let out = self.git().args(["rev-parse", "--verify", "--quiet", &format!("{spec}^{{commit}}")]).output()?;
-        Ok(out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string()))
-    }
-
-    fn is_ancestor(&self, ancestor: &str, of: &str) -> Result<bool> {
-        let out = self.git().args(["merge-base", "--is-ancestor", ancestor, of]).output()?;
-        match out.status.code() {
-            Some(0) => Ok(true),
-            Some(1) => Ok(false),
-            _ => Err(Error::Git {
-                args: format!("merge-base --is-ancestor {ancestor} {of}"),
-                stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
-            }),
-        }
-    }
-
-    /// The best common ancestor of `a` and `b`; `None` if they share no
-    /// history at all (git exits 1 with no output).
-    fn merge_base(&self, a: &str, b: &str) -> Result<Option<String>> {
-        let out = self.git().args(["merge-base", a, b]).output()?;
-        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        match out.status.code() {
-            Some(0) if !stdout.is_empty() => Ok(Some(stdout)),
-            Some(1) if stdout.is_empty() && out.stderr.is_empty() => Ok(None),
-            _ => Err(Error::Git {
-                args: format!("merge-base {a} {b}"),
-                stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
-            }),
-        }
-    }
-
-    fn current_branch(&self) -> Result<String> {
-        self.git()
-            .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
-            .text()
-            .map_err(|_| Error::Invalid(format!("HEAD is detached; check out `{FLEET_BRANCH}` first")))
-    }
-
     /// [`FLEET_BRANCH`], if that is the branch checked out; else how to get there.
     fn on_fleet_branch(&self) -> Result<String> {
-        let branch = self.current_branch()?;
-        if branch != FLEET_BRANCH {
-            return Err(Error::Invalid(format!(
-                "{} is on branch `{branch}`, but the fleet's baseline is `{FLEET_BRANCH}`; switch with `git -C {} \
-                 checkout {FLEET_BRANCH}`, or rename the branch with `git -C {} branch -m {branch} {FLEET_BRANCH}` \
-                 if it holds this machine's work",
-                self.root().display(),
-                self.root().display(),
-                self.root().display()
-            )));
-        }
-        Ok(branch)
+        on_fleet_branch(self.git(), self.root())
     }
 
     fn empty_tree(&self) -> Result<String> {
         self.git().args(["hash-object", "-t", "tree", "--stdin"]).stdin(Vec::new()).text()
-    }
-
-    fn changed_items(&self, from: &str, to: &str) -> Result<BTreeSet<ItemRef>> {
-        let out = self.git().args(["diff", "--name-only", "-z", "--no-renames", "--relative", from, to]).run()?;
-        Ok(split_paths(&out).map(|p| ItemRef::for_path(&p)).collect())
     }
 
     /// Author/committer env for a commit: `author` overrides the author;
@@ -649,13 +428,6 @@ impl Repo {
         if !configured {
             env.extend([("GIT_COMMITTER_NAME".into(), name), ("GIT_COMMITTER_EMAIL".into(), email)]);
         }
-        Ok(env)
-    }
-
-    /// Committer fallback for the commits created during pull.
-    fn committer_env(&self) -> Result<Vec<(String, String)>> {
-        let mut env = self.identity_env(None)?;
-        env.retain(|(k, _)| k.starts_with("GIT_COMMITTER"));
         Ok(env)
     }
 
@@ -719,7 +491,7 @@ impl Repo {
     }
 
     fn status(&self) -> Result<Status> {
-        let head = self.rev("HEAD")?;
+        let head = rev(self.git(), "HEAD")?;
         let head_paths = match &head {
             Some(h) => split_paths(&self.git().args(["ls-tree", "-r", "-z", "--name-only", h]).run()?).collect(),
             None => BTreeSet::new(),
@@ -727,39 +499,74 @@ impl Repo {
         // Porcelain paths are relative to the top level; the repo may be a subdirectory.
         let prefix = self.git().args(["rev-parse", "--show-prefix"]).run()?;
         let prefix = prefix.strip_suffix(b"\n").unwrap_or(&prefix);
-        let out = self
-            .git()
-            .literal()
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .args(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames", "--", "."])
-            .run()?;
-        let mut changed = BTreeMap::new();
-        let mut add = |raw: &[u8], untracked: bool| {
-            let rel = path_from_bytes(raw.strip_prefix(prefix).unwrap_or(raw));
-            // An import being staged, whatever `.gitignore` says.
-            if !crate::source::is_staging_path(&rel) {
-                changed.insert(rel, untracked);
-            }
-        };
-        let mut entries = out.split(|b| *b == 0).filter(|e| !e.is_empty());
-        while let Some(entry) = entries.next() {
-            if entry.len() < 4 {
-                continue;
-            }
-            // `XY to\0from` for renames/copies (only if rename detection is forced on).
-            if matches!(entry[0], b'R' | b'C')
-                && let Some(from) = entries.next()
-                && entry[0] == b'R'
-            {
-                add(from, false);
-            }
-            add(&entry[3..], entry[0] == b'?');
-        }
+        let changed = status_paths(self.git(), &["."])?
+            .into_iter()
+            .filter_map(|(path, untracked)| {
+                let rel = path_from_bytes(path.strip_prefix(prefix).unwrap_or(&path));
+                (!crate::source::is_staging_path(&rel)).then_some((rel, untracked))
+            })
+            .collect();
         Ok(Status { head, head_paths, changed })
     }
 }
 
-/// The draft entries for `items`; every one must be in the draft.
+/// The paths `git status` reports as changed under `pathspec` (everything
+/// if empty), as git spells them (relative to the top level), each with
+/// whether it is untracked.
+fn status_paths(git: Git, pathspec: &[&str]) -> Result<Vec<(Vec<u8>, bool)>> {
+    let out = git
+        .literal()
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames", "--"])
+        .args(pathspec)
+        .run()?;
+    let mut changed = Vec::new();
+    let mut entries = out.split(|b| *b == 0).filter(|e| !e.is_empty());
+    while let Some(entry) = entries.next() {
+        if entry.len() < 4 {
+            continue;
+        }
+        // `XY to\0from` for renames/copies (only if rename detection is forced on).
+        if matches!(entry[0], b'R' | b'C')
+            && let Some(from) = entries.next()
+            && entry[0] == b'R'
+        {
+            changed.push((from.to_vec(), false));
+        }
+        changed.push((entry[3..].to_vec(), entry[0] == b'?'));
+    }
+    Ok(changed)
+}
+
+fn rev(git: Git, spec: &str) -> Result<Option<String>> {
+    let out = git.args(["rev-parse", "--verify", "--quiet", &format!("{spec}^{{commit}}")]).output()?;
+    Ok(out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string()))
+}
+
+/// [`FLEET_BRANCH`], if that is the branch checked out in `root`; else how to get there.
+fn on_fleet_branch(git: Git, root: &Path) -> Result<String> {
+    let branch = git
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .text()
+        .map_err(|_| Error::Invalid(format!("HEAD is detached; check out `{FLEET_BRANCH}` first")))?;
+    if branch != FLEET_BRANCH {
+        return Err(Error::Invalid(format!(
+            "{} is on branch `{branch}`, but the fleet's baseline is `{FLEET_BRANCH}`; switch with `git -C {} \
+             checkout {FLEET_BRANCH}`, or rename the branch with `git -C {} branch -m {branch} {FLEET_BRANCH}` \
+             if it holds this machine's work",
+            root.display(),
+            root.display(),
+            root.display()
+        )));
+    }
+    Ok(branch)
+}
+
+/// Whether git has a configured `user.name` and `user.email`.
+fn has_git_identity(git: impl Fn() -> Git) -> Result<bool> {
+    Ok(git().args(["config", "user.name"]).succeeds()? && git().args(["config", "user.email"]).succeeds()?)
+}
+
 /// Why a pull can't move onto a baseline that shares no commit with `HEAD`
 /// (say, two machines that each made a root commit on an empty server). This is
 /// an error rather than [`PullOutcome::Blocked`]: Blocked means "commit or
@@ -777,6 +584,7 @@ fn unrelated_histories(root: &Path, branch: &str, head: &str, remote: &str) -> E
     ))
 }
 
+/// The draft entries for `items`; every one must be in the draft.
 fn pick(draft: &[DraftItem], items: &[ItemRef]) -> Result<Vec<DraftItem>> {
     if items.is_empty() {
         return Err(Error::Invalid("no items given".into()));
@@ -876,6 +684,7 @@ fn prune_empty_parents(root: &Path, rel: &Path) {
 
 #[cfg(test)]
 mod tests {
+    use super::pull::Before;
     use super::*;
 
     fn git(dir: &Path, args: &[&str]) -> String {
@@ -936,17 +745,53 @@ mod tests {
         s.parse().unwrap()
     }
 
-    /// Everything a pull could disturb: files, HEAD, index and stash.
-    fn snapshot(root: &Path) -> (BTreeMap<PathBuf, Vec<u8>>, String, String, String) {
+    /// A working-tree entry, as [`snapshot`] records it.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Node {
+        /// The content, and whether it is executable.
+        File(Vec<u8>, bool),
+        Link(PathBuf),
+    }
+
+    /// Everything a pull could disturb: files (symlinks and the executable
+    /// bit included), HEAD and the branch it is on, index and stash.
+    fn snapshot(root: &Path) -> (BTreeMap<PathBuf, Node>, String, String, String) {
         let files = WalkDir::new(root)
             .into_iter()
             .filter_entry(|e| e.file_name() != ".git")
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
-            .map(|e| (e.path().strip_prefix(root).unwrap().to_path_buf(), fs::read(e.path()).unwrap()))
+            .filter(|e| !e.file_type().is_dir())
+            .map(|e| {
+                let node = if e.file_type().is_symlink() {
+                    Node::Link(fs::read_link(e.path()).unwrap())
+                } else {
+                    Node::File(fs::read(e.path()).unwrap(), executable(e.path()))
+                };
+                (e.path().strip_prefix(root).unwrap().to_path_buf(), node)
+            })
             .collect();
         let stash = Git::new(root).args(["stash", "list"]).text().unwrap();
-        (files, git(root, &["rev-parse", "HEAD"]), git(root, &["ls-files", "-s"]), stash)
+        let head = git(root, &["rev-parse", "--symbolic-full-name", "HEAD"]) + " " + &git(root, &["rev-parse", "HEAD"]);
+        (files, head, git(root, &["ls-files", "-s"]), stash)
+    }
+
+    fn executable(path: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::metadata(path).unwrap().permissions().mode() & 0o111 != 0
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            false
+        }
+    }
+
+    #[cfg(unix)]
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
     }
 
     #[test]
@@ -1145,6 +990,11 @@ mod tests {
         let (a, b) = (repo(&f.a), repo(&f.b));
         write(&f.b.join("personal/pdf/ref.md"), "b's edit\n");
         write(&f.b.join("personal/new/SKILL.md"), "b new\n");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("SKILL.md", f.b.join("personal/new/link.md")).unwrap();
+            chmod(&f.b.join("instructions/style.md"), 0o755);
+        }
         write(&f.a.join("personal/pdf/SKILL.md"), "a's edit\n");
         let remote = a.commit(&[item("skill:pdf")], "a", None).unwrap();
         a.push().unwrap();
@@ -1247,6 +1097,9 @@ mod tests {
         assert_eq!(read(&f.b.join("secret.txt")), "mine\n");
     }
 
+    /// An ignored file that appears in the way during the pull is caught by
+    /// pull's last checks, or else by checkout itself, on the fast-forward
+    /// path and when rebasing.
     #[test]
     fn pull_protects_an_ignored_file_created_before_checkout() {
         let f = Fleet::new();
@@ -1256,18 +1109,47 @@ mod tests {
         let remote = a.commit(&[item("other:private.txt")], "private", None).unwrap();
         a.push().unwrap();
         let path = f.b.join("private.txt");
-        let create = || write(&path, "mine\n");
+        let blocked = PullOutcome::Blocked { baseline: remote, items: vec![item("other:private.txt")] };
+        for rebase in [false, true] {
+            if rebase {
+                write(&f.b.join("instructions/style.md"), "b committed\n");
+                b.commit(&[item("rule:style")], "style", None).unwrap();
+            }
+            for point in [Before::Checks, Before::Checkout] {
+                let before = snapshot(&f.b);
+                assert_eq!(b.pull_at(point, || write(&path, "mine\n")).unwrap(), blocked, "{point:?}");
+                assert_eq!(read(&path), "mine\n");
+                fs::remove_file(&path).unwrap();
+                assert_eq!(snapshot(&f.b), before);
+            }
+        }
+    }
 
-        assert!(matches!(b.pull_with(create), Err(Error::Git { .. })));
-        assert_eq!(read(&path), "mine\n");
-        fs::remove_file(&path).unwrap();
-        write(&f.b.join("instructions/style.md"), "b committed\n");
-        b.commit(&[item("rule:style")], "style", None).unwrap();
-        assert_eq!(
-            b.pull_with(create).unwrap(),
-            PullOutcome::Blocked { baseline: remote, items: vec![item("other:private.txt")] }
-        );
-        assert_eq!(read(&path), "mine\n");
+    /// A save that lands while pull works, in an item the new baseline
+    /// changes, blocks the pull like any draft edit there.
+    #[test]
+    fn pull_blocks_a_save_made_during_the_pull() {
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        write(&f.a.join("personal/pdf/SKILL.md"), "a's edit\n");
+        let remote = a.commit(&[item("skill:pdf")], "pdf", None).unwrap();
+        a.push().unwrap();
+        let (skill, sibling) = (f.b.join("personal/pdf/SKILL.md"), f.b.join("personal/pdf/ref.md"));
+        let blocked = PullOutcome::Blocked { baseline: remote, items: vec![item("skill:pdf")] };
+        for rebase in [false, true] {
+            if rebase {
+                write(&f.b.join("instructions/style.md"), "b committed\n");
+                b.commit(&[item("rule:style")], "style", None).unwrap();
+            }
+            let before = snapshot(&f.b);
+            assert_eq!(b.pull_at(Before::Checks, || write(&sibling, "saved during pull\n")).unwrap(), blocked);
+            assert_eq!(read(&sibling), "saved during pull\n");
+            b.restore(&[item("skill:pdf")]).unwrap();
+            assert_eq!(snapshot(&f.b), before);
+        }
+        // Checkout's own check covers the paths it changes.
+        assert_eq!(b.pull_at(Before::Checkout, || write(&skill, "saved\n")).unwrap(), blocked);
+        assert_eq!(read(&skill), "saved\n");
     }
 
     #[test]
@@ -1297,7 +1179,7 @@ mod tests {
         let before = snapshot(&f.b);
         let index = fs::read(f.b.join(".git/index")).unwrap();
         assert_eq!(
-            b.pull_with(|| panic!("conflicting replay reached the tree switch")).unwrap(),
+            b.pull_at(Before::Checks, || panic!("conflicting replay reached the tree switch")).unwrap(),
             PullOutcome::Blocked { baseline: remote, items: vec![item("skill:web")] }
         );
         assert_eq!(snapshot(&f.b), before);
@@ -1521,7 +1403,7 @@ mod tests {
         let late = f.b.join("personal/new/late.md");
         check_draft();
         let outcome = b
-            .pull_with(|| {
+            .pull_at(Before::Checks, || {
                 check_draft();
                 assert_eq!(git(&f.b, &["rev-parse", "HEAD"]), head);
                 write(&late, "saved during pull\n");
@@ -1686,5 +1568,392 @@ mod tests {
         r.push().unwrap();
         assert_eq!(origin_branches(&empty), "refs/heads/main");
         assert_eq!(r.pull().unwrap(), PullOutcome::UpToDate);
+    }
+
+    /// Config that would make git stash the draft, squash or run hooks
+    /// doesn't reach pull's switch.
+    #[test]
+    fn pull_ignores_autostash_merge_options_and_hooks() {
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        git(&f.b, &["config", "merge.autoStash", "true"]);
+        git(&f.b, &["config", "rebase.autoStash", "true"]);
+        git(&f.b, &["config", "branch.main.mergeOptions", "--squash"]);
+        write(&f.b.join("notes.txt"), "staged new\n");
+        write(&f.b.join("instructions/git.md"), "staged\n");
+        git(&f.b, &["add", "notes.txt", "instructions/git.md"]);
+        write(&f.b.join("instructions/git.md"), "unstaged\n");
+        let draft = b.draft().unwrap();
+        #[cfg(unix)]
+        for hook in ["post-checkout", "post-merge", "reference-transaction"] {
+            let path = f.b.join(".git/hooks").join(hook);
+            write(&path, "#!/bin/sh\ntouch hook-ran\nexit 1\n");
+            chmod(&path, 0o755);
+        }
+        write(&f.a.join("personal/pdf/SKILL.md"), "v2\n");
+        let remote = a.commit(&[item("skill:pdf")], "v2", None).unwrap();
+        a.push().unwrap();
+        let old = git(&f.b, &["rev-parse", "HEAD"]);
+
+        let staged_new = || assert_eq!(git(&f.b, &["show", ":notes.txt"]), "staged new");
+        let outcome = b.pull_at(Before::UpdateRef, staged_new).unwrap();
+        assert_eq!(outcome, PullOutcome::Updated { from: old, to: remote.clone() });
+        assert_eq!(git(&f.b, &["rev-parse", "HEAD"]), remote);
+        assert_eq!(git(&f.b, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+        assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "v2\n");
+        assert_eq!(b.draft().unwrap(), draft);
+        assert_eq!(git(&f.b, &["diff", "--cached", "--name-only"]), "instructions/git.md\nnotes.txt");
+        assert_eq!(git(&f.b, &["show", ":instructions/git.md"]), "staged");
+        assert_eq!(read(&f.b.join("instructions/git.md")), "unstaged\n");
+        assert_eq!(git(&f.b, &["stash", "list"]), "");
+        assert!(!f.b.join("hook-ran").exists());
+    }
+
+    #[test]
+    fn pull_never_writes_into_or_replaces_a_staging_directory() {
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        write(&f.b.join(".git/info/exclude"), ".sk1ll-stage-*\n");
+        let backup = f.b.join("imported/.sk1ll-stage-old-web/SKILL.md");
+        write(&backup, "the previous web\n");
+        let inside = "imported/.sk1ll-stage-old-web/extra.md";
+        write(&f.a.join(inside), "upstream\n");
+        git(&f.a, &["add", "--force", inside]);
+        git(&f.a, &["commit", "--quiet", "-m", "into a staging directory"]);
+        a.push().unwrap();
+        let before = snapshot(&f.b);
+        let outcome = b.pull().unwrap();
+        assert!(
+            matches!(&outcome, PullOutcome::Blocked { items, .. } if *items == [item("skill:.sk1ll-stage-old-web")])
+        );
+        assert_eq!(snapshot(&f.b), before);
+
+        // A file where a directory with an (empty) staging directory is: git
+        // would remove the staging directory to make room.
+        fs::remove_file(&backup).unwrap();
+        fs::create_dir(f.b.join("imported/.sk1ll-stage-1-2-3")).unwrap();
+        git(&f.a, &["rm", "-r", "--quiet", "imported"]);
+        write(&f.a.join("imported"), "now a file\n");
+        commit_all(&f.a, "imported is a file");
+        a.push().unwrap();
+        let outcome = b.pull().unwrap();
+        assert!(
+            matches!(&outcome, PullOutcome::Blocked { items, .. } if items.contains(&item("other:imported"))),
+            "{outcome:?}"
+        );
+        assert!(f.b.join("imported/.sk1ll-stage-1-2-3").is_dir());
+        assert!(f.b.join("imported/.sk1ll-stage-old-web").is_dir());
+    }
+
+    /// The skills repo can be a subdirectory of a larger worktree. Checkout
+    /// updates all of it, so pull checks all of it.
+    #[test]
+    fn pull_checks_the_whole_worktree_around_a_skills_subdirectory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = |p: &str| tmp.path().join(p);
+        let origin = path("origin.git");
+        let (a, b) = (path("a"), path("b"));
+        git(tmp.path(), &["init", "--quiet", "--bare", "-b", "main", origin.to_str().unwrap()]);
+        git(tmp.path(), &["init", "--quiet", "-b", "main", a.to_str().unwrap()]);
+        git(&a, &["config", "user.name", "Machine A"]);
+        git(&a, &["config", "user.email", "a@example.com"]);
+        write(&a.join("skills/sk1ll.toml"), "");
+        write(&a.join("skills/personal/pdf/SKILL.md"), "---\nname: pdf\n---\nPDFs.\n");
+        write(&a.join("README.md"), "the larger project\n");
+        commit_all(&a, "seed");
+        git(&a, &["remote", "add", REMOTE, origin.to_str().unwrap()]);
+        git(&a, &["push", "--quiet", "-u", REMOTE, "main"]);
+        git(tmp.path(), &["clone", "--quiet", origin.to_str().unwrap(), b.to_str().unwrap()]);
+        let r = repo(&b.join("skills"));
+
+        // An ignored file next to the skills repo, where upstream adds one.
+        write(&a.join("notes.txt"), "upstream\n");
+        commit_all(&a, "notes");
+        git(&a, &["push", "--quiet", REMOTE, "main"]);
+        let remote = git(&a, &["rev-parse", "HEAD"]);
+        write(&b.join(".git/info/exclude"), "/notes.txt\n");
+        write(&b.join("notes.txt"), "mine\n");
+        let before = snapshot(&b);
+        let blocked = |items: &[&str]| PullOutcome::Blocked {
+            baseline: git(&a, &["rev-parse", "HEAD"]),
+            items: items.iter().map(|i| item(i)).collect(),
+        };
+        assert_eq!(r.pull().unwrap(), blocked(&["other:../notes.txt"]));
+        // Also with an unpushed commit, so that pull rebases.
+        write(&b.join("skills/personal/pdf/SKILL.md"), "b committed\n");
+        r.commit(&[item("skill:pdf")], "pdf from b", Some("B <b@example.com>")).unwrap();
+        let before_rebase = snapshot(&b);
+        assert_eq!(r.pull().unwrap(), blocked(&["other:../notes.txt"]));
+        assert_eq!(snapshot(&b), before_rebase);
+        assert_eq!(read(&b.join("notes.txt")), "mine\n");
+        assert_ne!(before, before_rebase);
+
+        // A local change outside the skills repo to a file upstream changes.
+        fs::remove_file(b.join("notes.txt")).unwrap();
+        write(&a.join("README.md"), "upstream README\n");
+        commit_all(&a, "readme");
+        git(&a, &["push", "--quiet", REMOTE, "main"]);
+        write(&b.join("README.md"), "b's README\n");
+        assert!(r.draft().unwrap().is_empty());
+        let before = snapshot(&b);
+        assert_eq!(r.pull().unwrap(), blocked(&["other:../README.md"]));
+        assert_eq!(snapshot(&b), before);
+
+        git(&b, &["checkout", "--quiet", "--", "README.md"]);
+        assert!(matches!(r.pull().unwrap(), PullOutcome::Updated { .. }));
+        assert_eq!(read(&b.join("notes.txt")), "upstream\n");
+        assert_eq!(read(&b.join("README.md")), "upstream README\n");
+        assert_eq!(read(&b.join("skills/personal/pdf/SKILL.md")), "b committed\n");
+        assert_eq!(git(&b, &["rev-parse", "HEAD~1"]), git(&a, &["rev-parse", "HEAD"]));
+        assert_ne!(remote, git(&a, &["rev-parse", "HEAD"]));
+    }
+
+    #[test]
+    fn pull_refuses_submodules() {
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        let seed = git(&f.a, &["rev-parse", "HEAD"]);
+        let gitlink = format!("160000,{seed},vendor/lib");
+        let as_b = ["-c", "user.name=Machine B", "-c", "user.email=b@example.com"];
+        // In HEAD.
+        git(&f.b, &["update-index", "--add", "--cacheinfo", &gitlink]);
+        git(&f.b, &[&as_b[..], &["commit", "--quiet", "-m", "submodule"]].concat());
+        let before = snapshot(&f.b);
+        assert!(invalid(b.pull()).contains("submodules aren't supported"));
+        assert_eq!(snapshot(&f.b), before);
+        write(&f.a.join("personal/pdf/SKILL.md"), "v2\n");
+        a.commit(&[item("skill:pdf")], "v2", None).unwrap();
+        a.push().unwrap();
+        let before = snapshot(&f.b);
+        assert!(invalid(b.pull()).contains("submodules aren't supported"));
+        assert_eq!(snapshot(&f.b), before);
+
+        // In the new baseline, even with config that hides it or recurses into it.
+        git(&f.b, &["reset", "--quiet", "--hard", "HEAD~1"]);
+        git(&f.b, &["config", "submodule.recurse", "true"]);
+        git(&f.b, &["config", "diff.ignoreSubmodules", "all"]);
+        git(&f.a, &["update-index", "--add", "--cacheinfo", &gitlink]);
+        git(&f.a, &["commit", "--quiet", "-m", "submodule"]);
+        a.push().unwrap();
+        let before = snapshot(&f.b);
+        assert!(invalid(b.pull()).contains("submodules aren't supported"));
+        assert_eq!(snapshot(&f.b), before);
+
+        // Adding and removing a gitlink in the same range is unsupported too.
+        git(&f.a, &["rm", "--cached", "--quiet", "vendor/lib"]);
+        git(&f.a, &["commit", "--quiet", "-m", "no submodule"]);
+        a.push().unwrap();
+        assert!(invalid(b.pull()).contains("submodules aren't supported"));
+        assert_eq!(snapshot(&f.b), before);
+    }
+
+    #[test]
+    fn pull_refuses_sparse_checkouts() {
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        write(&f.a.join("personal/pdf/SKILL.md"), "v2\n");
+        a.commit(&[item("skill:pdf")], "v2", None).unwrap();
+        a.push().unwrap();
+        let before = snapshot(&f.b);
+        git(&f.b, &["config", "core.sparseCheckout", "true"]);
+        assert!(invalid(b.pull()).contains("sparse checkouts aren't supported"));
+        assert_eq!(snapshot(&f.b), before);
+        git(&f.b, &["config", "--unset", "core.sparseCheckout"]);
+        assert!(matches!(b.pull().unwrap(), PullOutcome::Updated { .. }));
+        assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "v2\n");
+    }
+
+    /// The conflict is named even when the unpushed commits end up where
+    /// they started (an edit, then its revert).
+    #[test]
+    fn pull_names_the_items_a_replayed_commit_conflicts_in() {
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        write(&f.b.join("instructions/style.md"), "b's style\n");
+        b.commit(&[item("rule:style")], "style", None).unwrap();
+        write(&f.b.join("instructions/style.md"), "Be terse.\n");
+        b.commit(&[item("rule:style")], "revert style", None).unwrap();
+        write(&f.a.join("instructions/style.md"), "a's style\n");
+        let remote = a.commit(&[item("rule:style")], "style", None).unwrap();
+        a.push().unwrap();
+        let before = snapshot(&f.b);
+        assert_eq!(b.pull().unwrap(), PullOutcome::Blocked { baseline: remote, items: vec![item("rule:style")] });
+        assert_eq!(snapshot(&f.b), before);
+    }
+
+    /// A replayed commit is the original object with a new tree, parent and
+    /// committer, minus its signature.
+    #[test]
+    fn pull_replays_commits_byte_for_byte() {
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        write(&f.b.join("instructions/style.md"), "b committed\n");
+        git(&f.b, &["add", "instructions/style.md"]);
+        let (tree, parent) = (git(&f.b, &["write-tree"]), git(&f.b, &["rev-parse", "HEAD"]));
+        let author = b"author Caf\xe9 Author <c@example.com> 1700000000 +0230\n".as_slice();
+        let kept = [author, b"encoding ISO-8859-1\nx-extra kept\n\nCaf\xe9\n\nBody \xe9.\n"].concat();
+        let original = [
+            format!("tree {tree}\nparent {parent}\n").as_bytes(),
+            author,
+            b"committer Old <old@example.com> 1700000001 +0100\nencoding ISO-8859-1\n",
+            b"gpgsig -----BEGIN PGP SIGNATURE-----\n \n c2lnbmF0dXJl\n -----END PGP SIGNATURE-----\n",
+            b"gpgsig-sha256 -----BEGIN PGP SIGNATURE-----\n c2lnbmF0dXJl\n -----END PGP SIGNATURE-----\n",
+            b"x-extra kept\n\nCaf\xe9\n\nBody \xe9.\n",
+        ]
+        .concat();
+        let commit = Git::new(&f.b).args(["hash-object", "-t", "commit", "-w", "--stdin"]).stdin(original);
+        git(&f.b, &["update-ref", "refs/heads/main", &commit.text().unwrap()]);
+        write(&f.a.join("imported/web/SKILL.md"), "web v2\n");
+        let remote = a.commit(&[item("skill:web")], "web v2", None).unwrap();
+        a.push().unwrap();
+
+        assert!(matches!(b.pull().unwrap(), PullOutcome::Updated { .. }));
+        let replayed = Git::new(&f.b).args(["cat-file", "commit", "HEAD"]).run().unwrap();
+        let (header, rest) = replayed.split_at(replayed.windows(2).position(|w| w == b"\n\n").unwrap() + 1);
+        let lines: Vec<&[u8]> = header.split_inclusive(|b| *b == b'\n').collect();
+        assert_eq!(lines[0], format!("tree {}\n", git(&f.b, &["rev-parse", "HEAD^{tree}"])).as_bytes());
+        assert_eq!(lines[1], format!("parent {remote}\n").as_bytes());
+        assert!(lines[3].starts_with(format!("committer {} <", machine::hostname()).as_bytes()));
+        assert_eq!([lines[2], &lines[4..].concat(), rest].concat(), kept);
+        assert_eq!(git(&f.b, &["show", "HEAD:instructions/style.md"]), "b committed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pull_puts_back_a_checkout_that_fails_half_way() {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root can write into the read-only directory below
+        }
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        // Git removes first, then writes in path order: it gets to `imported/`
+        // and fails at `instructions/`.
+        write(&f.a.join("imported/web/SKILL.md"), "web v2\n");
+        write(&f.a.join("imported/web/extra.md"), "added\n");
+        fs::remove_file(f.a.join("personal/pdf/ref.md")).unwrap();
+        write(&f.a.join("instructions/git.md"), "git v2\n");
+        commit_all(&f.a, "everything");
+        a.push().unwrap();
+        write(&f.b.join("instructions/style.md"), "b draft\n");
+        write(&f.b.join("notes.txt"), "staged\n");
+        git(&f.b, &["add", "notes.txt"]);
+        write(&f.b.join("personal/mine/SKILL.md"), "untracked\n");
+        std::os::unix::fs::symlink("SKILL.md", f.b.join("personal/mine/link.md")).unwrap();
+        let draft = b.draft().unwrap();
+        let before = snapshot(&f.b);
+
+        chmod(&f.b.join("instructions"), 0o555);
+        let result = b.pull();
+        chmod(&f.b.join("instructions"), 0o755);
+        match result {
+            Err(Error::Git { args, stderr }) => {
+                assert!(args.starts_with("checkout"), "{args}");
+                assert!(stderr.contains("instructions/git.md") && stderr.contains("put back"), "{stderr}");
+            }
+            other => panic!("expected a checkout error, got {other:?}"),
+        }
+        assert_eq!(snapshot(&f.b), before);
+        assert_eq!(b.draft().unwrap(), draft);
+
+        // A save to a file checkout already wrote must survive the rollback.
+        let changed = "imported/web/SKILL.md";
+        chmod(&f.b.join("instructions"), 0o555);
+        let result = b.pull_at(Before::CheckoutFailed, || {
+            assert_eq!(read(&f.b.join(changed)), "web v2\n");
+            write(&f.b.join(changed), "saved while checkout failed\n");
+        });
+        chmod(&f.b.join("instructions"), 0o755);
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains(changed) && error.contains("left these changes in place"), "{error}");
+        assert_eq!(read(&f.b.join(changed)), "saved while checkout failed\n");
+        b.restore(&[item("skill:web")]).unwrap();
+        assert_eq!(snapshot(&f.b), before);
+
+        assert!(matches!(b.pull().unwrap(), PullOutcome::Updated { .. }));
+        assert_eq!(read(&f.b.join("instructions/git.md")), "git v2\n");
+        assert_eq!(read(&f.b.join("imported/web/extra.md")), "added\n");
+        assert_eq!(b.draft().unwrap(), draft);
+    }
+
+    #[test]
+    fn pull_puts_back_a_switch_whose_branch_moved() {
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        write(&f.b.join("instructions/git.md"), "b draft\n");
+        write(&f.b.join("personal/mine/SKILL.md"), "untracked\n");
+        let draft = b.draft().unwrap();
+        write(&f.a.join("personal/pdf/SKILL.md"), "v2\n");
+        write(&f.a.join("personal/pdf/new.md"), "added\n");
+        a.commit(&[item("skill:pdf")], "v2", None).unwrap();
+        a.push().unwrap();
+        let (files, _, index, stash) = snapshot(&f.b);
+        // Another git command moves the branch (to a commit with the same
+        // tree) right before pull does.
+        let head = git(&f.b, &["rev-parse", "HEAD"]);
+        let tree = format!("{head}^{{tree}}");
+        let moved =
+            git(&f.b, &["-c", "user.name=T", "-c", "user.email=t@e", "commit-tree", "-p", &head, "-m", "x", &tree]);
+        let result = b.pull_at(Before::UpdateRef, || {
+            git(&f.b, &["update-ref", "refs/heads/main", &moved]);
+        });
+        match result {
+            Err(Error::Git { args, stderr }) => {
+                assert!(args.starts_with("update-ref"), "{args}");
+                assert!(stderr.contains("put back") && stderr.contains("moved"), "{stderr}");
+            }
+            other => panic!("expected an update-ref error, got {other:?}"),
+        }
+        assert_eq!(git(&f.b, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+        assert_eq!(git(&f.b, &["rev-parse", "HEAD"]), moved);
+        let (files_now, _, index_now, stash_now) = snapshot(&f.b);
+        assert_eq!((files_now, index_now, stash_now), (files, index, stash));
+        assert_eq!(b.draft().unwrap(), draft);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pull_rolls_back_when_git_cannot_remove_a_file() {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        fs::remove_file(f.a.join("instructions/git.md")).unwrap();
+        write(&f.a.join("imported/web/SKILL.md"), "web v2\n");
+        commit_all(&f.a, "remove a rule and update a skill");
+        a.push().unwrap();
+        let before = snapshot(&f.b);
+
+        chmod(&f.b.join("instructions"), 0o555);
+        let result = b.pull();
+        chmod(&f.b.join("instructions"), 0o755);
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("instructions/git.md") && error.contains("put back"), "{error}");
+        assert_eq!(snapshot(&f.b), before);
+    }
+
+    #[test]
+    fn pull_rolls_back_the_branch_if_head_cannot_reattach() {
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        write(&f.a.join("personal/pdf/SKILL.md"), "v2\n");
+        let target = a.commit(&[item("skill:pdf")], "v2", None).unwrap();
+        a.push().unwrap();
+        write(&f.b.join("instructions/git.md"), "b draft\n");
+        let head = git(&f.b, &["rev-parse", "HEAD"]);
+        let before = snapshot(&f.b);
+        let lock = f.b.join(".git/HEAD.lock");
+        let result = b.pull_at(Before::Attach, || {
+            assert_eq!(git(&f.b, &["rev-parse", "refs/heads/main"]), target);
+            write(&lock, "concurrent HEAD lock\n");
+        });
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("symbolic-ref") && error.contains("couldn't reattach HEAD"), "{error}");
+        fs::remove_file(&lock).unwrap();
+        assert_eq!(git(&f.b, &["rev-parse", "refs/heads/main"]), head);
+        git(&f.b, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        assert_eq!(snapshot(&f.b), before);
     }
 }
