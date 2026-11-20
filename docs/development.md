@@ -49,6 +49,8 @@ python3 crates/sk1ll-gui/tests/test_dev_fleet.py
 
 The automated tests don't drive the desktop app. Test interactive GUI flows by hand against the dev fleet.
 
+Time sync planning with `cargo test -p sk1ll-core sync_plan_no_change -- --ignored --nocapture`.
+
 CI (`.github/workflows/ci.yml`) runs the same checks on Linux, plus `scripts/check-version.sh` and `gh actions-lock --verify`. The arm64 macOS job builds the UI and runs the workspace build, tests and clippy.
 
 ## Workflow actions

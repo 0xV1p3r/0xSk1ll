@@ -2149,6 +2149,41 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "sync planning benchmark"]
+    fn sync_plan_no_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::init(&tmp.path().join("repo")).unwrap();
+        for i in 0..200 {
+            let skill = repo.personal_dir().join(format!("skill-{i}"));
+            write(&skill.join("SKILL.md"), "A skill.\n");
+            write(&skill.join("references/guide.md"), "Reference material.\n");
+            write(&skill.join("examples/example.md"), "An example.\n");
+        }
+        let harnesses = (0..4)
+            .map(|i| {
+                let name = format!("harness-{i}");
+                let harness = Harness {
+                    skills: Some(tmp.path().join(&name).join("skills").to_string_lossy().into_owned()),
+                    mode: LinkMode::Copy,
+                    ..Harness::default()
+                };
+                (name, harness)
+            })
+            .collect();
+        let assignment = Assignment::default();
+        let actions = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
+        assert_eq!(actions.len(), 800);
+        for action in &actions {
+            apply(&repo, action).unwrap();
+        }
+        let start = std::time::Instant::now();
+        let actions = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
+        let elapsed = start.elapsed();
+        assert!(actions.is_empty(), "{actions:?}");
+        println!("No-change sync plan for 200 skills across 4 copy-mode harnesses: {elapsed:?}");
+    }
+
+    #[test]
     fn reviewed_copies_reject_source_edits_before_and_during_staging() {
         for point in [Hook::BeforeCopy, Hook::CopyEntry] {
             let (_tmp, repo, harnesses) = skill_setup(LinkMode::Copy);

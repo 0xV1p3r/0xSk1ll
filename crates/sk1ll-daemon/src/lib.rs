@@ -73,6 +73,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     if !PREPARED.load(Ordering::SeqCst) {
         bail!("sk1ll_daemon::prepare_process must run before sk1ll_daemon::run");
     }
+    sk1ll_core::git::require_git(sk1ll_core::git::MIN_VERSION)?;
     let state = DaemonState::load(&cfg.state)?;
     let d = match state {
         Some(state) => Daemon::new(cfg, state)?,

@@ -25,6 +25,31 @@ use std::time::{Duration, Instant};
 
 use crate::{Error, Result};
 
+/// Git needed for `merge-tree --write-tree`.
+pub const MIN_VERSION: (u32, u32) = (2, 38);
+
+/// The version reported by the git on PATH, without the "git version" prefix.
+pub fn version() -> Result<String> {
+    let output = Git::command(None).arg("--version").text()?;
+    output
+        .strip_prefix("git version ")
+        .map(str::to_owned)
+        .ok_or_else(|| Error::Invalid(format!("unexpected git version output: {output}")))
+}
+
+/// Require at least the given major and minor version.
+pub fn require_git(min: (u32, u32)) -> Result<()> {
+    let requirement = format!("Git {}.{} or newer is required on PATH", min.0, min.1);
+    let installed = version().map_err(|e| Error::Invalid(format!("{requirement}: {e}")))?;
+    let mut parts = installed.split('.');
+    let major_minor = parts.next().and_then(|major| Some((major.parse::<u32>().ok()?, parts.next()?.parse().ok()?)));
+    if major_minor.is_some_and(|installed| installed >= min) {
+        Ok(())
+    } else {
+        Err(Error::Invalid(format!("{requirement}; found {installed}")))
+    }
+}
+
 /// One git invocation, built up like [`Command`] and run under the deadline
 /// described in the module docs. Front-ends (the daemon) use it so that none
 /// of their git commands can hang either.
@@ -39,8 +64,14 @@ pub struct Git {
 impl Git {
     /// `git -C <dir>`.
     pub fn new(dir: &Path) -> Self {
+        Self::command(Some(dir))
+    }
+
+    fn command(dir: Option<&Path>) -> Self {
         let mut cmd = Command::new("git");
-        cmd.arg("-C").arg(dir);
+        if let Some(dir) = dir {
+            cmd.arg("-C").arg(dir);
+        }
         if cfg!(test) {
             // Unit tests must not depend on the developer's own git config.
             let null = if cfg!(windows) { "NUL" } else { "/dev/null" };

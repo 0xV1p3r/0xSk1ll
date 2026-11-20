@@ -19,6 +19,10 @@ _Avoid_: Installed skill, stray, foreign skill
 One instruction file ("for X do Y"), kept in `instructions/`. A harness's **instructions** are all its enabled rules rendered together (into a block or as rule files).
 _Avoid_: Fragment, instruction (when meaning a single file)
 
+**Item ID**:
+The stable identifier of a personal skill, Rule or Import. It survives renames.
+_Avoid_: UUID, key
+
 ## Where content goes
 
 **Machine**:
@@ -55,6 +59,9 @@ _Avoid_: Git state, main
 **Draft**:
 Uncommitted changes to the repo on one machine; private to that machine and live in its harnesses.
 _Avoid_: System state, local state, working copy
+
+**Snapshot**:
+The daemon's published view of reconciled state, used to answer reads.
 
 **Commit**:
 To record selected draft items as a new commit on the fleet branch. It reaches the fleet once it is pushed.

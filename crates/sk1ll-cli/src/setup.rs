@@ -39,6 +39,7 @@ pub(crate) fn run(cli: &Cli) -> Result<()> {
         println!("this machine already has a skills repo at {}; nothing to set up", repo.display());
         return Ok(());
     }
+    sk1ll_core::git::require_git(sk1ll_core::git::MIN_VERSION)?;
     let mut input = Input::stdin();
 
     println!("How will this machine use 0xSk1ll?");

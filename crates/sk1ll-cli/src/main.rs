@@ -439,6 +439,7 @@ fn run(cli: Cli) -> Result<()> {
     };
 
     if let Cmd::Init { path } = &cli.cmd {
+        sk1ll_core::git::require_git(sk1ll_core::git::MIN_VERSION)?;
         let root = path.clone().unwrap_or(repo_path);
         let _lock = lock_direct(&root)?;
         // A machine without machine.toml is set up for the first time here:

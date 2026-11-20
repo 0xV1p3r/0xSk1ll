@@ -22,6 +22,8 @@ For several machines, a self-hosted server acts as the git remote and holds the 
 
 ## Install
 
+Install Git 2.38 or newer and make sure `git` is on `PATH`.
+
 Release builds target Linux and Apple silicon macOS. The [release page](https://github.com/0xV1p3r/0xSk1ll/releases) lists available archives:
 
 - `sk1ll-<version>-x86_64-linux.tar.gz` with `sk1ll`, the desktop app `sk1ll-gui`, `sk1ll-server` and the systemd unit, and an `aarch64` archive without the app,
@@ -35,9 +37,9 @@ tar -xzf sk1ll-0.1.0-x86_64-linux.tar.gz
 install -Dm755 sk1ll-0.1.0-x86_64-linux/sk1ll -t ~/.local/bin        # and sk1ll-gui for the app
 ```
 
-Or install the `.deb` with `sudo apt install ./0xSk1ll_0.1.0_amd64.deb`. `sk1ll` needs `git` on `PATH`; the app needs GTK 3 and WebKitGTK 4.1.
+Or install the `.deb` with `sudo apt install ./0xSk1ll_0.1.0_amd64.deb`. The app needs GTK 3 and WebKitGTK 4.1.
 
-On macOS, verify the download with `shasum -a 256 -c SHA256SUMS --ignore-missing`. Extract the archive, copy `0xSk1ll.app` to Applications and put the CLI binaries on your `PATH` if you use them from a terminal. Git must be on `PATH`. The app is unsigned and unnotarized. If Gatekeeper blocks a copy you verified, try opening it once and then use Open Anyway in System Settings → Privacy & Security. macOS builds run in CI and have had no manual testing.
+On macOS, verify the download with `shasum -a 256 -c SHA256SUMS --ignore-missing`. Extract the archive, copy `0xSk1ll.app` to Applications and put the CLI binaries on your `PATH` if you use them from a terminal. The app is unsigned and unnotarized. If Gatekeeper blocks a copy you verified, try opening it once and then use Open Anyway in System Settings → Privacy & Security. macOS builds run in CI and have had no manual testing.
 
 To build from source instead, run `cargo install --path crates/sk1ll-cli`, which installs `sk1ll` to `~/.cargo/bin`. The CLI builds on any platform in standalone mode. The daemon, `join` and `fleet` need Unix.
 
