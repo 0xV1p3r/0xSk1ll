@@ -81,6 +81,8 @@ sk1ll pull                           # fetch the new baseline, keep the draft on
 
 Commands take a bare skill or rule name, or `skill:<name>`, `rule:<name>`, `manifest` and `other:<path>`. `pull` never merges. If the new baseline changes an item that is also in your draft, `pull` changes nothing and marks the machine Blocked until you commit or restore that item.
 
+Pull updates only the working-tree files changed by the new Baseline. The Draft stays in place while Pull rebases any unpushed commits. Rebasing requires Git 2.40 or later. Pull drops commits whose changes are already in the new Baseline and keeps commits that were empty to begin with.
+
 ## Commands
 
 | Command | What it does |

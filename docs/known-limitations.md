@@ -66,6 +66,19 @@ The error identifies the backup to restore after moving the obstruction aside.
 On non-Unix platforms init and first-baseline file publication fail rather than
 use a path traversal that could follow a concurrent symlink replacement.
 
+## A save during Pull's checkout
+
+Pull leaves disjoint Draft files in place, including while it rebases unpushed
+commits. Git checks and updates the paths changed by the new Baseline. A save
+to one of those paths can still land between Git's check and its write. When
+Pull rebases, it also checks for ignored files immediately before checkout.
+Git can overwrite an ignored file that appears at an affected path after
+that check.
+
+When Pull rebases, it updates the branch only after Git updates the checkout.
+If another Git command moves the branch in between, Pull reports an error
+and leaves the checked-out changes in place.
+
 ## Filesystems without hard links
 
 Sync relies on `link(2)` to update or create a Rule file or block instructions
