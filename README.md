@@ -81,7 +81,9 @@ sk1ll pull                           # fetch the new baseline, keep the draft on
 
 Commands take a bare skill or rule name, or `skill:<name>`, `rule:<name>`, `manifest` and `other:<path>`. `pull` never merges. If the new baseline changes an item that is also in your draft, `pull` changes nothing and marks the machine Blocked until you commit or restore that item.
 
-Pull requires Git 2.40 or later. It updates only the working-tree paths changed by the new Baseline. The Draft stays in place while Pull rebases unpushed commits. Replayed commits lose their signatures. Pull drops commits that become empty and keeps commits that started empty. Pull refuses unpushed merge commits, submodules and sparse checkouts.
+Pull requires Git 2.40 or later, and 2.42 when the new Baseline changes a `.gitattributes` file. It updates only the working-tree paths the new Baseline changes, one at a time, and leaves the Draft where it is. Unpushed commits are replayed onto the new Baseline like a rebase: each gets this Machine as its committer and loses its signature. Pull drops commits that become empty and keeps commits that started empty. Pull refuses unpushed merge commits, submodules and sparse checkouts. A Pull that changes files needs Unix (Linux or macOS); elsewhere it fetches, then stops before it changes a file, the index or the branch.
+
+Pull never rolls back. If it stops half-way, because it crashed, hit an error, or found a new Draft edit in a file it was about to update (Blocked), the next `sk1ll pull` or the daemon finishes it. Until then `git status` shows the files it already updated, and `sk1ll commit` refuses. Don't run `git checkout`, `git switch` or other commands that move the branch in the skills repo while a Pull runs: it stops, and finishes once you switch back.
 
 ## Commands
 

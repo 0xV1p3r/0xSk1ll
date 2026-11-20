@@ -66,11 +66,33 @@ The error identifies the backup to restore after moving the obstruction aside.
 On non-Unix platforms init and first-baseline file publication fail rather than
 use a path traversal that could follow a concurrent symlink replacement.
 
-## A save during Pull's checkout
+## A save while Pull updates a file
 
-Pull leaves disjoint Draft files in place. Git's checkout checks the paths
-the new Baseline changes before writing them. A save to one of those paths
-in the gap between the check and the write can be overwritten.
+Pull leaves disjoint Draft files in place. It replaces a file the new
+Baseline changes only while the file still holds what the old Baseline has,
+the way sync replaces harness files: the old file goes to the recovery area
+first (in the repo's git directory) and is checked there. A save that lands
+inside that swap goes to the recovery area, the same as with sync, and Pull
+reports it once it has finished (`sk1ll recover adopt` puts it back as a
+Draft edit). On Linux and macOS, Pull exchanges the two files, so even a save
+renamed into place in the last moment ends up there. On other Unix systems,
+or file systems without that call, such a save can be replaced, as described
+above for rules files.
+
+Pull checks for clashes item by item before it changes anything. After that
+it checks each path right before it updates it, and that is where item-level
+protection ends: a new Draft edit to one of those paths stops the Pull there
+as Blocked, with the paths before it already updated. Only a restore clears
+that: commit refuses until the Pull is done, so copy the edit aside first if
+you want to keep it, restore the item and pull again. A save to another file
+of an item the Pull changes is no clash: it stays, as a Draft edit on top of
+the new Baseline.
+
+Pull needs the repo's git directory on the same file system as its working
+tree, and a Pull that stops half-way leaves its journal there
+(`sk1ll-pull.json`). If another Git command moves the branch before that
+Pull finishes, Pull can't finish it and says so; it changes nothing more.
+Remove the journal to give up on it.
 
 ## Filesystems without hard links
 

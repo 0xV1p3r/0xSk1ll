@@ -186,7 +186,7 @@ The table lists Linux paths. On macOS, config and data use `~/Library/Applicatio
 | Drafting | The machine has a draft. |
 | In sync | Latest baseline, no draft, no conflicts. |
 
-To clear Blocked, commit or restore the clashing items, then run `sk1ll pull`.
+To clear Blocked, commit or restore the clashing items, then run `sk1ll pull`. A Pull that stopped half-way (it crashed, or hit an error) is finished by the next Pull or by the daemon's next refresh, without fetching again.
 
 Join codes expire after `SK1LL_SERVER_JOIN_CODE_TTL` (default `24h`), using the server duration syntax. `sk1ll fleet invite` and the GUI show the exact time.
 
