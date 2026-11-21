@@ -1,12 +1,16 @@
 //! Changing a machine's assignment: every change is applied and logged in one
 //! transaction, so the log always explains the stored state.
+//!
+//! Toggles are keyed by Item ID (ADR 0006). A write never checks that its
+//! item exists: a toggle for an id no item has does nothing, and only an
+//! explicit prune of the orphans removes it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::Connection;
 use sk1ll_proto::{
-    Assignment, AssignmentCopy, AssignmentSnapshot, CopyMode, Expected, HarnessAssignment, HarnessMapping, ItemRef,
-    LogCause, LogEntry, MachineAssignmentCopy, ToggleKind,
+    Assignment, AssignmentSnapshot, CopyMode, Expected, HarnessAssignment, HarnessMapping, ItemId, ItemRef, LogCause,
+    LogEntry, MachineAssignmentCopy, ToggleChange, ToggleKind,
 };
 
 use crate::db;
@@ -15,103 +19,83 @@ use crate::error::{ApiError, Result};
 /// Author of changes the server makes on its own.
 pub const SERVER_AUTHOR: &str = "server";
 
+/// The longest item id or name a toggle may carry.
+const MAX_ITEM: usize = 256;
+
+/// Skills and rules and their Item IDs: the baseline's, or what a machine reported.
+pub type Items = [(ItemRef, ItemId)];
+
 /// One toggle to set; `after: None` removes an item's explicit toggle.
 #[derive(Debug, Clone)]
 pub struct Change {
     pub harness: String,
     pub kind: ToggleKind,
+    pub item_id: Option<ItemId>,
+    /// For the log; looked up among the known items when absent.
     pub name: Option<String>,
     pub after: Option<bool>,
     pub cause: LogCause,
 }
 
-/// A harness that starts with nothing enabled.
-pub fn all_off() -> HarnessAssignment {
-    HarnessAssignment { new_skills_default: false, new_rules_default: false, ..Default::default() }
+impl Change {
+    pub fn from_toggle(c: ToggleChange) -> Self {
+        Self {
+            harness: c.harness,
+            kind: c.kind,
+            item_id: c.item_id,
+            name: c.name,
+            after: c.enabled,
+            cause: LogCause::Change,
+        }
+    }
 }
 
 /// Current value of a toggle. Defaults are always `Some` (a harness without
 /// an entry has the all-enabled defaults); item toggles are `None` when unset.
-pub fn get(a: &Assignment, harness: &str, kind: ToggleKind, name: Option<&str>) -> Option<bool> {
+pub fn get(a: &Assignment, harness: &str, kind: ToggleKind, id: Option<&ItemId>) -> Option<bool> {
     let h = a.harnesses.get(harness);
     match kind {
-        ToggleKind::Skill => h.and_then(|h| h.skills.get(name?).copied()),
-        ToggleKind::Rule => h.and_then(|h| h.rules.get(name?).copied()),
+        ToggleKind::Skill => h.and_then(|h| h.skills.get(id?).copied()),
+        ToggleKind::Rule => h.and_then(|h| h.rules.get(id?).copied()),
         ToggleKind::NewSkillsDefault => Some(a.harness(harness).new_skills_default),
         ToggleKind::NewRulesDefault => Some(a.harness(harness).new_rules_default),
     }
 }
 
-fn set(a: &mut Assignment, harness: &str, kind: ToggleKind, name: Option<&str>, value: Option<bool>) {
-    let name = name.unwrap_or_default();
-    match (kind, value) {
-        (ToggleKind::Skill, Some(v)) => a.set_skill(harness, name, v),
-        (ToggleKind::Rule, Some(v)) => a.set_rule(harness, name, v),
-        (ToggleKind::Skill, None) => {
+fn set(a: &mut Assignment, harness: &str, kind: ToggleKind, id: Option<&ItemId>, value: Option<bool>) {
+    match (kind, id, value) {
+        (ToggleKind::Skill, Some(id), Some(v)) => a.set_skill(harness, id, v),
+        (ToggleKind::Rule, Some(id), Some(v)) => a.set_rule(harness, id, v),
+        (ToggleKind::Skill | ToggleKind::Rule, Some(id), None) => {
             if let Some(h) = a.harnesses.get_mut(harness) {
-                h.skills.remove(name);
+                let toggles = if kind == ToggleKind::Skill { &mut h.skills } else { &mut h.rules };
+                toggles.remove(id);
             }
         }
-        (ToggleKind::Rule, None) => {
-            if let Some(h) = a.harnesses.get_mut(harness) {
-                h.rules.remove(name);
-            }
-        }
-        (ToggleKind::NewSkillsDefault, Some(v)) => a.set_new_skills_default(harness, v),
-        (ToggleKind::NewRulesDefault, Some(v)) => a.set_new_rules_default(harness, v),
-        // Defaults can't be unset; `validate` rejects it.
-        (ToggleKind::NewSkillsDefault | ToggleKind::NewRulesDefault, None) => {}
+        (ToggleKind::NewSkillsDefault, _, Some(v)) => a.set_new_skills_default(harness, v),
+        (ToggleKind::NewRulesDefault, _, Some(v)) => a.set_new_rules_default(harness, v),
+        // `validate` rejects the rest: unset defaults, item toggles without an id.
+        _ => {}
     }
 }
 
-/// Checks a change's shape: names only for item toggles, values for defaults.
+/// Checks a change's shape: ids only for item toggles, values for defaults.
 pub fn validate(c: &Change) -> Result<()> {
     crate::check_name("harness", &c.harness)?;
-    match (c.kind.has_name(), &c.name) {
-        (true, Some(n)) => crate::check_name("item name", n)?,
-        (true, None) => {
-            return Err(ApiError::BadRequest("skill and rule toggles need a `name`".into()));
+    match (c.kind.has_item(), &c.item_id) {
+        (true, Some(id)) if id.to_string().len() > MAX_ITEM => {
+            return Err(ApiError::BadRequest(format!("item id `{id}` is too long")));
         }
-        (false, Some(_)) => return Err(ApiError::BadRequest("defaults take no `name`".into())),
+        (true, Some(_)) => {}
+        (true, None) => return Err(ApiError::BadRequest("skill and rule toggles need an `item_id`".into())),
+        (false, Some(_)) => return Err(ApiError::BadRequest("defaults take no `item_id`".into())),
         (false, None) if c.after.is_none() => {
             return Err(ApiError::BadRequest("defaults need `enabled`: true or false".into()));
         }
         (false, None) => {}
     }
-    Ok(())
-}
-
-/// The item an item toggle addresses; `None` for defaults.
-fn item(kind: ToggleKind, name: &str) -> Option<ItemRef> {
-    match kind {
-        ToggleKind::Skill => Some(ItemRef::Skill(name.to_string())),
-        ToggleKind::Rule => Some(ItemRef::Rule(name.to_string())),
-        ToggleKind::NewSkillsDefault | ToggleKind::NewRulesDefault => None,
-    }
-}
-
-/// Checks that every toggle that turns an item on names one the machine can
-/// have: in the baseline, its reported draft, or its unpushed commits. Turning an
-/// item off or removing its toggle is allowed for any item, so stale state
-/// can always be cleaned up.
-pub fn check_items(
-    changes: &[Change],
-    baseline: &BTreeSet<ItemRef>,
-    drafts: &[ItemRef],
-    unpushed: &[ItemRef],
-) -> Result<()> {
-    for c in changes {
-        if c.after != Some(true) {
-            continue;
-        }
-        let Some(item) = c.name.as_deref().and_then(|n| item(c.kind, n)) else {
-            continue;
-        };
-        if !baseline.contains(&item) && !drafts.contains(&item) && !unpushed.contains(&item) {
-            return Err(ApiError::Unprocessable(format!(
-                "`{item}` is absent from the baseline, this machine's draft and its unpushed commits"
-            )));
-        }
+    if c.name.as_ref().is_some_and(|n| n.len() > MAX_ITEM || n.chars().any(char::is_control)) {
+        return Err(ApiError::BadRequest("an item name must be one short line".into()));
     }
     Ok(())
 }
@@ -175,9 +159,9 @@ pub fn machine_copy_changes(
         if !destinations.insert(to.clone()) {
             return Err(ApiError::BadRequest(format!("target Harness `{to}` is mapped more than once")));
         }
-        let mut add = |kind, name, before, after| {
+        let mut add = |kind, item_id, before, after| {
             if before != after {
-                changes.push(Change { harness: to.clone(), kind, name, after, cause: LogCause::Change });
+                changes.push(Change { harness: to.clone(), kind, item_id, name: None, after, cause: LogCause::Change });
             }
         };
         if copy.mode == CopyMode::Replace {
@@ -187,15 +171,15 @@ pub fn machine_copy_changes(
         for (kind, src, dst) in
             [(ToggleKind::Skill, &src.skills, &dst.skills), (ToggleKind::Rule, &src.rules, &dst.rules)]
         {
-            for (name, value) in src {
-                let before = dst.get(name).copied();
+            for (id, value) in src {
+                let before = dst.get(id).copied();
                 if copy.mode == CopyMode::Replace || before.is_none() {
-                    add(kind, Some(name.clone()), before, Some(*value));
+                    add(kind, Some(id.clone()), before, Some(*value));
                 }
             }
             if copy.mode == CopyMode::Replace {
-                for (name, value) in dst.iter().filter(|(name, _)| !src.contains_key(*name)) {
-                    add(kind, Some(name.clone()), Some(*value), None);
+                for (id, value) in dst.iter().filter(|(id, _)| !src.contains_key(*id)) {
+                    add(kind, Some(id.clone()), Some(*value), None);
                 }
             }
         }
@@ -203,83 +187,69 @@ pub fn machine_copy_changes(
     Ok(changes)
 }
 
-/// The changes that copy `m`'s explicit toggles of `copy.from` to `copy.to`,
-/// and those skipped because `copy.to` already has an explicit toggle there.
-/// `from` must be an item `m` can have and `to` the same kind of item, not
-/// yet one it can have: a known different item keeps its own toggles.
-pub fn copy_changes(
-    m: &db::MachineRecord,
-    copy: &AssignmentCopy,
-    baseline: &BTreeSet<ItemRef>,
-) -> Result<(Vec<Change>, Vec<Change>)> {
-    let (kind, from, to) = match (&copy.from, &copy.to) {
-        (ItemRef::Skill(from), ItemRef::Skill(to)) => (ToggleKind::Skill, from, to),
-        (ItemRef::Rule(from), ItemRef::Rule(to)) => (ToggleKind::Rule, from, to),
-        _ => {
-            return Err(ApiError::BadRequest(format!(
-                "`{}` and `{}` are not the same kind of item",
-                copy.from, copy.to
-            )));
-        }
+/// The changes that give every item in `harness` the value `enabled`: both
+/// defaults and each explicit toggle. Items without a toggle follow the new
+/// default, so this needs no list of items and reaches unpulled ones too.
+pub fn harness_changes(a: &Assignment, harness: &str, enabled: bool) -> Vec<Change> {
+    let h = a.harness(harness);
+    let change = |kind, item_id: Option<&ItemId>| Change {
+        harness: harness.to_string(),
+        kind,
+        item_id: item_id.cloned(),
+        name: None,
+        after: Some(enabled),
+        cause: LogCause::Change,
     };
-    crate::check_name("item name", from)?;
-    crate::check_name("item name", to)?;
-    if from == to {
-        return Err(ApiError::BadRequest("`from` and `to` are the same item".into()));
-    }
-    let report = m.report.clone().unwrap_or_default();
-    let known =
-        |item: &ItemRef| baseline.contains(item) || report.drafts.contains(item) || report.unpushed.contains(item);
-    if !known(&copy.from) {
-        return Err(ApiError::Unprocessable(format!(
-            "`{}` is absent from the baseline, this machine's draft and its unpushed commits",
-            copy.from
-        )));
-    }
-    if known(&copy.to) {
-        return Err(ApiError::Conflict(format!("`{}` is already an item of machine `{}`", copy.to, m.id)));
-    }
-    Ok(m.assignment
-        .harnesses
-        .iter()
-        .filter_map(|(harness, h)| {
-            let toggles = if kind == ToggleKind::Skill { &h.skills } else { &h.rules };
-            toggles.get(from).map(|&enabled| Change {
-                harness: harness.clone(),
-                kind,
-                name: Some(to.clone()),
-                after: Some(enabled),
-                cause: LogCause::Change,
-            })
-        })
-        .partition(|c| get(&m.assignment, &c.harness, kind, Some(to)).is_none()))
+    let toggles = h.skills.keys().map(|id| change(ToggleKind::Skill, Some(id)));
+    let toggles = toggles.chain(h.rules.keys().map(|id| change(ToggleKind::Rule, Some(id))));
+    [change(ToggleKind::NewSkillsDefault, None), change(ToggleKind::NewRulesDefault, None)]
+        .into_iter()
+        .chain(toggles)
+        .collect()
 }
 
 /// Applies `changes` to `machine` and logs each one that changed something,
-/// inside the caller's transaction. With `baseline`, a change to a harness's
-/// new-items default first gives every existing item of that kind without a
-/// toggle an explicit one with its current value, so the new default only
-/// affects items that appear later. Existing items include the destination's
-/// latest reported drafts and unpushed commits, even when another machine writes.
+/// inside the caller's transaction. `baseline` and the machine's reported
+/// items name the entries. With `materialize`, a change to a harness's
+/// new-items default first gives every one of those items of that kind
+/// without a toggle an explicit one with its current value, so the new
+/// default only affects items that appear later.
 pub fn apply(
     tx: &Connection,
     machine: &str,
     author: &str,
     changes: Vec<Change>,
     now: i64,
-    baseline: Option<&BTreeSet<ItemRef>>,
+    baseline: &Items,
+    materialize: bool,
 ) -> Result<Applied> {
+    let m = db::machine(tx, machine)?.ok_or_else(|| ApiError::NotFound(format!("no machine `{machine}`")))?;
     let snapshot = db::snapshot(tx, machine)?.ok_or_else(|| ApiError::NotFound(format!("no machine `{machine}`")))?;
-    let existing = baseline
-        .map(|baseline| -> Result<BTreeSet<ItemRef>> {
-            let report = db::machine(tx, machine)?.and_then(|m| m.report).unwrap_or_default();
-            Ok(baseline.iter().cloned().chain(report.drafts).chain(report.unpushed).collect())
+    let reported = m.report.map(|r| r.items).unwrap_or_default();
+    let known: BTreeMap<(&ItemId, ToggleKind), &ItemRef> = baseline
+        .iter()
+        .map(|(item, id)| (id, item))
+        .chain(reported.iter().map(|r| (&r.id, &r.item)))
+        .filter_map(|(id, item)| {
+            let kind = match item {
+                ItemRef::Skill(_) => ToggleKind::Skill,
+                ItemRef::Rule(_) => ToggleKind::Rule,
+                _ => return None,
+            };
+            Some(((id, kind), item))
         })
-        .transpose()?;
+        .collect();
     let mut a = snapshot.assignment;
     let mut entries = Vec::new();
     let mut log = |a: &mut Assignment, c: Change, before: Option<bool>| -> Result<()> {
-        set(a, &c.harness, c.kind, c.name.as_deref(), c.after);
+        set(a, &c.harness, c.kind, c.item_id.as_ref(), c.after);
+        let name = match c.item_id.as_ref() {
+            Some(id) => c
+                .name
+                .or_else(|| known.get(&(id, c.kind)).map(|item| item.name().to_string()))
+                .map_or_else(|| db::last_name(tx, id), |name| Ok(Some(name)))?,
+            None => None,
+        };
         let mut entry = LogEntry {
             id: 0,
             at: now,
@@ -287,7 +257,8 @@ pub fn apply(
             machine: machine.to_string(),
             harness: c.harness,
             kind: c.kind,
-            name: c.name,
+            item_id: c.item_id,
+            name,
             before,
             after: c.after,
             cause: c.cause,
@@ -297,12 +268,12 @@ pub fn apply(
         Ok(())
     };
     for c in changes {
-        let before = get(&a, &c.harness, c.kind, c.name.as_deref());
+        let before = get(&a, &c.harness, c.kind, c.item_id.as_ref());
         if before == c.after {
             continue;
         }
-        if let Some(existing) = &existing {
-            for m in materialize_changes(&a, &c.harness, c.kind, existing) {
+        if materialize {
+            for m in materialize_changes(&a, &c.harness, c.kind, &known) {
                 log(&mut a, m, None)?;
             }
         }
@@ -313,25 +284,27 @@ pub fn apply(
 }
 
 /// For a change of `kind`'s default in `harness`: an explicit toggle with the
-/// current effective value for each existing item of that kind without one.
-fn materialize_changes(a: &Assignment, harness: &str, kind: ToggleKind, existing: &BTreeSet<ItemRef>) -> Vec<Change> {
+/// current effective value for each known item of that kind without one.
+fn materialize_changes(
+    a: &Assignment,
+    harness: &str,
+    kind: ToggleKind,
+    known: &BTreeMap<(&ItemId, ToggleKind), &ItemRef>,
+) -> Vec<Change> {
     let h = a.harness(harness);
     let (item_kind, current, toggles) = match kind {
         ToggleKind::NewSkillsDefault => (ToggleKind::Skill, h.new_skills_default, &h.skills),
         ToggleKind::NewRulesDefault => (ToggleKind::Rule, h.new_rules_default, &h.rules),
         ToggleKind::Skill | ToggleKind::Rule => return Vec::new(),
     };
-    existing
+    known
         .iter()
-        .filter_map(|i| match (item_kind, i) {
-            (ToggleKind::Skill, ItemRef::Skill(n)) | (ToggleKind::Rule, ItemRef::Rule(n)) => Some(n),
-            _ => None,
-        })
-        .filter(|n| !toggles.contains_key(*n) && crate::check_name("item name", n).is_ok())
-        .map(|n| Change {
+        .filter(|((id, kind), _)| *kind == item_kind && !toggles.contains_key(*id))
+        .map(|((id, _), item)| Change {
             harness: harness.to_string(),
             kind: item_kind,
-            name: Some(n.clone()),
+            item_id: Some((*id).clone()),
+            name: Some(item.name().to_string()),
             after: Some(current),
             cause: LogCause::DefaultMaterialized,
         })
@@ -346,11 +319,17 @@ pub fn undo_change(conn: &Connection, id: i64, allowed: impl FnOnce(&str) -> Res
     if e.cause == LogCause::MachineRemoved {
         return Err(ApiError::Conflict("a removed machine's assignment can't be restored; join it again".into()));
     }
-    if e.before.is_none() && !e.kind.has_name() {
+    if e.before.is_none() && !e.kind.has_item() {
         return Err(ApiError::Conflict(format!("log entry {id} has no earlier value to restore")));
     }
-    let change =
-        Change { harness: e.harness, kind: e.kind, name: e.name, after: e.before, cause: LogCause::Undo { entry: id } };
+    let change = Change {
+        harness: e.harness,
+        kind: e.kind,
+        item_id: e.item_id,
+        name: e.name,
+        after: e.before,
+        cause: LogCause::Undo { entry: id },
+    };
     Ok((e.machine, change))
 }
 
@@ -363,6 +342,7 @@ pub fn new_harness_changes(a: &Assignment, reported: &[String]) -> Vec<Change> {
             [ToggleKind::NewSkillsDefault, ToggleKind::NewRulesDefault].map(|kind| Change {
                 harness: h.clone(),
                 kind,
+                item_id: None,
                 name: None,
                 after: Some(false),
                 cause: LogCause::HarnessAdded,
@@ -371,66 +351,89 @@ pub fn new_harness_changes(a: &Assignment, reported: &[String]) -> Vec<Change> {
         .collect()
 }
 
-/// Removes every toggle for an item that is in neither the baseline nor the
-/// machine's own reported draft or unpushed commits (where it can still be assigned).
-pub fn sweep_changes(
-    a: &Assignment,
-    baseline: &BTreeSet<ItemRef>,
-    drafts: &[ItemRef],
-    unpushed: &[ItemRef],
-) -> Vec<Change> {
-    let mut changes = Vec::new();
-    for (harness, h) in &a.harnesses {
-        for (toggles, kind) in [(&h.skills, ToggleKind::Skill), (&h.rules, ToggleKind::Rule)] {
-            for name in toggles.keys() {
-                let item = item(kind, name).expect("item toggle");
-                if !baseline.contains(&item) && !drafts.contains(&item) && !unpushed.contains(&item) {
-                    changes.push(Change {
-                        harness: harness.clone(),
-                        kind,
-                        name: Some(name.clone()),
-                        after: None,
-                        cause: LogCause::ItemRemoved,
-                    });
-                }
-            }
-        }
-    }
-    changes
+/// Every value of one harness entry, as `(kind, item, value)`.
+fn values(h: &HarnessAssignment) -> Vec<(ToggleKind, Option<ItemId>, bool)> {
+    let defaults = [
+        (ToggleKind::NewSkillsDefault, None, h.new_skills_default),
+        (ToggleKind::NewRulesDefault, None, h.new_rules_default),
+    ];
+    let skills = h.skills.iter().map(|(id, v)| (ToggleKind::Skill, Some(id.clone()), *v));
+    let rules = h.rules.iter().map(|(id, v)| (ToggleKind::Rule, Some(id.clone()), *v));
+    defaults.into_iter().chain(skills).chain(rules).collect()
 }
 
-/// Drops `machine`'s toggles for items it can no longer have (see
-/// [`sweep_changes`]), as the server, inside the caller's transaction. Idempotent;
-/// `None` if the machine is gone or nothing changed.
-/// Only the items in `only` are considered: those a push removed from the
-/// baseline, or those an explicit Restore discarded. Toggles for items in the
-/// machine's latest drafts or unpushed report are kept. Status snapshots
-/// never sweep: a stash during a pull or an unpushed commit can hide drafts.
-pub fn sweep(
-    tx: &Connection,
-    machine: &str,
-    baseline: &BTreeSet<ItemRef>,
-    only: &[ItemRef],
-    now: i64,
-) -> Result<Option<Applied>> {
-    let Some(m) = db::machine(tx, machine)? else {
-        return Ok(None);
+/// Moves `machine`'s harness `from` (toggles and defaults) to `to`,
+/// replacing what `to` had, in the caller's transaction: one entry for every
+/// value `from` loses and one for every value `to` gets.
+pub fn rename_harness(tx: &Connection, machine: &str, author: &str, from: &str, to: &str, now: i64) -> Result<Applied> {
+    crate::check_name("harness", from)?;
+    crate::check_name("harness", to)?;
+    if from == to {
+        return Err(ApiError::BadRequest("the harness keeps its name".into()));
+    }
+    let snapshot = db::snapshot(tx, machine)?.ok_or_else(|| ApiError::NotFound(format!("no machine `{machine}`")))?;
+    let mut a = snapshot.assignment;
+    let Some(moved) = a.harnesses.get(from).cloned() else {
+        return Ok(Applied { assignment: a, revision: snapshot.revision, entries: Vec::new() });
     };
-    let report = m.report.unwrap_or_default();
-    let changes = sweep_changes(&m.assignment, baseline, &report.drafts, &report.unpushed)
-        .into_iter()
-        .filter(|c| c.name.as_deref().and_then(|n| item(c.kind, n)).is_some_and(|i| only.contains(&i)))
-        .collect::<Vec<_>>();
-    if changes.is_empty() {
-        return Ok(None);
-    }
-    let applied = apply(tx, machine, SERVER_AUTHOR, changes, now, None)?;
-    for e in &applied.entries {
-        if let Some(item) = e.name.as_deref().and_then(|n| item(e.kind, n)) {
-            tracing::info!("dropped the `{item}` toggle on {machine}/{} (item_removed)", e.harness);
+    let before_to = a.harness(to).clone();
+    a.rename_harness(from, to);
+    let cause = LogCause::HarnessRenamed { from: from.into(), to: to.into() };
+    let mut entries = Vec::new();
+    let mut log = |harness: &str, kind, item_id: Option<ItemId>, before, after| -> Result<()> {
+        if before == after {
+            return Ok(());
         }
+        let name = item_id.as_ref().map(|id| db::last_name(tx, id)).transpose()?.flatten();
+        let mut entry = LogEntry {
+            id: 0,
+            at: now,
+            author: author.into(),
+            machine: machine.into(),
+            harness: harness.into(),
+            kind,
+            item_id,
+            name,
+            before,
+            after,
+            cause: cause.clone(),
+        };
+        db::append_log(tx, &mut entry)?;
+        entries.push(entry);
+        Ok(())
+    };
+    for (kind, id, value) in values(&moved) {
+        log(from, kind, id, Some(value), None)?;
     }
-    Ok(Some(applied))
+    let after_to = a.harness(to).clone();
+    let keys: BTreeSet<_> = values(&before_to).into_iter().chain(values(&after_to)).map(|(k, id, _)| (k, id)).collect();
+    for (kind, id) in keys {
+        let (before, after) = (get_in(&before_to, kind, id.as_ref()), get_in(&after_to, kind, id.as_ref()));
+        log(to, kind, id, before, after)?;
+    }
+    let revision = db::save_assignment(tx, machine, &a)?;
+    Ok(Applied { assignment: a, revision, entries })
+}
+
+fn get_in(h: &HarnessAssignment, kind: ToggleKind, id: Option<&ItemId>) -> Option<bool> {
+    match kind {
+        ToggleKind::Skill => h.skills.get(id?).copied(),
+        ToggleKind::Rule => h.rules.get(id?).copied(),
+        ToggleKind::NewSkillsDefault => Some(h.new_skills_default),
+        ToggleKind::NewRulesDefault => Some(h.new_rules_default),
+    }
+}
+
+/// `(harness, kind, id)` of each of `a`'s toggles whose id is not `known`.
+pub fn orphans<'a>(a: &'a Assignment, known: &BTreeSet<&ItemId>) -> Vec<(&'a str, ToggleKind, &'a ItemId)> {
+    a.harnesses
+        .iter()
+        .flat_map(|(harness, h)| {
+            let skills = h.skills.keys().map(move |id| (harness.as_str(), ToggleKind::Skill, id));
+            skills.chain(h.rules.keys().map(move |id| (harness.as_str(), ToggleKind::Rule, id)))
+        })
+        .filter(|(_, _, id)| !known.contains(id))
+        .collect()
 }
 
 /// Deletes `machine` (and so its token), logging every toggle it had.
@@ -439,16 +442,8 @@ pub fn remove_machine(conn: &mut Connection, machine: &str, author: &str, now: i
     let a = db::assignment(&tx, machine)?.ok_or_else(|| ApiError::NotFound(format!("no machine `{machine}`")))?;
     let mut entries = Vec::new();
     for (harness, h) in &a.harnesses {
-        let defaults = [
-            (ToggleKind::NewSkillsDefault, None, h.new_skills_default),
-            (ToggleKind::NewRulesDefault, None, h.new_rules_default),
-        ];
-        let items = h
-            .skills
-            .iter()
-            .map(|(n, v)| (ToggleKind::Skill, Some(n.clone()), *v))
-            .chain(h.rules.iter().map(|(n, v)| (ToggleKind::Rule, Some(n.clone()), *v)));
-        for (kind, name, value) in defaults.into_iter().chain(items) {
+        for (kind, item_id, value) in values(h) {
+            let name = item_id.as_ref().map(|id| db::last_name(&tx, id)).transpose()?.flatten();
             let mut entry = LogEntry {
                 id: 0,
                 at: now,
@@ -456,6 +451,7 @@ pub fn remove_machine(conn: &mut Connection, machine: &str, author: &str, now: i
                 machine: machine.to_string(),
                 harness: harness.clone(),
                 kind,
+                item_id,
                 name,
                 before: Some(value),
                 after: None,

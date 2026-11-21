@@ -7,80 +7,82 @@ use std::path::Path;
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use sk1ll_proto::{
-    Assignment, AssignmentSnapshot, LogCause, LogEntry, LogFacets, LogQuery, MachineReport, Scope, ToggleKind,
+    Assignment, AssignmentSnapshot, ItemId, LogCause, LogEntry, LogFacets, LogQuery, MachineReport, Scope, ToggleKind,
 };
 
 use crate::error::Result;
 
-/// Each entry upgrades the schema by one `user_version`. Append only.
-const MIGRATIONS: &[&str] = &[
-    "
+/// The schema's `user_version`. A database at another version is replaced,
+/// not migrated: its machines have to join again.
+const SCHEMA_VERSION: i64 = 6;
+
+const SCHEMA: &str = "
     CREATE TABLE machines (
-        id          TEXT PRIMARY KEY,
-        token_hash  TEXT NOT NULL UNIQUE,
-        joined_at   INTEGER NOT NULL,
-        last_seen   INTEGER,
-        report      TEXT,
-        assignment  TEXT NOT NULL
+        id            TEXT PRIMARY KEY,
+        token_hash    TEXT NOT NULL UNIQUE,
+        joined_at     INTEGER NOT NULL,
+        last_seen     INTEGER,
+        report        TEXT,
+        assignment    TEXT NOT NULL,
+        revision      INTEGER NOT NULL,
+        scope         TEXT NOT NULL,
+        registration  TEXT NOT NULL
     );
     CREATE TABLE join_codes (
         code_hash   TEXT PRIMARY KEY,
         created_by  TEXT NOT NULL,
         created_at  INTEGER NOT NULL,
+        scope       TEXT NOT NULL,
         used_by     TEXT,
         used_at     INTEGER
     );
     CREATE TABLE log (
-        id       INTEGER PRIMARY KEY AUTOINCREMENT,
-        at       INTEGER NOT NULL,
-        author   TEXT NOT NULL,
-        machine  TEXT NOT NULL,
-        harness  TEXT NOT NULL,
-        kind     TEXT NOT NULL,
-        name     TEXT,
-        before   INTEGER,
-        after    INTEGER,
-        cause    TEXT NOT NULL
+        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        at                 INTEGER NOT NULL,
+        author             TEXT NOT NULL,
+        machine            TEXT NOT NULL,
+        harness            TEXT NOT NULL,
+        kind               TEXT NOT NULL,
+        item_id            TEXT,
+        name               TEXT,
+        before             INTEGER,
+        after              INTEGER,
+        cause              TEXT NOT NULL,
+        copy_registration  TEXT
     );
     CREATE INDEX log_machine ON log (machine, id);
-",
-    "
-    ALTER TABLE machines ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;
+    CREATE INDEX log_harness ON log (harness);
+    CREATE INDEX log_author ON log (author);
+    CREATE INDEX log_item ON log (item_id, id);
     CREATE TABLE counters (
         name   TEXT PRIMARY KEY,
         value  INTEGER NOT NULL
     );
     INSERT INTO counters (name, value) VALUES ('revision', 0);
-",
-    "CREATE INDEX log_harness ON log (harness);
-    CREATE INDEX log_author ON log (author);",
-    // Machines and codes from before scopes managed the whole fleet.
-    "ALTER TABLE machines ADD COLUMN scope TEXT NOT NULL DEFAULT 'fleet';
-    ALTER TABLE join_codes ADD COLUMN scope TEXT NOT NULL DEFAULT 'fleet';",
-    // A random id per join; existing machines get one now.
-    "
-    ALTER TABLE machines ADD COLUMN registration TEXT NOT NULL DEFAULT '';
-    UPDATE machines SET registration = lower(hex(randomblob(16))) WHERE registration = '';
-",
-];
+";
 
 pub fn open(path: &Path) -> anyhow::Result<Connection> {
     let mut conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
-    migrate(&mut conn)?;
+    create(&mut conn)?;
     Ok(conn)
 }
 
-fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
+/// Creates the schema, replacing a database at another version.
+fn create(conn: &mut Connection) -> rusqlite::Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    for (i, sql) in MIGRATIONS.iter().enumerate().skip(version.max(0) as usize) {
-        let tx = conn.transaction()?;
-        tx.execute_batch(sql)?;
-        tx.pragma_update(None, "user_version", i as i64 + 1)?;
-        tx.commit()?;
+    if version == SCHEMA_VERSION {
+        return Ok(());
     }
-    Ok(())
+    if version != 0 {
+        tracing::warn!("server.db has schema version {version}; replacing it: every machine has to join again");
+    }
+    let tx = conn.transaction()?;
+    tx.execute_batch("DROP TABLE IF EXISTS machines; DROP TABLE IF EXISTS join_codes; DROP TABLE IF EXISTS log; DROP TABLE IF EXISTS counters;")?;
+    tx.execute_batch(SCHEMA)?;
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.commit()
 }
 
 pub struct MachineRecord {
@@ -272,14 +274,15 @@ fn parse_kind(s: &str) -> Result<ToggleKind> {
 /// Appends `entry` (its `id` is ignored) and sets its new id.
 pub fn append_log(conn: &Connection, entry: &mut LogEntry) -> Result<()> {
     conn.execute(
-        "INSERT INTO log (at, author, machine, harness, kind, name, before, after, cause)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO log (at, author, machine, harness, kind, item_id, name, before, after, cause)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             entry.at,
             entry.author,
             entry.machine,
             entry.harness,
             kind_str(entry.kind),
+            entry.item_id.as_ref().map(ToString::to_string),
             entry.name,
             entry.before,
             entry.after,
@@ -290,31 +293,55 @@ pub fn append_log(conn: &Connection, entry: &mut LogEntry) -> Result<()> {
     Ok(())
 }
 
-// Store copy metadata alongside the tagged cause. Older API clients still
-// receive the same Change and Undo variants.
+/// Marks entry `id` as copied from another machine to this registration of
+/// its machine, so undoing it can tell a rejoin apart.
 pub fn mark_machine_copy(conn: &Connection, id: i64, registration: &str) -> Result<()> {
-    conn.execute(
-        "UPDATE log SET cause = json_set(cause, '$.copy_registration', ?2) WHERE id = ?1",
-        params![id, registration],
-    )?;
+    conn.execute("UPDATE log SET copy_registration = ?2 WHERE id = ?1", params![id, registration])?;
     Ok(())
 }
 
 pub fn copy_registration(conn: &Connection, id: i64) -> Result<Option<String>> {
-    Ok(conn.query_row("SELECT json_extract(cause, '$.copy_registration') FROM log WHERE id = ?1", [id], |row| {
-        row.get(0)
-    })?)
+    Ok(conn.query_row("SELECT copy_registration FROM log WHERE id = ?1", [id], |row| row.get(0))?)
 }
 
-const LOG_COLS: &str = "id, at, author, machine, harness, kind, name, before, after, cause";
+/// The name the log last recorded for `item_id`, if any.
+pub fn last_name(conn: &Connection, item_id: &ItemId) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT name FROM log WHERE item_id = ?1 AND name IS NOT NULL ORDER BY id DESC LIMIT 1",
+            [item_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
 
-type LogRow = (i64, i64, String, String, String, String, Option<String>, Option<bool>, Option<bool>, String);
+const LOG_COLS: &str = "id, at, author, machine, harness, kind, item_id, name, before, after, cause";
+
+type LogRow =
+    (i64, i64, String, String, String, String, Option<String>, Option<String>, Option<bool>, Option<bool>, String);
 
 fn log_row(r: &Row) -> rusqlite::Result<LogRow> {
-    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?))
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+        r.get(6)?,
+        r.get(7)?,
+        r.get(8)?,
+        r.get(9)?,
+        r.get(10)?,
+    ))
 }
 
-fn log_entry_from((id, at, author, machine, harness, kind, name, before, after, cause): LogRow) -> Result<LogEntry> {
+fn log_entry_from(
+    (id, at, author, machine, harness, kind, item_id, name, before, after, cause): LogRow,
+) -> Result<LogEntry> {
+    let item_id = item_id
+        .map(|i| i.parse::<ItemId>().map_err(anyhow::Error::msg).context("corrupt item id in server.db"))
+        .transpose()?;
     Ok(LogEntry {
         id,
         at,
@@ -322,6 +349,7 @@ fn log_entry_from((id, at, author, machine, harness, kind, name, before, after, 
         machine,
         harness,
         kind: parse_kind(&kind)?,
+        item_id,
         name,
         before,
         after,
@@ -330,14 +358,16 @@ fn log_entry_from((id, at, author, machine, harness, kind, name, before, after, 
 }
 
 /// Newest first. Empty filters match everything; `item` is a substring of
-/// `<kind>:<name>`, ignoring ASCII case (`instr`, so `%` and `_` are literal).
+/// `<kind>:<name>` or of the item id, ignoring ASCII case (`instr`, so `%`
+/// and `_` are literal).
 pub fn log_entries(conn: &Connection, q: &LogQuery) -> Result<Vec<LogEntry>> {
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
     let mut stmt = conn.prepare(&format!(
         "SELECT {LOG_COLS} FROM log
          WHERE (NULLIF(?1, '') IS NULL OR machine = ?1) AND (?2 IS NULL OR id < ?2)
            AND (NULLIF(?4, '') IS NULL OR harness = ?4) AND (NULLIF(?5, '') IS NULL OR author = ?5)
-           AND (NULLIF(?6, '') IS NULL OR instr(lower(kind || ':' || coalesce(name, '')), lower(?6)) > 0)
+           AND (NULLIF(?6, '') IS NULL OR instr(lower(kind || ':' || coalesce(name, '')), lower(?6)) > 0
+                OR instr(lower(coalesce(item_id, '')), lower(?6)) > 0)
          ORDER BY id DESC LIMIT ?3"
     ))?;
     let rows = stmt
@@ -364,104 +394,71 @@ pub fn log_entry(conn: &Connection, id: i64) -> Result<Option<LogEntry>> {
 mod tests {
     use super::*;
 
-    /// Applies the first `version` migrations, as an older server left them.
-    fn at_version(version: usize) -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        for sql in &MIGRATIONS[..version] {
-            conn.execute_batch(sql).unwrap();
-        }
-        conn.pragma_update(None, "user_version", version as i64).unwrap();
-        conn
-    }
-
-    fn user_version(conn: &Connection) -> i64 {
-        conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap()
-    }
-
-    #[test]
-    fn existing_machines_get_a_registration() {
-        // From before scopes (v3) and from scopes only (v4).
-        for version in [3, 4] {
-            let mut conn = at_version(version);
-            for id in ["a", "b"] {
-                conn.execute(
-                    "INSERT INTO machines (id, token_hash, joined_at, assignment) VALUES (?1, ?1, 1, '{}')",
-                    [id],
-                )
-                .unwrap();
-            }
-            if version == 4 {
-                conn.execute("UPDATE machines SET scope = 'self' WHERE id = 'b'", []).unwrap();
-            }
-            migrate(&mut conn).unwrap();
-            assert_eq!(user_version(&conn), 5);
-            let all = machines(&conn).unwrap();
-            let registrations: Vec<&str> = all.iter().map(|m| m.registration.as_str()).collect();
-            assert!(registrations.iter().all(|r| r.len() == 32), "{registrations:?}");
-            assert_ne!(registrations[0], registrations[1]);
-            let scopes: Vec<Scope> = all.iter().map(|m| m.scope).collect();
-            let b = if version == 4 { Scope::SelfOnly } else { Scope::Fleet };
-            assert_eq!(scopes, [Scope::Fleet, b], "v{version}");
-            insert_machine(&conn, "c", "c", 2, &Assignment::default(), Scope::SelfOnly).unwrap();
-            let c = machine(&conn, "c").unwrap().unwrap();
-            assert_eq!((c.registration.len(), c.scope), (32, Scope::SelfOnly));
-            assert_ne!(c.registration, registrations[0]);
+    fn entry(machine: &str, harness: &str, author: &str, kind: ToggleKind, name: Option<&str>) -> LogEntry {
+        LogEntry {
+            id: 0,
+            at: 1,
+            author: author.into(),
+            machine: machine.into(),
+            harness: harness.into(),
+            kind,
+            item_id: name.map(|n| format!("id-{n}").parse().unwrap()),
+            name: name.map(Into::into),
+            before: None,
+            after: Some(true),
+            cause: LogCause::Change,
         }
     }
 
     #[test]
-    fn migrates_once_and_round_trips_log() {
+    fn creates_once_round_trips_log_and_replaces_other_versions() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("server.db");
         drop(open(&path).unwrap());
         let conn = open(&path).unwrap();
         let v: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
-        assert_eq!(v, MIGRATIONS.len() as i64);
+        assert_eq!(v, SCHEMA_VERSION);
 
         let mut e = LogEntry {
-            id: 0,
-            at: 1,
-            author: "a".into(),
-            machine: "m".into(),
-            harness: "claude".into(),
-            kind: ToggleKind::NewSkillsDefault,
-            name: None,
             before: Some(true),
             after: None,
             cause: LogCause::Undo { entry: 3 },
+            ..entry("m", "claude", "a", ToggleKind::Skill, Some("pdf"))
         };
         append_log(&conn, &mut e).unwrap();
+        mark_machine_copy(&conn, e.id, "reg").unwrap();
         assert_eq!(log_entry(&conn, e.id).unwrap(), Some(e.clone()));
+        assert_eq!(copy_registration(&conn, e.id).unwrap().as_deref(), Some("reg"));
+        assert_eq!(last_name(&conn, e.item_id.as_ref().unwrap()).unwrap().as_deref(), Some("pdf"));
         assert_eq!(log_entries(&conn, &LogQuery { machine: Some("other".into()), ..Default::default() }).unwrap(), []);
         assert_eq!(log_entries(&conn, &LogQuery::default()).unwrap(), [e]);
+        insert_machine(&conn, "m", "t", 0, &Assignment::default(), Scope::Fleet).unwrap();
+        drop(conn);
+
+        // A database an older server left is replaced.
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", 5).unwrap();
+        drop(conn);
+        let conn = open(&path).unwrap();
+        assert!(machines(&conn).unwrap().is_empty());
+        assert!(log_entries(&conn, &LogQuery::default()).unwrap().is_empty());
     }
 
     #[test]
     fn log_filters_apply_before_the_limit_and_keep_the_cursor() {
         let dir = tempfile::tempdir().unwrap();
         let conn = open(&dir.path().join("server.db")).unwrap();
-        let entry = |machine: &str, harness: &str, author: &str, kind, name: Option<&str>| {
-            let mut e = LogEntry {
-                id: 0,
-                at: 1,
-                author: author.into(),
-                machine: machine.into(),
-                harness: harness.into(),
-                kind,
-                name: name.map(Into::into),
-                before: None,
-                after: Some(true),
-                cause: LogCause::Change,
-            };
+        let add = |e: LogEntry| {
+            let mut e = e;
             append_log(&conn, &mut e).unwrap();
             e.id
         };
-        let old = entry("m", "claude", "alice", ToggleKind::Skill, Some("PDF-tools"));
-        let rule = entry("m", "codex", "bob", ToggleKind::Rule, Some("pdf"));
+        let old = add(entry("m", "claude", "alice", ToggleKind::Skill, Some("PDF-tools")));
+        let rule = add(entry("m", "codex", "bob", ToggleKind::Rule, Some("pdf")));
         for _ in 0..5 {
-            entry("n", "claude", "bob", ToggleKind::Skill, Some("deploy"));
+            add(entry("n", "claude", "bob", ToggleKind::Skill, Some("deploy")));
         }
-        let default = entry("m", "claude", "alice", ToggleKind::NewSkillsDefault, None);
+        let default = add(entry("m", "claude", "alice", ToggleKind::NewSkillsDefault, None));
         let ids = |q: LogQuery| log_entries(&conn, &q).unwrap().into_iter().map(|e| e.id).collect::<Vec<_>>();
         let page = |q: LogQuery| LogQuery { limit: Some(1), ..q };
 
@@ -469,6 +466,7 @@ mod tests {
         assert_eq!(ids(page(LogQuery { item: Some("pdf".into()), ..Default::default() })), [rule]);
         assert_eq!(ids(LogQuery { item: Some("pdf".into()), before: Some(rule), ..Default::default() }), [old]);
         assert_eq!(ids(LogQuery { item: Some("SKILL:pdf".into()), ..Default::default() }), [old]);
+        assert_eq!(ids(LogQuery { item: Some("id-pdf-TOOLS".into()), ..Default::default() }), [old]);
         assert_eq!(ids(LogQuery { item: Some("new_skills".into()), ..Default::default() }), [default]);
         assert_eq!(ids(LogQuery { item: Some("%".into()), ..Default::default() }), Vec::<i64>::new());
         assert_eq!(ids(LogQuery { harness: Some("codex".into()), ..Default::default() }), [rule]);
@@ -509,41 +507,20 @@ mod tests {
         delete_machine(&conn, "m").unwrap();
         let r3 = insert_machine(&conn, "m", "t2", 0, &a, Scope::SelfOnly).unwrap();
         assert!(r3 > r2, "a re-joined machine never goes back");
-        assert_eq!(machine(&conn, "m").unwrap().unwrap().scope, Scope::SelfOnly);
+        let m = machine(&conn, "m").unwrap().unwrap();
+        assert_eq!((m.scope, m.registration.len()), (Scope::SelfOnly, 32));
     }
 
-    /// A database from before scopes: its machines and unused codes keep
-    /// managing the whole fleet.
     #[test]
-    fn scopes_migrate_to_fleet() {
+    fn join_codes_are_single_use_and_expire() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("server.db");
-        {
-            let mut conn = Connection::open(&path).unwrap();
-            let tx = conn.transaction().unwrap();
-            for sql in &MIGRATIONS[..3] {
-                tx.execute_batch(sql).unwrap();
-            }
-            tx.pragma_update(None, "user_version", 3).unwrap();
-            tx.execute(
-                "INSERT INTO machines (id, token_hash, joined_at, assignment) VALUES ('old', 'h', 0, '{\"harnesses\":{}}')",
-                [],
-            )
-            .unwrap();
-            tx.execute("INSERT INTO join_codes (code_hash, created_by, created_at) VALUES ('c', 'admin', 10)", [])
-                .unwrap();
-            tx.commit().unwrap();
-        }
-        let conn = open(&path).unwrap();
-        assert_eq!(machine(&conn, "old").unwrap().unwrap().scope, Scope::Fleet);
-        assert_eq!(machine_for_token(&conn, "h").unwrap(), Some(("old".into(), Scope::Fleet)));
+        let conn = open(&dir.path().join("server.db")).unwrap();
+        insert_join_code(&conn, "c", "admin", 10, Scope::Fleet).unwrap();
         assert_eq!(consume_join_code(&conn, "c", "new", 20, 100).unwrap(), Some(Scope::Fleet));
         assert_eq!(consume_join_code(&conn, "c", "new", 20, 100).unwrap(), None, "single use");
         insert_join_code(&conn, "s", "old", 30, Scope::SelfOnly).unwrap();
         assert_eq!(consume_join_code(&conn, "s", "x", 200, 100).unwrap(), None, "expired");
         assert_eq!(consume_join_code(&conn, "s", "x", 130, 100).unwrap(), None, "expired at `created_at + ttl`");
         assert_eq!(consume_join_code(&conn, "s", "x", 129, 100).unwrap(), Some(Scope::SelfOnly), "valid just before");
-        insert_join_code(&conn, "t", "old", 30, Scope::SelfOnly).unwrap();
-        assert_eq!(consume_join_code(&conn, "t", "x", 40, 100).unwrap(), Some(Scope::SelfOnly));
     }
 }

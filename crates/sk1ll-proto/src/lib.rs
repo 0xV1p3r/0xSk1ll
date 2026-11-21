@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use sk1ll_core::ItemId;
 pub use sk1ll_core::assignment::{Assignment, HarnessAssignment};
 
 /// Path of the fleet repo under the server's base URL.
@@ -43,7 +44,8 @@ pub use sk1ll_core::draft::ItemRef;
 // ---------------------------------------------------------------------------
 // WebSocket (`GET /api/ws`), JSON text frames tagged by `type`.
 
-/// Daemon → server.
+/// Daemon → server. The server handles them in order, so a write follows
+/// the status sent before it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonMessage {
@@ -51,13 +53,22 @@ pub enum DaemonMessage {
     Hello { machine_id: String },
     /// The machine's current state; send on connect and whenever it changes.
     Status(MachineReport),
-    /// The user Restore these draft items. Send after the updated status so
-    /// the server can drop toggles for items absent from both baseline and draft.
-    DraftDiscarded {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        id: Option<u64>,
-        items: Vec<ItemRef>,
-    },
+    /// A change to this machine's own assignment. Answered with
+    /// [`ServerMessage::AssignmentResult`] carrying the same `req`.
+    SetAssignment { req: u64, write: AssignmentWrite },
+}
+
+/// A change to one machine's assignment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum AssignmentWrite {
+    /// Toggles and defaults, as `PUT /api/machines/{id}/assignment` takes them.
+    Changes(AssignmentChanges),
+    /// Both defaults and every toggle of one harness, as
+    /// `POST /api/machines/{id}/assignment/harness/{harness}` sets them.
+    Harness { harness: String, enabled: bool },
+    /// Moves a harness's toggles and defaults to a new harness name.
+    RenameHarness(HarnessRename),
 }
 
 /// Server → daemon.
@@ -70,8 +81,10 @@ pub enum DaemonMessage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
-    /// Confirms that the discard transaction committed.
-    DraftDiscardApplied { id: u64 },
+    /// The outcome of [`DaemonMessage::SetAssignment`] `req`. `seq` is the
+    /// [`MachineReport::seq`] of the last status the server stored from this
+    /// session before applying it (0: none yet).
+    AssignmentResult { req: u64, seq: u64, result: AssignmentOutcome },
     /// This machine's full assignment. Sent on connect and after every change;
     /// snapshots that were superseded before they could be sent are skipped,
     /// so only the latest is guaranteed to arrive. Apply one only if its
@@ -86,14 +99,25 @@ pub enum ServerMessage {
     ImportsChanged { updates: Vec<ImportUpdate> },
 }
 
+/// What became of an assignment write sent over the session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssignmentOutcome {
+    Applied(AssignmentUpdate),
+    /// Refused with what the REST API would answer: its HTTP status and error.
+    Refused {
+        status: u16,
+        error: String,
+    },
+}
+
 /// A machine's assignment at one revision. On the wire the revision sits next
 /// to the assignment's own fields: `{"type": "assignment", "revision": 7,
 /// "harnesses": {...}}`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssignmentSnapshot {
     /// Grows with every change. It comes from one server-wide sequence, so it
-    /// also grows across removing and re-joining a machine. 0 means unknown.
-    #[serde(default)]
+    /// also grows across removing and re-joining a machine.
     pub revision: u64,
     #[serde(flatten)]
     pub assignment: Assignment,
@@ -103,9 +127,13 @@ pub struct AssignmentSnapshot {
     pub registration: Option<String>,
 }
 
-/// What a daemon reports about its machine. Names only, never content.
+/// What a daemon reports about its machine. Names and ids only, never content.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MachineReport {
+    /// Grows with every status a daemon session sends, from 1; the server
+    /// echoes it (see [`ServerMessage::AssignmentResult`]).
+    #[serde(default)]
+    pub seq: u64,
     /// Commit the machine's harnesses are built from; `None` before the first pull.
     #[serde(default)]
     pub baseline: Option<String>,
@@ -116,6 +144,10 @@ pub struct MachineReport {
     /// Items in commits the machine has committed but not yet pushed to the server.
     #[serde(default)]
     pub unpushed: Vec<ItemRef>,
+    /// The skills and rules in the machine's working tree, including
+    /// items in drafts or unpushed commits.
+    #[serde(default)]
+    pub items: Vec<ReportedItem>,
     #[serde(default)]
     pub conflicts: Vec<ConflictRef>,
     /// Harnesses present on the machine.
@@ -130,6 +162,13 @@ pub struct MachineReport {
     /// The daemon knows it hasn't applied the latest baseline yet.
     #[serde(default)]
     pub behind: bool,
+}
+
+/// A skill or rule's name and Item ID.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ReportedItem {
+    pub item: ItemRef,
+    pub id: ItemId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,14 +235,11 @@ pub struct MachineRow {
     pub last_seen: Option<i64>,
     /// Last report, if any.
     pub report: Option<MachineReport>,
-    /// What the machine may manage, from the join code it joined with. An
-    /// older server sends none: all its machines manage the whole fleet.
-    #[serde(default)]
+    /// What the machine may manage, from the join code it joined with.
     pub scope: Scope,
     /// Random and new for every join, unlike `joined_at`, which two joins in
-    /// the same second share. A 0.1.0 Server leaves it out.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub registration: Option<String>,
+    /// the same second share.
+    pub registration: String,
 }
 
 /// What a machine that joined with a join code may manage (ADR 0005). The
@@ -246,7 +282,7 @@ impl std::str::FromStr for Scope {
 // Assignment changes and log
 
 /// What a toggle change addresses within one harness.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToggleKind {
     Skill,
@@ -256,8 +292,8 @@ pub enum ToggleKind {
 }
 
 impl ToggleKind {
-    /// Whether `name` is required (item toggles) or must be absent (defaults).
-    pub fn has_name(self) -> bool {
+    /// Whether `item_id` is required (item toggles) or must be absent (defaults).
+    pub fn has_item(self) -> bool {
         matches!(self, Self::Skill | Self::Rule)
     }
 }
@@ -267,6 +303,11 @@ impl ToggleKind {
 pub struct ToggleChange {
     pub harness: String,
     pub kind: ToggleKind,
+    /// The item an item toggle is for. Any id is accepted: one no item has
+    /// is inert until such an item appears.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<ItemId>,
+    /// The item's name, recorded in the log for display.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// `null` removes an item's explicit toggle so it follows the default
@@ -284,26 +325,20 @@ pub struct AssignmentChanges {
     pub expected: Option<Expected>,
 }
 
-/// Set both defaults and every known item for one harness.
+/// `POST /api/machines/{id}/assignment/harness/{harness}` body: set both
+/// defaults and every explicit toggle of the harness, so that every item,
+/// pulled or not, has that value there.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SetHarnessAssignment {
     pub enabled: bool,
 }
 
-impl SetHarnessAssignment {
-    pub fn changes(self, harness: &str, items: impl IntoIterator<Item = ItemRef>) -> AssignmentChanges {
-        let toggle = |kind, name| ToggleChange { harness: harness.into(), kind, name, enabled: Some(self.enabled) };
-        let changes = items
-            .into_iter()
-            .filter_map(|item| match item {
-                ItemRef::Skill(name) => Some(toggle(ToggleKind::Skill, Some(name))),
-                ItemRef::Rule(name) => Some(toggle(ToggleKind::Rule, Some(name))),
-                ItemRef::Manifest | ItemRef::Other(_) => None,
-            })
-            .chain([toggle(ToggleKind::NewSkillsDefault, None), toggle(ToggleKind::NewRulesDefault, None)])
-            .collect();
-        AssignmentChanges { changes, expected: None }
-    }
+/// Move a harness's toggles and defaults to another harness name, replacing
+/// what that one had.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessRename {
+    pub from: String,
+    pub to: String,
 }
 
 /// A precondition of [`AssignmentChanges`].
@@ -352,52 +387,12 @@ pub struct AssignmentCopyPreview {
 pub struct AssignmentUpdate {
     pub assignment: Assignment,
     /// The assignment's revision after the change (see [`AssignmentSnapshot`]).
-    #[serde(default)]
     pub revision: u64,
     /// Log entries written, one per change that actually changed something.
     pub entries: Vec<LogEntry>,
     /// Errors applying this update to local placements, when applied by a daemon.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<String>,
-}
-
-/// Result of setting all items and defaults for a harness.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HarnessAssignmentResult {
-    #[serde(flatten)]
-    pub update: AssignmentUpdate,
-    #[serde(default)]
-    pub skipped: Vec<ItemRef>,
-}
-
-/// `POST /api/machines/{id}/assignment/copy` body: copy the machine's
-/// explicit toggles of `from` to `to`, before a rename of `from` to `to`
-/// reaches its Draft. A 0.1.0 Server answers HTTP 404.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AssignmentCopy {
-    /// An item the machine can have: in the baseline, its draft or its unpushed commits.
-    pub from: ItemRef,
-    /// The same kind of item, and none the machine can have yet.
-    pub to: ItemRef,
-}
-
-/// `POST /api/machines/{id}/assignment/copy` response.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AssignmentCopied {
-    pub assignment: Assignment,
-    /// The assignment's revision after the copy.
-    pub revision: u64,
-    /// The machine's [`MachineRow::registration`]; absent standalone.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub registration: Option<String>,
-    /// Log entries written, one per toggle in `applied`.
-    pub entries: Vec<LogEntry>,
-    /// The toggles written for `to`, one per Harness where `from` had an
-    /// explicit toggle and `to` had none.
-    pub applied: Vec<ToggleChange>,
-    /// The toggles not written because `to` already had an explicit one,
-    /// which was kept.
-    pub skipped: Vec<ToggleChange>,
 }
 
 /// One append-only assignment log entry. For item toggles `None` means "no
@@ -413,6 +408,9 @@ pub struct LogEntry {
     pub machine: String,
     pub harness: String,
     pub kind: ToggleKind,
+    /// The item of an item toggle.
+    pub item_id: Option<ItemId>,
+    /// The item's name when the entry was written, if known; for display.
     pub name: Option<String>,
     pub before: Option<bool>,
     pub after: Option<bool>,
@@ -426,15 +424,18 @@ pub enum LogCause {
     Change,
     /// Restores `before` of entry `entry`.
     Undo { entry: i64 },
-    /// The item is in neither the baseline nor the machine's reported draft.
-    ItemRemoved,
-    /// A harness's new-items default changed, so an existing baseline item
-    /// without a toggle got an explicit one with its old effective value.
+    /// A harness's new-items default changed, so an existing item without a
+    /// toggle got an explicit one with its old effective value.
     DefaultMaterialized,
     /// The machine was removed from the fleet.
     MachineRemoved,
     /// The machine reported a harness it had no assignment for; it starts all off.
     HarnessAdded,
+    /// The machine's harness was renamed: its toggles moved from `from` to `to`.
+    HarnessRenamed { from: String, to: String },
+    /// The toggle's item is in neither the baseline nor any machine's
+    /// report, and someone pruned the orphans.
+    OrphanPruned,
 }
 
 /// `GET /api/log` query.
@@ -449,7 +450,7 @@ pub struct LogQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
     /// Only entries whose `<kind>:<name>` (`skill:pdf`, `new_skills_default:`)
-    /// contains this, ignoring ASCII case.
+    /// or item id contains this, ignoring ASCII case.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item: Option<String>,
     /// Only entries with an id below this (paging, newest first). Filters
@@ -457,6 +458,40 @@ pub struct LogQuery {
     pub before: Option<i64>,
     /// Default 100, max 1000.
     pub limit: Option<u32>,
+}
+
+/// A toggle for an item that is in neither the baseline nor any machine's
+/// last report. It does nothing; `POST /api/assignment/orphans/prune` removes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Orphan {
+    pub machine: String,
+    pub harness: String,
+    /// `skill` or `rule`.
+    pub kind: ToggleKind,
+    pub item_id: ItemId,
+    /// The name the log last recorded for the item, if any.
+    pub name: Option<String>,
+}
+
+/// `GET /api/assignment/orphans`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrphansView {
+    pub orphans: Vec<Orphan>,
+}
+
+/// `POST /api/assignment/orphans/prune` body. `machine: None` prunes every
+/// machine for a `fleet` caller or the admin, and the caller's own for a
+/// `self` machine.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PruneOrphans {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+}
+
+/// `POST /api/assignment/orphans/prune` response: one entry per toggle removed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrphansPruned {
+    pub entries: Vec<LogEntry>,
 }
 
 /// `GET /api/log/facets`: the distinct values in the whole log, sorted, for filters.
@@ -491,12 +526,10 @@ pub struct JoinResponse {
     pub repo_path: String,
     pub assignment: Assignment,
     /// The assignment's revision (see [`AssignmentSnapshot`]).
-    #[serde(default)]
     pub revision: u64,
 }
 
-/// `POST /api/join-codes` body. An empty body or `null` (older clients)
-/// asks for the defaults.
+/// `POST /api/join-codes` body. An empty body or `null` asks for the defaults.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinCodeRequest {
     /// What the machine that joins with the code may manage.
@@ -508,13 +541,10 @@ pub struct JoinCodeRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinCode {
     pub code: String,
-    /// When the code stops working; `None` from an older server.
-    #[serde(default)]
-    pub expires_at: Option<i64>,
-    /// The scope the code grants; `None` from an older server, which ignores
-    /// the request's scope and always grants [`Scope::Fleet`].
-    #[serde(default)]
-    pub scope: Option<Scope>,
+    /// When the code stops working.
+    pub expires_at: i64,
+    /// The scope the code grants.
+    pub scope: Scope,
 }
 
 // ---------------------------------------------------------------------------
@@ -539,8 +569,7 @@ pub struct ImportsView {
     pub updates: Vec<ImportUpdate>,
     /// Imports that couldn't be checked, e.g. unreachable sources.
     pub errors: Vec<ImportError>,
-    /// Imports the server didn't check on purpose (its import check
-    /// settings); empty from an older server.
+    /// Imports the server didn't check on purpose (its import check settings).
     #[serde(default)]
     pub skipped: Vec<ImportSkipped>,
 }
@@ -558,31 +587,50 @@ pub struct ImportError {
     pub message: String,
 }
 
-pub const INVENTORY_UNAVAILABLE: &str = "inventory_unavailable";
-
 /// Body of every non-2xx API response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorBody {
     pub error: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub code: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn id(s: &str) -> ItemId {
+        s.parse().unwrap()
+    }
+
     #[test]
-    fn discard_ack_round_trip() {
-        for id in [None, Some(42)] {
-            let msg = DaemonMessage::DraftDiscarded { id, items: vec![] };
+    fn assignment_writes_round_trip() {
+        let changes = AssignmentChanges {
+            changes: vec![ToggleChange {
+                harness: "claude".into(),
+                kind: ToggleKind::Skill,
+                item_id: Some(id("01J0")),
+                name: Some("pdf".into()),
+                enabled: Some(true),
+            }],
+            expected: Some(Expected { revision: 3, registration: None }),
+        };
+        for write in [
+            AssignmentWrite::Changes(changes),
+            AssignmentWrite::Harness { harness: "claude".into(), enabled: false },
+            AssignmentWrite::RenameHarness(HarnessRename { from: "a".into(), to: "b".into() }),
+        ] {
+            let msg = DaemonMessage::SetAssignment { req: 7, write };
             let text = serde_json::to_string(&msg).unwrap();
+            assert!(text.starts_with(r#"{"type":"set_assignment","req":7,"write":{"op":"#), "{text}");
             assert_eq!(serde_json::from_str::<DaemonMessage>(&text).unwrap(), msg);
         }
-        let msg = ServerMessage::DraftDiscardApplied { id: 42 };
-        let text = serde_json::to_string(&msg).unwrap();
-        assert_eq!(text, r#"{"type":"draft_discard_applied","id":42}"#);
-        assert_eq!(serde_json::from_str::<ServerMessage>(&text).unwrap(), msg);
+        let refused = ServerMessage::AssignmentResult {
+            req: 7,
+            seq: 2,
+            result: AssignmentOutcome::Refused { status: 409, error: "changed".into() },
+        };
+        let value = serde_json::to_value(&refused).unwrap();
+        assert_eq!(value["result"]["refused"]["status"], 409);
+        assert_eq!(serde_json::from_value::<ServerMessage>(value).unwrap(), refused);
     }
 
     #[test]
@@ -596,8 +644,9 @@ mod tests {
     }
 
     #[test]
-    fn reports_accept_every_draft_item() {
-        let text = r#"{"type":"status","drafts":["skill:pdf","rule:git","manifest","other:README.md"]}"#;
+    fn reports_accept_every_draft_item_and_carry_ids() {
+        let text = r#"{"type":"status","seq":4,"drafts":["skill:pdf","rule:git","manifest","other:README.md"],
+            "items":[{"item":"skill:pdf","id":"01J0"}]}"#;
         let DaemonMessage::Status(r) = serde_json::from_str(text).unwrap() else { panic!("expected status") };
         assert_eq!(
             r.drafts,
@@ -608,31 +657,22 @@ mod tests {
                 ItemRef::Other("README.md".into())
             ]
         );
+        assert_eq!((r.seq, &r.items[0].id), (4, &id("01J0")));
         let back = serde_json::to_string(&DaemonMessage::Status(r.clone())).unwrap();
         assert_eq!(serde_json::from_str::<DaemonMessage>(&back).unwrap(), DaemonMessage::Status(r));
     }
 
     #[test]
-    fn draft_discarded_wire_format() {
-        let value = serde_json::json!({"type": "draft_discarded", "items": ["skill:wip", "rule:git", "manifest", "other:notes.txt"]});
-        let message: DaemonMessage = serde_json::from_value(value.clone()).unwrap();
-        assert_eq!(serde_json::to_value(message).unwrap(), value);
-    }
-
-    #[test]
     fn assignment_snapshots_carry_a_revision() {
         let mut a = Assignment::default();
-        a.set_skill("claude", "pdf", true);
+        a.set_skill("claude", &id("01J0"), true);
         let m =
             ServerMessage::Assignment(AssignmentSnapshot { revision: 7, assignment: a.clone(), registration: None });
         let v = serde_json::to_value(&m).unwrap();
         assert_eq!(v["type"], "assignment");
         assert_eq!(v["revision"], 7);
-        assert_eq!(v["harnesses"]["claude"]["skills"]["pdf"], true);
+        assert_eq!(v["harnesses"]["claude"]["skills"]["01J0"], true);
         assert_eq!(serde_json::from_value::<ServerMessage>(v).unwrap(), m);
-        // Without a revision (an older server) it reads as 0.
-        let old: ServerMessage = serde_json::from_str(r#"{"type":"assignment","harnesses":{}}"#).unwrap();
-        assert_eq!(old, ServerMessage::Assignment(AssignmentSnapshot::default()));
     }
 
     #[test]
@@ -645,7 +685,7 @@ mod tests {
         assert!(text.starts_with(r#"{"type":"status""#), "{text}");
         assert_eq!(serde_json::from_str::<DaemonMessage>(&text).unwrap(), status);
         let mut a = Assignment::default();
-        a.set_skill("claude", "pdf", false);
+        a.set_skill("claude", &id("01J0"), false);
         let snapshot = AssignmentSnapshot { revision: 1, assignment: a, registration: None };
         for m in [
             ServerMessage::Assignment(snapshot),
@@ -659,20 +699,10 @@ mod tests {
     }
 
     #[test]
-    fn scopes_are_additive() {
+    fn scopes_parse() {
         assert_eq!(serde_json::to_value(Scope::SelfOnly).unwrap(), "self");
         assert_eq!("fleet".parse::<Scope>().unwrap(), Scope::Fleet);
         assert!("admin".parse::<Scope>().is_err());
-        // An older server's bodies: no scope, expiry or skipped imports.
-        let code: JoinCode = serde_json::from_str(r#"{"code":"ABCDE-FGHJK"}"#).unwrap();
-        assert_eq!((code.expires_at, code.scope), (None, None));
-        let row: MachineRow = serde_json::from_str(
-            r#"{"id":"m","status":"in_sync","connected":true,"joined_at":0,"last_seen":null,"report":null}"#,
-        )
-        .unwrap();
-        assert_eq!(row.scope, Scope::Fleet);
-        let view: ImportsView = serde_json::from_str(r#"{"checked_at":null,"updates":[],"errors":[]}"#).unwrap();
-        assert!(view.skipped.is_empty());
         assert_eq!(serde_json::from_str::<JoinCodeRequest>("{}").unwrap().scope, Scope::Fleet);
     }
 

@@ -9,14 +9,18 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use sk1ll_proto::{
-    AssignmentCopied, AssignmentSnapshot, AssignmentUpdate, DaemonMessage, FleetView, ImportsView, ItemRef, JoinCode,
-    JoinResponse, LogCause, LogEntry, MachineReport, MachineRow, MachineStatus, Scope, ServerMessage, ToggleChange,
+    AssignmentSnapshot, AssignmentUpdate, DaemonMessage, FleetView, ImportsView, ItemId, ItemRef, JoinCode,
+    JoinResponse, LogCause, LogEntry, MachineReport, MachineRow, MachineStatus, ReportedItem, Scope, ServerMessage,
     ToggleKind,
 };
 use sk1ll_server::Config;
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 
 const ADMIN: &str = "admin-secret";
+
+fn id(s: &str) -> ItemId {
+    s.parse().unwrap()
+}
 
 struct TestServer {
     base: String,
@@ -262,6 +266,7 @@ fn fat_names(n: usize) -> Vec<String> {
 async fn fatten(server: &TestServer, ws: &mut Ws, machine: &str) {
     let names = fat_names(2000);
     let report = MachineReport {
+        seq: 1,
         drafts: names.iter().map(|n| ItemRef::Skill(n.clone())).collect(),
         harnesses: vec!["claude".into()],
         ..Default::default()
@@ -269,7 +274,7 @@ async fn fatten(server: &TestServer, ws: &mut Ws, machine: &str) {
     ws_send(ws, &DaemonMessage::Status(report.clone())).await;
     server.reported(machine, &report).await;
     let changes: Vec<Value> =
-        names.iter().map(|n| json!({"harness": "claude", "kind": "skill", "name": n, "enabled": true})).collect();
+        names.iter().map(|n| json!({"harness": "claude", "kind": "skill", "item_id": n, "enabled": true})).collect();
     server.put_assignment(ADMIN, machine, Value::Array(changes)).await;
 }
 
@@ -543,8 +548,8 @@ async fn an_expected_revision_and_registration_guard_a_write() {
     };
     let snapshot: AssignmentSnapshot = server.get_json(ADMIN, "/machines/ws/assignment").await;
     let registration = snapshot.registration.clone().expect("a registration");
-    assert_eq!(server.machine_row("ws").await.unwrap().registration.as_ref(), Some(&registration));
-    let change = json!([{"harness": "claude", "kind": "skill", "name": "pdf", "enabled": false}]);
+    assert_eq!(server.machine_row("ws").await.unwrap().registration, registration);
+    let change = json!([{"harness": "claude", "kind": "skill", "item_id": "pdf", "enabled": false}]);
     let expected = |revision: u64, registration: &str| json!({"changes": change, "expected": {"revision": revision, "registration": registration}});
     let resp = put(expected(snapshot.revision, &registration)).await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -569,126 +574,6 @@ async fn an_expected_revision_and_registration_guard_a_write() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_rename_copy_copies_the_source_toggles_and_keeps_explicit_ones() {
-    let server = start().await;
-    let token = server.join("ws", &["claude", "codex"]).await;
-    seed(&server, "ws", &token, &["personal/pdf/SKILL.md", "personal/csv/SKILL.md"]).await;
-    let request = |path: &str, body: Value| {
-        let request = server.http.post(server.url(path)).bearer_auth(&token).json(&body);
-        async move { request.send().await.unwrap() }
-    };
-    let copy = |from: &str, to: &str| request("/machines/ws/assignment/copy", json!({"from": from, "to": to}));
-    server
-        .put_assignment(
-            ADMIN,
-            "ws",
-            json!([
-                {"harness": "claude", "kind": "skill", "name": "pdf", "enabled": true},
-                {"harness": "codex", "kind": "skill", "name": "pdf", "enabled": true},
-                // Another client turned the new name off on codex first.
-                {"harness": "codex", "kind": "skill", "name": "docs", "enabled": false},
-            ]),
-        )
-        .await;
-    // A PUT can't turn on a name the machine can't have, whatever it claims.
-    let on = json!([{"harness": "claude", "kind": "skill", "name": "docs", "enabled": true}]);
-    let resp = server
-        .http
-        .put(server.url("/machines/ws/assignment"))
-        .bearer_auth(&token)
-        .json(&json!({"changes": on, "rename": {"from": "skill:pdf", "to": "skill:docs"}}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
-
-    assert_eq!(copy("skill:missing", "skill:docs").await.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(copy("rule:pdf", "skill:docs").await.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(copy("skill:pdf", "skill:pdf").await.status(), StatusCode::BAD_REQUEST);
-    // A known different item keeps its own toggles.
-    assert_eq!(copy("skill:pdf", "skill:csv").await.status(), StatusCode::CONFLICT);
-    assert_eq!(
-        request("/machines/nope/assignment/copy", json!({"from": "skill:pdf", "to": "skill:docs"})).await.status(),
-        StatusCode::NOT_FOUND
-    );
-
-    let before: AssignmentSnapshot = server.get_json(ADMIN, "/machines/ws/assignment").await;
-    let resp = copy("skill:pdf", "skill:docs").await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let copied: AssignmentCopied = resp.json().await.unwrap();
-    assert_eq!(copied.registration, before.registration);
-    assert_eq!(copied.revision, before.revision + 1);
-    let harnesses = |changes: &[ToggleChange]| changes.iter().map(|c| c.harness.clone()).collect::<Vec<_>>();
-    assert_eq!((harnesses(&copied.applied), harnesses(&copied.skipped)), (vec!["claude".into()], vec!["codex".into()]));
-    assert_eq!(copied.assignment.harness("claude").skills.get("docs"), Some(&true));
-    assert_eq!(copied.assignment.harness("codex").skills.get("docs"), Some(&false));
-    assert_eq!(copied.entries.len(), 1, "{:?}", copied.entries);
-    assert_eq!((copied.entries[0].cause.clone(), copied.entries[0].author.as_str()), (LogCause::Change, "ws"));
-    let after: AssignmentSnapshot = server.get_json(ADMIN, "/machines/ws/assignment").await;
-    assert_eq!((after.revision, after.assignment), (copied.revision, copied.assignment));
-
-    // Nothing to copy changes nothing.
-    let copied: AssignmentCopied = copy("skill:csv", "skill:tables").await.json().await.unwrap();
-    assert!(copied.applied.is_empty() && copied.skipped.is_empty() && copied.entries.is_empty());
-    assert_eq!(copied.revision, after.revision);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_push_before_the_rename_report_keeps_the_copied_toggles() {
-    let server = start().await;
-    let token = server.join("renamer", &["claude"]).await;
-    let pusher = server.join("pusher", &[]).await;
-    seed(&server, "renamer", &token, &["personal/pdf/SKILL.md", "personal/obsolete/SKILL.md"]).await;
-    let push_dir = clone(&server, "pusher", &pusher).await;
-    server
-        .put_assignment(
-            &token,
-            "renamer",
-            json!([
-                {"harness": "claude", "kind": "skill", "name": "pdf", "enabled": true},
-                {"harness": "claude", "kind": "skill", "name": "obsolete", "enabled": false},
-            ]),
-        )
-        .await;
-    let mut ws = ws_connect(&server, &token).await;
-    let before = MachineReport { harnesses: vec!["claude".into()], ..Default::default() };
-    ws_send(&mut ws, &DaemonMessage::Status(before.clone())).await;
-    server.reported("renamer", &before).await;
-
-    let copied: AssignmentCopied = server
-        .http
-        .post(server.url("/machines/renamer/assignment/copy"))
-        .bearer_auth(&token)
-        .json(&json!({"from": "skill:pdf", "to": "skill:docs"}))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(copied.applied.len(), 1);
-
-    let repo = push_dir.path().join("repo");
-    std::fs::remove_dir_all(repo.join("personal/obsolete")).unwrap();
-    commit_push(&server, &repo, "remove obsolete skill").await;
-    let path = "/machines/renamer/assignment";
-    let after = eventually(|| async {
-        let snapshot: AssignmentSnapshot = server.get_json(&token, path).await;
-        (!snapshot.assignment.harness("claude").skills.contains_key("obsolete")).then_some(snapshot)
-    })
-    .await;
-    assert_eq!(after.assignment.harness("claude").skills.get("docs"), Some(&true));
-
-    let renamed = MachineReport { drafts: vec![ItemRef::Skill("docs".into())], ..before };
-    ws_send(&mut ws, &DaemonMessage::Status(renamed.clone())).await;
-    server.reported("renamer", &renamed).await;
-    let after: AssignmentSnapshot = server.get_json(&token, path).await;
-    assert_eq!(after.assignment.harness("claude").skills.get("docs"), Some(&true));
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn assignment_changes_are_logged_and_undoable() {
     let server = start().await;
     let token = server.join("ws", &["claude"]).await;
@@ -699,13 +584,13 @@ async fn assignment_changes_are_logged_and_undoable() {
             &token,
             "ws",
             json!([
-                {"harness": "claude", "kind": "skill", "name": "pdf", "enabled": true},
+                {"harness": "claude", "kind": "skill", "item_id": "pdf", "enabled": true},
                 {"harness": "claude", "kind": "new_rules_default", "enabled": true},
                 {"harness": "claude", "kind": "new_rules_default", "enabled": true},
             ]),
         )
         .await;
-    assert!(update.assignment.skill_enabled("claude", "pdf"));
+    assert!(update.assignment.skill_enabled("claude", &id("pdf")));
     assert_eq!(update.entries.len(), 2, "the repeated change is a no-op");
     let e = &update.entries[0];
     assert_eq!((e.author.as_str(), e.machine.as_str(), e.kind), ("ws", "ws", ToggleKind::Skill));
@@ -731,7 +616,7 @@ async fn assignment_changes_are_logged_and_undoable() {
     assert_eq!((u.author.as_str(), u.before, u.after), ("admin", Some(true), None));
     assert_eq!(u.cause, LogCause::Undo { entry: e.id });
     let a = server.get_json::<AssignmentSnapshot>(&token, "/machines/ws/assignment").await.assignment;
-    assert!(!a.harness("claude").skills.contains_key("pdf"));
+    assert!(!a.harness("claude").skills.contains_key(&id("pdf")));
     assert!(a.harness("claude").new_rules_default);
 
     let again = server.http.post(server.url(&format!("/log/{}/undo", e.id))).bearer_auth(ADMIN).send().await.unwrap();
@@ -745,7 +630,7 @@ async fn log_filters_and_facets_cover_the_whole_log() {
     let token = server.join("ws", &["claude", "codex"]).await;
     seed(&server, "ws", &token, &["personal/pdf/SKILL.md"]).await;
     let pdf = server
-        .put_assignment(&token, "ws", json!([{"harness": "codex", "kind": "skill", "name": "pdf", "enabled": true}]))
+        .put_assignment(&token, "ws", json!([{"harness": "codex", "kind": "skill", "item_id": sk1ll_proto::ItemId::derived("skill", "pdf"), "enabled": true}]))
         .await
         .entries[0]
         .clone();
@@ -786,7 +671,7 @@ async fn websocket_gets_assignment_nudge_and_status() {
     assert_eq!(ws_next(&mut ws).await, ServerMessage::Nudge { baseline: fleet.baseline.unwrap() });
 
     ws_send(&mut ws, &DaemonMessage::Hello { machine_id: "ws".into() }).await;
-    let report = MachineReport { harnesses: vec!["claude".into(), "codex".into()], ..Default::default() };
+    let report = MachineReport { seq: 1, harnesses: vec!["claude".into(), "codex".into()], ..Default::default() };
     ws_send(&mut ws, &DaemonMessage::Status(report)).await;
     // `codex` was new, so the server adds it all off and pushes the assignment.
     let ServerMessage::Assignment(b) = ws_next(&mut ws).await else { panic!("expected assignment") };
@@ -801,10 +686,14 @@ async fn websocket_gets_assignment_nudge_and_status() {
     assert_eq!(ws_next(&mut ws).await, ServerMessage::Nudge { baseline: head.clone() });
 
     server
-        .put_assignment(&token, "ws", json!([{"harness": "claude", "kind": "skill", "name": "pdf", "enabled": true}]))
+        .put_assignment(
+            &token,
+            "ws",
+            json!([{"harness": "claude", "kind": "skill", "item_id": "pdf", "enabled": true}]),
+        )
         .await;
     let ServerMessage::Assignment(a) = ws_next(&mut ws).await else { panic!("expected assignment") };
-    assert!(a.assignment.skill_enabled("claude", "pdf"));
+    assert!(a.assignment.skill_enabled("claude", &id("pdf")));
 
     let fleet: FleetView = server.get_json(&token, "/fleet").await;
     assert_eq!(fleet.baseline.as_deref(), Some(head.as_str()));
@@ -812,6 +701,7 @@ async fn websocket_gets_assignment_nudge_and_status() {
     assert_eq!(fleet.machines[0].status, MachineStatus::Behind);
 
     let report = MachineReport {
+        seq: 2,
         baseline: Some(head.clone()),
         drafts: vec![ItemRef::Skill("new".into())],
         harnesses: vec!["claude".into(), "codex".into()],
@@ -839,7 +729,11 @@ async fn removing_a_machine_revokes_it() {
     let b_token = server.join("b", &["claude"]).await;
     seed(&server, "b", &b_token, &["personal/pdf/SKILL.md"]).await;
     server
-        .put_assignment(&a_token, "a", json!([{"harness": "claude", "kind": "skill", "name": "pdf", "enabled": true}]))
+        .put_assignment(
+            &a_token,
+            "a",
+            json!([{"harness": "claude", "kind": "skill", "item_id": "pdf", "enabled": true}]),
+        )
         .await;
     let mut ws = ws_connect(&server, &a_token).await;
     assert!(matches!(ws_next(&mut ws).await, ServerMessage::Assignment(_)));
@@ -865,186 +759,6 @@ async fn removing_a_machine_revokes_it() {
 
     let fleet: FleetView = server.get_json(&b_token, "/fleet").await;
     assert_eq!(fleet.machines.len(), 1);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn toggles_for_items_removed_from_baseline_are_dropped() {
-    let server = start().await;
-    let token = server.join("ws", &["claude"]).await;
-    let other = server.join("other", &["claude"]).await;
-    let dir = clone(&server, "ws", &token).await;
-    let repo = dir.path().join("repo");
-    write(&repo, "personal/pdf/SKILL.md", "pdf\n");
-    write(&repo, "personal/keep/SKILL.md", "keep\n");
-    write(&repo, "instructions/git.md", "git\n");
-    commit_push(&server, &repo, "initial").await;
-
-    let toggles = json!([
-        {"harness": "claude", "kind": "skill", "name": "pdf", "enabled": true},
-        {"harness": "claude", "kind": "skill", "name": "keep", "enabled": true},
-        {"harness": "claude", "kind": "rule", "name": "git", "enabled": true},
-    ]);
-    server.put_assignment(&token, "ws", toggles.clone()).await;
-    server.put_assignment(&token, "other", toggles).await;
-    // `other` has `pdf` in its draft, so its toggle survives.
-    let mut ws = ws_connect(&server, &other).await;
-    ws_next(&mut ws).await;
-    let report = MachineReport {
-        drafts: vec![ItemRef::Skill("pdf".into())],
-        harnesses: vec!["claude".into()],
-        ..Default::default()
-    };
-    ws_send(&mut ws, &DaemonMessage::Status(report)).await;
-    eventually(|| async {
-        let fleet: FleetView = server.get_json(&token, "/fleet").await;
-        fleet.machines.iter().find(|m| m.id == "other")?.report.as_ref().map(|_| ())
-    })
-    .await;
-
-    std::fs::remove_dir_all(repo.join("personal/pdf")).unwrap();
-    std::fs::remove_file(repo.join("instructions/git.md")).unwrap();
-    commit_push(&server, &repo, "drop pdf and git").await;
-
-    let a = eventually(|| async {
-        let a = server.get_json::<AssignmentSnapshot>(&token, "/machines/ws/assignment").await.assignment;
-        Some(a).filter(|a| !a.harness("claude").skills.contains_key("pdf"))
-    })
-    .await;
-    let claude = a.harness("claude");
-    assert!(claude.skills["keep"] && claude.rules.is_empty());
-
-    let other_a = server.get_json::<AssignmentSnapshot>(&token, "/machines/other/assignment").await.assignment;
-    assert!(other_a.harness("claude").skills.contains_key("pdf"));
-    assert!(other_a.harness("claude").rules.is_empty());
-
-    let log: Vec<LogEntry> = server.get_json(&token, "/log").await;
-    let dropped: Vec<_> = log.iter().filter(|e| e.cause == LogCause::ItemRemoved).collect();
-    assert_eq!(dropped.len(), 3);
-    assert!(dropped.iter().all(|e| e.author == "server" && e.before == Some(true) && e.after.is_none()));
-
-    // Once `pdf` leaves `other`'s draft, a later push that didn't remove it
-    // leaves its toggle, which does nothing while `pdf` is absent.
-    let report = MachineReport { harnesses: vec!["claude".into()], ..Default::default() };
-    ws_send(&mut ws, &DaemonMessage::Status(report.clone())).await;
-    server.reported("other", &report).await;
-    std::fs::remove_dir_all(repo.join("personal/keep")).unwrap();
-    commit_push(&server, &repo, "drop keep").await;
-    let other_a = eventually(|| async {
-        let a = server.get_json::<AssignmentSnapshot>(&token, "/machines/other/assignment").await.assignment;
-        Some(a).filter(|a| !a.harness("claude").skills.contains_key("keep"))
-    })
-    .await;
-    assert_eq!(other_a.harness("claude").skills.get("pdf"), Some(&true));
-}
-
-/// Review finding: a `self` machine's push must not change other machines'
-/// assignments. It drops only its own toggles for the items it removed; the
-/// others' stay, so restoring the items restores them. A fleet push drops
-/// toggles only for the items it removed itself.
-#[tokio::test(flavor = "multi_thread")]
-async fn pushes_drop_only_toggles_for_the_items_they_removed() {
-    let server = start().await;
-    let me = server.join_scoped("me", &["claude"], "self").await;
-    let fleet = server.join_scoped("fleet", &["claude"], "fleet").await;
-    let (me_dir, _) = seed(&server, "me", &me, &["personal/pdf/SKILL.md", "instructions/git.md"]).await;
-    let mine = me_dir.path().join("repo");
-    // `gone` was never in the baseline: an explicit off toggle for it is allowed.
-    let on = json!([
-        {"harness": "claude", "kind": "skill", "name": "pdf", "enabled": true},
-        {"harness": "claude", "kind": "rule", "name": "git", "enabled": false},
-        {"harness": "claude", "kind": "skill", "name": "gone", "enabled": false},
-    ]);
-    server.put_assignment(&me, "me", on.clone()).await;
-    server.put_assignment(&fleet, "fleet", on).await;
-    let toggles = |id: &'static str| {
-        let server = &server;
-        async move {
-            let a = server.get_json::<AssignmentSnapshot>(ADMIN, &format!("/machines/{id}/assignment")).await;
-            let claude = a.assignment.harness("claude");
-            (claude.skills.get("pdf").copied(), claude.rules.get("git").copied(), claude.skills.get("gone").copied())
-        }
-    };
-
-    // The self machine removes `pdf` and `git`: only its own toggles for them go.
-    std::fs::remove_dir_all(mine.join("personal/pdf")).unwrap();
-    std::fs::remove_file(mine.join("instructions/git.md")).unwrap();
-    commit_push(&server, &mine, "drop pdf and git").await;
-    eventually(|| async { (toggles("me").await == (None, None, Some(false))).then_some(()) }).await;
-    assert_eq!(toggles("fleet").await, (Some(true), Some(false), Some(false)));
-
-    // A fleet push removing only `tmp` drops only `tmp`, everywhere.
-    let fleet_dir = clone(&server, "fleet", &fleet).await;
-    let theirs = fleet_dir.path().join("repo");
-    write(&theirs, "personal/tmp/SKILL.md", "tmp\n");
-    commit_push(&server, &theirs, "add tmp").await;
-    let tmp = json!([{"harness": "claude", "kind": "skill", "name": "tmp", "enabled": true}]);
-    server.put_assignment(&fleet, "fleet", tmp.clone()).await;
-    server.put_assignment(&me, "me", tmp).await;
-    std::fs::remove_dir_all(theirs.join("personal/tmp")).unwrap();
-    commit_push(&server, &theirs, "drop tmp").await;
-    for id in ["fleet", "me"] {
-        eventually(|| async {
-            let a = server.get_json::<AssignmentSnapshot>(ADMIN, &format!("/machines/{id}/assignment")).await;
-            (!a.assignment.harness("claude").skills.contains_key("tmp")).then_some(())
-        })
-        .await;
-    }
-    assert_eq!(toggles("fleet").await, (Some(true), Some(false), Some(false)));
-    assert_eq!(toggles("me").await, (None, None, Some(false)));
-    let log: Vec<LogEntry> = server.get_json(ADMIN, "/log?machine=fleet").await;
-    let dropped: Vec<_> = log.iter().filter(|e| e.cause == LogCause::ItemRemoved).collect();
-    assert_eq!(dropped.len(), 1, "{log:?}");
-    assert_eq!(dropped[0].name.as_deref(), Some("tmp"));
-
-    // Restoring the content restores the assignment.
-    git(&mine, &["pull", "--quiet", "--rebase", "origin", "main"]);
-    write(&mine, "personal/pdf/SKILL.md", "pdf\n");
-    write(&mine, "instructions/git.md", "git\n");
-    commit_push(&server, &mine, "restore pdf and git").await;
-    assert_eq!(toggles("fleet").await, (Some(true), Some(false), Some(false)));
-
-    // Once restored, a fleet push that removes `pdf` sweeps it as before.
-    git(&theirs, &["pull", "--quiet", "--rebase", "origin", "main"]);
-    std::fs::remove_dir_all(theirs.join("personal/pdf")).unwrap();
-    commit_push(&server, &theirs, "drop pdf").await;
-    eventually(|| async { (toggles("fleet").await == (None, Some(false), Some(false))).then_some(()) }).await;
-}
-
-/// Review finding: a push swept every toggle for an absent item, so a draft
-/// that a peer's latest status happened to leave out (a stash during a pull,
-/// say) lost its toggle to any unrelated push.
-#[tokio::test(flavor = "multi_thread")]
-async fn unrelated_push_keeps_a_draft_missing_from_the_latest_status() {
-    let server = start().await;
-    let token = server.join("ws", &["claude"]).await;
-    let pusher = server.join("pusher", &["claude"]).await;
-    let (dir, _) = seed(&server, "pusher", &pusher, &["personal/tmp/SKILL.md"]).await;
-    let mut ws = ws_connect(&server, &token).await;
-    let drafting = MachineReport {
-        drafts: vec![ItemRef::Skill("wip".into())],
-        harnesses: vec!["claude".into()],
-        ..Default::default()
-    };
-    ws_send(&mut ws, &DaemonMessage::Status(drafting.clone())).await;
-    server.reported("ws", &drafting).await;
-    let changes = json!([
-        {"harness": "claude", "kind": "skill", "name": "wip", "enabled": true},
-        {"harness": "claude", "kind": "skill", "name": "tmp", "enabled": true},
-    ]);
-    server.put_assignment(&token, "ws", changes).await;
-    let empty = MachineReport { harnesses: vec!["claude".into()], ..Default::default() };
-    ws_send(&mut ws, &DaemonMessage::Status(empty.clone())).await;
-    server.reported("ws", &empty).await;
-
-    std::fs::remove_dir_all(dir.path().join("repo/personal/tmp")).unwrap();
-    commit_push(&server, &dir.path().join("repo"), "drop tmp").await;
-    // The `tmp` toggle going proves the push's sweep has completed.
-    let a = eventually(|| async {
-        let a = server.get_json::<AssignmentSnapshot>(&token, "/machines/ws/assignment").await.assignment;
-        Some(a).filter(|a| !a.harness("claude").skills.contains_key("tmp"))
-    })
-    .await;
-    assert_eq!(a.harness("claude").skills.get("wip"), Some(&true));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1201,22 +915,22 @@ async fn join_codes_carry_their_scope_and_expiry() {
     let server = start_with(|c| c.join_code_ttl = Duration::from_secs(3600), false).await;
     let before = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
     let code = server.scoped_code(ADMIN, "self").await;
-    assert_eq!(code.scope, Some(Scope::SelfOnly));
-    let expires = code.expires_at.unwrap();
+    assert_eq!(code.scope, Scope::SelfOnly);
+    let expires = code.expires_at;
     assert!((before + 3600..=before + 3605).contains(&expires), "{expires} vs {before}");
-    // No body, `null` (older daemons) and `{}` all ask for a fleet code.
+    // No body, `null` and `{}` all ask for a fleet code.
     for body in [None, Some("null"), Some("{}"), Some(" ")] {
         let resp = server.create_code(ADMIN, body).await;
         assert_eq!(resp.status(), StatusCode::CREATED, "{body:?}");
-        assert_eq!(resp.json::<JoinCode>().await.unwrap().scope, Some(Scope::Fleet), "{body:?}");
+        assert_eq!(resp.json::<JoinCode>().await.unwrap().scope, Scope::Fleet, "{body:?}");
     }
     for body in [r#"{"scope":"admin"}"#, "[", r#""self""#] {
         assert_eq!(server.create_code(ADMIN, Some(body)).await.status(), StatusCode::BAD_REQUEST, "{body}");
     }
     // A fleet machine may mint either scope.
     let fleet = server.join("f", &[]).await;
-    assert_eq!(server.scoped_code(&fleet, "self").await.scope, Some(Scope::SelfOnly));
-    assert_eq!(server.scoped_code(&fleet, "fleet").await.scope, Some(Scope::Fleet));
+    assert_eq!(server.scoped_code(&fleet, "self").await.scope, Scope::SelfOnly);
+    assert_eq!(server.scoped_code(&fleet, "fleet").await.scope, Scope::Fleet);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1248,17 +962,16 @@ async fn self_scoped_machines_manage_only_themselves() {
     let mine = server.put_assignment(&me, "me", toggle.clone()).await;
     forbidden(server.try_put_assignment(&me, "other", toggle.clone()).await).await;
     forbidden(server.try_put_assignment(&me, "ghost", toggle.clone()).await).await;
-    // A rename's copy follows the same rule: its own gets past the scope
-    // check (and fails only on the unknown item), no one else's does.
+    // Copying another Machine's Assignment can only target this Machine.
     let copy = |id: &str| {
         let req = server
             .http
-            .post(server.url(&format!("/machines/{id}/assignment/copy")))
+            .post(server.url(&format!("/machines/{id}/assignment/copy-from")))
             .bearer_auth(&me)
-            .json(&json!({"from": "skill:pdf", "to": "skill:docs"}));
+            .json(&json!({"source": "other", "mode": "merge"}));
         async move { req.send().await.unwrap() }
     };
-    assert_eq!(copy("me").await.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(copy("me").await.status(), StatusCode::OK);
     forbidden(copy("other").await).await;
     forbidden(copy("ghost").await).await;
     let theirs = server.put_assignment(&other, "other", toggle.clone()).await;
@@ -1312,11 +1025,13 @@ async fn replaced_socket_cannot_report_after_revocation() {
 
     let token = server.join("ws", &["claude"]).await;
     let mut fresh = ws_connect(&server, &token).await;
-    let good = MachineReport { baseline: Some("good".into()), harnesses: vec!["claude".into()], ..Default::default() };
+    let good =
+        MachineReport { seq: 1, baseline: Some("good".into()), harnesses: vec!["claude".into()], ..Default::default() };
     ws_send(&mut fresh, &DaemonMessage::Status(good.clone())).await;
     server.reported("ws", &good).await;
 
-    let evil = MachineReport { baseline: Some("evil".into()), harnesses: vec!["evil".into()], ..Default::default() };
+    let evil =
+        MachineReport { seq: 2, baseline: Some("evil".into()), harnesses: vec!["evil".into()], ..Default::default() };
     let _ = old.send(Message::text(serde_json::to_string(&DaemonMessage::Status(evil)).unwrap())).await;
     // The server let go of the old socket: it ends once what's buffered is read.
     let drained = tokio::time::timeout(Duration::from_secs(20), async { while let Some(Ok(_)) = old.next().await {} });
@@ -1338,7 +1053,7 @@ async fn stalled_daemon_gets_only_the_latest_assignment() {
     let name = &fat_names(1)[0];
     let mut last = 0;
     for i in 0..30 {
-        let change = json!([{"harness": "claude", "kind": "skill", "name": name, "enabled": i % 2 == 1}]);
+        let change = json!([{"harness": "claude", "kind": "skill", "item_id": name, "enabled": i % 2 == 1}]);
         last = server.put_assignment(&token, "ws", change).await.revision;
     }
 
@@ -1347,7 +1062,7 @@ async fn stalled_daemon_gets_only_the_latest_assignment() {
         let a = ws_assignment(&mut ws).await;
         received.push(a.revision);
         if a.revision == last {
-            assert!(a.assignment.skill_enabled("claude", name));
+            assert!(a.assignment.skill_enabled("claude", &id(name)));
             break;
         }
     }
@@ -1375,12 +1090,14 @@ async fn reports_keep_every_kind_of_draft_item() {
     let fleet: FleetView = server.get_json(&token, "/fleet").await;
     let text = json!({
         "type": "status",
+        "seq": 1,
         "baseline": fleet.baseline,
         "drafts": ["skill:pdf", "manifest", "other:notes.txt", "bogus:x"],
         "harnesses": ["claude"],
     });
     ws.send(Message::text(text.to_string())).await.unwrap();
     let expected = MachineReport {
+        seq: 1,
         baseline: fleet.baseline,
         drafts: vec![ItemRef::Skill("pdf".into()), ItemRef::Manifest, ItemRef::Other("notes.txt".into())],
         harnesses: vec!["claude".into()],
@@ -1391,14 +1108,19 @@ async fn reports_keep_every_kind_of_draft_item() {
 }
 
 /// Review finding: pushes in quick succession collapsed into fewer nudges.
+/// A push that deletes an item changes no assignment (ADR 0006).
 #[tokio::test(flavor = "multi_thread")]
-async fn each_push_is_announced_and_cleaned_up() {
+async fn each_push_is_announced_and_changes_no_assignment() {
     let server = start().await;
     let token = server.join("ws", &["claude"]).await;
     let (dir, c0) = seed(&server, "ws", &token, &["personal/pdf/SKILL.md"]).await;
     let repo = dir.path().join("repo");
     server
-        .put_assignment(&token, "ws", json!([{"harness": "claude", "kind": "skill", "name": "pdf", "enabled": true}]))
+        .put_assignment(
+            &token,
+            "ws",
+            json!([{"harness": "claude", "kind": "skill", "item_id": "pdf", "enabled": true}]),
+        )
         .await;
     let mut ws = ws_connect(&server, &token).await;
     ws_assignment(&mut ws).await;
@@ -1419,9 +1141,9 @@ async fn each_push_is_announced_and_cleaned_up() {
     }
     assert_eq!(nudges, [c1, c2, c3]);
     let a = server.get_json::<AssignmentSnapshot>(&token, "/machines/ws/assignment").await.assignment;
-    assert!(!a.harness("claude").skills.contains_key("pdf"));
+    assert!(a.harness("claude").skills.contains_key(&id("pdf")));
     let log: Vec<LogEntry> = server.get_json(&token, "/log?machine=ws").await;
-    assert!(log.iter().any(|e| e.cause == LogCause::ItemRemoved && e.name.as_deref() == Some("pdf")));
+    assert_eq!(log.len(), 1, "{log:?}");
 }
 
 /// Review finding: snapshots could reach the daemon out of commit order.
@@ -1435,7 +1157,7 @@ async fn assignment_revisions_arrive_in_order() {
     let first = ws_assignment(&mut ws).await.revision;
 
     let puts = (0..20).map(|i| {
-        let change = json!([{"harness": "claude", "kind": "skill", "name": format!("k{i:02}"), "enabled": true}]);
+        let change = json!([{"harness": "claude", "kind": "skill", "item_id": format!("k{i:02}"), "enabled": true}]);
         server.put_assignment(&token, "ws", change)
     });
     let last = futures_util::future::join_all(puts).await.iter().map(|u| u.revision).max().unwrap();
@@ -1462,257 +1184,6 @@ async fn assignment_revisions_arrive_in_order() {
     assert_eq!(log_before, log_after);
 }
 
-/// Review finding: a PUT could enable another machine's private draft item.
-#[tokio::test(flavor = "multi_thread")]
-async fn assignments_only_accept_items_the_machine_can_have() {
-    let server = start().await;
-    let a = server.join("a", &["claude"]).await;
-    let b = server.join("b", &["claude"]).await;
-    seed(&server, "a", &a, &["personal/pdf/SKILL.md", "instructions/git.md"]).await;
-    let mut ws = ws_connect(&server, &b).await;
-    let report = MachineReport {
-        drafts: vec![ItemRef::Skill("secret".into()), ItemRef::Rule("wip".into())],
-        harnesses: vec!["claude".into()],
-        ..Default::default()
-    };
-    ws_send(&mut ws, &DaemonMessage::Status(report.clone())).await;
-    server.reported("b", &report).await;
-
-    for (kind, name) in [("skill", "secret"), ("rule", "wip"), ("skill", "nowhere")] {
-        let change = json!([{"harness": "claude", "kind": kind, "name": name, "enabled": true}]);
-        let resp = server.try_put_assignment(&a, "a", change).await;
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        let body: Value = resp.json().await.unwrap();
-        assert!(body["error"].as_str().unwrap().contains(&format!("{kind}:{name}")), "{body}");
-    }
-    let mine = json!([
-        {"harness": "claude", "kind": "skill", "name": "secret", "enabled": true},
-        {"harness": "claude", "kind": "rule", "name": "wip", "enabled": true},
-    ]);
-    assert_eq!(server.put_assignment(&b, "b", mine).await.entries.len(), 2);
-    let baseline = json!([
-        {"harness": "claude", "kind": "skill", "name": "pdf", "enabled": true},
-        {"harness": "claude", "kind": "rule", "name": "git", "enabled": true},
-        {"harness": "claude", "kind": "new_rules_default", "enabled": false},
-    ]);
-    assert_eq!(server.put_assignment(&a, "a", baseline).await.entries.len(), 2);
-    // Switching off or clearing unknown items is always fine.
-    let cleanup = json!([
-        {"harness": "claude", "kind": "skill", "name": "gone", "enabled": null},
-        {"harness": "claude", "kind": "skill", "name": "gone", "enabled": false},
-    ]);
-    server.put_assignment(&a, "a", cleanup).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn assignments_accept_only_the_destination_machines_unpushed_items() {
-    let server = start().await;
-    let a = server.join("a", &["claude"]).await;
-    let b = server.join("b", &["claude"]).await;
-    let mut ws = ws_connect(&server, &a).await;
-    let report = MachineReport {
-        unpushed: vec![ItemRef::Skill("wip".into()), ItemRef::Rule("git".into())],
-        ..Default::default()
-    };
-    ws_send(&mut ws, &DaemonMessage::Status(report.clone())).await;
-    server.reported("a", &report).await;
-    let changes = json!([
-        {"harness": "claude", "kind": "skill", "name": "wip", "enabled": true},
-        {"harness": "claude", "kind": "rule", "name": "git", "enabled": true},
-    ]);
-    // Validation uses the destination's report, regardless of the caller.
-    assert_eq!(server.try_put_assignment(&a, "b", changes.clone()).await.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    let enabled = server.put_assignment(&b, "a", changes).await;
-    assert_eq!(enabled.entries.len(), 2);
-    assert!(enabled.assignment.skill_enabled("claude", "wip"));
-    assert!(enabled.assignment.rule_enabled("claude", "git"));
-
-    let disabled = server
-        .put_assignment(&b, "a", json!([{"harness": "claude", "kind": "skill", "name": "wip", "enabled": false}]))
-        .await;
-    let undo = server
-        .http
-        .post(server.url(&format!("/log/{}/undo", disabled.entries[0].id)))
-        .bearer_auth(&b)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(undo.status(), StatusCode::OK);
-    assert!(undo.json::<AssignmentUpdate>().await.unwrap().assignment.skill_enabled("claude", "wip"));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn push_keeps_toggles_for_removed_items_in_unpushed_commits() {
-    let server = start().await;
-    let a = server.join("a", &["claude"]).await;
-    let b = server.join("b", &["claude"]).await;
-    let files = ["README.md", "personal/wip/SKILL.md", "instructions/git.md", "personal/stale/SKILL.md"];
-    let (dir_a, baseline) = seed(&server, "a", &a, &files).await;
-    let dir_b = clone(&server, "b", &b).await;
-    let repo_a = dir_a.path().join("repo");
-    write(&repo_a, "personal/wip/SKILL.md", "local skill\n");
-    write(&repo_a, "instructions/git.md", "local rule\n");
-    let mut ws = ws_connect(&server, &a).await;
-    server
-        .put_assignment(
-            &a,
-            "a",
-            json!([
-                {"harness": "claude", "kind": "skill", "name": "wip", "enabled": true},
-                {"harness": "claude", "kind": "rule", "name": "git", "enabled": true},
-                {"harness": "claude", "kind": "skill", "name": "stale", "enabled": false},
-            ]),
-        )
-        .await;
-    git_async(repo_a.clone(), vec!["add".into(), "-A".into()]).await;
-    git_async(repo_a, vec!["commit".into(), "--quiet".into(), "-m".into(), "commit locally".into()]).await;
-    let committed = MachineReport {
-        baseline: Some(baseline),
-        unpushed: vec![ItemRef::Skill("wip".into()), ItemRef::Rule("git".into())],
-        ..Default::default()
-    };
-    ws_send(&mut ws, &DaemonMessage::Status(committed.clone())).await;
-    server.reported("a", &committed).await;
-
-    let repo_b = dir_b.path().join("repo");
-    std::fs::remove_dir_all(repo_b.join("personal/wip")).unwrap();
-    std::fs::remove_dir_all(repo_b.join("personal/stale")).unwrap();
-    std::fs::remove_file(repo_b.join("instructions/git.md")).unwrap();
-    commit_push(&server, &repo_b, "drop wip, git and stale").await;
-    // The stale toggle proves the push's sweep has completed.
-    let assignment = eventually(|| async {
-        let a = server.get_json::<AssignmentSnapshot>(&a, "/machines/a/assignment").await.assignment;
-        (!a.harness("claude").skills.contains_key("stale")).then_some(a)
-    })
-    .await;
-    assert_eq!(assignment.harness("claude").skills.get("wip"), Some(&true));
-    assert_eq!(assignment.harness("claude").rules.get("git"), Some(&true));
-    let log: Vec<LogEntry> = server.get_json(&a, "/log?machine=a").await;
-    assert!(!log.iter().any(|e| e.cause == LogCause::ItemRemoved && e.name.as_deref() != Some("stale")));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn draft_discarded_preserves_unpushed_items() {
-    let server = start().await;
-    let token = server.join("a", &["claude"]).await;
-    let mut ws = ws_connect(&server, &token).await;
-    let drafting =
-        MachineReport { drafts: vec![ItemRef::Skill("wip".into()), ItemRef::Rule("git".into())], ..Default::default() };
-    ws_send(&mut ws, &DaemonMessage::Status(drafting.clone())).await;
-    server.reported("a", &drafting).await;
-    server
-        .put_assignment(
-            &token,
-            "a",
-            json!([
-                {"harness": "claude", "kind": "skill", "name": "wip", "enabled": true},
-                {"harness": "claude", "kind": "rule", "name": "git", "enabled": true},
-                {"harness": "claude", "kind": "skill", "name": "gone", "enabled": false},
-            ]),
-        )
-        .await;
-    let committed = MachineReport { unpushed: drafting.drafts, ..Default::default() };
-    ws_send(&mut ws, &DaemonMessage::Status(committed.clone())).await;
-    server.reported("a", &committed).await;
-    ws_send(
-        &mut ws,
-        &DaemonMessage::DraftDiscarded {
-            id: None,
-            items: vec![ItemRef::Skill("wip".into()), ItemRef::Rule("git".into()), ItemRef::Skill("gone".into())],
-        },
-    )
-    .await;
-    // A later report is a barrier for processing the discard message.
-    let marker = MachineReport { behind: true, ..committed };
-    ws_send(&mut ws, &DaemonMessage::Status(marker.clone())).await;
-    server.reported("a", &marker).await;
-    let assignment = server.get_json::<AssignmentSnapshot>(&token, "/machines/a/assignment").await.assignment;
-    assert!(!assignment.harness("claude").skills.contains_key("gone"));
-    assert_eq!(assignment.harness("claude").skills.get("wip"), Some(&true));
-    assert_eq!(assignment.harness("claude").rules.get("git"), Some(&true));
-}
-
-/// Review finding: toggles kept for a draft item outlived the draft.
-#[tokio::test(flavor = "multi_thread")]
-async fn draft_discarded_drops_and_logs_only_removed_items() {
-    let server = start().await;
-    let token = server.join("ws", &["claude"]).await;
-    let other = server.join("other", &["claude"]).await;
-    let (_dir, _) = seed(&server, "ws", &token, &["personal/pdf/SKILL.md"]).await;
-    let mut ws = ws_connect(&server, &token).await;
-    let drafting = MachineReport {
-        drafts: vec![ItemRef::Skill("wip".into()), ItemRef::Rule("keep".into())],
-        harnesses: vec!["claude".into()],
-        ..Default::default()
-    };
-    ws_send(&mut ws, &DaemonMessage::Status(drafting.clone())).await;
-    server.reported("ws", &drafting).await;
-    server
-        .put_assignment(
-            &token,
-            "ws",
-            json!([
-                {"harness": "claude", "kind": "skill", "name": "wip", "enabled": true},
-                {"harness": "claude", "kind": "rule", "name": "keep", "enabled": true},
-                {"harness": "claude", "kind": "skill", "name": "pdf", "enabled": true},
-                {"harness": "claude", "kind": "skill", "name": "unmentioned", "enabled": false}
-            ]),
-        )
-        .await;
-    server
-        .put_assignment(
-            &other,
-            "other",
-            json!([{"harness": "claude", "kind": "skill", "name": "wip", "enabled": false}]),
-        )
-        .await;
-    while !ws_assignment(&mut ws).await.assignment.skill_enabled("claude", "wip") {}
-
-    let restore = MachineReport {
-        drafts: vec![ItemRef::Rule("keep".into())],
-        harnesses: vec!["claude".into()],
-        ..Default::default()
-    };
-    ws_send(&mut ws, &DaemonMessage::Status(restore.clone())).await;
-    server.reported("ws", &restore).await;
-    let before = server.get_json::<AssignmentSnapshot>(&token, "/machines/ws/assignment").await.assignment;
-    assert!(before.skill_enabled("claude", "wip"), "status alone must preserve the toggle");
-    let discarded = DaemonMessage::DraftDiscarded {
-        id: Some(17),
-        items: vec![
-            ItemRef::Skill("wip".into()),
-            ItemRef::Skill("wip".into()),
-            ItemRef::Skill("pdf".into()),
-            ItemRef::Rule("keep".into()),
-            ItemRef::Manifest,
-            ItemRef::Other("notes.txt".into()),
-        ],
-    };
-    ws_send(&mut ws, &discarded).await;
-    let a = ws_assignment(&mut ws).await;
-    assert_eq!(ws_next(&mut ws).await, ServerMessage::DraftDiscardApplied { id: 17 });
-    let claude = a.assignment.harness("claude");
-    assert!(!claude.skills.contains_key("wip"));
-    assert_eq!(claude.skills.get("unmentioned"), Some(&false));
-    assert!(claude.skills["pdf"] && claude.rules["keep"]);
-    let other_a = server.get_json::<AssignmentSnapshot>(&token, "/machines/other/assignment").await.assignment;
-    assert_eq!(other_a.harness("claude").skills.get("wip"), Some(&false));
-
-    // A repeat is a no-op, including the assignment revision and log.
-    ws_send(&mut ws, &discarded).await;
-    assert_eq!(ws_next(&mut ws).await, ServerMessage::DraftDiscardApplied { id: 17 });
-    let marker = MachineReport { behind: true, ..restore };
-    ws_send(&mut ws, &DaemonMessage::Status(marker.clone())).await;
-    server.reported("ws", &marker).await;
-    let unchanged: AssignmentSnapshot = server.get_json(&token, "/machines/ws/assignment").await;
-    assert_eq!(unchanged.revision, a.revision);
-    let log: Vec<LogEntry> = server.get_json(&token, "/log?machine=ws").await;
-    let dropped: Vec<_> = log.iter().filter(|e| e.cause == LogCause::ItemRemoved).collect();
-    assert_eq!(dropped.len(), 1);
-    let e = dropped[0];
-    assert_eq!((e.author.as_str(), e.name.as_deref(), e.before, e.after), ("server", Some("wip"), Some(true), None));
-}
-
 /// Review finding: a silent connection kept a machine online forever.
 #[tokio::test(flavor = "multi_thread")]
 async fn silent_connections_go_offline() {
@@ -1728,8 +1199,9 @@ async fn silent_connections_go_offline() {
     let live_token = server.join("live", &[]).await;
     // Never read, so it never answers pings.
     let mut silent = ws_connect(&server, &silent_token).await;
-    ws_send(&mut silent, &DaemonMessage::Status(MachineReport::default())).await;
-    server.reported("silent", &MachineReport::default()).await;
+    let report = MachineReport { seq: 1, ..Default::default() };
+    ws_send(&mut silent, &DaemonMessage::Status(report.clone())).await;
+    server.reported("silent", &report).await;
     let mut live = ws_connect(&server, &live_token).await;
     tokio::spawn(async move { while let Some(Ok(_)) = live.next().await {} });
 
@@ -1754,7 +1226,7 @@ async fn changing_a_default_keeps_existing_items() {
     let (dir, _) =
         seed(&server, "ws", &token, &["personal/a/SKILL.md", "personal/b/SKILL.md", "instructions/f.md"]).await;
     server
-        .put_assignment(&token, "ws", json!([{"harness": "claude", "kind": "skill", "name": "a", "enabled": true}]))
+        .put_assignment(&token, "ws", json!([{"harness": "claude", "kind": "skill", "item_id": sk1ll_proto::ItemId::derived("skill", "a"), "enabled": true}]))
         .await;
 
     let update = server
@@ -1770,42 +1242,21 @@ async fn changing_a_default_keeps_existing_items() {
         ]
     );
     let claude = update.assignment.harness("claude");
-    assert!(claude.skill_enabled("a") && !claude.skill_enabled("b"));
-    assert!(claude.rules.is_empty() && !claude.rule_enabled("f"));
+    assert!(
+        claude.skill_enabled(&sk1ll_proto::ItemId::derived("skill", "a"))
+            && !claude.skill_enabled(&sk1ll_proto::ItemId::derived("skill", "b"))
+    );
+    assert!(claude.rules.is_empty() && !claude.rule_enabled(&sk1ll_proto::ItemId::derived("rule", "f")));
 
     // Items that appear later follow the new default.
     let repo = dir.path().join("repo");
     write(&repo, "personal/c/SKILL.md", "c\n");
     commit_push(&server, &repo, "add c").await;
     let a = server.get_json::<AssignmentSnapshot>(&token, "/machines/ws/assignment").await.assignment;
-    assert!(a.skill_enabled("claude", "c") && !a.skill_enabled("claude", "b"));
-}
-
-/// A pull may briefly hide drafts; snapshots must not erase assignments.
-#[tokio::test(flavor = "multi_thread")]
-async fn draft_toggle_survives_transient_absence() {
-    let server = start().await;
-    let token = server.join("ws", &["claude"]).await;
-    let mut ws = ws_connect(&server, &token).await;
-    let drafting = MachineReport {
-        drafts: vec![ItemRef::Skill("wip".into())],
-        harnesses: vec!["claude".into()],
-        ..Default::default()
-    };
-    ws_send(&mut ws, &DaemonMessage::Status(drafting.clone())).await;
-    server.reported("ws", &drafting).await;
-    server
-        .put_assignment(&token, "ws", json!([{"harness": "claude", "kind": "skill", "name": "wip", "enabled": true}]))
-        .await;
-    let empty = MachineReport { harnesses: vec!["claude".into()], ..Default::default() };
-    ws_send(&mut ws, &DaemonMessage::Status(empty.clone())).await;
-    server.reported("ws", &empty).await;
-    ws_send(&mut ws, &DaemonMessage::Status(drafting.clone())).await;
-    server.reported("ws", &drafting).await;
-    let a = server.get_json::<AssignmentSnapshot>(&token, "/machines/ws/assignment").await.assignment;
-    assert_eq!(a.harness("claude").skills.get("wip"), Some(&true));
-    let log: Vec<LogEntry> = server.get_json(&token, "/log?machine=ws").await;
-    assert!(!log.iter().any(|e| e.cause == LogCause::ItemRemoved));
+    assert!(
+        a.skill_enabled("claude", &sk1ll_proto::ItemId::derived("skill", "c"))
+            && !a.skill_enabled("claude", &sk1ll_proto::ItemId::derived("skill", "b"))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1862,7 +1313,7 @@ async fn idle_disconnect_does_not_refresh_last_seen() {
     .await;
     let token = server.join("silent", &[]).await;
     let mut silent = ws_connect(&server, &token).await;
-    let report = MachineReport::default();
+    let report = MachineReport { seq: 1, ..Default::default() };
     ws_send(&mut silent, &DaemonMessage::Status(report.clone())).await;
     server.reported("silent", &report).await;
     let last_frame = server.machine_row("silent").await.unwrap().last_seen;
@@ -1913,7 +1364,7 @@ async fn push_timeout_runs_follow_up(hook_body: &str, idle: Duration, max: Durat
         .put_assignment(
             &token,
             "ws",
-            json!([{"harness": "claude", "kind": "skill", "name": "removed", "enabled": true}]),
+            json!([{"harness": "claude", "kind": "skill", "item_id": "removed", "enabled": true}]),
         )
         .await;
     let mut ws = ws_connect(&server, &token).await;
@@ -1965,12 +1416,8 @@ async fn push_timeout_runs_follow_up(hook_body: &str, idle: Duration, max: Durat
     .await
     .expect("timed-out push did not run its follow-up");
     assert_eq!(nudge, first);
-    let a = eventually(|| async {
-        let a = server.get_json::<AssignmentSnapshot>(&token, "/machines/ws/assignment").await.assignment;
-        (!a.harness("claude").skills.contains_key("removed")).then_some(a)
-    })
-    .await;
-    assert!(a.harness("claude").skills.is_empty());
+    let a = server.get_json::<AssignmentSnapshot>(&token, "/machines/ws/assignment").await.assignment;
+    assert_eq!(a.harness("claude").skills.get(&id("removed")), Some(&true));
 
     let push = tokio::process::Command::new("git")
         .arg("-C")
@@ -2059,6 +1506,7 @@ async fn defaults_and_undo_materialize_destination_drafts_and_unpushed() {
     let mut ws = ws_connect(&server, &alpha).await;
     let mut other_ws = ws_connect(&server, &beta).await;
     let mut report = MachineReport {
+        seq: 1,
         harnesses: vec!["claude".into()],
         drafts: vec![ItemRef::Skill("draft".into()), ItemRef::Rule("draft".into())],
         unpushed: vec![
@@ -2071,9 +1519,16 @@ async fn defaults_and_undo_materialize_destination_drafts_and_unpushed() {
         ],
         ..Default::default()
     };
+    report.items = report
+        .drafts
+        .iter()
+        .chain(&report.unpushed)
+        .cloned()
+        .map(|item| ReportedItem { id: id(item.name()), item })
+        .collect();
     ws_send(&mut ws, &DaemonMessage::Status(report.clone())).await;
     server.reported("alpha", &report).await;
-    let other = MachineReport { drafts: vec![ItemRef::Skill("other".into())], ..Default::default() };
+    let other = MachineReport { seq: 1, drafts: vec![ItemRef::Skill("other".into())], ..Default::default() };
     ws_send(&mut other_ws, &DaemonMessage::Status(other.clone())).await;
     server.reported("beta", &other).await;
     for (kind, default, item_kind) in
@@ -2084,7 +1539,7 @@ async fn defaults_and_undo_materialize_destination_drafts_and_unpushed() {
                 &beta,
                 "alpha",
                 json!([
-                    {"harness": "claude", "kind": kind, "name": "explicit", "enabled": true}
+                    {"harness": "claude", "kind": kind, "item_id": "explicit", "enabled": true}
                 ]),
             )
             .await;
@@ -2110,14 +1565,16 @@ async fn defaults_and_undo_materialize_destination_drafts_and_unpushed() {
         }
         let h = update.assignment.harness("claude");
         let toggles = if kind == "skill" { &h.skills } else { &h.rules };
-        assert_eq!(toggles.get("explicit"), Some(&true));
-        assert!(!toggles.contains_key("other"));
-        assert!(!toggles.contains_key("future"));
+        assert_eq!(toggles.get(&id("explicit")), Some(&true));
+        assert!(!toggles.contains_key(&id("other")));
+        assert!(!toggles.contains_key(&id("future")));
         assert!(update.assignment.harness("codex").skills.is_empty());
 
         // A new local item inherits true. Undo must preserve that true value too.
         let future = if kind == "skill" { ItemRef::Skill("future".into()) } else { ItemRef::Rule("future".into()) };
+        report.items.push(ReportedItem { item: future.clone(), id: id("future") });
         report.drafts.push(future);
+        report.seq += 1;
         ws_send(&mut ws, &DaemonMessage::Status(report.clone())).await;
         server.reported("alpha", &report).await;
         let entry = update.entries.last().unwrap();
@@ -2133,9 +1590,9 @@ async fn defaults_and_undo_materialize_destination_drafts_and_unpushed() {
         assert_eq!((preserved.before, preserved.after), (None, Some(true)));
         let h = undone.assignment.harness("claude");
         let toggles = if kind == "skill" { &h.skills } else { &h.rules };
-        assert_eq!(toggles.get("draft"), Some(&false));
-        assert_eq!(toggles.get("unpushed"), Some(&false));
-        assert_eq!(toggles.get("future"), Some(&true));
+        assert_eq!(toggles.get(&id("draft")), Some(&false));
+        assert_eq!(toggles.get(&id("unpushed")), Some(&false));
+        assert_eq!(toggles.get(&id("future")), Some(&true));
         assert_eq!(undone.entries[1].cause, LogCause::Undo { entry: entry.id });
     }
 }
@@ -2245,8 +1702,8 @@ async fn copy_machine_assignment_previews_merges_replaces_and_logs() {
             ADMIN,
             "source",
             json!([
-                {"harness":"claude","kind":"skill","name":"private","enabled":false},
-                {"harness":"claude","kind":"rule","name":"shared","enabled":false},
+                {"harness":"claude","kind":"skill","item_id":"private","name":"private","enabled":false},
+                {"harness":"claude","kind":"rule","item_id":"shared","enabled":false},
                 {"harness":"claude","kind":"new_skills_default","enabled":true}
             ]),
         )
@@ -2256,8 +1713,8 @@ async fn copy_machine_assignment_previews_merges_replaces_and_logs() {
             ADMIN,
             "target",
             json!([
-                {"harness":"claude","kind":"rule","name":"shared","enabled":false},
-                {"harness":"codex","kind":"skill","name":"old","enabled":false}
+                {"harness":"claude","kind":"rule","item_id":"shared","enabled":false},
+                {"harness":"codex","kind":"skill","item_id":"old","enabled":false}
             ]),
         )
         .await;
