@@ -1,5 +1,9 @@
 # The daemon is a reconciler
 
+Status: accepted. Sync already plans from desired state and read endpoints
+use the published Assignment. The full Snapshot, refresh fingerprint and
+network prepare and local commit split are pending.
+
 The daemon is level-triggered. Desired state is a pure function of its inputs.
 The fingerprint includes HEAD, the remote head, the Draft tree OID, the
 Assignment revision, the `machine.toml` hash and Harness fingerprints. The daemon
