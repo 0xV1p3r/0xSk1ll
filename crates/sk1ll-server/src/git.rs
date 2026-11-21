@@ -20,7 +20,6 @@ use futures_util::StreamExt;
 use sk1ll_core::instructions::INSTRUCTIONS_DIR;
 use sk1ll_core::manifest::MANIFEST_FILE;
 use sk1ll_core::skill::{IMPORTED_DIR, PERSONAL_DIR};
-use sk1ll_proto::{ItemId, ItemRef};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio_util::io::ReaderStream;
@@ -318,63 +317,73 @@ pub async fn show(repo: &Path, commit: &str, path: &str) -> anyhow::Result<Optio
     git(repo, &["show", &format!("{commit}:{path}")]).await
 }
 
-/// A file a baseline item's id is read from, at most this big; a bigger one
-/// counts as absent, as it does for core.
-const ID_SOURCE_MAX: usize = sk1ll_core::content::MAX_FILE_BYTES as usize;
-
-/// The skills and rules at `commit` and their Item IDs, read as core reads
-/// them from a working tree ([`sk1ll_core::item_id::tree_ids`]): the files
-/// ids come from are read in one `cat-file --batch`.
-pub async fn item_ids_at(repo: &Path, commit: &str) -> anyhow::Result<Vec<(ItemRef, ItemId)>> {
-    let args = [
-        "ls-tree",
-        "-r",
-        "-z",
-        "--name-only",
-        commit,
-        "--",
-        PERSONAL_DIR,
-        IMPORTED_DIR,
-        INSTRUCTIONS_DIR,
-        MANIFEST_FILE,
-    ];
-    let Some(out) = git(repo, &args).await? else { bail!("cannot list tree of {commit}") };
-    let paths: Vec<String> = out.split('\0').filter(|p| !p.is_empty()).map(String::from).collect();
-    // The batch protocol is line-based: such a path can't be asked for.
-    let sources: Vec<&str> =
-        sk1ll_core::item_id::id_sources(&paths).into_iter().filter(|p| !p.contains('\n')).collect();
-    let mut files = BTreeMap::new();
-    if !sources.is_empty() {
-        let input = sources.iter().flat_map(|p| [commit, ":", p, "\n"]).collect::<String>().into_bytes();
-        let Some(out) = git_bytes(repo, &["cat-file", "--batch"], Some(input)).await? else {
-            bail!("cannot read the item ids of {commit}")
-        };
-        for (path, bytes) in sources.into_iter().zip(parse_batch(&out)) {
-            if let Some(bytes) = bytes.filter(|b| b.len() <= ID_SOURCE_MAX) {
-                files.insert(path.to_string(), bytes);
+/// Reads each metadata blob separately. Rule claims stop at the end of
+/// frontmatter, so their content and other objects do not share a read cap.
+pub async fn item_ids_at(repo: &Path, commit: &str) -> anyhow::Result<sk1ll_core::item_id::ItemInventory> {
+    let args = ["ls-tree", "-r", "-z", commit, "--", PERSONAL_DIR, IMPORTED_DIR, INSTRUCTIONS_DIR, MANIFEST_FILE];
+    let Some(out) = git_bytes(repo, &args, None).await? else { bail!("cannot list tree of {commit}") };
+    let mut entries = BTreeMap::new();
+    let mut errors = Vec::new();
+    for row in out.split(|&b| b == 0).filter(|row| !row.is_empty()) {
+        let row = match str::from_utf8(row) {
+            Ok(row) => row,
+            Err(e) => {
+                errors.push(format!("non-UTF-8 path in {commit}: {e}"));
+                continue;
             }
-        }
+        };
+        let (metadata, path) = row.split_once('\t').context("malformed ls-tree entry")?;
+        let mut metadata = metadata.split_whitespace();
+        let mode = metadata.next().context("missing mode")?;
+        let oid = metadata.nth(1).context("missing object ID")?;
+        entries.insert(path.to_string(), (mode, oid));
     }
-    Ok(sk1ll_core::item_id::tree_ids(&paths, &files))
+    let paths: Vec<_> = entries.keys().cloned().collect();
+    let mut files = BTreeMap::new();
+    for path in sk1ll_core::item_id::id_sources(&paths) {
+        let (mode, oid) = entries[path];
+        let claim = if matches!(mode, "100644" | "100755") {
+            claim_blob(repo, oid, path).await.map_err(|e| e.to_string())
+        } else {
+            Err("expected a regular file".into())
+        };
+        files.insert(path.to_string(), claim);
+    }
+    let mut inventory = sk1ll_core::item_id::tree_inventory(&paths, &files);
+    inventory.errors.extend(errors);
+    Ok(inventory)
 }
 
-/// The objects in `cat-file --batch` output, in order; `None` for one missing.
-fn parse_batch(mut out: &[u8]) -> Vec<Option<Vec<u8>>> {
-    let mut objects = Vec::new();
-    while let Some(end) = out.iter().position(|b| *b == b'\n') {
-        let header = String::from_utf8_lossy(&out[..end]).into_owned();
-        out = &out[end + 1..];
-        let size = header.rsplit(' ').next().and_then(|s| s.parse::<usize>().ok());
-        match size.filter(|_| !header.ends_with(" missing") && header.split(' ').count() == 3) {
-            Some(size) if out.len() > size => {
-                objects.push(Some(out[..size].to_vec()));
-                out = &out[size + 1..];
+async fn claim_blob(repo: &Path, oid: &str, path: &str) -> anyhow::Result<Vec<u8>> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["cat-file", "blob", oid])
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("reading Item ID blob")?;
+    let mut stdout = child.stdout.take().expect("piped");
+    let mut source = sk1ll_core::item_id::ClaimSource::new(path);
+    tokio::time::timeout(INSPECT_TIMEOUT, async {
+        let mut chunk = [0; 8192];
+        loop {
+            let n = stdout.read(&mut chunk).await?;
+            if n == 0 {
+                anyhow::ensure!(child.wait().await?.success(), "could not read Item ID blob {oid}");
+                break;
             }
-            Some(_) => break,
-            None => objects.push(None),
+            if source.push(&chunk[..n]).map_err(anyhow::Error::msg)? {
+                child.kill().await?;
+                break;
+            }
         }
-    }
-    objects
+        Ok::<_, anyhow::Error>(source.finish())
+    })
+    .await
+    .context("reading Item ID blob timed out")?
 }
 
 /// How the import check runs `git ls-remote`.
@@ -1021,10 +1030,13 @@ mod tests {
         assert!(!String::from_utf8_lossy(&plain.stdout).contains("personal/pdf"));
 
         let server = Server::open(config).await.unwrap();
-        let pdf = ItemRef::Skill("pdf".into());
-        let has_pdf = |items: &[(ItemRef, ItemId)]| items.iter().any(|(i, _)| *i == pdf);
+        let pdf = sk1ll_proto::ItemRef::Skill("pdf".into());
+        let has_pdf = |inventory: &sk1ll_core::item_id::ItemInventory| inventory.items.iter().any(|(i, _)| *i == pdf);
         assert_eq!(server.head().as_deref(), Some(with.as_str()));
-        assert!(has_pdf(&server.baseline_items()), "the baseline listing ignores the replacement");
+        assert!(
+            server.live_items().await.unwrap().iter().any(|(i, _)| *i == pdf),
+            "the baseline listing ignores the replacement"
+        );
         assert!(has_pdf(&item_ids_at(&repo, &with).await.unwrap()));
         assert_eq!(run(&repo, &["config", "core.useReplaceRefs"]), "false", "startup sets it again");
     }
@@ -1174,12 +1186,6 @@ while ! test -f '{}'; do sleep 0.01; done
         assert!(signal_group(pgid, 0).unwrap(), "the descendant should still be running");
         terminate_group(&mut child, pgid).await.unwrap();
         assert!(!signal_group(pgid, 0).unwrap(), "cleanup must wait until the entire group is gone");
-    }
-
-    #[test]
-    fn batch_output_is_read_by_size() {
-        let out = b"aaaa blob 3\nab\n\nx:missing missing\nbbbb blob 0\n\ncccc blob 9\ntrunc";
-        assert_eq!(parse_batch(out), [Some(b"ab\n".to_vec()), None, Some(Vec::new())]);
     }
 
     #[test]

@@ -1408,7 +1408,9 @@ async fn push_timeout_runs_follow_up(hook_body: &str, idle: Duration, max: Durat
     // both cases the configured timeout must run follow-up under the lock.
     let nudge = tokio::time::timeout(Duration::from_secs(4), async {
         loop {
-            if let ServerMessage::Nudge { baseline } = ws_next(&mut ws).await {
+            if let ServerMessage::Nudge { baseline } = ws_next(&mut ws).await
+                && baseline == first
+            {
                 break baseline;
             }
         }
@@ -1507,6 +1509,7 @@ async fn defaults_and_undo_materialize_destination_drafts_and_unpushed() {
     let mut other_ws = ws_connect(&server, &beta).await;
     let mut report = MachineReport {
         seq: 1,
+        inventory_complete: true,
         harnesses: vec!["claude".into()],
         drafts: vec![ItemRef::Skill("draft".into()), ItemRef::Rule("draft".into())],
         unpushed: vec![
@@ -1776,4 +1779,107 @@ async fn copy_machine_assignment_previews_merges_replaces_and_logs() {
     }
     let restored: AssignmentSnapshot = server.get_json(ADMIN, "/machines/target/assignment").await;
     assert_eq!(restored.assignment, update.assignment);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_rules_keep_their_claim_and_incomplete_baselines_refuse_prune() {
+    let server = start().await;
+    let token = server.join("alpha", &["claude"]).await;
+    let dir = clone(&server, "alpha", &token).await;
+    let repo = dir.path().join("repo");
+    let rule = format!("---\nid: retained-rule\n---\n{}", "body\n".repeat(250_000));
+    write(&repo, "instructions/large.md", &rule);
+    // The manifest used to share the Rule body cap.
+    let manifest =
+        format!("{}\n[import.pdf]\nsource = 'github:o/r'\nid = 'retained-import'\n", "# description\n".repeat(100_000));
+    write(&repo, "sk1ll.toml", &manifest);
+    write(&repo, "imported/pdf/SKILL.md", "imported content");
+    commit_push(&server, &repo, "large rule").await;
+    server
+        .put_assignment(
+            &token,
+            "alpha",
+            json!([{
+                "harness": "claude", "kind": "rule", "item_id": "retained-rule", "enabled": true
+            }]),
+        )
+        .await;
+    server
+        .put_assignment(
+            &token,
+            "alpha",
+            json!([{
+                "harness": "claude", "kind": "skill", "item_id": "retained-import", "enabled": true
+            }]),
+        )
+        .await;
+    let view: sk1ll_proto::OrphansView = server.get_json(&token, "/assignment/orphans").await;
+    assert!(view.orphans.is_empty());
+    let before: AssignmentSnapshot = server.get_json(&token, "/machines/alpha/assignment").await;
+
+    write(&repo, "instructions/broken.md", "---\nid: [invalid]\n---\n");
+    commit_push(&server, &repo, "unreadable claim").await;
+    for path in ["/assignment/orphans", "/fleet"] {
+        let status = server.get(&token, path).await.status();
+        assert_eq!(status, if path == "/fleet" { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE });
+    }
+    // Boot the Server over this same Baseline. Inventory errors must not prevent startup.
+    sk1ll_server::Server::open(sk1ll_server::Config::new(server._dir.path().join("data"))).await.unwrap();
+    let prune = server.http.post(server.url("/assignment/orphans/prune")).bearer_auth(&token).send().await.unwrap();
+    assert_eq!(prune.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let default = server
+        .try_put_assignment(
+            &token,
+            "alpha",
+            json!([
+                {"harness":"claude","kind":"new_rules_default","enabled":true}
+            ]),
+        )
+        .await;
+    assert_eq!(default.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let after: AssignmentSnapshot = server.get_json(&token, "/machines/alpha/assignment").await;
+    assert_eq!(after, before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn materializing_defaults_and_undo_read_the_current_baseline() {
+    let server = start().await;
+    let token = server.join("alpha", &["claude"]).await;
+    let dir = clone(&server, "alpha", &token).await;
+    let work = dir.path().join("repo");
+    let bare = server._dir.path().join("data/repo.git");
+    // Simulate the gap before post-push follow-up publishes the new HEAD.
+    let push_unannounced = |name: &str, id: &str| {
+        write(&work, &format!("instructions/{name}.md"), &format!("---\nid: {id}\n---\nbody"));
+        git(&work, &["add", "--all"]);
+        git(&work, &["commit", "--quiet", "-m", name]);
+        git(&work, &["push", "--quiet", bare.to_str().unwrap(), "HEAD:main"]);
+    };
+    push_unannounced("new", "first-id");
+    let update = server
+        .put_assignment(
+            &token,
+            "alpha",
+            json!([{
+                "harness": "claude", "kind": "new_rules_default", "enabled": true
+            }]),
+        )
+        .await;
+    assert_eq!(update.assignment.harness("claude").rules.get(&id("first-id")), Some(&false));
+    push_unannounced("later", "second-id");
+    let undo_id = update.entries.last().unwrap().id;
+    let undo: AssignmentUpdate = server
+        .http
+        .post(server.url(&format!("/log/{undo_id}/undo")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(undo.assignment.harness("claude").rules.get(&id("second-id")), Some(&true));
+    assert!(!undo.assignment.harness("claude").new_rules_default);
 }

@@ -64,6 +64,7 @@ pub struct Server {
 struct Baseline {
     head: Option<String>,
     inventory: Option<Inventory>,
+    head_stale: bool,
 }
 
 /// A commit and the skills and rules in its tree, with their Item IDs.
@@ -146,13 +147,7 @@ impl Server {
         })
         .await??;
         let baseline = match git::head(&config.repo_dir(), &branch).await? {
-            git::Head::Commit(commit) => Baseline {
-                head: Some(commit.clone()),
-                inventory: Some(Inventory {
-                    items: Arc::new(git::item_ids_at(&config.repo_dir(), &commit).await?),
-                    commit,
-                }),
-            },
+            git::Head::Commit(commit) => Baseline { head: Some(commit), ..Baseline::default() },
             git::Head::Unborn => Baseline::default(),
         };
         if config.admin_token.is_none() {
@@ -233,7 +228,10 @@ impl Server {
         if let Some(i) = lock(&self.baseline).inventory.as_ref().filter(|i| i.commit == commit) {
             return Ok(i.items.clone());
         }
-        let items = Arc::new(git::item_ids_at(&self.config.repo_dir(), commit).await?);
+        let inventory = git::item_ids_at(&self.config.repo_dir(), commit).await?;
+        anyhow::ensure!(inventory.errors.is_empty(), "incomplete inventory: {}", inventory.errors.join("; "));
+        let items: Arc<Vec<_>> =
+            Arc::new(inventory.items.into_iter().filter_map(|(item, id)| id.map(|id| (item, id))).collect());
         let mut baseline = lock(&self.baseline);
         if baseline.head.as_deref() == Some(commit) {
             baseline.inventory = Some(Inventory { commit: commit.to_string(), items: items.clone() });
@@ -334,26 +332,63 @@ impl Server {
         .await
     }
 
-    /// After a push (with the push lock held): if HEAD moved, list its
-    /// items, nudge every daemon and recheck imports. Nothing else follows
-    /// from a push: toggles are by Item ID, so items it removed leave their
-    /// toggles inert rather than dropped (ADR 0006).
-    async fn after_push(&self) {
-        let new = match self.read_head().await {
-            Ok(git::Head::Commit(h)) => h,
-            Ok(git::Head::Unborn) => return,
-            Err(e) => return tracing::error!("reading HEAD after push: {e:#}"),
-        };
-        if self.head().as_deref() == Some(new.as_str()) {
+    /// A push moves HEAD and nudges the machines. Inventory is read on
+    /// demand by operations that need it.
+    async fn after_push(self: &Arc<Self>) {
+        if self.refresh_head().await.is_ok() {
             return;
         }
-        lock(&self.baseline).head = Some(new.clone());
-        if let Err(e) = self.inventory(&new).await {
-            tracing::error!("listing the items of {new}: {e:#}");
+        {
+            let mut baseline = lock(&self.baseline);
+            if baseline.head_stale {
+                return;
+            }
+            baseline.head_stale = true;
         }
-        tracing::info!("baseline is now {new}");
-        self.broadcast(&ServerMessage::Nudge { baseline: new });
+        let server = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let Some(server) = server.upgrade() else { break };
+                let _push = server.push_lock.lock().await;
+                if !lock(&server.baseline).head_stale || server.refresh_head().await.is_ok() {
+                    break;
+                }
+            }
+        });
+    }
+
+    async fn refresh_head(&self) -> anyhow::Result<()> {
+        let new = match self.read_head().await {
+            Ok(git::Head::Commit(commit)) => Some(commit),
+            Ok(git::Head::Unborn) => None,
+            Err(error) => {
+                tracing::error!("reading HEAD after push: {error:#}");
+                return Err(error);
+            }
+        };
+        {
+            let mut baseline = lock(&self.baseline);
+            baseline.head_stale = false;
+            if baseline.head == new {
+                return Ok(());
+            }
+            baseline.head = new.clone();
+        }
+        if let Some(baseline) = new {
+            tracing::info!("baseline is now {baseline}");
+            self.broadcast(&ServerMessage::Nudge { baseline });
+        }
         self.imports_due.notify_one();
+        Ok(())
+    }
+
+    async fn inventory_lock(&self) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        let push = self.push_lock.clone().lock_owned().await;
+        if self.push_degraded.load(Ordering::SeqCst) {
+            return Err(ApiError::Unavailable("git push state is degraded; restart the Server".into()));
+        }
+        Ok(push)
     }
 }
 
@@ -484,6 +519,42 @@ mod tests {
         holder.join().unwrap();
     }
 
+    #[tokio::test]
+    async fn a_stale_head_is_retried_after_push() {
+        use sk1ll_core::git::Git;
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::open(Config::new(dir.path().join("data"))).await.unwrap();
+        let bare = server.config.repo_dir();
+        let initial = server.head().unwrap();
+        let git = |args: &[&str]| {
+            Git::new(&bare)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .args(args)
+                .text()
+                .unwrap()
+        };
+        let tree = git(&["rev-parse", "HEAD^{tree}"]);
+        let next = git(&["commit-tree", &tree, "-p", &initial, "-m", "update"]);
+        let branch = bare.join(&server.branch);
+        std::fs::write(&branch, format!("{tree}\n")).unwrap();
+        server.after_push().await;
+        assert!(lock(&server.baseline).head_stale);
+        std::fs::write(&branch, format!("{next}\n")).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while server.head().as_deref() != Some(next.as_str()) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!lock(&server.baseline).head_stale);
+    }
+
     /// A push that deletes items changes no assignment: their toggles stay,
     /// inert, until someone prunes the orphans.
     #[tokio::test]
@@ -515,7 +586,7 @@ mod tests {
         push("pdf");
         server.after_push().await;
         let pdf: ItemId = "pdf-id".parse().unwrap();
-        assert!(server.baseline_items().iter().any(|(_, id)| *id == pdf));
+        assert!(server.live_items().await.unwrap().iter().any(|(_, id)| *id == pdf));
         let mut a = sk1ll_proto::Assignment::default();
         a.set_skill("claude", &pdf, true);
         let stored = a.clone();
@@ -525,7 +596,7 @@ mod tests {
         std::fs::remove_dir_all(work.join("personal/pdf")).unwrap();
         push("without pdf");
         server.after_push().await;
-        assert!(server.baseline_items().iter().all(|(_, id)| *id != pdf));
+        assert!(server.live_items().await.unwrap().iter().all(|(_, id)| *id != pdf));
         let after = server.db(|conn| db::snapshot(conn, "m")).await.unwrap().unwrap();
         assert_eq!((after.revision, after.assignment), (revision, a));
         let log = server.db(|conn| db::log_entries(conn, &Default::default())).await.unwrap();

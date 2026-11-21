@@ -14,7 +14,7 @@ use crate::error::Result;
 
 /// The schema's `user_version`. A database at another version is replaced,
 /// not migrated: its machines have to join again.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 const SCHEMA: &str = "
     CREATE TABLE machines (
@@ -54,6 +54,12 @@ const SCHEMA: &str = "
     CREATE INDEX log_harness ON log (harness);
     CREATE INDEX log_author ON log (author);
     CREATE INDEX log_item ON log (item_id, id);
+    CREATE TABLE harness_renames (
+        registration TEXT NOT NULL,
+        operation_id TEXT NOT NULL,
+        request TEXT NOT NULL,
+        PRIMARY KEY (registration, operation_id)
+    );
     CREATE TABLE counters (
         name   TEXT PRIMARY KEY,
         value  INTEGER NOT NULL
@@ -79,7 +85,7 @@ fn create(conn: &mut Connection) -> rusqlite::Result<()> {
         tracing::warn!("server.db has schema version {version}; replacing it: every machine has to join again");
     }
     let tx = conn.transaction()?;
-    tx.execute_batch("DROP TABLE IF EXISTS machines; DROP TABLE IF EXISTS join_codes; DROP TABLE IF EXISTS log; DROP TABLE IF EXISTS counters;")?;
+    tx.execute_batch("DROP TABLE IF EXISTS machines; DROP TABLE IF EXISTS join_codes; DROP TABLE IF EXISTS log; DROP TABLE IF EXISTS counters; DROP TABLE IF EXISTS harness_renames;")?;
     tx.execute_batch(SCHEMA)?;
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()
@@ -205,6 +211,24 @@ pub fn save_assignment(conn: &Connection, id: &str, a: &Assignment) -> Result<u6
         params![id, to_json(a), revision as i64],
     )?;
     Ok(revision)
+}
+
+pub fn harness_rename(conn: &Connection, registration: &str, operation_id: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT request FROM harness_renames WHERE registration = ?1 AND operation_id = ?2",
+            params![registration, operation_id],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+pub fn save_harness_rename(conn: &Connection, registration: &str, operation_id: &str, request: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO harness_renames (registration, operation_id, request) VALUES (?1, ?2, ?3)",
+        params![registration, operation_id, request],
+    )?;
+    Ok(())
 }
 
 pub fn save_report(conn: &Connection, id: &str, report: &MachineReport, now: i64) -> Result<()> {

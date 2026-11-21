@@ -53,6 +53,8 @@ pub enum DaemonMessage {
     Hello { machine_id: String },
     /// The machine's current state; send on connect and whenever it changes.
     Status(MachineReport),
+    /// A short-lived CLI session updates Item IDs without replacing fleet status.
+    Inventory(InventoryReport),
     /// A change to this machine's own assignment. Answered with
     /// [`ServerMessage::AssignmentResult`] carrying the same `req`.
     SetAssignment { req: u64, write: AssignmentWrite },
@@ -149,6 +151,10 @@ pub struct MachineReport {
     #[serde(default)]
     pub items: Vec<ReportedItem>,
     #[serde(default)]
+    pub inventory_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory_error: Option<String>,
+    #[serde(default)]
     pub conflicts: Vec<ConflictRef>,
     /// Harnesses present on the machine.
     #[serde(default)]
@@ -162,6 +168,16 @@ pub struct MachineReport {
     /// The daemon knows it hasn't applied the latest baseline yet.
     #[serde(default)]
     pub behind: bool,
+}
+
+/// Inventory data a short-lived session can update without a full refresh.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventoryReport {
+    pub seq: u64,
+    pub items: Vec<ReportedItem>,
+    pub inventory_complete: bool,
+    pub inventory_error: Option<String>,
+    pub harnesses: Vec<String>,
 }
 
 /// A skill or rule's name and Item ID.
@@ -333,12 +349,14 @@ pub struct SetHarnessAssignment {
     pub enabled: bool,
 }
 
-/// Move a harness's toggles and defaults to another harness name, replacing
-/// what that one had.
+/// Move a harness's Assignment once for this operation ID and registration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarnessRename {
     pub from: String,
     pub to: String,
+    pub operation_id: String,
+    #[serde(default)]
+    pub replace: bool,
 }
 
 /// A precondition of [`AssignmentChanges`].
@@ -616,7 +634,12 @@ mod tests {
         for write in [
             AssignmentWrite::Changes(changes),
             AssignmentWrite::Harness { harness: "claude".into(), enabled: false },
-            AssignmentWrite::RenameHarness(HarnessRename { from: "a".into(), to: "b".into() }),
+            AssignmentWrite::RenameHarness(HarnessRename {
+                from: "a".into(),
+                to: "b".into(),
+                operation_id: "op".into(),
+                replace: false,
+            }),
         ] {
             let msg = DaemonMessage::SetAssignment { req: 7, write };
             let text = serde_json::to_string(&msg).unwrap();

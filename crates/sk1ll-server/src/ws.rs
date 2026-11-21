@@ -29,7 +29,8 @@ use futures_util::stream::SplitStream;
 use futures_util::{Sink, SinkExt, StreamExt};
 use serde_json::Value;
 use sk1ll_proto::{
-    AssignmentOutcome, AssignmentSnapshot, AssignmentWrite, DaemonMessage, ItemRef, MachineReport, Scope, ServerMessage,
+    AssignmentOutcome, AssignmentSnapshot, AssignmentWrite, DaemonMessage, InventoryReport, ItemRef, MachineReport,
+    Scope, ServerMessage,
 };
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -214,14 +215,25 @@ async fn read_loop(
                             tracing::warn!("{machine}: ignoring status {seq} after status {stored}");
                             continue;
                         }
-                        match on_status(server, machine, id, token_hash, report, cancel).await {
+                        match on_report(server, machine, id, token_hash, Report::Status(report), cancel).await {
                             Ok(true) => stored = seq,
                             Ok(false) => {}
                             Err(e) => return tracing::error!("{machine}: storing status: {e}; closing"),
                         }
                     }
+                    Ok(DaemonMessage::Inventory(report)) => {
+                        let seq = report.seq;
+                        if seq <= stored {
+                            continue;
+                        }
+                        match on_report(server, machine, id, token_hash, Report::Inventory(report), cancel).await {
+                            Ok(true) => stored = seq,
+                            Ok(false) => {}
+                            Err(e) => return tracing::error!("{machine}: storing inventory: {e}; closing"),
+                        }
+                    }
                     Ok(DaemonMessage::SetAssignment { req, write }) => {
-                        let result = if stored == 0 {
+                        let result = if stored == 0 && !matches!(write, AssignmentWrite::RenameHarness(_)) {
                             Some(AssignmentOutcome::Refused {
                                 status: 400,
                                 error: "send status before changing Assignment".into(),
@@ -311,36 +323,48 @@ fn text(msg: &ServerMessage) -> Message {
 /// parse (an item ref from a newer daemon, say) are skipped and logged
 /// rather than dropping the whole report.
 fn parse(mut v: Value) -> std::result::Result<DaemonMessage, String> {
-    if v.get("type").and_then(Value::as_str) == Some("status") {
-        for field in ["drafts", "unpushed", "clashes", "conflicts", "items"] {
-            let Some(Value::Array(entries)) = v.get_mut(field) else {
-                continue;
+    let fields: &[&str] = match v.get("type").and_then(Value::as_str) {
+        Some("status") => &["drafts", "unpushed", "clashes", "conflicts", "items"],
+        Some("inventory") => &["items"],
+        _ => &[],
+    };
+    for &field in fields {
+        let Some(Value::Array(entries)) = v.get_mut(field) else { continue };
+        let before = entries.len();
+        entries.retain(|e| {
+            let ok = match field {
+                "conflicts" => serde_json::from_value::<sk1ll_proto::ConflictRef>(e.clone()).is_ok(),
+                "items" => serde_json::from_value::<sk1ll_proto::ReportedItem>(e.clone())
+                    .is_ok_and(|r| matches!(r.item, ItemRef::Skill(_) | ItemRef::Rule(_))),
+                _ => serde_json::from_value::<ItemRef>(e.clone()).is_ok(),
             };
-            entries.retain(|e| {
-                let ok = match field {
-                    "conflicts" => serde_json::from_value::<sk1ll_proto::ConflictRef>(e.clone()).is_ok(),
-                    "items" => serde_json::from_value::<sk1ll_proto::ReportedItem>(e.clone()).is_ok(),
-                    _ => serde_json::from_value::<ItemRef>(e.clone()).is_ok(),
-                };
-                if !ok {
-                    tracing::warn!("status: skipping malformed `{field}` entry {e}");
-                }
-                ok
-            });
+            if !ok {
+                tracing::warn!("status: skipping malformed `{field}` entry {e}");
+            }
+            ok
+        });
+        if field == "items" && entries.len() != before {
+            v["inventory_complete"] = Value::Bool(false);
+            v["inventory_error"] = Value::String("malformed Item IDs in report".into());
         }
     }
     serde_json::from_value(v).map_err(|e| e.to_string())
 }
 
+enum Report {
+    Status(MachineReport),
+    Inventory(InventoryReport),
+}
+
 /// Stores the report if the session is still current and its token still
 /// valid (`false` if not); adds harnesses the machine has no assignment for
 /// (all off).
-async fn on_status(
+async fn on_report(
     server: &Arc<Server>,
     machine: &str,
     id: u64,
     token_hash: &str,
-    report: MachineReport,
+    report: Report,
     cancel: &CancellationToken,
 ) -> Result<bool> {
     if cancel.is_cancelled() {
@@ -357,11 +381,22 @@ async fn on_status(
                 return Ok(None);
             }
             let tx = conn.transaction()?;
-            db::save_report(&tx, &m, &report, now)?;
-            let Some(a) = db::assignment(&tx, &m)? else {
-                return Ok(None);
+            let Some(record) = db::machine(&tx, &m)? else { return Ok(None) };
+            let (report, harnesses) = match report {
+                Report::Status(report) => {
+                    let harnesses = report.harnesses.clone();
+                    (report, harnesses)
+                }
+                Report::Inventory(update) => {
+                    let mut report = record.report.unwrap_or_default();
+                    report.items = update.items;
+                    report.inventory_complete = update.inventory_complete;
+                    report.inventory_error = update.inventory_error;
+                    (report, update.harnesses)
+                }
             };
-            let added = assign::new_harness_changes(&a, &report.harnesses);
+            db::save_report(&tx, &m, &report, now)?;
+            let added = assign::new_harness_changes(&record.assignment, &harnesses);
             let mut latest = None;
             if !added.is_empty() {
                 latest = Some(assign::apply(&tx, &m, assign::SERVER_AUTHOR, added, now, &[], false)?.snapshot());
@@ -392,7 +427,7 @@ async fn on_set_assignment(
     }
     // The scope is read again from the token as the write commits.
     let caller = Caller::Machine { id: machine.into(), scope: Scope::SelfOnly, token_hash: token_hash.into() };
-    Some(match crate::api::write_assignment(server, caller, machine.into(), write).await {
+    Some(match crate::api::write_assignment(server, caller, machine.into(), write, Some(id)).await {
         Ok(update) => AssignmentOutcome::Applied(update),
         Err(e) => AssignmentOutcome::Refused { status: e.status().as_u16(), error: e.message() },
     })
@@ -593,8 +628,13 @@ mod tests {
 
         let id: sk1ll_proto::ItemId = "drafted".parse().unwrap();
         let item = sk1ll_proto::ReportedItem { item: ItemRef::Skill("new".into()), id: id.clone() };
-        let report =
-            MachineReport { seq: 1, items: vec![item], harnesses: vec!["claude".into()], ..Default::default() };
+        let report = MachineReport {
+            seq: 1,
+            items: vec![item],
+            inventory_complete: true,
+            harnesses: vec!["claude".into()],
+            ..Default::default()
+        };
         ws.send(send(DaemonMessage::Status(report))).await.unwrap();
         // Turning the default off right after materializes the reported item.
         let change = |kind, enabled| sk1ll_proto::ToggleChange {
@@ -627,6 +667,119 @@ mod tests {
         assert_eq!(h.skills.get(&id), Some(&false), "the reported draft item kept its value");
         let materialized = update.entries.iter().find(|e| e.cause == sk1ll_proto::LogCause::DefaultMaterialized);
         assert_eq!(materialized.and_then(|e| e.name.as_deref()), Some("new"));
+        serve.abort();
+    }
+
+    #[tokio::test]
+    async fn replayed_rename_and_replaced_session_cannot_overwrite_assignment() {
+        use sk1ll_proto::{AssignmentChanges, HarnessRename, ToggleChange, ToggleKind};
+        use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest};
+
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::open(crate::Config::new(dir.path().join("data"))).await.unwrap();
+        let skill: sk1ll_proto::ItemId = "skill-id".parse().unwrap();
+        let mut initial = sk1ll_proto::Assignment::default();
+        initial.set_skill("old", &skill, true);
+        initial.set_harness("existing", false);
+        server
+            .db(move |conn| db::insert_machine(conn, "m", &crate::hash("t"), 0, &initial, Scope::SelfOnly))
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = server.router();
+        let serve = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let connect = || async {
+            let mut req = format!("ws://{address}/api/ws").into_client_request().unwrap();
+            req.headers_mut().insert("authorization", "Bearer t".parse().unwrap());
+            let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+            assert!(ws.next().await.is_some());
+            ws
+        };
+        let send = |msg: DaemonMessage| tungstenite::Message::text(serde_json::to_string(&msg).unwrap());
+        let mut first = connect().await;
+        let denied =
+            HarnessRename { from: "old".into(), to: "existing".into(), operation_id: "deny".into(), replace: false };
+        first
+            .send(send(DaemonMessage::SetAssignment { req: 9, write: AssignmentWrite::RenameHarness(denied) }))
+            .await
+            .unwrap();
+        loop {
+            let tungstenite::Message::Text(text) = first.next().await.unwrap().unwrap() else { continue };
+            if let Ok(ServerMessage::AssignmentResult { req: 9, result, .. }) = serde_json::from_str(&text) {
+                assert!(matches!(result, AssignmentOutcome::Refused { status: 409, .. }));
+                break;
+            }
+        }
+        let rename =
+            HarnessRename { from: "old".into(), to: "existing".into(), operation_id: "move".into(), replace: true };
+        first
+            .send(send(DaemonMessage::SetAssignment { req: 10, write: AssignmentWrite::RenameHarness(rename.clone()) }))
+            .await
+            .unwrap();
+        // Treat the response as lost after the server commits.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while server
+                .db(|conn| db::harness_rename(conn, &db::machine(conn, "m")?.unwrap().registration, "move"))
+                .await
+                .unwrap()
+                .is_none()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let (generation, cancel) = {
+            let conns = crate::lock(&server.conns);
+            (conns["m"].id, conns["m"].cancel.clone())
+        };
+        let push = server.push_lock.lock().await;
+        let token_hash = crate::hash("t");
+        let mut stale = Box::pin(on_set_assignment(
+            &server,
+            "m",
+            generation,
+            &token_hash,
+            AssignmentWrite::Changes(AssignmentChanges {
+                expected: None,
+                changes: vec![ToggleChange {
+                    harness: "existing".into(),
+                    kind: ToggleKind::NewRulesDefault,
+                    name: None,
+                    item_id: None,
+                    enabled: Some(false),
+                }],
+            }),
+            &cancel,
+        ));
+        // The first session passed the early generation check and is waiting to materialize defaults.
+        assert!(futures_util::poll!(&mut stale).is_pending());
+        let mut next = connect().await;
+        drop(push);
+        assert!(matches!(stale.await, Some(AssignmentOutcome::Refused { status: 409, .. })));
+
+        // Even if a later report had recreated the source with all-off defaults,
+        // replay of the completed operation leaves the populated destination alone.
+        let status =
+            MachineReport { seq: 1, inventory_complete: true, harnesses: vec!["old".into()], ..Default::default() };
+        next.send(send(DaemonMessage::Status(status))).await.unwrap();
+        next.send(send(DaemonMessage::SetAssignment { req: 11, write: AssignmentWrite::RenameHarness(rename) }))
+            .await
+            .unwrap();
+        loop {
+            let tungstenite::Message::Text(text) = next.next().await.unwrap().unwrap() else { continue };
+            if let Ok(ServerMessage::AssignmentResult { req: 11, seq, result }) = serde_json::from_str(&text) {
+                let AssignmentOutcome::Applied(update) = result else { panic!("{result:?}") };
+                assert_eq!(seq, 1);
+                assert!(update.entries.is_empty());
+                assert!(update.assignment.skill_enabled("existing", &skill));
+                assert!(update.assignment.harness("existing").new_rules_default);
+                assert!(!update.assignment.harness("old").new_rules_default);
+                break;
+            }
+        }
         serve.abort();
     }
 

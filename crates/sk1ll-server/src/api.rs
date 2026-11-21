@@ -224,14 +224,33 @@ pub(crate) async fn write_assignment(
     caller: Caller,
     machine: String,
     write: AssignmentWrite,
+    session: Option<u64>,
 ) -> Result<AssignmentUpdate> {
     caller.require_machine(&machine)?;
-    let (id, author, now, baseline) = (machine.clone(), caller.author().to_string(), now(), server.baseline_items());
+    let materializes =
+        matches!(&write, AssignmentWrite::Changes(changes) if changes.changes.iter().any(|c| !c.kind.has_item()));
+    let (push, baseline) = if materializes {
+        let push = server.inventory_lock().await?;
+        (Some(push), server.live_items().await?)
+    } else if matches!(&write, AssignmentWrite::Changes(changes) if changes.changes.iter().any(|c| c.item_id.is_some() && c.name.is_none()))
+    {
+        (None, server.live_items().await.unwrap_or_else(|_| server.baseline_items()))
+    } else {
+        (None, server.baseline_items())
+    };
+    let (id, author, now, current) = (machine.clone(), caller.author().to_string(), now(), server.clone());
     let applied = server
         .db(move |conn| {
+            let _push = push;
+            if session.is_some_and(|generation| !current.is_current(&machine, generation)) {
+                return Err(ApiError::Conflict("this session was replaced".into()));
+            }
             let tx = conn.transaction()?;
             authorize_assignment(&tx, &caller, &machine)?;
             let m = db::machine(&tx, &machine)?.ok_or_else(|| ApiError::NotFound(format!("no machine `{machine}`")))?;
+            if materializes && m.report.as_ref().is_some_and(|report| !report.inventory_complete) {
+                return Err(ApiError::Unavailable("the Machine's inventory is incomplete".into()));
+            }
             let applied = match write {
                 AssignmentWrite::Changes(AssignmentChanges { changes, expected }) => {
                     let changes: Vec<Change> = changes.into_iter().map(Change::from_toggle).collect();
@@ -246,9 +265,7 @@ pub(crate) async fn write_assignment(
                     let changes = assign::harness_changes(&m.assignment, &harness, enabled);
                     assign::apply(&tx, &machine, &author, changes, now, &baseline, false)?
                 }
-                AssignmentWrite::RenameHarness(HarnessRename { from, to }) => {
-                    assign::rename_harness(&tx, &machine, &author, &from, &to, now)?
-                }
+                AssignmentWrite::RenameHarness(rename) => assign::rename_harness(&tx, &m, &author, rename, now)?,
             };
             tx.commit()?;
             Ok(applied)
@@ -263,7 +280,7 @@ async fn put_assignment(
     Path(id): Path<String>,
     Json(body): Json<AssignmentChanges>,
 ) -> Result<Json<AssignmentUpdate>> {
-    Ok(Json(write_assignment(&server, caller, id, AssignmentWrite::Changes(body)).await?))
+    Ok(Json(write_assignment(&server, caller, id, AssignmentWrite::Changes(body), None).await?))
 }
 
 /// Sets both defaults and every toggle of one harness: every item, pulled
@@ -275,7 +292,7 @@ async fn set_harness_assignment(
     Json(body): Json<SetHarnessAssignment>,
 ) -> Result<Json<AssignmentUpdate>> {
     let write = AssignmentWrite::Harness { harness, enabled: body.enabled };
-    Ok(Json(write_assignment(&server, caller, machine, write).await?))
+    Ok(Json(write_assignment(&server, caller, machine, write, None).await?))
 }
 
 async fn rename_harness(
@@ -284,7 +301,7 @@ async fn rename_harness(
     Path(machine): Path<String>,
     Json(body): Json<HarnessRename>,
 ) -> Result<Json<AssignmentUpdate>> {
-    Ok(Json(write_assignment(&server, caller, machine, AssignmentWrite::RenameHarness(body)).await?))
+    Ok(Json(write_assignment(&server, caller, machine, AssignmentWrite::RenameHarness(body), None).await?))
 }
 
 fn plan_copy(
@@ -349,7 +366,15 @@ async fn copy_from(
     Ok(Json(published(&server, &id, applied)))
 }
 
-/// The ids toggles can be for: the baseline's and every machine's reported ones.
+/// Partial reports cannot be used to tell whether an ID is absent.
+fn check_machine_inventories(machines: &[db::MachineRecord]) -> Result<()> {
+    if let Some(machine) = machines.iter().find(|m| m.report.as_ref().is_some_and(|r| !r.inventory_complete)) {
+        return Err(ApiError::Unavailable(format!("inventory for `{}` is incomplete", machine.id)));
+    }
+    Ok(())
+}
+
+/// The Baseline's IDs and every Machine's reported IDs.
 fn known_ids(baseline: &[(sk1ll_proto::ItemRef, ItemId)], machines: &[db::MachineRecord]) -> BTreeSet<ItemId> {
     let reported = machines.iter().flat_map(|m| m.report.iter().flat_map(|r| r.items.iter().map(|i| i.id.clone())));
     baseline.iter().map(|(_, id)| id.clone()).chain(reported).collect()
@@ -362,6 +387,7 @@ async fn orphans(State(server): ServerState, _: Caller) -> Result<Json<OrphansVi
     let orphans = server
         .db(move |conn| {
             let machines = db::machines(conn)?;
+            check_machine_inventories(&machines)?;
             let known = known_ids(&baseline, &machines);
             let known = known.iter().collect();
             let mut orphans = Vec::new();
@@ -400,7 +426,7 @@ async fn prune_orphans(State(server): ServerState, caller: Caller, body: Bytes) 
         }
     };
     target.clone()(&caller)?;
-    let push = server.push_lock.clone().lock_owned().await;
+    let push = server.inventory_lock().await?;
     let baseline = server.live_items().await?;
     let now = now();
     let (entries, updated) = server
@@ -410,6 +436,7 @@ async fn prune_orphans(State(server): ServerState, caller: Caller, body: Bytes) 
             let caller = caller.current(&tx)?;
             let target = target(&caller)?;
             let machines = db::machines(&tx)?;
+            check_machine_inventories(&machines)?;
             if let Some(t) = &target
                 && !machines.iter().any(|m| m.id == *t)
             {
@@ -471,14 +498,30 @@ async fn log_facets(State(server): ServerState, _: Caller) -> Result<Json<LogFac
 /// Restores an entry's `before` as a new entry. A no-op (empty `entries`) if
 /// the toggle already has that value.
 async fn undo(State(server): ServerState, caller: Caller, Path(id): Path<i64>) -> Result<Json<AssignmentUpdate>> {
-    let (author, now, baseline) = (caller.author().to_string(), now(), server.baseline_items());
+    let materializes = server
+        .db(move |conn| {
+            let entry = db::log_entry(conn, id)?.ok_or_else(|| ApiError::NotFound(format!("no log entry {id}")))?;
+            Ok(!entry.kind.has_item() && db::copy_registration(conn, id)?.is_none())
+        })
+        .await?;
+    let (push, baseline) = if materializes {
+        let push = server.inventory_lock().await?;
+        (Some(push), server.live_items().await?)
+    } else {
+        (None, server.baseline_items())
+    };
+    let (author, now) = (caller.author().to_string(), now());
     let (machine, applied) = server
         .db(move |conn| {
+            let _push = push;
             let tx = conn.transaction()?;
             let caller = caller.current(&tx)?;
             let (machine, change) = assign::undo_change(&tx, id, |machine| caller.require_machine(machine))?;
             let gone = || ApiError::Conflict(format!("machine `{machine}` is no longer in the fleet"));
             let m = db::machine(&tx, &machine)?.ok_or_else(gone)?;
+            if materializes && m.report.as_ref().is_some_and(|report| !report.inventory_complete) {
+                return Err(ApiError::Unavailable("the Machine's inventory is incomplete".into()));
+            }
             let copy_registration = db::copy_registration(&tx, id)?;
             if copy_registration.as_ref().is_some_and(|r| *r != m.registration) {
                 return Err(ApiError::Conflict(format!("machine `{machine}` joined the fleet again since this copy")));
@@ -548,7 +591,7 @@ mod tests {
             .iter()
             .map(|id| ReportedItem { item: ItemRef::Skill(format!("s-{id}")), id: id.parse().unwrap() })
             .collect();
-        let report = MachineReport { items, ..Default::default() };
+        let report = MachineReport { items, inventory_complete: true, ..Default::default() };
         server.db(move |conn| db::save_report(conn, machine, &report, now())).await.unwrap();
     }
 
@@ -625,7 +668,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let rename = |from: &str, to: &str| Json(HarnessRename { from: from.into(), to: to.into() });
+        let rename = |from: &str, to: &str| {
+            Json(HarnessRename { from: from.into(), to: to.into(), operation_id: "op1".into(), replace: false })
+        };
         let update = rename_harness(State(server.clone()), me.clone(), Path("me".into()), rename("claude", "work"))
             .await
             .unwrap()
@@ -690,6 +735,41 @@ mod tests {
         assert!(orphans(State(server.clone()), Caller::Admin).await.unwrap().0.orphans.is_empty());
         let a = server.db(|conn| db::assignment(conn, "fleet")).await.unwrap().unwrap();
         assert!(a.harness("claude").skills.contains_key(&"drafted".parse::<ItemId>().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn prune_refuses_degraded_push_and_incomplete_machine_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::open(Config::new(dir.path().join("data"))).await.unwrap();
+        join_with(&server, "me", Scope::Fleet).await;
+        let update = put_assignment(
+            State(server.clone()),
+            Caller::Admin,
+            Path("me".into()),
+            changes(vec![toggle("gone", Some(true))]),
+        )
+        .await
+        .unwrap()
+        .0;
+        server.push_degraded.store(true, std::sync::atomic::Ordering::SeqCst);
+        let prune = || prune_orphans(State(server.clone()), Caller::Admin, Bytes::new());
+        assert!(matches!(prune().await, Err(ApiError::Unavailable(message)) if message.contains("degraded")));
+        server.push_degraded.store(false, std::sync::atomic::Ordering::SeqCst);
+        server
+            .db(|conn| {
+                db::save_report(
+                    conn,
+                    "me",
+                    &MachineReport { inventory_error: Some("bad Rule ID".into()), ..Default::default() },
+                    now(),
+                )
+            })
+            .await
+            .unwrap();
+        assert!(matches!(prune().await, Err(ApiError::Unavailable(message)) if message.contains("incomplete")));
+        let snapshot = get_assignment(State(server.clone()), Caller::Admin, Path("me".into())).await.unwrap().0;
+        assert_eq!(snapshot.revision, update.revision);
+        assert_eq!(snapshot.assignment, update.assignment);
     }
 
     /// Review finding: a request authenticated as a `fleet` machine, then

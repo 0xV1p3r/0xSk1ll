@@ -365,18 +365,40 @@ fn values(h: &HarnessAssignment) -> Vec<(ToggleKind, Option<ItemId>, bool)> {
 /// Moves `machine`'s harness `from` (toggles and defaults) to `to`,
 /// replacing what `to` had, in the caller's transaction: one entry for every
 /// value `from` loses and one for every value `to` gets.
-pub fn rename_harness(tx: &Connection, machine: &str, author: &str, from: &str, to: &str, now: i64) -> Result<Applied> {
+pub fn rename_harness(
+    tx: &Connection,
+    machine: &db::MachineRecord,
+    author: &str,
+    rename: sk1ll_proto::HarnessRename,
+    now: i64,
+) -> Result<Applied> {
+    let request = serde_json::to_string(&rename).expect("serializing harness rename");
+    let sk1ll_proto::HarnessRename { from, to, operation_id, replace } = rename;
+    let (from, to, registration) = (from.as_str(), to.as_str(), &machine.registration);
     crate::check_name("harness", from)?;
     crate::check_name("harness", to)?;
+    crate::check_name("operation ID", &operation_id)?;
     if from == to {
         return Err(ApiError::BadRequest("the harness keeps its name".into()));
     }
-    let snapshot = db::snapshot(tx, machine)?.ok_or_else(|| ApiError::NotFound(format!("no machine `{machine}`")))?;
+    let id = &machine.id;
+    let snapshot = db::snapshot(tx, id)?.ok_or_else(|| ApiError::NotFound(format!("no machine `{id}`")))?;
     let mut a = snapshot.assignment;
-    let Some(moved) = a.harnesses.get(from).cloned() else {
+    if let Some(prior) = db::harness_rename(tx, registration, &operation_id)? {
+        if prior != request {
+            return Err(ApiError::Conflict("harness rename operation ID was already used".into()));
+        }
         return Ok(Applied { assignment: a, revision: snapshot.revision, entries: Vec::new() });
-    };
-    let before_to = a.harness(to).clone();
+    }
+    if a.harnesses.contains_key(to) && !replace {
+        return Err(ApiError::Conflict(format!("harness `{to}` already has an Assignment")));
+    }
+    db::save_harness_rename(tx, registration, &operation_id, &request)?;
+    let moved = a.harnesses.get(from).cloned();
+    let before_to = a.harnesses.get(to).cloned();
+    if moved.is_none() && before_to.is_none() {
+        return Ok(Applied { assignment: a, revision: snapshot.revision, entries: Vec::new() });
+    }
     a.rename_harness(from, to);
     let cause = LogCause::HarnessRenamed { from: from.into(), to: to.into() };
     let mut entries = Vec::new();
@@ -389,7 +411,7 @@ pub fn rename_harness(tx: &Connection, machine: &str, author: &str, from: &str, 
             id: 0,
             at: now,
             author: author.into(),
-            machine: machine.into(),
+            machine: machine.id.clone(),
             harness: harness.into(),
             kind,
             item_id,
@@ -402,16 +424,17 @@ pub fn rename_harness(tx: &Connection, machine: &str, author: &str, from: &str, 
         entries.push(entry);
         Ok(())
     };
-    for (kind, id, value) in values(&moved) {
+    for (kind, id, value) in moved.iter().flat_map(values) {
         log(from, kind, id, Some(value), None)?;
     }
-    let after_to = a.harness(to).clone();
-    let keys: BTreeSet<_> = values(&before_to).into_iter().chain(values(&after_to)).map(|(k, id, _)| (k, id)).collect();
+    let after_to = a.harnesses.get(to);
+    let keys: BTreeSet<_> = before_to.iter().chain(after_to).flat_map(values).map(|(k, id, _)| (k, id)).collect();
     for (kind, id) in keys {
-        let (before, after) = (get_in(&before_to, kind, id.as_ref()), get_in(&after_to, kind, id.as_ref()));
+        let before = before_to.as_ref().and_then(|a| get_in(a, kind, id.as_ref()));
+        let after = after_to.and_then(|a| get_in(a, kind, id.as_ref()));
         log(to, kind, id, before, after)?;
     }
-    let revision = db::save_assignment(tx, machine, &a)?;
+    let revision = db::save_assignment(tx, id, &a)?;
     Ok(Applied { assignment: a, revision, entries })
 }
 
