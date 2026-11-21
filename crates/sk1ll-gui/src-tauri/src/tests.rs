@@ -813,19 +813,13 @@ async fn harness_commands_forward_changes_and_open_only_the_daemons_machine_conf
     assert!(crate::editors::config_target(directory.path()).is_err(), "a directory is not a config file");
 }
 
-/// A daemon started before an upgrade has no harness routes: it answers 404
-/// without a body, which the app reports as a daemon to restart.
 #[tokio::test]
-async fn a_daemon_without_a_route_is_reported_as_too_old() {
+async fn the_bridge_preserves_a_missing_route_status() {
     let daemon = FakeDaemon::start(Router::new()).await;
     let bridge = Bridge::new(daemon.client.clone());
     let error = bridge.harness_settings().await.unwrap_err();
     assert_eq!(error.status, Some(404));
-    assert!(error.message.contains("older than this client") && error.message.contains("restart"), "{}", error.message);
-    // Any other route missing is no sign of an old daemon.
-    let error = bridge.harnesses().await.unwrap_err();
-    assert_eq!(error.status, Some(404));
-    assert!(!error.message.contains("older than this client"), "{}", error.message);
+    assert_eq!(error.message, "404 Not Found");
 }
 
 #[tokio::test]
