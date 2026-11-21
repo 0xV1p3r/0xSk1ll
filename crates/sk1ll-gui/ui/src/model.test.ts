@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { applyToggle, cellState, emptyHarness, everythingOn, headline, insecureHttp, itemStateLabel, mergeAssignments, statusLabels, statusOrder, statusTone } from './model';
 import type { Assignment, MachineReport } from './types';
 
-const report: MachineReport = { baseline: 'a', drafts: [], unpushed: [], conflicts: [], harnesses: [], blocked: false, clashes: [], behind: false };
+const report: MachineReport = { seq: 1, items: [], baseline: 'a', drafts: [], unpushed: [], conflicts: [], harnesses: [], blocked: false, clashes: [], behind: false };
 describe('Machine status and badges', () => {
   it('uses the glossary severity ordering even when every condition applies', () => {
     const busy = { ...report, blocked: true, behind: true, drafts: ['skill:pdf'], conflicts: [{ item: 'skill:pdf', harness: 'claude' }] };
@@ -24,15 +24,15 @@ describe('Machine status and badges', () => {
 describe('Assignment cells', () => {
   const assignment: Assignment = { harnesses: { claude: { ...emptyHarness(), new_skills_default: false, skills: { pdf: true, git: false } } } };
   it('distinguishes explicit on and off from inherited state', () => {
-    expect(cellState(assignment, 'claude', 'skill:pdf')).toEqual({ enabled: true, explicit: true });
-    expect(cellState(assignment, 'claude', 'skill:git')).toEqual({ enabled: false, explicit: true });
-    expect(cellState(assignment, 'claude', 'skill:new')).toEqual({ enabled: false, explicit: false });
-    expect(cellState(assignment, 'claude', 'rule:git')).toEqual({ enabled: true, explicit: false });
-    expect(cellState(assignment, 'codex', 'skill:new')).toEqual({ enabled: true, explicit: false });
+    expect(cellState(assignment, 'claude', 'skill:pdf', 'pdf')).toEqual({ enabled: true, explicit: true });
+    expect(cellState(assignment, 'claude', 'skill:git', 'git')).toEqual({ enabled: false, explicit: true });
+    expect(cellState(assignment, 'claude', 'skill:new', 'new')).toEqual({ enabled: false, explicit: false });
+    expect(cellState(assignment, 'claude', 'rule:git', 'git')).toEqual({ enabled: true, explicit: false });
+    expect(cellState(assignment, 'codex', 'skill:new', 'new')).toEqual({ enabled: true, explicit: false });
   });
   it('removes explicit toggles when following the default again', () => {
-    const next = applyToggle(assignment, { harness: 'claude', kind: 'skill', name: 'pdf', enabled: null });
-    expect(cellState(next, 'claude', 'skill:pdf')).toEqual({ enabled: false, explicit: false });
+    const next = applyToggle(assignment, { harness: 'claude', kind: 'skill', item_id: 'pdf', name: 'pdf', enabled: null });
+    expect(cellState(next, 'claude', 'skill:pdf', 'pdf')).toEqual({ enabled: false, explicit: false });
     expect(assignment.harnesses.claude.skills.pdf).toBe(true);
   });
   it('leaves default materialization to the Server', () => {
@@ -70,13 +70,13 @@ describe('revisioned Assignment snapshots', () => {
 describe('first-run setup', () => {
   it('turns on defaults first, then every Baseline item, in each Harness', () => {
     const items = [
-      { item: 'skill:pdf', in_baseline: true, draft: null, unpushed: false, description: null },
-      { item: 'rule:git', in_baseline: true, draft: null, unpushed: false, description: null },
-      { item: 'skill:local', in_baseline: false, draft: 'added' as const, unpushed: false, description: null },
+      { item: 'skill:pdf', id: 'pdf', in_baseline: true, draft: null, unpushed: false, description: null },
+      { item: 'rule:git', id: 'git', in_baseline: true, draft: null, unpushed: false, description: null },
+      { item: 'skill:local', id: 'local', in_baseline: false, draft: 'added' as const, unpushed: false, description: null },
     ];
     expect(everythingOn(['claude'], items)).toEqual([
       { harness: 'claude', kind: 'new_skills_default', enabled: true }, { harness: 'claude', kind: 'new_rules_default', enabled: true },
-      { harness: 'claude', kind: 'skill', name: 'pdf', enabled: true }, { harness: 'claude', kind: 'rule', name: 'git', enabled: true },
+      { harness: 'claude', kind: 'skill', item_id: 'pdf', name: 'pdf', enabled: true }, { harness: 'claude', kind: 'rule', item_id: 'git', name: 'git', enabled: true },
     ]);
     expect(everythingOn([], items)).toEqual([]);
   });

@@ -1,7 +1,7 @@
 //! The fleet's bare repo: setup, reading the baseline, and serving git smart
 //! HTTP by running `git http-backend` as a CGI program.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -18,8 +18,8 @@ use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use futures_util::StreamExt;
 use sk1ll_core::instructions::INSTRUCTIONS_DIR;
+use sk1ll_core::manifest::MANIFEST_FILE;
 use sk1ll_core::skill::{IMPORTED_DIR, PERSONAL_DIR};
-use sk1ll_proto::ItemRef;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio_util::io::ReaderStream;
@@ -179,43 +179,16 @@ const INSPECT_TIMEOUT: Duration = Duration::from_secs(60);
 /// How much output a repo read may produce before it is stopped and fails.
 const INSPECT_OUTPUT: usize = 64 << 20;
 
-/// How long all the reads done under the push lock for one push or one
-/// draft discard may take together, so the lock can't be held through many
-/// consecutive [`INSPECT_TIMEOUT`]s.
-const INSPECT_BUDGET: Duration = Duration::from_secs(120);
-
-/// What is left of [`INSPECT_BUDGET`].
-pub struct Budget(Duration);
-
-impl Default for Budget {
-    fn default() -> Self {
-        Self(INSPECT_BUDGET)
-    }
-}
-
-impl Budget {
-    /// Runs `read` in what is left of the budget; `None`, logged, if it runs
-    /// out. Dropping a read stops its git, children included.
-    pub async fn spend<T>(&mut self, read: impl Future<Output = T>) -> Option<T> {
-        if self.0.is_zero() {
-            tracing::error!("repo reads used up their {INSPECT_BUDGET:?} budget");
-            return None;
-        }
-        let start = tokio::time::Instant::now();
-        let result = tokio::time::timeout(self.0, read).await;
-        self.0 = self.0.saturating_sub(start.elapsed());
-        if result.is_err() {
-            tracing::error!("repo reads used up their {INSPECT_BUDGET:?} budget");
-        }
-        result.ok()
-    }
-}
-
 /// Runs git in `repo`, ignoring replacement objects; `Ok(None)` if it exited
 /// non-zero. An error if it outlives [`INSPECT_TIMEOUT`] or writes more than
 /// [`INSPECT_OUTPUT`].
 async fn git(repo: &Path, args: &[&str]) -> anyhow::Result<Option<String>> {
-    inspect("git".as_ref(), repo, args, INSPECT_TIMEOUT, INSPECT_OUTPUT).await
+    git_bytes(repo, args, None).await.map(|out| out.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+/// [`git`] with `stdin` as its input, returning raw output.
+async fn git_bytes(repo: &Path, args: &[&str], stdin: Option<Vec<u8>>) -> anyhow::Result<Option<Vec<u8>>> {
+    inspect("git".as_ref(), repo, args, stdin, INSPECT_TIMEOUT, INSPECT_OUTPUT).await
 }
 
 /// Kills a read's process group unless disarmed, so a read that fails or is
@@ -234,22 +207,23 @@ impl Drop for GroupGuard {
     }
 }
 
-/// [`git`] with `program` as git, stopped (with any children) after `timeout`
-/// or past `max_output` bytes of output.
+/// [`git_bytes`] with `program` as git, stopped (with any children) after
+/// `timeout` or past `max_output` bytes of output.
 async fn inspect(
     program: &std::ffi::OsStr,
     repo: &Path,
     args: &[&str],
+    stdin: Option<Vec<u8>>,
     timeout: Duration,
     max_output: usize,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<Vec<u8>>> {
     let mut cmd = Command::new(program);
     cmd.arg("-C")
         .arg(repo)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_NO_REPLACE_OBJECTS", "1")
-        .stdin(Stdio::null())
+        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
@@ -261,7 +235,15 @@ async fn inspect(
     #[cfg(unix)]
     let mut guard = GroupGuard(Some(pgid));
     let mut stdout = child.stdout.take().expect("piped");
+    let input = child.stdin.take();
     let run = async {
+        let write = async {
+            if let (Some(mut input), Some(bytes)) = (input, stdin) {
+                // A git that exits early closes its end: what it read decides.
+                let _ = input.write_all(&bytes).await;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
         let mut out = Vec::new();
         let read = async {
             let mut chunk = vec![0; 64 << 10];
@@ -277,7 +259,7 @@ async fn inspect(
             }
         };
         let wait = async { child.wait().await.context("waiting for git") };
-        let ((), status) = tokio::try_join!(read, wait)?;
+        let ((), (), status) = tokio::try_join!(write, read, wait)?;
         Ok::<_, anyhow::Error>((status, out))
     };
     match tokio::time::timeout(timeout, run).await {
@@ -287,7 +269,7 @@ async fn inspect(
             {
                 guard.0 = None;
             }
-            Ok(status.success().then(|| String::from_utf8_lossy(&out).into_owned()))
+            Ok(status.success().then_some(out))
         }
         Err(_) => {
             #[cfg(unix)]
@@ -335,29 +317,73 @@ pub async fn show(repo: &Path, commit: &str, path: &str) -> anyhow::Result<Optio
     git(repo, &["show", &format!("{commit}:{path}")]).await
 }
 
-/// Skills (`personal/<n>/SKILL.md`, `imported/<n>/SKILL.md`) and rules
-/// (`instructions/<n>.md`) at `commit`.
-pub async fn items_at(repo: &Path, commit: &str) -> anyhow::Result<BTreeSet<ItemRef>> {
-    let args = ["ls-tree", "-r", "-z", "--name-only", commit, "--", PERSONAL_DIR, IMPORTED_DIR, INSTRUCTIONS_DIR];
-    let Some(out) = git(repo, &args).await? else { bail!("cannot list tree of {commit}") };
-    Ok(out.split('\0').filter_map(item_for_path).collect())
+/// Reads each metadata blob separately. Rule claims stop at the end of
+/// frontmatter, so their content and other objects do not share a read cap.
+pub async fn item_ids_at(repo: &Path, commit: &str) -> anyhow::Result<sk1ll_core::item_id::ItemInventory> {
+    let args = ["ls-tree", "-r", "-z", commit, "--", PERSONAL_DIR, IMPORTED_DIR, INSTRUCTIONS_DIR, MANIFEST_FILE];
+    let Some(out) = git_bytes(repo, &args, None).await? else { bail!("cannot list tree of {commit}") };
+    let mut entries = BTreeMap::new();
+    let mut errors = Vec::new();
+    for row in out.split(|&b| b == 0).filter(|row| !row.is_empty()) {
+        let row = match str::from_utf8(row) {
+            Ok(row) => row,
+            Err(e) => {
+                errors.push(format!("non-UTF-8 path in {commit}: {e}"));
+                continue;
+            }
+        };
+        let (metadata, path) = row.split_once('\t').context("malformed ls-tree entry")?;
+        let mut metadata = metadata.split_whitespace();
+        let mode = metadata.next().context("missing mode")?;
+        let oid = metadata.nth(1).context("missing object ID")?;
+        entries.insert(path.to_string(), (mode, oid));
+    }
+    let paths: Vec<_> = entries.keys().cloned().collect();
+    let mut files = BTreeMap::new();
+    for path in sk1ll_core::item_id::id_sources(&paths) {
+        let (mode, oid) = entries[path];
+        let claim = if matches!(mode, "100644" | "100755") {
+            claim_blob(repo, oid, path).await.map_err(|e| e.to_string())
+        } else {
+            Err("expected a regular file".into())
+        };
+        files.insert(path.to_string(), claim);
+    }
+    let mut inventory = sk1ll_core::item_id::tree_inventory(&paths, &files);
+    inventory.errors.extend(errors);
+    Ok(inventory)
 }
 
-/// The skill or rule a tree path makes exist. Stricter than core's
-/// [`ItemRef::for_path`], which maps any file under a skill dir: a skill is
-/// in the baseline only with its `SKILL.md`.
-fn item_for_path(path: &str) -> Option<ItemRef> {
-    let parts: Vec<&str> = path.split('/').collect();
-    match parts.as_slice() {
-        [dir, name, "SKILL.md"] if *dir == PERSONAL_DIR || *dir == IMPORTED_DIR => {
-            Some(ItemRef::Skill(name.to_string()))
+async fn claim_blob(repo: &Path, oid: &str, path: &str) -> anyhow::Result<Vec<u8>> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["cat-file", "blob", oid])
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("reading Item ID blob")?;
+    let mut stdout = child.stdout.take().expect("piped");
+    let mut source = sk1ll_core::item_id::ClaimSource::new(path);
+    tokio::time::timeout(INSPECT_TIMEOUT, async {
+        let mut chunk = [0; 8192];
+        loop {
+            let n = stdout.read(&mut chunk).await?;
+            if n == 0 {
+                anyhow::ensure!(child.wait().await?.success(), "could not read Item ID blob {oid}");
+                break;
+            }
+            if source.push(&chunk[..n]).map_err(anyhow::Error::msg)? {
+                child.kill().await?;
+                break;
+            }
         }
-        [dir, file] if *dir == INSTRUCTIONS_DIR => file
-            .strip_suffix(".md")
-            .filter(|n| !n.is_empty() && !n.starts_with('.'))
-            .map(|n| ItemRef::Rule(n.to_string())),
-        _ => None,
-    }
+        Ok::<_, anyhow::Error>(source.finish())
+    })
+    .await
+    .context("reading Item ID blob timed out")?
 }
 
 /// How the import check runs `git ls-remote`.
@@ -503,6 +529,7 @@ fn basic_password(headers: &HeaderMap) -> Option<String> {
 
 async fn cgi(server: Arc<Server>, caller: Caller, path_info: String, req: Request) -> anyhow::Result<Response> {
     let is_push = req.method() == "POST" && path_info.ends_with("/git-receive-pack");
+    let author = caller.author().to_string();
     let receive_pack = is_push
         || (path_info.ends_with("/info/refs")
             && req.uri().query().is_some_and(|q| q.split('&').any(|p| p == "service=git-receive-pack")));
@@ -510,25 +537,23 @@ async fn cgi(server: Arc<Server>, caller: Caller, path_info: String, req: Reques
         return Ok(degraded_response());
     }
     // A push holds the lock from before receive-pack until its follow-up is
-    // done, so each push is diffed and announced on its own, in order.
-    // Removing a machine takes the lock too: a push queued behind a removal
-    // of its machine is refused here, and a running one finishes first.
-    let (push, caller) = if is_push {
+    // done, so pushes are announced one by one, in order. Removing a machine
+    // takes the lock too: a push queued behind a removal of its machine is
+    // refused here, and a running one finishes first.
+    let push = if is_push {
         let guard = server.push_lock.clone().lock_owned().await;
         // Cleanup may have failed while this request was queued.
         if server.push_degraded.load(Ordering::SeqCst) {
             return Ok(degraded_response());
         }
-        let caller = match server.db(move |conn| caller.current(conn)).await {
-            Ok(caller) => caller,
+        match server.db(move |conn| caller.current(conn)).await {
+            Ok(_) => {}
             Err(ApiError::Unauthorized) => return Ok(unauthorized()),
             Err(e) => return Err(e.into()),
-        };
-        let mut budget = Budget::default();
-        let before = budget.spend(server.read_head()).await.context("reading HEAD before a push")??;
-        (Some((guard, before, budget)), caller)
+        }
+        Some(guard)
     } else {
-        (None, caller)
+        None
     };
     let passed: Vec<(&str, String)> = [
         ("CONTENT_TYPE", header::CONTENT_TYPE),
@@ -552,7 +577,7 @@ async fn cgi(server: Arc<Server>, caller: Caller, path_info: String, req: Reques
         .env("REQUEST_METHOD", req.method().as_str())
         .env("PATH_INFO", &path_info)
         .env("QUERY_STRING", req.uri().query().unwrap_or_default())
-        .env("REMOTE_USER", caller.author())
+        .env("REMOTE_USER", author)
         .env("GIT_NO_REPLACE_OBJECTS", "1")
         // The repo's own hooks, whatever its config says: the pre-receive
         // hook there keeps pushes to the baseline branch.
@@ -678,20 +703,18 @@ async fn cgi(server: Arc<Server>, caller: Caller, path_info: String, req: Reques
             if let Err(e) = stopped {
                 errors.abort();
                 tracing::error!("git backend cleanup failed: {e:#}");
-                if let Some((_guard, ..)) = push {
-                    // Set the flag before releasing the guard. Queued and new
-                    // pushes must fail closed while a writer may survive,
-                    // and nothing may trust the HEAD read before it.
+                if let Some(_guard) = push {
+                    // Set the flag before releasing the guard: queued and new
+                    // pushes must fail closed while a writer may survive.
                     server.push_degraded.store(true, Ordering::SeqCst);
-                    server.forget_head();
                     tracing::error!("{DEGRADED_MESSAGE}");
                 }
                 return;
             }
         }
         errors.abort();
-        if let Some((_guard, before, budget)) = push {
-            server.after_push(before, budget, &caller).await;
+        if let Some(_guard) = push {
+            server.after_push().await;
         }
     });
     response_rx.await.context("git backend ended before a response")
@@ -984,6 +1007,8 @@ mod tests {
         run(dir.path(), &["clone", "--quiet", &repo.to_string_lossy(), &work.to_string_lossy()]);
         std::fs::create_dir_all(work.join("personal/pdf")).unwrap();
         std::fs::write(work.join("personal/pdf/SKILL.md"), "x\n").unwrap();
+        // The live listing has only items with an explicit Item ID.
+        std::fs::write(work.join("personal/pdf/.sk1ll-id"), "pdf-id\n").unwrap();
         run(&work, &["add", "--all"]);
         run(&work, &["commit", "--quiet", "-m", "pdf"]);
         run(&work, &["push", "--quiet", "origin", "HEAD:main"]);
@@ -1007,10 +1032,14 @@ mod tests {
         assert!(!String::from_utf8_lossy(&plain.stdout).contains("personal/pdf"));
 
         let server = Server::open(config).await.unwrap();
-        let pdf = ItemRef::Skill("pdf".into());
+        let pdf = sk1ll_proto::ItemRef::Skill("pdf".into());
+        let has_pdf = |inventory: &sk1ll_core::item_id::ItemInventory| inventory.items.iter().any(|(i, _)| *i == pdf);
         assert_eq!(server.head().as_deref(), Some(with.as_str()));
-        assert!(server.baseline_items().contains(&pdf), "the baseline listing ignores the replacement");
-        assert!(items_at(&repo, &with).await.unwrap().contains(&pdf));
+        assert!(
+            server.live_items().await.unwrap().iter().any(|(i, _)| *i == pdf),
+            "the baseline listing ignores the replacement"
+        );
+        assert!(has_pdf(&item_ids_at(&repo, &with).await.unwrap()));
         assert_eq!(run(&repo, &["config", "core.useReplaceRefs"]), "false", "startup sets it again");
     }
 
@@ -1023,7 +1052,7 @@ mod tests {
         let pid_file = dir.path().join("pid");
         let stub = stub_git(dir.path(), &pid_file, "wait");
         let deadline = Duration::from_secs(60);
-        let read = inspect("/bin/sh".as_ref(), &stub, &["rev-parse", "HEAD"], deadline, INSPECT_OUTPUT);
+        let read = inspect("/bin/sh".as_ref(), &stub, &["rev-parse", "HEAD"], None, deadline, INSPECT_OUTPUT);
         tokio::pin!(read);
 
         // Start the read and let the child install its signal handler before
@@ -1078,7 +1107,8 @@ while ! test -f '{}'; do sleep 0.01; done
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("pid");
         let stub = stub_git(dir.path(), &pid_file, "exec yes");
-        let err = inspect("/bin/sh".as_ref(), &stub, &["ls-tree"], Duration::from_secs(60), 4096).await.unwrap_err();
+        let err =
+            inspect("/bin/sh".as_ref(), &stub, &["ls-tree"], None, Duration::from_secs(60), 4096).await.unwrap_err();
         assert!(err.to_string().contains("wrote more than"), "{err}");
         tokio::time::timeout(Duration::from_secs(30), async {
             while running(&pid_file) {
@@ -1090,15 +1120,21 @@ while ! test -f '{}'; do sleep 0.01; done
     }
 
     /// Review finding: a read dropped before its deadline (its caller
-    /// cancelled, or a budget ran out) stops its whole process group.
+    /// cancelled) stops its whole process group.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_cancelled_read_stops_its_children() {
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("pid");
         let stub = stub_git(dir.path(), &pid_file, "wait");
-        let mut read =
-            Box::pin(inspect("/bin/sh".as_ref(), &stub, &["rev-parse"], Duration::from_secs(300), INSPECT_OUTPUT));
+        let mut read = Box::pin(inspect(
+            "/bin/sh".as_ref(),
+            &stub,
+            &["rev-parse"],
+            None,
+            Duration::from_secs(300),
+            INSPECT_OUTPUT,
+        ));
         let ready = async {
             while !pid_file.exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1110,17 +1146,7 @@ while ! test -f '{}'; do sleep 0.01; done
         }
         assert!(running(&pid_file));
 
-        tokio::time::pause();
-        let mut budget = Budget(Duration::from_secs(1));
-        let cancelled = {
-            let mut spend = std::pin::pin!(budget.spend(read));
-            assert!(futures_util::poll!(&mut spend).is_pending());
-            tokio::time::advance(Duration::from_secs(1)).await;
-            spend.await
-        };
-        tokio::time::resume();
-        assert!(cancelled.is_none(), "the budget runs out first");
-        assert_eq!(budget.0, Duration::ZERO);
+        drop(read);
         tokio::time::timeout(Duration::from_secs(30), async {
             while running(&pid_file) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1128,7 +1154,6 @@ while ! test -f '{}'; do sleep 0.01; done
         })
         .await
         .expect("the stub's TERM-resistant child must be gone");
-        assert!(budget.spend(async {}).await.is_none(), "a spent budget runs nothing more");
     }
 
     #[test]
@@ -1163,18 +1188,6 @@ while ! test -f '{}'; do sleep 0.01; done
         assert!(signal_group(pgid, 0).unwrap(), "the descendant should still be running");
         terminate_group(&mut child, pgid).await.unwrap();
         assert!(!signal_group(pgid, 0).unwrap(), "cleanup must wait until the entire group is gone");
-    }
-
-    #[test]
-    fn maps_paths_to_items() {
-        assert_eq!(item_for_path("personal/pdf/SKILL.md"), Some(ItemRef::Skill("pdf".into())));
-        assert_eq!(item_for_path("imported/x/SKILL.md"), Some(ItemRef::Skill("x".into())));
-        assert_eq!(item_for_path("instructions/10-git.md"), Some(ItemRef::Rule("10-git".into())));
-        assert_eq!(item_for_path("personal/pdf/ref/SKILL.md"), None);
-        assert_eq!(item_for_path("instructions/notes.txt"), None);
-        assert_eq!(item_for_path("instructions/sub/a.md"), None);
-        assert_eq!(item_for_path("instructions/.md"), None);
-        assert_eq!(item_for_path("instructions/.hidden.md"), None);
     }
 
     #[test]

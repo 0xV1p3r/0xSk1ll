@@ -82,6 +82,8 @@ pub fn run() {
             commands::set_assignment,
             commands::log,
             commands::log_facets,
+            commands::orphans,
+            commands::prune_orphans,
             commands::undo,
             commands::join,
             commands::join_code,

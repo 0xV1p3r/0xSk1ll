@@ -60,7 +60,7 @@ impl IntoResponse for Error {
             Self::Internal(e) => format!("{e:#}"),
             e => e.to_string(),
         };
-        (status, Json(ErrorBody { error, code: None })).into_response()
+        (status, Json(ErrorBody { error })).into_response()
     }
 }
 

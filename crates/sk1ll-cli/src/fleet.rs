@@ -11,11 +11,11 @@ use sk1ll_daemon::client::{
 };
 use sk1ll_daemon::service::Manager;
 use sk1ll_daemon::{Config, DaemonState};
-use sk1ll_proto::{AssignmentChanges, LogQuery, Scope, ToggleChange, ToggleKind};
+use sk1ll_proto::{AssignmentChanges, AssignmentWrite, LogQuery, Scope, ToggleChange, ToggleKind};
 
 use crate::{
-    Cli, Cmd, FleetCmd, InviteScope, Kind, assign_target, bundled_fallback, check_exists, confirm, every_item,
-    fetch_hint, names, print_bundled, print_import_changes, print_update, short,
+    Cli, Cmd, FleetCmd, InviteScope, Kind, assign_target, bundled_fallback, confirm, fetch_hint, names, print_bundled,
+    print_import_changes, print_update, resolve_assignment_item, short,
 };
 
 /// Sets up this process's environment, before any thread starts: the
@@ -41,7 +41,7 @@ pub(crate) fn prepare(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn joined_state(cli: &Cli) -> Option<DaemonState> {
+pub(crate) fn joined_state(cli: &Cli) -> Option<DaemonState> {
     let cfg = daemon_config(cli).ok()?;
     DaemonState::load(&cfg.state).ok().flatten()
 }
@@ -65,60 +65,46 @@ pub(crate) fn assign_direct(cli: &Cli, repo: &Path, lock: Option<&sk1ll_core::En
     if !sk1ll_core::MachineConfig::load(&cfg.machine_config)?.harnesses().contains_key(harness) {
         bail!("unknown harness `{harness}` on this machine (see `sk1ll harnesses`)");
     }
-    let mut changes = Vec::new();
-    let toggle = |kind, name, on: bool| ToggleChange { harness: harness.clone(), kind, name, enabled: Some(on) };
+    check_joined_repo(repo, &state)?;
     let target = assign_target(*kind, name.clone(), *enabled, *default_skills, *default_rules, *all)?;
-    if let Some(s) = all {
-        let lock = lock.context("a fleet assignment change requires the engine lock")?;
-        if let Some(result) =
-            runtime()?.block_on(sk1ll_daemon::set_harness_assignment_direct(&cfg, lock, harness, s.on()))?
-        {
-            println!(
-                "fleet assignment of {} is now revision {}; run `sk1ll sync` to apply",
-                state.machine_id, result.update.revision
-            );
-            for item in result.skipped {
-                eprintln!("Skipped item with an ineligible name: {item}");
-            }
-            return Ok(true);
-        }
-        eprintln!("warning: {}", sk1ll_daemon::client::LEGACY_HARNESS_ASSIGNMENT_WARNING);
-        changes.extend(every_toggle(&sk1ll_core::Repo::open(repo)?, harness, s.on())?);
-    }
-    if let Some((kind, name, enabled)) = target {
-        check_exists(&sk1ll_core::Repo::open(repo)?, kind, &name)?;
-        let kind = match kind {
-            Kind::Skill => ToggleKind::Skill,
-            Kind::Rule => ToggleKind::Rule,
-        };
-        changes.push(toggle(kind, Some(name), enabled.on()));
-    }
-    if let Some(s) = default_skills {
-        changes.push(toggle(ToggleKind::NewSkillsDefault, None, s.on()));
-    }
-    if let Some(s) = default_rules {
-        changes.push(toggle(ToggleKind::NewRulesDefault, None, s.on()));
-    }
+    let write = assignment_write(repo, harness, target, *default_skills, *default_rules, *all)?;
+    let Some(write) = write else { return Ok(true) };
     let lock = lock.context("a fleet assignment change requires the engine lock")?;
-    let update = runtime()?.block_on(sk1ll_daemon::set_assignment_direct(
-        &cfg,
-        lock,
-        &AssignmentChanges { changes, ..Default::default() },
-    ))?;
+    let update = runtime()?.block_on(sk1ll_daemon::write_assignment_direct(&cfg, lock, write))?;
     println!("fleet assignment of {} is now revision {}; run `sk1ll sync` to apply", state.machine_id, update.revision);
     Ok(true)
 }
 
-/// `assign <harness> --all on|off`: every skill and rule, then both defaults.
-fn every_toggle(repo: &sk1ll_core::Repo, harness: &str, on: bool) -> Result<Vec<ToggleChange>> {
-    let (skills, rules) = every_item(repo)?;
-    let toggle = |kind, name| ToggleChange { harness: harness.to_string(), kind, name, enabled: Some(on) };
-    Ok(skills
-        .into_iter()
-        .map(|s| toggle(ToggleKind::Skill, Some(s)))
-        .chain(rules.into_iter().map(|r| toggle(ToggleKind::Rule, Some(r))))
-        .chain([toggle(ToggleKind::NewSkillsDefault, None), toggle(ToggleKind::NewRulesDefault, None)])
-        .collect())
+fn assignment_write(
+    repo: &Path,
+    harness: &str,
+    target: Option<(Kind, String, crate::Switch)>,
+    default_skills: Option<crate::Switch>,
+    default_rules: Option<crate::Switch>,
+    all: Option<crate::Switch>,
+) -> Result<Option<AssignmentWrite>> {
+    if let Some(state) = all {
+        return Ok(Some(AssignmentWrite::Harness { harness: harness.into(), enabled: state.on() }));
+    }
+    let mut changes = Vec::new();
+    let toggle =
+        |kind, item_id, name, on| ToggleChange { harness: harness.into(), kind, item_id, name, enabled: Some(on) };
+    if let Some((kind, name, state)) = target
+        && let Some(id) = resolve_assignment_item(&sk1ll_core::Repo::open(repo)?, kind, &name, state)?
+    {
+        let kind = match kind {
+            Kind::Skill => ToggleKind::Skill,
+            Kind::Rule => ToggleKind::Rule,
+        };
+        changes.push(toggle(kind, Some(id), Some(name), state.on()));
+    }
+    if let Some(state) = default_skills {
+        changes.push(toggle(ToggleKind::NewSkillsDefault, None, None, state.on()));
+    }
+    if let Some(state) = default_rules {
+        changes.push(toggle(ToggleKind::NewRulesDefault, None, None, state.on()));
+    }
+    Ok((!changes.is_empty()).then_some(AssignmentWrite::Changes(AssignmentChanges { changes, expected: None })))
 }
 
 /// The daemon's config, with the CLI's `--machine-config` / `--assignment`.
@@ -159,18 +145,14 @@ pub(crate) fn assignment_if_present(state: Option<&Path>, cache: &Path) -> Resul
     sk1ll_daemon::state::load_assignment_if_present(&cfg)
 }
 
-pub(crate) fn queue_discarded(
-    state: Option<&Path>,
-    lock: Option<&sk1ll_core::EngineLock>,
-    items: Vec<sk1ll_core::ItemRef>,
-) -> Result<()> {
-    let mut cfg = Config::from_env()?;
-    if let Some(p) = state {
-        cfg.state = p.to_path_buf();
-    }
-    if DaemonState::load(&cfg.state)?.is_some_and(|s| !s.revoked) {
-        sk1ll_daemon::state::queue_discards(&cfg, lock.context("a fleet restore requires the engine lock")?, items)?;
-    }
+pub(crate) fn check_joined_repo(repo: &Path, state: &DaemonState) -> Result<()> {
+    let joined = state.repo.canonicalize()?;
+    anyhow::ensure!(
+        repo.canonicalize()? == joined,
+        "selected repo {} differs from the joined repo {}; select the joined repo to change fleet content",
+        repo.display(),
+        joined.display()
+    );
     Ok(())
 }
 
@@ -180,13 +162,7 @@ pub(crate) fn require_standalone_adoption(state: Option<&Path>, repo: &sk1ll_cor
         cfg.state = p.to_path_buf();
     }
     if let Some(state) = DaemonState::load(&cfg.state)?.filter(|s| !s.revoked) {
-        let joined = state.repo.canonicalize()?;
-        anyhow::ensure!(
-            repo.root() == joined,
-            "selected repo {} differs from the joined repo {}; select the joined repo to change fleet content",
-            repo.root().display(),
-            joined.display()
-        );
+        check_joined_repo(repo.root(), &state)?;
         bail!(
             "Adopt needs a connection to the Server; start the daemon with `sk1ll daemon` and wait for it to connect"
         );
@@ -234,9 +210,6 @@ fn join(cli: Cli) -> Result<()> {
     let (joined, via_daemon) = runtime()?.block_on(sk1ll_daemon::join_or_rejoin(&cfg, opts))?;
     let how = match joined.setup {
         sk1ll_daemon::gitx::Setup::Cloned => "cloned the fleet repo into",
-        sk1ll_daemon::gitx::Setup::Initialized => {
-            "the server is empty; started a new skills repo (commit to share it) in"
-        }
         sk1ll_daemon::gitx::Setup::Adopted => "using the existing clone at",
     };
     println!("joined the fleet as {}", joined.machine_id);
@@ -272,10 +245,7 @@ fn fleet(cli: &Cli, command: Option<&FleetCmd>) -> Result<()> {
             let code = rt.block_on(client.join_code(scope)).map_err(fleet_error)?;
             println!("{}", code.code);
             println!("sk1ll join {} {}", shell_arg(&url), shell_arg(&code.code));
-            match code.expires_at {
-                Some(t) => println!("expires {}", utc(t)),
-                None => println!("expires after the Server's SK1LL_SERVER_JOIN_CODE_TTL (default 24h)"),
-            }
+            println!("expires {}", utc(code.expires_at));
             match scope {
                 Scope::Fleet => println!("scope fleet: the Machine may manage the whole Fleet"),
                 Scope::SelfOnly => println!("scope self: the Machine may manage only itself"),
@@ -334,6 +304,20 @@ fn fleet(cli: &Cli, command: Option<&FleetCmd>) -> Result<()> {
             copy.source_expected = Some(preview.source);
             let update = rt.block_on(client.copy_machine_assignment(target, &copy)).map_err(fleet_error)?;
             println!("copied Assignment to {target} at revision {}", update.revision);
+        }
+        Some(FleetCmd::Orphans) => {
+            let view = rt.block_on(client.orphans()).map_err(fleet_error)?;
+            for orphan in &view.orphans {
+                let name = orphan.name.as_deref().unwrap_or("-");
+                println!("{} / {}  {:?} {} ({name})", orphan.machine, orphan.harness, orphan.kind, orphan.item_id);
+            }
+            println!("{} orphan toggle(s)", view.orphans.len());
+        }
+        Some(FleetCmd::PruneOrphans { machine }) => {
+            let result = rt
+                .block_on(client.prune_orphans(&sk1ll_proto::PruneOrphans { machine: machine.clone() }))
+                .map_err(fleet_error)?;
+            println!("cleared {} orphan toggle(s)", result.entries.len());
         }
         Some(FleetCmd::Log { machine, harness, author, item, before, limit }) => {
             let query = LogQuery {
@@ -474,7 +458,7 @@ fn ago(secs: i64) -> String {
 /// The running daemon, when it manages the repo a command is about.
 pub(crate) struct Daemon {
     rt: tokio::runtime::Runtime,
-    client: Client,
+    pub(crate) client: Client,
     status: StatusView,
 }
 
@@ -666,33 +650,17 @@ impl Daemon {
                 if !self.block(c.harnesses())?.iter().any(|h| h.name == harness) {
                     bail!("unknown harness `{harness}` on this machine (see `sk1ll harnesses`)");
                 }
-                let mut changes = Vec::new();
-                let toggle =
-                    |kind, name, on: bool| ToggleChange { harness: harness.clone(), kind, name, enabled: Some(on) };
                 let target = assign_target(kind, name, state, default_skills, default_rules, all)?;
-                if let Some((kind, name, state)) = target {
-                    check_exists(&sk1ll_core::Repo::open(repo)?, kind, &name)?;
-                    let kind = match kind {
-                        Kind::Skill => ToggleKind::Skill,
-                        Kind::Rule => ToggleKind::Rule,
-                    };
-                    changes.push(toggle(kind, Some(name), state.on()));
-                }
-                if let Some(s) = default_skills {
-                    changes.push(toggle(ToggleKind::NewSkillsDefault, None, s.on()));
-                }
-                if let Some(s) = default_rules {
-                    changes.push(toggle(ToggleKind::NewRulesDefault, None, s.on()));
-                }
+                let Some(write) = assignment_write(repo, &harness, target, default_skills, default_rules, all)? else {
+                    return Ok(());
+                };
                 let machine = self.status.machine_id.clone();
-                let update = if let Some(s) = all {
-                    let result = self.block(c.set_harness_assignment(&harness, s.on()))?;
-                    if let Some(warning) = result.warning {
-                        eprintln!("warning: {warning}");
+                let update = match write {
+                    AssignmentWrite::Harness { harness, enabled } => {
+                        self.block(c.set_harness_assignment(&harness, enabled))?
                     }
-                    result.update
-                } else {
-                    self.block(c.set_assignment(&machine, &AssignmentChanges { changes, ..Default::default() }))?
+                    AssignmentWrite::Changes(changes) => self.block(c.set_assignment(&machine, &changes))?,
+                    AssignmentWrite::RenameHarness(_) => unreachable!(),
                 };
                 if all.is_some() && !update.errors.is_empty() {
                     println!("Assignment of {machine} was saved at revision {}.", update.revision);

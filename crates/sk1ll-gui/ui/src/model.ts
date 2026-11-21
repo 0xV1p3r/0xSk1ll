@@ -1,4 +1,4 @@
-import type { Assignment, CachedAssignmentSnapshot as AssignmentSnapshot, HarnessAssignment, ItemRef, ItemView, MachineReport, MachineRow, MachineStatus, ToggleChange } from './types';
+import type { Assignment, CachedAssignmentSnapshot as AssignmentSnapshot, HarnessAssignment, ItemId, ItemRef, ItemView, MachineReport, MachineRow, MachineStatus, ToggleChange } from './types';
 
 export const statusOrder: MachineStatus[] = ['offline', 'blocked', 'conflict', 'behind', 'drafting', 'in_sync'];
 export const statusLabels: Record<MachineStatus, string> = {
@@ -29,9 +29,9 @@ export function splitItem(item: ItemRef): { kind: string; name: string } {
 export function everythingOn(harnesses: string[], items: ItemView[]): ToggleChange[] {
   return harnesses.flatMap((harness): ToggleChange[] => [
     { harness, kind: 'new_skills_default', enabled: true }, { harness, kind: 'new_rules_default', enabled: true },
-    ...items.filter(item => item.in_baseline).map((item): ToggleChange => {
+    ...items.filter(item => item.in_baseline && item.id != null).map((item): ToggleChange => {
       const { kind, name } = splitItem(item.item);
-      return { harness, kind: kind === 'rule' ? 'rule' : 'skill', name, enabled: true };
+      return { harness, kind: kind === 'rule' ? 'rule' : 'skill', item_id: item.id!, name, enabled: true };
     }),
   ]);
 }
@@ -42,21 +42,21 @@ export function insecureHttp(server: string): boolean {
   const host = url.hostname.replace(/^\[|\]$/g, '');
   return url.protocol === 'http:' && !(host.toLowerCase() === 'localhost' || host === '::1' || /^127\.\d+\.\d+\.\d+$/.test(host));
 }
-export function cellState(assignment: Assignment, harness: string, item: ItemRef) {
+export function cellState(assignment: Assignment, harness: string, item: ItemRef, id: ItemId | null | undefined) {
   const h = assignment.harnesses[harness] ?? emptyHarness();
-  const { kind, name } = splitItem(item);
+  const { kind } = splitItem(item);
   const items = kind === 'skill' ? h.skills : h.rules;
-  const explicit = Object.hasOwn(items, name);
-  return { explicit, enabled: explicit ? items[name] : kind === 'skill' ? h.new_skills_default : h.new_rules_default };
+  const explicit = id != null && Object.hasOwn(items, id);
+  return { explicit, enabled: explicit ? items[id!] : kind === 'skill' ? h.new_skills_default : h.new_rules_default };
 }
 export function applyToggle(assignment: Assignment, change: ToggleChange): Assignment {
   const next = structuredClone(assignment);
   const h = next.harnesses[change.harness] ??= emptyHarness();
   // Default changes are rendered only after the Server materializes existing items.
-  if ((change.kind === 'skill' || change.kind === 'rule') && change.name !== undefined) {
+  if ((change.kind === 'skill' || change.kind === 'rule') && change.item_id !== undefined) {
     const map = change.kind === 'skill' ? h.skills : h.rules;
-    if (change.enabled === null) delete map[change.name];
-    else map[change.name] = change.enabled;
+    if (change.enabled === null) delete map[change.item_id];
+    else Object.defineProperty(map, change.item_id, { value: change.enabled, writable: true, enumerable: true, configurable: true });
   }
   return next;
 }
@@ -65,8 +65,8 @@ export const time = (seconds: number | null) => seconds === null ? 'Never' : new
 
 // Machine ids are data: `constructor` or `__proto__` must not read or write the object's prototype.
 export const own = <T,>(record: Record<string, T>, key: string): T | undefined => Object.hasOwn(record, key) ? record[key] : undefined;
-// Which registration of a Machine this is: the Server's random id, else (from a 0.1.0 Server) the second it joined.
-export const registrationOf = (machine: Pick<MachineRow, 'registration' | 'joined_at'>) => machine.registration ?? `joined at ${machine.joined_at}`;
+// Standalone has no registration.
+export const registrationOf = (machine: Pick<MachineRow, 'registration'>) => machine.registration ?? null;
 // A snapshot with when its request was sent and answered, on one counter shared by every load and write.
 export type StampedSnapshot = AssignmentSnapshot & { sent?: number; received?: number };
 let clock = 0;

@@ -13,7 +13,7 @@ import type { LogCause } from './types';
 import { Confirm, ErrorNotice, KindBadge, Loading, Nothing, Panel, PanelToolbar, SectionTitle, When } from './shared';
 
 
-const causeLabel = (cause: LogCause) => cause.type === 'undo' ? `Restored #${cause.entry}` : ({ change: 'Changed', item_removed: 'Item removed', default_materialized: 'Default applied', machine_removed: 'Machine removed', harness_added: 'Harness added' })[cause.type];
+const causeLabel = (cause: LogCause) => cause.type === 'undo' ? `Restored #${cause.entry}` : ({ change: 'Changed', orphan_pruned: 'Orphan cleared', harness_renamed: 'Harness renamed', default_materialized: 'Default applied', machine_removed: 'Machine removed', harness_added: 'Harness added' })[cause.type];
 const toggleLabel = (value: boolean | null) => value === null ? 'Default' : value ? 'On' : 'Off';
 export function Log({ revision, fleetRevision = revision, changed }: { fleetRevision?: number; revision: number; changed: () => void }) {
   const log = useRef<HTMLDivElement>(null);
@@ -53,13 +53,13 @@ export function Log({ revision, fleetRevision = revision, changed }: { fleetRevi
       <TableBody>{rows?.map(entry => <TableRow className="group" key={entry.id}>
         <TableCell className="text-muted-foreground"><When seconds={entry.at} focusable={false} /><span className="mt-0.5 block text-xs">{time(entry.at)}</span><span className="block text-xs">#{entry.id}</span></TableCell>
         <TableCell><span className="text-xs text-muted-foreground">{entry.machine} / {entry.harness}</span>
-          <p className="mt-0.5 flex items-center gap-2 text-sm font-medium">{entry.name === null ? <span className="first-letter:uppercase">{entry.kind.replaceAll('_', ' ')}</span> : <><span>{entry.name}</span><KindBadge kind={entry.kind} /></>}</p></TableCell>
+          <p className="mt-0.5 flex items-center gap-2 text-sm font-medium">{entry.item_id === null ? <span className="first-letter:uppercase">{entry.kind.replaceAll('_', ' ')}</span> : <><span title={entry.item_id}>{entry.name ?? entry.item_id}</span><KindBadge kind={entry.kind} /></>}</p></TableCell>
         <TableCell className="whitespace-nowrap">{toggleLabel(entry.before)} <span className="text-muted-foreground">→</span> {toggleLabel(entry.after)}</TableCell>
         <TableCell>{entry.cause.type === 'change' ? <span className="text-muted-foreground">—</span> : <Badge variant="secondary">{causeLabel(entry.cause)}</Badge>}</TableCell>
         <TableCell className="text-muted-foreground">{entry.author}</TableCell>
-        <TableCell data-log-id={entry.id} className="w-24 min-w-24 max-w-24 whitespace-normal xl:w-36 xl:min-w-36 xl:max-w-36">{removed(entry.machine) ? <span className="text-xs text-muted-foreground" title="This Machine was removed. Join it again to restore its Assignment.">Machine removed</span> : <Confirm label={`Restore ${toggleLabel(entry.before)}`} title="Restore Assignment?" description={`Restore ${entry.name === null ? entry.kind.replaceAll('_', ' ') : `${entry.kind}:${entry.name}`} on Machine ${entry.machine} / Harness ${entry.harness} to ${toggleLabel(entry.before)}?`} confirmLabel="Restore" variant="default" triggerVariant="outline"
-          ariaLabel={`Restore ${toggleLabel(entry.before)} for log entry ${entry.id}: ${entry.name === null ? entry.kind.replaceAll('_', ' ') : `${entry.kind}:${entry.name}`} on ${entry.machine} / ${entry.harness}`} action={() => { restoreFocus.current = true; return api.undo(entry.id); }} onDone={() => {
-            toast({ title: `Restored Assignment ${entry.name === null ? entry.kind.replaceAll('_', ' ') : `${entry.kind}:${entry.name}`} on ${entry.machine} / ${entry.harness} to ${toggleLabel(entry.before)}.` }); changed();
+        <TableCell data-log-id={entry.id} className="w-24 min-w-24 max-w-24 whitespace-normal xl:w-36 xl:min-w-36 xl:max-w-36">{removed(entry.machine) ? <span className="text-xs text-muted-foreground" title="This Machine was removed. Join it again to restore its Assignment.">Machine removed</span> : <Confirm label={`Restore ${toggleLabel(entry.before)}`} title="Restore Assignment?" description={`Restore ${entry.item_id === null ? entry.kind.replaceAll('_', ' ') : `${entry.kind}:${entry.name ?? entry.item_id}`} on Machine ${entry.machine} / Harness ${entry.harness} to ${toggleLabel(entry.before)}?`} confirmLabel="Restore" variant="default" triggerVariant="outline"
+          ariaLabel={`Restore ${toggleLabel(entry.before)} for log entry ${entry.id}: ${entry.item_id === null ? entry.kind.replaceAll('_', ' ') : `${entry.kind}:${entry.name ?? entry.item_id}`} on ${entry.machine} / ${entry.harness}`} action={() => { restoreFocus.current = true; return api.undo(entry.id); }} onDone={() => {
+            toast({ title: `Restored Assignment ${entry.item_id === null ? entry.kind.replaceAll('_', ' ') : `${entry.kind}:${entry.name ?? entry.item_id}`} on ${entry.machine} / ${entry.harness} to ${toggleLabel(entry.before)}.` }); changed();
           }} />}</TableCell>
       </TableRow>)}</TableBody></Table>}</div></Panel>
     {(before !== undefined || pages.length > 0 || (data?.length ?? 0) >= 50) && <div className="flex items-center justify-end gap-2">

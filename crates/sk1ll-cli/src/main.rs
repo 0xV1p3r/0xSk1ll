@@ -39,14 +39,6 @@ mod fleet {
         Ok(sk1ll_core::Assignment::load(cache)?)
     }
 
-    pub(crate) fn queue_discarded(
-        _state: Option<&Path>,
-        _lock: Option<&sk1ll_core::EngineLock>,
-        _items: Vec<sk1ll_core::ItemRef>,
-    ) -> Result<()> {
-        Ok(())
-    }
-
     pub(crate) fn assign_direct(_cli: &Cli, _repo: &Path, _lock: Option<&sk1ll_core::EngineLock>) -> Result<bool> {
         Ok(false)
     }
@@ -294,6 +286,14 @@ enum FleetCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// List toggles for items absent from the Baseline and every Machine's last report
+    Orphans,
+    /// Clear orphan toggles in your scope
+    PruneOrphans {
+        /// Clear only this Machine's orphan toggles
+        #[arg(long)]
+        machine: Option<String>,
+    },
     /// Show the Assignment log, newest first
     Log {
         #[arg(long)]
@@ -508,6 +508,10 @@ fn run(cli: Cli) -> Result<()> {
     }
     if matches!(cli.cmd, Cmd::Assign { .. }) && fleet::assign_direct(&cli, &repo_path, lock.as_ref())? {
         return Ok(());
+    }
+
+    if lock.is_some() && matches!(cli.cmd, Cmd::Sync { .. } | Cmd::Assign { .. } | Cmd::Adopt { .. }) {
+        harnesses::recover_pending(&cli, &machine_path, &assignment_path)?;
     }
 
     match cli.cmd {
@@ -732,7 +736,6 @@ fn run(cli: Cli) -> Result<()> {
             println!("pushed to origin");
         }
         Cmd::Restore { items, all, yes } => {
-            let before: std::collections::BTreeSet<ItemRef> = repo.draft()?.into_iter().map(|d| d.item).collect();
             if all {
                 let draft = repo.draft()?;
                 if draft.is_empty() {
@@ -753,9 +756,6 @@ fn run(cli: Cli) -> Result<()> {
                 repo.restore(&items)?;
                 println!("restored {}", names(&items));
             }
-            let after: std::collections::BTreeSet<ItemRef> = repo.draft()?.into_iter().map(|d| d.item).collect();
-            let discarded = before.difference(&after).cloned().collect();
-            fleet::queue_discarded(daemon_state.as_deref(), lock.as_ref(), discarded)?;
             // Restore also repairs repositories with damaged configuration.
             // A pending pull's tree is partial: IDs wait until it is finished.
             if let Ok(restored) = Repo::open(&repo_path)
@@ -804,9 +804,10 @@ fn run(cli: Cli) -> Result<()> {
                     None => sync::unmanaged::select(&repo, &harnesses, &harness, &name)?,
                 };
                 sync::unmanaged::publish(&repo, &adoption)?;
+                let id = assignment_item(&repo, Kind::Skill, &name)?;
                 let mut assignments = assignment()?;
                 for location in &adoption.locations {
-                    assignments.set_skill(&location.harness, &name, true);
+                    assignments.set_skill(&location.harness, &id, true);
                 }
                 assignments.save(&assignment_path)?;
                 sync::unmanaged::complete(&repo, &harnesses, &adoption)?;
@@ -836,51 +837,27 @@ fn run(cli: Cli) -> Result<()> {
             }
             let mut a = assignment()?;
             if let Some(s) = all {
-                let (skills, rules) = every_item(&repo)?;
-                let (skills, skipped_skills): (Vec<_>, Vec<_>) =
-                    skills.into_iter().partition(|name| sk1ll_core::imports::validate_name(name).is_ok());
-                let (rules, skipped_rules): (Vec<_>, Vec<_>) =
-                    rules.into_iter().partition(|name| sk1ll_core::imports::validate_name(name).is_ok());
-                if a.harness(&harness).new_skills_default != s.on() {
-                    a.materialize_skills(&harness, &skipped_skills);
-                }
-                if a.harness(&harness).new_rules_default != s.on() {
-                    a.materialize_rules(&harness, &skipped_rules);
-                }
-                for name in &skills {
-                    a.set_skill(&harness, name, s.on());
-                }
-                for name in &rules {
-                    a.set_rule(&harness, name, s.on());
-                }
-                for item in skipped_skills
-                    .into_iter()
-                    .map(sk1ll_core::ItemRef::Skill)
-                    .chain(skipped_rules.into_iter().map(sk1ll_core::ItemRef::Rule))
-                {
-                    eprintln!("warning: skipped {item} (ineligible name)");
-                }
-                a.set_new_skills_default(&harness, s.on());
-                a.set_new_rules_default(&harness, s.on());
-                println!("{harness}: eligible skills and rules {}, and both defaults", s.label());
+                a.set_harness(&harness, s.on());
+                println!("{harness}: skills and rules {}, and both defaults", s.label());
             }
-            if let Some((kind, name, state)) = assign_target(kind, name, state, default_skills, default_rules, all)? {
-                let label = check_exists(&repo, kind, &name)?;
+            if let Some((kind, name, state)) = assign_target(kind, name, state, default_skills, default_rules, all)?
+                && let Some(id) = resolve_assignment_item(&repo, kind, &name, state)?
+            {
                 match kind {
-                    Kind::Skill => a.set_skill(&harness, &name, state.on()),
-                    Kind::Rule => a.set_rule(&harness, &name, state.on()),
+                    Kind::Skill => a.set_skill(&harness, &id, state.on()),
+                    Kind::Rule => a.set_rule(&harness, &id, state.on()),
                 }
-                println!("{harness}: {label} {name} {}", state.label());
+                println!("{harness}: {} {name} {}", kind.label(), state.label());
             }
             if let Some(s) = default_skills {
-                let names = repo.skills()?.into_iter().map(|s| s.name).collect::<Vec<_>>();
-                a.materialize_skills(&harness, &names);
+                let ids = all_item_ids(repo.skills()?.into_iter().map(|s| s.id))?;
+                a.materialize_skills(&harness, &ids);
                 a.set_new_skills_default(&harness, s.on());
                 println!("{harness}: skills default {}", s.label());
             }
             if let Some(s) = default_rules {
-                let names = repo.rules()?.into_iter().map(|f| f.name).collect::<Vec<_>>();
-                a.materialize_rules(&harness, &names);
+                let ids = all_item_ids(repo.rules()?.into_iter().map(|r| r.id))?;
+                a.materialize_rules(&harness, &ids);
                 a.set_new_rules_default(&harness, s.on());
                 println!("{harness}: rules default {}", s.label());
             }
@@ -924,21 +901,49 @@ fn assign_target(
     }
 }
 
-/// What `assign --all` names: every skill and every rule in the repo.
-fn every_item(repo: &Repo) -> Result<(Vec<String>, Vec<String>)> {
-    Ok((repo.skills()?.into_iter().map(|s| s.name).collect(), repo.rules()?.into_iter().map(|r| r.name).collect()))
+impl Kind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Skill => "skill",
+            Self::Rule => "rule",
+        }
+    }
 }
 
-/// Fails unless the repo has that skill or rule; returns its label.
-fn check_exists(repo: &Repo, kind: Kind, name: &str) -> Result<&'static str> {
-    let (exists, label) = match kind {
-        Kind::Skill => (repo.skills()?.iter().any(|s| s.name == name), "skill"),
-        Kind::Rule => (repo.rules()?.iter().any(|f| f.name == name), "rule"),
+fn find_assignment_item(repo: &Repo, kind: Kind, name: &str) -> Result<Option<sk1ll_core::ItemId>> {
+    let item = match kind {
+        Kind::Skill => ItemRef::Skill(name.into()),
+        Kind::Rule => ItemRef::Rule(name.into()),
     };
-    if !exists {
-        bail!("no {label} named `{name}` in the repo");
+    match repo.item_ids()?.into_iter().find_map(|(candidate, id)| (candidate == item).then_some(id)) {
+        None => Ok(None),
+        Some(Some(id)) => Ok(Some(id)),
+        // Mutating commands write missing IDs first, except into a pending pull.
+        Some(None) => bail!("{item} has no Item ID yet; finish the pending pull with `sk1ll pull` first"),
     }
-    Ok(label)
+}
+
+/// Every item's Item ID, for recording current values before a default changes.
+fn all_item_ids(ids: impl IntoIterator<Item = Option<sk1ll_core::ItemId>>) -> Result<Vec<sk1ll_core::ItemId>> {
+    ids.into_iter()
+        .collect::<Option<Vec<_>>>()
+        .context("an item has no Item ID yet; finish the pending pull with `sk1ll pull` first")
+}
+
+fn assignment_item(repo: &Repo, kind: Kind, name: &str) -> Result<sk1ll_core::ItemId> {
+    find_assignment_item(repo, kind, name)?.with_context(|| format!("no {} named `{name}` in the repo", kind.label()))
+}
+
+fn resolve_assignment_item(repo: &Repo, kind: Kind, name: &str, state: Switch) -> Result<Option<sk1ll_core::ItemId>> {
+    if state.on() {
+        let id = find_assignment_item(repo, kind, name)?;
+        if id.is_none() {
+            eprintln!("warning: no {} named `{name}` in the repo", kind.label());
+        }
+        Ok(id)
+    } else {
+        assignment_item(repo, kind, name).map(Some)
+    }
 }
 
 fn print_import_changes(name: &str, changes: sk1ll_core::imports::ImportChanges) {
@@ -1060,6 +1065,13 @@ mod tests {
     use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// `item`'s Item ID, written first if it has none.
+    fn test_item_id(root: &Path, item: ItemRef) -> sk1ll_core::ItemId {
+        Repo::open(root).unwrap().assign_missing_ids().unwrap();
+        let ids = Repo::open(root).unwrap().item_ids().unwrap();
+        ids.into_iter().find(|(found, _)| *found == item).and_then(|(_, id)| id).expect("an item with an Item ID")
+    }
+
     struct TestRepo(PathBuf);
 
     impl TestRepo {
@@ -1161,72 +1173,6 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn direct_fleet_assignment_authenticates_and_stores_the_server_snapshot() {
-        use std::io::Read;
-        let repo = TestRepo::new().with_skill();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        repo.joined(&format!("http://{}", listener.local_addr().unwrap()));
-        let root = repo.0.clone();
-        let server = std::thread::spawn(move || {
-            let started = std::time::Instant::now();
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok((s, _)) => break s,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(started.elapsed() < std::time::Duration::from_secs(3), "no Server PUT received");
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                    Err(e) => panic!("{e}"),
-                }
-            };
-            stream.set_read_timeout(Some(std::time::Duration::from_secs(3))).unwrap();
-            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
-            let mut headers = String::new();
-            loop {
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                headers.push_str(&line);
-                if line == "\r\n" {
-                    break;
-                }
-            }
-            let len: usize = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().unwrap())
-                })
-                .unwrap();
-            let mut body = vec![0; len];
-            reader.read_exact(&mut body).unwrap();
-            assert!(EngineLock::try_acquire(&root).unwrap().is_none(), "held across the Server request");
-            let response = r#"{"revision":9,"assignment":{"harnesses":{
-                "h":{"new_skills_default":false,"skills":{"pdf":false}}}},"entries":[]}"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
-                 connection: close\r\n\r\n{response}",
-                response.len()
-            )
-            .unwrap();
-            (headers, String::from_utf8(body).unwrap())
-        });
-        let result = repo.run(&["assign", "h", "skill", "pdf", "off", "--default-skills", "off"]);
-        let (headers, body) = server.join().unwrap();
-        result.unwrap();
-        assert!(headers.starts_with("PUT /api/machines/test/assignment HTTP/1.1\r\n"), "{headers}");
-        assert!(headers.to_ascii_lowercase().contains("authorization: bearer tok\r\n"), "{headers}");
-        assert!(body.contains(r#""kind":"skill","name":"pdf","enabled":false"#), "{body}");
-        assert!(body.contains(r#""kind":"new_skills_default","enabled":false"#), "{body}");
-        let snap = sk1ll_daemon::state::load_snapshot(&repo.0.join(".git/daemon-assignment.json")).unwrap().unwrap();
-        assert_eq!(snap.revision, 9);
-        assert!(!snap.assignment.skill_enabled("h", "pdf"));
-        assert!(!repo.0.join("assignment.json").exists(), "Server state is stored without depending on the mirror");
-    }
-
-    #[test]
-    #[cfg(unix)]
     fn direct_fleet_assignment_fails_when_the_server_is_unreachable() {
         let repo = TestRepo::new().with_skill();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1239,27 +1185,12 @@ mod tests {
         )
         .unwrap();
         let err = repo.run(&["assign", "h", "skill", "pdf", "on"]).expect_err("fleet assignment must reach the server");
-        assert!(err.to_string().contains("server is unreachable"), "{err}");
+        assert!(err.to_string().contains("server unreachable"), "{err}");
         assert!(!repo.0.join("assignment.json").exists(), "the mirror cannot record an unaccepted change");
         assert_eq!(
             sk1ll_daemon::state::load_snapshot(&repo.0.join(".git/daemon-assignment.json")).unwrap().unwrap().revision,
             0
         );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn direct_restores_persist_discard_notifications_for_the_daemon() {
-        for all in [false, true] {
-            let repo = TestRepo::new().with_skill();
-            repo.joined("http://127.0.0.1:1");
-            fs::write(repo.0.join("machine.toml"), "[broken").unwrap();
-            repo.run(if all { &["restore", "--all", "--yes"] } else { &["restore", "pdf"] }).unwrap();
-            let outbox = fs::read_to_string(repo.0.join(".git/daemon-outbox.json"))
-                .expect("direct restore queues the same durable notification as the daemon");
-            assert!(outbox.contains("skill:pdf"), "{outbox}");
-            assert!(!repo.0.join("personal/pdf").exists());
-        }
     }
 
     #[test]
@@ -1282,7 +1213,7 @@ mod tests {
         .save(&repo.0.join(".git/daemon.json"))
         .unwrap();
         let mut assignment = Assignment::default();
-        assignment.set_skill("h", "pdf", false);
+        assignment.set_skill("h", &test_item_id(&repo.0, ItemRef::Skill("pdf".into())), false);
         sk1ll_daemon::state::save_snapshot(
             &repo.0.join(".git/daemon-assignment.json"),
             &sk1ll_proto::AssignmentSnapshot { revision: 7, assignment, registration: None },
@@ -1362,12 +1293,14 @@ mod tests {
         fs::write(repo.0.join("instructions/git.md"), "Git.").unwrap();
         repo.run(&["assign", "h", "--default-skills", "off", "--default-rules", "off"]).unwrap();
         let a = Assignment::load(&repo.0.join("assignment.json")).unwrap();
-        assert!(a.skill_enabled("h", "pdf"));
-        assert!(a.rule_enabled("h", "git"));
-        assert!(!a.skill_enabled("h", "later") && !a.rule_enabled("h", "later"));
+        let pdf = test_item_id(&repo.0, ItemRef::Skill("pdf".into()));
+        assert!(a.skill_enabled("h", &pdf));
+        assert!(a.rule_enabled("h", &test_item_id(&repo.0, ItemRef::Rule("git".into()))));
+        // Items that appear later follow the new defaults.
+        assert!(!a.harness("h").new_skills_default && !a.harness("h").new_rules_default);
         repo.run(&["assign", "h", "skill", "pdf", "off", "--default-skills", "on"]).unwrap();
         let a = Assignment::load(&repo.0.join("assignment.json")).unwrap();
-        assert!(!a.skill_enabled("h", "pdf"));
+        assert!(!a.skill_enabled("h", &pdf));
     }
 
     /// Without a daemon, a change holds the engine lock, so it fails while

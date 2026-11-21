@@ -27,7 +27,7 @@ beforeEach(() => {
   vi.mocked(api.previewHarness).mockResolvedValue(preview());
   vi.mocked(api.applyHarness).mockResolvedValue({ harnesses, errors: [] });
   vi.mocked(api.setHarnessAssignment).mockResolvedValue({
-    update: { assignment: { harnesses: {} }, revision: 1, entries: [] }, warning: null,
+    assignment: { harnesses: {} }, revision: 1, entries: [],
   });
 });
 const mount = (changed = vi.fn()) => { render(<HarnessPanel revision={0} editorId="code" changed={changed} />); return changed; };
@@ -58,8 +58,7 @@ it('previews a disable, which leaves what sk1ll placed, and applies it', async (
 
 it("turns the Harness's items off in the Assignment first, then previews again", async () => {
   vi.mocked(api.setHarnessAssignment).mockResolvedValueOnce({
-    update: { assignment: { harnesses: {} }, revision: 1, entries: [] },
-    warning: 'Unpulled items may stay on. Skipped items with ineligible names: skill:old name',
+    assignment: { harnesses: {} }, revision: 1, entries: [],
   });
   mount();
   fireEvent.click(await screen.findByRole('checkbox', { name: 'Sync into codex' }));
@@ -69,14 +68,12 @@ it("turns the Harness's items off in the Assignment first, then previews again",
   fireEvent.click(within(dialog).getByRole('button', { name: "Turn off this Harness's items first" }));
   await waitFor(() => expect(api.setHarnessAssignment).toHaveBeenCalledWith('codex', false));
   expect(await within(dialog).findByText('Nothing that sk1ll placed is left behind by this change.')).toBeTruthy();
-  expect(within(dialog).getByRole('status').textContent).toContain('skill:old name');
   expect(api.applyHarness).not.toHaveBeenCalled();
 });
 
 it('shows placement errors after saving an Assignment and allows a retry', async () => {
   vi.mocked(api.setHarnessAssignment).mockResolvedValueOnce({
-    update: { assignment: { harnesses: {} }, revision: 1, entries: [], errors: ['permission denied'] },
-    warning: null,
+    assignment: { harnesses: {} }, revision: 1, entries: [], errors: ['permission denied'],
   });
   mount();
   fireEvent.click(await screen.findByRole('checkbox', { name: 'Sync into codex' }));

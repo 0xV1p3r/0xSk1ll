@@ -11,7 +11,7 @@ vi.mock('./api', () => ({ api: { status: vi.fn(), connectionInfo: vi.fn(), skill
 vi.mock('./Skills', () => ({ Skills: ({ handoff }: { handoff: { create?: string } }) => <div data-create={handoff.create}>Local library</div> }));
 vi.mock('./Matrix', () => ({ Matrix: () => <div>Matrix</div> }));
 
-const firstRun: StatusView = { mode: 'standalone', has_origin: false, repo_ready: false, machine_id: 'box', server_url: null, repo: '/home/me/skills', headline: 'in_sync', connection: 'standalone', last_error: null, revoked: false, server_baseline: null, assignment_revision: 0, awaiting_assignment: false, auth_rejected_since: null, pending_discards: 0, report: { baseline: null, drafts: [], unpushed: [], conflicts: [], harnesses: [], blocked: false, clashes: [], behind: false } };
+const firstRun: StatusView = { mode: 'standalone', has_origin: false, repo_ready: false, machine_id: 'box', server_url: null, repo: '/home/me/skills', headline: 'in_sync', connection: 'standalone', last_error: null, revoked: false, server_baseline: null, assignment_revision: 0, awaiting_assignment: false, auth_rejected_since: null, report: { seq: 1, items: [], baseline: null, drafts: [], unpushed: [], conflicts: [], harnesses: [], blocked: false, clashes: [], behind: false } };
 const joined: StatusView = { ...firstRun, mode: 'joined', has_origin: true, repo_ready: true, server_url: 'https://skills.example.com', connection: 'connected', assignment_revision: 1 };
 const choice = (name: string, installed = true, enabled = installed): HarnessChoice =>
   ({ name, installed, enabled, harness: { skills: `~/.${name}/skills`, instructions: null, instructions_format: 'block', mode: 'symlink' } });
@@ -52,7 +52,7 @@ it('chooses Harnesses before anything is synced', async () => {
 it('joins a Fleet, waits for the restart and turns everything on', async () => {
   vi.mocked(api.join).mockImplementation(async () => { current = joined; return { machine_id: 'box', repo: '/home/me/skills', setup: 'cloned', harnesses: ['claude'], revision: 1 }; });
   vi.mocked(api.harnesses).mockResolvedValue([{ name: 'claude', origin: 'detected', harness: choice('claude').harness }]);
-  vi.mocked(api.items).mockResolvedValue([{ item: 'skill:pdf', in_baseline: true, draft: null, unpushed: false, description: null }]);
+  vi.mocked(api.items).mockResolvedValue([{ item: 'skill:pdf', id: 'pdf', in_baseline: true, draft: null, unpushed: false, description: null }]);
   vi.mocked(api.setAssignment).mockResolvedValue({ assignment: { harnesses: {} }, revision: 2, entries: [] });
   render(<App />);
   await continueTo('Join a Fleet');
@@ -66,13 +66,13 @@ it('joins a Fleet, waits for the restart and turns everything on', async () => {
   fireEvent.click(await screen.findByRole('button', { name: 'Turn everything on' }));
   await waitFor(() => expect(api.setAssignment).toHaveBeenCalledWith('box', { changes: [
     { harness: 'claude', kind: 'new_skills_default', enabled: true }, { harness: 'claude', kind: 'new_rules_default', enabled: true },
-    { harness: 'claude', kind: 'skill', name: 'pdf', enabled: true },
+    { harness: 'claude', kind: 'skill', item_id: 'pdf', name: 'pdf', enabled: true },
   ] }));
   expect(await screen.findByRole('heading', { name: 'Fleet' })).toBeTruthy();
 });
 
 it('starts a new Fleet with the admin token and skips straight to the matrix', async () => {
-  vi.mocked(api.join).mockImplementation(async () => { current = joined; return { machine_id: 'first', repo: '/home/me/skills', setup: 'initialized', harnesses: [], revision: 1 }; });
+  vi.mocked(api.join).mockImplementation(async () => { current = joined; return { machine_id: 'first', repo: '/home/me/skills', setup: 'cloned', harnesses: [], revision: 1 }; });
   render(<App />);
   await continueTo('Join as the first Machine');
   fireEvent.click(screen.getByRole('button', { name: 'Continue' }));

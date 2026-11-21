@@ -18,7 +18,7 @@ use crate::{Server, git, lock, now};
 
 /// Checks now, then every `import_poll` and after each push. Daemons are
 /// told when the updates, errors or skipped imports change; the message
-/// carries only the updates, as older daemons expect, and the GUI rereads
+/// carries the updates, and the GUI rereads
 /// the whole view.
 pub async fn poll(server: Arc<Server>) {
     loop {

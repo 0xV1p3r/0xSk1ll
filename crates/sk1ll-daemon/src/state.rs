@@ -4,8 +4,7 @@
 //! environment, see [`crate::auth`]).
 //!
 //! Next to it, also private: the last assignment snapshot the server sent
-//! (revision and content together, so they can't disagree) and the outbox
-//! of `draft_discarded` messages not yet delivered.
+//! (revision and content together, so they can't disagree)
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -41,11 +40,18 @@ impl std::fmt::Debug for DaemonState {
 }
 
 impl DaemonState {
+    pub(crate) fn rename_authority(&self) -> String {
+        sk1ll_core::hash::hash_str(&format!("{}\0{}\0{}", self.server_url, self.machine_id, self.token))
+    }
+
     /// `None` if the machine hasn't joined.
     pub fn load(path: &Path) -> anyhow::Result<Option<Self>> {
         match fs::read_to_string(path) {
             Ok(text) => Ok(Some(serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match fs::symlink_metadata(path) {
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                _ => Err(e).with_context(|| format!("reading {}", path.display())),
+            },
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
     }
@@ -114,21 +120,6 @@ pub fn load_assignment_if_present(cfg: &crate::Config) -> anyhow::Result<Option<
         return Ok(load_snapshot(&cfg.snapshot_path())?.map(|s| s.assignment));
     }
     Ok(Some(sk1ll_proto::Assignment::load(&cfg.assignment)?))
-}
-
-/// Persists direct-mode restore notifications for the daemon's next connection.
-/// The caller must hold the joined repo's engine lock while restoring and
-/// appending, so the daemon cannot load the outbox between those operations.
-pub fn queue_discards(
-    cfg: &crate::Config,
-    _lock: &sk1ll_core::EngineLock,
-    items: Vec<sk1ll_proto::ItemRef>,
-) -> anyhow::Result<()> {
-    if items.is_empty() {
-        return Ok(());
-    }
-    let state = DaemonState::load(&cfg.state)?.context("not joined to a fleet")?;
-    crate::outbox::Outbox::load(cfg.outbox_path(), &state).push(items)
 }
 
 /// `url` without `user:password@`, for comparing remotes.
@@ -244,7 +235,7 @@ mod tests {
         let path = dir.path().join("sk1ll/daemon-assignment.json");
         assert_eq!(load_snapshot(&path).unwrap(), None);
         let mut snap = AssignmentSnapshot { revision: 7, ..Default::default() };
-        snap.assignment.set_skill("h", "x", false);
+        snap.assignment.set_skill("h", &"x".parse().unwrap(), false);
         save_snapshot(&path, &snap).unwrap();
         assert_eq!(load_snapshot(&path).unwrap(), Some(snap));
         fs::write(&path, "{broken").unwrap();

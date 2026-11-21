@@ -70,7 +70,7 @@ curl -fsS -X POST -H "Authorization: Bearer $SK1LL_SERVER_ADMIN_TOKEN" \
   | jq -er 'if .scope == "self" then .code else error("the server did not grant self scope") end'
 ```
 
-The response holds the `code`, its `scope` and `expires_at` (Unix seconds). Without a body, the code has `fleet` scope. An older server ignores the requested scope and grants `fleet` without saying so in the response, which is why the example prints the code only when the response confirms `"scope": "self"`, as `sk1ll fleet invite` and the GUI do.
+The response includes the `code`, its `scope` and `expires_at` in Unix seconds. An empty request body creates a `fleet` code.
 
 On a joined machine with a running daemon, run `sk1ll fleet invite` to create a single-use join code. It prints the code, a ready-to-paste join command for the new machine, when the code expires, and its scope. You can also create a code from the GUI's Fleet or Settings screen.
 
@@ -90,9 +90,7 @@ A join code decides what the machine that joins with it may manage ([ADR 0005](a
 
 Every machine can read the fleet view, the log and every assignment. The admin token can do everything. A `self` machine that tries more gets `403` with the reason, and since it can't create join codes, it can't create a `fleet` code either. Scopes cover fleet administration only: a `self` machine can still push content to the baseline.
 
-A push drops toggles only for the skills and rules it removed from the baseline, and keeps each machine's toggles for items in its draft or unpushed commits. A push by a `fleet` machine or the admin drops them on every machine; a push by a `self` machine drops only its own, and the other machines keep theirs. Toggles for items no longer in the baseline do nothing, and apply again if an item with the same kind and name comes back from any machine's push. Later pushes that don't remove the item leave them alone; a `fleet` machine or the admin can clear them by changing the assignment. Every write also checks the caller's token and scope again as it is stored, so a request sent just before its machine was removed, or joined again with a `self` code, fails. Removing a machine waits for a push in progress, and a push queued behind the removal of its machine is refused with `401`. The server accepts pushes only to the baseline branch, the one the repo's HEAD names when the server starts: pushes to tags, other branches, refs under the branch's name or `refs/replace/` are refused, and its own reads ignore replacement objects. The server writes `hooks/pre-receive` in the repo over on every start to enforce this, so put your own checks elsewhere. If HEAD is detached or names something outside `refs/heads/`, the server refuses to start; point it at the branch with `git -C <data>/repo.git symbolic-ref HEAD refs/heads/<branch>`. Changing HEAD while the server runs isn't supported: restart it afterwards. If it can't list the tree before or after a push, that push drops no toggles. If it can't read the baseline when a draft is discarded, it drops nothing and closes the daemon's session with code 1013; the daemon reconnects, backing off, and sends the discard again. `sk1ll fleet` marks `self` machines with *manages only itself*, and the GUI's Fleet screen shows each machine's scope.
-
-Machines that joined before scopes existed have `fleet` scope. A machine removed and joined again gets the scope of its new code.
+Every write checks the caller's token and scope again inside its transaction. Removing a machine waits for a push in progress. A push queued behind a removal is refused with `401`. The server takes pushes only to the Baseline branch, selected from HEAD at startup, and ignores replacement objects. If HEAD is detached, point it to the branch with `git -C <data>/repo.git symbolic-ref HEAD refs/heads/<branch>` and restart the server. `sk1ll fleet` marks `self` Machines as *manages only itself*. A Machine removed and joined again gets the scope of its new code.
 
 On the new machine:
 
@@ -115,9 +113,19 @@ If either Assignment changes or either Machine rejoins after preview, preview ag
 
 Run `sk1ll fleet` to find the machine id. Run `sk1ll fleet remove <machine>` and type that id at the confirmation prompt. In a script, pass `--yes` to confirm removal. For an id that starts with `-`, put `--` before it: `sk1ll fleet remove --yes -- -lab`. The daemon must be running. Removal revokes the machine's credential.
 
-Use `sk1ll assign <harness> --all on|off` to change both defaults and every Baseline item, even if this Machine has yet to pull it. The operation also includes this Machine’s reported drafts and unpushed items. Older Servers use the local item list and warn that unpulled items may stay on.
+Use `sk1ll assign <harness> --all on|off` to set both defaults and every explicit toggle for a Harness, including its toggles for items the Machine has yet to pull.
 
 Use `sk1ll fleet log` to see recent Assignment changes, newest first. Filter with `--machine`, `--harness`, `--author`, or `--item`. Use `--limit` to set the page size and `--before <entry-id>` to page back. To undo a change, run `sk1ll fleet undo <entry-id>`.
+
+## Orphan toggles
+
+Assignment uses Item IDs. Renames keep their toggles on every Machine. A push or Restore changes only the repo content. Toggles for absent IDs are inert.
+
+Run `sk1ll fleet orphans` to list toggles whose Item ID appears in neither the Baseline nor any Machine's last report. `sk1ll fleet prune-orphans` clears the listed orphans in your scope and records each removal in the Assignment log. A `self` Machine can clear only its own toggles. A `fleet` Machine or the admin can clear across the Fleet, or pass `--machine <id>` to select one Machine.
+
+The Server refuses to list or clear orphans while the Baseline or any reported inventory is incomplete. Fix the affected Item ID metadata and let the Machine report again. The Server also refuses pruning while git push state is degraded.
+
+The server exposes `GET /api/assignment/orphans` and `POST /api/assignment/orphans/prune`. The optional prune body is `{"machine":"workstation"}`.
 
 ## Run the daemon
 

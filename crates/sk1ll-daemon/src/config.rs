@@ -102,11 +102,6 @@ impl Config {
         self.state.with_file_name("daemon-assignment.json")
     }
 
-    /// Undelivered `draft_discarded` messages, next to the state file.
-    pub fn outbox_path(&self) -> PathBuf {
-        self.state.with_file_name("daemon-outbox.json")
-    }
-
     /// `SK1LL_DAEMON_SOCKET`, else `$XDG_RUNTIME_DIR/sk1ll/daemon.sock`, else
     /// `run/daemon.sock` in the config dir (a directory of its own, since the
     /// socket's directory must be private). macOS has no runtime dir, so it is

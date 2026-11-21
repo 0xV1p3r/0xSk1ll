@@ -83,7 +83,7 @@ command!(set_notifications(enabled: bool) -> bool, set_notifications(enabled));
 command!(harness_settings() -> HarnessSettings, harness_settings());
 command!(preview_harness(request: HarnessChangeRequest) -> HarnessPreview, preview_harness(&request));
 command!(
-    set_harness_assignment(harness: String, enabled: bool) -> HarnessAssignmentUpdate,
+    set_harness_assignment(harness: String, enabled: bool) -> AssignmentUpdate,
     set_harness_assignment(&harness, enabled)
 );
 command!(apply_harness(request: HarnessChangeRequest) -> HarnessApplied, apply_harness(&request));
@@ -113,6 +113,8 @@ command!(
     set_assignment(&machine, &changes)
 );
 command!(log(query: LogQuery) -> Vec<LogEntry>, log(&query));
+command!(orphans() -> OrphansView, orphans());
+command!(prune_orphans() -> OrphansPruned, prune_orphans(&PruneOrphans::default()));
 command!(log_facets() -> LogFacets, log_facets());
 command!(undo(entry: i64) -> AssignmentUpdate, undo(entry));
 command!(join(request: JoinApiRequest) -> Joined, join(&request));

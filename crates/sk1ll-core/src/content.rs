@@ -247,22 +247,19 @@ pub fn list(
     for entry in &mut entries {
         entry.enabled_harnesses = harnesses
             .iter()
-            .filter(|(h, config)| match &entry.item {
-                Some(ItemRef::Skill(n)) => {
+            // An item without an Item ID yet has no toggle: the default applies.
+            .filter(|(h, config)| match (&entry.item, &entry.id) {
+                (Some(ItemRef::Skill(_)), id) => {
                     config.skills_dir().is_some()
-                        && if entry.id.is_some() {
-                            assignment.skill_enabled(h, n)
-                        } else {
-                            assignment.harness(h).new_skills_default
-                        }
+                        && id
+                            .as_ref()
+                            .map_or(assignment.harness(h).new_skills_default, |id| assignment.skill_enabled(h, id))
                 }
-                Some(ItemRef::Rule(n)) => {
+                (Some(ItemRef::Rule(n)), id) => {
                     config.instructions_file().is_some()
-                        && if entry.id.is_some() {
-                            assignment.rule_enabled(h, n)
-                        } else {
-                            assignment.harness(h).new_rules_default
-                        }
+                        && id
+                            .as_ref()
+                            .map_or(assignment.harness(h).new_rules_default, |id| assignment.rule_enabled(h, id))
                         && rules.iter().find(|f| f.name == *n).is_none_or(|f| f.applies_to(h))
                 }
                 _ => false,

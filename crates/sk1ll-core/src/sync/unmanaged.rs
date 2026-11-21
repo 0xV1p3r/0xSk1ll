@@ -369,7 +369,7 @@ mod tests {
         let id = ItemId::read_skill(&repo.personal_dir().join("pdf")).unwrap().unwrap();
         assert!(ulid::Ulid::from_string(&id.to_string()).is_ok());
         prepare(&repo, &hs, "a", "pdf").unwrap();
-        assert_eq!(ItemId::read_skill(&repo.personal_dir().join("pdf")).unwrap(), Some(id));
+        assert_eq!(ItemId::read_skill(&repo.personal_dir().join("pdf")).unwrap(), Some(id.clone()));
         // The identical draft copy is a retryable Adopt, not a clash.
         assert!(!discover(&repo, &hs).unwrap()[0].clashes_with_repo);
         let mut assignment = Assignment::default();
@@ -377,7 +377,7 @@ mod tests {
             assignment.set_new_skills_default(h, false);
         }
         for l in &adoption.locations {
-            assignment.set_skill(&l.harness, "pdf", true);
+            assignment.set_skill(&l.harness, &id, true);
         }
         complete(&repo, &hs, &adoption).unwrap();
         for action in plan(&repo, &hs, &assignment, PlanOptions::default()).unwrap() {
@@ -394,7 +394,7 @@ mod tests {
         }
         let remaining = discover(&repo, &hs).unwrap();
         assert_eq!(remaining[0].variants[0].locations[0].harness, "c");
-        assignment.set_skill("c", "pdf", true);
+        assignment.set_skill("c", &id, true);
         assert!(
             plan(&repo, &hs, &assignment, PlanOptions::default())
                 .unwrap()

@@ -20,7 +20,7 @@ One instruction file ("for X do Y"), kept in `instructions/`. A harness's **inst
 _Avoid_: Fragment, instruction (when meaning a single file)
 
 **Item ID**:
-The stable identifier of a personal skill, Rule or Import. It survives renames.
+The stable identifier of a personal skill, Rule or Import. Assignment toggles follow it through renames. An item without an explicit ID derives one from its kind and name.
 _Avoid_: UUID, key
 
 ## Where content goes
@@ -39,6 +39,9 @@ All machines that share one repo.
 **Assignment**:
 Which skills and rules are enabled in which harness on which machine. It is live fleet state held by the server, not part of the repo, so it has no draft.
 _Avoid_: Profile, selection, enablement
+
+**Orphan toggle**:
+An explicit Assignment toggle whose Item ID is absent from the Baseline and every Machine's last report. It is inert and can be cleared from the Assignment matrix or with `sk1ll fleet prune-orphans`.
 
 **Server**:
 The self-hosted fleet server: the fleet's git remote, which also holds its assignments and machine status and tells machines when to pull. Always means this one; the daemon's endpoint is its **local API**.

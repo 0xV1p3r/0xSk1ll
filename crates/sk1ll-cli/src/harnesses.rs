@@ -19,6 +19,14 @@ use crate::{Cli, confirm};
 
 #[derive(Subcommand)]
 pub(crate) enum HarnessCmd {
+    /// Rename a harness and move its Assignment
+    Rename {
+        old: String,
+        new: String,
+        /// Replace an Assignment already stored for the new name
+        #[arg(long)]
+        replace: bool,
+    },
     /// Sync into a harness again
     Enable {
         name: String,
@@ -83,6 +91,7 @@ impl HarnessCmd {
     /// The change and its options; `add` starts from `current`, the harness as it is now.
     fn split(self, current: Option<Harness>) -> (HarnessChange, ChangeOpts) {
         match self {
+            Self::Rename { .. } => unreachable!("renames are applied separately"),
             Self::Enable { name, opts } => (HarnessChange::Enable { name }, opts),
             Self::Disable { name, opts } => (HarnessChange::Disable { name }, opts),
             Self::Remove { name, opts } => (HarnessChange::Remove { name }, opts),
@@ -117,6 +126,10 @@ pub(crate) fn run(mut cli: Cli, repo: &Path, machine_path: &Path, assignment_pat
     let all = *all;
     let command = command.take();
     let Some(command) = command else { return list(machine_path, all, &mut std::io::stdout()) };
+    if let HarnessCmd::Rename { old, new, replace } = command {
+        let request = sk1ll_core::harness_rename::RenameRequest { from: old, to: new, replace };
+        return rename(&cli, repo, machine_path, assignment_path, request);
+    }
     let current = match &command {
         HarnessCmd::Add { name, .. } => {
             MachineConfig::load(machine_path)?.choices().into_iter().find(|c| c.name == *name).map(|c| c.harness)
@@ -131,6 +144,7 @@ pub(crate) fn run(mut cli: Cli, repo: &Path, machine_path: &Path, assignment_pat
     let Some(lock) = crate::lock_direct(repo)? else {
         bail!("{} is not a git repo; harnesses can be changed once the skills repo exists", repo.display());
     };
+    recover_pending(&cli, machine_path, assignment_path)?;
     let repo = Repo::open(repo)?;
     // `None` only for a joined machine still waiting for its assignment;
     // anything unreadable stops here, before machine.toml changes.
@@ -167,6 +181,74 @@ pub(crate) fn run(mut cli: Cli, repo: &Path, machine_path: &Path, assignment_pat
     }
     println!("harnesses in sync");
     Ok(())
+}
+
+fn rename(
+    cli: &Cli,
+    repo: &Path,
+    machine: &Path,
+    cache: &Path,
+    request: sk1ll_core::harness_rename::RenameRequest,
+) -> Result<()> {
+    use sk1ll_core::harness_rename::RenameIntent;
+    let (from, to) = (request.from.clone(), request.to.clone());
+    #[cfg(unix)]
+    if let Some(daemon) = crate::fleet::connect(cli, repo)? {
+        let renamed = crate::fleet::runtime()?.block_on(daemon.client.rename_harness(&request))?;
+        print_routed_rules(&renamed.routed_rules, &from);
+        println!("renamed harness {from} to {to}");
+        for error in &renamed.update.errors {
+            eprintln!("{error}");
+        }
+        if !renamed.update.errors.is_empty() {
+            bail!("could not apply all placements");
+        }
+        return Ok(());
+    }
+    let lock = crate::lock_direct(repo)?.ok_or_else(|| anyhow::anyhow!("{} is not a git repo", repo.display()))?;
+    #[cfg(unix)]
+    {
+        let cfg = crate::fleet::daemon_config(cli)?;
+        if let Some(state) = sk1ll_daemon::DaemonState::load(&cfg.state)? {
+            anyhow::ensure!(!state.revoked, "this machine was removed from the fleet");
+            crate::fleet::check_joined_repo(repo, &state)?;
+            let renamed =
+                crate::fleet::runtime()?.block_on(sk1ll_daemon::rename_harness_direct(&cfg, &state, &lock, request))?;
+            print_routed_rules(&renamed.routed_rules, &from);
+            println!("renamed harness {from} to {to}; run `sk1ll sync` to apply");
+            return Ok(());
+        }
+    }
+    let _ = cli;
+    let authoritative = sk1ll_core::Assignment::load(cache)?;
+    let intent = RenameIntent::prepare(machine, repo, request, &authoritative, None)?;
+    intent.apply_standalone(machine, cache)?;
+    print_routed_rules(&intent.routed_rules, &from);
+    println!("renamed harness {from} to {to}; run `sk1ll sync` to apply");
+    drop(lock);
+    Ok(())
+}
+
+pub(crate) fn recover_pending(cli: &Cli, machine: &Path, assignment: &Path) -> Result<()> {
+    use sk1ll_core::harness_rename::RenameIntent;
+    if !RenameIntent::exists(machine)? {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    if sk1ll_daemon::DaemonState::load(&crate::fleet::daemon_config(cli)?.state)?.is_some() {
+        bail!("finish the pending Harness rename by repeating the rename or starting the daemon");
+    }
+    let _ = cli;
+    if let Some(intent) = RenameIntent::load(machine, None)? {
+        intent.apply_standalone(machine, assignment)?;
+    }
+    Ok(())
+}
+
+fn print_routed_rules(rules: &[String], old: &str) {
+    if !rules.is_empty() {
+        eprintln!("Rules still routed to {old}. Update their harnesses frontmatter: {}", rules.join(", "));
+    }
 }
 
 /// The harnesses sync writes into; with `all`, also those it doesn't.
@@ -386,7 +468,8 @@ mod tests {
         assert!(!skills.join("pdf").exists());
         sk1ll(root, &["harnesses", "disable", "h", "--yes"]).unwrap();
         let assignment = sk1ll_core::Assignment::load(&root.join("assignment.json")).unwrap();
-        assert!(!assignment.skill_enabled("h", "pdf") && !assignment.skill_enabled("h", "added-later"));
+        let pdf = sk1ll_core::Repo::open(&repo).unwrap().skills().unwrap()[0].id.clone().expect("an Item ID");
+        assert!(!assignment.skill_enabled("h", &pdf) && !assignment.harness("h").new_skills_default);
 
         sk1ll(root, &["harnesses", "remove", "h", "--yes"]).unwrap();
         assert!(!fs::read_to_string(root.join("machine.toml")).unwrap().contains("[harnesses.h]"));

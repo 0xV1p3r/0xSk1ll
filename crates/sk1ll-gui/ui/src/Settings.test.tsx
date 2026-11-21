@@ -18,7 +18,7 @@ beforeEach(() => {
   vi.mocked(api.setPreferredEditor).mockResolvedValue();
 });
 const mount = (revoked = false) => render(<Settings status={{ server_url: 'https://example.com', connection: 'connected',
-  revoked, machine_id: 'laptop', assignment_revision: 4, pending_discards: 0, auth_rejected_since: null } as StatusView} socket="/daemon.sock" revision={0} changed={vi.fn()} />);
+  revoked, machine_id: 'laptop', assignment_revision: 4, auth_rejected_since: null } as StatusView} socket="/daemon.sock" revision={0} changed={vi.fn()} />);
 it('collapses rejoin when joined', async () => {
   mount(); expect(screen.queryByLabelText('Server URL')).toBeNull();
   fireEvent.click(screen.getByRole('button', { name: 'Rejoin this Machine…' }));
@@ -34,7 +34,7 @@ it('saves editor changes', async () => {
 it('orders sections and hides inactive diagnostic rows', async () => {
   mount(); await screen.findByLabelText('Preferred editor');
   expect(screen.getAllByRole('heading', { level: 2 }).map(node => node.textContent)).toEqual(['This machine', 'Fleet membership', 'Editor', 'Diagnostics']);
-  expect(screen.queryByText('Pending Restore reports')).toBeNull(); expect(screen.queryByText('Auth rejected since')).toBeNull();
+  expect(screen.queryByText('Auth rejected since')).toBeNull();
   expect(screen.getByText('/daemon.sock')).toBeTruthy(); expect(screen.getByText('Assignment revision')).toBeTruthy();
 });
 it('reveals the join code and confirms the effective default Machine id', async () => {
@@ -51,7 +51,7 @@ it('reveals the join code and confirms the effective default Machine id', async 
   const dialog = await screen.findByRole('dialog'); expect(dialog.textContent).toContain('laptop'); expect(dialog.textContent).toContain('Copied from desktop');
 });
 it('joins with the admin token instead of a join code', async () => {
-  vi.mocked(api.join).mockResolvedValue({ machine_id: 'laptop', repo: '/skills', setup: 'initialized', harnesses: [], revision: 1 });
+  vi.mocked(api.join).mockResolvedValue({ machine_id: 'laptop', repo: '/skills', setup: 'cloned', harnesses: [], revision: 1 });
   mount(true);
   fireEvent.change(screen.getByLabelText('Join with'), { target: { value: 'admin' } });
   fireEvent.change(screen.getByLabelText('Server URL'), { target: { value: 'https://skills.example.com' } });
@@ -83,9 +83,9 @@ it('uses readable Harness values and preserves path formatting', async () => {
 });
 
 it('keeps active diagnostic details with a keyboard-reachable timestamp', async () => {
-  render(<Settings status={{ server_url: '', machine_id: 'laptop', connection: 'auth_rejected', pending_discards: 2, auth_rejected_since: 1, assignment_revision: 4, last_error: 'Credentials expired' } as StatusView} socket="/daemon.sock" revision={0} changed={vi.fn()} />);
+  render(<Settings status={{ server_url: '', machine_id: 'laptop', connection: 'auth_rejected', auth_rejected_since: 1, assignment_revision: 4, last_error: 'Credentials expired' } as StatusView} socket="/daemon.sock" revision={0} changed={vi.fn()} />);
   await screen.findByLabelText('Preferred editor');
-  expect(screen.getByText('Pending Restore reports')).toBeTruthy(); expect(screen.getByText('Auth rejected since')).toBeTruthy();
+  expect(screen.getByText('Auth rejected since')).toBeTruthy();
   expect(screen.getByText('Credentials expired')).toBeTruthy(); expect(document.querySelector('time')?.getAttribute('tabindex')).toBe('0');
 });
 

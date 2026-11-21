@@ -260,10 +260,17 @@ mod tests {
     #[test]
     fn turning_the_items_off_first_lets_sync_take_them_out() {
         let (tmp, repo, config, lock) = setup();
+        repo.assign_missing_ids().unwrap();
+        let repo = Repo::open(repo.root()).unwrap();
         sync_all(&repo, &config, &Assignment::default());
         let mut off = Assignment::default();
-        off.set_skill("h", "pdf", false);
-        off.set_rule("h", "git", false);
+        for (item, id) in repo.item_ids().unwrap() {
+            let id = id.expect("an Item ID");
+            match item {
+                crate::ItemRef::Skill(_) => off.set_skill("h", &id, false),
+                _ => off.set_rule("h", &id, false),
+            }
+        }
         off.set_new_skills_default("h", false);
         off.set_new_rules_default("h", false);
         sync_all(&repo, &config, &off);

@@ -101,8 +101,8 @@ export function Action({ label, action, onDone, disabled = false, variant = 'out
     {announceDone && <span role="status" className="sr-only">{done ? doneLabel : ''}</span>}
     <ErrorNotice error={mutation.error} /></div>;
 }
-export function Confirm({ label, title, description, action, onDone, disabled = false, typed, ariaLabel, confirmLabel = label, variant = 'destructive', triggerVariant = variant }: {
-  label: string; title: string; description: ReactNode; action: () => Promise<unknown>;
+export function Confirm({ label, title, description, body, action, onDone, disabled = false, typed, ariaLabel, confirmLabel = label, variant = 'destructive', triggerVariant = variant }: {
+  label: string; title: string; description: ReactNode; body?: ReactNode; action: () => Promise<unknown>;
   onDone: () => void; disabled?: boolean; typed?: string; ariaLabel?: string; confirmLabel?: string;
   variant?: 'destructive' | 'default'; triggerVariant?: 'destructive' | 'default' | 'outline';
 }) {
@@ -113,6 +113,7 @@ export function Confirm({ label, title, description, action, onDone, disabled = 
     <DialogTrigger render={<Button variant={triggerVariant} size="sm" aria-label={ariaLabel} disabled={disabled} />}>{label}</DialogTrigger>
     <DialogContent showCloseButton={!mutation.pending}><DialogHeader><DialogTitle>{title}</DialogTitle>
       <DialogDescription>{description}</DialogDescription></DialogHeader>
+      {body}
       {typed && <Field><FieldLabel htmlFor="confirm-machine">Type <code className="font-mono">{typed}</code> to confirm</FieldLabel>
         <Input id="confirm-machine" value={text} onChange={e => setText(e.target.value)} autoComplete="off" /></Field>}
       <ErrorNotice error={mutation.error} /><DialogFooter>

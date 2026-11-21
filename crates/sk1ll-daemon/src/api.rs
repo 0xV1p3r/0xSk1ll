@@ -90,6 +90,9 @@ pub(crate) fn router(d: Arc<Daemon>) -> Router {
         .route("/machines/{id}", delete(pass))
         .route("/machines/{id}/assignment", get(assignment).put(assignment))
         .route("/assignment/harness/{harness}", post(set_harness_assignment))
+        .route("/assignment/rename-harness", post(rename_harness))
+        .route("/assignment/orphans", get(pass))
+        .route("/assignment/orphans/prune", post(pass))
         .route("/machines/{id}/assignment/copy-from", post(pass))
         .route("/machines/{id}/assignment/copy-from/preview", post(pass))
         .route("/log", get(pass))
@@ -113,7 +116,7 @@ async fn check_api_version(request: Request, next: Next) -> Response {
                  restart the daemon so it runs the installed sk1ll (systemctl --user restart sk1ll-daemon)",
                 sk1ll_core::VERSION
             );
-            (StatusCode::UPGRADE_REQUIRED, Json(sk1ll_proto::ErrorBody { error, code: None })).into_response()
+            (StatusCode::UPGRADE_REQUIRED, Json(sk1ll_proto::ErrorBody { error })).into_response()
         }
         _ => next.run(request).await,
     }
@@ -514,7 +517,7 @@ async fn assignment(
     OriginalUri(uri): OriginalUri,
     body: Bytes,
 ) -> Result<Response> {
-    if !d.is_standalone() {
+    if !d.is_standalone() && (method == Method::GET || machine != d.ident.machine_id()) {
         return pass(State(d), method, OriginalUri(uri), body).await;
     }
     if machine != d.ident.machine_id() {
@@ -531,7 +534,8 @@ async fn assignment(
         return Ok(Json(snap).into_response());
     }
     let changes = serde_json::from_slice(&body).map_err(|e| Error::BadRequest(e.to_string()))?;
-    let update = d.blocking(move |d, eng| d.set_local_assignment(eng, &changes)).await?;
+    let update =
+        d.blocking(move |d, eng| d.write_assignment(eng, sk1ll_proto::AssignmentWrite::Changes(changes))).await?;
     Ok(Json(update).into_response())
 }
 
@@ -539,52 +543,16 @@ async fn set_harness_assignment(
     State(d): St,
     UrlPath(harness): UrlPath<String>,
     Json(body): Json<sk1ll_proto::SetHarnessAssignment>,
-) -> Result<Json<crate::client::HarnessAssignmentUpdate>> {
-    use crate::client::{HarnessAssignmentUpdate, LEGACY_HARNESS_ASSIGNMENT_WARNING};
-    if d.is_standalone() {
-        let (update, skipped) = d
-            .blocking(move |d, eng| {
-                let (changes, skipped) = d.harness_assignment_changes(eng, &harness, body)?;
-                Ok((d.set_local_assignment(eng, &changes)?, skipped))
-            })
-            .await?;
-        return Ok(Json(HarnessAssignmentUpdate { update, warning: skipped_warning(&skipped), skipped }));
-    }
-    let state = d.ident.joined()?;
-    let (mut update, warning, skipped) = match server::set_harness_assignment(&d.http, state, &harness, body).await? {
-        Some(result) => (result.update, skipped_warning(&result.skipped), result.skipped),
-        None => {
-            let (changes, skipped) =
-                d.blocking(move |d, eng| d.harness_assignment_changes(eng, &harness, body)).await?;
-            let update = server::change_assignment(&d.http, state, &changes).await.map_err(Error::Internal)?;
-            let mut warning = LEGACY_HARNESS_ASSIGNMENT_WARNING.to_string();
-            if let Some(names) = skipped_warning(&skipped) {
-                warning.push(' ');
-                warning.push_str(&names);
-            }
-            (update, Some(warning), skipped)
-        }
-    };
-    let snapshot = sk1ll_proto::AssignmentSnapshot {
-        revision: update.revision,
-        assignment: update.assignment.clone(),
-        registration: None,
-    };
-    update.errors = d
-        .blocking(move |d, eng| d.apply_assignment(eng, snapshot))
-        .await
-        .unwrap_or_else(|e| vec![crate::auth::redact(&format!("applying the saved Assignment: {e}"))]);
-    d.event(crate::client::Event::Fleet);
-    Ok(Json(HarnessAssignmentUpdate { update, warning, skipped }))
+) -> Result<Json<sk1ll_proto::AssignmentUpdate>> {
+    let write = sk1ll_proto::AssignmentWrite::Harness { harness, enabled: body.enabled };
+    Ok(Json(d.blocking(move |d, eng| d.write_assignment(eng, write)).await?))
 }
 
-fn skipped_warning(skipped: &[sk1ll_proto::ItemRef]) -> Option<String> {
-    (!skipped.is_empty()).then(|| {
-        format!(
-            "Skipped items with ineligible names: {}",
-            skipped.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
-        )
-    })
+async fn rename_harness(
+    State(d): St,
+    Json(rename): Json<crate::client::HarnessRenameRequest>,
+) -> Result<Json<crate::client::HarnessRenameResult>> {
+    Ok(Json(d.blocking(move |d, eng| d.rename_harness(eng, rename)).await?))
 }
 
 /// Server pass-through: same path and query under the server's `/api`.

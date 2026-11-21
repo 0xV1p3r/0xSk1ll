@@ -132,25 +132,17 @@ proxy commands can't send it elsewhere, but private sources that relied on
 that configuration need the real host name and a default key or the agent.
 Restrict the server's outbound network too if that matters to you.
 
-## Toggles for items no longer in the baseline
+## Toggles for absent items
 
-A push drops toggles only for the items it removed itself: on every machine
-for a `fleet` machine or the admin, on its own assignment only for a `self`
-machine (ADR 0005). Other toggles for items that aren't in the baseline stay
-in their assignments, and in `GET /machines/{id}/assignment`: other machines'
-toggles for items a `self` machine removed, toggles kept for a draft or
-unpushed commit that has since gone, toggles for items that were already
-absent before a push (servers before ADR 0005 dropped those on any push),
-and toggles left behind when cleanup failed, ran out of time reading the repo
-or was interrupted by a restart. They do nothing while the item is absent,
-and apply again when an item of the same kind and name is pushed, even if it's a new item
-that only shares the name. A `fleet` machine or the admin can clear them by
-setting the toggles.
+Assignment keeps toggles for absent Item IDs until someone clears them. An
+offline Machine's last report can still include an item that was later
+removed from the Baseline. Its toggles are eligible for pruning once the
+Machine reports the item gone or the Machine is removed from the Fleet.
 
 ## The server's repo at startup and HEAD changes
 
-The server's reads of its repo while serving have a deadline, an output cap
-and, for each push or draft discard, a total budget (ADR 0005). The git
+The server's reads of its repo while serving have a deadline and an output
+cap. The git
 commands it runs while setting the repo up at startup (creating it, the
 initial commit, its config and the pre-receive hook) don't: a repo stuck on
 storage or a lock can hold startup until git gives up. The server decides the
@@ -158,19 +150,8 @@ baseline branch from HEAD once at startup and writes `hooks/pre-receive` over
 on every start. Changing HEAD while it runs isn't supported, and pushes keep
 going to the branch it started with until it restarts.
 
-## Reviewed actions across versions
-
-Reviewed Import updates require the Daemon's reviewed update route. Harness
-Apply requires a fingerprint from Harness Preview. Restart or upgrade the
-Daemon if the desktop app reports that either capability is missing.
+## Reviewed sync and concurrent changes
 
 A reviewed Sync can apply several placements. When a staged copy's digest
 differs from the reviewed digest, the Daemon leaves that copy unpublished and
 returns a new preview. Placements completed before the mismatch remain applied.
-
-## Assignment edits on older Servers
-
-Servers that omit Machine registrations do not enforce the Assignment
-revision precondition. The desktop matrix warns before a bulk edit on those
-Servers because it can overwrite an intervening change. Bulk Undo requires
-a Server that checks revisions or the standalone Daemon.

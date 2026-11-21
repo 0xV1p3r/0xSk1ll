@@ -282,11 +282,10 @@ it.each(['import', 'unmanaged', 'deleted'] as const)('hides rename and delete fo
 });
 it.each(['personal', 'rule'] as const)('validates and submits rename for %s, selecting its new name', async type => {
   const kind = type === 'rule' ? 'rule' : 'skill';
-  vi.mocked(api.renameItem).mockResolvedValue({ item: `${kind}:fresh`, migrated: ['claude'], assignment_error: null });
+  vi.mocked(api.renameItem).mockResolvedValue({ item: `${kind}:fresh` });
   mount([entry('target', type), entry('taken', type), entry('fresh', type === 'rule' ? 'personal' : 'rule')]); await select('target', type === 'rule' ? 'Rule' : 'Personal');
   fireEvent.click(screen.getByRole('button', { name: 'Rename…' }));
   const input = screen.getByLabelText('Name'), submit = screen.getByRole('button', { name: 'Rename' });
-  expect(screen.getByText(/Assignment toggles carry over on this Machine only/)).toBeTruthy();
   for (const name of ['', 'target', 'TARGET', 'TAKEN', 'bad name', 'a..b', '_bad']) {
     fireEvent.change(input, { target: { value: name } }); expect(submit.hasAttribute('disabled')).toBe(true);
     fireEvent.submit(input.closest('form')!);
@@ -296,35 +295,6 @@ it.each(['personal', 'rule'] as const)('validates and submits rename for %s, sel
   expect(await screen.findByRole('dialog', { name: 'fresh' })).toBeTruthy();
   expect(api.renameItem).toHaveBeenCalledWith({ kind, name: 'target', to: 'fresh' });
   expect(toast).toHaveBeenCalledWith({ title: 'Renamed to fresh' }); expect(changed).toHaveBeenCalledOnce();
-});
-it('offers renaming without the Assignment only after the copy was refused', async () => {
-  vi.mocked(api.renameItem).mockRejectedValueOnce({ status: 409, message: '`writing` was not renamed: offline' })
-    .mockRejectedValueOnce({ status: 409, message: 'still offline' })
-    .mockResolvedValueOnce({ item: 'skill:fresh', migrated: [], kept: [], assignment_error: null });
-  mount(); await select('writing', 'Personal'); fireEvent.click(screen.getByRole('button', { name: 'Rename…' }));
-  expect(screen.queryByRole('button', { name: 'Rename without copying Assignment' })).toBeNull();
-  const input = screen.getByLabelText('Name'); fireEvent.change(input, { target: { value: 'fresh' } }); fireEvent.submit(input.closest('form')!);
-  expect(await screen.findByText(/was not renamed: offline/)).toBeTruthy();
-  expect(screen.getByText(/this Machine's Assignment toggles stay with writing/)).toBeTruthy();
-  // Trying again copies again.
-  fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
-  expect(await screen.findByText('still offline')).toBeTruthy();
-  expect(api.renameItem).toHaveBeenLastCalledWith({ kind: 'skill', name: 'writing', to: 'fresh' });
-  fireEvent.click(screen.getByRole('button', { name: 'Rename without copying Assignment' }));
-  expect(await screen.findByRole('dialog', { name: 'fresh' })).toBeTruthy();
-  expect(api.renameItem).toHaveBeenLastCalledWith({ kind: 'skill', name: 'writing', to: 'fresh', copy_assignment: false });
-  expect(toast).toHaveBeenCalledWith({ title: 'Renamed to fresh', description: "This Machine's Assignment was not copied." });
-});
-it('keeps other rename failures free of the no-copy option', async () => {
-  vi.mocked(api.renameItem).mockRejectedValueOnce({ status: 400, message: 'name `fresh` is taken' })
-    .mockResolvedValueOnce({ item: 'skill:fresh', migrated: [], kept: ['claude'], assignment_error: null });
-  mount(); await select('writing', 'Personal'); fireEvent.click(screen.getByRole('button', { name: 'Rename…' }));
-  const input = screen.getByLabelText('Name'); fireEvent.change(input, { target: { value: 'fresh' } }); fireEvent.submit(input.closest('form')!);
-  expect(await screen.findByText(/is taken/)).toBeTruthy();
-  expect(screen.queryByRole('button', { name: 'Rename without copying Assignment' })).toBeNull();
-  fireEvent.submit(input.closest('form')!);
-  expect(await screen.findByRole('dialog', { name: 'fresh' })).toBeTruthy();
-  expect(toast).toHaveBeenCalledWith({ title: 'Renamed to fresh', description: 'claude kept the Assignment fresh already had.' });
 });
 it('offers Resume adoption only for the variant matching an interrupted Adopt', async () => {
   const variants = entry('notes', 'unmanaged').variants.map(variant => ({ ...variant, resumable: variant.hash === 'sha256:two' }));

@@ -536,9 +536,13 @@ impl Repo {
         let to = rev(self.git(), "HEAD")?.unwrap_or_default();
         let claims = crate::item_id::claims_at(self.root(), &to, |_| true, true)?;
         crate::item_id::check_claims(&claims).map_err(|e| repair_before(e, "push the replayed commits"))?;
-        let manifest = crate::item_id::manifest_on_disk(self.root())?;
-        let draft = crate::item_id::claims_on_disk(self.root(), &manifest, |_| true)?;
-        crate::item_id::check_claims(&draft).map_err(|e| repair_before(e, "sync the replayed Draft"))?;
+        // The pull went through: Draft metadata it can't read is reported by
+        // the inventory, not as a failed pull. Duplicates are refused.
+        let draft = crate::item_id::manifest_on_disk(self.root())
+            .and_then(|manifest| crate::item_id::claims_on_disk(self.root(), &manifest, |_| true));
+        if let Ok(draft) = draft {
+            crate::item_id::check_claims(&draft).map_err(|e| repair_before(e, "sync the replayed Draft"))?;
+        }
         pulled
     }
 
