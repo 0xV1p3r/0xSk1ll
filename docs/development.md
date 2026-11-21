@@ -18,7 +18,7 @@
 - A rule file must share an inode with its recorded anchor in the rules directory's `.sk1ll-state/anchors/`.
 - In block-format instructions, sync owns its marked block.
 
-An existing skill symlink enters the index only when its canonical target is the repo skill currently assigned to that harness. Sync locks each managed directory while it recovers or writes placements. It records a pending placement or removal and the recovery entry before moving the incumbent. It validates the object that moved and publishes the replacement only at a vacant name. Recovery checks which object is at the destination and keeps the backup if a different object took its place. A read-only plan resolves pending ownership in memory.
+An existing skill symlink enters the index only when its canonical target is the repo skill currently assigned to that harness. Sync locks each managed directory while it recovers or writes placements. It records a pending placement or removal and the recovery entry before moving the incumbent. It validates the object that moved and publishes the replacement only at a vacant name. Recovery checks which object is at the destination and keeps the backup if a different object took its place. A read-only plan resolves pending ownership in memory. The index stores a full placement fingerprint, including directories and modes, separately from the source content hash. Recovery keeps a backup whose payload differs from that fingerprint or has no recorded placement.
 
 ## Isolated dev fleet
 

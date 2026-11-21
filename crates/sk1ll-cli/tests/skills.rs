@@ -75,14 +75,11 @@ fn unmanaged_list_and_adopt_preserve_differing_variants_and_assignment() {
         let index: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let copy = dir.join("pdf");
         let token = std::fs::read_to_string(copy.join(sk1ll_core::sync::PLACEMENT_MARKER)).unwrap();
-        assert_eq!(
-            index["entries"]["pdf"],
-            serde_json::json!({
-                "kind": "copy",
-                "hash": sk1ll_core::hash::hash_dir(&copy).unwrap(),
-                "token": token,
-            })
-        );
+        let entry = &index["entries"]["pdf"];
+        assert_eq!(entry["kind"], "copy");
+        assert_eq!(entry["hash"], sk1ll_core::hash::hash_dir(&copy).unwrap());
+        assert_eq!(entry["token"], token);
+        assert!(entry["payload"].as_str().is_some_and(|hash| hash.starts_with("sha256:")));
         assert_eq!(index["pending"], serde_json::json!({}));
     }
     assert_eq!(std::fs::read_to_string(root.join("c/pdf/SKILL.md")).unwrap(), "different");

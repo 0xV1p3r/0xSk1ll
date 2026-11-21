@@ -5,7 +5,7 @@ use crate::config_file;
 pub const INDEX_PATH: &str = ".sk1ll-state/index.json";
 pub(super) const INDEX_DIR: &str = ".sk1ll-state";
 pub const PLACEMENT_MARKER: &str = ".sk1ll-placement";
-pub(super) const INDEX_VERSION: u32 = 2;
+pub(super) const INDEX_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileId {
@@ -49,9 +49,9 @@ impl std::fmt::Display for FileId {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
 pub enum IndexEntry {
-    Link { hash: String, target: PathBuf },
-    Copy { hash: String, token: String },
-    Rule { hash: String, file: FileId },
+    Link { hash: String, target: PathBuf, payload: String },
+    Copy { hash: String, token: String, payload: String },
+    Rule { hash: String, file: FileId, payload: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +62,12 @@ pub(super) enum Intent {
 }
 
 impl IndexEntry {
+    pub(super) fn payload(&self) -> &str {
+        match self {
+            Self::Link { payload, .. } | Self::Copy { payload, .. } | Self::Rule { payload, .. } => payload,
+        }
+    }
+
     fn anchor_name(&self) -> Option<String> {
         match self {
             Self::Copy { token, .. } if token.len() == 32 && token.bytes().all(|b| b.is_ascii_hexdigit()) => {
@@ -224,12 +230,14 @@ pub(super) fn index_path(dir: &Path) -> Result<PathBuf> {
 pub(super) fn load_index(dir: &Path) -> Result<Index> {
     let path = index_path(dir)?;
     let backup = index_backup(dir);
-    let source =
-        if (crate::placement::is_placeholder(&path, &backup) || missing(&path)?) && backup.symlink_metadata().is_ok() {
-            &backup
-        } else {
-            &path
-        };
+    let source = if missing(&path)?
+        && backup.parent().is_some_and(|p| p.symlink_metadata().is_ok_and(|m| m.is_dir()))
+        && backup.symlink_metadata().is_ok_and(|m| m.is_file())
+    {
+        &backup
+    } else {
+        &path
+    };
     let Some(text) = config_file::read_text(source, false)? else { return Ok(Index::default()) };
     let index: Index =
         serde_json::from_str(&text).map_err(|e| Error::Parse { path: path.clone(), message: e.to_string() })?;
@@ -282,12 +290,67 @@ fn missing(path: &Path) -> Result<bool> {
     }
 }
 
+const HISTORY: &str = "index-history";
+const BACKUP_META: &str = "entry.json";
+const BACKUP_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct IndexBackup {
+    version: u32,
+    payload: String,
+    displaced_at: std::time::SystemTime,
+}
+
+fn archive_index(dir: &Path, rollback: &Path) -> Result<()> {
+    let history = dir.join(INDEX_DIR).join(HISTORY);
+    mkdir_private(&history)?;
+    let dest = history.join(new_token()?);
+    crate::placement::rename_noreplace(rollback, &dest).at(&dest)?;
+    config_file::sync_dir(&dest)?;
+    config_file::sync_dir(rollback)
+}
+
+pub(super) fn prune_indexes(lock: &DirLock, grace: std::time::Duration) -> Result<()> {
+    let history = lock.dir.join(INDEX_DIR).join(HISTORY);
+    match history.symlink_metadata() {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Err(Error::Invalid(format!("{} is not a plain recovery directory", history.display()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).at(&history),
+    }
+    for name in read_dir_names(&history)? {
+        let archived = history.join(name);
+        if !archived.symlink_metadata().is_ok_and(|meta| meta.is_dir()) {
+            continue;
+        }
+        let Some(text) = config_file::read_text(&archived.join(BACKUP_META), false)? else { continue };
+        let Ok(meta) = serde_json::from_str::<IndexBackup>(&text) else { continue };
+        if meta.version == BACKUP_VERSION
+            && meta.displaced_at.elapsed().is_ok_and(|age| age >= grace)
+            && crate::hash::hash_payload(&archived.join("previous")).ok().as_ref() == Some(&meta.payload)
+        {
+            fs::remove_dir_all(&archived).at(&archived)?;
+        }
+    }
+    Ok(())
+}
+
 fn write_index(dir: &Path, index: &Index, unchanged: impl FnOnce() -> Result<()>) -> Result<()> {
     let path = index_path(dir)?;
     create_state_dir(dir)?;
     let backup = index_backup(dir);
     let rollback = backup.parent().expect("backup has a parent");
     mkdir_private(rollback)?;
+    if !missing(&backup)? {
+        if missing(&path)? {
+            crate::placement::rename_noreplace(&backup, &path).at(&path)?;
+            config_file::sync_dir(&path)?;
+            config_file::sync_dir(&backup)?;
+        } else {
+            archive_index(dir, rollback)?;
+            mkdir_private(rollback)?;
+        }
+    }
     let scratch = Scratch::open(dir)?;
     let stage = if index.is_empty() {
         None
@@ -296,23 +359,18 @@ fn write_index(dir: &Path, index: &Index, unchanged: impl FnOnce() -> Result<()>
             .map_err(|e| Error::Parse { path: path.clone(), message: e.to_string() })?;
         Some(config_file::Staged::write(&scratch.path().join("index.json"), &body, config_file::existing_mode(&path))?)
     };
-    crate::placement::clear_placeholder(&path, &backup).at(&path)?;
-    let extra = rollback.join("exchange-aside");
-    if !missing(&extra)? {
-        let saved = dir.join(INDEX_DIR).join(format!("index-recovered-{}", new_token()?));
-        crate::placement::rename_noreplace(&extra, &saved).at(&saved)?;
-    }
-    if !missing(&backup)? {
-        if missing(&path)? {
-            crate::placement::rename_noreplace(&backup, &path).at(&path)?;
-        } else {
-            let saved = dir.join(INDEX_DIR).join(format!("index-recovered-{}", new_token()?));
-            crate::placement::rename_noreplace(&backup, &saved).at(&saved)?;
-        }
-    }
     let expected =
         if missing(&path)? { None } else { Some((crate::hash::hash_payload(&path)?, rule_identity(&path)?)) };
     unchanged()?;
+    if let Some((payload, _)) = &expected {
+        let meta = IndexBackup {
+            version: BACKUP_VERSION,
+            payload: payload.clone(),
+            displaced_at: std::time::SystemTime::now(),
+        };
+        let metadata = serde_json::to_vec(&meta).map_err(|e| Error::Invalid(e.to_string()))?;
+        config_file::replace_private(&rollback.join(BACKUP_META), &metadata)?;
+    }
     #[cfg(test)]
     hook(Hook::IndexBeforeMove, &path);
     let swap = crate::placement::swap_managed(
@@ -340,18 +398,21 @@ fn write_index(dir: &Path, index: &Index, unchanged: impl FnOnce() -> Result<()>
         Err(e) => Err(e).at(&path),
     };
     if result.is_err() {
-        if !missing(&backup)? && !crate::placement::is_placeholder(&backup, &backup) {
-            // If the live name was taken, leave both versions available.
-            let _ = crate::placement::rename_noreplace(&backup, &path);
+        if !missing(&backup)? {
+            // A competing publication leaves both versions available.
+            if crate::placement::rename_noreplace(&backup, &path).is_ok() {
+                config_file::sync_dir(&path)?;
+                config_file::sync_dir(&backup)?;
+            } else {
+                displaced::remove_if_there(&rollback.join(BACKUP_META))?;
+                config_file::sync_dir(&backup)?;
+            }
         }
         return result;
     }
     config_file::sync_dir(&path)?;
-    if let Some((hash, _)) = expected
-        && crate::hash::hash_payload(&backup).ok().as_ref() == Some(&hash)
-    {
-        fs::remove_file(&backup).at(&backup)?;
-        config_file::sync_dir(&backup)?;
+    if expected.is_some() {
+        archive_index(dir, rollback)?;
     }
     Ok(())
 }
@@ -440,6 +501,13 @@ impl<'a> Ownership<'a> {
             }
             Ok(_) | Err(Error::Parse { .. } | Error::Invalid(_)) => Err(changed_since_plan(self.dest)),
             Err(e) => Err(e),
+        }
+    }
+
+    pub(super) fn placed_payload(&self) -> Result<Option<&str>> {
+        match &self.expected {
+            Some(entry) if holds(self.dest, entry)? => Ok(Some(entry.payload())),
+            _ => Ok(None),
         }
     }
 
@@ -549,7 +617,11 @@ mod tests {
             let dir = tmp.path();
             let lock = DirLock::acquire(dir).unwrap();
             let path = dir.join(INDEX_PATH);
-            let link = |target: &str| IndexEntry::Link { hash: target.into(), target: PathBuf::from(target) };
+            let link = |target: &str| IndexEntry::Link {
+                hash: target.into(),
+                target: PathBuf::from(target),
+                payload: "fixture".into(),
+            };
             let mut before = Index::default();
             before.set("skill", Some(link("before")), None);
             save_index(dir, &before).unwrap();
@@ -582,12 +654,44 @@ mod tests {
         let path = dir.join(INDEX_PATH);
         let backup = index_backup(dir);
         let mut before = Index::default();
-        before.set("skill", Some(IndexEntry::Link { hash: "link".into(), target: "/repo/skill".into() }), None);
+        before.set(
+            "skill",
+            Some(IndexEntry::Link { hash: "link".into(), target: "/repo/skill".into(), payload: "fixture".into() }),
+            None,
+        );
         save_index(dir, &before).unwrap();
         crate::placement::detach(&path, &backup).unwrap();
         assert_eq!(load_index(dir).unwrap(), before);
         lock.save(&before, &Index::default(), &path).unwrap();
         assert!(load_index(dir).unwrap().is_empty());
         assert!(!backup.exists());
+    }
+
+    #[test]
+    fn a_write_through_an_open_index_descriptor_keeps_its_archived_version() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let lock = DirLock::acquire(dir).unwrap();
+        let path = dir.join(INDEX_PATH);
+        let mut before = Index::default();
+        let link =
+            |target: &str| IndexEntry::Link { hash: target.into(), target: target.into(), payload: "fixture".into() };
+        before.set("skill", Some(link("first")), None);
+        save_index(dir, &before).unwrap();
+        let mut open = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut after = before.clone();
+        after.set("skill", Some(link("second")), None);
+        lock.save(&before, &after, &path).unwrap();
+        open.write_all(b"\nlate edit").unwrap();
+        let history = dir.join(INDEX_DIR).join(HISTORY);
+        let saved = history.join(read_dir_names(&history).unwrap().remove(0)).join("previous");
+        assert!(fs::read_to_string(&saved).unwrap().ends_with("late edit"));
+        lock.save(&after, &Index::default(), &path).unwrap();
+        assert_eq!(read_dir_names(&history).unwrap().len(), 2);
+        prune_indexes(&lock, std::time::Duration::ZERO).unwrap();
+        assert_eq!(read_dir_names(&history).unwrap().len(), 1);
+        assert!(fs::read_to_string(&saved).unwrap().ends_with("late edit"));
+        assert!(load_index(dir).unwrap().is_empty());
     }
 }

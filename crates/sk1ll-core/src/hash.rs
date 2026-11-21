@@ -7,7 +7,7 @@ use walkdir::WalkDir;
 
 use crate::git::path_bytes;
 use crate::sync::excluded_from_skill;
-use crate::{IoExt, Result};
+use crate::{Error, IoExt, Result};
 
 /// Stable content hash of a skill directory (file paths + contents), without
 /// what [`excluded_from_skill`] leaves out: `.git`, and the placement marker
@@ -60,6 +60,7 @@ fn hash_dir_buffered(dir: &Path, buf: &mut [u8]) -> Result<String> {
 pub(crate) fn hash_payload(path: &Path) -> Result<String> {
     let mut hash = Sha256::new();
     let mut buffer = [0; BUFFER];
+    let mut observed = Vec::new();
     for entry in WalkDir::new(path).follow_root_links(false).sort_by_file_name() {
         let entry = entry.map_err(std::io::Error::from).at(path)?;
         let at = entry.path();
@@ -67,6 +68,7 @@ pub(crate) fn hash_payload(path: &Path) -> Result<String> {
         hash.update((rel.len() as u64).to_le_bytes());
         hash.update(rel);
         let meta = fs::symlink_metadata(at).at(at)?;
+        observed.push((at.to_path_buf(), PayloadMetadata::of(at, &meta)?));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -88,7 +90,79 @@ pub(crate) fn hash_payload(path: &Path) -> Result<String> {
             return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "unsupported recovery entry")).at(at);
         }
     }
+    // A write to an early file may have happened while we read a later
+    // one. Recheck every entry, including directories for new names.
+    for (at, before) in observed {
+        let after = fs::symlink_metadata(&at).at(&at)?;
+        if before != PayloadMetadata::of(&at, &after)? {
+            return Err(Error::Changed(format!("{} changed while fingerprinting its payload", at.display())));
+        }
+    }
     Ok(format!("sha256:{}", hex(&hash.finalize())))
+}
+
+#[derive(PartialEq, Eq)]
+struct PayloadMetadata {
+    size: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    unix: (u64, u64, u32, i64, i64),
+    #[cfg(windows)]
+    windows: (u32, u64, i64, u32),
+    #[cfg(not(any(unix, windows)))]
+    created: Option<std::time::SystemTime>,
+    #[cfg(not(any(unix, windows)))]
+    readonly: bool,
+}
+
+impl PayloadMetadata {
+    fn of(_path: &Path, meta: &fs::Metadata) -> Result<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(Self {
+            size: meta.len(),
+            modified: meta.modified().ok(),
+            #[cfg(unix)]
+            unix: (meta.dev(), meta.ino(), meta.mode(), meta.ctime(), meta.ctime_nsec()),
+            #[cfg(windows)]
+            windows: windows_payload_metadata(_path).at(_path)?,
+            #[cfg(not(any(unix, windows)))]
+            created: meta.created().ok(),
+            #[cfg(not(any(unix, windows)))]
+            readonly: meta.permissions().readonly(),
+        })
+    }
+}
+
+#[cfg(windows)]
+fn windows_payload_metadata(path: &Path) -> std::io::Result<(u32, u64, i64, u32)> {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_READ_ATTRIBUTES, FileBasicInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    };
+    let file = fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let mut identity = BY_HANDLE_FILE_INFORMATION::default();
+    let mut basic = FILE_BASIC_INFO::default();
+    // SAFETY: the handle is open and both output structures are writable
+    // for the duration of the calls.
+    unsafe {
+        if GetFileInformationByHandle(file.as_raw_handle(), &mut identity) == 0
+            || GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileBasicInfo,
+                (&mut basic as *mut FILE_BASIC_INFO).cast(),
+                std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+            ) == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    let inode = (u64::from(identity.nFileIndexHigh) << 32) | u64::from(identity.nFileIndexLow);
+    Ok((identity.dwVolumeSerialNumber, inode, basic.ChangeTime, basic.FileAttributes))
 }
 
 /// Feeds a file's length, then its bytes, to `hasher` without holding the
@@ -156,7 +230,7 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The algorithm before paths were hashed byte-exactly, with the names
@@ -195,6 +269,13 @@ mod tests {
 
     /// Called once a file's length is taken and before its bytes are read, to
     /// simulate a concurrent write deterministically.
+    pub(crate) fn with_read_hook<T>(hook: impl FnMut(&Path) + 'static, run: impl FnOnce() -> T) -> T {
+        MID_READ.with_borrow_mut(|slot| *slot = Some(Box::new(hook)));
+        let result = run();
+        MID_READ.with_borrow_mut(|slot| *slot = None);
+        result
+    }
+
     pub(super) fn mid_read(path: &Path) {
         if let Some(mut f) = MID_READ.with_borrow_mut(Option::take) {
             f(path);

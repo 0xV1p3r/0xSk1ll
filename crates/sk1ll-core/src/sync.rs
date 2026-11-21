@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::assignment::Assignment;
-use crate::hash::{hash_dir, hash_str};
+use crate::hash::{hash_dir, hash_payload, hash_str};
 use crate::instructions::{self, Rule};
 use crate::machine::{Harness, InstructionsFormat, LinkMode};
 use crate::skill::Skill;
@@ -22,7 +22,7 @@ use crate::{Error, IoExt, Repo, Result};
 mod ownership;
 use ownership::{
     DirLock, FileId, INDEX_DIR, Intent, Ownership, Scratch, create_anchor, index_entry, load_index, mkdir_private,
-    retire_anchors, same_anchor,
+    prune_indexes, retire_anchors, same_anchor,
 };
 pub use ownership::{INDEX_PATH, IndexEntry, PLACEMENT_MARKER};
 #[cfg(test)]
@@ -316,29 +316,29 @@ fn plan_skills(
         }
         let kind = match classify(repo.root(), &dest, Some(&skill.path), recorded)? {
             Existing::Missing => Some((ActionKind::Create, None)),
-            Existing::ManagedLink(to)
-                if harness.mode == LinkMode::Symlink && to == skill.path.canonicalize().at(&skill.path)? =>
-            {
-                // An exact link the index doesn't record yet only needs recording.
-                let owned = matches!(recorded, Some(IndexEntry::Link { target, .. }) if *target == to);
-                (!owned).then_some((ActionKind::Update, None))
+            Existing::ManagedLink(to) => {
+                let changed = recorded.is_some_and(|entry| seen.edited(entry));
+                if changed && !opts.force {
+                    Some((ActionKind::Conflict, Some(format!("skill link {EDITED}"))))
+                } else {
+                    let matches_source =
+                        harness.mode == LinkMode::Symlink && to == skill.path.canonicalize().at(&skill.path)?;
+                    (!matches_source || recorded.is_none() || changed).then_some((ActionKind::Update, None))
+                }
             }
             Existing::ManagedCopy(rec) => {
-                // Changed from a copy since observed: never matches `rec`.
-                let current = seen.copy_hash.clone().unwrap_or_default();
+                let changed = recorded.is_some_and(|entry| seen.edited(entry));
                 #[cfg(test)]
                 hook(Hook::PlanSource, &dest);
                 let want = sel.source_hash(skill)?;
-                let copy = harness.mode == LinkMode::Copy;
-                if copy && current == rec && rec == want {
-                    None
-                } else if current != rec && !opts.force {
+                if changed && !opts.force {
                     edited()
-                } else {
+                } else if changed || harness.mode != LinkMode::Copy || rec != want {
                     Some((ActionKind::Update, None))
+                } else {
+                    None
                 }
             }
-            Existing::ManagedLink(_) => Some((ActionKind::Update, None)),
             Existing::Unmanaged(why) => Some((ActionKind::Conflict, Some(why))),
         };
         if let Some((kind, reason)) = kind {
@@ -361,9 +361,10 @@ fn plan_skills(
             }
             let seen = observe_skill(&entry.path())?;
             match classify(repo.root(), &entry.path(), None, recorded)? {
-                Existing::ManagedCopy(rec) if seen.copy_hash.as_ref() != Some(&rec) && !opts.force => {
-                    let (kind, reason) = edited().expect("conflict");
-                    actions.push(action(&name, kind, None, seen, reason));
+                Existing::ManagedCopy(_) | Existing::ManagedLink(_)
+                    if !opts.force && recorded.is_some_and(|entry| seen.edited(entry)) =>
+                {
+                    actions.push(action(&name, ActionKind::Conflict, None, seen, Some(format!("skill {EDITED}"))));
                 }
                 Existing::ManagedLink(_) | Existing::ManagedCopy(_) => {
                     actions.push(action(&name, ActionKind::Remove, None, seen, None));
@@ -377,7 +378,7 @@ fn plan_skills(
     }
     for (name, entry) in &index {
         if !name.starts_with(".sk1ll-") && !seen_names.contains(name) && !matches!(entry, IndexEntry::Rule { .. }) {
-            actions.push(action(name, ActionKind::Remove, None, Observed { state: None, copy_hash: None }, None));
+            actions.push(action(name, ActionKind::Remove, None, Observed { state: None, payload: None }, None));
         }
     }
     Ok(())
@@ -430,12 +431,12 @@ fn plan_rules(hname: &str, dir: &Path, rules: &[&Rule], opts: PlanOptions, actio
     let foreign = || Some(format!("{NOT_A_FILE} where sk1ll placed the rule; left alone"));
     // The hash the index records for `file`, if what is there is the very
     // file it records: any other, even with the same text, is someone else's.
-    let recorded = |file: &str, seen: &RuleSeen| -> Result<Option<String>> {
+    let recorded = |file: &str, seen: &RuleSeen| -> Result<Option<&IndexEntry>> {
         match (index.get(file), seen) {
-            (Some(entry @ IndexEntry::Rule { file: placed, hash }), RuleSeen::File { file: at, .. })
+            (Some(entry @ IndexEntry::Rule { file: placed, .. }), RuleSeen::File { file: at, .. })
                 if placed == at && same_anchor(dir, entry, &dir.join(file))? =>
             {
-                Ok(Some(hash.clone()))
+                Ok(Some(entry))
             }
             _ => Ok(None),
         }
@@ -449,14 +450,15 @@ fn plan_rules(hname: &str, dir: &Path, rules: &[&Rule], opts: PlanOptions, actio
         let (kind, reason) = match &seen {
             None => (ActionKind::Create, None),
             Some(RuleSeen::Other(_)) => (ActionKind::Conflict, foreign()),
-            Some(at @ RuleSeen::File { hash: cur, .. }) => match recorded(&file, at)? {
+            Some(at @ RuleSeen::File { payload, .. }) => match recorded(&file, at)? {
                 None => (ActionKind::Conflict, Some("existing rule file not managed by sk1ll".into())),
-                Some(rec) if *cur == want && rec == want => {
+                Some(entry) if payload != entry.payload() && !opts.force => {
+                    (ActionKind::Conflict, Some(format!("rule {EDITED}")))
+                }
+                Some(IndexEntry::Rule { hash, payload: recorded, .. }) if payload == recorded && hash == &want => {
                     desired.insert(file);
                     continue;
                 }
-                Some(_) if *cur == want => (ActionKind::Update, None),
-                Some(rec) if *cur != rec && !opts.force => (ActionKind::Conflict, Some(format!("rule {EDITED}"))),
                 Some(_) => (ActionKind::Update, None),
             },
         };
@@ -472,10 +474,12 @@ fn plan_rules(hname: &str, dir: &Path, rules: &[&Rule], opts: PlanOptions, actio
         let (kind, reason) = match &seen {
             None => (ActionKind::Remove, None),
             Some(RuleSeen::Other(_)) => (ActionKind::Conflict, foreign()),
-            Some(at @ RuleSeen::File { hash: cur, .. }) => match recorded(file, at)? {
+            Some(at @ RuleSeen::File { payload, .. }) => match recorded(file, at)? {
                 // Another file took the name: nothing of sk1ll's is there to remove.
                 None => continue,
-                Some(rec) if *cur != rec && !opts.force => (ActionKind::Conflict, Some(format!("rule {EDITED}"))),
+                Some(entry) if payload != entry.payload() && !opts.force => {
+                    (ActionKind::Conflict, Some(format!("rule {EDITED}")))
+                }
                 Some(_) => (ActionKind::Remove, None),
             },
         };
@@ -526,10 +530,10 @@ fn apply_rule(
             let stage = scratch.path().join(format!("stage-{file}"));
             crate::config_file::write_new(&stage, content.as_bytes())?;
             let result = (|| {
-                let Some(RuleSeen::File { file, hash }) = rule_seen(&stage)? else {
+                let Some(RuleSeen::File { file, hash, payload }) = rule_seen(&stage)? else {
                     return Err(changed_since_plan(&stage));
                 };
-                let next = IndexEntry::Rule { file, hash };
+                let next = IndexEntry::Rule { file, hash, payload };
                 create_anchor(dir, &next, &stage)?;
                 crate::config_file::sync_dir(&stage)?;
                 swap_in(Some(&stage), dest, displace, Some(Intent::Place { next, recovery: None }))
@@ -625,8 +629,9 @@ fn apply_skill(repo: &Repo, action: &Action, adopted: bool, reviewed_digest: Opt
                 {
                     return Err(changed_since_plan(dest));
                 }
-                let hash = expected.ok_or_else(|| changed_since_plan(dest))?.to_string();
-                return ownership.record(Some(IndexEntry::Link { hash, target: canonical }));
+                let hash = link_identity(&fs::read_link(dest).at(dest)?);
+                let payload = hash_payload(dest)?;
+                return ownership.record(Some(IndexEntry::Link { hash, target: canonical, payload }));
             }
             // Build the replacement in the skills dir's own scratch directory
             // (same filesystem, never discovered as a skill), then swap it in.
@@ -636,7 +641,7 @@ fn apply_skill(repo: &Repo, action: &Action, adopted: bool, reviewed_digest: Opt
                 LinkMode::Symlink => {
                     symlink_dir(&canonical, &stage).at(&stage)?;
                     let hash = link_identity(&fs::read_link(&stage).at(&stage)?);
-                    Ok(IndexEntry::Link { hash, target: canonical })
+                    Ok(IndexEntry::Link { hash, target: canonical, payload: hash_payload(&stage)? })
                 }
                 LinkMode::Copy => {
                     #[cfg(test)]
@@ -652,7 +657,7 @@ fn apply_skill(repo: &Repo, action: &Action, adopted: bool, reviewed_digest: Opt
                         return Err(Error::Changed(format!("{} changed since the sync preview", src.display())));
                     }
                     unmanaged::durable_tree(&stage)?;
-                    let next = IndexEntry::Copy { token, hash: digest };
+                    let next = IndexEntry::Copy { token, hash: digest, payload: hash_payload(&stage)? };
                     create_anchor(dir, &next, &marker)?;
                     Ok(next)
                 }
@@ -683,7 +688,7 @@ const NOT_A_FILE: &str = "not a plain file";
 /// One look at a rule file's place, never following a symlink there.
 enum RuleSeen {
     /// A plain file: the hash of its text, and which file it is.
-    File { hash: String, file: FileId },
+    File { hash: String, file: FileId, payload: String },
     /// Anything else.
     Other(String),
 }
@@ -693,14 +698,10 @@ impl RuleSeen {
     /// file with the same text never passes for the one observed.
     fn state(&self) -> String {
         match self {
-            RuleSeen::File { hash, file } => rule_fingerprint(hash, file),
+            RuleSeen::File { payload, file, .. } => format!("{payload}@{file}"),
             RuleSeen::Other(what) => format!("{NOT_A_FILE}: {what}"),
         }
     }
-}
-
-fn rule_fingerprint(hash: &str, file: &FileId) -> String {
-    format!("{hash}@{file}")
 }
 
 /// `None`: absent. Opened without blocking, so a FIFO there can't stall the engine.
@@ -723,7 +724,8 @@ fn rule_seen(path: &Path) -> Result<Option<RuleSeen>> {
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).at(path)?;
     let identity = FileId::read(&file, &meta, path)?;
-    Ok(Some(RuleSeen::File { hash: crate::hash::hash_bytes(&bytes), file: identity }))
+    let payload = hash_payload(path)?;
+    Ok(Some(RuleSeen::File { hash: crate::hash::hash_bytes(&bytes), file: identity, payload }))
 }
 
 /// A rule file's [`RuleSeen::state`]; `None`: absent. Whatever isn't a
@@ -739,42 +741,36 @@ struct Observed {
     /// and placement token), checked alongside its ownership record.
     /// Recovery compares just this fingerprint.
     state: Option<String>,
-    /// For a directory, its content hash, taken in the same pass as `state`.
-    copy_hash: Option<String>,
+    payload: Option<String>,
+}
+
+impl Observed {
+    fn edited(&self, entry: &IndexEntry) -> bool {
+        self.payload.as_deref() != Some(entry.payload())
+    }
 }
 
 /// Snapshot the entry itself, never following a skill symlink into the repo.
 fn observe_skill(dest: &Path) -> Result<Observed> {
     let meta = match fs::symlink_metadata(dest) {
         Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Observed { state: None, copy_hash: None }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Observed { state: None, payload: None }),
         Err(e) => return Err(e).at(dest),
     };
-    let (state, copy_hash) = if meta.file_type().is_symlink() {
-        (link_identity(&fs::read_link(dest).at(dest)?), None)
+    let (state, payload) = if meta.file_type().is_symlink() {
+        let payload = hash_payload(dest)?;
+        (format!("{}:{payload}", link_identity(&fs::read_link(dest).at(dest)?)), Some(payload))
     } else if meta.is_dir() {
-        let token = placement_token(dest)?;
-        let hash = hash_dir(dest)?;
         let marker = rule_identity(&dest.join(PLACEMENT_MARKER))?;
-        (format!("{}:{marker:?}", copy_state(&hash, token.as_deref())), Some(hash))
+        let payload = hash_payload(dest)?;
+        (format!("copy:{payload}:{marker:?}"), Some(payload))
     } else {
         ("unmanaged".to_string(), None)
     };
-    Ok(Observed { state: Some(state), copy_hash })
+    Ok(Observed { state: Some(state), payload })
 }
 
-/// What [`observe_skill`] says of a directory with the content hash `hash`
-/// and the placement token `token`. A copy sync placed differs from another
-/// with the same content by its token.
-fn copy_state(hash: &str, token: Option<&str>) -> String {
-    match token {
-        Some(token) => format!("copy:{hash}#{token}"),
-        None => format!("copy:{hash}"),
-    }
-}
-
-/// The token in the directory `dir`'s [`PLACEMENT_MARKER`]; `None` unless
-/// that is a plain file. Never follows a symlink there.
+/// Read the reserved root marker without following a link.
 fn placement_token(dir: &Path) -> Result<Option<String>> {
     use crate::config_file::{Entry, open_entry};
     use std::io::Read;
@@ -832,7 +828,8 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
 fn swap_in(stage: Option<&Path>, dest: &Path, displace: Displace, intent: Option<Intent>) -> Result<Option<Error>> {
     let holder = dest.parent().unwrap_or(dest);
     let mut held = if displace.expected.is_some() {
-        Some(displaced::Displacing::begin(displace.kind, displace.harness, dest, displace.expected, holder)?)
+        let payload = displace.ownership.map(Ownership::placed_payload).transpose()?.flatten();
+        Some(displaced::Displacing::begin(displace.kind, displace.harness, dest, displace.expected, payload, holder)?)
     } else {
         None
     };
@@ -865,6 +862,8 @@ fn swap_in(stage: Option<&Path>, dest: &Path, displace: Displace, intent: Option
     }
     let swapped = crate::placement::swap_managed(stage, dest, backup.as_deref(), || {
         if let Some(held) = &mut held {
+            #[cfg(test)]
+            hook(Hook::AfterRename, dest);
             held.mark_moved(dest)?;
             let intact = held.intact();
             #[cfg(test)]
@@ -958,7 +957,7 @@ fn replace_file(
     #[cfg(test)]
     hook(Hook::AfterCheck, path);
     let Displace { kind, harness, expected, .. } = displace;
-    let mut held = match displaced::Displacing::begin(kind, harness, path, expected, holder) {
+    let mut held = match displaced::Displacing::begin(kind, harness, path, expected, None, holder) {
         Ok(held) => held,
         Err(e) => return fail(e),
     };
@@ -1175,6 +1174,7 @@ fn recover_managed(harness: &str, dir: &Path, directory: DirectoryKind) -> Resul
 fn recover_dir(lock: &DirLock, harness: &str, directory: DirectoryKind) -> Result<Vec<displaced::Entry>> {
     settle_pending(lock)?;
     retire_anchors(lock)?;
+    prune_indexes(lock, displaced::GRACE)?;
     let dir = lock.dir;
     let scratch = Scratch::open(dir)?;
     for name in read_dir_names(scratch.path())? {
@@ -1233,11 +1233,6 @@ fn settle_pending(lock: &DirLock) -> Result<()> {
         return Ok(());
     }
     displaced::reindex(lock.dir)?;
-    for (name, intent) in &before.pending {
-        if let Some(id) = intent.recovery() {
-            displaced::clear_placeholder(id, &lock.dir.join(name))?;
-        }
-    }
     let after = before.clone().settle(lock.dir)?;
     for (name, intent) in &before.pending {
         if let Some(id) = intent.recovery() {
@@ -1311,7 +1306,7 @@ fn adopt_skill(repo: &Repo, harness: &str, src: &Path, name: &str) -> Result<()>
     };
     let ownership = Ownership::new(&lock, src, name, recorded.as_ref());
     let hash = copy_into_repo(repo, src, name)?;
-    ownership.record(Some(IndexEntry::Copy { token, hash }))
+    ownership.record(Some(IndexEntry::Copy { token, hash, payload: hash_payload(src)? }))
 }
 
 /// Replaces the repo's skill `name` (a new personal one if there is none)
@@ -1356,7 +1351,7 @@ fn adopt_rule(repo: &Repo, harness: &str, src: &Path, file: &str) -> Result<()> 
     let ownership = Ownership::new(&lock, src, file, recorded.as_ref());
     rule_into_repo(repo, file, &text)?;
     // The file read, whichever it is: from now on sync manages it.
-    let next = IndexEntry::Rule { file: id, hash: hash_str(&text) };
+    let next = IndexEntry::Rule { file: id, hash: hash_str(&text), payload: hash_payload(src)? };
     create_anchor(dir, &next, src)?;
     if !holds(src, &next)? {
         return Err(changed_since_plan(src));
@@ -1460,7 +1455,7 @@ pub mod displaced {
 
     const META: &str = "entry.json";
     const CONTENT: &str = "content";
-    const VERSION: u32 = 2;
+    const VERSION: u32 = 3;
     /// The recovery area's directory within [`TMP_DIR`].
     const AREA: &str = "displaced";
     /// Where in [`root`] the index is: one file per entry, holding its directory.
@@ -1924,16 +1919,18 @@ pub mod displaced {
     }
 
     fn differs(meta: &Meta, path: &Path) -> Result<bool> {
-        if meta.kept || meta.expected.is_empty() || fingerprint(meta.kind, path)?.unwrap_or_default() != meta.expected {
+        if meta.kept
+            || meta.expected.is_empty()
+            || fingerprint(meta.kind, path).ok().flatten().as_deref() != Some(&meta.expected)
+        {
             return Ok(true);
         }
-        let Some(expected) = &meta.payload else { return Ok(true) };
-        // Unreadable or special entries are kept rather than pruned.
-        Ok(crate::hash::hash_payload(path).ok().as_ref() != Some(expected))
+        // Backups without a baseline are separately protected from pruning.
+        Ok(meta.payload.as_ref().is_some_and(|expected| hash_payload(path).ok().as_ref() != Some(expected)))
     }
 
     fn protected(id: &str, meta: &Meta) -> bool {
-        if meta.active || meta.dest.parent().is_none() {
+        if meta.active || meta.payload.is_none() || meta.dest.parent().is_none() {
             return true;
         }
         let holder = meta.dest.parent().unwrap();
@@ -1941,13 +1938,6 @@ pub mod displaced {
             return false;
         }
         load_index(holder).map_or(true, |index| index.pending.values().any(|op| op.recovery() == Some(id)))
-    }
-
-    pub(super) fn clear_placeholder(id: &str, dest: &Path) -> Result<()> {
-        if let Some(dir) = locate(&root()?, id) {
-            crate::placement::clear_placeholder(dest, &dir.join(CONTENT)).at(dest)?;
-        }
-        Ok(())
     }
 
     pub(super) fn settle(id: &str, dest: &Path, keep: bool) -> Result<()> {
@@ -2027,7 +2017,7 @@ pub mod displaced {
         expected: Option<&str>,
         holder: &Path,
     ) -> Result<Entry> {
-        let mut held = Displacing::begin(kind, harness, dest, expected, holder)?;
+        let mut held = Displacing::begin(kind, harness, dest, expected, None, holder)?;
         if let Err(e) = held.take(aside) {
             held.abandon();
             return Err(e);
@@ -2066,6 +2056,7 @@ pub mod displaced {
             harness: &str,
             dest: &Path,
             expected: Option<&str>,
+            payload: Option<&str>,
             holder: &Path,
         ) -> Result<Self> {
             let root = root()?;
@@ -2110,10 +2101,7 @@ pub mod displaced {
                 displaced_at: now(),
                 kept: false,
                 active: true,
-                payload: expected.and_then(|_| {
-                    let real = if kind == Kind::Instructions { real_file(dest)? } else { dest.to_path_buf() };
-                    crate::hash::hash_payload(&real).ok()
-                }),
+                payload: payload.map(str::to_owned),
             };
             let expected = meta.expected.clone();
             let held = Self { id, root, dir, kind, dest: dest.to_path_buf(), expected, held: None };
@@ -2177,7 +2165,7 @@ pub mod displaced {
                 self.abandon();
                 return Ok(());
             }
-            if !self.dir.join("exchange-aside").exists() && place(&self.content(), &self.dest).is_ok() {
+            if place(&self.content(), &self.dest).is_ok() {
                 self.abandon();
                 return Ok(());
             }
@@ -2211,10 +2199,9 @@ pub mod displaced {
         /// `Some(Error::Displaced)` if it changed; otherwise the entry is
         /// left for [`prune`].
         pub(super) fn finish(self, pending: bool) -> Result<Option<Error>> {
-            let changed = match load(&self.dir)? {
-                Some((meta, path)) => differs(&meta, &path)?,
-                None => true,
-            };
+            // Report writes during the swap. A previously edited payload
+            // is retained but a requested forced replacement still succeeds.
+            let changed = !self.intact().unwrap_or(false);
             // The intent owns this recovery entry until it settles. Keep
             // the active flag set even if an external editor removed the index.
             if !pending {
@@ -2316,6 +2303,7 @@ enum Hook {
     /// Right after the replacement went in (or the removal happened),
     /// before the displaced content is checked one last time.
     AfterSwap,
+    AfterRename,
     BeforePrune,
     IndexBeforeMove,
 }
@@ -2517,7 +2505,7 @@ fn symlink_dir(src: &Path, dest: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 fn copy_entry(dest: &Path) -> IndexEntry {
     let token = placement_token(dest).unwrap().expect("a placement marker");
-    IndexEntry::Copy { token, hash: hash_dir(dest).unwrap() }
+    IndexEntry::Copy { token, hash: hash_dir(dest).unwrap(), payload: hash_payload(dest).unwrap() }
 }
 
 #[cfg(test)]
@@ -2550,13 +2538,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().join("repo/personal/pdf");
         let file = FileId { dev: 1, ino: 2 };
-        let copy = IndexEntry::Copy { token: "t1".into(), hash: "sha256:1".into() };
+        let copy = IndexEntry::Copy { token: "t1".into(), hash: "sha256:1".into(), payload: "payload".into() };
         let mut index = Index::default();
-        index.set("link", Some(IndexEntry::Link { hash: link_identity(&target), target }), None);
+        index.set(
+            "link",
+            Some(IndexEntry::Link { hash: link_identity(&target), target, payload: "payload".into() }),
+            None,
+        );
         index.set("copy", Some(copy.clone()), Some(Intent::Place { next: copy.clone(), recovery: None }));
         index.set(
             "rule.md",
-            Some(IndexEntry::Rule { file, hash: "sha256:2".into() }),
+            Some(IndexEntry::Rule { file, hash: "sha256:2".into(), payload: "payload".into() }),
             Some(Intent::Remove { recovery: None }),
         );
         assert!(load_index(tmp.path()).unwrap().is_empty());
@@ -2567,10 +2559,13 @@ mod tests {
         assert_eq!(json["version"], INDEX_VERSION);
         let entries = &json["entries"];
         assert_eq!(entries["link"]["kind"], "link");
-        assert_eq!(entries["copy"], serde_json::json!({"kind": "copy", "token": "t1", "hash": "sha256:1"}));
+        assert_eq!(
+            entries["copy"],
+            serde_json::json!({"kind": "copy", "token": "t1", "hash": "sha256:1", "payload": "payload"})
+        );
         assert_eq!(
             entries["rule.md"],
-            serde_json::json!({"kind": "rule", "file": {"dev": 1, "ino": 2}, "hash": "sha256:2"})
+            serde_json::json!({"kind": "rule", "file": {"dev": 1, "ino": 2}, "hash": "sha256:2", "payload": "payload"})
         );
         assert_eq!(json["pending"]["copy"]["op"], "place");
         assert_eq!(json["pending"]["copy"]["next"], entries["copy"]);
@@ -2597,7 +2592,7 @@ mod tests {
         std::os::unix::fs::symlink(&victim, &planted).unwrap();
         let mut index = Index::default();
         let file = FileId { dev: 1, ino: 2 };
-        index.set("git.md", Some(IndexEntry::Rule { file, hash: "sha256:1".into() }), None);
+        index.set("git.md", Some(IndexEntry::Rule { file, hash: "sha256:1".into(), payload: "payload".into() }), None);
         save_index(tmp.path(), &index).unwrap();
         assert_eq!(load_index(tmp.path()).unwrap(), index);
         assert!(fs::symlink_metadata(path).unwrap().file_type().is_file());
@@ -2635,7 +2630,9 @@ mod tests {
         assert!(index.entries.remove("pdf").is_some());
         assert!(index.entries.contains_key("notes"));
         save_index(&dir, &index).unwrap();
-        assert_eq!(unmanaged::discover(&repo, &harnesses).unwrap()[0].name, "pdf");
+        assert!(unmanaged::discover(&repo, &harnesses).unwrap().is_empty());
+        let blocked = unmanaged::select(&repo, &harnesses, "h", "pdf").unwrap_err();
+        assert!(blocked.to_string().contains(PLACEMENT_MARKER));
         let placements = placed(&repo, "h", &harnesses["h"]).unwrap();
         assert_eq!(placements.len(), 1);
         assert_eq!(placements[0].dest, dir.join("notes"));
@@ -2915,7 +2912,8 @@ mod tests {
             assert!(view(&assignment, true).is_empty());
             recover(None, &harnesses).unwrap();
             assert!(view(&assignment, true).is_empty());
-            assert_eq!(unmanaged::discover(&repo, &harnesses).unwrap()[0].name, "pdf");
+            let error = unmanaged::select(&repo, &harnesses, "h", "pdf").unwrap_err();
+            assert!(error.to_string().contains(PLACEMENT_MARKER), "{error}");
             assert!(dest.join("SKILL.md").is_file());
         }
     }
@@ -3002,6 +3000,129 @@ mod tests {
             assert!(displaced::get(&entry.id).unwrap().changed, "{case}");
             assert!(displaced::prune_older_than(Duration::ZERO).unwrap().is_empty(), "{case}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edits_since_placement_conflict_and_forced_swaps_keep_the_backup() {
+        use std::os::unix::fs::PermissionsExt;
+        for case in ["git init", "mode", "empty directory"] {
+            let d = Displacement::new("skill update");
+            let _root = displaced::test_root(&d.tmp.path().join("recovery"));
+            match case {
+                "git init" => {
+                    crate::git::Git::new(&d.dest).args(["init", "-q"]).run().unwrap();
+                }
+                "mode" => {
+                    let mode = fs::metadata(&d.file).unwrap().permissions().mode();
+                    fs::set_permissions(&d.file, fs::Permissions::from_mode(mode ^ 0o100)).unwrap();
+                }
+                "empty directory" => fs::create_dir(d.dest.join("empty")).unwrap(),
+                _ => unreachable!(),
+            }
+            let edited = hash_payload(&d.dest).unwrap();
+            let normal = plan(&d.repo, &d.harnesses, &d.assignment, PlanOptions::default()).unwrap();
+            assert_eq!(normal[0].kind, ActionKind::Conflict, "{case}");
+            let forced = plan(&d.repo, &d.harnesses, &d.assignment, PlanOptions { force: true }).unwrap();
+            apply(&d.repo, &forced[0]).unwrap();
+            let entry = d.entry();
+            assert!(entry.changed, "{case}");
+            assert_eq!(hash_payload(&entry.path).unwrap(), edited);
+            assert!(displaced::prune_older_than(Duration::ZERO).unwrap().is_empty(), "{case}");
+        }
+    }
+
+    #[test]
+    fn a_write_to_an_early_file_during_the_final_prune_scan_keeps_the_entry() {
+        use std::io::Write;
+        let (tmp, repo, harnesses) = skill_setup(LinkMode::Copy);
+        let _root = displaced::test_root(&tmp.path().join("recovery"));
+        let source = repo.personal_dir().join("pdf");
+        write(&source.join("a-first"), "old");
+        fs::write(source.join("z-large"), vec![b'x'; 1 << 20]).unwrap();
+        let assignment = Assignment::default();
+        let actions = || plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
+        apply(&repo, &actions()[0]).unwrap();
+        let dest = tmp.path().join("skills/pdf");
+        let open = fs::OpenOptions::new().write(true).open(dest.join("a-first")).unwrap();
+        write(&source.join("SKILL.md"), "Updated.\n");
+        apply(&repo, &actions()[0]).unwrap();
+        let entry = displaced::list().unwrap().remove(0);
+        assert!(!entry.changed);
+        let later = entry.path.join("z-large");
+        let checking = std::rc::Rc::new(std::cell::Cell::new(false));
+        let at_deletion_check = checking.clone();
+        let mut open = Some(open);
+        let removed = crate::hash::tests::with_read_hook(
+            move |path| {
+                if checking.get()
+                    && path == later
+                    && let Some(mut file) = open.take()
+                {
+                    file.write_all(b"new").unwrap();
+                }
+            },
+            || {
+                with_hook(
+                    Hook::BeforePrune,
+                    move |_| at_deletion_check.set(true),
+                    || displaced::prune_with(displaced::GRACE, 0),
+                )
+            },
+        )
+        .unwrap();
+        assert!(removed.is_empty());
+        assert_eq!(fs::read_to_string(entry.path.join("a-first")).unwrap(), "new");
+        assert!(displaced::get(&entry.id).unwrap().changed);
+    }
+
+    #[test]
+    fn a_fresh_process_crash_after_the_backup_rename_preserves_both_saves() {
+        const CHILD: &str = "SK1LL_BACKUP_RENAME_CRASH_TEST";
+        let harnesses = |dir: &Path| {
+            BTreeMap::from([(
+                "h".into(),
+                Harness {
+                    instructions: Some(dir.join("rules").to_string_lossy().into_owned()),
+                    instructions_format: InstructionsFormat::Rules,
+                    ..Harness::default()
+                },
+            )])
+        };
+        if let Some(dir) = std::env::var_os(CHILD).map(PathBuf::from) {
+            let _root = displaced::test_root(&dir.join("recovery"));
+            let repo = Repo::open(dir.join("repo")).unwrap();
+            let actions = plan(&repo, &harnesses(&dir), &Assignment::default(), PlanOptions::default()).unwrap();
+            with_hook(Hook::AfterRename, |_| std::process::exit(78), || apply(&repo, &actions[0])).unwrap();
+            panic!("the child reached the end of the swap");
+        }
+
+        let (tmp, repo, harnesses, dir) = instructions_setup(InstructionsFormat::Rules);
+        let _root = displaced::test_root(&tmp.path().join("recovery"));
+        let assignment = Assignment::default();
+        apply(&repo, &plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap()[0]).unwrap();
+        write(&repo.root().join("instructions/git.md"), "Updated.\n");
+        #[cfg(target_os = "linux")]
+        let executable = PathBuf::from("/proc/self/exe");
+        #[cfg(not(target_os = "linux"))]
+        let executable = std::env::current_exe().unwrap();
+        let status = std::process::Command::new(executable)
+            .args(["--exact", "sync::tests::a_fresh_process_crash_after_the_backup_rename_preserves_both_saves"])
+            .env(CHILD, tmp.path())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(78));
+        let live = dir.join("git.md");
+        assert_eq!(live.symlink_metadata().unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        let backup = displaced::list().unwrap().remove(0);
+        write(&live, "Editor saved to live name.\n");
+        write(&backup.path, "Editor saved to recovery.\n");
+        assert!(displaced::prune_older_than(Duration::ZERO).unwrap().is_empty());
+        recover(None, &harnesses).unwrap();
+        assert!(displaced::get(&backup.id).unwrap().changed);
+        assert!(displaced::prune_older_than(Duration::ZERO).unwrap().is_empty());
+        assert_eq!(fs::read_to_string(&live).unwrap(), "Editor saved to live name.\n");
+        assert_eq!(fs::read_to_string(&backup.path).unwrap(), "Editor saved to recovery.\n");
     }
 
     #[cfg(unix)]
@@ -3125,7 +3246,11 @@ mod tests {
         symlink_dir(&repo.personal_dir().join("pdf"), &dir.join("pdf")).unwrap();
         let actions = plan(&repo, &harnesses, &Assignment::default(), PlanOptions::default()).unwrap();
         let mut changed = Index::default();
-        changed.set("pdf", Some(IndexEntry::Copy { hash: "other".into(), token: "t1".into() }), None);
+        changed.set(
+            "pdf",
+            Some(IndexEntry::Copy { hash: "other".into(), token: "t1".into(), payload: "payload".into() }),
+            None,
+        );
         let edit = changed.clone();
         let result = with_hook(
             Hook::BeforeSwap,
@@ -3409,7 +3534,11 @@ mod tests {
         write(&incoming, "A local rule.\n");
         let target = repo.personal_dir().join("pdf");
         let mut links = Index::default();
-        links.set("pdf", Some(IndexEntry::Link { hash: link_identity(&target), target }), None);
+        links.set(
+            "pdf",
+            Some(IndexEntry::Link { hash: link_identity(&target), target, payload: "payload".into() }),
+            None,
+        );
         let save = || {
             Assignment::default().save(&assignment_path).unwrap();
             adopt_rule(&repo, "h", &incoming, "new.md").unwrap();
@@ -4335,7 +4464,7 @@ mod tests {
         let legacy = state.join("0000000000001-h-old.md");
         write(&legacy.join("content"), "Old rule.\n");
         let meta = format!(
-            r#"{{"version":2,"harness":"h","kind":"rule","dest":{:?},"expected":"","displaced_at":0}}"#,
+            r#"{{"version":3,"harness":"h","kind":"rule","dest":{:?},"expected":"","displaced_at":0}}"#,
             d.holder.join("old.md")
         );
         write(&legacy.join("entry.json"), &meta);

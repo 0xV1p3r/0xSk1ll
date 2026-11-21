@@ -8,86 +8,13 @@ pub fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
     crate::sync::rename_noreplace(from, to)
 }
 
-pub(crate) fn is_placeholder(path: &Path, backup: &Path) -> bool {
-    std::fs::read_link(path).is_ok_and(|target| target == backup.with_file_name("exchange-placeholder"))
-}
-
-pub(crate) fn clear_placeholder(src: &Path, backup: &Path) -> std::io::Result<()> {
-    if !is_placeholder(src, backup) {
-        return Ok(());
-    }
-    let aside = backup.with_file_name("exchange-aside");
-    match aside.symlink_metadata() {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::rename(src, &aside)?,
-        Err(e) => return Err(e),
-        Ok(_) => return Err(std::io::ErrorKind::AlreadyExists.into()),
-    }
-    if is_placeholder(&aside, backup) {
-        std::fs::remove_file(aside)
-    } else {
-        rename_noreplace(&aside, src)?;
-        Err(std::io::ErrorKind::AlreadyExists.into())
-    }
-}
-
-/// Detach an incumbent before validation. Both recovery names are private
-/// to the caller. If an editor replaces the exchange placeholder, restore
-/// the editor's file without replacement or keep it in the second slot.
+/// Detach the incumbent into the caller's vacant private recovery slot.
 pub(crate) fn detach(src: &Path, backup: &Path) -> std::io::Result<()> {
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-    {
-        let sentinel = backup.with_file_name("exchange-placeholder");
-        let aside = backup.with_file_name("exchange-aside");
-        std::os::unix::fs::symlink(&sentinel, backup)?;
-        match exchange(src, backup) {
-            Ok(()) => {
-                match std::fs::rename(src, &aside) {
-                    Ok(()) => {
-                        if std::fs::read_link(&aside).is_ok_and(|target| target == sentinel) {
-                            std::fs::remove_file(aside)?;
-                        } else {
-                            rename_noreplace(&aside, src)?;
-                            return Err(std::io::ErrorKind::AlreadyExists.into());
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e),
-                }
-                return Ok(());
-            }
-            Err(e) => {
-                std::fs::remove_file(backup)?;
-                if !matches!(e.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS | libc::ENOTSUP)) {
-                    return Err(e);
-                }
-            }
-        }
+    match backup.symlink_metadata() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::rename(src, backup),
+        Err(e) => Err(e),
+        Ok(_) => Err(std::io::ErrorKind::AlreadyExists.into()),
     }
-    // The backup name is vacant and private. A rename moves the object
-    // that is there at the syscall, never unlinking a later replacement.
-    std::fs::rename(src, backup)
-}
-
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-fn exchange(a: &Path, b: &Path) -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let a = std::ffi::CString::new(a.as_os_str().as_bytes())?;
-    let b = std::ffi::CString::new(b.as_os_str().as_bytes())?;
-    // SAFETY: the paths are NUL-terminated and stay alive for the syscall.
-    #[cfg(target_os = "macos")]
-    let result = unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), libc::RENAME_SWAP) };
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            libc::AT_FDCWD as libc::c_long,
-            a.as_ptr(),
-            libc::AT_FDCWD as libc::c_long,
-            b.as_ptr(),
-            libc::RENAME_EXCHANGE as libc::c_long,
-        )
-    };
-    if result == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
 }
 
 /// Move the incumbent, validate the object that actually moved, then make

@@ -334,14 +334,11 @@ fn assert_indexed_copy(dir: &Path, name: &str) {
     let index: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     let copy = dir.join(name);
     let token = std::fs::read_to_string(copy.join(sk1ll_core::sync::PLACEMENT_MARKER)).unwrap();
-    assert_eq!(
-        index["entries"][name],
-        serde_json::json!({
-            "kind": "copy",
-            "hash": sk1ll_core::hash::hash_dir(&copy).unwrap(),
-            "token": token,
-        })
-    );
+    let entry = &index["entries"][name];
+    assert_eq!(entry["kind"], "copy");
+    assert_eq!(entry["hash"], sk1ll_core::hash::hash_dir(&copy).unwrap());
+    assert_eq!(entry["token"], token);
+    assert!(entry["payload"].as_str().is_some_and(|hash| hash.starts_with("sha256:")));
     assert_eq!(index["pending"], serde_json::json!({}));
 }
 
@@ -1467,7 +1464,7 @@ async fn displaced_conflicts_report_to_server_and_resolve() {
             "entry.json",
             &serde_json::json!({
                 "harness": HARNESS, "kind": "skill", "dest": m.skills().join("x"),
-                "version": 2, "expected": "", "displaced_at": 0
+                "version": 3, "expected": "", "displaced_at": 0
             })
             .to_string(),
         );

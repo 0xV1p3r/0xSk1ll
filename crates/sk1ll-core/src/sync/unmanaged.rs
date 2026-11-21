@@ -56,6 +56,11 @@ pub fn discover(repo: &Repo, harnesses: &BTreeMap<String, Harness>) -> Result<Ve
                 continue;
             }
             let canonical = path.canonicalize().at(&path)?;
+            match refuse_source_marker(&canonical) {
+                Ok(()) => {}
+                Err(Error::Invalid(_)) => continue,
+                Err(e) => return Err(e),
+            }
             let hash = hash_dir(&canonical)?;
             let variant = found.entry(name).or_default().entry(hash.clone()).or_insert_with(|| Variant {
                 hash,
@@ -134,6 +139,14 @@ pub fn adopted(
         .filter_map(|(harness, h)| {
             let path = h.skills_dir()?.join(name);
             let canonical = path.canonicalize().ok()?;
+            if refuse_source_marker(&canonical).is_err()
+                && !matches!(
+                    classify(repo.root(), &path, None, index_entry(&path).ok()?.as_ref()).ok()?,
+                    Existing::ManagedCopy(_) | Existing::ManagedLink(_)
+                )
+            {
+                return None;
+            }
             (hash_dir(&canonical).ok()? == hash).then(|| Location { harness: harness.clone(), path })
         })
         .collect();
@@ -149,6 +162,12 @@ pub fn select(repo: &Repo, harnesses: &BTreeMap<String, Harness>, harness: &str,
         || name.starts_with('.')
     {
         return Err(Error::Invalid("skill name must be a folder name".into()));
+    }
+    if let Some(dir) = harnesses.get(harness).and_then(Harness::skills_dir) {
+        let path = dir.join(name);
+        if matches!(classify(repo.root(), &path, None, index_entry(&path)?.as_ref())?, Existing::Unmanaged(_)) {
+            refuse_source_marker(&path)?;
+        }
     }
     let skill = discover(repo, harnesses)?
         .into_iter()
@@ -180,6 +199,9 @@ pub fn publish(repo: &Repo, adoption: &Adoption) -> Result<()> {
         }
         return Err(Error::Invalid("adoption destination changed; leaving its content alone".into()));
     }
+    for location in &adoption.locations {
+        refuse_source_marker(&location.path)?;
+    }
     let canonical = adoption
         .locations
         .iter()
@@ -193,7 +215,9 @@ pub fn publish(repo: &Repo, adoption: &Adoption) -> Result<()> {
     let stage = crate::source::unique(&parent);
     fs::create_dir(&stage).at(&stage)?;
     let copied = (|| {
+        refuse_source_marker(&canonical)?;
         copy_dir(&canonical, &stage)?;
+        refuse_source_marker(&canonical)?;
         if hash_dir(&stage)? != adoption.hash {
             return Err(Error::Invalid("skill changed while being adopted; retry".into()));
         }
@@ -286,10 +310,12 @@ pub fn complete(repo: &Repo, harnesses: &BTreeMap<String, Harness>, adoption: &A
             continue;
         }
         let canonical = dest.canonicalize().at(&dest)?;
+        refuse_source_marker(&canonical)?;
         if hash_dir(&canonical)? != adoption.hash {
             continue;
         }
         let expected = observe_skill(&dest)?.state;
+        refuse_source_marker(&canonical)?;
         if hash_dir(&canonical)? != adoption.hash {
             continue;
         }
@@ -314,6 +340,31 @@ pub fn complete(repo: &Repo, harnesses: &BTreeMap<String, Harness>, adoption: &A
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_user_marker_is_refused_before_grouping_and_after_selection() {
+        let (tmp, repo, harnesses) = setup();
+        let blocked = tmp.path().join("a/pdf");
+        let clean = tmp.path().join("b/pdf");
+        write(&blocked.join("SKILL.md"), "Same skill.\n");
+        write(&clean.join("SKILL.md"), "Same skill.\n");
+        write(&blocked.join(PLACEMENT_MARKER), "User data.\n");
+
+        let error = prepare(&repo, &harnesses, "a", "pdf").unwrap_err();
+        assert!(error.to_string().contains(PLACEMENT_MARKER));
+        assert!(!repo.personal_dir().join("pdf").exists());
+        let selected = select(&repo, &harnesses, "b", "pdf").unwrap();
+        assert_eq!(selected.locations.len(), 1);
+        assert_eq!(selected.locations[0].path, clean);
+
+        write(&clean.join(PLACEMENT_MARKER), "Late user data.\n");
+        let error = publish(&repo, &selected).unwrap_err();
+        assert!(error.to_string().contains(PLACEMENT_MARKER));
+        assert_eq!(fs::read_to_string(blocked.join(PLACEMENT_MARKER)).unwrap(), "User data.\n");
+        assert_eq!(fs::read_to_string(clean.join(PLACEMENT_MARKER)).unwrap(), "Late user data.\n");
+        assert!(!repo.personal_dir().join("pdf").exists());
+        assert!(displaced::list().unwrap().is_empty());
+    }
 
     fn setup() -> (tempfile::TempDir, Repo, BTreeMap<String, Harness>) {
         let tmp = tempfile::tempdir().unwrap();

@@ -18,7 +18,7 @@ fn recover_list_shows_displaced_content() {
     std::fs::write(
         entry.join("entry.json"),
         format!(
-            r#"{{"version":2,"harness":"agent","kind":"rule","dest":"{}","expected":"","displaced_at":0}}"#,
+            r#"{{"version":3,"harness":"agent","kind":"rule","dest":"{}","expected":"","displaced_at":0}}"#,
             root.join("rule.md").display()
         ),
     )
