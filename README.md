@@ -22,7 +22,7 @@ For several machines, a self-hosted server acts as the git remote and holds the 
 
 ## Install
 
-Install Git 2.38 or newer and make sure `git` is on `PATH`.
+Install Git 2.40 or newer and make sure `git` is on `PATH`.
 
 Release builds target Linux and Apple silicon macOS. The [release page](https://github.com/0xV1p3r/0xSk1ll/releases) lists available archives:
 

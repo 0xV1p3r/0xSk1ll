@@ -25,8 +25,8 @@ use std::time::{Duration, Instant};
 
 use crate::{Error, Result};
 
-/// Git needed for `merge-tree --write-tree`.
-pub const MIN_VERSION: (u32, u32) = (2, 38);
+/// Oldest Git version sk1ll supports.
+pub const MIN_VERSION: (u32, u32) = (2, 40);
 
 /// The version reported by the git on PATH, without the "git version" prefix.
 pub fn version() -> Result<String> {
