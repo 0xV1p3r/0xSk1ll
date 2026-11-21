@@ -160,8 +160,10 @@ The `rules` format keeps each rule's frontmatter except `harnesses`, so Claude's
 
 Sync records the hashes of copied skills and rule files in `.sk1ll-state/index.json` in their respective directories. A block's hash is in its opening marker. When harness content differs from its recorded hash, sync reports a conflict and leaves the edit in place. You can resolve it in either of these ways.
 
-- `sk1ll adopt <harness> <name>` copies the edited skill or rule file back into the repo as a draft change and restores the rule's `harnesses:` key.
-- `sk1ll sync --force` overwrites the edit.
+- `sk1ll adopt <harness> <name>` copies the edited skill or rule file back into the repo as a draft change and restores the rule's `harnesses:` key. The repo version it replaces goes to recovery under the harness name `repo`, like content sync replaces.
+- `sk1ll sync --force` overwrites the edit. The edited copy, or the edited skill link, goes to recovery.
+
+Adopt copies a skill without its `.git` directories. sk1ll then owns only what it copied, so a harness copy that has a `.git` stays a conflict. A forced sync keeps that copy in recovery until you discard it. The same applies to a repo version with a `.git`, and `sk1ll recover adopt` keeps an entry whose `.git` it did not copy.
 
 A `block` mixes several rules, so it can't be adopted. Move that edit into `instructions/` by hand.
 

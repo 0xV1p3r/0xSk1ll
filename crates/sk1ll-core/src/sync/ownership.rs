@@ -325,11 +325,16 @@ pub(super) fn prune_indexes(lock: &DirLock, grace: std::time::Duration) -> Resul
         }
         let Some(text) = config_file::read_text(&archived.join(BACKUP_META), false)? else { continue };
         let Ok(meta) = serde_json::from_str::<IndexBackup>(&text) else { continue };
+        // Never recursive: a changed or extra entry keeps the archive.
         if meta.version == BACKUP_VERSION
             && meta.displaced_at.elapsed().is_ok_and(|age| age >= grace)
-            && crate::hash::hash_payload(&archived.join("previous")).ok().as_ref() == Some(&meta.payload)
+            && crate::hash::remove_payload(&archived.join("previous"), &meta.payload)?
         {
-            fs::remove_dir_all(&archived).at(&archived)?;
+            displaced::remove_if_there(&archived.join(BACKUP_META))?;
+            match fs::remove_dir(&archived) {
+                Err(e) if e.kind() != std::io::ErrorKind::DirectoryNotEmpty => return Err(e).at(&archived),
+                _ => {}
+            }
         }
     }
     Ok(())
@@ -689,7 +694,15 @@ mod tests {
         assert!(fs::read_to_string(&saved).unwrap().ends_with("late edit"));
         lock.save(&after, &Index::default(), &path).unwrap();
         assert_eq!(read_dir_names(&history).unwrap().len(), 2);
+        // An archive holding anything else is never deleted recursively.
+        let other =
+            read_dir_names(&history).unwrap().into_iter().find(|n| !saved.starts_with(history.join(n))).unwrap();
+        let stray = history.join(&other).join("stray");
+        fs::write(&stray, "not sk1ll's").unwrap();
         prune_indexes(&lock, std::time::Duration::ZERO).unwrap();
+        assert_eq!(fs::read_to_string(&stray).unwrap(), "not sk1ll's");
+        fs::remove_file(&stray).unwrap();
+        fs::remove_dir(history.join(other)).unwrap();
         assert_eq!(read_dir_names(&history).unwrap().len(), 1);
         assert!(fs::read_to_string(&saved).unwrap().ends_with("late edit"));
         assert!(load_index(dir).unwrap().is_empty());

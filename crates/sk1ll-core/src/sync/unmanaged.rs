@@ -261,8 +261,13 @@ pub fn rollback(repo: &Repo, adoption: &Adoption) -> Result<bool> {
         if hash_dir(&dest)? != adoption.hash {
             return Ok(false);
         }
-        let displace =
-            Displace { kind: displaced::Kind::Skill, harness: "adopt", expected: expected.as_deref(), ownership: None };
+        let displace = Displace {
+            kind: displaced::Kind::Skill,
+            harness: "adopt",
+            expected: expected.as_deref(),
+            ownership: None,
+            baseline: None,
+        };
         if let Some(error) = remove_displacing(&dest, displace)? {
             return Err(error);
         }

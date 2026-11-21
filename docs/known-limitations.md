@@ -57,7 +57,11 @@ On Linux, directories are placed with `renameat2(RENAME_NOREPLACE)`. On macOS
 they use `renamex_np(RENAME_EXCL)`. On other platforms, or filesystems that
 reject those calls, sync checks the destination and then renames. In that case
 an *empty* directory created in the gap can be replaced. A directory with
-content in it is never replaced.
+content in it is never replaced. Files and symlinks fall back to a hard link
+or a new symlink at the destination, which never replaces anything. The old
+name is then unlinked, so a concurrent rename onto that old name in the gap
+can be lost. The same fallback applies when sync detaches an incumbent into
+its backup slot.
 
 ## First baseline and join recovery
 
@@ -74,6 +78,16 @@ A concurrent obstruction is kept, and rollback refuses to overwrite it.
 The error identifies the backup to restore after moving the obstruction aside.
 On non-Unix platforms init and first-baseline file publication fail rather than
 use a path traversal that could follow a concurrent symlink replacement.
+
+## Extended attributes and alternate data streams
+
+The fingerprint that decides whether placed content is unchanged includes
+extended attributes (and with them, ACLs) on Linux and macOS. A change to
+an attribute therefore counts as an edit, including one the system adds
+by itself, such as a relabel or a macOS provenance attribute. On Windows
+alternate data streams are not covered, and on other Unix systems neither are
+extended attributes. A change to either alone can be lost when sync replaces
+or prunes the file.
 
 ## Filesystems without hard links
 
@@ -96,6 +110,14 @@ cap.
 Superseded ownership indexes are saved under `.sk1ll-state/index-history/`.
 Directory recovery checks them after the same grace period and keeps any
 that changed. This history sits outside the size cap.
+
+Pruning never deletes a directory recursively. It unlinks only the files and
+symlinks the fingerprint covered, each after checking that its metadata is
+unchanged, and then removes each directory only while it is empty. A file
+added, or changed, after the check stops the removal. The rest of the backup
+stays in recovery, marked changed. Files already unlinked by then are gone,
+and they matched the fingerprint. `sk1ll recover discard` is the one
+recursive deletion, and it runs only on request.
 
 The cap is a cleanup target, not a strict ceiling. It is checked before a
 new copy is added, so recovery can sit above the cap until the next prune.

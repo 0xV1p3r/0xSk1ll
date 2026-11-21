@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::git::path_bytes;
-use crate::sync::excluded_from_skill;
+use crate::sync::{SKILL_CONTENT_EXCLUSIONS, excluded_from_skill};
 use crate::{Error, IoExt, Result};
 
 /// Stable content hash of a skill directory (file paths + contents), without
@@ -55,50 +55,202 @@ fn hash_dir_buffered(dir: &Path, buf: &mut [u8]) -> Result<String> {
     Ok(format!("sha256:{}", hex(&hasher.finalize())))
 }
 
-/// Fingerprints the entire recovery payload, including directory entries
-/// and their mode bits. Skill hash exclusions do not apply here.
+/// Fingerprints the entire recovery payload, including directory entries,
+/// their mode bits and (on Linux and macOS) extended attributes. Skill hash
+/// exclusions do not apply here.
 pub(crate) fn hash_payload(path: &Path) -> Result<String> {
-    let mut hash = Sha256::new();
-    let mut buffer = [0; BUFFER];
-    let mut observed = Vec::new();
-    for entry in WalkDir::new(path).follow_root_links(false).sort_by_file_name() {
-        let entry = entry.map_err(std::io::Error::from).at(path)?;
-        let at = entry.path();
-        let rel = path_bytes(at.strip_prefix(path).unwrap_or(at));
-        hash.update((rel.len() as u64).to_le_bytes());
-        hash.update(rel);
-        let meta = fs::symlink_metadata(at).at(at)?;
-        observed.push((at.to_path_buf(), PayloadMetadata::of(at, &meta)?));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            hash.update(meta.permissions().mode().to_le_bytes());
+    Ok(Payload::of(path, false)?.hash)
+}
+
+/// A payload fingerprint and how each entry it covers looked while it was
+/// taken, so a later step can tell whether any of them changed since.
+#[derive(PartialEq, Eq)]
+pub(crate) struct Payload {
+    pub(crate) hash: String,
+    /// In walk order: every directory before what it contains.
+    entries: Vec<(std::path::PathBuf, bool, PayloadMetadata)>,
+}
+
+impl Payload {
+    /// `skill_copy`: leave out what a skill copy leaves out below the root
+    /// ([`SKILL_CONTENT_EXCLUSIONS`]), but not the root placement marker.
+    /// Without such content, this is the same as the whole payload.
+    fn of(path: &Path, skill_copy: bool) -> Result<Self> {
+        let mut hash = Sha256::new();
+        let mut buffer = [0; BUFFER];
+        let mut entries = Vec::new();
+        let walker = WalkDir::new(path).follow_root_links(false).sort_by_file_name().into_iter().filter_entry(|e| {
+            !skill_copy || e.depth() == 0 || !SKILL_CONTENT_EXCLUSIONS.iter().any(|x| e.file_name() == *x)
+        });
+        for entry in walker {
+            let entry = entry.map_err(std::io::Error::from).at(path)?;
+            let at = entry.path();
+            let rel = path_bytes(at.strip_prefix(path).unwrap_or(at));
+            hash.update((rel.len() as u64).to_le_bytes());
+            hash.update(rel);
+            let meta = fs::symlink_metadata(at).at(at)?;
+            entries.push((at.to_path_buf(), meta.is_dir(), PayloadMetadata::of(at, &meta)?));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                hash.update(meta.permissions().mode().to_le_bytes());
+            }
+            #[cfg(not(unix))]
+            hash.update([u8::from(meta.permissions().readonly())]);
+            hash_xattrs(&mut hash, at).at(at)?;
+            if meta.is_symlink() {
+                hash.update(b"l");
+                let target = target_bytes(&fs::read_link(at).at(at)?);
+                hash.update((target.len() as u64).to_le_bytes());
+                hash.update(target);
+            } else if meta.is_dir() {
+                hash.update(b"d");
+            } else if meta.is_file() {
+                hash.update(b"f");
+                hash_file(&mut hash, at, &mut buffer).at(at)?;
+            } else {
+                return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "unsupported recovery entry")).at(at);
+            }
         }
-        #[cfg(not(unix))]
-        hash.update([u8::from(meta.permissions().readonly())]);
-        if meta.is_symlink() {
-            hash.update(b"l");
-            let target = target_bytes(&fs::read_link(at).at(at)?);
-            hash.update((target.len() as u64).to_le_bytes());
-            hash.update(target);
-        } else if meta.is_dir() {
-            hash.update(b"d");
-        } else if meta.is_file() {
-            hash.update(b"f");
-            hash_file(&mut hash, at, &mut buffer).at(at)?;
+        // A write to an early file may have happened while we read a later
+        // one. Recheck every entry, including directories for new names.
+        for (at, _, before) in &entries {
+            let after = fs::symlink_metadata(at).at(at)?;
+            if *before != PayloadMetadata::of(at, &after)? {
+                return Err(Error::Changed(format!("{} changed while fingerprinting its payload", at.display())));
+            }
+        }
+        Ok(Self { hash: format!("sha256:{}", hex(&hash.finalize())), entries })
+    }
+}
+
+/// [`hash_payload`] without what skill copies leave out below the root
+/// (`.git`): what a copy of `path` is the whole payload of.
+pub(crate) fn hash_copied_payload(path: &Path) -> Result<String> {
+    Ok(Payload::of(path, true)?.hash)
+}
+
+/// Runs `read` (a copy or a read of `path`) between two looks at the
+/// payload, leaving out what skill copies leave out, and returns the
+/// fingerprint of exactly what `read` saw: a change to any entry while it
+/// ran, even one undone since, fails with [`Error::Changed`].
+pub(crate) fn read_payload<T>(path: &Path, read: impl FnOnce() -> Result<T>) -> Result<(String, T)> {
+    let before = Payload::of(path, true)?;
+    let value = read()?;
+    if Payload::of(path, true)? != before {
+        return Err(Error::Changed(format!("{} changed while it was read", path.display())));
+    }
+    Ok((before.hash, value))
+}
+
+/// Deletes the payload at `path` if it is still the one fingerprinted
+/// `expected`, without ever deleting recursively: each file or symlink the
+/// fingerprint covered is unlinked only while it is unchanged, then each
+/// directory is removed only while empty. Anything that does not match, or
+/// that appears meanwhile, stops the removal and stays, with whatever
+/// directories hold it: `false`. A file someone renamed away is not lost and
+/// does not stop it.
+pub(crate) fn remove_payload(path: &Path, expected: &str) -> Result<bool> {
+    let payload = match Payload::of(path, false) {
+        Ok(payload) => payload,
+        Err(Error::Changed(_)) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if payload.hash != expected {
+        return Ok(false);
+    }
+    #[cfg(test)]
+    tests::before_removal(path);
+    for (at, dir, before) in payload.entries.iter().rev() {
+        let removed = if *dir {
+            fs::remove_dir(at)
         } else {
-            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "unsupported recovery entry")).at(at);
+            match fs::symlink_metadata(at) {
+                Ok(after) if PayloadMetadata::of(at, &after)? == *before => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Ok(_) => return Ok(false),
+                Err(e) => return Err(e).at(at),
+            }
+            // A directory symlink on Windows needs remove_dir.
+            fs::remove_file(at).or_else(|e| if cfg!(windows) { fs::remove_dir(at) } else { Err(e) })
+        };
+        match removed {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e)
+                if *dir
+                    && matches!(
+                        e.kind(),
+                        std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::AlreadyExists
+                    ) =>
+            {
+                return Ok(false);
+            }
+            Err(e) => return Err(e).at(at),
         }
     }
-    // A write to an early file may have happened while we read a later
-    // one. Recheck every entry, including directories for new names.
-    for (at, before) in observed {
-        let after = fs::symlink_metadata(&at).at(&at)?;
-        if before != PayloadMetadata::of(&at, &after)? {
-            return Err(Error::Changed(format!("{} changed while fingerprinting its payload", at.display())));
+    Ok(true)
+}
+
+/// Feeds the extended attributes of `path` (not following a symlink), sorted
+/// by name, to `hasher`. ACLs are among them on Linux.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn hash_xattrs(hasher: &mut Sha256, path: &Path) -> std::io::Result<()> {
+    use rustix::io::Errno;
+    #[cfg(target_os = "macos")]
+    const MISSING: Errno = Errno::NOATTR;
+    #[cfg(not(target_os = "macos"))]
+    const MISSING: Errno = Errno::NODATA;
+    // A size query, then the read; a value that grew meanwhile is asked again.
+    fn read(
+        size: impl Fn() -> rustix::io::Result<usize>,
+        get: impl Fn(&mut [u8]) -> rustix::io::Result<usize>,
+    ) -> rustix::io::Result<Vec<u8>> {
+        loop {
+            let mut buf = vec![0; size()?];
+            if buf.is_empty() {
+                return Ok(buf);
+            }
+            match get(&mut buf) {
+                Ok(n) => {
+                    buf.truncate(n);
+                    return Ok(buf);
+                }
+                Err(Errno::RANGE) => {}
+                Err(e) => return Err(e),
+            }
         }
     }
-    Ok(format!("sha256:{}", hex(&hash.finalize())))
+    let names = match read(|| rustix::fs::llistxattr_query(path), |buf| rustix::fs::llistxattr(path, buf)) {
+        Ok(names) => names,
+        Err(e) if e == Errno::NOTSUP || e == Errno::OPNOTSUPP => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut names: Vec<&[u8]> = names.split(|b| *b == 0).filter(|n| !n.is_empty()).collect();
+    names.sort_unstable();
+    for name in names {
+        let name_c = std::ffi::CString::new(name).map_err(std::io::Error::other)?;
+        let value = match read(
+            || rustix::fs::lgetxattr_query(path, name_c.as_c_str()),
+            |buf| rustix::fs::lgetxattr(path, name_c.as_c_str(), buf),
+        ) {
+            Ok(value) => value,
+            // One removed meanwhile fails the final metadata recheck instead.
+            Err(e) if e == MISSING => continue,
+            Err(e) => return Err(e.into()),
+        };
+        hasher.update(b"x");
+        hasher.update((name.len() as u64).to_le_bytes());
+        hasher.update(name);
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(&value);
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+fn hash_xattrs(_: &mut Sha256, _: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 #[derive(PartialEq, Eq)]
@@ -276,6 +428,27 @@ pub(crate) mod tests {
         result
     }
 
+    type Removal = Box<dyn FnOnce(&Path)>;
+
+    thread_local! {
+        static BEFORE_REMOVAL: std::cell::RefCell<Option<Removal>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// Called once, after a payload removal matched the fingerprint and
+    /// before it unlinks anything.
+    pub(crate) fn with_removal_hook<T>(hook: impl FnOnce(&Path) + 'static, run: impl FnOnce() -> T) -> T {
+        BEFORE_REMOVAL.with_borrow_mut(|slot| *slot = Some(Box::new(hook)));
+        let result = run();
+        BEFORE_REMOVAL.with_borrow_mut(|slot| *slot = None);
+        result
+    }
+
+    pub(super) fn before_removal(path: &Path) {
+        if let Some(f) = BEFORE_REMOVAL.with_borrow_mut(Option::take) {
+            f(path);
+        }
+    }
+
     pub(super) fn mid_read(path: &Path) {
         if let Some(mut f) = MID_READ.with_borrow_mut(Option::take) {
             f(path);
@@ -363,6 +536,63 @@ pub(crate) mod tests {
             assert_eq!(hash.unwrap(), legacy_hash_dir(&dir), "{case}");
             assert_ne!(legacy_hash_dir(&dir), before, "{case}");
         }
+    }
+
+    /// A payload removal stops at a file whose content, mode or extended
+    /// attributes changed after the fingerprint matched, and at a directory
+    /// that gained an entry.
+    #[test]
+    fn payload_removal_keeps_what_changed_after_the_check() {
+        type Edit = fn(&Path);
+        let cases: [(&str, Edit); 3] = [
+            ("content", |dir| fs::write(dir.join("a/f"), "edited").unwrap()),
+            ("new entry", |dir| fs::write(dir.join("a/new"), "new").unwrap()),
+            ("mode", |dir| {
+                let path = dir.join("a/f");
+                let mut permissions = fs::metadata(&path).unwrap().permissions();
+                permissions.set_readonly(true);
+                fs::set_permissions(path, permissions).unwrap();
+            }),
+        ];
+        for (case, edit) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join("payload");
+            write(&dir.join("a/f"), "f");
+            write(&dir.join("b"), "b");
+            let expected = hash_payload(&dir).unwrap();
+            assert!(!remove_payload(&dir, "sha256:other").unwrap(), "{case}");
+            assert_eq!(hash_payload(&dir).unwrap(), expected);
+            assert!(!with_removal_hook(edit, || remove_payload(&dir, &expected)).unwrap(), "{case}");
+            assert!(dir.join("a").exists(), "{case}");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("payload");
+        write(&dir.join("a/f"), "f");
+        let expected = hash_payload(&dir).unwrap();
+        assert!(remove_payload(&dir, &expected).unwrap());
+        assert!(!dir.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    fn extended_attributes_are_part_of_the_payload() {
+        use rustix::fs::{XattrFlags, lsetxattr};
+        use rustix::io::Errno;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("payload");
+        write(&dir.join("f"), "f");
+        let before = hash_payload(&dir).unwrap();
+        match lsetxattr(dir.join("f"), "user.sk1ll-test", b"1", XattrFlags::empty()) {
+            // No user attributes on this filesystem.
+            Err(e) if e == Errno::NOTSUP || e == Errno::OPNOTSUPP || e == Errno::PERM => return,
+            result => result.unwrap(),
+        }
+        let tagged = hash_payload(&dir).unwrap();
+        assert_ne!(tagged, before);
+        let retag = |dir: &Path| lsetxattr(dir.join("f"), "user.sk1ll-test", b"2", XattrFlags::empty()).unwrap();
+        assert!(!with_removal_hook(retag, || remove_payload(&dir, &tagged)).unwrap());
+        assert!(dir.join("f").exists());
+        assert_ne!(hash_payload(&dir).unwrap(), tagged);
     }
 
     #[cfg(unix)]

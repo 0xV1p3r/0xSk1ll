@@ -9,12 +9,9 @@ pub fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 /// Detach the incumbent into the caller's vacant private recovery slot.
+/// Something already in the slot stays, and so does the incumbent.
 pub(crate) fn detach(src: &Path, backup: &Path) -> std::io::Result<()> {
-    match backup.symlink_metadata() {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::rename(src, backup),
-        Err(e) => Err(e),
-        Ok(_) => Err(std::io::ErrorKind::AlreadyExists.into()),
-    }
+    rename_noreplace(src, backup)
 }
 
 /// Move the incumbent, validate the object that actually moved, then make
@@ -206,5 +203,34 @@ impl Directory {
     }
     pub fn create_file(&self, _: &Path, _: &[u8], _: bool) -> std::io::Result<()> {
         Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Detaching never replaces what is in the backup slot, file or directory.
+    #[test]
+    fn detach_never_replaces_an_occupied_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        for dir in [false, true] {
+            let (src, backup) = (tmp.path().join(format!("src-{dir}")), tmp.path().join(format!("slot-{dir}")));
+            if dir {
+                std::fs::create_dir(&src).unwrap();
+                std::fs::create_dir(&backup).unwrap();
+            } else {
+                std::fs::write(&src, "incumbent").unwrap();
+                std::fs::write(&backup, "occupant").unwrap();
+            }
+            assert_eq!(detach(&src, &backup).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+            assert!(src.exists() && backup.exists());
+            if !dir {
+                assert_eq!(std::fs::read_to_string(&backup).unwrap(), "occupant");
+            }
+            let vacant = tmp.path().join(format!("vacant-{dir}"));
+            detach(&src, &vacant).unwrap();
+            assert!(!src.exists() && vacant.exists());
+        }
     }
 }
