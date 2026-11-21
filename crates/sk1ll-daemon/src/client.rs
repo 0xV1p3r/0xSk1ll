@@ -286,6 +286,8 @@ pub enum PullResult {
     Blocked {
         baseline: String,
         items: Vec<ItemRef>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pending: bool,
     },
 }
 
@@ -1281,7 +1283,7 @@ mod tests {
         let e = Event::Assignment { revision: 3 };
         assert_eq!(serde_json::to_value(&e).unwrap(), serde_json::json!({"type": "assignment", "revision": 3}));
         assert_eq!(e.name(), "assignment");
-        let p = PullResult::Blocked { baseline: "b".into(), items: vec![ItemRef::Skill("x".into())] };
+        let p = PullResult::Blocked { baseline: "b".into(), items: vec![ItemRef::Skill("x".into())], pending: false };
         let v = serde_json::to_value(&p).unwrap();
         assert_eq!(v["state"], "blocked");
         assert_eq!(serde_json::from_value::<PullResult>(v).unwrap(), p);

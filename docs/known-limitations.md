@@ -66,6 +66,30 @@ The error identifies the backup to restore after moving the obstruction aside.
 On non-Unix platforms init and first-baseline file publication fail rather than
 use a path traversal that could follow a concurrent symlink replacement.
 
+## A save while Pull updates a file
+
+Pull leaves disjoint Draft files in place. Before replacing a file, it checks
+that the file still holds what the old Baseline has. It then exchanges the
+names with the new file, so a save renamed in at the last moment goes into
+recovery. A writer with the displaced file still open keeps writing to that
+same file. Adopt moves the recovered file into the Draft, including any
+subsequent writes through that open file. These operations need atomic
+exchange and no-replace rename on the filesystems where they are used.
+
+Pull checks for clashes item by item before it changes anything. After that,
+a Draft edit to a path it has yet to update can block it. Move any edits you
+want to keep aside, restore or clear the obstruction, then pull again. A
+save to a path Pull already updated stays as Draft. While Pull is pending,
+the Daemon keeps the last complete Draft report and pauses sync. A Harness
+that reads Skills through symlinks can already see the paths Pull updated.
+
+Pull needs the repo's Git directory on the same filesystem as its working
+tree. An interrupted Pull leaves `sk1ll-pull.json` there, along with the
+evidence it uses to resume after a process exits. Pull recovery after power
+loss is unsupported. Keep external Git commands that switch branches or
+write the index out of the repo during Pull. Pull checks the branch again
+before writing the index, and another Git command can still race that check.
+
 ## Filesystems without hard links
 
 Sync relies on `link(2)` to update or create a Rule file or block instructions
@@ -74,15 +98,12 @@ fail and leave the original in place. They never fall back to an unsafe write.
 
 ## The recovery size cap
 
-Unchanged recovery copies are pruned after a 10-minute grace period. Copies
-that changed are never pruned automatically. The total size is capped by
-`SK1LL_DISPLACED_MAX` (default 1 GiB). Above the cap, the oldest unchanged
-copies are pruned first, even inside the grace period. If a program still
-holds such a copy open and writes to it after it is pruned, that write is
-lost.
-
-The cap is a cleanup target, not a strict ceiling. It is checked before a
-new copy is added, so recovery can sit above the cap until the next prune.
+Unchanged harness recovery copies are pruned after a 10-minute grace period.
+Changed copies and Draft recovery entries from Pull stay until you adopt or
+discard them. Above `SK1LL_DISPLACED_MAX` (default 1 GiB), pruning can remove
+the oldest unchanged harness copies earlier. A write through a file still
+held open after it was pruned is lost. A new copy can put recovery above the
+cleanup target until the next prune.
 
 ## Content browsing outside Unix
 

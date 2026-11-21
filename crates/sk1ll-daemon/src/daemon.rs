@@ -130,6 +130,7 @@ struct PullState {
     head: Option<String>,
     remote: Option<String>,
     blocked: Option<Vec<ItemRef>>,
+    pending: bool,
 }
 
 type ReviewedSync = (Repo, Vec<(Action, Option<String>)>);
@@ -805,19 +806,37 @@ impl Daemon {
         let machine = MachineConfig::load(&self.cfg.machine_config)?;
         let harnesses = machine.harnesses();
         let lock = eng.lock.as_ref().ok_or_else(|| Error::Conflict(format!("{} is not locked", root.display())))?;
-        if reviewed.is_none() {
+        let mut outcome = RefreshOutcome::default();
+        let repo = Repo::open_git_only(&root)?;
+        let finish = repo.finish_pull(lock);
+        let pending = repo.pull_pending()?;
+        let mut pending_items = Vec::new();
+        match finish {
+            Ok(None) => {}
+            Ok(Some(PullOutcome::Blocked { items, .. })) => {
+                pending_items.clone_from(&items);
+                eng.blocked = Some(items);
+            }
+            Ok(Some(_)) | Err(sk1ll_core::Error::Displaced { .. }) if !pending => {
+                tracing::info!("finished a pull that had stopped half-way");
+                eng.blocked = None;
+                self.pull_cleared_blocked.store(true, Ordering::Relaxed);
+            }
+            Err(e) => outcome.errors.push(format!("pull: {e}")),
+            Ok(Some(_)) => {}
+        }
+        if !pending && reviewed.is_none() {
             sync::recover(lock, &harnesses)?;
             Self::recover_imports(&root)?;
+            // After the pull is finished: a pending pull's tree is partial, and
+            // writing into it could block the paths it still has to update.
+            // Before sync, so placements carry the IDs.
+            Repo::open(&root)?.assign_missing_ids()?;
         }
-        let repo = Repo::open(&root)?;
-        if reviewed.is_none() {
-            repo.assign_missing_ids()?;
-        }
-        let mut outcome = RefreshOutcome::default();
         let is_reviewed = reviewed.is_some();
         let mut conflicts: Vec<ConflictRef> = Vec::new();
         let snapshot = self.snapshot();
-        if let Some(snap) = &snapshot {
+        if !pending && let Some(snap) = &snapshot {
             let planned = reviewed.map(Ok).unwrap_or_else(|| {
                 Repo::open(&root).and_then(|repo| {
                     let actions = sync::plan(&repo, &harnesses, &snap.assignment, PlanOptions::default())?;
@@ -860,18 +879,23 @@ impl Daemon {
         }
 
         for entry in sync::displaced::changed()? {
-            let c = ConflictRef { item: displaced_item(&entry), harness: entry.harness.clone() };
+            let c = ConflictRef { item: displaced_item(&entry, &root), harness: entry.harness.clone() };
             if !conflicts.contains(&c) {
                 conflicts.push(c);
             }
         }
-        let repo = Repo::open_git_only(&root)?;
-        let drafts = repo.draft()?.into_iter().map(|d| d.item).collect();
+        // The partial checkout is not a Draft. Keep the last complete inventory
+        // while the journal is active, including when a new refresh cannot read it.
+        let drafts = if pending {
+            self.view.borrow().report.drafts.clone()
+        } else {
+            repo.draft()?.into_iter().map(|d| d.item).collect()
+        };
         let baseline = gitx::baseline(&root)?;
         let unpushed = gitx::unpushed_items(&root)?;
-        let clashes = eng.blocked.clone().unwrap_or_default();
-        let blocked = eng.blocked.is_some();
-        let behind = blocked || eng.server_baseline.as_ref().is_some_and(|h| baseline.as_ref() != Some(h));
+        let blocked = !pending && eng.blocked.is_some();
+        let clashes = if blocked { eng.blocked.clone().unwrap_or_default() } else { Vec::new() };
+        let behind = pending || blocked || eng.server_baseline.as_ref().is_some_and(|h| baseline.as_ref() != Some(h));
         let report = MachineReport {
             baseline,
             drafts,
@@ -880,6 +904,7 @@ impl Daemon {
             harnesses: harnesses.keys().cloned().collect(),
             blocked,
             clashes,
+            pull_pending: pending.then_some(pending_items),
             behind,
         };
         let server_baseline = eng.server_baseline.clone();
@@ -933,8 +958,9 @@ impl Daemon {
         let server_baseline = eng.server_baseline.clone();
         let blocked = eng.blocked.is_some();
         self.update(|v| {
-            v.report.behind =
-                blocked || server_baseline.as_ref().is_some_and(|h| v.report.baseline.as_ref() != Some(h));
+            v.report.behind = v.report.pull_pending.is_some()
+                || blocked
+                || server_baseline.as_ref().is_some_and(|h| v.report.baseline.as_ref() != Some(h));
             v.server_baseline = server_baseline;
         });
     }
@@ -945,7 +971,12 @@ impl Daemon {
     /// whether the machine is Blocked.
     fn pull_state(eng: &Engine) -> Result<PullState> {
         let root = Self::root(eng);
-        Ok(PullState { head: gitx::rev(root, "HEAD")?, remote: gitx::remote_head(root)?, blocked: eng.blocked.clone() })
+        Ok(PullState {
+            head: gitx::rev(root, "HEAD")?,
+            remote: gitx::remote_head(root)?,
+            blocked: eng.blocked.clone(),
+            pending: Repo::open_git_only(root)?.pull_pending()?,
+        })
     }
 
     /// After file changes (or the periodic reconciliation): refresh, and if
@@ -1028,9 +1059,14 @@ impl Daemon {
 
     fn pull_inner(&self, eng: &mut Engine) -> Result<PullResult> {
         let root = eng.state.repo().to_path_buf();
-        let first = match gitx::rev(&root, "HEAD")? {
-            None => Some(gitx::adopt_first_baseline(&root)?),
-            Some(_) => gitx::adopt_first_baseline_over_init(&root)?,
+        let repo = Repo::open_git_only(&root)?;
+        let first = if repo.pull_pending()? {
+            None
+        } else {
+            match gitx::rev(&root, "HEAD")? {
+                None => Some(gitx::adopt_first_baseline(&root)?),
+                Some(_) => gitx::adopt_first_baseline_over_init(&root)?,
+            }
         };
         let result = if let Some(first) = first {
             eng.blocked = None;
@@ -1039,24 +1075,37 @@ impl Daemon {
                 gitx::FirstBaseline::Empty => PullResult::UpToDate,
                 gitx::FirstBaseline::Blocked { baseline, items } => {
                     eng.blocked = Some(items.clone());
-                    PullResult::Blocked { baseline, items }
+                    PullResult::Blocked { baseline, items, pending: false }
                 }
             }
         } else {
-            match Repo::open_git_only(&root)?.pull()? {
-                PullOutcome::UpToDate => {
+            let head = gitx::rev(&root, "HEAD")?;
+            let lock = eng.lock.as_ref().ok_or_else(|| Error::Conflict(format!("{} is not locked", root.display())))?;
+            match repo.pull(lock) {
+                Ok(PullOutcome::UpToDate) => {
                     eng.blocked = None;
                     PullResult::UpToDate
                 }
-                PullOutcome::Updated { from, to } => {
+                Ok(PullOutcome::Updated { from, to }) => {
                     eng.blocked = None;
                     PullResult::Updated { from: Some(from), to }
                 }
-                PullOutcome::Blocked { baseline, items } => {
+                Ok(PullOutcome::Blocked { baseline, items }) => {
                     tracing::warn!("blocked: baseline {baseline} clashes with the draft");
                     eng.blocked = Some(items.clone());
-                    PullResult::Blocked { baseline, items }
+                    PullResult::Blocked { baseline, items, pending: repo.pull_pending()? }
                 }
+                // The pull went through; a save made to a file it replaced
+                // is in the recovery area, which the report lists as a conflict.
+                Err(e @ sk1ll_core::Error::Displaced { .. }) if !repo.pull_pending()? => {
+                    tracing::warn!("{e}");
+                    eng.blocked = None;
+                    match gitx::rev(&root, "HEAD")? {
+                        Some(to) if Some(&to) != head.as_ref() => PullResult::Updated { from: head, to },
+                        _ => PullResult::UpToDate,
+                    }
+                }
+                Err(e) => return Err(e.into()),
             }
         };
         if let Some(remote) = gitx::remote_head(&root)? {
@@ -1380,6 +1429,7 @@ impl Daemon {
     /// until the next refresh has done it this plan sees it as missing.
     fn plan_as_is(&self, snap: &AssignmentSnapshot, force: bool) -> Result<(Repo, Vec<Action>)> {
         let repo = Repo::open(self.repo_root())?;
+        Self::require_sync_ready(&repo)?;
         let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
         let actions = sync::plan(&repo, &harnesses, &snap.assignment, PlanOptions { force })?;
         Ok((repo, actions))
@@ -1398,20 +1448,24 @@ impl Daemon {
 
     /// A reader: no engine mutex.
     pub(crate) fn recovered(&self) -> Result<Vec<ConflictView>> {
-        Ok(sync::displaced::list()?.into_iter().map(displaced_view).collect())
+        let root = self.repo_root();
+        Ok(sync::displaced::list()?.into_iter().map(|entry| displaced_view(entry, root)).collect())
     }
 
     /// A reader: no engine mutex, and so no recovery of interrupted imports
     /// (see [`Daemon::plan_as_is`]).
     pub(crate) fn conflicts(&self) -> Result<Vec<ConflictView>> {
-        let mut result: Vec<_> = if let Some(snap) = self.snapshot() {
+        let mut result: Vec<_> = if self.view.borrow().report.pull_pending.is_none()
+            && let Some(snap) = self.snapshot()
+        {
             let (_, actions) = self.plan_as_is(&snap, false)?;
             actions.iter().filter(|a| a.kind == ActionKind::Conflict).map(conflict_view).collect()
         } else {
             Vec::new()
         };
+        let root = self.repo_root();
         for entry in sync::displaced::changed()? {
-            result.push(displaced_view(entry));
+            result.push(displaced_view(entry, root));
         }
         Ok(result)
     }
@@ -1432,10 +1486,18 @@ impl Daemon {
             ));
         }
         let repo = Repo::open(self.repo_root())?;
+        Self::require_sync_ready(&repo)?;
         let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
         let actions = sync::plan(&repo, &harnesses, &self.current_assignment()?, PlanOptions { force })?;
         let sources = Self::sync_source_digests(&actions, sync::deploy_hash)?;
         Self::sync_preview_result(&actions, &sources)
+    }
+
+    fn require_sync_ready(repo: &Repo) -> Result<()> {
+        if repo.pull_pending()? {
+            return Err(Error::Conflict("pull pending. Finish `sk1ll pull` before syncing harnesses".into()));
+        }
+        Ok(())
     }
 
     fn sync_source_digests(
@@ -1505,6 +1567,7 @@ impl Daemon {
     pub(crate) fn sync(&self, eng: &mut Engine, force: bool, fingerprint: Option<&str>) -> Result<SyncResult> {
         self.ensure_managed(eng)?;
         self.lock_repo(eng)?;
+        Self::require_sync_ready(&Repo::open_git_only(Self::root(eng))?)?;
         let reviewed = if let Some(fingerprint) = fingerprint {
             if self.is_standalone() {
                 self.reload_local_assignment()?;
@@ -1564,9 +1627,11 @@ impl Daemon {
         self.ensure_managed(eng)?;
         self.lock_repo(eng)?;
         let result = if adopt {
-            sync::displaced::adopt(&Repo::open(Self::root(eng))?, id).map(Some)
+            let root = Self::root(eng);
+            let lock = eng.lock.as_ref().ok_or_else(|| Error::Conflict(format!("{} is not locked", root.display())))?;
+            sync::displaced::adopt(&Repo::open_git_only(root)?, id, lock).map(Some)
         } else {
-            sync::displaced::discard_from(&Repo::open(Self::root(eng))?, id).map(|()| None)
+            sync::displaced::discard_from(&Repo::open_git_only(Self::root(eng))?, id).map(|()| None)
         };
         self.refresh(eng)?;
         self.event(Event::Status);
@@ -2232,8 +2297,8 @@ fn conflict_items(a: &Action) -> Vec<ItemRef> {
     }
 }
 
-fn displaced_view(entry: sync::displaced::Entry) -> ConflictView {
-    let item = displaced_item(&entry);
+fn displaced_view(entry: sync::displaced::Entry, root: &Path) -> ConflictView {
+    let item = displaced_item(&entry, root);
     ConflictView {
         kind: Some("displaced".into()),
         id: Some(entry.id),
@@ -2250,12 +2315,20 @@ fn displaced_view(entry: sync::displaced::Entry) -> ConflictView {
     }
 }
 
-fn displaced_item(entry: &sync::displaced::Entry) -> ItemRef {
+/// `root`: the skills repo, which a pull's entries are from.
+fn displaced_item(entry: &sync::displaced::Entry, root: &Path) -> ItemRef {
     let name = entry.dest.file_name().unwrap_or_default().to_string_lossy();
     match entry.kind {
         sync::displaced::Kind::Skill => ItemRef::Skill(name.into_owned()),
         sync::displaced::Kind::Rule => ItemRef::Rule(name.strip_suffix(".md").unwrap_or(&name).to_string()),
         sync::displaced::Kind::Instructions => ItemRef::Other(entry.dest.display().to_string()),
+        sync::displaced::Kind::Draft => {
+            let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+            match entry.dest.strip_prefix(&root) {
+                Ok(path) => ItemRef::for_path(path),
+                Err(_) => ItemRef::Other(entry.dest.display().to_string()),
+            }
+        }
     }
 }
 
@@ -2610,7 +2683,11 @@ impl Daemon {
         let (view, recovery) = if let Some(id) = &req.id {
             let entry = sync::displaced::get(id)?;
             let target = sync::displaced::target(&repo, &entry)?;
-            (displaced_view(entry), Some(target))
+            if entry.kind == sync::displaced::Kind::Draft {
+                return Self::pull_recovery_diff(&repo, entry, target.path);
+            }
+            let view = displaced_view(entry, repo.root());
+            (view, Some(target))
         } else {
             let view = self
                 .conflicts()?
@@ -2697,6 +2774,30 @@ impl Daemon {
             return Err(Error::BadRequest(String::from_utf8_lossy(&output.stderr).into_owned()));
         }
         Ok(DiffView { item, target, diff: String::from_utf8_lossy(&output.stdout).into_owned() })
+    }
+
+    /// What a pull displaced from the working tree, against what is at its
+    /// path now: adopting puts it back there.
+    fn pull_recovery_diff(repo: &Repo, entry: sync::displaced::Entry, target: PathBuf) -> Result<DiffView> {
+        let item = displaced_item(&entry, repo.root());
+        let temp = tempfile::tempdir().map_err(anyhow::Error::from)?;
+        let right = if target.symlink_metadata().is_ok() {
+            target.clone()
+        } else {
+            let empty = temp.path().join("Draft");
+            std::fs::write(&empty, "").map_err(anyhow::Error::from)?;
+            empty
+        };
+        let output = std::process::Command::new("git")
+            .args(["diff", "--no-index", "--no-ext-diff", "--no-textconv", "--"])
+            .arg(&entry.path)
+            .arg(&right)
+            .output()
+            .map_err(anyhow::Error::from)?;
+        if !matches!(output.status.code(), Some(0 | 1)) {
+            return Err(Error::BadRequest(String::from_utf8_lossy(&output.stderr).into_owned()));
+        }
+        Ok(DiffView { item, target: Some(target), diff: String::from_utf8_lossy(&output.stdout).into_owned() })
     }
 }
 

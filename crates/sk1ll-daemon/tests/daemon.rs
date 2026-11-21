@@ -2366,6 +2366,81 @@ async fn standalone_commits_locally_and_pushes_and_pulls_its_own_origin() {
     assert!(!m.outbox_path().exists());
 }
 
+/// A pull that stopped half-way (here: at a directory it can't write to)
+/// is finished by the daemon's next refresh, without another pull.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refresh_finishes_a_pull_that_stopped_half_way() {
+    use sk1ll_daemon::client::{PullResult, SyncRequest};
+    use std::os::unix::fs::PermissionsExt;
+    let mut m = Machine::new("solo");
+    sk1ll_core::Repo::init(&m.repo()).unwrap();
+    let bare = m.home.path().join("origin.git");
+    git(m.home.path(), &["init", "--quiet", "--bare", "-b", "main", bare.to_str().unwrap()]);
+    git(&m.repo(), &["remote", "add", "origin", bare.to_str().unwrap()]);
+    m.write("personal/pdf/SKILL.md", "initial");
+    m.start().await;
+    m.commit_all().await;
+    assert!(m.client.push().await.unwrap().pushed);
+    let peer = m.home.path().join("peer");
+    git(m.home.path(), &["clone", "--quiet", bare.to_str().unwrap(), peer.to_str().unwrap()]);
+    write(&peer.join("instructions"), "git.md", "Use Conventional Commits.");
+    write(&peer.join("personal/pdf"), "SKILL.md", "remote edit");
+    git(&peer, &["add", "-A"]);
+    git(&peer, &["commit", "--quiet", "-m", "remote edit"]);
+    git(&peer, &["push", "--quiet", "origin", "main"]);
+    let remote = git(&peer, &["rev-parse", "HEAD"]);
+
+    let pdf = m.repo().join("personal/pdf");
+    let mode = |mode| std::fs::set_permissions(&pdf, std::fs::Permissions::from_mode(mode)).unwrap();
+    mode(0o555);
+    if std::fs::write(pdf.join("probe"), "").is_ok() {
+        return; // root writes into read-only directories
+    }
+    m.client.pull().await.unwrap_err();
+    let journal = m.repo().join(".git/sk1ll-pull.json");
+    assert!(journal.exists());
+    let rule = std::fs::read_to_string(m.repo().join("instructions/git.md")).unwrap();
+    assert_eq!(rule, "Use Conventional Commits.", "rolled forward, never back");
+    let report = m.status().await.report;
+    assert_eq!(report.pull_pending, Some(vec![]));
+    assert!(report.drafts.is_empty(), "the partial checkout is not a Draft");
+    assert_eq!(m.harness_skill("pdf").as_deref(), Some("initial"));
+    let error = m.client.sync(&SyncRequest { force: true, ..Default::default() }).await.unwrap_err();
+    assert!(error.to_string().contains("pull pending"), "{error}");
+
+    // An editor can still write to a file in the read-only directory.
+    m.write("personal/pdf/SKILL.md", "saved while pull was pending");
+    let pdf_item = ItemRef::Skill("pdf".into());
+    eventually(|| async {
+        let report = m.status().await.report;
+        (report.pull_pending.as_deref() == Some(std::slice::from_ref(&pdf_item))).then_some(())
+    })
+    .await;
+    assert_eq!(m.harness_skill("pdf").as_deref(), Some("initial"));
+    assert!(m.status().await.report.drafts.is_empty());
+    assert!(matches!(m.client.pull().await.unwrap(), PullResult::Blocked { pending: true, .. }));
+    m.write("personal/pdf/SKILL.md", "initial");
+    mode(0o755);
+
+    // Any refresh finishes it; this one follows a draft edit.
+    m.write("notes.txt", "a draft");
+    eventually(|| async { (m.head() == remote && !journal.exists()).then_some(()) }).await;
+    eventually(|| async { (m.harness_skill("pdf").as_deref() == Some("remote edit")).then_some(()) }).await;
+    assert_eq!(git(&m.repo(), &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    // The peer's Rule came without an Item ID: once the pull is done, the
+    // refresh writes one, as a Draft change.
+    assert_eq!(git(&m.repo(), &["status", "--porcelain"]), "M instructions/git.md\n?? notes.txt");
+    let rule = std::fs::read_to_string(m.repo().join("instructions/git.md")).unwrap();
+    assert!(rule.contains("id: ") && rule.ends_with("Use Conventional Commits."), "{rule}");
+    eventually(|| async {
+        let status = m.status().await;
+        (status.report.pull_pending.is_none() && status.headline != MachineStatus::Blocked).then_some(())
+    })
+    .await;
+    assert!(m.log().contains("finished a pull that had stopped half-way"), "{}", m.log());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn setup_chooses_harnesses_only_before_the_repo_exists() {
     let mut m = Machine::new("solo");

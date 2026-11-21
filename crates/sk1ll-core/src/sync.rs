@@ -1230,7 +1230,7 @@ fn adopt_target(repo: &Repo, kind: displaced::Kind, dest: &Path, item_id: Option
         skill_id: None,
         rule: None,
     };
-    if kind == displaced::Kind::Instructions {
+    if matches!(kind, displaced::Kind::Instructions | displaced::Kind::Draft) {
         return Ok(target);
     }
     let (skills, rules) = repo.content()?;
@@ -1463,6 +1463,9 @@ pub mod displaced {
     //! extension), next to `entry.json`. A `.gitignore` keeps the area out of
     //! any git repo the holder is in (dotfiles).
     //!
+    //! Pull keeps what it replaces in the skills repo's working tree the same
+    //! way, as [`Kind::Draft`] entries whose holder is the repo's git directory.
+    //!
     //! The state directory ([`root`]) holds an index of where each entry is,
     //! so [`list`] finds them all; [`super::recover`] lists again any entry
     //! of a harness the index lost. Entries older versions kept in the state
@@ -1517,10 +1520,18 @@ pub mod displaced {
         Rule,
         /// A whole block instructions file (the target's content, if it is linked).
         Instructions,
+        /// A file or symlink in the skills repo's working tree that pull
+        /// replaced or removed (see [`crate::Repo::pull`]). Its entry is in
+        /// the repo's git directory, and its harness is [`PULL`].
+        Draft,
     }
+
+    /// The harness [`Kind::Draft`] entries are recorded under.
+    pub const PULL: &str = "pull";
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct RepoIdentity {
+        #[serde(with = "stored_path")]
         root: PathBuf,
         #[cfg(unix)]
         device: u64,
@@ -1546,6 +1557,7 @@ pub mod displaced {
     struct Provenance {
         repo: RepoIdentity,
         head: Option<String>,
+        #[serde(default, with = "stored_path::optional")]
         source: Option<PathBuf>,
     }
 
@@ -1587,6 +1599,7 @@ pub mod displaced {
     struct Meta {
         harness: String,
         kind: Kind,
+        #[serde(with = "stored_path")]
         dest: PathBuf,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         item_id: Option<ItemId>,
@@ -1602,6 +1615,61 @@ pub mod displaced {
         kept: bool,
     }
 
+    mod stored_path {
+        use std::path::{Path, PathBuf};
+
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Serialize, Deserialize)]
+        #[serde(untagged)]
+        enum Stored<'a> {
+            Text(std::borrow::Cow<'a, str>),
+            Bytes { git_quoted: std::borrow::Cow<'a, str> },
+        }
+
+        pub(super) fn serialize<S: serde::Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
+            match path.to_str() {
+                Some(text) => Stored::Text(text.into()),
+                None => Stored::Bytes { git_quoted: crate::draft::quote_path(&crate::git::path_bytes(path)).into() },
+            }
+            .serialize(serializer)
+        }
+
+        pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<PathBuf, D::Error> {
+            match Stored::deserialize(deserializer)? {
+                Stored::Text(text) => Ok(PathBuf::from(text.as_ref())),
+                Stored::Bytes { git_quoted } => crate::draft::unquote_path(&git_quoted)
+                    .map(|raw| crate::git::path_from_bytes(&raw))
+                    .ok_or_else(|| serde::de::Error::custom("invalid quoted path")),
+            }
+        }
+
+        pub(super) mod optional {
+            use std::path::PathBuf;
+
+            use serde::{Deserialize, Serialize};
+
+            #[derive(Serialize, Deserialize)]
+            struct Stored(#[serde(with = "super")] PathBuf);
+
+            pub(in super::super) fn serialize<S: serde::Serializer>(
+                path: &Option<PathBuf>,
+                serializer: S,
+            ) -> Result<S::Ok, S::Error> {
+                path.clone().map(Stored).serialize(serializer)
+            }
+
+            pub(in super::super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+                deserializer: D,
+            ) -> Result<Option<PathBuf>, D::Error> {
+                Ok(Option::<Stored>::deserialize(deserializer)?.map(|Stored(path)| path))
+            }
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct IndexPath(#[serde(with = "stored_path")] PathBuf);
+
     /// One displaced item.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
     pub struct Entry {
@@ -1614,8 +1682,10 @@ pub mod displaced {
         #[serde(skip)]
         provenance: Option<Provenance>,
         /// Where in the harness the content was displaced from.
+        #[serde(with = "stored_path")]
         pub dest: PathBuf,
         /// The displaced content itself (a file, directory or symlink).
+        #[serde(with = "stored_path")]
         pub path: PathBuf,
         /// Unix seconds.
         pub displaced_at: u64,
@@ -1739,7 +1809,15 @@ pub mod displaced {
     /// Deletes an entry and its content for good.
     pub fn discard(id: &str) -> Result<()> {
         let root = root()?;
-        get(id)?;
+        let entry = get(id)?;
+        if entry.kind == Kind::Draft
+            && let Some(git_dir) = entry.path.ancestors().nth(4)
+            && crate::draft::pull_journal_exists(git_dir)?
+        {
+            return Err(Error::Invalid(
+                "pull pending. Finish the pull before discarding Draft recovery content".into(),
+            ));
+        }
         let dir = locate(&root, id).expect("an entry just loaded");
         forget(&root, id, &dir)
     }
@@ -1751,32 +1829,36 @@ pub mod displaced {
     }
 
     fn check_repo(repo: &Repo, entry: &Entry) -> Result<()> {
-        if let Some(provenance) = &entry.provenance
-            && RepoIdentity::of(repo)? != provenance.repo
-        {
-            return Err(Error::Invalid(format!(
+        let other = match &entry.provenance {
+            Some(provenance) => (RepoIdentity::of(repo)? != provenance.repo).then(|| provenance.repo.root.clone()),
+            // Pull's entries are in the git directory of the repo they came from.
+            None if entry.kind == Kind::Draft => {
+                let holder = entry.path.ancestors().nth(4).unwrap_or(&entry.path);
+                let out = crate::git::Git::new(repo.root()).args(["rev-parse", "--absolute-git-dir"]).run()?;
+                let git_dir = crate::git::path_from_bytes(out.strip_suffix(b"\n").unwrap_or(&out));
+                let same = matches!((git_dir.canonicalize(), holder.canonicalize()), (Ok(a), Ok(b)) if a == b);
+                (!same).then(|| holder.to_path_buf())
+            }
+            None => None,
+        };
+        match other {
+            Some(root) => Err(Error::Invalid(format!(
                 "recovery entry `{}` belongs to another repo ({})",
                 entry.id,
-                provenance.repo.root.display()
-            )));
+                root.display()
+            ))),
+            None => Ok(()),
         }
-        Ok(())
     }
 
-    /// Takes an entry's content back, then deletes the entry:
-    ///
-    /// - A copied skill becomes the repo's version of that skill, and a rule
-    ///   file its rule (as [`super::adopt`] does for a conflict): a draft
-    ///   change, which the next sync brings to the harness.
-    /// - A block instructions file goes back into the harness (one block
-    ///   mixes several rules, so it can't go into the repo), with the
-    ///   current managed block in place of its own unless its own was edited
-    ///   by hand; the next plan then shows that as a conflict. The file it
-    ///   replaces is displaced in turn. Refused while the current managed
-    ///   block is edited by hand: that conflict has to be resolved first, or
-    ///   the block would lose the marker that makes it one.
+    /// Where [`adopt`] puts an entry's content. Refused for an entry of
+    /// another repo, and when the Item ID it was placed with no longer leads
+    /// to the item it came from.
     pub fn target(repo: &Repo, entry: &Entry) -> Result<AdoptTarget> {
         check_repo(repo, entry)?;
+        if entry.kind == Kind::Draft {
+            return adopt_target(repo, entry.kind, &entry.dest, None);
+        }
         let provenance = entry.provenance.as_ref().ok_or_else(|| recovery_target_changed(entry.item_id.as_ref()))?;
         let mut target = adopt_target(repo, entry.kind, &entry.dest, entry.item_id.as_ref())?;
         if target.existing {
@@ -1812,7 +1894,23 @@ pub mod displaced {
         Ok(true)
     }
 
-    pub fn adopt(repo: &Repo, id: &str) -> Result<PathBuf> {
+    /// Takes an entry's content back, then deletes the entry:
+    ///
+    /// - A copied skill becomes the repo's version of that skill, and a rule
+    ///   file its rule (as [`super::adopt`] does for a conflict): a draft
+    ///   change, which the next sync brings to the harness.
+    /// - A block instructions file goes back into the harness (one block
+    ///   mixes several rules, so it can't go into the repo), with the
+    ///   current managed block in place of its own unless its own was edited
+    ///   by hand; the next plan then shows that as a conflict. The file it
+    ///   replaces is displaced in turn. Refused while the current managed
+    ///   block is edited by hand: that conflict has to be resolved first, or
+    ///   the block would lose the marker that makes it one.
+    /// - A file pull displaced from the repo's working tree goes back to its
+    ///   path as a Draft change (see [`crate::draft::adopt_displaced`]).
+    ///
+    /// Returns where the content went.
+    pub fn adopt(repo: &Repo, id: &str, lock: &crate::EngineLock) -> Result<PathBuf> {
         let entry = get(id)?;
         let target = target(repo, &entry)?;
         match entry.kind {
@@ -1824,6 +1922,10 @@ pub mod displaced {
             Kind::Skill => copy_into_repo(repo, &entry.path, &target, entry.item_id.as_ref(), target.placed_origin)?,
             Kind::Rule => rule_into_repo(repo, &target, &read_text(&entry.path)?, entry.item_id.as_ref())?,
             Kind::Instructions => restore_instructions(repo, &entry)?,
+            Kind::Draft => {
+                crate::draft::adopt_displaced(repo, &entry, lock)?;
+                return Ok(target.path);
+            }
         }
         discard(id)?;
         Ok(target.path)
@@ -1891,7 +1993,7 @@ pub mod displaced {
         prune_with(age, u64::MAX)
     }
 
-    pub(super) fn prune_with(age: Duration, max: u64) -> Result<Vec<String>> {
+    pub(crate) fn prune_with(age: Duration, max: u64) -> Result<Vec<String>> {
         let root = root()?;
         let now = now();
         let old = |since: u64| now.saturating_sub(since) >= age.as_secs();
@@ -1906,7 +2008,7 @@ pub mod displaced {
             match (dir, loaded) {
                 (Some(dir), Some((meta, path))) => {
                     let size = disk_size(&path, &mut inodes);
-                    if differs(&meta, &path)? {
+                    if meta.kind == Kind::Draft || differs(&meta, &path)? {
                         total += size;
                     } else if old(meta.displaced_at) {
                         forget(&root, &id, &dir)?;
@@ -1918,6 +2020,16 @@ pub mod displaced {
                 }
                 // Begun but never filled (killed meanwhile), or not ours.
                 (dir, None) => {
+                    if let Some(content) = dir.as_ref().map(|dir| dir.join(CONTENT))
+                        && !matches!(fs::symlink_metadata(&content), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+                    {
+                        total += disk_size(&content, &mut inodes);
+                        continue;
+                    }
+                    // A prepared Draft removal can wait in a journal indefinitely.
+                    if dir.as_deref().and_then(read_meta).is_some_and(|meta| meta.kind == Kind::Draft) {
+                        continue;
+                    }
                     let since = dir.as_deref().and_then(modified).or_else(|| modified(&pointer));
                     if since.is_some_and(old) {
                         match dir {
@@ -1962,7 +2074,7 @@ pub mod displaced {
 
     /// Lists in the index every entry in `holder`'s area it lacks (the state
     /// directory was lost or moved, say).
-    pub(super) fn reindex(holder: &Path) -> Result<()> {
+    pub(crate) fn reindex(holder: &Path) -> Result<()> {
         let area = area(holder);
         let names = read_dir_names(&area)?;
         if names.is_empty() {
@@ -2003,7 +2115,7 @@ pub mod displaced {
     /// be in: nothing else is ever read from or deleted through the index.
     fn indexed(root: &Path, id: &str) -> Option<PathBuf> {
         let text = fs::read_to_string(root.join(INDEX).join(id)).ok()?;
-        let dir: PathBuf = serde_json::from_str(&text).ok()?;
+        let IndexPath(dir) = serde_json::from_str(&text).ok()?;
         let area = dir.parent()?;
         let ok = dir.is_absolute()
             && dir.file_name()? == id
@@ -2022,7 +2134,7 @@ pub mod displaced {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
             Err(e) => return Err(e).at(&path),
         };
-        let body = serde_json::to_string(dir).map_err(|e| Error::Invalid(e.to_string()))?;
+        let body = serde_json::to_string(&IndexPath(dir.to_path_buf())).map_err(|e| Error::Invalid(e.to_string()))?;
         if let Err(e) = file.write_all(body.as_bytes()).and_then(|()| file.sync_all()) {
             let _ = fs::remove_file(&path);
             return Err(e).at(&path);
@@ -2086,16 +2198,15 @@ pub mod displaced {
         !id.is_empty() && !id.starts_with('.') && !id.contains(['/', '\\'])
     }
 
+    fn read_meta(dir: &Path) -> Option<Meta> {
+        let text = instructions::read_optional(&dir.join(META)).ok().flatten()?;
+        serde_json::from_str(&text).ok()
+    }
+
     /// An entry's metadata and content path; `None` unless both are there.
     fn load(dir: &Path) -> Result<Option<(Meta, PathBuf)>> {
         let path = dir.join(CONTENT);
-        let Some(text) = instructions::read_optional(&dir.join(META)).ok().flatten() else {
-            return Ok(None);
-        };
-        let Ok(meta) = serde_json::from_str::<Meta>(&text) else {
-            return Ok(None);
-        };
-        Ok(fs::symlink_metadata(&path).is_ok().then_some((meta, path)))
+        Ok(read_meta(dir).filter(|_| fs::symlink_metadata(&path).is_ok()).map(|meta| (meta, path)))
     }
 
     fn entry(id: String, meta: Meta, path: PathBuf) -> Result<Entry> {
@@ -2124,7 +2235,30 @@ pub mod displaced {
                 Ok(crate::config_file::read_regular(path, false)?
                     .map(|bytes| hash_str(&String::from_utf8_lossy(&bytes))))
             }
+            Kind::Draft => match fs::symlink_metadata(path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e).at(path),
+                Ok(m) if m.file_type().is_symlink() => {
+                    Ok(Some(leaf_fingerprint(None, &crate::git::path_bytes(&fs::read_link(path).at(path)?))))
+                }
+                Ok(m) if m.is_file() => {
+                    #[cfg(unix)]
+                    let mode = std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o7777;
+                    #[cfg(not(unix))]
+                    let mode = 0;
+                    Ok(crate::config_file::read_regular(path, false)?.map(|bytes| leaf_fingerprint(Some(mode), &bytes)))
+                }
+                Ok(_) => Ok(Some("not a file".into())),
+            },
         }
+    }
+
+    /// What a [`Kind::Draft`] entry is compared by: whether it is a symlink,
+    /// and its exact bytes (a symlink's target).
+    pub(crate) fn leaf_fingerprint(mode: Option<u32>, bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let kind = mode.map_or_else(|| "link".into(), |mode| format!("file:{mode:o}"));
+        format!("{kind}:{}", crate::hash::hex(&Sha256::digest(bytes)))
     }
 
     pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
@@ -2152,7 +2286,7 @@ pub mod displaced {
 
     /// Moves `aside` (left behind by an interrupted sync, in `holder`) into
     /// a new entry for `dest`, and returns it.
-    pub(super) fn rescue(
+    pub(crate) fn rescue(
         kind: Kind,
         harness: &str,
         dest: &Path,
@@ -2180,7 +2314,7 @@ pub mod displaced {
     }
 
     /// One displacement in progress (see the module docs).
-    pub(super) struct Displacing {
+    pub(crate) struct Displacing {
         id: String,
         root: PathBuf,
         /// The entry's directory.
@@ -2194,7 +2328,7 @@ pub mod displaced {
     impl Displacing {
         /// Creates the entry in `holder`'s area (and prunes old ones).
         /// Nothing is displaced yet.
-        pub(super) fn begin(
+        pub(crate) fn begin(
             repo: Option<&Repo>,
             kind: Kind,
             harness: &str,
@@ -2210,7 +2344,9 @@ pub mod displaced {
             let root = root()?;
             make_dirs(&root.join(INDEX))?;
             // Best effort: a stale entry that can't be pruned is no reason not to sync.
-            let _ = prune();
+            if kind != Kind::Draft {
+                let _ = prune();
+            }
             let area = area(holder);
             make_dirs(&area)?;
             let ignore = area.join(".gitignore");
@@ -2220,7 +2356,8 @@ pub mod displaced {
             let area = std::path::absolute(&area).at(&area)?;
             let millis = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
             let name = dest.file_name().unwrap_or_default().to_string_lossy();
-            let base = format!("{millis:013}-{}-{}", slug(harness), slug(&name));
+            let bounded = |s: &str| slug(s).chars().take(64).collect::<String>();
+            let base = format!("{millis:013}-{}-{}", bounded(harness), bounded(&name));
             let mut ids = (0..).map(|n| if n == 0 { base.clone() } else { format!("{base}-{n}") });
             let (id, dir) = loop {
                 let id = ids.next().expect("an unused id");
@@ -2259,19 +2396,57 @@ pub mod displaced {
         }
 
         fn write_meta(&self, meta: &Meta) -> Result<()> {
-            let body = serde_json::to_string_pretty(meta).map_err(|e| Error::Invalid(e.to_string()))?;
-            let path = self.dir.join(META);
-            fs::write(&path, body).at(&path)
+            let body = serde_json::to_vec_pretty(meta).map_err(|e| Error::Invalid(e.to_string()))?;
+            crate::config_file::replace_private(&self.dir.join(META), &body)
         }
 
-        fn content(&self) -> PathBuf {
+        #[cfg(unix)]
+        pub(crate) fn draft(holder: &Path, id: &str) -> Result<Self> {
+            let root = root()?;
+            if !valid_id(id) {
+                return Err(Error::Invalid("invalid pull recovery id".into()));
+            }
+            let dir = area(holder).join(id);
+            let meta = read_meta(&dir)
+                .filter(|meta| meta.kind == Kind::Draft)
+                .ok_or_else(|| Error::Invalid(format!("cannot read pull recovery entry at {}", dir.display())))?;
+            let held = fs::symlink_metadata(dir.join(CONTENT)).is_ok().then_some(Held::Moved);
+            Ok(Self { id: id.into(), root, dir, kind: Kind::Draft, dest: meta.dest, expected: meta.expected, held })
+        }
+
+        #[cfg(unix)]
+        pub(crate) fn expects(&self, fingerprint: &str) -> bool {
+            self.expected == fingerprint
+        }
+
+        #[cfg(unix)]
+        pub(crate) fn id(&self) -> &str {
+            &self.id
+        }
+
+        #[cfg(unix)]
+        pub(crate) fn filled(&self) -> bool {
+            self.held.is_some()
+        }
+
+        pub(crate) fn forget_empty(id: &str) -> Result<()> {
+            let root = root()?;
+            let dir = locate(&root, id).ok_or_else(|| Error::Invalid(format!("no displaced entry `{id}`")))?;
+            match fs::symlink_metadata(dir.join(CONTENT)) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => forget(&root, id, &dir),
+                _ => Err(Error::Invalid(format!("displaced entry `{id}` still holds content"))),
+            }
+        }
+
+        /// Where the displaced content is (or goes) in the entry.
+        pub(crate) fn content(&self) -> PathBuf {
             self.dir.join(CONTENT)
         }
 
         /// Moves `src` (the destination, or a leftover aside) into the
         /// entry. It is in the same directory tree, so this is one rename;
         /// if that fails anyway (a mount point in between), nothing moved.
-        pub(super) fn take(&mut self, src: &Path) -> Result<()> {
+        pub(crate) fn take(&mut self, src: &Path) -> Result<()> {
             rename(src, &self.content()).at(src)?;
             self.held = Some(Held::Moved);
             Ok(())
@@ -2288,8 +2463,21 @@ pub mod displaced {
             Ok(true)
         }
 
+        /// [`take`](Self::take) for `name` in the directory `parent`,
+        /// never following a symlink to it; `false` if nothing is there.
+        #[cfg(unix)]
+        pub(crate) fn take_at(&mut self, parent: &std::os::fd::OwnedFd, name: &std::ffi::OsStr) -> Result<bool> {
+            let content = self.content();
+            match rustix::fs::renameat(parent, name, rustix::fs::CWD, &content) {
+                Ok(()) => self.held = Some(Held::Moved),
+                Err(rustix::io::Errno::NOENT) => return Ok(false),
+                Err(e) => return Err(std::io::Error::from(e)).at(&self.dest),
+            }
+            Ok(true)
+        }
+
         /// Whether the displaced content still matches what was expected.
-        pub(super) fn intact(&self) -> Result<bool> {
+        pub(crate) fn intact(&self) -> Result<bool> {
             let at = if self.held.is_some() { self.content() } else { self.dest.clone() };
             Ok(!self.expected.is_empty() && fingerprint(self.kind, &at)?.unwrap_or_default() == self.expected)
         }
@@ -2324,7 +2512,7 @@ pub mod displaced {
         /// Drops the entry, unless it holds content that was moved here: a
         /// hard link can go (the original is still in place), that can't, so
         /// it is kept instead.
-        pub(super) fn abandon(self) {
+        pub(crate) fn abandon(self) {
             if self.held == Some(Held::Moved) && fs::symlink_metadata(self.content()).is_ok() {
                 let _ = self.keep();
                 return;
@@ -2335,7 +2523,7 @@ pub mod displaced {
         /// After the swap: checks the content one last time.
         /// `Some(Error::Displaced)` if it changed; otherwise the entry is
         /// left for [`prune`].
-        pub(super) fn finish(self) -> Result<Option<Error>> {
+        pub(crate) fn finish(self) -> Result<Option<Error>> {
             Ok((!self.intact()?).then(|| self.displaced_error()))
         }
 
@@ -2599,6 +2787,11 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    fn adopt_test_entry(repo: &Repo, id: &str) -> Result<PathBuf> {
+        crate::git::Git::new(repo.root()).args(["init", "-q"]).run()?;
+        displaced::adopt(repo, id, &crate::EngineLock::acquire(repo.root())?)
+    }
 
     fn write(path: &Path, text: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -3468,7 +3661,7 @@ mod tests {
         let replacement = repo.personal_dir().join("replacement");
         write(&replacement.join("SKILL.md"), "Different item.\n");
         id.write_skill(&replacement).unwrap();
-        assert!(displaced::adopt(&repo, &entry.id).unwrap_err().to_string().contains("Pick a target"));
+        assert!(adopt_test_entry(&repo, &entry.id).unwrap_err().to_string().contains("Pick a target"));
         assert_eq!(fs::read_to_string(replacement.join("SKILL.md")).unwrap(), "Different item.\n");
         assert!(displaced::get(&entry.id).is_ok());
     }
@@ -3529,7 +3722,7 @@ mod tests {
         }
         let entry = displaced::list().unwrap().into_iter().find(|entry| entry.dest == dest).unwrap();
         assert_eq!(entry.item_id.unwrap().to_string(), "original-rule");
-        displaced::adopt(&repo, &entry.id).unwrap();
+        adopt_test_entry(&repo, &entry.id).unwrap();
         let restored = repo.rules().unwrap().remove(0);
         assert_eq!(restored.id.unwrap().to_string(), "original-rule");
         assert_eq!(restored.body, "Edited.");
@@ -3622,7 +3815,7 @@ mod tests {
                     // However old, a changed entry is never pruned.
                     assert!(!displaced::prune_older_than(Duration::ZERO).unwrap().contains(&entry.id), "{case}");
 
-                    displaced::adopt(&repo, &entry.id).unwrap();
+                    adopt_test_entry(&repo, &entry.id).unwrap();
                     assert!(displaced::list().unwrap().iter().all(|e| e.id != entry.id), "{case}");
                     if format == InstructionsFormat::Rules {
                         let rule = fs::read_to_string(repo.root().join("instructions/git.md")).unwrap();
@@ -3680,7 +3873,7 @@ mod tests {
                         repo.rename_item("skill", "pdf", "docs").unwrap();
                         "docs"
                     };
-                    displaced::adopt(&repo, &entry.id).unwrap();
+                    adopt_test_entry(&repo, &entry.id).unwrap();
                     let personal = repo.personal_dir().join(name);
                     assert_eq!(fs::read_to_string(personal.join("SKILL.md")).unwrap(), kept, "{case}");
                     assert_eq!(ItemId::read_skill(&personal).unwrap(), id);
@@ -4000,7 +4193,7 @@ mod tests {
         };
         assert!(conflict(&d));
 
-        let err = displaced::adopt(&d.repo, &entry.id).unwrap_err();
+        let err = adopt_test_entry(&d.repo, &entry.id).unwrap_err();
         assert!(matches!(&err, Error::Invalid(m) if m.contains("edited by hand")), "{err}");
         assert_eq!(fs::read_to_string(&d.dest).unwrap(), edited);
         assert!(displaced::get(&entry.id).unwrap().changed);

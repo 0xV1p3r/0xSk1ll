@@ -51,7 +51,7 @@ mod unix {
             Ok(Self(open_directory(path, create)?))
         }
 
-        fn parent(&self, path: &Path, create: bool) -> io::Result<(OwnedFd, OsString)> {
+        pub(crate) fn parent(&self, path: &Path, create: bool) -> io::Result<(OwnedFd, OsString)> {
             let parts: Vec<_> = path.components().collect();
             if parts.is_empty() || parts.iter().any(|p| !matches!(p, Component::Normal(_))) {
                 return Err(io::Error::other("file path must be relative and normalized"));
