@@ -239,17 +239,24 @@ export function GettingStarted({ status, entries, machines, scope, addImport, ne
   const [visible, setVisible] = useState(() => reopened || gettingStartedShown());
   const standalone = status.mode === 'standalone';
   const unmanaged = entries?.filter(entry => entry.type === 'unmanaged').length ?? 0;
-  const steps: { title: string; done: boolean; action?: ReactNode }[] = [
-    { title: 'Add a Skill or Rule', done: !!entries?.some(entry => entry.type !== 'unmanaged'),
+  const added = !!entries?.some(entry => entry.type !== 'unmanaged');
+  const { baseline, drafts, unpushed, blocked, clashes } = status.report;
+  // Standalone, the starter commit already makes a Baseline; in a Fleet the commit must also reach the Server.
+  const waiting = standalone ? '' : blocked || clashes.length ? 'Blocked by the new Baseline' : unpushed.length ? `${plural(unpushed.length, 'item')} not pushed` : '';
+  const committed = added && baseline !== null && drafts.length === 0 && !waiting;
+  // Optional steps never keep the checklist open: some Unmanaged skills are meant to stay that way.
+  const steps: { title: string; done: boolean; optional?: boolean; note?: string; action?: ReactNode }[] = [
+    { title: 'Add a Skill or Rule', done: added,
       action: <><Button size="sm" onClick={addImport}>Add Import</Button><Button size="sm" variant="outline" onClick={newSkill}>New Skill</Button><Button size="sm" variant="outline" onClick={newRule}>New Rule</Button></> },
-    ...(unmanaged ? [{ title: `Adopt ${plural(unmanaged, 'Unmanaged skill')} already in your Harnesses`, done: false,
+    ...(unmanaged ? [{ title: `Adopt ${plural(unmanaged, 'Unmanaged skill')} already in your Harnesses`, done: false, optional: true,
       action: <Button size="sm" variant="outline" onClick={showUnmanaged}>Show</Button> }] : []),
-    { title: standalone ? 'Commit your Draft' : 'Commit your Draft to the Fleet', done: status.report.baseline !== null && status.report.drafts.length === 0,
+    { title: standalone ? 'Commit your Draft' : 'Commit your Draft to the Fleet', done: committed, note: waiting || undefined,
       action: <Button size="sm" variant="outline" onClick={reviewDraft}>Review Draft</Button> },
     ...(standalone ? [] : [{ title: 'Add another Machine', done: (machines ?? 0) > 1, action: <JoinCodeButton label="Create join code" serverUrl={status.server_url} scope={scope} /> }]),
   ];
   const known = !!entries && (standalone || machines !== undefined);
-  const finished = known && steps.every(step => step.done);
+  const required = steps.filter(step => !step.optional);
+  const finished = known && required.every(step => step.done);
   // Reopening a finished checklist keeps it open; one with steps left still closes when they're done.
   const [sawUnfinished, setSawUnfinished] = useState(false);
   useEffect(() => { if (known && !finished) setSawUnfinished(true); }, [known, finished]);
@@ -257,11 +264,11 @@ export function GettingStarted({ status, entries, machines, scope, addImport, ne
   useEffect(() => { if (visible && finished && !keepOpen) { hideGettingStarted(); setVisible(false); onDismiss(); } }, [visible, finished, keepOpen, onDismiss]);
   if (!visible || (finished && !keepOpen)) return null;
   return <Panel label="Getting started"><PanelToolbar><SectionTitle>Getting started</SectionTitle>
-    <span className="text-xs text-muted-foreground tabular-nums">{steps.filter(step => step.done).length} of {steps.length} done</span>
+    <span className="text-xs text-muted-foreground tabular-nums">{required.filter(step => step.done).length} of {required.length} done</span>
     <Button variant="ghost" size="sm" className="ml-auto" onClick={() => { hideGettingStarted(); setVisible(false); onDismiss(); }}>Dismiss</Button></PanelToolbar>
     <ol className="divide-y">{steps.map(step => <li key={step.title} className="flex flex-wrap items-center gap-3 px-3.5 py-2.5">
       <span aria-hidden className={cn('grid size-5 shrink-0 place-items-center rounded-full border', step.done && 'border-success bg-success text-background')}>{step.done && <Check className="size-3" />}</span>
-      <span className={cn('min-w-0 flex-1 text-sm', step.done && 'text-muted-foreground line-through')}>{step.title}<span className="sr-only">{step.done ? ', done' : ', to do'}</span></span>
+      <span className={cn('min-w-0 flex-1 text-sm', step.done && 'text-muted-foreground line-through')}>{step.title}{step.optional && <Badge variant="secondary" className="ml-2">Optional</Badge>}{step.note && <span className="block text-xs text-muted-foreground">{step.note}</span>}<span className="sr-only">{step.done ? ', done' : step.optional ? ', optional' : ', to do'}</span></span>
       {!step.done && <div className="flex gap-2">{step.action}</div>}
     </li>)}</ol>
   </Panel>;
