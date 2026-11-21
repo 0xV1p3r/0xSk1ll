@@ -20,7 +20,7 @@ One instruction file ("for X do Y"), kept in `instructions/`. A harness's **inst
 _Avoid_: Fragment, instruction (when meaning a single file)
 
 **Item ID**:
-The stable identifier of a personal skill, Rule or Import. Assignment toggles follow it through renames. An item without an explicit ID derives one from its kind and name.
+The stable identifier of a personal skill, Rule or Import, always explicit: it is never derived from the item's name. Assignment toggles follow it through renames. sk1ll writes a fresh one, as a Draft change, to an item that lacks one; until then the item has no toggle and follows the defaults.
 _Avoid_: UUID, key
 
 ## Where content goes

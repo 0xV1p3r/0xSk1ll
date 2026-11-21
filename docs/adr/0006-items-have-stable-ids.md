@@ -1,6 +1,6 @@
 # Items have stable IDs
 
-Status: accepted. Item IDs are implemented. Assignment by Item ID lands in Phase 2.
+Status: accepted. Item IDs and Assignment by Item ID are implemented.
 
 Each personal skill, Rule and Import has an Item ID. Personal skills keep it in
 `.sk1ll-id`, Rules in frontmatter, and Imports in their manifest entry. Assignment
@@ -13,9 +13,19 @@ uses the Item ID, so a rename is local to the repo and the ID moves with the ite
   This supersedes the push cleanup and toggle sweeping in
   [ADR 0005](0005-join-code-scopes.md) and removes the draft-discard protocol.
 - An orphan list shows stale toggles. Only an explicit prune clears them.
-- The daemon and mutating commands assign a fresh ULID to items with a
-  missing ID. The write appears in the Draft. Until then, read-only callers
-  see a null ID and sync uses the Harness defaults for that item.
+- Item IDs are always explicit; none is derived from a kind and name. The
+  daemon and mutating commands assign a fresh ULID to items with a missing
+  ID. The write appears in the Draft. Until then, read-only callers see a
+  null ID and sync uses the Harness defaults for that item, so an item
+  re-created by hand starts from the defaults, like one re-created through
+  sk1ll.
+- A daemon refresh first finishes a pending Pull, then writes missing IDs,
+  then syncs and reports. It never writes IDs into a pending Pull's partial
+  tree, and it does not sync while IDs cannot be written.
+- A Machine's reported inventory is incomplete while Item ID metadata is
+  unreadable, an item has no ID yet, two items share one, or a Pull is
+  pending. The server refuses orphan pruning and default changes that
+  record existing items' values while an inventory it needs is incomplete.
 - Item ID claims must be unique across the repo. `sk1ll repair-ids` keeps the
   first claim by path and assigns fresh IDs to the others.
 - A rename carries the explicit ID with the item. Recovery

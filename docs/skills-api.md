@@ -25,7 +25,9 @@ These endpoints use the Daemon's local Unix socket. Shared Rust types are in
 
 `type` is `personal`, `import`, `rule`, or `unmanaged`. `item` is
 `skill:<name>` or `rule:<name>`, and is null for unmanaged Skills. The Item ID
-field `id` is omitted for unmanaged Skills.
+field `id` is omitted for unmanaged Skills. It is null for an item that has no
+Item ID yet; the next refresh writes one, and until then the item follows the
+Harness defaults.
 `description` is a string or null. `draft` is `added`, `modified`, `deleted`,
 or null. `in_baseline` refers to the applied fleet Baseline, so an unpushed
 commit can still have `in_baseline: false` and `draft: null`.
@@ -216,6 +218,9 @@ status. The server replies with `assignment_result`, the request's `req`, and th
 last status `seq` it processed for the session. Admin and cross-Machine writes use the server's REST API. Unknown Item IDs are accepted and inert.
 
 The status carries `inventory_complete` and an optional `inventory_error`.
+An inventory is incomplete while Item ID metadata is unreadable, an item has
+no Item ID yet, two items share one, or a Pull is pending (the Daemon then
+keeps reporting its last inventory).
 A daemonless CLI session sends an `inventory` frame. The server merges its
 Item IDs into the last report and preserves its Git and Harness status.
 When an item is replaced with a different ID under the same name, `GET /items`

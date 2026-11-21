@@ -189,7 +189,7 @@ sk1ll assign codex --default-rules on       # default for new rules
 
 Changing a default first records every existing item's current value as an explicit toggle, so existing items keep their state.
 
-Item toggles use Item IDs. `sk1ll assign` resolves the name in the local repo and warns if the item you want to turn on is missing. A rename preserves the Item ID and keeps the Assignment across the Fleet. Deleting an item and creating it again with sk1ll gives it a new ID, so it follows the defaults. Hand-made items without an explicit ID derive one from kind and name. Recreating one under the same name reuses its old ID and any retained toggles.
+Item toggles use Item IDs. `sk1ll assign` resolves the name in the local repo and warns if the item you want to turn on is missing. A rename preserves the Item ID and keeps the Assignment across the Fleet. Deleting an item and creating it again gives it a new ID, so it follows the defaults. That holds for an item re-created by hand too: Item IDs are never derived from names, so the Daemon or the next mutating command writes it a fresh one. Until an item has an Item ID it has no toggle and follows the defaults. Changing a default records every item's value by Item ID, so it is refused while a pending Pull leaves an item without one.
 
 An `assignment.json` file has this shape. The keys under `skills` and `rules` are Item IDs. Imports use the `skills` map.
 

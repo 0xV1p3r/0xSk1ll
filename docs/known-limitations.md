@@ -80,7 +80,8 @@ Pull checks for clashes item by item before it changes anything. After that,
 a Draft edit to a path it has yet to update can block it. Move any edits you
 want to keep aside, restore or clear the obstruction, then pull again. A
 save to a path Pull already updated stays as Draft. While Pull is pending,
-the Daemon keeps the last complete Draft report and pauses sync. A Harness
+the Daemon keeps the last complete Draft report and inventory, reports the
+inventory as incomplete, writes no Item IDs and pauses sync. A Harness
 that reads Skills through symlinks can already see the paths Pull updated.
 
 Pull needs the repo's Git directory on the same filesystem as its working

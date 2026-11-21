@@ -11,6 +11,8 @@ break compatibility.
 
 - List and clear orphan Assignment toggles in the desktop matrix or with
   `sk1ll fleet orphans` and `sk1ll fleet prune-orphans`.
+- `sk1ll repair-ids` gives items that share an Item ID fresh ones in the
+  Draft. Commit and Pull refuse duplicate Item IDs.
 - `sk1ll harnesses rename <old> <new>` moves a Harness's Assignment
   and renames its table in `machine.toml`.
 
@@ -65,9 +67,15 @@ break compatibility.
 ### Changed
 
 - Assignment toggles use Item IDs. Renaming a Skill or Rule preserves its
-  Assignment on every Machine. Deleting and recreating an item through sk1ll
-  creates a fresh ID. Hand-made items with derived IDs reuse the ID for
-  the same kind and name.
+  Assignment on every Machine. Item IDs are always explicit: the daemon and
+  mutating commands write a fresh ID to any item that lacks one, so an item
+  deleted and re-created, by hand or through sk1ll, starts from the
+  defaults.
+- Pull rolls forward: it replays unpushed commits without touching the
+  working tree, then updates only the paths the new Baseline changes. An
+  interrupted Pull is finished by the next `sk1ll pull` or Daemon refresh,
+  and content it replaced goes to the recovery area. sk1ll needs Git 2.40
+  or later.
 - A Daemon sends its Machine's Assignment writes over the same WebSocket
   as status, so Adopt reports its Draft before enabling it.
 
