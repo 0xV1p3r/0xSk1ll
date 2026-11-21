@@ -112,7 +112,7 @@ Commands take a bare skill or rule name, or `skill:<name>`, `rule:<name>`, `mani
 | `fleet` | Show every machine in the fleet |
 | `fleet invite` | Create a single-use join code and print the join command and expiry; `--scope self` limits the new machine to managing itself |
 | `fleet remove <machine>` | Remove a machine after confirming its id. Use `--yes` in scripts |
-| `harnesses rename <old> <new>` | Rename a Harness and move its Assignment |
+| `harnesses rename <old> <new> [--replace]` | Rename a Harness and move its Assignment |
 | `fleet orphans` | List orphan Assignment toggles |
 | `fleet prune-orphans [--machine <id>]` | Clear orphan toggles within your scope |
 | `fleet copy-assignment <source> <target>` | Preview and copy a joined Machine's Assignment. Use `--merge`, repeat `--map from=to`, or pass `--yes` in scripts |

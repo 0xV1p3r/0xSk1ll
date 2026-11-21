@@ -123,6 +123,8 @@ Assignment uses Item IDs. Renames keep their toggles on every Machine. A push or
 
 Run `sk1ll fleet orphans` to list toggles whose Item ID appears in neither the Baseline nor any Machine's last report. `sk1ll fleet prune-orphans` clears the listed orphans in your scope and records each removal in the Assignment log. A `self` Machine can clear only its own toggles. A `fleet` Machine or the admin can clear across the Fleet, or pass `--machine <id>` to select one Machine.
 
+The Server refuses to list or clear orphans while the Baseline or any reported inventory is incomplete. Fix the affected Item ID metadata and let the Machine report again. The Server also refuses pruning while git push state is degraded.
+
 The server exposes `GET /api/assignment/orphans` and `POST /api/assignment/orphans/prune`. The optional prune body is `{"machine":"workstation"}`.
 
 ## Run the daemon

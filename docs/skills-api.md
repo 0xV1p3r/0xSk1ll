@@ -213,8 +213,13 @@ toggle. A default change takes `kind: "new_skills_default"` or
 
 A joined Daemon sends its own writes as `set_assignment` frames after the latest
 status. The server replies with `assignment_result`, the request's `req`, and the
-last status `seq` it processed for the session. Admin and cross-Machine writes
-use the server's REST API. Unknown Item IDs are accepted and inert.
+last status `seq` it processed for the session. Admin and cross-Machine writes use the server's REST API. Unknown Item IDs are accepted and inert.
+
+The status carries `inventory_complete` and an optional `inventory_error`.
+A daemonless CLI session sends an `inventory` frame. The server merges its
+Item IDs into the last report and preserves its Git and Harness status.
+When an item is replaced with a different ID under the same name, `GET /items`
+returns separate Baseline and Draft rows.
 
 `POST /assignment/harness/{harness}` takes `{"enabled":false}` and sets both
 defaults and every explicit toggle for that Harness. It returns the
