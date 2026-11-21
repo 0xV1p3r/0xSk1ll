@@ -311,3 +311,40 @@ it('closes a reopened checklist once its last step is done', async () => {
   await waitFor(() => expect(screen.queryByRole('region', { name: 'Getting started' })).toBeNull());
   expect(props.onDismiss).toHaveBeenCalled();
 });
+
+const checklist = { machines: 2, reopened: true, onDismiss: vi.fn(), addImport: vi.fn(), newSkill: vi.fn(), newRule: vi.fn(), showUnmanaged: vi.fn(), reviewDraft: vi.fn() };
+const pdf = { type: 'personal', name: 'pdf' } as ContentEntry;
+const commitStep = () => screen.getByText(/^Commit your Draft/).closest('li')!;
+
+it('only completes the Fleet commit step once it is pushed and not Blocked', async () => {
+  const fleet = (report: Partial<StatusView['report']>) => ({ ...joined, report: { ...joined.report, baseline: 'abc', ...report } });
+  const { rerender } = render(<GettingStarted {...checklist} status={fleet({ unpushed: ['skill:pdf'] })} entries={[pdf]} />);
+  expect(within(commitStep()).getByText('1 item not pushed')).toBeTruthy();
+  expect(within(commitStep()).getByText(', to do')).toBeTruthy();
+  fireEvent.click(within(commitStep()).getByRole('button', { name: 'Review Draft' }));
+  expect(checklist.reviewDraft).toHaveBeenCalled();
+  rerender(<GettingStarted {...checklist} status={fleet({ blocked: true, clashes: ['skill:pdf'], drafts: ['skill:pdf'] })} entries={[pdf]} />);
+  expect(within(commitStep()).getByText('Blocked by the new Baseline')).toBeTruthy();
+  rerender(<GettingStarted {...checklist} status={fleet({})} entries={[]} />);
+  expect(within(commitStep()).getByText(', to do')).toBeTruthy();
+  rerender(<GettingStarted {...checklist} status={fleet({})} entries={[pdf]} />);
+  await waitFor(() => expect(screen.queryByRole('region', { name: 'Getting started' })).toBeNull());
+});
+
+it('leaves the standalone commit step to do on a fresh repo with only its starter commit', () => {
+  render(<GettingStarted {...checklist} machines={undefined} status={{ ...firstRun, repo_ready: true, report: { ...firstRun.report, baseline: 'starter' } }} entries={[]} />);
+  expect(screen.getByText('0 of 2 done')).toBeTruthy();
+  expect(within(commitStep()).getByText(', to do')).toBeTruthy();
+});
+
+it('treats adopting Unmanaged skills as optional', async () => {
+  const props = { ...checklist, machines: undefined, status: { ...firstRun, repo_ready: true, report: { ...firstRun.report, baseline: 'abc' } } };
+  const unmanaged = { type: 'unmanaged', name: 'scratch' } as ContentEntry;
+  const { rerender } = render(<GettingStarted {...props} entries={[unmanaged]} />);
+  const step = screen.getByText(/Adopt 1 Unmanaged skill already/).closest('li')!;
+  expect(within(step).getByText('Optional')).toBeTruthy();
+  expect(screen.getByText('0 of 2 done')).toBeTruthy();
+  rerender(<GettingStarted {...props} entries={[unmanaged, pdf]} />);
+  await waitFor(() => expect(screen.queryByRole('region', { name: 'Getting started' })).toBeNull());
+  expect(props.onDismiss).toHaveBeenCalled();
+});
