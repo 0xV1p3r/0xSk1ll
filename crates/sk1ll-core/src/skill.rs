@@ -19,7 +19,7 @@ pub enum Origin {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Skill {
-    pub id: ItemId,
+    pub id: Option<ItemId>,
     pub name: String,
     pub origin: Origin,
     pub path: PathBuf,
@@ -31,11 +31,12 @@ pub struct Skill {
 /// All skills in the repo, by name. Personal skills take precedence.
 pub fn discover(root: &Path) -> Result<Vec<Skill>> {
     let manifest = crate::item_id::manifest_on_disk(root)?;
-    let ids = crate::item_id::resolve(crate::item_id::claims_on_disk(root, &manifest, |_| true)?)?;
+    let ids = crate::item_id::claims_on_disk(root, &manifest, |_| true)?;
+    crate::item_id::check_claims(&ids)?;
     discover_with(root, &ids)
 }
 
-pub(crate) fn discover_with(root: &Path, ids: &crate::item_id::Resolved) -> Result<Vec<Skill>> {
+pub(crate) fn discover_with(root: &Path, ids: &crate::item_id::Claims) -> Result<Vec<Skill>> {
     let mut skills = BTreeMap::new();
     for (relative, id) in ids {
         let origin = if relative.starts_with(IMPORTED_DIR) {

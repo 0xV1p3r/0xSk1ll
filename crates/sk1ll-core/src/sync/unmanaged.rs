@@ -236,7 +236,7 @@ pub fn rollback(repo: &Repo, adoption: &Adoption) -> Result<bool> {
         if hash_dir(&dest)? != adoption.hash {
             return Ok(false);
         }
-        if let Some(error) = remove_displacing(displaced::Kind::Skill, "adopt", &dest, expected.as_deref())? {
+        if let Some(error) = remove_displacing(repo, displaced::Kind::Skill, "adopt", &dest, expected.as_deref())? {
             return Err(error);
         }
     }
@@ -297,8 +297,9 @@ pub fn complete(repo: &Repo, harnesses: &BTreeMap<String, Harness>, adoption: &A
                 name: adoption.name.clone(),
                 mode: config.mode,
                 source: Some(source.clone()),
-                item_id: repo.resolved_ids()?.get(source.strip_prefix(repo.root()).unwrap()).cloned(),
+                item_id: repo.resolved_ids()?.get(source.strip_prefix(repo.root()).unwrap()).cloned().flatten(),
                 expected,
+                metadata_only: false,
             },
             reason: None,
         };

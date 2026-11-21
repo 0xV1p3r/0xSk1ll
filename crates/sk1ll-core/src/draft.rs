@@ -258,6 +258,11 @@ impl Repo {
         }
         // A commit is only useful if it can be pushed, and that needs the fleet branch.
         self.on_fleet_branch()?;
+        let (_, st) = self.select(items, "committed")?;
+        self.check_id_transitions(st.head.as_deref(), items, "commit")?;
+        self.assign_item_ids(|path| {
+            items.contains(&claim_item(path)) || items.contains(&crate::item_id::item_for_path(path))
+        })?;
         let (selected, st) = self.select(items, "committed")?;
         let (case_removed, paths): (Vec<&PathBuf>, Vec<&PathBuf>) =
             selected.iter().flat_map(|d| &d.paths).partition(|path| st.case_removed.contains(*path));
@@ -293,7 +298,25 @@ impl Repo {
         let _ = fs::remove_file(&index);
         let tree = tree?;
         let claims = crate::item_id::claims_at(self.root(), &tree, |_| true, true)?;
-        crate::item_id::check_claims(&claims).map_err(|e| duplicate_after(e, "commit"))?;
+        crate::item_id::check_claims(&claims).map_err(|e| repair_before(e, "commit"))?;
+        let working_manifest = crate::item_id::manifest_on_disk(self.root())?;
+        for (path, id) in &claims {
+            let item = crate::item_id::item_for_path(path);
+            if id.is_none() && (items.contains(&item) || items.contains(&claim_item(path))) {
+                if path.starts_with(IMPORTED_DIR) {
+                    if working_manifest.import.contains_key(item.name()) {
+                        return Err(Error::Invalid(format!(
+                            "`{item}` needs its Item ID in the commit. Select `manifest` too"
+                        )));
+                    }
+                } else {
+                    return Err(Error::Invalid(format!(
+                        "can't commit {} without its Item ID",
+                        crate::item_id::claim_path(path).display()
+                    )));
+                }
+            }
+        }
         if let Some(h) = &st.head
             && self.git().args(["rev-parse", &format!("{h}^{{tree}}")]).text()? == tree
         {
@@ -318,6 +341,10 @@ impl Repo {
     /// Pushes [`FLEET_BRANCH`] to [`REMOTE`]; it must be checked out.
     pub fn push(&self) -> Result<()> {
         self.on_fleet_branch()?;
+        if let Some(head) = self.rev("HEAD")? {
+            let claims = crate::item_id::claims_at(self.root(), &head, |_| true, true)?;
+            crate::item_id::check_claims(&claims).map_err(|e| repair_before(e, "push"))?;
+        }
         let refspec = format!("refs/heads/{FLEET_BRANCH}:refs/heads/{FLEET_BRANCH}");
         self.git().args(["push", "--quiet", REMOTE, &refspec]).run()?;
         Ok(())
@@ -334,6 +361,7 @@ impl Repo {
                 "there is no baseline to restore the manifest to; commit it first (it would delete {MANIFEST_FILE})"
             )));
         }
+        self.check_id_transitions(st.head.as_deref(), items, "restore")?;
         let selected_items: BTreeSet<_> = selected.iter().map(|d| &d.item).collect();
         let restores_manifest = selected_items.contains(&ItemRef::Manifest);
         let restores = |path: &Path| selected_items.contains(&crate::item_id::item_for_path(path));
@@ -384,6 +412,64 @@ impl Repo {
         }
         if let (Some(head), false) = (&st.head, in_head.is_empty()) {
             self.git().literal().args(["checkout", "--quiet", head, "--"]).args(&in_head).run()?;
+        }
+        Ok(())
+    }
+
+    fn check_id_transitions(&self, head: Option<&str>, selected: &[ItemRef], operation: &str) -> Result<()> {
+        use crate::item_id::{claim_path, claims_at, claims_on_disk, manifest_on_disk};
+        let Some(head) = head else { return Ok(()) };
+        let committed = claims_at(self.root(), head, |_| true, true)?;
+        // Restore still has to work when the selected metadata itself is broken.
+        let restoring = operation == "restore";
+        let manifest = match manifest_on_disk(self.root()) {
+            Err(Error::Parse { .. }) if restoring && selected.contains(&ItemRef::Manifest) => {
+                crate::Manifest::default()
+            }
+            result => result?,
+        };
+        let working = if restoring {
+            match claims_on_disk(self.root(), &manifest, |_| true) {
+                Err(Error::Parse { .. } | Error::Invalid(_)) => {
+                    claims_on_disk(self.root(), &manifest, |path| !selected.contains(&claim_item(path)))?
+                }
+                result => result?,
+            }
+        } else {
+            claims_on_disk(self.root(), &manifest, |_| true)?
+        };
+        let locations = |claims: crate::item_id::Claims| {
+            let mut by_id = BTreeMap::<_, Vec<_>>::new();
+            for (path, id) in claims {
+                if let Some(id) = id {
+                    by_id.entry(id).or_default().push(path);
+                }
+            }
+            by_id
+        };
+        let committed = locations(committed);
+        let working = locations(working);
+        for (id, old) in &committed {
+            let [old] = old.as_slice() else { continue };
+            let Some([new]) = working.get(id).map(Vec::as_slice) else { continue };
+            if old == new {
+                continue;
+            }
+            let mut sides = BTreeSet::from([claim_item(old), claim_item(new)]);
+            if old.starts_with(IMPORTED_DIR) || new.starts_with(IMPORTED_DIR) {
+                let import = if old.starts_with(IMPORTED_DIR) { old } else { new };
+                let skill = crate::item_id::item_for_path(import);
+                // A Fork changes both the manifest and the vendored/personal paths.
+                sides.insert(skill);
+            }
+            if sides.iter().any(|item| selected.contains(item)) && !sides.iter().all(|item| selected.contains(item)) {
+                let items = sides.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+                return Err(Error::Invalid(format!(
+                    "can't {operation} one side of Item ID `{id}` moving from {} to {}. Select both sides: {items}",
+                    claim_path(old).display(),
+                    claim_path(new).display()
+                )));
+            }
         }
         Ok(())
     }
@@ -457,6 +543,11 @@ impl Repo {
             return Ok(PullOutcome::Blocked { baseline: remote, items });
         }
         let to = self.rev("HEAD")?.unwrap_or_default();
+        let claims = crate::item_id::claims_at(self.root(), &to, |_| true, true)?;
+        crate::item_id::check_claims(&claims).map_err(|e| repair_before(e, "push the replayed commits"))?;
+        let manifest = crate::item_id::manifest_on_disk(self.root())?;
+        let draft = crate::item_id::claims_on_disk(self.root(), &manifest, |_| true)?;
+        crate::item_id::check_claims(&draft).map_err(|e| repair_before(e, "sync the replayed Draft"))?;
         Ok(PullOutcome::Updated { from: head, to })
     }
 
@@ -609,7 +700,7 @@ impl Repo {
     }
 
     fn git(&self) -> Git {
-        Git::new(self.root())
+        Git::new(self.root()).env("GIT_OPTIONAL_LOCKS", "0")
     }
 
     fn rev(&self, spec: &str) -> Result<Option<String>> {
@@ -761,6 +852,11 @@ impl Repo {
     }
 
     fn status(&self) -> Result<Status> {
+        for dir in [self.personal_dir(), self.root().join(INSTRUCTIONS_DIR)] {
+            for (path, _) in crate::item_id::entries(&dir)? {
+                crate::repo::check_rename_stage(&path)?;
+            }
+        }
         let head = self.rev("HEAD")?;
         let head_paths = match &head {
             Some(h) => split_paths(&self.git().args(["ls-tree", "-r", "-z", "--name-only", h]).run()?).collect(),
@@ -775,6 +871,8 @@ impl Repo {
             .args([
                 "-c",
                 "core.ignoreCase=false",
+                "-c",
+                "core.fsmonitor=false",
                 "status",
                 "--porcelain=v1",
                 "-z",
@@ -855,6 +953,19 @@ impl Repo {
             }
         }
         Ok(head.iter().filter(|p| item_path(p).is_some_and(|item| removed_items.contains(&item))).cloned().collect())
+    }
+}
+
+fn claim_item(path: &Path) -> ItemRef {
+    if path.starts_with(IMPORTED_DIR) { ItemRef::Manifest } else { crate::item_id::item_for_path(path) }
+}
+
+fn repair_before(error: Error, operation: &str) -> Error {
+    match error {
+        Error::DuplicateItemId { .. } => Error::Invalid(format!(
+            "can't {operation}: {error}. Run `sk1ll repair-ids`, then commit the repaired items"
+        )),
+        error => error,
     }
 }
 
@@ -1013,9 +1124,13 @@ mod tests {
         let baseline = repo.commit(std::slice::from_ref(&old), "Add PDF", None).unwrap();
         let id = repo.skills().unwrap()[0].id.clone();
         repo.rename_item("skill", "pdf", "docs").unwrap();
-        let commit_error = repo.commit(std::slice::from_ref(&new), "Add docs", None).unwrap_err();
-        let restore_error = repo.restore(std::slice::from_ref(&old)).unwrap_err();
-        for err in [commit_error, restore_error] {
+        let errors = [&old, &new].into_iter().flat_map(|item| {
+            [
+                repo.commit(std::slice::from_ref(item), "Rename side", None).unwrap_err(),
+                repo.restore(std::slice::from_ref(item)).unwrap_err(),
+            ]
+        });
+        for err in errors {
             let message = err.to_string();
             for expected in ["both sides", "personal/pdf/.sk1ll-id", "personal/docs/.sk1ll-id"] {
                 assert!(message.contains(expected), "{message}");
@@ -1032,6 +1147,20 @@ mod tests {
     }
 
     #[test]
+    fn committing_a_handmade_import_persists_its_id_and_requires_the_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::init_committed(tmp.path()).unwrap();
+        write(&repo.root().join("sk1ll.toml"), "import = { pdf = { source = 'upstream' } }\n");
+        write(&repo.imported_dir().join("pdf/SKILL.md"), "PDFs.\n");
+        let pdf = item("skill:pdf");
+        let error = repo.commit(std::slice::from_ref(&pdf), "Import without manifest", None).unwrap_err();
+        assert!(error.to_string().contains("Select `manifest` too"));
+        let id = crate::Manifest::load(repo.root()).unwrap().import["pdf"].id.clone().unwrap();
+        repo.commit(&[pdf.clone(), ItemRef::Manifest], "Import with manifest", None).unwrap();
+        assert_eq!(crate::content::item_ids_at(repo.root(), "HEAD").unwrap()[&pdf], Some(id));
+    }
+
+    #[test]
     fn item_commit_tracks_an_ignored_sidecar() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = Repo::init_committed(tmp.path()).unwrap();
@@ -1039,7 +1168,7 @@ mod tests {
         repo.create_item("skill", "pdf", "PDF").unwrap();
         let sidecar = "personal/pdf/.sk1ll-id";
         assert_eq!(git(repo.root(), &["check-ignore", sidecar]), sidecar);
-        let id = repo.skills().unwrap()[0].id.to_string();
+        let id = repo.skills().unwrap()[0].id.as_ref().unwrap().to_string();
         repo.commit(&[ItemRef::Skill("pdf".into())], "Add PDF", None).unwrap();
         assert_eq!(git(repo.root(), &["show", &format!("HEAD:{sidecar}")]), id);
         assert!(repo.draft().unwrap().iter().all(|change| matches!(change.item, ItemRef::Other(_))));
@@ -1178,7 +1307,10 @@ mod tests {
         let sha = r.commit(&[item("skill:pdf"), item("skill:web")], "commit pdf, web from b", None).unwrap();
         assert_eq!(git(&f.b, &["rev-parse", "HEAD"]), sha);
         let files = git(&f.b, &["show", "--name-only", "--format=", "HEAD"]);
-        assert_eq!(files.lines().collect::<Vec<_>>(), ["imported/web/SKILL.md", "personal/pdf/SKILL.md"]);
+        assert_eq!(
+            files.lines().collect::<Vec<_>>(),
+            ["imported/web/SKILL.md", "personal/pdf/.sk1ll-id", "personal/pdf/SKILL.md"]
+        );
         let expected = format!("{}|commit pdf, web from b", machine::hostname());
         assert_eq!(git(&f.b, &["log", "-1", "--format=%an|%s"]), expected);
         assert_eq!(items(&r), [("rule:git".into(), Change::Modified), ("other:notes.txt".into(), Change::Added)]);
@@ -1289,10 +1421,35 @@ mod tests {
         assert_eq!(git(&f.b, &["rev-parse", "HEAD~1"]), web);
         assert_eq!(git(&f.b, &["log", "-1", "--format=%s"]), "style from b");
         assert_eq!(read(&f.b.join("imported/web/SKILL.md")), "web v2\n");
-        assert_eq!(read(&f.b.join("instructions/style.md")), "b committed\n");
+        assert!(read(&f.b.join("instructions/style.md")).ends_with("b committed\n"));
         assert_eq!(b.draft().unwrap(), draft);
         assert_eq!(git(&f.b, &["diff", "--cached", "--name-only"]), "notes.txt");
         assert_eq!(git(&f.b, &["stash", "list"]), "");
+    }
+
+    #[test]
+    fn pull_replay_detects_duplicate_ids_from_two_clones_before_push() {
+        let f = Fleet::new();
+        let a = repo(&f.a);
+        let b = repo(&f.b);
+        // Both machines committed a copy of the same skill at disjoint paths.
+        a.create_item("skill", "a-copy", "").unwrap();
+        let from = a.personal_dir().join("a-copy");
+        let to = b.personal_dir().join("b-copy");
+        fs::create_dir(&to).unwrap();
+        for name in ["SKILL.md", ".sk1ll-id"] {
+            fs::copy(from.join(name), to.join(name)).unwrap();
+        }
+        a.commit(&[item("skill:a-copy")], "Add copy on A", None).unwrap();
+        b.commit(&[item("skill:b-copy")], "Add copy on B", None).unwrap();
+        a.push().unwrap();
+        let err = b.pull().unwrap_err().to_string();
+        assert!(err.contains("sk1ll repair-ids") && err.contains("a-copy") && err.contains("b-copy"), "{err}");
+        assert!(b.push().unwrap_err().to_string().contains("sk1ll repair-ids"));
+        assert_eq!(b.repair_ids().unwrap(), 1);
+        assert!(b.draft().unwrap().iter().any(|change| change.item == item("skill:b-copy")));
+        b.commit(&[item("skill:b-copy")], "Repair duplicate ID", None).unwrap();
+        b.push().unwrap();
     }
 
     #[test]

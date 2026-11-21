@@ -51,7 +51,7 @@ export interface LogQuery { machine?: string; harness?: string; author?: string;
 export interface LogFacets { machines: string[]; harnesses: string[]; authors: string[] }
 // The GUI bridge adds a byte fingerprint to the Daemon's Draft entry.
 export interface DraftEntry { item: ItemRef; change: 'added' | 'modified' | 'deleted'; paths: string[]; fingerprint: string }
-export interface DiffView { item: ItemRef; diff: string }
+export interface DiffView { item: ItemRef; diff: string; target?: string }
 export interface CommitMessage { items: ItemRef[]; message: string }
 export interface CommitRequest { items: string[]; message?: string; author?: string }
 export interface CommitResponse { sha: string; items: ItemRef[]; message: string; pushed: boolean; push_error: string | null }

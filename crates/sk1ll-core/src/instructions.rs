@@ -38,7 +38,7 @@ const NOTE: &str = "<!-- Managed by 0xSk1ll: edit instructions/ in your skills r
 /// order, so numeric prefixes (`10-git.md`) control ordering.
 #[derive(Debug, Clone, Serialize)]
 pub struct Rule {
-    pub id: ItemId,
+    pub id: Option<ItemId>,
     pub name: String,
     pub path: PathBuf,
     pub description: Option<String>,
@@ -61,11 +61,12 @@ impl Rule {
 
 pub fn discover(root: &Path) -> Result<Vec<Rule>> {
     let manifest = crate::item_id::manifest_on_disk(root)?;
-    let ids = crate::item_id::resolve(crate::item_id::claims_on_disk(root, &manifest, |_| true)?)?;
+    let ids = crate::item_id::claims_on_disk(root, &manifest, |_| true)?;
+    crate::item_id::check_claims(&ids)?;
     discover_with(root, &ids)
 }
 
-pub(crate) fn discover_with(root: &Path, ids: &crate::item_id::Resolved) -> Result<Vec<Rule>> {
+pub(crate) fn discover_with(root: &Path, ids: &crate::item_id::Claims) -> Result<Vec<Rule>> {
     let mut paths: Vec<_> = ids.keys().filter(|path| path.starts_with(INSTRUCTIONS_DIR)).collect();
     paths.sort();
     paths
@@ -304,6 +305,30 @@ pub(crate) fn with_id(text: &str, path: &Path, id: &ItemId) -> Result<String> {
     Ok(format!("{}{updated}{}", &text[..start], &text[start + frontmatter.len()..]))
 }
 
+pub(crate) fn write_id(path: &Path, id: &ItemId) -> Result<()> {
+    let original = crate::config_file::read_text(path, false)?
+        .ok_or_else(|| Error::Invalid(format!("{} is missing", path.display())))?;
+    let updated = with_id(&original, path, id)?;
+    validate_edit(&updated, path)?;
+    let parent = path.parent().unwrap();
+    #[cfg(unix)]
+    {
+        let directory = crate::placement::open_directory(parent, false).at(parent)?;
+        let mode = crate::config_file::existing_mode(path).unwrap_or(0o644);
+        let written =
+            crate::placement::replace_file(&directory, path.file_name().unwrap(), updated.as_bytes(), mode, || {
+                Ok::<_, Error>(crate::config_file::read_text(path, false)?.as_ref() == Some(&original))
+            })
+            .at(path)??;
+        if !written {
+            return Err(Error::Changed(format!("{} changed while writing its Item ID", path.display())));
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    crate::config_file::Staged::write(path, updated.as_bytes(), None)?.replace()
+}
+
 /// Reads only the Rule's frontmatter. The body may exceed the editor limit.
 pub(crate) fn read_explicit_id(reader: impl std::io::Read, path: &Path) -> Result<Option<ItemId>> {
     use std::io::{BufRead, BufReader, Read};
@@ -352,7 +377,10 @@ pub(crate) fn restore_metadata(
         }
         let keys = if had_routing { &["id"][..] } else { &METADATA_KEYS[..] };
         added = split_metadata(&rule.metadata_source, path, keys)?.1;
-    } else if let Some(id) = recovered_id {
+    }
+    if !mapping.contains_key("id")
+        && let Some(id) = recovered_id
+    {
         mapping.insert("id".into(), id.to_string().into());
         replaced_id = true;
     }
@@ -513,7 +541,7 @@ mod tests {
         let (rule_frontmatter, metadata_source) =
             split_metadata(split_frontmatter(raw).0.unwrap_or_default(), path, &METADATA_KEYS).unwrap();
         Rule {
-            id: explicit_id(raw, path).unwrap().unwrap_or_else(|| ItemId::derived("rule", "r")),
+            id: explicit_id(raw, path).unwrap(),
             name: "r".into(),
             path: path.into(),
             description: None,

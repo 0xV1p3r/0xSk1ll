@@ -86,10 +86,114 @@ mod unix {
             Ok(())
         }
 
+        pub(crate) fn new_directory(&self, name: &OsStr) -> io::Result<Self> {
+            fd::mkdirat(&self.0, name, Mode::from_raw_mode(0o700))?;
+            Ok(Self(child(&self.0, name, false)?))
+        }
+
+        pub(crate) fn create_directory(&self, path: &Path) -> io::Result<()> {
+            let (parent, name) = self.parent(path, true)?;
+            child(&parent, &name, true).map(drop)
+        }
+
+        pub(crate) fn copy_file(&self, from: &Path, to: &Path) -> io::Result<()> {
+            use std::os::unix::fs::PermissionsExt;
+            let (parent, name) = self.parent(to, true)?;
+            let mut src = File::open(from)?;
+            let mode = src.metadata()?.permissions().mode();
+            let mut dest = File::from(fd::openat(
+                &parent,
+                &name,
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::from_raw_mode(mode & 0o777),
+            )?);
+            io::copy(&mut src, &mut dest)?;
+            dest.set_permissions(std::fs::Permissions::from_mode(mode))?;
+            Ok(())
+        }
+
+        pub(crate) fn is_directory(&self, name: &OsStr) -> bool {
+            child(&self.0, name, false).is_ok()
+        }
+
+        pub(crate) fn still_at(&self, path: &Path) -> io::Result<bool> {
+            let visible = open_directory(path, false)?;
+            let a = fd::fstat(&self.0)?;
+            let b = fd::fstat(&visible)?;
+            Ok(a.st_dev == b.st_dev && a.st_ino == b.st_ino)
+        }
+
+        pub(crate) fn rename_child(&self, from: &OsStr, to: &OsStr) -> io::Result<()> {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            match fd::renameat_with(&self.0, from, &self.0, to, fd::RenameFlags::NOREPLACE) {
+                Ok(()) => return Ok(()),
+                Err(rustix::io::Errno::INVAL | rustix::io::Errno::NOSYS | rustix::io::Errno::OPNOTSUPP) => {}
+                Err(e) => return Err(e.into()),
+            }
+            #[cfg(target_os = "macos")]
+            {
+                use std::os::fd::AsRawFd;
+                use std::os::unix::ffi::OsStrExt;
+                let from = std::ffi::CString::new(from.as_bytes())?;
+                let to = std::ffi::CString::new(to.as_bytes())?;
+                // Both names are relative to the pinned directory and NUL-terminated.
+                if unsafe {
+                    libc::renameatx_np(
+                        self.0.as_raw_fd(),
+                        from.as_ptr(),
+                        self.0.as_raw_fd(),
+                        to.as_ptr(),
+                        libc::RENAME_EXCL,
+                    )
+                } == 0
+                {
+                    return Ok(());
+                }
+                let e = io::Error::last_os_error();
+                if !matches!(e.raw_os_error(), Some(libc::EINVAL | libc::ENOTSUP)) {
+                    return Err(e);
+                }
+            }
+            self.check_missing(Path::new(to))?;
+            Ok(fd::renameat(&self.0, from, &self.0, to)?)
+        }
+
+        pub(crate) fn remove_tree(&self, name: &OsStr) -> io::Result<()> {
+            remove_tree(&self.0, name)
+        }
+
+        pub(crate) fn replace_text(&self, name: &OsStr, text: &str) -> io::Result<()> {
+            let meta = fd::statat(&self.0, name, AtFlags::SYMLINK_NOFOLLOW)?;
+            if fd::FileType::from_raw_mode(meta.st_mode) != fd::FileType::RegularFile {
+                return Err(io::Error::other("not a regular file"));
+            }
+            replace_file(&self.0, name, text.as_bytes(), meta.st_mode as u32, || Ok::<_, io::Error>(true))??;
+            Ok(())
+        }
+
         pub fn create_symlink(&self, path: &Path, target: &OsStr) -> io::Result<()> {
             let (parent, name) = self.parent(path, true)?;
             Ok(fd::symlinkat(target, &parent, &name)?)
         }
+    }
+
+    fn remove_tree(parent: &OwnedFd, name: &OsStr) -> io::Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = child(parent, name, false)?;
+        for entry in fd::Dir::read_from(&dir)? {
+            let entry = entry?;
+            let name = OsStr::from_bytes(entry.file_name().to_bytes());
+            if matches!(name.to_str(), Some("." | "..")) {
+                continue;
+            }
+            let meta = fd::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW)?;
+            if fd::FileType::from_raw_mode(meta.st_mode) == fd::FileType::Directory {
+                remove_tree(&dir, name)?;
+            } else {
+                fd::unlinkat(&dir, name, AtFlags::empty())?;
+            }
+        }
+        Ok(fd::unlinkat(parent, name, AtFlags::REMOVEDIR)?)
     }
 
     pub(crate) fn replace_file<E>(

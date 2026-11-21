@@ -42,7 +42,6 @@ pub enum ContentType {
 pub struct ContentEntry {
     pub name: String,
     pub item: Option<ItemRef>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<ItemId>,
     #[serde(rename = "type")]
     pub kind: ContentType,
@@ -106,9 +105,10 @@ fn git(root: &Path) -> Git {
 
 /// Inventory identities for the working tree. Missing content can be looked
 /// up in a commit, but malformed metadata is an error.
-pub fn item_ids_on_disk(root: &Path) -> Result<BTreeMap<ItemRef, ItemId>> {
+pub fn item_ids_on_disk(root: &Path) -> Result<BTreeMap<ItemRef, Option<ItemId>>> {
     let manifest = crate::item_id::manifest_on_disk(root)?;
-    let ids = crate::item_id::resolve(crate::item_id::claims_on_disk(root, &manifest, |_| true)?)?;
+    let ids = crate::item_id::claims_on_disk(root, &manifest, |_| true)?;
+    crate::item_id::check_claims(&ids)?;
     Ok(ids
         .into_iter()
         .filter(|(path, _)| !path.starts_with(crate::skill::IMPORTED_DIR) || root.join(path).join("SKILL.md").is_file())
@@ -117,10 +117,10 @@ pub fn item_ids_on_disk(root: &Path) -> Result<BTreeMap<ItemRef, ItemId>> {
 }
 
 /// Inventory identities at a commit, including the IDs of draft-deleted items.
-pub fn item_ids_at(root: &Path, revision: &str) -> Result<BTreeMap<ItemRef, ItemId>> {
+pub fn item_ids_at(root: &Path, revision: &str) -> Result<BTreeMap<ItemRef, Option<ItemId>>> {
     let claims = crate::item_id::claims_at(root, revision, |_| true, true)?;
-    let ids = crate::item_id::resolve(claims)?;
-    Ok(ids.into_iter().map(|(path, id)| (crate::item_id::item_for_path(&path), id)).collect())
+    crate::item_id::check_claims(&claims)?;
+    Ok(claims.into_iter().map(|(path, id)| (crate::item_id::item_for_path(&path), id)).collect())
 }
 
 fn tracked(root: &Path, revision: &str) -> Result<Vec<(String, String, String)>> {
@@ -167,7 +167,7 @@ pub fn list(
                 draft: drafts.get(&item).copied(),
                 in_baseline: baseline.contains(&item),
                 item: Some(item),
-                id: Some(id),
+                id,
                 kind,
                 description,
                 path: Some(path),
@@ -231,7 +231,7 @@ pub fn list(
             ContentEntry {
                 name: item.name().into(),
                 item: Some(item.clone()),
-                id: head_ids.as_ref().and_then(|ids| ids.get(&item)).cloned(),
+                id: head_ids.as_ref().and_then(|ids| ids.get(&item)).cloned().flatten(),
                 kind,
                 path: Some(absolute),
                 description,
@@ -248,10 +248,21 @@ pub fn list(
         entry.enabled_harnesses = harnesses
             .iter()
             .filter(|(h, config)| match &entry.item {
-                Some(ItemRef::Skill(n)) => config.skills_dir().is_some() && assignment.skill_enabled(h, n),
+                Some(ItemRef::Skill(n)) => {
+                    config.skills_dir().is_some()
+                        && if entry.id.is_some() {
+                            assignment.skill_enabled(h, n)
+                        } else {
+                            assignment.harness(h).new_skills_default
+                        }
+                }
                 Some(ItemRef::Rule(n)) => {
                     config.instructions_file().is_some()
-                        && assignment.rule_enabled(h, n)
+                        && if entry.id.is_some() {
+                            assignment.rule_enabled(h, n)
+                        } else {
+                            assignment.harness(h).new_rules_default
+                        }
                         && rules.iter().find(|f| f.name == *n).is_none_or(|f| f.applies_to(h))
                 }
                 _ => false,
@@ -704,13 +715,26 @@ mod tests {
         fs::write(&path, "one\ntwo\n").unwrap();
         assert!(matches!(item_ids_on_disk(repo.root()), Err(Error::Parse { .. })));
         fs::remove_file(&path).unwrap();
-        assert!(item_ids_on_disk(repo.root()).unwrap()[&ItemRef::Skill("pdf".into())].to_string().starts_with("d:"));
+        assert_eq!(item_ids_on_disk(repo.root()).unwrap()[&ItemRef::Skill("pdf".into())], None);
 
         std::os::unix::fs::symlink("plausible-id", &path).unwrap();
         commit(&repo);
         fs::remove_dir_all(repo.personal_dir().join("pdf")).unwrap();
         assert!(matches!(item_ids_at(repo.root(), "HEAD"), Err(Error::Parse { .. })));
         assert!(read(&repo, "skill:pdf", ".sk1ll-id").unwrap_err().to_string().contains("reserved"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rule_symlinks_cannot_carry_ids_on_disk_or_in_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::init(tmp.path()).unwrap();
+        repo.create_item("rule", "style", "").unwrap();
+        let path = repo.root().join("instructions/linked.md");
+        std::os::unix::fs::symlink("style.md", &path).unwrap();
+        assert!(item_ids_on_disk(repo.root()).unwrap_err().to_string().contains("linked.md"));
+        commit(&repo);
+        assert!(item_ids_at(repo.root(), "HEAD").unwrap_err().to_string().contains("linked.md"));
     }
 
     #[test]

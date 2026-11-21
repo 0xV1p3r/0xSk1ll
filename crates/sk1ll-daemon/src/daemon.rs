@@ -809,6 +809,10 @@ impl Daemon {
             sync::recover(lock, &harnesses)?;
             Self::recover_imports(&root)?;
         }
+        let repo = Repo::open(&root)?;
+        if reviewed.is_none() {
+            repo.assign_missing_ids()?;
+        }
         let mut outcome = RefreshOutcome::default();
         let is_reviewed = reviewed.is_some();
         let mut conflicts: Vec<ConflictRef> = Vec::new();
@@ -1175,6 +1179,14 @@ impl Daemon {
 
     /// Restores draft items, then queues `draft_discarded` durably. The server
     /// session sends the updated status before it.
+    pub(crate) fn repair_ids(&self, eng: &mut Engine) -> Result<usize> {
+        self.ensure_managed(eng)?;
+        self.lock_repo(eng)?;
+        let count = Repo::open(Self::root(eng))?.repair_ids()?;
+        self.refresh(eng)?;
+        Ok(count)
+    }
+
     pub(crate) fn restore(&self, eng: &mut Engine, req: RestoreRequest) -> Result<RestoreResponse> {
         self.ensure_managed(eng)?;
         self.lock_repo(eng)?;
@@ -1224,7 +1236,6 @@ impl Daemon {
         let baseline = gitx::baseline(root)?;
         let head = gitx::rev(root, "HEAD")?;
         let baseline_paths = paths(baseline.as_deref())?;
-        let head_paths = paths(head.as_deref())?;
         let mut inventory = BTreeMap::<ItemRef, ItemView>::new();
         let entry = |item: ItemRef| ItemView {
             item,
@@ -1240,34 +1251,14 @@ impl Daemon {
                 inventory.entry(item.clone()).or_insert_with(|| entry(item)).in_baseline = true;
             }
         }
-        let status = read(&[
-            "-c",
-            "core.fsmonitor=false",
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-            "--no-renames",
-            "--ignore-submodules=all",
-        ])?;
-        let mut changed = BTreeMap::<ItemRef, Vec<String>>::new();
-        for raw in status.split(|b| *b == 0).filter(|p| p.len() >= 4) {
-            let path = String::from_utf8_lossy(&raw[3..]).into_owned();
-            if sk1ll_core::source::is_staging_path(Path::new(&path)) {
-                continue;
-            }
-            changed.entry(ItemRef::for_path(Path::new(&path))).or_default().push(path);
-        }
-        for (item, paths) in changed {
-            let tracked = head_paths.iter().filter(|p| ItemRef::for_path(Path::new(p)) == item);
-            let existed = tracked.clone().next().is_some();
-            let exists = tracked.chain(paths.iter()).any(|p| root.join(p).symlink_metadata().is_ok());
-            let change = match (existed, exists) {
-                (_, false) => ChangeKind::Deleted,
-                (true, true) => ChangeKind::Modified,
-                (false, true) => ChangeKind::Added,
+        let repo = Repo::open_git_only(root)?;
+        for draft in repo.draft()? {
+            let change = match draft.change {
+                sk1ll_core::Change::Added => ChangeKind::Added,
+                sk1ll_core::Change::Modified => ChangeKind::Modified,
+                sk1ll_core::Change::Deleted => ChangeKind::Deleted,
             };
-            inventory.entry(item.clone()).or_insert_with(|| entry(item)).draft = Some(change);
+            inventory.entry(draft.item.clone()).or_insert_with(|| entry(draft.item)).draft = Some(change);
         }
         for item in gitx::unpushed_items(root)? {
             inventory.entry(item.clone()).or_insert_with(|| entry(item)).unpushed = true;
@@ -1319,7 +1310,7 @@ impl Daemon {
             }
         }
         for value in inventory.values_mut() {
-            value.id = disk_ids.get(&value.item).or_else(|| historical.get(&value.item)).cloned();
+            value.id = disk_ids.get(&value.item).or_else(|| historical.get(&value.item)).cloned().flatten();
             let ItemRef::Skill(name) = &value.item else { continue };
             for directory in SKILL_DIRS {
                 let path = format!("{directory}/{name}/SKILL.md");
@@ -1368,7 +1359,7 @@ impl Daemon {
         let repo = Repo::open_git_only(self.repo_root())?;
         let item = ItemRef::resolve(item, &repo.draft()?)?;
         let diff = repo.diff(&item)?;
-        Ok(DiffView { item, diff })
+        Ok(DiffView { item, diff, target: None })
     }
 
     /// The current plan; `force` plans as if overwriting. For engine
@@ -1528,6 +1519,7 @@ impl Daemon {
             sync::recover(lock, &harnesses)?;
             Self::recover_imports(root)?;
             let repo = Repo::open(root)?;
+            repo.assign_missing_ids()?;
             let actions = sync::plan(&repo, &harnesses, &snapshot.assignment, PlanOptions { force })?;
             let sources = Self::sync_source_digests(&actions, sync::deploy_hash)?;
             let preview = Self::sync_preview_result(&actions, &sources)?;
@@ -1543,6 +1535,7 @@ impl Daemon {
             None
         };
         if force && reviewed.is_none() {
+            Repo::open(Self::root(eng))?.assign_missing_ids()?;
             let (repo, actions) = self.plan(eng, true)?;
             for a in actions.iter().filter(|a| a.kind != ActionKind::Conflict) {
                 sync::apply(&repo, a)?;
@@ -1567,21 +1560,20 @@ impl Daemon {
         })
     }
 
-    pub(crate) fn resolve_displaced(&self, eng: &mut Engine, id: &str, adopt: bool) -> Result<()> {
+    pub(crate) fn resolve_displaced(&self, eng: &mut Engine, id: &str, adopt: bool) -> Result<Option<PathBuf>> {
         self.ensure_managed(eng)?;
         self.lock_repo(eng)?;
         let result = if adopt {
-            sync::displaced::adopt(&Repo::open(Self::root(eng))?, id)
+            sync::displaced::adopt(&Repo::open(Self::root(eng))?, id).map(Some)
         } else {
-            sync::displaced::discard(id)
+            sync::displaced::discard_from(&Repo::open(Self::root(eng))?, id).map(|()| None)
         };
         self.refresh(eng)?;
         self.event(Event::Status);
         if adopt {
             self.event(Event::Draft);
         }
-        result?;
-        Ok(())
+        Ok(result?)
     }
 
     fn find_conflict<'a>(actions: &'a [Action], t: &ConflictTarget) -> Result<&'a Action> {
@@ -2390,6 +2382,7 @@ impl Daemon {
         self.ensure_managed(eng)?;
         self.lock_repo(eng)?;
         let repo = Repo::open(Self::root(eng))?;
+        repo.assign_missing_ids()?;
         repo.check_rename(&req.kind, &req.name, &req.to)?;
         let (old, item) = if req.kind == "skill" {
             (ItemRef::Skill(req.name.clone()), ItemRef::Skill(req.to.clone()))
@@ -2427,6 +2420,10 @@ impl Daemon {
                     req.name,
                     req.to
                 )));
+            }
+            Err(e @ RenameError::Stranded { .. }) => {
+                self.set_error(e.to_string());
+                return Err(Error::Conflict(e.to_string()));
             }
             Err(RenameError::NotMoved(e)) => e,
         };
@@ -2608,68 +2605,82 @@ impl Daemon {
     }
     /// A reader: no engine mutex.
     pub(crate) fn conflict_diff(&self, req: &crate::client::ConflictDiffRequest) -> Result<DiffView> {
-        let view = if let Some(id) = &req.id {
-            self.recovered()?.into_iter().find(|v| v.id.as_ref() == Some(id))
+        use sk1ll_core::Origin;
+        let repo = Repo::open(self.repo_root())?;
+        let (view, recovery) = if let Some(id) = &req.id {
+            let entry = sync::displaced::get(id)?;
+            let target = sync::displaced::target(&repo, &entry)?;
+            (displaced_view(entry), Some(target))
         } else {
-            self.conflicts()?
+            let view = self
+                .conflicts()?
                 .into_iter()
                 .find(|v| Some(&v.harness) == req.harness.as_ref() && Some(&v.name) == req.name.as_ref())
-        }
-        .ok_or_else(|| Error::NotFound("Conflict no longer exists".into()))?;
-        let item = if view.name == BLOCK_NAME { Some(ItemRef::Other(view.name.clone())) } else { None }
+                .ok_or_else(|| Error::NotFound("Conflict no longer exists".into()))?;
+            (view, None)
+        };
+        let left_source = view.path.unwrap_or(view.dest);
+        let mut item = if view.name == BLOCK_NAME { Some(ItemRef::Other(view.name.clone())) } else { None }
             .or(view.item.clone())
             .or_else(|| view.items.first().cloned())
             .unwrap_or(ItemRef::Other(view.name.clone()));
-        match &item {
-            ItemRef::Skill(name) | ItemRef::Rule(name) => imports::validate_name(name)?,
-            _ => {}
-        }
-        let repo = Repo::open(self.repo_root())?;
+        let mut left_origin = Origin::Personal;
+        let mut target = recovery.as_ref().map(|target| target.path.clone());
         let snapshot = self.snapshot();
         let temp = tempfile::tempdir().map_err(anyhow::Error::from)?;
-        let mut right = match &item {
+        let right = temp.path().join("Draft");
+        match &item {
             ItemRef::Skill(name) => {
-                let p = repo.root().join("personal").join(name);
-                let source = if p.exists() { p } else { repo.root().join("imported").join(name) };
-                let path = temp.path().join("Draft");
-                if source.is_dir() {
-                    copy_authored(&source, &path).map_err(anyhow::Error::from)?;
+                imports::validate_name(name)?;
+                let (source, origin) = if let Some(target) = &recovery {
+                    (target.path.clone(), target.origin.unwrap_or(Origin::Personal))
+                } else if let Some(skill) = repo.skills()?.into_iter().find(|skill| skill.name == *name) {
+                    (skill.path, skill.origin)
+                } else {
+                    (repo.personal_dir().join(name), Origin::Personal)
+                };
+                item = ItemRef::Skill(source.file_name().unwrap_or_default().to_string_lossy().into_owned());
+                left_origin = match &recovery {
+                    Some(target) => target.placed_origin.unwrap_or(origin),
+                    None => sync::displaced::skill_placement_origin(&left_source)?.unwrap_or(origin),
+                };
+                if source.symlink_metadata().is_ok_and(|meta| meta.is_dir()) {
+                    sync::copy_skill_for_diff(&source, &right, origin)?;
                 }
-                path
+                target = Some(source);
             }
             ItemRef::Rule(name) => {
-                let path = temp.path().join("Draft");
-                if let Some(rule) = repo.rules()?.into_iter().find(|rule| &rule.name == name) {
+                imports::validate_name(name)?;
+                let path =
+                    target.clone().unwrap_or_else(|| repo.root().join("instructions").join(format!("{name}.md")));
+                item = ItemRef::Rule(path.file_stem().unwrap_or_default().to_string_lossy().into_owned());
+                if let Some(rule) = repo.rules()?.into_iter().find(|rule| rule.path == path) {
                     let (_, content) = sk1ll_core::instructions::render_rule(&rule);
-                    std::fs::write(&path, content).map_err(anyhow::Error::from)?;
+                    std::fs::write(&right, content).map_err(anyhow::Error::from)?;
                 }
-                path
+                target = Some(path);
             }
             _ => {
                 let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
                 let assignment =
                     &snapshot.as_ref().ok_or_else(|| Error::Conflict("Awaiting Assignment".into()))?.assignment;
                 let files = sync::render_instructions(&repo, &harnesses, assignment, &view.harness)?;
-                let path = temp.path().join("Draft");
-                std::fs::write(&path, files.into_iter().map(|f| f.content).collect::<Vec<_>>().join("\n"))
+                std::fs::write(&right, files.into_iter().map(|f| f.content).collect::<Vec<_>>().join("\n"))
                     .map_err(anyhow::Error::from)?;
-                path
             }
-        };
-        let mut left = view.path.unwrap_or(view.dest);
+        }
+        let mut left = left_source;
         if view.name == BLOCK_NAME && matches!(item, ItemRef::Other(_)) {
             let text = std::fs::read_to_string(&left).map_err(anyhow::Error::from)?;
             let content = sk1ll_core::instructions::managed_content(&text, &left)?;
             left = temp.path().join("Harness");
             std::fs::write(&left, content).map_err(anyhow::Error::from)?;
-        } else if left.is_dir() {
-            // Diff only authored files: the harness copy carries the management marker.
+        } else if left.symlink_metadata().is_ok_and(|meta| meta.is_dir()) {
             let copy = temp.path().join("Harness");
-            copy_authored(&left, &copy).map_err(anyhow::Error::from)?;
+            sync::copy_skill_for_diff(&left, &copy, left_origin)?;
             left = copy;
         }
         if !right.exists() {
-            right = temp.path().join("Draft");
             if left.is_dir() {
                 std::fs::create_dir(&right).map_err(anyhow::Error::from)?;
             } else {
@@ -2685,26 +2696,8 @@ impl Daemon {
         if !matches!(output.status.code(), Some(0 | 1)) {
             return Err(Error::BadRequest(String::from_utf8_lossy(&output.stderr).into_owned()));
         }
-        Ok(DiffView { item, diff: String::from_utf8_lossy(&output.stdout).into_owned() })
+        Ok(DiffView { item, target, diff: String::from_utf8_lossy(&output.stdout).into_owned() })
     }
-}
-
-fn copy_authored(from: &Path, to: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(to)?;
-    for entry in std::fs::read_dir(from)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if [sync::MARKER, ".git", sk1ll_core::skill::ID_FILE].iter().any(|skip| name == *skip) {
-            continue;
-        }
-        let kind = entry.file_type()?;
-        if kind.is_dir() {
-            copy_authored(&entry.path(), &to.join(&name))?;
-        } else if kind.is_file() {
-            std::fs::copy(entry.path(), to.join(&name))?;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2839,6 +2832,7 @@ mod tests {
                 mode: sk1ll_core::LinkMode::Copy,
                 source: Some(source.into()),
                 item_id: None,
+                metadata_only: false,
                 expected: None,
             },
             reason: None,
@@ -2874,6 +2868,7 @@ mod tests {
             std::fs::create_dir_all(&skill).unwrap();
             std::fs::write(skill.join("SKILL.md"), name).unwrap();
         }
+        repo.assign_missing_ids().unwrap();
         let failing_source = repo.personal_dir().join("b-io-error");
         let cfg = Config {
             repo: Some(root),

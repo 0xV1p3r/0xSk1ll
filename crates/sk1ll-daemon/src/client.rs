@@ -13,6 +13,7 @@
 //! | POST | `/skills/adopt` | `ConflictTarget` → 204; unmanaged Adopt needs a Server connection when joined |
 //! | POST | `/items/create` | [`CreateItemRequest`] → 204 |
 //! | POST | `/items/delete` | [`DeleteItemRequest`] → 204 (a Draft deletion) |
+//! | POST | `/items/repair-ids` | → number of duplicate claims reassigned in the Draft |
 //! | POST | `/items/rename` | [`RenameItemRequest`] → [`RenameItemResponse`] |
 //! | GET | `/draft` | → `Vec<`[`DraftEntry`]`>` |
 //! | GET | `/draft/diff?item=` | → [`DiffView`] |
@@ -22,7 +23,8 @@
 //! | POST | `/pull` | → [`PullResult`] |
 //! | GET | `/conflicts` | → `Vec<`[`ConflictView`]`>` |
 //! | GET | `/conflicts/displaced` | → all recovered entries |
-//! | POST | `/conflicts/displaced/{id}/adopt`, `/conflicts/displaced/{id}/discard` | → 204 |
+//! | POST | `/conflicts/displaced/{id}/adopt` | → destination path |
+//! | POST | `/conflicts/displaced/{id}/discard` | → 204 |
 //! | POST | `/conflicts/adopt`, `/conflicts/overwrite` | [`ConflictTarget`] → 204 |
 //! | GET | `/harnesses` | → `Vec<`[`HarnessView`]`>` |
 //! | GET | `/setup/harnesses` | → `Vec<`[`HarnessChoice`]`>` |
@@ -201,7 +203,6 @@ pub enum ChangeKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ItemView {
     pub item: ItemRef,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<sk1ll_core::ItemId>,
     pub in_baseline: bool,
     pub draft: Option<ChangeKind>,
@@ -222,6 +223,8 @@ pub struct DraftEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffView {
     pub item: ItemRef,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<PathBuf>,
     pub diff: String,
 }
 
@@ -866,6 +869,10 @@ impl Client {
         self.post("/commit", req).await
     }
 
+    pub async fn repair_ids(&self) -> Result<usize> {
+        self.post("/items/repair-ids", &()).await
+    }
+
     pub async fn restore(&self, req: &RestoreRequest) -> Result<RestoreResponse> {
         self.post("/restore", req).await
     }
@@ -878,8 +885,8 @@ impl Client {
         self.get("/conflicts/displaced").await
     }
 
-    pub async fn adopt_displaced(&self, id: &str) -> Result<()> {
-        self.post_empty(&format!("/conflicts/displaced/{}/adopt", encode(id)), &()).await
+    pub async fn adopt_displaced(&self, id: &str) -> Result<PathBuf> {
+        self.post(&format!("/conflicts/displaced/{}/adopt", encode(id)), &()).await
     }
 
     pub async fn discard_displaced(&self, id: &str) -> Result<()> {

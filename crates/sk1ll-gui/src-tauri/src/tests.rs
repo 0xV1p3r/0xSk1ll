@@ -63,7 +63,7 @@ async fn commands_use_the_unix_client_and_preserve_payloads_and_errors() {
     let requests = Recorded::default();
     let fleet = json!({"baseline":"abc", "machines":[]});
     let items = json!([{"item":"skill:pdf", "in_baseline":true, "draft":null, "unpushed":false,
-        "description":"Read PDF files"}]);
+        "description":"Read PDF files", "id":null}]);
     let assignment = json!({"revision":7, "harnesses": {"claude": {"new_skills_default":false,
         "new_rules_default":true, "skills":{"pdf":true}, "rules":{}}}});
     let committed = json!({"sha":"abc", "items":["skill:pdf"], "message":"Ship PDF", "pushed":false,
@@ -93,12 +93,12 @@ async fn commands_use_the_unix_client_and_preserve_payloads_and_errors() {
     for path in [
         "POST /conflicts/adopt",
         "POST /conflicts/overwrite",
-        "POST /conflicts/displaced/a%2Fb/adopt",
         "POST /conflicts/displaced/a%2Fb/discard",
         "DELETE /machines/a%2Fb",
     ] {
         replies.insert(path.into(), (StatusCode::NO_CONTENT, Value::Null));
     }
+    replies.insert("POST /conflicts/displaced/a%2Fb/adopt".into(), (StatusCode::OK, json!("/tmp/skills/personal/pdf")));
     replies.insert(
         "PUT /machines/alpha/assignment".into(),
         (StatusCode::UNPROCESSABLE_ENTITY, json!({"error":"skill:local is not in the Baseline"})),
@@ -480,7 +480,7 @@ fn editor_bundle_detection_and_json_contract() {
 async fn skill_commands_preserve_queries_payloads_and_errors() {
     let requests = Recorded::default();
     let inventory = json!([{"name":"pdf", "item":null, "type":"unmanaged", "description":"PDF",
-        "draft":null, "in_baseline":false, "path":null, "enabled_harnesses":[], "clashes_with_repo":false,
+        "draft":null, "id":null, "in_baseline":false, "path":null, "enabled_harnesses":[], "clashes_with_repo":false,
         "variants":[{"hash":"sha256:one", "description":"PDF", "locations":[{"harness":"claude", "path":"/tmp/pdf"}],
         "resumable":false}]}]);
     let tree = json!([{"path":"SKILL.md", "kind":"file", "size":12}]);

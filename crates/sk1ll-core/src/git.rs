@@ -18,7 +18,7 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::process::{Child, ChildStdout, Command, ExitStatus, Output, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -129,7 +129,36 @@ impl Git {
 
     /// Runs git and returns its output whatever the exit status. Running out
     /// of time is an [`Error::Git`].
-    pub fn output(mut self) -> Result<Output> {
+    pub fn output(self) -> Result<Output> {
+        let (status, stdout, stderr) = self.output_with(|mut pipe| {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes)?;
+            Ok(bytes)
+        })?;
+        Ok(Output { status, stdout, stderr })
+    }
+
+    pub(crate) fn run_stream<T: Send + 'static>(
+        self,
+        read: impl FnOnce(ChildStdout) -> std::io::Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let args = self.describe();
+        let (status, value, stderr) = self.output_with(read)?;
+        if status.success() {
+            Ok(value)
+        } else {
+            Err(Error::Git { args, stderr: String::from_utf8_lossy(&stderr).trim().into() })
+        }
+    }
+
+    fn output_with<T: Send + 'static>(
+        mut self,
+        read: impl FnOnce(ChildStdout) -> std::io::Result<T> + Send + 'static,
+    ) -> Result<(ExitStatus, T, Vec<u8>)> {
+        enum Stream<T> {
+            Out(std::io::Result<T>),
+            Err(std::io::Result<Vec<u8>>),
+        }
         let describe = self.describe();
         let timeout = match self.timeout {
             Some(t) => t,
@@ -149,18 +178,18 @@ impl Git {
             _ => None,
         };
         let (tx, rx) = mpsc::channel();
-        for (stream, pipe) in [
-            (0, child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>)),
-            (1, child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>)),
-        ] {
-            let tx = tx.clone();
-            thread::spawn(move || {
-                let mut buf = Vec::new();
-                let res = pipe.map_or(Ok(0), |mut p| p.read_to_end(&mut buf));
-                let _ = tx.send((stream, res.map(|_| buf)));
-            });
-        }
-        drop(tx);
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let out_tx = tx.clone();
+        thread::spawn(move || {
+            let _ = out_tx.send(Stream::Out(read(stdout)));
+        });
+        thread::spawn(move || {
+            let mut pipe = stderr;
+            let mut bytes = Vec::new();
+            let result = pipe.read_to_end(&mut bytes).map(|_| bytes);
+            let _ = tx.send(Stream::Err(result));
+        });
 
         let deadline = timeout.map(|t| Instant::now() + t);
         let status = wait_until(&mut child, deadline).map_err(spawn_err)?;
@@ -171,16 +200,17 @@ impl Git {
         };
         // The pipes close once every process holding them is gone; a
         // straggler (a backgrounded grandchild) gets killed at the deadline.
-        let mut streams: [Option<Vec<u8>>; 2] = [None, None];
+        let (mut stdout, mut stderr) = (None, None);
         let mut killed_stragglers = false;
-        while streams.iter().any(Option::is_none) {
+        while stdout.is_none() || stderr.is_none() {
             let got = match deadline {
                 _ if timed_out || killed_stragglers => rx.recv_timeout(GRACE).map_err(|_| ()),
                 Some(d) => rx.recv_timeout(d.saturating_duration_since(Instant::now())).map_err(|_| ()),
                 None => rx.recv().map_err(|_| ()),
             };
             match got {
-                Ok((i, res)) => streams[i] = Some(res.map_err(spawn_err)?),
+                Ok(Stream::Out(value)) => stdout = Some(value),
+                Ok(Stream::Err(value)) => stderr = Some(value),
                 Err(()) if !killed_stragglers && !timed_out => {
                     kill_group(&mut child);
                     killed_stragglers = true;
@@ -188,7 +218,7 @@ impl Git {
                 Err(()) => break,
             }
         }
-        let [stdout, stderr] = streams.map(Option::unwrap_or_default);
+        let stderr = stderr.transpose().map_err(spawn_err)?.unwrap_or_default();
         let finished = !timed_out && !killed_stragglers;
         // Only join the writer once git is done with its input; after a
         // timeout it's left to finish (or fail) on its own. Git not reading
@@ -210,7 +240,10 @@ impl Git {
             }
             return Err(Error::Git { args: describe, stderr: msg });
         }
-        Ok(Output { status, stdout, stderr })
+        let stdout = stdout
+            .ok_or_else(|| spawn_err(std::io::Error::other("git stdout closed unexpectedly")))?
+            .map_err(spawn_err)?;
+        Ok((status, stdout, stderr))
     }
 
     /// Runs git; a non-zero exit is an [`Error::Git`]. Returns raw stdout.

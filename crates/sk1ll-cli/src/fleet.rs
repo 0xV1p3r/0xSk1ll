@@ -531,7 +531,9 @@ impl Daemon {
                     }
                 }
             }
-            Cmd::Recover { command: crate::RecoverCmd::Adopt { id } } => self.block(c.adopt_displaced(&id))?,
+            Cmd::Recover { command: crate::RecoverCmd::Adopt { id } } => {
+                println!("adopted into {}", self.block(c.adopt_displaced(&id))?.display());
+            }
             Cmd::Recover { command: crate::RecoverCmd::Discard { id } } => self.block(c.discard_displaced(&id))?,
             Cmd::Commit { items, message, author, push } => {
                 let resp = self.block(c.commit(&CommitRequest { items, message, author }))?;
@@ -548,6 +550,9 @@ impl Daemon {
                     (false, Some(e)) => println!("not pushed yet ({e}); the daemon pushes it when it can"),
                     (false, None) => println!("not pushed yet; the daemon pushes it when it can"),
                 }
+            }
+            Cmd::RepairIds => {
+                println!("reassigned {} duplicate Item ID(s) in the Draft", self.block(c.repair_ids())?);
             }
             Cmd::Push => match self.block(c.push())?.pushed {
                 true => println!(

@@ -4,6 +4,7 @@
 
 use std::convert::Infallible;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
@@ -69,6 +70,7 @@ pub(crate) fn router(d: Arc<Daemon>) -> Router {
         .route("/imports", get(imports))
         .route("/imports/check", post(check_imports))
         .route("/items/create", post(create_item))
+        .route("/items/repair-ids", post(repair_ids))
         .route("/items/delete", post(delete_item))
         .route("/items/rename", post(rename_item))
         .route("/conflicts/diff", post(conflict_diff))
@@ -290,6 +292,10 @@ async fn commit(State(d): St, Json(req): Json<CommitRequest>) -> Result<Json<Com
     Ok(Json(d.blocking(move |d, eng| d.commit(eng, req)).await?))
 }
 
+async fn repair_ids(State(d): St) -> Result<Json<usize>> {
+    Ok(Json(d.blocking(move |d, eng| d.repair_ids(eng)).await?))
+}
+
 async fn restore(State(d): St, Json(req): Json<RestoreRequest>) -> Result<Json<RestoreResponse>> {
     Ok(Json(d.blocking(move |d, eng| d.restore(eng, req)).await?))
 }
@@ -306,9 +312,9 @@ async fn conflicts(State(d): St) -> Result<Json<Vec<ConflictView>>> {
     Ok(Json(d.reading(|d| d.conflicts()).await?))
 }
 
-async fn adopt_displaced(State(d): St, UrlPath(id): UrlPath<String>) -> Result<StatusCode> {
-    d.blocking(move |d, eng| d.resolve_displaced(eng, &id, true)).await?;
-    Ok(StatusCode::NO_CONTENT)
+async fn adopt_displaced(State(d): St, UrlPath(id): UrlPath<String>) -> Result<Json<PathBuf>> {
+    let target = d.blocking(move |d, eng| d.resolve_displaced(eng, &id, true)).await?;
+    Ok(Json(target.expect("a successful Adopt has a target")))
 }
 
 async fn discard_displaced(State(d): St, UrlPath(id): UrlPath<String>) -> Result<StatusCode> {

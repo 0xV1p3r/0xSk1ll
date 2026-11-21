@@ -426,6 +426,7 @@ fn solo(id: &str, server_url: &str, snap: Option<AssignmentSnapshot>) -> Machine
     for s in ["x", "y", "z"] {
         m.write(&format!("personal/{s}/SKILL.md"), &format!("{s}\n"));
     }
+    sk1ll_core::Repo::open(&repo).unwrap().assign_missing_ids().unwrap();
     git(&repo, &["checkout", "--quiet", "-B", "main"]);
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "--quiet", "-m", "seed"]);
@@ -1438,36 +1439,34 @@ async fn displaced_conflicts_report_to_server_and_resolve() {
     let mut m = solo("solo", &server.url(), Some(snapshot(1, &["x"])));
     let state = m.home.path().join(if cfg!(target_os = "macos") { DATA_DIR } else { "state" });
     m = m.with_env("XDG_STATE_HOME", state.to_str().unwrap());
-    // Two entries kept in the state directory by an older version, and one in
-    // the skills dir's own recovery area that the state directory's index
-    // doesn't know (it was lost): the daemon's recovery lists it again.
-    let recovery = state.join("sk1ll/displaced");
-    let area = m.skills().join(".sk1ll-tmp/displaced");
-    for (id, dir) in [("adopt-me", &recovery), ("discard-me", &recovery), ("found-again", &area)] {
-        let dir = dir.join(id);
-        write(&dir.join("content"), "SKILL.md", "recovered edit\n");
-        write(
-            &dir,
-            "entry.json",
-            &serde_json::json!({
-                "harness": HARNESS, "kind": "skill", "dest": m.skills().join("x"),
-                "expected": "", "displaced_at": 0
-            })
-            .to_string(),
-        );
-    }
     m.start().await;
     let (mut ws, _) = server.accept().await;
-    let DaemonMessage::Status(report) = next_message(&mut ws).await else { panic!("expected status") };
-    assert!(report.conflicts.iter().any(|c| c.harness == HARNESS && c.item == ItemRef::Skill("x".into())));
-    let entries = m.client.conflicts().await.unwrap();
-    assert_eq!(entries.iter().filter(|e| e.kind.as_deref() == Some("displaced")).count(), 3);
-    assert!(entries.iter().all(|e| e.path.is_some() && e.displaced_at == Some(0)));
-    m.client.adopt_displaced("adopt-me").await.unwrap();
-    assert_eq!(std::fs::read_to_string(m.repo().join("personal/x/SKILL.md")).unwrap(), "recovered edit\n");
-    assert_eq!(m.client.conflicts().await.unwrap().len(), 2);
-    m.client.discard_displaced("found-again").await.unwrap();
-    m.client.discard_displaced("discard-me").await.unwrap();
+    let DaemonMessage::Status(_) = next_message(&mut ws).await else { panic!("expected status") };
+    eventually(|| async { m.harness_skill("x").map(drop) }).await;
+    let mut open = std::fs::OpenOptions::new().append(true).open(m.skills().join("x/SKILL.md")).unwrap();
+    m.write("personal/x/SKILL.md", "draft v2\n");
+    let entry =
+        eventually(|| async { m.client.recovered().await.ok()?.into_iter().find(|entry| entry.name == "x") }).await;
+    use std::io::Write;
+    open.write_all(b"late harness edit\n").unwrap();
+    drop(open);
+    let id = entry.id.unwrap();
+    let index = state.join("sk1ll/displaced/.index").join(&id);
+    std::fs::remove_file(index).unwrap();
+    m.client.sync(&Default::default()).await.unwrap();
+    eventually(|| async {
+        m.status()
+            .await
+            .report
+            .conflicts
+            .iter()
+            .any(|c| c.harness == HARNESS && c.item == ItemRef::Skill("x".into()))
+            .then_some(())
+    })
+    .await;
+    let target = m.client.adopt_displaced(&id).await.unwrap();
+    assert_eq!(target, m.repo().join("personal/x"));
+    assert_eq!(std::fs::read_to_string(target.join("SKILL.md")).unwrap(), "x\nlate harness edit\n");
     assert!(m.client.conflicts().await.unwrap().is_empty());
     assert!(m.status().await.report.conflicts.is_empty());
 }
@@ -1827,6 +1826,7 @@ async fn gui_creation_import_inventory_check_and_conflict_diff() {
     use sk1ll_daemon::client::{ConflictDiffRequest, CreateItemRequest};
     let mut snap = snapshot(1, &["x"]);
     snap.assignment.set_rule(HARNESS, "diff-rule", true);
+    snap.assignment.set_skill(HARNESS, "external", true);
     let mut m = solo("gui", "http://127.0.0.1:1", Some(snap));
     m.write("personal/x/.sk1ll-id", "x-id\n");
     m.write(
@@ -1858,6 +1858,8 @@ async fn gui_creation_import_inventory_check_and_conflict_diff() {
     let upstream = tempfile::tempdir().unwrap();
     git(upstream.path(), &["init", "-q", "-b", "main"]);
     write(upstream.path(), "SKILL.md", "upstream v1\n");
+    write(upstream.path(), ".sk1ll-id", "vendored content\n");
+    std::os::unix::fs::symlink("SKILL.md", upstream.path().join("alias")).unwrap();
     git(upstream.path(), &["add", "."]);
     git(upstream.path(), &["commit", "-qm", "first"]);
     m.client
@@ -1915,9 +1917,45 @@ async fn gui_creation_import_inventory_check_and_conflict_diff() {
         .diff;
     assert!(rule_diff.contains("-Harness rule.") && rule_diff.contains("+Draft rule."), "{rule_diff}");
     assert!(!rule_diff.contains("diff-rule-id") && !rule_diff.contains("harnesses:"), "{rule_diff}");
+    eventually(|| async { m.harness_skill("external") }).await;
+    let external = m.skills().join("external");
+    write(&external, ".sk1ll-id", "changed sidecar\n");
+    std::fs::remove_file(external.join("alias")).unwrap();
+    std::os::unix::fs::symlink(".sk1ll-id", external.join("alias")).unwrap();
+    let diff = m
+        .client
+        .conflict_diff(&ConflictDiffRequest { harness: Some(HARNESS.into()), name: Some("external".into()), id: None })
+        .await
+        .unwrap();
+    assert!(diff.diff.contains("-changed sidecar") && diff.diff.contains("+vendored content"), "{}", diff.diff);
+    assert!(diff.diff.contains("120000") && diff.diff.contains("alias"), "{}", diff.diff);
+    assert_eq!(diff.target, Some(m.repo().join("imported/external")));
     m.client.remove_import("external").await.unwrap();
     assert!(m.client.imports().await.unwrap().imports.is_empty());
     assert!(!m.repo().join("imported/external").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_repairs_duplicate_ids_and_persists_handmade_ids_in_the_draft() {
+    let mut m = solo("repair", "http://127.0.0.1:1", Some(snapshot(1, &["x"])));
+    let source = m.repo().join("personal/x");
+    let copy = m.repo().join("personal/copy");
+    std::fs::create_dir(&copy).unwrap();
+    for file in ["SKILL.md", ".sk1ll-id"] {
+        std::fs::copy(source.join(file), copy.join(file)).unwrap();
+    }
+    m.write("instructions/handmade.md", "Plain rule.\n");
+    m.start().await;
+    let error = m.client.items().await.unwrap_err();
+    assert!(error.message.contains("personal/copy/.sk1ll-id") && error.message.contains("personal/x/.sk1ll-id"));
+    assert_eq!(m.client.repair_ids().await.unwrap(), 1);
+    let items = m.client.items().await.unwrap();
+    let get = |item| items.iter().find(|entry| entry.item == item).unwrap();
+    let copy = get(ItemRef::Skill("copy".into()));
+    let source = get(ItemRef::Skill("x".into()));
+    assert!(copy.id.is_some() && source.id.is_some() && copy.id != source.id);
+    assert!(get(ItemRef::Rule("handmade".into())).id.is_some());
+    assert_eq!(m.client.repair_ids().await.unwrap(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2919,7 +2957,8 @@ async fn skill_file_writes_require_current_personal_or_rule_text() {
     assert!(error.message.contains("Invalid Rule frontmatter"));
     request.content = "---\nharnesses: [claude]\n---\n# Valid".into();
     m.client.write_skill_file(&request).await.unwrap();
-    assert_eq!(m.client.skill_file(&request.file).await.unwrap().text.as_deref(), Some(request.content.as_str()));
+    let saved = m.client.skill_file(&request.file).await.unwrap().text.unwrap();
+    assert!(saved.contains("id:") && saved.contains("harnesses: [claude]") && saved.ends_with("# Valid"), "{saved}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

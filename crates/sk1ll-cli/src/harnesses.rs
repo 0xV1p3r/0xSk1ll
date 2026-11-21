@@ -144,6 +144,7 @@ pub(crate) fn run(mut cli: Cli, repo: &Path, machine_path: &Path, assignment_pat
     print_preview(machine_path, &change, &rows, assignment.is_none(), true);
     decide(&opts)?;
     harness_change::apply(&lock, &repo, machine_path, &change, &plan.fingerprint)?;
+    repo.assign_missing_ids()?;
     let mut failed = 0;
     match assignment {
         None => println!("no assignment yet; the harnesses sync once the daemon has the server's"),

@@ -368,11 +368,15 @@ impl Repo {
         if to.symlink_metadata().is_ok() {
             return Err(Error::Invalid(format!("personal skill `{name}` already exists")));
         }
+        let relative = Path::new(skill::IMPORTED_DIR).join(name);
+        self.assign_item_ids(|path| path == relative)?;
         let id = self
             .resolved_ids()?
-            .get(Path::new(skill::IMPORTED_DIR).join(name).as_path())
+            .get(&relative)
             .cloned()
+            .flatten()
             .ok_or_else(|| Error::Invalid(format!("no vendored import named `{name}`")))?;
+        let manifest = manifest::stage_remove_import(self.root(), name)?;
         let sidecar = to.join(skill::ID_FILE);
         let backup = source::unique(&to);
         crate::sync::rename_noreplace(&from, &to).at(&to)?;
@@ -383,7 +387,7 @@ impl Repo {
                 saved = true;
             }
             id.write_skill(&to)?;
-            manifest::remove_import(self.root(), name)
+            manifest.replace()
         })();
         if let Err(error) = result {
             if saved {
@@ -921,6 +925,34 @@ mod tests {
     }
 
     #[test]
+    fn fork_removes_inline_import_and_requires_both_commit_and_restore_sides() {
+        let src = Source::new();
+        let mut repo = src.repo();
+        repo.add_link(None, &src.origin(), Some("skills/pdf"), None, None).unwrap();
+        let import = &repo.manifest.import["pdf"];
+        let id = import.id.clone().unwrap();
+        let manifest = format!("import = {{ pdf = {{ source = '{}', id = '{id}' }} }}\n", import.source);
+        fs::write(repo.root().join("sk1ll.toml"), manifest).unwrap();
+        let skill = crate::ItemRef::Skill("pdf".into());
+        let items = [crate::ItemRef::Manifest, skill];
+        repo.commit(&items, "Add inline import", None).unwrap();
+        repo.fork("pdf").unwrap();
+        assert!(crate::Manifest::load(repo.root()).unwrap().import.is_empty());
+        assert_eq!(repo.skills().unwrap()[0].id.as_ref(), Some(&id));
+        for item in &items {
+            let only = std::slice::from_ref(item);
+            for error in [repo.commit(only, "One side", None).unwrap_err(), repo.restore(only).unwrap_err()] {
+                assert!(
+                    error.to_string().contains("manifest, skill:pdf")
+                        || error.to_string().contains("skill:pdf, manifest"),
+                    "{error}"
+                );
+            }
+        }
+        repo.commit(&items, "Fork", None).unwrap();
+    }
+
+    #[test]
     fn add_records_an_id_and_fork_carries_it_into_the_personal_skill() {
         let src = Source::new();
         let mut repo = src.repo();
@@ -932,13 +964,13 @@ mod tests {
         let mut repo = src.repo();
         let id = repo.manifest.import["pdf"].id.clone().unwrap();
         assert!(ulid::Ulid::from_string(&id.to_string()).is_ok());
-        assert_eq!(repo.skills().unwrap()[0].id, id);
+        assert_eq!(repo.skills().unwrap()[0].id.as_ref(), Some(&id));
         assert_eq!(fs::read(repo.imported_dir().join("pdf/.sk1ll-id")).unwrap(), b"upstream file\n");
 
         repo.fork("pdf").unwrap();
         let skill = repo.skills().unwrap().remove(0);
         assert_eq!(skill.origin, crate::Origin::Personal);
-        assert_eq!(skill.id, id);
+        assert_eq!(skill.id.as_ref(), Some(&id));
         assert_eq!(ItemId::read_skill(&skill.path).unwrap(), Some(id));
         assert!(!repo.manifest.import.contains_key("pdf"));
     }
