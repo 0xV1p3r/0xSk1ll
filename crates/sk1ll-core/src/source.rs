@@ -295,13 +295,24 @@ fn explain_github_failure(source: &str, e: Error) -> Error {
 /// Waits for, then holds, the lock on `cache` (an OS file lock on a file
 /// next to it, so it also covers other processes and a cache not cloned
 /// yet). Released when dropped.
-pub(crate) fn lock_cache(cache: &Path) -> Result<fs::File> {
+pub(crate) fn lock_cache(cache: &Path) -> Result<CacheLock> {
     let mut path = cache.as_os_str().to_owned();
     path.push(".lock");
     let path = PathBuf::from(path);
     let file = fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path).at(&path)?;
     file.lock().at(&path)?;
-    Ok(file)
+    Ok(CacheLock(file))
+}
+
+/// A held [`lock_cache`] lock.
+pub(crate) struct CacheLock(fs::File);
+
+impl Drop for CacheLock {
+    fn drop(&mut self) {
+        // As for the engine lock: a child forked meanwhile shares the lock
+        // until it reaches exec, so it is released explicitly.
+        let _ = self.0.unlock();
+    }
 }
 
 /// Prefix of staging directories. Draft, skill discovery and the daemon's
