@@ -68,8 +68,10 @@ pub fn init_bare(repo: &Path) -> anyhow::Result<()> {
 /// pushes: receive-pack refuses to create or update a hidden ref (the last
 /// matching entry wins), and a pre-receive hook, written on every start,
 /// refuses every other ref too, since hiding matches by prefix and so lets
-/// `<branch>/x` through. Changing HEAD takes a restart.
-pub fn configure_pushes(repo: &Path) -> anyhow::Result<String> {
+/// `<branch>/x` through. Changing HEAD takes a restart. With `check`, the
+/// hook also runs that `sk1ll-server` binary as `--check-push <commit>` on
+/// each new baseline (see [`check_push`]).
+pub fn configure_pushes(repo: &Path, check: Option<&Path>) -> anyhow::Result<String> {
     let branch = baseline_branch(repo)?;
     let path = repo.to_string_lossy();
     for args in [
@@ -82,7 +84,7 @@ pub fn configure_pushes(repo: &Path) -> anyhow::Result<String> {
         }
     }
     let partial = repo.join("hooks/pre-receive.sk1ll-tmp");
-    std::fs::write(&partial, pre_receive_hook(&branch)).context("writing the pre-receive hook")?;
+    std::fs::write(&partial, pre_receive_hook(&branch, check)).context("writing the pre-receive hook")?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -110,9 +112,15 @@ fn baseline_branch(repo: &Path) -> anyhow::Result<String> {
     Ok(branch)
 }
 
-/// A pre-receive hook that refuses every ref update but one to `branch`.
-fn pre_receive_hook(branch: &str) -> String {
+/// A pre-receive hook that refuses every ref update but one to `branch`,
+/// and with `check`, one whose new commit that binary's `--check-push`
+/// refuses. Run by receive-pack in the bare repo, before the refs move and
+/// with the pushed objects still quarantined, which the check reads.
+fn pre_receive_hook(branch: &str, check: Option<&Path>) -> String {
     let branch = shell_quote(branch);
+    let check = check.map_or_else(String::new, |program| {
+        format!("\t{} --check-push \"$new\" || exit 1\n", shell_quote(&program.to_string_lossy()))
+    });
     format!(
         "#!/bin/sh\n\
          # Written by sk1ll-server on every start; changes here are lost.\n\
@@ -121,8 +129,21 @@ fn pre_receive_hook(branch: &str) -> String {
          \t\tprintf 'sk1ll-server: only %s takes pushes, not %s\\n' {branch} \"$ref\" >&2\n\
          \t\texit 1\n\
          \tfi\n\
+         {check}\
          done\n"
     )
+}
+
+/// Refuses `commit` as the new baseline of the bare repo `repo` unless every
+/// item in its tree (personal skill, Rule, Import) has an Item ID of its own,
+/// so the baseline's Item IDs are always complete (ADR 0006). The error names
+/// each item and how to repair it.
+pub async fn check_push(repo: &Path, commit: &str) -> anyhow::Result<()> {
+    let inventory = item_ids_at(repo, commit).await.with_context(|| format!("cannot read the Item IDs of {commit}"))?;
+    match inventory.id_problems() {
+        Some(problems) => bail!("refusing {commit}: {problems}"),
+        None => Ok(()),
+    }
 }
 
 /// Bootstrap commands must not inherit identity, signing, hooks or templates
@@ -1154,6 +1175,55 @@ while ! test -f '{}'; do sleep 0.01; done
         })
         .await
         .expect("the stub's TERM-resistant child must be gone");
+    }
+
+    /// The hook runs the check only when it has a binary to run, quoted.
+    #[test]
+    fn the_hook_checks_each_new_baseline_with_the_server_binary() {
+        let plain = pre_receive_hook("refs/heads/main", None);
+        assert!(!plain.contains("--check-push"), "{plain}");
+        let checked = pre_receive_hook("refs/heads/main", Some(Path::new("/opt/it's/sk1ll-server")));
+        assert!(checked.contains(r#"'/opt/it'\''s/sk1ll-server' --check-push "$new" || exit 1"#), "{checked}");
+    }
+
+    /// Every item of the pushed tree needs an Item ID of its own; the
+    /// refusal names each item that has none, or shares one.
+    #[tokio::test]
+    async fn check_push_refuses_items_without_an_item_id_of_their_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path();
+        run(work, &["init", "--quiet"]);
+        let write = |path: &str, text: &str| {
+            let path = work.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let commit = |message: &str| {
+            run(work, &["add", "--all"]);
+            run(work, &["commit", "--quiet", "--allow-empty", "-m", message]);
+            run(work, &["rev-parse", "HEAD"])
+        };
+        assert!(check_push(work, &commit("empty")).await.is_ok());
+        write("personal/pdf/SKILL.md", "x\n");
+        write("personal/pdf/.sk1ll-id", "pdf\n");
+        write("instructions/git.md", "---\nid: git\n---\nUse git.\n");
+        write("imported/web/SKILL.md", "x\n");
+        write("sk1ll.toml", "[import.web]\nsource = 'github:o/r'\nid = 'web'\n");
+        assert!(check_push(work, &commit("all have IDs")).await.is_ok());
+
+        write("personal/bare/SKILL.md", "x\n");
+        let error = check_push(work, &commit("one without")).await.unwrap_err().to_string();
+        assert!(error.contains("skill:bare (personal/bare/.sk1ll-id) has no Item ID"), "{error}");
+        assert!(error.contains("sk1ll repair-ids"), "{error}");
+        write("personal/bare/.sk1ll-id", "git\n");
+        let error = check_push(work, &commit("a shared one")).await.unwrap_err().to_string();
+        assert!(
+            error.contains("skill:bare (personal/bare/.sk1ll-id), rule:git (instructions/git.md) share"),
+            "{error}"
+        );
+        write("personal/bare/.sk1ll-id", "two\nlines\n");
+        let error = check_push(work, &commit("an unreadable one")).await.unwrap_err().to_string();
+        assert!(error.contains("unreadable Item ID: personal/bare/.sk1ll-id"), "{error}");
     }
 
     #[test]

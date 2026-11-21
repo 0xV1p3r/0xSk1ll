@@ -425,6 +425,67 @@ pub fn id_sources(paths: &[String]) -> Vec<&str> {
 pub struct ItemInventory {
     pub items: Vec<(ItemRef, Option<ItemId>)>,
     pub errors: Vec<String>,
+    /// Where each item's Item ID is (or goes), for messages: a personal
+    /// skill's sidecar, an Import's manifest table or a Rule's file.
+    pub claims: BTreeMap<ItemRef, String>,
+}
+
+impl ItemInventory {
+    /// What keeps this inventory from giving every item an Item ID of its
+    /// own (ADR 0006); `None` if nothing does.
+    pub fn id_problems(&self) -> Option<IdProblems> {
+        let mut by_id = BTreeMap::<&ItemId, Vec<&ItemRef>>::new();
+        let mut missing = Vec::new();
+        for (item, id) in &self.items {
+            match id {
+                Some(id) => by_id.entry(id).or_default().push(item),
+                None => missing.push(item.clone()),
+            }
+        }
+        let shared: Vec<_> = by_id
+            .into_iter()
+            .filter(|(_, items)| items.len() > 1)
+            .map(|(id, items)| (id.clone(), items.into_iter().cloned().collect()))
+            .collect();
+        let problems = IdProblems { unreadable: self.errors.clone(), missing, shared, claims: self.claims.clone() };
+        (!problems.unreadable.is_empty() || !problems.missing.is_empty() || !problems.shared.is_empty())
+            .then_some(problems)
+    }
+}
+
+/// Items of an inventory without an Item ID of their own (see
+/// [`ItemInventory::id_problems`]). Displayed, it names each one and how to
+/// repair them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdProblems {
+    /// Metadata that could not be read, so its items' Item IDs are unknown.
+    pub unreadable: Vec<String>,
+    /// Items without an Item ID.
+    pub missing: Vec<ItemRef>,
+    /// Item IDs more than one item claims, with those items.
+    pub shared: Vec<(ItemId, Vec<ItemRef>)>,
+    claims: BTreeMap<ItemRef, String>,
+}
+
+impl std::fmt::Display for IdProblems {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = |item: &ItemRef| match self.claims.get(item) {
+            Some(claim) => format!("{item} ({claim})"),
+            None => item.to_string(),
+        };
+        f.write_str("every item needs an Item ID of its own:")?;
+        for item in &self.missing {
+            write!(f, "\n  {} has no Item ID", name(item))?;
+        }
+        for (id, items) in &self.shared {
+            let items: Vec<_> = items.iter().map(name).collect();
+            write!(f, "\n  {} share the Item ID `{id}`", items.join(", "))?;
+        }
+        for error in &self.unreadable {
+            write!(f, "\n  unreadable Item ID: {error}")?;
+        }
+        f.write_str("\nRun `sk1ll repair-ids`, commit the repaired items and push again")
+    }
 }
 
 /// Collects only the bytes needed for an Item ID claim. A Rule's body can be
@@ -535,6 +596,12 @@ pub fn tree_inventory(
                 .map(|manifest| manifest.import.get(name).and_then(|import| import.id.clone()))
                 .map_err(Clone::clone)
         };
+        let claim = if dir == PERSONAL_DIR {
+            format!("{dir}/{name}/{ID_FILE}")
+        } else {
+            format!("{MANIFEST_FILE} [import.{name}]")
+        };
+        inventory.claims.insert(ItemRef::Skill(name.into()), claim);
         skills.insert(name, id);
     }
     let rules = paths.iter().filter_map(|path| {
@@ -551,8 +618,13 @@ pub fn tree_inventory(
                 None => Ok(None),
             })
             .map_err(|error| format!("{path}: {error}"));
-        Some((ItemRef::Rule(name.into()), id))
+        Some((ItemRef::Rule(name.into()), id, path.clone()))
     });
+    let rules: Vec<_> = rules.collect();
+    for (item, _, path) in &rules {
+        inventory.claims.insert(item.clone(), path.clone());
+    }
+    let rules = rules.into_iter().map(|(item, id, _)| (item, id));
     for (item, id) in skills.into_iter().map(|(name, id)| (ItemRef::Skill(name.into()), id)).chain(rules) {
         let id = id.unwrap_or_else(|error| {
             inventory.errors.push(error);
@@ -716,6 +788,35 @@ fn tree_rule(path: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn id_problems_name_items_without_an_item_id_of_their_own() {
+        let paths: Vec<String> = ["personal/a/SKILL.md", "personal/b/SKILL.md", "instructions/r.md", "sk1ll.toml"]
+            .into_iter()
+            .chain(["personal/a/.sk1ll-id", "personal/b/.sk1ll-id", "imported/web/SKILL.md"])
+            .map(Into::into)
+            .collect();
+        let file = |text: &str| Ok(text.as_bytes().to_vec());
+        let mut files = BTreeMap::from([
+            ("personal/a/.sk1ll-id".to_string(), file("same\n")),
+            ("personal/b/.sk1ll-id".to_string(), file("same\n")),
+            ("instructions/r.md".to_string(), file("No ID.\n")),
+            (MANIFEST_FILE.to_string(), file("[import.web]\nsource = 'github:o/r'\n")),
+        ]);
+        let problems = tree_inventory(&paths, &files).id_problems().expect("problems");
+        assert_eq!(problems.missing, [ItemRef::Skill("web".into()), ItemRef::Rule("r".into())]);
+        let same: ItemId = "same".parse().unwrap();
+        assert_eq!(problems.shared, [(same, vec![ItemRef::Skill("a".into()), ItemRef::Skill("b".into())])]);
+        let text = problems.to_string();
+        assert!(text.contains("skill:web (sk1ll.toml [import.web]) has no Item ID"), "{text}");
+        assert!(text.contains("rule:r (instructions/r.md) has no Item ID"), "{text}");
+        assert!(text.ends_with("Run `sk1ll repair-ids`, commit the repaired items and push again"), "{text}");
+
+        files.insert("personal/b/.sk1ll-id".into(), file("other\n"));
+        files.insert("instructions/r.md".into(), file("---\nid: r\n---\nNo ID.\n"));
+        files.insert(MANIFEST_FILE.into(), file("[import.web]\nsource = 'github:o/r'\nid = 'web'\n"));
+        assert_eq!(tree_inventory(&paths, &files).id_problems(), None);
+    }
 
     #[test]
     fn historical_claims_are_cached_by_tree_and_stream_past_large_rule_bodies() {

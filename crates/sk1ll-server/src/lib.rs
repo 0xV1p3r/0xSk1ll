@@ -9,6 +9,8 @@ pub mod config;
 mod db;
 mod error;
 mod git;
+
+pub use git::check_push;
 mod imports;
 mod ws;
 
@@ -138,11 +140,12 @@ impl Server {
     /// Creates the data dir, bare repo and database as needed.
     pub async fn open(config: Config) -> anyhow::Result<Arc<Self>> {
         let (data_dir, repo, db_path) = (config.data_dir.clone(), config.repo_dir(), config.db_path());
+        let push_check = config.push_check.clone();
         let (conn, branch) = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
             git::init_bare(&repo)?;
             git::init_baseline(&repo)?;
-            let branch = git::configure_pushes(&repo)?;
+            let branch = git::configure_pushes(&repo, push_check.as_deref())?;
             anyhow::Ok((db::open(&db_path)?, branch))
         })
         .await??;
@@ -229,9 +232,14 @@ impl Server {
             return Ok(i.items.clone());
         }
         let inventory = git::item_ids_at(&self.config.repo_dir(), commit).await?;
-        anyhow::ensure!(inventory.errors.is_empty(), "incomplete inventory: {}", inventory.errors.join("; "));
-        let items: Arc<Vec<_>> =
-            Arc::new(inventory.items.into_iter().filter_map(|(item, id)| id.map(|id| (item, id))).collect());
+        // The pre-receive hook refuses a baseline without them (see
+        // `git::check_push`), so every item has an Item ID of its own.
+        if let Some(problems) = inventory.id_problems() {
+            anyhow::bail!("baseline {commit} is unusable: {problems}");
+        }
+        let items: Arc<Vec<_>> = Arc::new(
+            inventory.items.into_iter().map(|(item, id)| (item, id.expect("id_problems found none missing"))).collect(),
+        );
         let mut baseline = lock(&self.baseline);
         if baseline.head.as_deref() == Some(commit) {
             baseline.inventory = Some(Inventory { commit: commit.to_string(), items: items.clone() });

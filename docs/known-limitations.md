@@ -193,6 +193,15 @@ baseline branch from HEAD once at startup and writes `hooks/pre-receive` over
 on every start. Changing HEAD while it runs isn't supported, and pushes keep
 going to the branch it started with until it restarts.
 
+The hook checks each push's Item IDs by running the `sk1ll-server` binary
+that wrote it, by its path at startup. Replacing that binary while the server
+runs makes the hook run the new one; removing it refuses every push until the
+server restarts. A server embedded through the library (`Config::new`) has no
+binary to run and doesn't check Item IDs. Commits that reach the bare repo
+without a push, such as a fetch run on the server by hand, aren't checked
+either: the server then refuses to list or prune orphans and to change
+defaults until a checked push replaces that Baseline.
+
 ## Reviewed sync and concurrent changes
 
 A reviewed Sync can apply several placements. When a staged copy's digest

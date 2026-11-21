@@ -27,7 +27,16 @@ uses the Item ID, so a rename is local to the repo and the ID moves with the ite
   pending. The server refuses orphan pruning and default changes that
   record existing items' values while an inventory it needs is incomplete.
 - Item ID claims must be unique across the repo. `sk1ll repair-ids` keeps the
-  first claim by path and assigns fresh IDs to the others.
+  first claim by path and assigns fresh IDs to the others, then gives every
+  item without an ID a fresh one.
+- The Baseline always gives every item an Item ID of its own. The server's
+  pre-receive hook refuses a push whose new tree has an item without one, two
+  items sharing one, or unreadable Item ID metadata, naming each item. It
+  reads the tree with the same inventory code as the server and the Daemon.
+  The server's Baseline inventory relies on that: a Baseline without complete
+  IDs (one written on the server by hand, say) is unusable for orphan
+  listing, pruning and default changes, instead of having its ID-less items
+  silently left out.
 - A rename carries the explicit ID with the item. Recovery
   records the placed Item ID so Adopt can find a renamed item or bring back a
   deleted one.

@@ -51,6 +51,11 @@ pub struct Config {
     /// Deadline for the whole Git backend exchange, including upload and
     /// response forwarding (`SK1LL_SERVER_PUSH_MAX`, default `10m`).
     pub push_max: Duration,
+    /// The `sk1ll-server` binary the pre-receive hook runs as
+    /// `--check-push <commit>` to refuse a baseline whose items lack Item
+    /// IDs of their own. [`Config::from_env`] sets the running binary;
+    /// without one (embedded servers, tests) pushes are not checked.
+    pub push_check: Option<PathBuf>,
 }
 
 impl Config {
@@ -71,6 +76,7 @@ impl Config {
             send_timeout: Duration::from_secs(10),
             push_idle: Duration::from_secs(30),
             push_max: Duration::from_secs(600),
+            push_check: None,
         }
     }
 
@@ -108,6 +114,7 @@ impl Config {
         if let Some(v) = var("SK1LL_SERVER_PUSH_MAX") {
             cfg.push_max = parse_duration(&v).with_context(|| format!("SK1LL_SERVER_PUSH_MAX: `{v}`"))?;
         }
+        cfg.push_check = Some(std::env::current_exe().context("locating the sk1ll-server binary for push checks")?);
         Ok(cfg)
     }
 

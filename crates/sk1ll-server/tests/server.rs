@@ -40,6 +40,8 @@ async fn start_with(tune: impl FnOnce(&mut Config), small_buffers: bool) -> Test
     let dir = tempfile::tempdir().unwrap();
     let mut config = Config::new(dir.path().join("data"));
     config.admin_token = Some(ADMIN.into());
+    // As the binary itself does: pushes are checked for Item IDs.
+    config.push_check = Some(env!("CARGO_BIN_EXE_sk1ll-server").into());
     tune(&mut config);
     let socket = tokio::net::TcpSocket::new_v4().unwrap();
     if small_buffers {
@@ -243,6 +245,19 @@ async fn commit_push(server: &TestServer, repo: &Path, msg: &str) -> String {
     })
     .await;
     head
+}
+
+/// `git push origin <refspec>` in `repo`, which may fail.
+fn push_output(repo: &Path, refspec: &str) -> std::process::Output {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["push", "origin", refspec])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .unwrap()
 }
 
 /// A fresh clone with `files` pushed as the baseline; returns it and HEAD.
@@ -495,7 +510,7 @@ async fn offline_clones_share_a_root_and_can_rebase_then_push() {
     for (repo, name) in [(&a_repo, "a"), (&b_repo, "b")] {
         git(repo, &["config", "user.name", name]);
         git(repo, &["config", "user.email", &format!("{name}@example.com")]);
-        write(repo, &format!("personal/{name}/SKILL.md"), name);
+        write_item(repo, &format!("personal/{name}/SKILL.md"), name);
         git(repo, &["add", "-A"]);
         let out = Command::new("git")
             .arg("-C")
@@ -699,7 +714,7 @@ async fn websocket_gets_assignment_nudge_and_status() {
 
     let dir = clone(&server, "ws", &token).await;
     let repo = dir.path().join("repo");
-    write(&repo, "personal/pdf/SKILL.md", "---\nname: pdf\n---\n");
+    write_item(&repo, "personal/pdf/SKILL.md", "---\nname: pdf\n---\n");
     let head = commit_push(&server, &repo, "add pdf").await;
     assert_eq!(ws_next(&mut ws).await, ServerMessage::Nudge { baseline: head.clone() });
 
@@ -817,7 +832,7 @@ async fn push_moved_import(server: &TestServer, id: &str, token: &str) -> (Strin
     let dir = clone(server, id, token).await;
     let repo = dir.path().join("repo");
     let source = format!("file://{}", upstream.display());
-    write(&repo, "sk1ll.toml", &format!("[import.pdf]\nsource = \"{source}\"\nref = \"main\"\n"));
+    write(&repo, "sk1ll.toml", &format!("[import.pdf]\nsource = \"{source}\"\nref = \"main\"\nid = \"pdf\"\n"));
     write(
         &repo,
         "sk1ll.lock",
@@ -887,7 +902,7 @@ async fn encoded_userinfo_cannot_reach_an_unlisted_host() {
     let (crafted, plain) = ("ssh://evil.example%2F@github.com/o/r", "ssh://git@github.com/o/r");
     let (mut manifest, mut lock) = (String::new(), String::new());
     for (name, source) in [("crafted", crafted), ("plain", plain)] {
-        manifest.push_str(&format!("[import.{name}]\nsource = \"{source}\"\nref = \"main\"\n"));
+        manifest.push_str(&format!("[import.{name}]\nsource = \"{source}\"\nref = \"main\"\nid = \"{name}\"\n"));
         lock.push_str(&format!(
             "[skills.{name}]\nsource = \"{source}\"\npath = \"\"\nref = \"main\"\ncommit = \"{}\"\nhash = \"x\"\n",
             "a".repeat(40)
@@ -1144,11 +1159,11 @@ async fn each_push_is_announced_and_changes_no_assignment() {
     ws_assignment(&mut ws).await;
     assert_eq!(ws_next(&mut ws).await, ServerMessage::Nudge { baseline: c0 });
 
-    write(&repo, "personal/a/SKILL.md", "a\n");
+    write_item(&repo, "personal/a/SKILL.md", "a\n");
     let c1 = commit_push(&server, &repo, "add a").await;
     std::fs::remove_dir_all(repo.join("personal/pdf")).unwrap();
     let c2 = commit_push(&server, &repo, "drop pdf").await;
-    write(&repo, "personal/b/SKILL.md", "b\n");
+    write_item(&repo, "personal/b/SKILL.md", "b\n");
     let c3 = commit_push(&server, &repo, "add b").await;
 
     let mut nudges = Vec::new();
@@ -1374,7 +1389,7 @@ async fn push_timeout_runs_follow_up(hook_body: &str, idle: Duration, max: Durat
     let token = server.join("ws", &["claude"]).await;
     let (dir, first) = seed(&server, "ws", &token, &["personal/keep/SKILL.md"]).await;
     let repo = dir.path().join("repo");
-    write(&repo, "personal/removed/SKILL.md", "removed\n");
+    write_item(&repo, "personal/removed/SKILL.md", "removed\n");
     let second = commit_push(&server, &repo, "add removed").await;
     server
         .put_assignment(
@@ -1465,7 +1480,7 @@ async fn backend_deadline_kills_pre_receive_descendants() {
     let token = server.join("ws", &["claude"]).await;
     let (dir, baseline) = seed(&server, "ws", &token, &["README.md"]).await;
     let repo = dir.path().join("repo");
-    write(&repo, "personal/wip/SKILL.md", "committed\n");
+    write_item(&repo, "personal/wip/SKILL.md", "committed\n");
     git_async(repo.clone(), vec!["add".into(), "-A".into()]).await;
     git_async(repo.clone(), vec!["commit".into(), "--quiet".into(), "-m".into(), "commit".into()]).await;
     let bare = server._dir.path().join("data/repo.git");
@@ -1696,6 +1711,48 @@ async fn pushes_to_refs_outside_the_baseline_branch_are_refused() {
     assert_eq!(git(&bare, &["rev-parse", "refs/heads/main"]), head);
 }
 
+/// The pre-receive hook refuses a baseline with an item (personal skill,
+/// Rule, Import) that has no Item ID or shares one, naming each, so every
+/// baseline the server reads gives each item an Item ID of its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn pushes_need_an_item_id_of_its_own_on_every_item() {
+    let server = start().await;
+    let token = server.join("writer", &[]).await;
+    let (dir, head) = seed(&server, "writer", &token, &["personal/kept/SKILL.md"]).await;
+    let repo = dir.path().join("repo");
+    write(&repo, "personal/bare/SKILL.md", "no id\n");
+    write(&repo, "instructions/plain.md", "No id.\n");
+    write(&repo, "imported/web/SKILL.md", "vendored\n");
+    write(&repo, "sk1ll.toml", "[import.web]\nsource = 'github:o/r'\n");
+    write_item(&repo, "personal/copy/SKILL.md", "copied\n");
+    write(&repo, "personal/copy/.sk1ll-id", "kept\n");
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "--quiet", "-m", "items without their own Item IDs"]);
+    let refused = push_output(&repo, "HEAD:main");
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    for expected in [
+        "skill:bare (personal/bare/.sk1ll-id) has no Item ID",
+        "rule:plain (instructions/plain.md) has no Item ID",
+        "skill:web (sk1ll.toml [import.web]) has no Item ID",
+        "skill:copy (personal/copy/.sk1ll-id), skill:kept (personal/kept/.sk1ll-id) share the Item ID `kept`",
+        "Run `sk1ll repair-ids`",
+    ] {
+        assert!(stderr.contains(expected), "{expected}: {stderr}");
+    }
+    let bare = server._dir.path().join("data/repo.git");
+    assert_eq!(git(&bare, &["rev-parse", "refs/heads/main"]), head);
+
+    write(&repo, "personal/bare/.sk1ll-id", "bare\n");
+    write(&repo, "instructions/plain.md", "---\nid: plain\n---\nNo id.\n");
+    write(&repo, "sk1ll.toml", "[import.web]\nsource = 'github:o/r'\nid = 'web'\n");
+    write(&repo, "personal/copy/.sk1ll-id", "copy\n");
+    let fixed = commit_push(&server, &repo, "every item has its own Item ID").await;
+    assert_eq!(git(&bare, &["rev-parse", "refs/heads/main"]), fixed);
+    let fleet: FleetView = server.get_json(ADMIN, "/fleet").await;
+    assert_eq!(fleet.baseline.as_deref(), Some(fixed.as_str()));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn main_rejects_rewrites_and_deletion() {
     let server = start().await;
@@ -1834,7 +1891,16 @@ async fn oversized_rules_keep_their_claim_and_incomplete_baselines_refuse_prune(
     let before: AssignmentSnapshot = server.get_json(&token, "/machines/alpha/assignment").await;
 
     write(&repo, "instructions/broken.md", "---\nid: [invalid]\n---\n");
-    commit_push(&server, &repo, "unreadable claim").await;
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "--quiet", "-m", "unreadable claim"]);
+    let refused = push_output(&repo, "HEAD:main");
+    assert!(!refused.status.success(), "a push with an unreadable Item ID is refused");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("instructions/broken.md") && stderr.contains("sk1ll repair-ids"), "{stderr}");
+    // A baseline that never went through the check (written on the server
+    // by hand, say) is served, but nothing reads its Item IDs.
+    let bare = server._dir.path().join("data/repo.git");
+    git(&bare, &["fetch", "--quiet", &repo.to_string_lossy(), "HEAD:refs/heads/main"]);
     for path in ["/assignment/orphans", "/fleet"] {
         let status = server.get(&token, path).await.status();
         assert_eq!(status, if path == "/fleet" { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE });
