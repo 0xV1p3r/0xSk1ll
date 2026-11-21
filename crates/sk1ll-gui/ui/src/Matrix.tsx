@@ -17,11 +17,24 @@ import { matrixCheckbox, useAssignmentWrites } from './assignments';
 import { useResource } from './hooks';
 import { toast } from './toast';
 import { cn } from '@/lib/utils';
-import { CheckboxSwatch, ErrorNotice, KindBadge, Loading, Nothing, Panel, PanelToolbar, Pending } from './shared';
+import { CheckboxSwatch, Confirm, ErrorNotice, KindBadge, Loading, Nothing, Panel, PanelToolbar, Pending } from './shared';
 import type { ItemView, MachineRow, StatusView, ToggleChange } from './types';
 
 const loadMatrix = async (status: StatusView) => {
-  const [fleet, items] = await Promise.all([status.mode === 'standalone' ? Promise.resolve({ baseline: status.report.baseline, machines: [{ id: status.machine_id, status: status.headline, connected: true, joined_at: 0, last_seen: null, scope: undefined, report: status.report, registration: null }] }) : api.fleet(), api.items()]);
+  const [fleet, localItems] = await Promise.all([status.mode === 'standalone' ? Promise.resolve({ baseline: status.report.baseline, machines: [{ id: status.machine_id, status: status.headline, connected: true, joined_at: 0, last_seen: null, scope: undefined, report: status.report, registration: null }] }) : api.fleet(), api.items()]);
+  const byId = new Map<string, ItemView>();
+  for (const item of localItems) {
+    if (item.id == null) continue;
+    const previous = byId.get(item.id);
+    if (!previous || item.draft !== 'deleted') byId.set(item.id, { ...item, in_baseline: item.in_baseline || !!previous?.in_baseline });
+    else if (item.in_baseline) byId.set(item.id, { ...previous, in_baseline: true });
+  }
+  for (const machine of fleet.machines) {
+    for (const { item, id } of machine.report?.items ?? []) {
+      if (!byId.has(id)) byId.set(id, { item, id, in_baseline: false, draft: null, unpushed: machine.report!.unpushed.includes(item), description: null });
+    }
+  }
+  const items = [...byId.values()];
   // Each Machine loads on its own: one that fails (removed meanwhile, say) leaves the others usable.
   const results = await Promise.allSettled(fleet.machines.map(machine => loadAssignment(machine)));
   const ids = fleet.machines.map(machine => machine.id);
@@ -146,16 +159,20 @@ function AuthorityMatrix({ revision, status, target, openLog }: MatrixProps) {
     groups.flatMap(g => g.collapsed || !g.loaded ? [summary(g)] : g.harnesses.map(harness => column({ machine: g.machine.id, harness })));
   const expectedFor = (machine: string) => {
     const registration = data.fleet.machines.find(row => row.id === machine)?.registration;
-    return standalone || registration ? { revision: own(data.assignments, machine)!.revision, ...(registration && { registration }) } : undefined;
+    return { revision: own(data.assignments, machine)!.revision, ...(registration && { registration }) };
   };
+  const reportedName = (item: ItemView, machine: string) =>
+    data.fleet.machines.find(row => row.id === machine)?.report?.items?.find(entry => entry.id === item.id)?.item;
+  const available = (item: ItemView, machine: string) =>
+    item.in_baseline || !!reportedName(item, machine) || machine === status.machine_id;
   const cell = (item: ItemView, machine: string, harness: string) => {
-    const state = cellState(assignment(machine), harness, item.item);
+    const state = cellState(assignment(machine), harness, item.item, item.id);
     const defaults = assignment(machine).harnesses[harness] ?? emptyHarness();
     const differs = state.explicit && state.enabled !== defaults[splitItem(item.item).kind === 'skill' ? 'new_skills_default' : 'new_rules_default'];
-    const localOnly = !item.in_baseline && machine !== status.machine_id;
-    const { kind, name } = splitItem(item.item);
+    const localOnly = !available(item, machine);
+    const { kind, name } = splitItem(reportedName(item, machine) ?? item.item);
     const later = offline.has(machine) ? ` Applies when ${machine} reconnects.` : '';
-    const reason = localOnly ? `${state.explicit ? `${terms.explicit} Assignment` : terms.inheritedLong}. ${itemStateLabel(item)}. This item can only be assigned on this Machine until it reaches the Baseline.`
+    const reason = localOnly ? `${state.explicit ? `${terms.explicit} Assignment` : terms.inheritedLong}. ${itemStateLabel(item)}. This Machine has no report of the item yet.`
       : state.explicit ? `${terms.explicit} Assignment, ${differs ? 'overriding' : 'same as'} the Harness default. Use the reset button to inherit the default.${later}`
         : `${terms.inheritedLong}. Toggle to set an explicit Assignment.${later}`;
     const note = [differs && 'Overrides the Harness default.', later.trim()].filter(Boolean).join(' ');
@@ -167,50 +184,45 @@ function AuthorityMatrix({ revision, status, target, openLog }: MatrixProps) {
         <Checkbox ref={focused ? destination : undefined} className={matrixCheckbox(state.explicit, state.enabled)} checked={state.enabled} disabled={localOnly || !!pending.get(machine)}
           aria-label={`${item.item} in ${machine} / ${harness}, ${state.explicit ? 'explicit' : 'inherited'}`}
           aria-description={localOnly ? reason : note || undefined}
-          onCheckedChange={enabled => void write(machine, [{ harness, kind: kind as 'skill' | 'rule', name, enabled }], { expected: expectedFor(machine) })} />
+          onCheckedChange={enabled => void write(machine, [{ harness, kind: kind as 'skill' | 'rule', item_id: item.id!, name, enabled }], { expected: expectedFor(machine) })} />
       </TooltipTrigger><TooltipContent className="max-w-64">{reason}</TooltipContent></Tooltip>
       <span className="inline-flex size-6 shrink-0 items-center justify-center">{state.explicit && !localOnly && <Tooltip><TooltipTrigger render={<Button size="icon-xs" variant="ghost" disabled={!!pending.get(machine)}
         aria-label={`Use default for ${item.item} in ${machine} / ${harness}`}
-        onClick={() => void write(machine, [{ harness, kind: kind as 'skill' | 'rule', name, enabled: null }], { expected: expectedFor(machine) })} />}>
+        onClick={() => void write(machine, [{ harness, kind: kind as 'skill' | 'rule', item_id: item.id!, name, enabled: null }], { expected: expectedFor(machine) })} />}>
         <RotateCcw /></TooltipTrigger><TooltipContent>Inherit the Harness default</TooltipContent></Tooltip>}</span>
     </div></TableCell>;
   };
   // Writes once per Machine, then announces what the Server accepted.
   const bulk = async (selected: ItemView[], selectedColumns: typeof columns, enabled: boolean | null, title: (changes: number) => string) => {
-    if (!standalone && selectedColumns.some(column => !expectedFor(column.machine)) &&
-      !window.confirm('This Server cannot detect concurrent Assignment edits. This bulk change may overwrite them. Continue?')) return;
     const accepted = await Promise.all(groups.filter(g => g.loaded).map(async ({ machine }) => {
       const changes: ToggleChange[] = selectedColumns.filter(c => c.machine === machine.id).flatMap(c =>
-        selected.filter(item => item.in_baseline || machine.id === status.machine_id).map(item => {
-          const { kind, name } = splitItem(item.item);
-          return { harness: c.harness, kind: kind as 'skill' | 'rule', name, enabled };
+        selected.filter(item => available(item, machine.id)).map(item => {
+          const { kind, name } = splitItem(reportedName(item, machine.id) ?? item.item);
+          return { harness: c.harness, kind: kind as 'skill' | 'rule', item_id: item.id!, name, enabled };
         }));
       // The values shown, at the revision shown: the write applies only to that revision, so they are what Undo restores.
       const shown = own(data.assignments, machine.id)!;
       const previous = changes.map(change => {
-        const state = cellState(shown.assignment, change.harness, `${change.kind}:${change.name}`);
+        const state = cellState(shown.assignment, change.harness, `${change.kind}:${change.name}`, change.item_id);
         return { ...change, enabled: state.explicit ? state.enabled : null };
       });
       const expected = expectedFor(machine.id);
       const snapshot = await write(machine.id, changes, { expected });
-      // Only an authority that checks `expected` can guard an Undo: the Daemon standalone, or a Server that reports registrations.
-      const guarded = !!expected;
-      return snapshot ? { machine: machine.id, registration: registrationOf(machine), changes: changes.length, previous, snapshot, guarded } : null;
+      return snapshot ? { machine: machine.id, registration: registrationOf(machine), changes: changes.length, previous, snapshot } : null;
     }));
     if (!active.current) return;
     const done = accepted.filter(result => result !== null), later = done.filter(result => offline.has(result.machine)).map(result => result.machine);
-    const undoable = done.filter(result => result.guarded);
     if (done.length) toast({ title: title(done.reduce((sum, result) => sum + result.changes, 0)),
-      action: !undoable.length ? undefined : { label: 'Undo', run: () => {
+      action: { label: 'Undo', run: () => {
         // Checked now: only a Machine still in the Fleet, under the same registration, whose Assignment is still what this update left.
         const now = active.current ? latest.current : undefined;
-        const current = now ? undoable.filter(result => registrationIn(now, result.machine) === result.registration
+        const current = now ? done.filter(result => registrationIn(now, result.machine) === result.registration
           && sameSnapshot(own(now.assignments, result.machine), result.snapshot)) : [];
         if (!current.length) {
           toast({ title: 'Undo is no longer available', description: 'The Machine or Fleet changed since this bulk update.' });
           return;
         }
-        const changed = undoable.length - current.length;
+        const changed = done.length - current.length;
         void (async () => {
         // The authority checks again as it writes: a newer Assignment, or a new registration, refuses the Undo.
         const results = await Promise.all(current.map(async result => {
@@ -290,6 +302,7 @@ function AuthorityMatrix({ revision, status, target, openLog }: MatrixProps) {
         <span className="inline-flex items-center gap-1.5"><CheckboxSwatch explicit={false} enabled /><CheckboxSwatch explicit={false} enabled={false} />{terms.inheritedLong}</span>
       </div>
     </PanelToolbar>
+    {!standalone && <OrphanToggles revision={revision} machine={data.fleet.machines.find(row => row.id === status.machine_id)} changed={() => void resource.refresh()} />}
     <span id="default-hint" className="sr-only">{defaultHint}</span>
     {groups.length > 0 && <div className="overflow-hidden [&_[data-slot=table-container]]:max-h-[max(24rem,calc(100svh-9rem))] [&_[data-slot=table-container]]:scroll-pt-[4.5rem]"><Table aria-label="Assignment matrix" stickyFirstColumn>
       <TableHeader><TableRow className="bg-muted hover:bg-muted">
@@ -312,7 +325,7 @@ function AuthorityMatrix({ revision, status, target, openLog }: MatrixProps) {
         {segments(c => <TableHead key={`${c.machine}/${c.harness}`} scope="col" className={cn(headEdge, 'top-10 h-8 min-w-28 font-mono text-xs font-normal text-muted-foreground')}><div className="flex items-center justify-between gap-1">{c.harness}{menu(`Actions for ${c.machine} / ${c.harness}`, [
           { label: 'Enable all visible items', run: () => columnBulk(c, true) },
           { label: 'Disable all visible items', run: () => columnBulk(c, false) },
-        ], !!pending.get(c.machine) || !items.some(item => item.in_baseline || c.machine === status.machine_id))}</div></TableHead>,
+        ], !!pending.get(c.machine) || !items.some(item => available(item, c.machine)))}</div></TableHead>,
         g => g.loaded ? <TableHead key={`${g.machine.id}/collapsed`} scope="col" className={cn(headEdge, 'top-10 h-8 text-xs font-normal text-muted-foreground')}>{count(g.harnesses.length, 'Harness', 'Harnesses')}</TableHead>
           : <TableHead key={`${g.machine.id}/unavailable`} scope="col" className={cn(headEdge, 'top-10 h-auto min-w-56 py-1.5 text-xs font-normal whitespace-normal')}>
             <div role="alert" className="flex items-start justify-between gap-2"><span className="min-w-0 break-words text-destructive-foreground">Assignment not loaded: {own(data.failed, g.machine.id)}</span>
@@ -334,22 +347,22 @@ function AuthorityMatrix({ revision, status, target, openLog }: MatrixProps) {
               <Switch.Thumb className="size-3.5 rounded-full bg-card shadow-sm transition-transform data-checked:translate-x-3.5" /></Switch.Root></label></TableCell>,
           g => <TableCell key={`${g.machine.id}/${g.loaded ? 'collapsed' : 'unavailable'}`} className="border-l" />)}
         </TableRow>)}
-        {items.map(item => <TableRow key={item.item}>
+        {items.map(item => <TableRow key={item.id!}>
           <TableHead scope="row" className="sticky left-0 z-10 h-14 min-w-60 max-w-80 bg-background py-2 pr-9 font-normal whitespace-normal">
-            <div className="flex flex-wrap items-center gap-2"><span className="text-sm font-medium">{splitItem(item.item).name}</span><KindBadge kind={splitItem(item.item).kind} />
-              {new Set(columns.map(c => cellState(assignment(c.machine), c.harness, item.item).enabled)).size > 1 &&
+            <div className="flex flex-wrap items-center gap-2"><span className="text-sm font-medium" title={item.id ?? undefined}>{splitItem(item.item).name}</span><KindBadge kind={splitItem(item.item).kind} />
+              {new Set(columns.map(c => cellState(assignment(c.machine), c.harness, item.item, item.id).enabled)).size > 1 &&
                 <Tooltip><TooltipTrigger render={<Badge variant="secondary" tabIndex={0} />}>Mixed</TooltipTrigger><TooltipContent>Enabled in some visible Harnesses and disabled in others.</TooltipContent></Tooltip>}
               <span className="absolute top-1/2 right-2 -translate-y-1/2">{menu(`Actions for ${item.item}`, [
                 { label: 'Enable in all visible Harnesses', run: () => rowBulk(item, true) },
                 { label: 'Disable in all visible Harnesses', run: () => rowBulk(item, false) },
                 { label: 'Reset all to default', run: () => rowBulk(item, null) },
-              ], !columns.length || columns.some(c => pending.get(c.machine)) || !columns.some(c => item.in_baseline || c.machine === status.machine_id))}</span>
+              ], !columns.length || columns.some(c => pending.get(c.machine)) || !columns.some(c => available(item, c.machine)))}</span>
               {itemStateLabel(item) && <Badge variant="info">{itemStateLabel(item)}</Badge>}</div>
             {item.description && <p className="mt-1 text-xs text-muted-foreground">{item.description}</p>}
           </TableHead>
           {segments(c => cell(item, c.machine, c.harness), g => {
             if (!g.loaded) return <TableCell key={`${g.machine.id}/unavailable`} className="border-l" />;
-            const on = g.harnesses.filter(harness => cellState(assignment(g.machine.id), harness, item.item).enabled).length;
+            const on = g.harnesses.filter(harness => cellState(assignment(g.machine.id), harness, item.item, item.id).enabled).length;
             return <TableCell key={`${g.machine.id}/collapsed`} className="border-l text-center text-xs text-muted-foreground tabular-nums">
               <span aria-hidden>{on}/{g.harnesses.length}</span><span className="sr-only">Enabled in {on} of {count(g.harnesses.length, 'Harness', 'Harnesses')}</span></TableCell>;
           })}
@@ -362,4 +375,20 @@ function AuthorityMatrix({ revision, status, target, openLog }: MatrixProps) {
       {selected.length ? 'No Harnesses reported. Check the Machine configuration in Settings.' : 'Choose Machines above to show their Harnesses.'}</Nothing>}
     </Panel>
   </>;
+}
+
+
+function OrphanToggles({ revision, machine, changed }: { revision: number; machine?: MachineRow; changed: () => void }) {
+  const resource = useResource(api.orphans, revision);
+  const count = resource.data?.orphans.length ?? 0;
+  if (count === 0) return null;
+  const self = machine?.scope === 'self';
+  const own = resource.data?.orphans.filter(orphan => orphan.machine === machine?.id).length ?? 0;
+  return <PanelToolbar>
+    <span className="text-sm">{count} {count === 1 ? 'toggle' : 'toggles'} for items that no longer exist</span>
+    {(!self || own > 0) && <Confirm label="Clear" title="Clear orphan toggles?"
+      description={self ? 'Clear orphan toggles for this Machine.' : 'Clear orphan toggles across the Fleet.'}
+      confirmLabel="Clear" triggerVariant="outline" action={() => api.pruneOrphans()}
+      onDone={() => { void resource.refresh(); changed(); }} />}
+  </PanelToolbar>;
 }

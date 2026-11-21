@@ -6,7 +6,7 @@ import { api } from './api';
 import type { LogCause, LogEntry } from './types';
 vi.mock('./api', () => ({ api: { log: vi.fn(), logFacets: vi.fn(), fleet: vi.fn() }, errorMessage: String }));
 afterEach(() => { cleanup(); vi.resetAllMocks(); });
-const entry = (id: number, cause: LogCause = { type: 'change' }): LogEntry => ({ id, machine: 'laptop', harness: 'claude', name: 'pdf', kind: 'skill', before: true, after: false, at: 1, author: 'alice', cause });
+const entry = (id: number, cause: LogCause = { type: 'change' }): LogEntry => ({ id, machine: 'laptop', harness: 'claude', name: 'pdf', item_id: 'pdf', kind: 'skill', before: true, after: false, at: 1, author: 'alice', cause });
 it('queries filters on the server and resets pagination', async () => {
   vi.mocked(api.log).mockImplementation(async query => query.item ? [] : Array.from({ length: 50 }, (_, i) => entry((query.before ?? 101) - 1 - i)));
   vi.mocked(api.logFacets).mockRejectedValue(new Error('unavailable'));
@@ -35,12 +35,12 @@ it('loads global facets and refreshes them with revision', async () => {
   await waitFor(() => expect(api.logFacets).toHaveBeenCalledTimes(2));
 });
 it('shows entry IDs and readable causes', async () => {
-  const causes: LogCause[] = [{ type: 'undo', entry: 101 }, { type: 'item_removed' }, { type: 'default_materialized' }, { type: 'machine_removed' }, { type: 'harness_added' }];
+  const causes: LogCause[] = [{ type: 'undo', entry: 101 }, { type: 'orphan_pruned' }, { type: 'default_materialized' }, { type: 'machine_removed' }, { type: 'harness_added' }];
   vi.mocked(api.log).mockResolvedValue(causes.map((cause, i) => entry(105 - i, cause)));
   vi.mocked(api.fleet).mockResolvedValue({ baseline: null, machines: [] });
   render(<Log revision={0} changed={() => {}} />);
   await screen.findByText('#101');
-  for (const label of ['Restored #101', 'Item removed', 'Default applied', 'Machine removed', 'Harness added']) expect(screen.getAllByText(label).length).toBeGreaterThan(0);
+  for (const label of ['Restored #101', 'Orphan cleared', 'Default applied', 'Machine removed', 'Harness added']) expect(screen.getAllByText(label).length).toBeGreaterThan(0);
 });
 it('holds pagination until a typed search is applied, so a stale cursor is never reused', async () => {
   vi.mocked(api.log).mockImplementation(async query => Array.from({ length: 50 }, (_, i) => entry((query.before ?? 101) - 1 - i)));

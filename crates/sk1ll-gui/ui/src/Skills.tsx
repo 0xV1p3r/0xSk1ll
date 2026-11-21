@@ -10,7 +10,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { toast } from './toast';
-import { api, errorStatus } from './api';
+import { api } from './api';
 import { useMutation, useResource } from './hooks';
 import { ChangeBadge, Confirm, DiffLines, ErrorNotice, Loading, Nothing, Notice, Panel, PanelToolbar, Pending, SectionTitle } from './shared';
 import { terms } from './model';
@@ -217,8 +217,6 @@ function SkillDetail({ entry, entries, close, initialHarness, revision, changed,
   const [comparing, setComparing] = useState(false);
   const [renaming, setRenaming] = useState(false), [renameTo, setRenameTo] = useState(entry.name);
   const rename = useMutation();
-  // The Daemon refused the rename because this Machine's Assignment could not be copied first (HTTP 409).
-  const [copyRefused, setCopyRefused] = useState(false);
   const kind = entry.type === 'rule' ? 'rule' : 'skill';
   const renameError = !renameTo ? 'Enter a name' : (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(renameTo) || renameTo.includes('..')) ? 'Use letters, numbers, dots, underscores or hyphens; start with a letter or number.' : renameTo === entry.name ? 'Choose a different name.' : entries.some(value => (kind === 'rule' ? value.type === 'rule' : value.type !== 'rule') && value.name.toLowerCase() === renameTo.toLowerCase()) ? 'This name is already taken.' : '';
   const [confirmation, setConfirmation] = useState<{ editorId?: string }>();
@@ -255,15 +253,11 @@ function SkillDetail({ entry, entries, close, initialHarness, revision, changed,
   const disabledReason = needsServer ? 'Needs a connection to the Server' : entry.clashes_with_repo ? 'Name clashes with a repo Skill'
     : clash ? 'This variant differs from the personal copy of an interrupted Adopt' : !editors.data ? '' : !preferred ? 'No editors found' : '';
   const edit = (editorId: string) => { if (needsConversion) setConfirmation({ editorId }); else execute(editorId); };
-  // The Daemon copies the Assignment first; without the copy, the new name follows the Harness defaults.
-  const submitRename = (copy: boolean) => void rename.run(async () => {
-    try { return await api.renameItem({ kind, name: entry.name, to: renameTo, ...!copy && { copy_assignment: false } }); }
-    catch (error) { setCopyRefused(copy && errorStatus(error) === 409); throw error; }
-  }, result => {
-    const kept = result.kept?.length ? ` ${result.kept.join(', ')} kept the Assignment ${renameTo} already had.` : '';
-    toast({ title: `Renamed to ${renameTo}`, description: copy ? kept.trim() || undefined : "This Machine's Assignment was not copied." });
-    setRenaming(false); setCopyRefused(false);
-    converted({ ...entry, name: renameTo, item: result.item, draft: 'added', in_baseline: false, enabled_harnesses: copy ? entry.enabled_harnesses : [] }); changed();
+  const submitRename = () => void rename.run(() => api.renameItem({ kind, name: entry.name, to: renameTo }), result => {
+    toast({ title: `Renamed to ${renameTo}` });
+    setRenaming(false);
+    converted({ ...entry, name: renameTo, item: result.item, draft: 'added', in_baseline: false });
+    changed();
   });
   return <>
     <div className="flex shrink-0 flex-wrap items-start justify-between gap-x-6 gap-y-3 border-b border-border px-5 py-4 pr-12">
@@ -275,7 +269,7 @@ function SkillDetail({ entry, entries, close, initialHarness, revision, changed,
       </DialogHeader>
       <div className="flex flex-col items-end gap-1.5"><div className="flex flex-wrap justify-end gap-2">
         {(entry.type === 'personal' || entry.type === 'rule') && entry.draft !== 'deleted' && <>
-          <Button variant="outline" size="sm" onClick={() => { if (!canLeave()) return; setRenameTo(entry.name); setCopyRefused(false); setRenaming(true); }}>Rename…</Button>
+          <Button variant="outline" size="sm" onClick={() => { if (!canLeave()) return; setRenameTo(entry.name); setRenaming(true); }}>Rename…</Button>
           <Confirm label="Delete…" confirmLabel="Delete" triggerVariant="outline" title={`Delete ${entry.name}?`} description={connection === 'standalone' ? "This removes it from this Machine's Draft. Commit saves the deletion to the local repository." : "This removes it from this Machine's Draft. The deletion reaches other Machines after you commit and push it and they sync."} action={async () => { if (!canLeave()) throw new Error('Save or cancel your edits before deleting this item.'); await api.deleteItem({ kind, name: entry.name }); }} onDone={() => { toast({ title: `${entry.name} deleted in Draft` }); close(); changed(); }} />
         </>}
         {(entry.draft || fileSaved) && <Button ref={reviewButton} variant="outline" size="default" onClick={reviewDraft}>Review in Draft</Button>}
@@ -317,13 +311,11 @@ function SkillDetail({ entry, entries, close, initialHarness, revision, changed,
         : <SkillBrowser canLeave={canLeave} editor={(entry.type === 'personal' || entry.type === 'rule') ? { writable: entry.draft !== 'deleted', changed: () => { setFileSaved(true); changed(); }, guard } : undefined} key={`${item}:${hash}:${harness}`} query={query} revision={revision} />}
     </div>
     <Dialog open={renaming} onOpenChange={open => { if (!rename.pending) setRenaming(open); }}><DialogContent showCloseButton={!rename.pending}><DialogHeader><DialogTitle>Rename {entry.name}</DialogTitle><DialogDescription>Rename this item in Draft.</DialogDescription></DialogHeader>
-      <form className="flex flex-col gap-4" onSubmit={event => { event.preventDefault(); if (!renameError && !rename.pending) submitRename(true); }}>
-        <FieldGroup><Field data-invalid={!!renameError}><FieldLabel htmlFor="rename-name">Name</FieldLabel><Input id="rename-name" value={renameTo} onChange={event => { setRenameTo(event.target.value); setCopyRefused(false); }} aria-invalid={!!renameError} aria-describedby="rename-error" />{renameError && <FieldError id="rename-error">{renameError}</FieldError>}</Field></FieldGroup>
-        <Notice title="Assignment changes">Assignment toggles carry over on this Machine only. Other Machines use each Harness's default for the new name after you Commit and Push.</Notice><ErrorNotice error={rename.error} />
-        {copyRefused && <Notice title="Rename without copying Assignment?" tone="destructive">Nothing was renamed. You can still rename, but this Machine's Assignment toggles stay with {entry.name}: {renameTo} follows each Harness's default here until you set them again.</Notice>}
+      <form className="flex flex-col gap-4" onSubmit={event => { event.preventDefault(); if (!renameError && !rename.pending) submitRename(); }}>
+        <FieldGroup><Field data-invalid={!!renameError}><FieldLabel htmlFor="rename-name">Name</FieldLabel><Input id="rename-name" value={renameTo} onChange={event => { setRenameTo(event.target.value); }} aria-invalid={!!renameError} aria-describedby="rename-error" />{renameError && <FieldError id="rename-error">{renameError}</FieldError>}</Field></FieldGroup>
+        <ErrorNotice error={rename.error} />
         <DialogFooter><Button type="button" variant="outline" disabled={rename.pending} onClick={() => setRenaming(false)}>Cancel</Button>
-          {copyRefused && <Button type="button" variant="destructive" disabled={!!renameError || rename.pending} onClick={() => submitRename(false)}>Rename without copying Assignment</Button>}
-          <Button type="submit" disabled={!!renameError || rename.pending}><Pending pending={rename.pending}>{copyRefused ? 'Try again' : 'Rename'}</Pending></Button></DialogFooter>
+          <Button type="submit" disabled={!!renameError || rename.pending}><Pending pending={rename.pending}>Rename</Pending></Button></DialogFooter>
       </form></DialogContent></Dialog>
     <Dialog open={!!confirmation} onOpenChange={open => { if (!open && !mutation.pending) setConfirmation(undefined); }}>
       <DialogContent finalFocus={() => needsConversion ? confirmationTrigger.current : reviewButton.current} showCloseButton={!mutation.pending}><DialogHeader><DialogTitle>{entry.type === 'import' ? 'Fork' : resuming ? 'Resume adopting' : 'Adopt'} {entry.name}?</DialogTitle>

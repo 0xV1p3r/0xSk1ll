@@ -116,7 +116,6 @@ export function ChangeDialog({ change, onClose, onApplied }: { change: HarnessCh
   const preview = useResource(load, 0);
   const [failed, setFailed] = useState<string[]>();
   const apply = useMutation();
-  const [warning, setWarning] = useState<string | null>(null);
   const refreshPreview = () => {
     preview.setData(undefined);
     return preview.refresh();
@@ -139,14 +138,12 @@ export function ChangeDialog({ change, onClose, onApplied }: { change: HarnessCh
             {managed > 0 && preview.data.before && <div className="mt-2 flex flex-col items-start gap-1">
               <Button variant="outline" size="sm" disabled={busy} onClick={() => void turnOff.run(async () => {
                 const result = await api.setHarnessAssignment(change.name, false);
-                setWarning(result.warning);
-                if (result.update.errors?.length) {
-                  throw new Error(`Assignment saved, but sync failed: ${result.update.errors.join('\n')}`);
+                if (result.errors?.length) {
+                  throw new Error(`Assignment saved, but sync failed: ${result.errors.join('\n')}`);
                 }
                 toast({ title: `Turned off ${change.name}'s items`, description: 'Sync removes what it placed there; copies edited by hand stay.' });
               })}><Pending pending={turnOff.pending}>Turn off this Harness's items first</Pending></Button>
               <p className="text-xs text-muted-foreground">Sets every Skill and Rule off for {change.name} in the Assignment, so sync takes out what it placed. Then preview again.</p></div>}</>}
-          {warning && <p role="status" className="text-sm text-muted-foreground">{warning}</p>}
           <ErrorNotice error={turnOff.error} />
         </section>
         <section aria-label="Then sync"><h3 className="text-sm font-medium">Then sync</h3>

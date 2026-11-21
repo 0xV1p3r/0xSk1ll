@@ -48,7 +48,7 @@ export function JoinCodeButton({ label, serverUrl, variant = 'outline', scope: o
     <p className="text-xs text-muted-foreground">{scope === 'fleet' ? 'Whole Fleet' : 'Only itself'}: the new Machine {scopeSummary[scope].charAt(0).toLowerCase() + scopeSummary[scope].slice(1)}</p>
     <Dialog open={joinCode !== undefined} onOpenChange={open => { if (!open) setJoinCode(undefined); }}>
       <DialogContent finalFocus={trigger}><DialogHeader><DialogTitle>Join code</DialogTitle>
-        <DialogDescription>Copy this single-use code now. It cannot be shown again and {joinCode?.expires_at != null ? <>expires {time(joinCode.expires_at)}.</> : <>expires after 24 hours by default. The Server operator can change the expiry with SK1LL_SERVER_JOIN_CODE_TTL.</>}
+        <DialogDescription>Copy this single-use code now. It cannot be shown again{joinCode && <> and expires {time(joinCode.expires_at)}.</>}
           {' '}On the new Machine, enter the code under Settings → Join / rejoin this Machine{command ? ', or run the command below.' : '.'}</DialogDescription></DialogHeader>
         <code className="rounded-md border bg-muted px-3 py-2 font-mono text-base break-all select-all">{joinCode?.code}</code>
         <p className="text-sm text-muted-foreground"><span className="font-medium text-foreground">{(joinCode?.scope ?? 'fleet') === 'fleet' ? 'Whole Fleet' : 'Only itself'}.</span> {scopeSummary[joinCode?.scope ?? 'fleet']}</p>
@@ -69,7 +69,6 @@ export function Settings({ revision, fleetRevision = revision, status, socket, c
     ['Repository', status.repo], ['Origin', status.has_origin ? 'Configured' : 'None'],
     ['Socket', socket], ['Assignment revision', status.assignment_revision],
   ];
-  if (status.pending_discards > 0) diagnostics.push(['Pending Restore reports', status.pending_discards]);
   if (status.auth_rejected_since !== null) diagnostics.push(['Auth rejected since', time(status.auth_rejected_since)]);
   const fleet = useResource(api.fleet, fleetRevision, undefined, !standalone);
   const saveEditor = useMutation();
