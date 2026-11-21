@@ -2311,6 +2311,7 @@ async fn standalone_commits_locally_and_pushes_and_pulls_its_own_origin() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refresh_finishes_a_pull_that_stopped_half_way() {
+    use sk1ll_daemon::client::{PullResult, SyncRequest};
     use std::os::unix::fs::PermissionsExt;
     let mut m = Machine::new("solo");
     sk1ll_core::Repo::init(&m.repo()).unwrap();
@@ -2341,6 +2342,25 @@ async fn a_refresh_finishes_a_pull_that_stopped_half_way() {
     assert!(journal.exists());
     let rule = std::fs::read_to_string(m.repo().join("instructions/git.md")).unwrap();
     assert_eq!(rule, "Use Conventional Commits.", "rolled forward, never back");
+    let report = m.status().await.report;
+    assert_eq!(report.pull_pending, Some(vec![]));
+    assert!(report.drafts.is_empty(), "the partial checkout is not a Draft");
+    assert_eq!(m.harness_skill("pdf").as_deref(), Some("initial"));
+    let error = m.client.sync(&SyncRequest { force: true, ..Default::default() }).await.unwrap_err();
+    assert!(error.to_string().contains("pull pending"), "{error}");
+
+    // An editor can still write to a file in the read-only directory.
+    m.write("personal/pdf/SKILL.md", "saved while pull was pending");
+    let pdf_item = ItemRef::Skill("pdf".into());
+    eventually(|| async {
+        let report = m.status().await.report;
+        (report.pull_pending.as_deref() == Some(std::slice::from_ref(&pdf_item))).then_some(())
+    })
+    .await;
+    assert_eq!(m.harness_skill("pdf").as_deref(), Some("initial"));
+    assert!(m.status().await.report.drafts.is_empty());
+    assert!(matches!(m.client.pull().await.unwrap(), PullResult::Blocked { pending: true, .. }));
+    m.write("personal/pdf/SKILL.md", "initial");
     mode(0o755);
 
     // Any refresh finishes it; this one follows a draft edit.
@@ -2349,7 +2369,11 @@ async fn a_refresh_finishes_a_pull_that_stopped_half_way() {
     eventually(|| async { (m.harness_skill("pdf").as_deref() == Some("remote edit")).then_some(()) }).await;
     assert_eq!(git(&m.repo(), &["symbolic-ref", "HEAD"]), "refs/heads/main");
     assert_eq!(git(&m.repo(), &["status", "--porcelain"]), "?? notes.txt");
-    assert_ne!(m.status().await.headline, MachineStatus::Blocked);
+    eventually(|| async {
+        let status = m.status().await;
+        (status.report.pull_pending.is_none() && status.headline != MachineStatus::Blocked).then_some(())
+    })
+    .await;
     assert!(m.log().contains("finished a pull that had stopped half-way"), "{}", m.log());
 }
 

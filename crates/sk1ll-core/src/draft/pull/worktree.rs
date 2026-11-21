@@ -1,29 +1,7 @@
-//! Pull's changes to the working tree, one path at a time, each only while
-//! the path holds what pull last saw there.
-//!
-//! Every path is reached through pinned directory descriptors, never
-//! following a symlink. What pull replaces or removes goes to the recovery
-//! area first (see [`crate::sync::displaced`]), as a [`Kind::Draft`] entry
-//! in the git directory, and is checked there:
-//!
-//! - A file is hard-linked into its entry, checked against what pull saw,
-//!   and only then replaced, by a rename that swaps the new file in (where
-//!   the platform can exchange two names, see [`exchange`]). If a save
-//!   renamed its own file into place after the check, the exchange brings
-//!   that file out again, and it goes to a recovery entry of its own. A
-//!   write through a descriptor opened earlier lands in the entry, which is
-//!   checked once more afterwards. Either way the result is the
-//!   [`Error::Displaced`] that says where the save is.
-//! - A file pull removes is moved into its entry, and put back if it isn't
-//!   what pull saw.
-//! - A new file is linked into place, which never replaces anything.
-//!
-//! Replacements are staged in the git directory, named by their place in
-//! the journal, so that a later pull can tell what an interrupted one left
-//! there (see [`Worktree::tidy`]).
-//!
-//! Only Unix has the descriptor-relative calls this needs; elsewhere
-//! [`Worktree::open`] refuses, before anything changes.
+//! Pinned, descriptor-relative publication for Pull. A prepared addition
+//! consumes its staging slot, a removal fills its recovery entry, and an
+//! exchange changes the staging slot's inode. A resumed Pull reads that
+//! evidence before looking at the destination.
 
 #[cfg(unix)]
 pub(super) use unix::Worktree;
@@ -81,11 +59,11 @@ mod unix {
     use rustix::fs::{self as fd, AtFlags, CWD, FileType, Mode, OFlags};
     use rustix::io::Errno;
 
-    use super::super::journal::Journal;
-    use super::super::{Before, Entry, Hook};
+    use super::super::journal::{Inode, Operation};
+    use super::super::{Before, Change, Hook};
     use super::{Content, Kind, Node, Outcome};
     use crate::placement::Directory;
-    use crate::sync::displaced::{self, Displacing, PULL, leaf_fingerprint};
+    use crate::sync::displaced::{self, Displacing, Entry, PULL, leaf_fingerprint};
     use crate::{Error, IoExt, Result};
 
     /// The working tree, pinned at its top level.
@@ -125,184 +103,223 @@ mod unix {
             }
         }
 
-        /// Deals with what an interrupted pull left staged: a file that is
-        /// also somewhere else (a replacement linked into place, or old
-        /// content that is in its recovery entry too) goes, and so does
-        /// one that holds the content pull stages for that path. Anything
-        /// else (a directory too) is what a swap brought out of the working
-        /// tree, which goes to the recovery area.
-        pub(in super::super) fn tidy(
-            &self,
-            journal: &Journal,
-            content: impl Fn(&Entry, &Path) -> Result<Content>,
-        ) -> Result<()> {
-            let names = match fs::read_dir(&self.stage) {
-                Ok(names) => names,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        /// Test the publication primitives before creating a journal.
+        pub(in super::super) fn preflight(&self, changes: &[Change]) -> Result<()> {
+            if changes.is_empty() {
+                return Ok(());
+            }
+            match fs::read_dir(&self.stage) {
+                Ok(mut slots) => {
+                    if slots.next().is_some() {
+                        return Err(Error::Invalid(format!(
+                            "pull staging is left at {} without a journal",
+                            self.stage.display()
+                        )));
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e).at(&self.stage),
-            };
-            for name in names {
-                let staged = name.at(&self.stage)?.path();
-                let meta = fs::symlink_metadata(&staged).at(&staged)?;
-                let change = staged
-                    .file_name()
-                    .and_then(|n| n.to_str()?.parse::<usize>().ok())
-                    .and_then(|i| journal.changes.get(i));
-                let ours = !meta.is_dir()
-                    && (meta.nlink() > 1
-                        || match change.and_then(|c| Some((c.new.as_ref()?, &c.path))) {
-                            Some((entry, path)) => holds(&staged, &content(entry, path)?)?,
-                            None => false,
-                        });
-                if ours {
-                    fs::remove_file(&staged).at(&staged)?;
-                } else {
-                    let dest = change.map_or_else(|| staged.clone(), |c| self.root.join(&c.path));
-                    displaced::rescue(Kind::Draft, PULL, &dest, &staged, None, &self.holder)?;
+            }
+            let holder = crate::placement::open_directory(&self.holder, false).at(&self.holder)?;
+            for change in changes {
+                // Find the nearest parent reached without following a symlink.
+                for at in change.path.ancestors().filter(|at| !at.as_os_str().is_empty()) {
+                    let (parent, name) = match self.dir.parent(at, false) {
+                        Ok(found) => found,
+                        Err(e) if missing(&e) => continue,
+                        Err(e) => return Err(e).at(self.root.join(at)),
+                    };
+                    let path = self.root.join(at);
+                    let same = same_mount(&holder, &parent).at(&path)?;
+                    let leaf = fd::openat(&parent, &name, crate::placement::DIRECTORY, Mode::empty());
+                    if !same || matches!(leaf, Ok(dir) if !same_mount(&holder, &dir).at(&path)?) {
+                        return Err(Error::Invalid(format!("pull cannot cross a mount at {}", path.display())));
+                    }
+                    break;
                 }
             }
-            Ok(())
+            let probe = self.holder.join("sk1ll-pull-probe");
+            let first = probe.join("first");
+            let second = probe.join("second");
+            let _ = fs::remove_dir_all(&probe);
+            fs::DirBuilder::new().mode(0o700).create(&probe).at(&probe)?;
+            let result = (|| {
+                fs::write(&first, []).at(&first)?;
+                fs::write(&second, []).at(&second)?;
+                let dir = Directory::open(&probe, false).at(&probe)?;
+                let (parent, name) = dir.parent(Path::new("second"), false).at(&probe)?;
+                if changes.iter().any(|c| c.old.is_some() && c.new.is_some()) {
+                    exchange(&first, &parent, &name).map_err(|e| {
+                        Error::Invalid(format!("pull needs atomic file exchange on {} ({e})", self.root.display()))
+                    })?;
+                }
+                if changes.iter().any(|c| c.new.is_some()) {
+                    let (_, vacant) = dir.parent(Path::new("vacant"), false).at(&probe)?;
+                    publish(&first, &parent, &vacant).map_err(|e| {
+                        Error::Invalid(format!("pull needs no-replace rename on {} ({e})", self.root.display()))
+                    })?;
+                }
+                Ok(())
+            })();
+            let _ = fs::remove_dir_all(&probe);
+            result
         }
 
-        /// Removes the file or symlink at `path`, which held `node`.
-        pub(in super::super) fn remove(&self, path: &Path, node: &Node) -> Result<Outcome> {
-            let dest = self.root.join(path);
-            let (parent, name) = match self.dir.parent(path, false) {
-                Ok(found) => found,
-                Err(e) if missing(&e) => return Ok(Outcome::Done(None)),
-                Err(e) => return Err(e).at(&dest),
-            };
-            let mut held = Displacing::begin(Kind::Draft, PULL, &dest, Some(&fingerprint(node)), &self.holder)?;
-            match held.take_at(&parent, &name) {
-                Ok(true) => {}
-                // Gone already: nothing to remove.
-                Ok(false) => {
-                    held.abandon();
-                    return Ok(Outcome::Done(None));
-                }
-                Err(e) => {
-                    held.abandon();
-                    return Err(e);
-                }
-            }
-            match held.intact() {
-                Ok(true) => Ok(Outcome::Done(held.finish()?)),
-                verdict => match held.put_back_at(&parent, &name) {
-                    // Put back, or kept as changed if something new is there.
-                    Ok(()) | Err(Error::Displaced { .. }) => verdict.map(|_| Outcome::Changed),
-                    Err(e) => Err(e),
-                },
-            }
-        }
-
-        /// Puts `content` at `path`, where `node` (nothing, or a directory
-        /// that must be empty) is.
-        pub(in super::super) fn create(
+        pub(in super::super) fn prepare(
             &self,
             i: usize,
             path: &Path,
-            content: &Content,
-            node: &Node,
-        ) -> Result<Outcome> {
+            old: &Node,
+            content: Option<&Content>,
+            keep_mode: bool,
+        ) -> Result<Operation> {
             let dest = self.root.join(path);
-            let (parent, name) = match self.dir.parent(path, true) {
-                Ok(found) => found,
-                // Not a directory (or a symlink to one) on the way.
-                Err(e) if matches!(e.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP | libc::EEXIST)) => {
-                    return Ok(Outcome::Changed);
-                }
-                Err(e) => return Err(e).at(&dest),
+            let existing = matches!(old, Node::File { .. } | Node::Link(_));
+            let recovery = || {
+                Displacing::begin(Kind::Draft, PULL, &dest, Some(&fingerprint(old)), &self.holder)
+                    .map(|held| held.id().to_string())
             };
-            if *node == Node::Directory {
-                match fd::unlinkat(&parent, &name, AtFlags::REMOVEDIR) {
-                    Ok(()) | Err(Errno::NOENT) => {}
-                    Err(Errno::NOTEMPTY | Errno::EXIST | Errno::NOTDIR) => return Ok(Outcome::Changed),
-                    Err(e) => return Err(io::Error::from(e)).at(&dest),
-                }
-            }
-            let created = match content {
-                Content::Link(target) => fd::symlinkat(OsStr::from_bytes(target), &parent, &name),
-                Content::File { .. } => {
-                    let staged = self.stage(i, content, None)?;
-                    let linked = fd::linkat(CWD, &staged, &parent, &name, AtFlags::empty());
-                    fs::remove_file(&staged).at(&staged)?;
-                    linked
-                }
+            let Some(content) = content else {
+                return Ok(Operation::Remove { recovery: recovery()? });
             };
-            match created {
-                Ok(()) => Ok(Outcome::Done(None)),
-                Err(Errno::EXIST) => Ok(Outcome::Changed),
-                Err(e) => Err(io::Error::from(e)).at(&dest),
+            let mode = match (old, content) {
+                (Node::File { mode, .. }, Content::File { executable, .. }) => {
+                    Some(if keep_mode { *mode } else { permissions(*mode, *executable) })
+                }
+                _ => None,
+            };
+            let slot = self.slot(i);
+            // Before an operation is recorded, its slot only contains our
+            // own unpublished file, possibly left by an interrupted write.
+            remove_file(&slot)?;
+            self.stage(i, content, mode)?;
+            if existing {
+                let staged = inode(&slot)?.ok_or_else(|| Error::Invalid("pull's staged file is missing".into()))?;
+                Ok(Operation::Replace { recovery: recovery()?, staged })
+            } else {
+                Ok(Operation::Add)
             }
         }
 
-        /// Replaces the file or symlink at `path`, which held `node`, with
-        /// `content`. A replaced file keeps its permissions, apart from the
-        /// executable bits when `content` changes them.
-        pub(in super::super) fn replace(
+        /// Returns completion even if the destination has since changed.
+        pub(in super::super) fn completed(&self, i: usize, operation: &Operation) -> Result<Option<Outcome>> {
+            let slot = self.slot(i);
+            let completed = match operation {
+                Operation::Add => {
+                    return Ok(inode(&slot)?.is_none().then_some(Outcome::Done(None)));
+                }
+                Operation::Remove { recovery } => {
+                    let held = Displacing::draft(&self.holder, recovery)?;
+                    if !held.filled() {
+                        return Ok(None);
+                    }
+                    held
+                }
+                Operation::Replace { recovery, staged } => {
+                    let mut held = Displacing::draft(&self.holder, recovery)?;
+                    if !held.filled() {
+                        match inode(&slot)? {
+                            Some(at) if at == *staged => return Ok(None),
+                            Some(_) => held.take(&slot)?,
+                            None => {
+                                return Err(Error::Invalid(format!(
+                                    "pull's exchange slot {} is missing",
+                                    slot.display()
+                                )));
+                            }
+                        }
+                    }
+                    held
+                }
+            };
+            Ok(Some(Outcome::Done(completed.finish()?)))
+        }
+
+        pub(in super::super) fn apply(
             &self,
             i: usize,
             path: &Path,
             node: &Node,
-            content: &Content,
+            operation: &Operation,
             hook: Hook,
         ) -> Result<Outcome> {
             let dest = self.root.join(path);
-            let (parent, name) = match self.dir.parent(path, false) {
+            let (parent, name) = match self.dir.parent(path, matches!(operation, Operation::Add)) {
                 Ok(found) => found,
-                Err(e) if missing(&e) => return Ok(Outcome::Changed),
+                Err(e) if missing(&e) || e.kind() == io::ErrorKind::AlreadyExists => return Ok(Outcome::Changed),
                 Err(e) => return Err(e).at(&dest),
             };
-            let permissions = match (node, content) {
-                (Node::File { mode, .. }, Content::File { executable, .. }) => Some(permissions(*mode, *executable)),
-                _ => None,
-            };
-            let staged = self.stage(i, content, permissions)?;
-            let unstage = || fs::remove_file(&staged).at(&staged);
-            let mut held = match Displacing::begin(Kind::Draft, PULL, &dest, Some(&fingerprint(node)), &self.holder) {
-                Ok(held) => held,
-                Err(e) => {
-                    unstage()?;
-                    return Err(e);
+            let slot = self.slot(i);
+            let out = match operation {
+                Operation::Add => {
+                    match read(&parent, &name).at(&dest)? {
+                        Node::Directory if *node == Node::Directory => {
+                            if !prune_empty(&parent, &name).at(&dest)? {
+                                return Ok(Outcome::Changed);
+                            }
+                        }
+                        Node::Missing => {}
+                        _ => return Ok(Outcome::Changed),
+                    }
+                    publish(&slot, &parent, &name)
+                }
+                Operation::Remove { recovery } | Operation::Replace { recovery, .. } => {
+                    let mut held = Displacing::draft(&self.holder, recovery)?;
+                    if read(&parent, &name).at(&dest)? != *node || !held.expects(&fingerprint(node)) {
+                        return Ok(Outcome::Changed);
+                    }
+                    match operation {
+                        Operation::Remove { .. } => {
+                            hook(Before::Remove)?;
+                            if !held.take_at(&parent, &name)? {
+                                return Ok(Outcome::Changed);
+                            }
+                            Ok(())
+                        }
+                        _ => {
+                            hook(Before::Swap)?;
+                            exchange(&slot, &parent, &name)
+                        }
+                    }
                 }
             };
-            let verdict = match held.link_at(&parent, &name) {
-                Ok(true) => held.intact(),
-                Ok(false) => Ok(false),
-                Err(e) => Err(e),
-            };
-            if !matches!(verdict, Ok(true)) {
+            match out {
+                Ok(()) => {}
+                Err(Errno::NOENT | Errno::EXIST | Errno::NOTDIR | Errno::ISDIR) => return Ok(Outcome::Changed),
+                Err(e) => return Err(io::Error::from(e)).at(&dest),
+            }
+            hook(Before::Published)?;
+            self.completed(i, operation)?
+                .ok_or_else(|| Error::Invalid("pull's operation left no completion record".into()))
+        }
+
+        /// An interrupted adoption must leave both inodes reachable.
+        pub(in super::super) fn adopt(&self, path: &Path, node: &Node, entry: &Entry) -> Result<()> {
+            let dest = self.root.join(path);
+            let missing = *node == Node::Missing;
+            let (parent, name) = self.dir.parent(path, missing).at(&dest)?;
+            if read(&parent, &name).at(&dest)? != *node {
+                return Err(Error::Changed(format!("{} changed during recovery adoption", dest.display())));
+            }
+            if missing {
+                publish(&entry.path, &parent, &name).map_err(io::Error::from).at(&dest)?;
+                return Displacing::forget_empty(&entry.id);
+            }
+            let held = Displacing::begin(Kind::Draft, PULL, &dest, Some(&fingerprint(node)), &self.holder)?;
+            if let Err(error) = exchange(&entry.path, &parent, &name) {
                 held.abandon();
-                unstage()?;
-                return verdict.map(|_| Outcome::Changed);
+                return Err(io::Error::from(error)).at(&dest);
             }
-            hook(Before::Swap)?;
-            let out = match exchange(&staged, &parent, &name) {
-                Ok(out) => out,
-                // Deleted meanwhile, which stays so.
-                Err(Errno::NOENT) => {
-                    held.abandon();
-                    unstage()?;
-                    return Ok(Outcome::Changed);
-                }
-                Err(e) => {
-                    held.abandon();
-                    unstage()?;
-                    return Err(io::Error::from(e)).at(&dest);
-                }
-            };
-            // `staged` now holds what was at `path`: the old content, which
-            // its entry holds too, unless a save renamed its file in since.
-            let mut displaced = None;
-            if out {
-                if same_file(&staged, &held.content()) {
-                    unstage()?;
-                } else {
-                    let entry = displaced::rescue(Kind::Draft, PULL, &dest, &staged, None, &self.holder)?;
-                    displaced = Some(Error::Displaced { dest: dest.clone(), kept: entry.path, id: entry.id });
-                }
-            }
-            Ok(Outcome::Done(held.finish()?.or(displaced)))
+            let mut held = held;
+            // Until this move succeeds, the old destination is still at the
+            // original recovery entry. Neither name is ever unlinked here.
+            held.take(&entry.path)?;
+            Displacing::forget_empty(&entry.id)?;
+            held.finish()?.map_or(Ok(()), Err)
+        }
+
+        fn slot(&self, i: usize) -> PathBuf {
+            self.stage.join(i.to_string())
         }
 
         /// Removes the directories above `removed` that are empty now, as
@@ -332,7 +349,7 @@ mod unix {
                 Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e).at(&self.stage),
                 _ => {}
             }
-            let staged = self.stage.join(i.to_string());
+            let staged = self.slot(i);
             match content {
                 Content::Link(target) => std::os::unix::fs::symlink(OsStr::from_bytes(target), &staged).at(&staged)?,
                 Content::File { bytes, executable } => {
@@ -368,46 +385,107 @@ mod unix {
         }
     }
 
-    /// Moves `staged` to `name` in `parent`. Where it can, it exchanges the
-    /// two names, so that whatever was at `name` then ends up at `staged`
-    /// (`true`); otherwise it is replaced (`false`).
-    fn exchange(staged: &Path, parent: &OwnedFd, name: &OsStr) -> std::result::Result<bool, Errno> {
-        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-        match fd::renameat_with(CWD, staged, parent, name, fd::RenameFlags::EXCHANGE) {
-            Ok(()) => return Ok(true),
-            // A file system without the call: plain rename.
-            Err(Errno::INVAL | Errno::NOSYS | Errno::OPNOTSUPP) => {}
-            Err(e) => return Err(e),
+    fn exchange(staged: &Path, parent: &OwnedFd, name: &OsStr) -> std::result::Result<(), Errno> {
+        #[cfg(test)]
+        if NO_EXCHANGE.with(std::cell::Cell::get) {
+            return Err(Errno::OPNOTSUPP);
         }
-        fd::renameat(CWD, staged, parent, name).map(|()| false)
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        return fd::renameat_with(CWD, staged, parent, name, fd::RenameFlags::EXCHANGE);
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+        {
+            let _ = (staged, parent, name);
+            Err(Errno::OPNOTSUPP)
+        }
     }
 
-    /// [`displaced`]'s fingerprint of what `node` is.
+    fn publish(staged: &Path, parent: &OwnedFd, name: &OsStr) -> std::result::Result<(), Errno> {
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        return fd::renameat_with(CWD, staged, parent, name, fd::RenameFlags::NOREPLACE);
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+        {
+            let _ = (staged, parent, name);
+            Err(Errno::OPNOTSUPP)
+        }
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        pub(in crate::draft) static NO_EXCHANGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
     fn fingerprint(node: &Node) -> String {
         match node {
-            Node::File { bytes, .. } => leaf_fingerprint(false, bytes),
-            Node::Link(target) => leaf_fingerprint(true, target),
-            // Never displaced: only files and symlinks are replaced or removed.
+            Node::File { bytes, mode } => leaf_fingerprint(Some(*mode), bytes),
+            Node::Link(target) => leaf_fingerprint(None, target),
             Node::Missing | Node::Directory | Node::Other => String::new(),
         }
     }
 
-    fn same_file(a: &Path, b: &Path) -> bool {
-        match (fs::symlink_metadata(a), fs::symlink_metadata(b)) {
-            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
-            _ => false,
+    fn inode(path: &Path) -> Result<Option<Inode>> {
+        match fs::symlink_metadata(path) {
+            Ok(meta) => Ok(Some(Inode { device: meta.dev(), number: meta.ino() })),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).at(path),
         }
     }
 
-    /// Whether the staged file or symlink `staged` holds `content`.
-    fn holds(staged: &Path, content: &Content) -> Result<bool> {
-        let meta = fs::symlink_metadata(staged).at(staged)?;
-        Ok(match content {
-            Content::Link(target) => {
-                meta.file_type().is_symlink() && fs::read_link(staged).at(staged)?.as_os_str().as_bytes() == target
+    fn remove_file(path: &Path) -> Result<()> {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).at(path),
+        }
+    }
+
+    fn same_mount(a: &OwnedFd, b: &OwnedFd) -> io::Result<bool> {
+        if fd::fstat(a)?.st_dev != fd::fstat(b)?.st_dev {
+            return Ok(false);
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let mount_id = |dir: &OwnedFd| {
+                let mask = fd::StatxFlags::MNT_ID;
+                let stat = fd::statx(dir, "", AtFlags::EMPTY_PATH, mask).ok()?;
+                (stat.stx_mask & mask.bits() != 0).then_some(stat.stx_mnt_id)
+            };
+            if let (Some(a), Some(b)) = (mount_id(a), mount_id(b)) {
+                return Ok(a == b);
             }
-            Content::File { bytes, .. } => meta.is_file() && fs::read(staged).at(staged)? == *bytes,
-        })
+        }
+        Ok(true)
+    }
+
+    /// Removes empty descendants before their parent. Files, symlinks and
+    /// import staging directories are obstructions, even if empty.
+    fn prune_empty(parent: &OwnedFd, name: &OsStr) -> io::Result<bool> {
+        use crate::placement::DIRECTORY;
+        let dir = match fd::openat(parent, name, DIRECTORY, Mode::empty()) {
+            Ok(dir) => dir,
+            Err(Errno::NOENT) => return Ok(true),
+            Err(Errno::NOTDIR | Errno::LOOP) => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        if !same_mount(parent, &dir)? {
+            return Ok(false);
+        }
+        for entry in fd::Dir::read_from(&dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            if crate::source::is_staging_path(Path::new(OsStr::from_bytes(name)))
+                || !prune_empty(&dir, OsStr::from_bytes(name))?
+            {
+                return Ok(false);
+            }
+        }
+        match fd::unlinkat(parent, name, AtFlags::REMOVEDIR) {
+            Ok(()) | Err(Errno::NOENT) => Ok(true),
+            Err(Errno::NOTEMPTY | Errno::EXIST | Errno::NOTDIR) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
     }
 
     fn missing(error: &io::Error) -> bool {
@@ -448,53 +526,53 @@ mod unix {
     }
 }
 
+#[cfg(all(test, unix))]
+pub(in crate::draft) use unix::NO_EXCHANGE;
+
 #[cfg(not(unix))]
 mod other {
+    use super::super::{Change, Hook, journal::Operation};
+    use super::{Content, Node, Outcome};
+    use crate::sync::displaced::Entry;
+    use crate::{Error, Result};
     use std::path::Path;
 
-    use super::super::journal::Journal;
-    use super::super::{Entry, Hook};
-    use super::{Content, Node, Outcome};
-    use crate::{Error, Result};
-
-    /// Never opens: see the module docs.
     pub(in super::super) struct Worktree;
 
     impl Worktree {
         pub(in super::super) fn open(_: &Path, _: &Path) -> Result<Self> {
-            Err(Error::Invalid(
-                "pull can only change files on Unix; it fetched the new baseline but left the working tree, the \
-                 index and the branch as they were"
-                    .into(),
-            ))
+            Err(Error::Invalid("pull can only change files on Unix".into()))
         }
-
         pub(in super::super) fn read(&self, _: &Path) -> Result<Node> {
-            unreachable!("never opened")
+            unreachable!()
         }
-
-        pub(in super::super) fn tidy(&self, _: &Journal, _: impl Fn(&Entry, &Path) -> Result<Content>) -> Result<()> {
-            unreachable!("never opened")
+        pub(in super::super) fn preflight(&self, _: &[Change]) -> Result<()> {
+            unreachable!()
         }
-
-        pub(in super::super) fn remove(&self, _: &Path, _: &Node) -> Result<Outcome> {
-            unreachable!("never opened")
+        pub(in super::super) fn prepare(
+            &self,
+            _: usize,
+            _: &Path,
+            _: &Node,
+            _: Option<&Content>,
+            _: bool,
+        ) -> Result<Operation> {
+            unreachable!()
         }
-
-        pub(in super::super) fn create(&self, _: usize, _: &Path, _: &Content, _: &Node) -> Result<Outcome> {
-            unreachable!("never opened")
+        pub(in super::super) fn completed(&self, _: usize, _: &Operation) -> Result<Option<Outcome>> {
+            unreachable!()
         }
-
-        pub(in super::super) fn replace(&self, _: usize, _: &Path, _: &Node, _: &Content, _: Hook) -> Result<Outcome> {
-            unreachable!("never opened")
+        pub(in super::super) fn apply(&self, _: usize, _: &Path, _: &Node, _: &Operation, _: Hook) -> Result<Outcome> {
+            unreachable!()
         }
-
+        pub(in super::super) fn adopt(&self, _: &Path, _: &Node, _: &Entry) -> Result<()> {
+            unreachable!()
+        }
         pub(in super::super) fn prune<'p>(&self, _: impl Iterator<Item = &'p Path>) {
-            unreachable!("never opened")
+            unreachable!()
         }
-
         pub(in super::super) fn clear(&self) {
-            unreachable!("never opened")
+            unreachable!()
         }
     }
 }

@@ -1260,6 +1260,7 @@ pub mod displaced {
     struct Meta {
         harness: String,
         kind: Kind,
+        #[serde(with = "stored_path")]
         dest: PathBuf,
         /// The fingerprint sync expected the content to have; empty if it
         /// expected none (so any content is someone else's).
@@ -1272,6 +1273,39 @@ pub mod displaced {
         kept: bool,
     }
 
+    mod stored_path {
+        use std::path::{Path, PathBuf};
+
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Serialize, Deserialize)]
+        #[serde(untagged)]
+        enum Stored<'a> {
+            Text(std::borrow::Cow<'a, str>),
+            Bytes { git_quoted: std::borrow::Cow<'a, str> },
+        }
+
+        pub(super) fn serialize<S: serde::Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
+            match path.to_str() {
+                Some(text) => Stored::Text(text.into()),
+                None => Stored::Bytes { git_quoted: crate::draft::quote_path(&crate::git::path_bytes(path)).into() },
+            }
+            .serialize(serializer)
+        }
+
+        pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<PathBuf, D::Error> {
+            match Stored::deserialize(deserializer)? {
+                Stored::Text(text) => Ok(PathBuf::from(text.as_ref())),
+                Stored::Bytes { git_quoted } => crate::draft::unquote_path(&git_quoted)
+                    .map(|raw| crate::git::path_from_bytes(&raw))
+                    .ok_or_else(|| serde::de::Error::custom("invalid quoted path")),
+            }
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct IndexPath(#[serde(with = "stored_path")] PathBuf);
+
     /// One displaced item.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
     pub struct Entry {
@@ -1280,8 +1314,10 @@ pub mod displaced {
         pub harness: String,
         pub kind: Kind,
         /// Where in the harness the content was displaced from.
+        #[serde(with = "stored_path")]
         pub dest: PathBuf,
         /// The displaced content itself (a file, directory or symlink).
+        #[serde(with = "stored_path")]
         pub path: PathBuf,
         /// Unix seconds.
         pub displaced_at: u64,
@@ -1343,7 +1379,15 @@ pub mod displaced {
     /// Deletes an entry and its content for good.
     pub fn discard(id: &str) -> Result<()> {
         let root = root()?;
-        get(id)?;
+        let entry = get(id)?;
+        if entry.kind == Kind::Draft
+            && let Some(git_dir) = entry.path.ancestors().nth(4)
+            && crate::draft::pull_journal_exists(git_dir)?
+        {
+            return Err(Error::Invalid(
+                "pull pending. Finish the pull before discarding Draft recovery content".into(),
+            ));
+        }
         let dir = locate(&root, id).expect("an entry just loaded");
         forget(&root, id, &dir)
     }
@@ -1360,7 +1404,7 @@ pub mod displaced {
     ///   replaces is displaced in turn. Refused while the current managed
     ///   block is edited by hand: that conflict has to be resolved first, or
     ///   the block would lose the marker that makes it one.
-    pub fn adopt(repo: &Repo, id: &str) -> Result<()> {
+    pub fn adopt(repo: &Repo, id: &str, lock: &crate::EngineLock) -> Result<()> {
         let entry = get(id)?;
         let name = entry.dest.file_name().unwrap_or_default().to_string_lossy().into_owned();
         match entry.kind {
@@ -1372,7 +1416,7 @@ pub mod displaced {
             Kind::Skill => copy_into_repo(repo, &entry.path, &name)?,
             Kind::Rule => rule_into_repo(repo, &name, &read_text(&entry.path)?)?,
             Kind::Instructions => restore_instructions(&entry)?,
-            Kind::Draft => crate::draft::adopt_displaced(repo, &entry)?,
+            Kind::Draft => return crate::draft::adopt_displaced(repo, &entry, lock),
         }
         discard(id)
     }
@@ -1439,7 +1483,7 @@ pub mod displaced {
         prune_with(age, u64::MAX)
     }
 
-    pub(super) fn prune_with(age: Duration, max: u64) -> Result<Vec<String>> {
+    pub(crate) fn prune_with(age: Duration, max: u64) -> Result<Vec<String>> {
         let root = root()?;
         let now = now();
         let old = |since: u64| now.saturating_sub(since) >= age.as_secs();
@@ -1454,7 +1498,7 @@ pub mod displaced {
             match (dir, loaded) {
                 (Some(dir), Some((meta, path))) => {
                     let size = disk_size(&path, &mut inodes);
-                    if differs(&meta, &path)? {
+                    if meta.kind == Kind::Draft || differs(&meta, &path)? {
                         total += size;
                     } else if old(meta.displaced_at) {
                         forget(&root, &id, &dir)?;
@@ -1466,6 +1510,16 @@ pub mod displaced {
                 }
                 // Begun but never filled (killed meanwhile), or not ours.
                 (dir, None) => {
+                    if let Some(content) = dir.as_ref().map(|dir| dir.join(CONTENT))
+                        && !matches!(fs::symlink_metadata(&content), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+                    {
+                        total += disk_size(&content, &mut inodes);
+                        continue;
+                    }
+                    // A prepared Draft removal can wait in a journal indefinitely.
+                    if dir.as_deref().and_then(read_meta).is_some_and(|meta| meta.kind == Kind::Draft) {
+                        continue;
+                    }
                     let since = dir.as_deref().and_then(modified).or_else(|| modified(&pointer));
                     if since.is_some_and(old) {
                         match dir {
@@ -1551,7 +1605,7 @@ pub mod displaced {
     /// be in: nothing else is ever read from or deleted through the index.
     fn indexed(root: &Path, id: &str) -> Option<PathBuf> {
         let text = fs::read_to_string(root.join(INDEX).join(id)).ok()?;
-        let dir: PathBuf = serde_json::from_str(&text).ok()?;
+        let IndexPath(dir) = serde_json::from_str(&text).ok()?;
         let area = dir.parent()?;
         let ok = dir.is_absolute()
             && dir.file_name()? == id
@@ -1570,7 +1624,7 @@ pub mod displaced {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
             Err(e) => return Err(e).at(&path),
         };
-        let body = serde_json::to_string(dir).map_err(|e| Error::Invalid(e.to_string()))?;
+        let body = serde_json::to_string(&IndexPath(dir.to_path_buf())).map_err(|e| Error::Invalid(e.to_string()))?;
         if let Err(e) = file.write_all(body.as_bytes()).and_then(|()| file.sync_all()) {
             let _ = fs::remove_file(&path);
             return Err(e).at(&path);
@@ -1634,16 +1688,15 @@ pub mod displaced {
         !id.is_empty() && !id.starts_with('.') && !id.contains(['/', '\\'])
     }
 
+    fn read_meta(dir: &Path) -> Option<Meta> {
+        let text = instructions::read_optional(&dir.join(META)).ok().flatten()?;
+        serde_json::from_str(&text).ok()
+    }
+
     /// An entry's metadata and content path; `None` unless both are there.
     fn load(dir: &Path) -> Result<Option<(Meta, PathBuf)>> {
         let path = dir.join(CONTENT);
-        let Some(text) = instructions::read_optional(&dir.join(META)).ok().flatten() else {
-            return Ok(None);
-        };
-        let Ok(meta) = serde_json::from_str::<Meta>(&text) else {
-            return Ok(None);
-        };
-        Ok(fs::symlink_metadata(&path).is_ok().then_some((meta, path)))
+        Ok(read_meta(dir).filter(|_| fs::symlink_metadata(&path).is_ok()).map(|meta| (meta, path)))
     }
 
     fn entry(id: String, meta: Meta, path: PathBuf) -> Result<Entry> {
@@ -1676,10 +1729,14 @@ pub mod displaced {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(e).at(path),
                 Ok(m) if m.file_type().is_symlink() => {
-                    Ok(Some(leaf_fingerprint(true, &crate::git::path_bytes(&fs::read_link(path).at(path)?))))
+                    Ok(Some(leaf_fingerprint(None, &crate::git::path_bytes(&fs::read_link(path).at(path)?))))
                 }
                 Ok(m) if m.is_file() => {
-                    Ok(crate::config_file::read_regular(path, false)?.map(|bytes| leaf_fingerprint(false, &bytes)))
+                    #[cfg(unix)]
+                    let mode = std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o7777;
+                    #[cfg(not(unix))]
+                    let mode = 0;
+                    Ok(crate::config_file::read_regular(path, false)?.map(|bytes| leaf_fingerprint(Some(mode), &bytes)))
                 }
                 Ok(_) => Ok(Some("not a file".into())),
             },
@@ -1688,9 +1745,9 @@ pub mod displaced {
 
     /// What a [`Kind::Draft`] entry is compared by: whether it is a symlink,
     /// and its exact bytes (a symlink's target).
-    pub(crate) fn leaf_fingerprint(link: bool, bytes: &[u8]) -> String {
+    pub(crate) fn leaf_fingerprint(mode: Option<u32>, bytes: &[u8]) -> String {
         use sha2::{Digest, Sha256};
-        let kind = if link { "link" } else { "file" };
+        let kind = mode.map_or_else(|| "link".into(), |mode| format!("file:{mode:o}"));
         format!("{kind}:{}", crate::hash::hex(&Sha256::digest(bytes)))
     }
 
@@ -1771,7 +1828,9 @@ pub mod displaced {
             let root = root()?;
             make_dirs(&root.join(INDEX))?;
             // Best effort: a stale entry that can't be pruned is no reason not to sync.
-            let _ = prune();
+            if kind != Kind::Draft {
+                let _ = prune();
+            }
             let area = area(holder);
             make_dirs(&area)?;
             let ignore = area.join(".gitignore");
@@ -1781,7 +1840,8 @@ pub mod displaced {
             let area = std::path::absolute(&area).at(&area)?;
             let millis = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
             let name = dest.file_name().unwrap_or_default().to_string_lossy();
-            let base = format!("{millis:013}-{}-{}", slug(harness), slug(&name));
+            let bounded = |s: &str| slug(s).chars().take(64).collect::<String>();
+            let base = format!("{millis:013}-{}-{}", bounded(harness), bounded(&name));
             let mut ids = (0..).map(|n| if n == 0 { base.clone() } else { format!("{base}-{n}") });
             let (id, dir) = loop {
                 let id = ids.next().expect("an unused id");
@@ -1818,9 +1878,46 @@ pub mod displaced {
         }
 
         fn write_meta(&self, meta: &Meta) -> Result<()> {
-            let body = serde_json::to_string_pretty(meta).map_err(|e| Error::Invalid(e.to_string()))?;
-            let path = self.dir.join(META);
-            fs::write(&path, body).at(&path)
+            let body = serde_json::to_vec_pretty(meta).map_err(|e| Error::Invalid(e.to_string()))?;
+            crate::config_file::replace_private(&self.dir.join(META), &body)
+        }
+
+        #[cfg(unix)]
+        pub(crate) fn draft(holder: &Path, id: &str) -> Result<Self> {
+            let root = root()?;
+            if !valid_id(id) {
+                return Err(Error::Invalid("invalid pull recovery id".into()));
+            }
+            let dir = area(holder).join(id);
+            let meta = read_meta(&dir)
+                .filter(|meta| meta.kind == Kind::Draft)
+                .ok_or_else(|| Error::Invalid(format!("cannot read pull recovery entry at {}", dir.display())))?;
+            let held = fs::symlink_metadata(dir.join(CONTENT)).is_ok().then_some(Held::Moved);
+            Ok(Self { id: id.into(), root, dir, kind: Kind::Draft, dest: meta.dest, expected: meta.expected, held })
+        }
+
+        #[cfg(unix)]
+        pub(crate) fn expects(&self, fingerprint: &str) -> bool {
+            self.expected == fingerprint
+        }
+
+        #[cfg(unix)]
+        pub(crate) fn id(&self) -> &str {
+            &self.id
+        }
+
+        #[cfg(unix)]
+        pub(crate) fn filled(&self) -> bool {
+            self.held.is_some()
+        }
+
+        pub(crate) fn forget_empty(id: &str) -> Result<()> {
+            let root = root()?;
+            let dir = locate(&root, id).ok_or_else(|| Error::Invalid(format!("no displaced entry `{id}`")))?;
+            match fs::symlink_metadata(dir.join(CONTENT)) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => forget(&root, id, &dir),
+                _ => Err(Error::Invalid(format!("displaced entry `{id}` still holds content"))),
+            }
         }
 
         /// Where the displaced content is (or goes) in the entry.
@@ -1831,7 +1928,7 @@ pub mod displaced {
         /// Moves `src` (the destination, or a leftover aside) into the
         /// entry. It is in the same directory tree, so this is one rename;
         /// if that fails anyway (a mount point in between), nothing moved.
-        pub(super) fn take(&mut self, src: &Path) -> Result<()> {
+        pub(crate) fn take(&mut self, src: &Path) -> Result<()> {
             rename(src, &self.content()).at(src)?;
             self.held = Some(Held::Moved);
             Ok(())
@@ -1859,44 +1956,6 @@ pub mod displaced {
                 Err(e) => return Err(std::io::Error::from(e)).at(&self.dest),
             }
             Ok(true)
-        }
-
-        /// [`link`](Self::link) for `name` in the directory `parent`: a
-        /// symlink there is linked itself, never its target.
-        #[cfg(unix)]
-        pub(crate) fn link_at(&mut self, parent: &std::os::fd::OwnedFd, name: &std::ffi::OsStr) -> Result<bool> {
-            let content = self.content();
-            match rustix::fs::linkat(parent, name, rustix::fs::CWD, &content, rustix::fs::AtFlags::empty()) {
-                Ok(()) => self.held = Some(Held::Linked),
-                Err(rustix::io::Errno::NOENT) => return Ok(false),
-                Err(e) => return Err(std::io::Error::from(e)).at(&self.dest),
-            }
-            Ok(true)
-        }
-
-        /// [`put_back`](Self::put_back) to `name` in the directory `parent`,
-        /// for a file or symlink.
-        #[cfg(unix)]
-        pub(crate) fn put_back_at(self, parent: &std::os::fd::OwnedFd, name: &std::ffi::OsStr) -> Result<()> {
-            use rustix::fs::{AtFlags, CWD, linkat, symlinkat};
-            if self.held != Some(Held::Moved) {
-                self.abandon();
-                return Ok(());
-            }
-            let content = self.content();
-            let placed = match fs::symlink_metadata(&content) {
-                Ok(m) if m.file_type().is_symlink() => fs::read_link(&content)
-                    .and_then(|target| symlinkat(&target, parent, name).map_err(std::io::Error::from)),
-                Ok(m) if m.is_file() => linkat(CWD, &content, parent, name, AtFlags::empty()).map_err(Into::into),
-                Ok(_) => Err(std::io::ErrorKind::Unsupported.into()),
-                Err(e) => Err(e),
-            };
-            if placed.is_ok() && fs::remove_file(&content).is_ok() {
-                self.abandon();
-                return Ok(());
-            }
-            self.keep()?;
-            Err(self.displaced_error())
         }
 
         /// Whether the displaced content still matches what was expected.
@@ -2210,6 +2269,11 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    fn adopt_test_entry(repo: &Repo, id: &str) -> Result<()> {
+        crate::git::Git::new(repo.root()).args(["init", "-q"]).run()?;
+        displaced::adopt(repo, id, &crate::EngineLock::acquire(repo.root())?)
+    }
 
     fn write(path: &Path, text: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -2954,7 +3018,7 @@ mod tests {
                     // However old, a changed entry is never pruned.
                     assert!(!displaced::prune_older_than(Duration::ZERO).unwrap().contains(&entry.id), "{case}");
 
-                    displaced::adopt(&repo, &entry.id).unwrap();
+                    adopt_test_entry(&repo, &entry.id).unwrap();
                     assert!(displaced::list().unwrap().iter().all(|e| e.id != entry.id), "{case}");
                     if format == InstructionsFormat::Rules {
                         let rule = fs::read_to_string(repo.root().join("instructions/git.md")).unwrap();
@@ -2998,7 +3062,7 @@ mod tests {
                     }
                     assert!(sk1ll_leftovers(&tmp.path().join("skills")).is_empty(), "{case}");
 
-                    displaced::adopt(&repo, &entry.id).unwrap();
+                    adopt_test_entry(&repo, &entry.id).unwrap();
                     let adopted = fs::read_to_string(repo.personal_dir().join("pdf/SKILL.md")).unwrap();
                     assert_eq!(adopted, kept, "{case}");
                     assert!(!repo.personal_dir().join("pdf").join(MARKER).exists());
@@ -3317,7 +3381,7 @@ mod tests {
         };
         assert!(conflict(&d));
 
-        let err = displaced::adopt(&d.repo, &entry.id).unwrap_err();
+        let err = adopt_test_entry(&d.repo, &entry.id).unwrap_err();
         assert!(matches!(&err, Error::Invalid(m) if m.contains("edited by hand")), "{err}");
         assert_eq!(fs::read_to_string(&d.dest).unwrap(), edited);
         assert!(displaced::get(&entry.id).unwrap().changed);

@@ -127,6 +127,9 @@ pub struct MachineReport {
     /// Draft items that clash with the newer baseline (when `blocked`).
     #[serde(default)]
     pub clashes: Vec<ItemRef>,
+    /// A journal is still active. The entries are the items blocking it, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_pending: Option<Vec<ItemRef>>,
     /// The daemon knows it hasn't applied the latest baseline yet.
     #[serde(default)]
     pub behind: bool,
@@ -164,7 +167,7 @@ pub fn headline(offline: bool, report: Option<&MachineReport>, server_baseline: 
     }
     let empty = MachineReport::default();
     let r = report.unwrap_or(&empty);
-    if r.blocked {
+    if r.blocked || r.pull_pending.is_some() {
         MachineStatus::Blocked
     } else if !r.conflicts.is_empty() {
         MachineStatus::Conflict

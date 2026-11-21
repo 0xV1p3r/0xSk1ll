@@ -44,6 +44,13 @@ impl EngineLock {
         })
     }
 
+    pub(crate) fn check_for(&self, root: &Path) -> Result<()> {
+        if self.path == lock_path(root)? {
+            return Ok(());
+        }
+        Err(Error::Invalid(format!("the supplied engine lock is for a different repository than {}", root.display())))
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -52,10 +59,15 @@ impl EngineLock {
 /// The lock lives in the git common dir, so every worktree of one repository
 /// shares it, and it never shows up in the draft.
 fn open(root: &Path) -> Result<(File, PathBuf)> {
-    let common = Git::new(root).args(["rev-parse", "--path-format=absolute", "--git-common-dir"]).text()?;
-    let path = PathBuf::from(common).join(LOCK_FILE);
+    let path = lock_path(root)?;
     let file = OpenOptions::new().create(true).truncate(false).write(true).open(&path).at(&path)?;
     Ok((file, path))
+}
+
+fn lock_path(root: &Path) -> Result<PathBuf> {
+    let common = Git::new(root).args(["rev-parse", "--path-format=absolute", "--git-common-dir"]).run()?;
+    let common = crate::git::path_from_bytes(common.strip_suffix(b"\n").unwrap_or(&common));
+    Ok(common.canonicalize().at(&common)?.join(LOCK_FILE))
 }
 
 #[cfg(test)]

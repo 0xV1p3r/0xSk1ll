@@ -490,7 +490,9 @@ fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
         Cmd::Recover { command } => match command {
             RecoverCmd::List => print_recovered(sync::displaced::list()?),
-            RecoverCmd::Adopt { id } => sync::displaced::adopt(&repo, &id)?,
+            RecoverCmd::Adopt { id } => {
+                sync::displaced::adopt(&repo, &id, lock.as_ref().context("repository is not locked")?)?
+            }
             RecoverCmd::Discard { id } => sync::displaced::discard(&id)?,
         },
         Cmd::Conflicts => {
@@ -596,6 +598,10 @@ fn run(cli: Cli) -> Result<()> {
             println!("moved {name} to personal/");
         }
         Cmd::Status => {
+            if repo.pull_pending()? {
+                println!("pull pending. Run `sk1ll pull` to finish");
+                return Ok(());
+            }
             for s in repo.import_status()? {
                 let state = match s.state {
                     ImportState::Clean => "clean",
@@ -607,6 +613,9 @@ fn run(cli: Cli) -> Result<()> {
             print_plan(&sync::plan(&repo, &machine()?.harnesses(), &assignment()?, PlanOptions::default())?);
         }
         Cmd::Sync { dry_run, force } => {
+            if repo.pull_pending()? {
+                bail!("pull pending. Finish `sk1ll pull` before syncing harnesses");
+            }
             let harnesses = machine()?.harnesses();
             // Recovery moves and deletes; only a real sync, holding the lock, may run it.
             if !dry_run && let Some(lock) = &lock {
@@ -708,7 +717,7 @@ fn run(cli: Cli) -> Result<()> {
             fleet::queue_discarded(daemon_state.as_deref(), lock.as_ref(), discarded)?;
             println!("run `sk1ll sync` to apply");
         }
-        Cmd::Pull => match repo.pull()? {
+        Cmd::Pull => match repo.pull(lock.as_ref().context("repository is not locked")?)? {
             PullOutcome::UpToDate => println!("already on the latest baseline"),
             PullOutcome::Updated { from, to } => {
                 println!("baseline {} -> {}; run `sk1ll sync` to apply", short(&from), short(&to));
@@ -1234,6 +1243,23 @@ mod tests {
         let err = repo.run(&["sync"]).expect_err("a joined machine needs its authoritative assignment");
         assert!(err.to_string().contains("no authoritative assignment"), "{err}");
         assert!(!skills.join("pdf").exists());
+    }
+
+    #[test]
+    fn direct_sync_refuses_a_pending_pull() {
+        let repo = TestRepo::new().with_skill();
+        let skills = repo.0.join(".git/harness/skills");
+        fs::write(
+            repo.0.join("machine.toml"),
+            format!("id = 'test'\n[harnesses.h]\nskills = '{}'\nmode = 'copy'\n{}", skills.display(), no_presets()),
+        )
+        .unwrap();
+        fs::write(repo.0.join(".git/sk1ll-pull.json"), "interrupted journal").unwrap();
+        for command in [["sync", "--force"], ["sync", "--dry-run"]] {
+            let error = repo.run(&command).unwrap_err().to_string();
+            assert!(error.contains("pull pending"), "{error}");
+            assert!(!skills.exists());
+        }
     }
 
     /// The daemon's message may already carry the hint; it's added once.

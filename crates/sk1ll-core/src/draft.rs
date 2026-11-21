@@ -389,7 +389,8 @@ impl Repo {
     /// checked out here. A remote without that branch is an error too, unless
     /// it has no branches at all (an empty server, which only older servers start
     /// as): then there is nothing to pull yet, and the first push creates it.
-    pub fn pull(&self) -> Result<PullOutcome> {
+    pub fn pull(&self, lock: &crate::EngineLock) -> Result<PullOutcome> {
+        lock.check_for(self.root())?;
         pull::run(self, &mut |_| Ok(()))
     }
 
@@ -401,13 +402,15 @@ impl Repo {
     /// Finishes a [`pull`](Self::pull) that stopped half-way, without
     /// fetching: `None` if there is none. Blocked if a draft change is still
     /// in the way.
-    pub fn finish_pull(&self) -> Result<Option<PullOutcome>> {
+    pub fn finish_pull(&self, lock: &crate::EngineLock) -> Result<Option<PullOutcome>> {
+        lock.check_for(self.root())?;
         pull::finish(self, &mut |_| Ok(()))
     }
 
     /// [`pull`](Self::pull), running `f` once when it reaches `point`.
     #[cfg(test)]
     fn pull_at(&self, point: pull::Before, f: impl FnOnce()) -> Result<PullOutcome> {
+        let _lock = crate::EngineLock::acquire(self.root())?;
         let mut f = Some(f);
         pull::run(self, &mut |at| {
             if at == point
@@ -422,6 +425,7 @@ impl Repo {
     /// [`pull`](Self::pull), stopping at `point` as a crash would.
     #[cfg(test)]
     fn pull_crashing_at(&self, point: pull::Before) -> Result<PullOutcome> {
+        let _lock = crate::EngineLock::acquire(self.root())?;
         pull::run(self, &mut |at| match at == point {
             true => Err(Error::Invalid(format!("crashed at {at:?}"))),
             false => Ok(()),
@@ -549,8 +553,17 @@ impl Repo {
     }
 }
 
+pub(crate) fn pull_journal_exists(git_dir: &Path) -> Result<bool> {
+    pull::journal_exists(git_dir)
+}
+
 /// Puts back a working-tree file pull displaced (see [`sync::displaced::adopt`](crate::sync::displaced::adopt)).
-pub(crate) fn adopt_displaced(repo: &Repo, entry: &crate::sync::displaced::Entry) -> Result<()> {
+pub(crate) fn adopt_displaced(
+    repo: &Repo,
+    entry: &crate::sync::displaced::Entry,
+    lock: &crate::EngineLock,
+) -> Result<()> {
+    lock.check_for(repo.root())?;
     pull::adopt(repo, entry)
 }
 
@@ -661,7 +674,7 @@ fn slash(path: &str) -> String {
 }
 
 /// Git's C-style quoting (as in `core.quotePath`), but keeping valid UTF-8 as is.
-fn quote_path(raw: &[u8]) -> String {
+pub(crate) fn quote_path(raw: &[u8]) -> String {
     let mut out = String::from("\"");
     for chunk in raw.utf8_chunks() {
         for c in chunk.valid().chars() {
@@ -685,7 +698,7 @@ fn quote_path(raw: &[u8]) -> String {
 }
 
 /// The inverse of [`quote_path`]; `None` if `quoted` isn't one of its outputs.
-fn unquote_path(quoted: &str) -> Option<Vec<u8>> {
+pub(crate) fn unquote_path(quoted: &str) -> Option<Vec<u8>> {
     let inner = quoted.strip_prefix('"')?.strip_suffix('"')?;
     let mut out = Vec::new();
     let mut chars = inner.chars();
@@ -775,6 +788,14 @@ mod tests {
             git(tmp.path(), &["clone", "--quiet", origin.to_str().unwrap(), b.to_str().unwrap()]);
             Self { _tmp: tmp, a, b }
         }
+    }
+
+    fn pull_now(repo: &Repo) -> Result<PullOutcome> {
+        repo.pull(&crate::EngineLock::acquire(repo.root())?)
+    }
+
+    fn finish_now(repo: &Repo) -> Result<Option<PullOutcome>> {
+        repo.finish_pull(&crate::EngineLock::acquire(repo.root())?)
     }
 
     fn repo(root: &Path) -> Repo {
@@ -952,14 +973,14 @@ mod tests {
     fn pull_with_clean_draft_fast_forwards() {
         let f = Fleet::new();
         let (a, b) = (repo(&f.a), repo(&f.b));
-        assert_eq!(b.pull().unwrap(), PullOutcome::UpToDate);
+        assert_eq!(pull_now(&b).unwrap(), PullOutcome::UpToDate);
         let old = git(&f.b, &["rev-parse", "HEAD"]);
         write(&f.a.join("personal/pdf/SKILL.md"), "v2\n");
         let new = a.commit(&[item("skill:pdf")], "v2", None).unwrap();
         a.push().unwrap();
-        assert_eq!(b.pull().unwrap(), PullOutcome::Updated { from: old, to: new });
+        assert_eq!(pull_now(&b).unwrap(), PullOutcome::Updated { from: old, to: new });
         assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "v2\n");
-        assert_eq!(b.pull().unwrap(), PullOutcome::UpToDate);
+        assert_eq!(pull_now(&b).unwrap(), PullOutcome::UpToDate);
     }
 
     /// An import being staged stays where it is, even with a `.gitignore`
@@ -986,7 +1007,7 @@ mod tests {
         write(&f.a.join("personal/pdf/SKILL.md"), "v2\n");
         a.commit(&[item("skill:pdf")], "v2", None).unwrap();
         a.push().unwrap();
-        assert!(matches!(b.pull().unwrap(), PullOutcome::Updated { .. }));
+        assert!(matches!(pull_now(&b).unwrap(), PullOutcome::Updated { .. }));
         assert_eq!(read(&staged), "being staged\n");
         assert_eq!(mtime(), old, "never swept away and put back");
         assert_eq!(b.draft().unwrap(), draft);
@@ -1006,7 +1027,7 @@ mod tests {
         write(&f.a.join("personal/pdf/SKILL.md"), "v2\n");
         let v2 = a.commit(&[item("skill:pdf")], "v2", None).unwrap();
         a.push().unwrap();
-        assert!(matches!(b.pull().unwrap(), PullOutcome::Updated { to, .. } if to == v2));
+        assert!(matches!(pull_now(&b).unwrap(), PullOutcome::Updated { to, .. } if to == v2));
         assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "v2\n");
         assert_eq!(b.draft().unwrap(), draft);
         assert_eq!(read(&f.b.join("instructions/git.md")), "b draft\n");
@@ -1018,7 +1039,7 @@ mod tests {
         write(&f.a.join("imported/web/SKILL.md"), "web v2\n");
         let web = a.commit(&[item("skill:web")], "web v2", None).unwrap();
         a.push().unwrap();
-        assert!(matches!(b.pull().unwrap(), PullOutcome::Updated { .. }));
+        assert!(matches!(pull_now(&b).unwrap(), PullOutcome::Updated { .. }));
         assert_eq!(git(&f.b, &["rev-parse", "HEAD~1"]), web);
         assert_eq!(git(&f.b, &["log", "-1", "--format=%s"]), "style from b");
         assert_eq!(read(&f.b.join("imported/web/SKILL.md")), "web v2\n");
@@ -1044,7 +1065,7 @@ mod tests {
         a.push().unwrap();
 
         let before = snapshot(&f.b);
-        let outcome = b.pull().unwrap();
+        let outcome = pull_now(&b).unwrap();
         assert_eq!(outcome, PullOutcome::Blocked { baseline: remote.clone(), items: vec![item("skill:pdf")] });
         assert_eq!(snapshot(&f.b), before);
 
@@ -1055,12 +1076,12 @@ mod tests {
         write(&f.b.join("personal/pdf/ref.md"), "unrelated?\n");
         let before = snapshot(&f.b);
         // The draft touches pdf too, so this is caught before anything moves.
-        assert!(matches!(b.pull().unwrap(), PullOutcome::Blocked { .. }));
+        assert!(matches!(pull_now(&b).unwrap(), PullOutcome::Blocked { .. }));
         assert_eq!(snapshot(&f.b), before);
 
         b.restore(&[item("skill:pdf")]).unwrap();
         let before = snapshot(&f.b);
-        let outcome = b.pull().unwrap();
+        let outcome = pull_now(&b).unwrap();
         assert_eq!(outcome, PullOutcome::Blocked { baseline: remote, items: vec![item("skill:pdf")] });
         assert_eq!(snapshot(&f.b), before);
         assert!(f.b.join("personal/new/SKILL.md").is_file());
@@ -1137,14 +1158,14 @@ mod tests {
             baseline: remote.clone(),
             items: vec![item("other:build/out.txt"), item("other:secret.txt")],
         };
-        assert_eq!(b.pull().unwrap(), blocked);
+        assert_eq!(pull_now(&b).unwrap(), blocked);
         assert_eq!(snapshot(&f.b), before);
 
         // Rebase path.
         write(&f.b.join("instructions/style.md"), "b committed\n");
         b.commit(&[item("rule:style")], "style", None).unwrap();
         let before = snapshot(&f.b);
-        assert_eq!(b.pull().unwrap(), blocked);
+        assert_eq!(pull_now(&b).unwrap(), blocked);
         assert_eq!(snapshot(&f.b), before);
         assert_eq!(read(&f.b.join("secret.txt")), "mine\n");
     }
@@ -1489,7 +1510,7 @@ mod tests {
 
         let stashes = || git(&f.a, &["stash", "list", "--format=%H %gs"]);
         let before = stashes();
-        assert!(matches!(a.pull().unwrap(), PullOutcome::Updated { .. }));
+        assert!(matches!(pull_now(&a).unwrap(), PullOutcome::Updated { .. }));
         assert_eq!(stashes(), before);
         assert_eq!(read(&f.a.join("instructions/git.md")), "a draft\n");
         assert_eq!(read(&f.a.join("notes.txt")), "untracked\n");
@@ -1519,7 +1540,7 @@ mod tests {
         );
         a.push().unwrap();
 
-        assert!(matches!(b.pull().unwrap(), PullOutcome::Updated { .. }));
+        assert!(matches!(pull_now(&b).unwrap(), PullOutcome::Updated { .. }));
         assert_eq!(git(&f.b, &["log", "--format=%s", "origin/main..HEAD"]), "originally empty");
         assert!(b.draft().unwrap().is_empty());
     }
@@ -1538,7 +1559,7 @@ mod tests {
         b.push().unwrap();
 
         let before = snapshot(&f.a);
-        assert!(invalid(a.pull()).contains("merge commits among the unpushed commits"));
+        assert!(invalid(pull_now(&a)).contains("merge commits among the unpushed commits"));
         assert_eq!(snapshot(&f.a), before);
     }
 
@@ -1559,7 +1580,7 @@ mod tests {
         let r = repo(&c);
         let before = snapshot(&c);
         for _ in 0..2 {
-            let message = invalid(r.pull());
+            let message = invalid(pull_now(&r));
             assert!(message.contains("unrelated histories"), "{message}");
             assert_eq!(snapshot(&c), before);
         }
@@ -1592,7 +1613,7 @@ mod tests {
         let r = repo(&c);
         write(&c.join("personal/pdf/SKILL.md"), "c's pdf\n");
         let before = snapshot(&c);
-        for message in [invalid(r.pull()), invalid(r.push()), invalid(r.commit(&[item("skill:pdf")], "m", None))] {
+        for message in [invalid(pull_now(&r)), invalid(r.push()), invalid(r.commit(&[item("skill:pdf")], "m", None))] {
             assert!(message.contains("`master`") && message.contains("`main`"), "{message}");
             assert!(message.contains("branch -m master main"), "{message}");
         }
@@ -1610,7 +1631,7 @@ mod tests {
         let c = independent(&f, "main", &other);
         let r = repo(&c);
         let before = snapshot(&c);
-        let message = invalid(r.pull());
+        let message = invalid(pull_now(&r));
         assert!(message.contains("no `main` branch") && message.contains("trunk"), "{message}");
         assert_eq!(snapshot(&c), before);
 
@@ -1618,10 +1639,10 @@ mod tests {
         let empty = f._tmp.path().join("empty.git");
         git(f._tmp.path(), &["init", "--quiet", "--bare", "-b", "main", empty.to_str().unwrap()]);
         git(&c, &["remote", "set-url", REMOTE, empty.to_str().unwrap()]);
-        assert_eq!(r.pull().unwrap(), PullOutcome::UpToDate);
+        assert_eq!(pull_now(&r).unwrap(), PullOutcome::UpToDate);
         r.push().unwrap();
         assert_eq!(origin_branches(&empty), "refs/heads/main");
-        assert_eq!(r.pull().unwrap(), PullOutcome::UpToDate);
+        assert_eq!(pull_now(&r).unwrap(), PullOutcome::UpToDate);
     }
 
     /// Config that would make git stash the draft, squash or run hooks
@@ -1676,7 +1697,7 @@ mod tests {
         git(&f.a, &["commit", "--quiet", "-m", "into a staging directory"]);
         a.push().unwrap();
         let before = snapshot(&f.b);
-        let outcome = b.pull().unwrap();
+        let outcome = pull_now(&b).unwrap();
         assert!(
             matches!(&outcome, PullOutcome::Blocked { items, .. } if *items == [item("skill:.sk1ll-stage-old-web")])
         );
@@ -1690,7 +1711,7 @@ mod tests {
         write(&f.a.join("imported"), "now a file\n");
         commit_all(&f.a, "imported is a file");
         a.push().unwrap();
-        let outcome = b.pull().unwrap();
+        let outcome = pull_now(&b).unwrap();
         assert!(
             matches!(&outcome, PullOutcome::Blocked { items, .. } if items.contains(&item("other:imported"))),
             "{outcome:?}"
@@ -1732,12 +1753,12 @@ mod tests {
             baseline: git(&a, &["rev-parse", "HEAD"]),
             items: items.iter().map(|i| item(i)).collect(),
         };
-        assert_eq!(r.pull().unwrap(), blocked(&["other:../notes.txt"]));
+        assert_eq!(pull_now(&r).unwrap(), blocked(&["other:../notes.txt"]));
         // Also with an unpushed commit, so that pull rebases.
         write(&b.join("skills/personal/pdf/SKILL.md"), "b committed\n");
         r.commit(&[item("skill:pdf")], "pdf from b", Some("B <b@example.com>")).unwrap();
         let before_rebase = snapshot(&b);
-        assert_eq!(r.pull().unwrap(), blocked(&["other:../notes.txt"]));
+        assert_eq!(pull_now(&r).unwrap(), blocked(&["other:../notes.txt"]));
         assert_eq!(snapshot(&b), before_rebase);
         assert_eq!(read(&b.join("notes.txt")), "mine\n");
         assert_ne!(before, before_rebase);
@@ -1750,11 +1771,11 @@ mod tests {
         write(&b.join("README.md"), "b's README\n");
         assert!(r.draft().unwrap().is_empty());
         let before = snapshot(&b);
-        assert_eq!(r.pull().unwrap(), blocked(&["other:../README.md"]));
+        assert_eq!(pull_now(&r).unwrap(), blocked(&["other:../README.md"]));
         assert_eq!(snapshot(&b), before);
 
         git(&b, &["checkout", "--quiet", "--", "README.md"]);
-        assert!(matches!(r.pull().unwrap(), PullOutcome::Updated { .. }));
+        assert!(matches!(pull_now(&r).unwrap(), PullOutcome::Updated { .. }));
         assert_eq!(read(&b.join("notes.txt")), "upstream\n");
         assert_eq!(read(&b.join("README.md")), "upstream README\n");
         assert_eq!(read(&b.join("skills/personal/pdf/SKILL.md")), "b committed\n");
@@ -1772,26 +1793,26 @@ mod tests {
         // Only in the index, with nothing to pull, and with something.
         git(&f.b, &["update-index", "--add", "--cacheinfo", &gitlink]);
         let before = snapshot(&f.b);
-        assert!(invalid(b.pull()).contains("submodules aren't supported"));
+        assert!(invalid(pull_now(&b)).contains("submodules aren't supported"));
         assert_eq!(snapshot(&f.b), before);
         write(&f.a.join("instructions/git.md"), "git v2\n");
         a.commit(&[item("rule:git")], "git v2", None).unwrap();
         a.push().unwrap();
-        assert!(invalid(b.pull()).contains("submodules aren't supported"));
+        assert!(invalid(pull_now(&b)).contains("submodules aren't supported"));
         assert_eq!(snapshot(&f.b), before);
         git(&f.b, &["update-index", "--force-remove", "vendor/lib"]);
-        assert!(matches!(b.pull().unwrap(), PullOutcome::Updated { .. }));
+        assert!(matches!(pull_now(&b).unwrap(), PullOutcome::Updated { .. }));
         // In HEAD.
         git(&f.b, &["update-index", "--add", "--cacheinfo", &gitlink]);
         git(&f.b, &[&as_b[..], &["commit", "--quiet", "-m", "submodule"]].concat());
         let before = snapshot(&f.b);
-        assert!(invalid(b.pull()).contains("submodules aren't supported"));
+        assert!(invalid(pull_now(&b)).contains("submodules aren't supported"));
         assert_eq!(snapshot(&f.b), before);
         write(&f.a.join("personal/pdf/SKILL.md"), "v2\n");
         a.commit(&[item("skill:pdf")], "v2", None).unwrap();
         a.push().unwrap();
         let before = snapshot(&f.b);
-        assert!(invalid(b.pull()).contains("submodules aren't supported"));
+        assert!(invalid(pull_now(&b)).contains("submodules aren't supported"));
         assert_eq!(snapshot(&f.b), before);
 
         // In the new baseline, even with config that hides it or recurses into it.
@@ -1802,14 +1823,14 @@ mod tests {
         git(&f.a, &["commit", "--quiet", "-m", "submodule"]);
         a.push().unwrap();
         let before = snapshot(&f.b);
-        assert!(invalid(b.pull()).contains("submodules aren't supported"));
+        assert!(invalid(pull_now(&b)).contains("submodules aren't supported"));
         assert_eq!(snapshot(&f.b), before);
 
         // Adding and removing a gitlink in the same range is unsupported too.
         git(&f.a, &["rm", "--cached", "--quiet", "vendor/lib"]);
         git(&f.a, &["commit", "--quiet", "-m", "no submodule"]);
         a.push().unwrap();
-        assert!(invalid(b.pull()).contains("submodules aren't supported"));
+        assert!(invalid(pull_now(&b)).contains("submodules aren't supported"));
         assert_eq!(snapshot(&f.b), before);
     }
 
@@ -1822,10 +1843,10 @@ mod tests {
         a.push().unwrap();
         let before = snapshot(&f.b);
         git(&f.b, &["config", "core.sparseCheckout", "true"]);
-        assert!(invalid(b.pull()).contains("sparse checkouts aren't supported"));
+        assert!(invalid(pull_now(&b)).contains("sparse checkouts aren't supported"));
         assert_eq!(snapshot(&f.b), before);
         git(&f.b, &["config", "--unset", "core.sparseCheckout"]);
-        assert!(matches!(b.pull().unwrap(), PullOutcome::Updated { .. }));
+        assert!(matches!(pull_now(&b).unwrap(), PullOutcome::Updated { .. }));
         assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "v2\n");
     }
 
@@ -1843,7 +1864,7 @@ mod tests {
         let remote = a.commit(&[item("rule:style")], "style", None).unwrap();
         a.push().unwrap();
         let before = snapshot(&f.b);
-        assert_eq!(b.pull().unwrap(), PullOutcome::Blocked { baseline: remote, items: vec![item("rule:style")] });
+        assert_eq!(pull_now(&b).unwrap(), PullOutcome::Blocked { baseline: remote, items: vec![item("rule:style")] });
         assert_eq!(snapshot(&f.b), before);
     }
 
@@ -1873,7 +1894,7 @@ mod tests {
         let remote = a.commit(&[item("skill:web")], "web v2", None).unwrap();
         a.push().unwrap();
 
-        assert!(matches!(b.pull().unwrap(), PullOutcome::Updated { .. }));
+        assert!(matches!(pull_now(&b).unwrap(), PullOutcome::Updated { .. }));
         let replayed = Git::new(&f.b).args(["cat-file", "commit", "HEAD"]).run().unwrap();
         let (header, rest) = replayed.split_at(replayed.windows(2).position(|w| w == b"\n\n").unwrap() + 1);
         let lines: Vec<&[u8]> = header.split_inclusive(|b| *b == b'\n').collect();
@@ -1927,7 +1948,15 @@ mod tests {
     /// daemon's refresh), in a new process: nothing of it is only in memory.
     #[test]
     fn a_pull_that_stopped_half_way_is_finished_later() {
-        let points = [Before::File(0), Before::File(2), Before::Swap, Before::Index, Before::UpdateRef, Before::Done];
+        let points = [
+            Before::File(0),
+            Before::File(2),
+            Before::Swap,
+            Before::Published,
+            Before::Index,
+            Before::UpdateRef,
+            Before::Done,
+        ];
         for point in points {
             for (rebase, by_pull) in [(false, true), (false, false), (true, true), (true, false)] {
                 let case =
@@ -1948,7 +1977,7 @@ mod tests {
                 let anchor = git(&f.b, &["rev-parse", "refs/worktree/sk1ll-pull"]);
 
                 let b = repo(&f.b);
-                let outcome = if by_pull { b.pull().unwrap() } else { b.finish_pull().unwrap().unwrap() };
+                let outcome = if by_pull { pull_now(&b).unwrap() } else { finish_now(&b).unwrap().unwrap() };
                 let target = git(&f.b, &["rev-parse", "refs/heads/main"]);
                 assert_eq!(outcome, PullOutcome::Updated { from: old, to: target.clone() }, "{case}");
                 assert_eq!(anchor, target, "{case}: the anchor kept the target's objects");
@@ -1956,8 +1985,8 @@ mod tests {
                 assert!(!pending(&b), "{case}");
                 assert_at_upstream(&f);
                 assert_eq!(b.draft().unwrap(), draft, "{case}");
-                assert_eq!(b.finish_pull().unwrap(), None, "{case}");
-                assert_eq!(b.pull().unwrap(), PullOutcome::UpToDate, "{case}");
+                assert_eq!(finish_now(&b).unwrap(), None, "{case}");
+                assert_eq!(pull_now(&b).unwrap(), PullOutcome::UpToDate, "{case}");
             }
         }
     }
@@ -2007,7 +2036,7 @@ mod tests {
                     assert_eq!(git(&f.b, &["rev-parse", "HEAD"]), remote);
                     assert_ne!(remote, old);
                     assert!(!pending(&b) && b.draft().unwrap().is_empty());
-                    crate::sync::displaced::adopt(&b, &id).unwrap();
+                    crate::sync::displaced::adopt(&b, &id, &crate::EngineLock::acquire(b.root()).unwrap()).unwrap();
                     assert_eq!(read(&path), saved);
                     assert_eq!(items(&b), [("skill:pdf".into(), Change::Modified)]);
                     b.restore(&[item("skill:pdf")]).unwrap();
@@ -2043,11 +2072,11 @@ mod tests {
         assert!(pending(&b));
         assert_eq!((head_ref(&f.b), git(&f.b, &["rev-parse", "HEAD"])), ("refs/heads/main".into(), old.clone()));
         // Still Blocked, and nothing else can move the branch meanwhile.
-        assert_eq!(b.finish_pull().unwrap().unwrap(), outcome);
+        assert_eq!(finish_now(&b).unwrap().unwrap(), outcome);
         assert!(invalid(b.commit(&[item("skill:pdf")], "m", None)).contains("half-way"));
 
         b.restore(&[item("skill:pdf")]).unwrap();
-        assert_eq!(b.pull().unwrap(), PullOutcome::Updated { from: old, to: remote });
+        assert_eq!(pull_now(&b).unwrap(), PullOutcome::Updated { from: old, to: remote });
         assert_eq!(read(&pdf), "pdf v2\n");
         assert!(!pending(&b) && b.draft().unwrap().is_empty());
     }
@@ -2082,7 +2111,7 @@ mod tests {
         let lock = f.b.join(".git/index.lock");
         write(&lock, "");
         let before = snapshot(&f.b);
-        match b.pull() {
+        match pull_now(&b) {
             Err(Error::Git { stderr, .. }) => assert!(stderr.contains("index.lock"), "{stderr}"),
             other => panic!("expected git's error, got {other:?}"),
         }
@@ -2098,7 +2127,7 @@ mod tests {
         }
         assert!(pending(&b));
         fs::remove_file(&lock).unwrap();
-        assert_eq!(b.pull().unwrap(), PullOutcome::Updated { from: old, to: remote });
+        assert_eq!(pull_now(&b).unwrap(), PullOutcome::Updated { from: old, to: remote });
         assert_at_upstream(&f);
     }
 
@@ -2116,7 +2145,7 @@ mod tests {
         a.push().unwrap();
         b.pull_crashing_at(Before::File(1)).unwrap_err();
         assert_eq!(fs::read(f.b.join("instructions/git.md")).unwrap(), b"git v2\r\n");
-        assert!(matches!(repo(&f.b).pull().unwrap(), PullOutcome::Updated { .. }));
+        assert!(matches!(pull_now(&repo(&f.b)).unwrap(), PullOutcome::Updated { .. }));
         assert_eq!(fs::read(f.b.join("personal/pdf/SKILL.md")).unwrap(), b"pdf v2\r\n");
         assert_eq!(git(&f.b, &["status", "--porcelain"]), "");
 
@@ -2132,7 +2161,7 @@ mod tests {
         b.pull_crashing_at(Before::File(2)).unwrap_err();
         assert_eq!(fs::read(f.b.join("instructions/git.md")).unwrap(), b"git v2\r\n");
         assert_eq!(fs::read(f.b.join("personal/pdf/SKILL.md")).unwrap(), b"---\nname: pdf\n---\nPDFs.\n");
-        assert!(matches!(repo(&f.b).pull().unwrap(), PullOutcome::Updated { .. }));
+        assert!(matches!(pull_now(&repo(&f.b)).unwrap(), PullOutcome::Updated { .. }));
         assert_eq!(fs::read(f.b.join("personal/pdf/SKILL.md")).unwrap(), b"pdf v2\r\n");
         assert_eq!(git(&f.b, &["status", "--porcelain"]), "");
     }
@@ -2148,7 +2177,7 @@ mod tests {
         chmod(&f.a.join("personal/pdf/run.sh"), 0o755);
         commit_all(&f.a, "a script");
         a.push().unwrap();
-        assert!(matches!(b.pull().unwrap(), PullOutcome::Updated { .. }));
+        assert!(matches!(pull_now(&b).unwrap(), PullOutcome::Updated { .. }));
         assert!(executable(&f.b.join("personal/pdf/run.sh")));
 
         chmod(&f.b.join("personal/pdf/SKILL.md"), 0o600);
@@ -2161,7 +2190,7 @@ mod tests {
         chmod(&f.a.join("instructions/git.md"), 0o755);
         commit_all(&f.a, "changes");
         a.push().unwrap();
-        assert!(matches!(b.pull().unwrap(), PullOutcome::Updated { .. }));
+        assert!(matches!(pull_now(&b).unwrap(), PullOutcome::Updated { .. }));
         assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "v2\n");
         assert_eq!(mode("personal/pdf/SKILL.md"), 0o600);
         assert_eq!(mode("personal/pdf/run.sh"), 0o700);
@@ -2171,7 +2200,7 @@ mod tests {
         chmod(&f.a.join("instructions/git.md"), 0o644);
         commit_all(&f.a, "not executable");
         a.push().unwrap();
-        assert!(matches!(b.pull().unwrap(), PullOutcome::Updated { .. }));
+        assert!(matches!(pull_now(&b).unwrap(), PullOutcome::Updated { .. }));
         assert_eq!(mode("instructions/git.md"), 0o640);
     }
 
@@ -2180,11 +2209,12 @@ mod tests {
     /// the branch, the next pull finishes.
     #[test]
     fn pull_stops_when_another_command_switches_branches() {
-        for (n, point) in [Before::File(1), Before::UpdateRef].into_iter().enumerate() {
+        for (n, point) in [Before::File(1), Before::Index, Before::UpdateRef].into_iter().enumerate() {
             let f = Fleet::new();
             let b = repo(&f.b);
             let remote = half_way_setup(&f);
             let old = git(&f.b, &["rev-parse", "HEAD"]);
+            let staged = git(&f.b, &["diff", "--cached", "--name-only"]);
             let other = format!("other-{n}");
             let error = invalid(b.pull_at(point, || {
                 git(&f.b, &["switch", "--quiet", "-c", &other]);
@@ -2192,13 +2222,16 @@ mod tests {
             assert!(error.contains("switched") && error.contains(&format!("refs/heads/{other}")), "{error}");
             assert_eq!(head_ref(&f.b), format!("refs/heads/{other}"));
             assert_eq!(git(&f.b, &["rev-parse", "main", &other]), format!("{old}\n{old}"));
+            if point == Before::Index {
+                assert_eq!(git(&f.b, &["diff", "--cached", "--name-only"]), staged);
+            }
             if point == Before::File(1) {
                 // Only the first path was updated, before the switch.
                 assert_eq!(read(&f.b.join("instructions/git.md")), "Use Conventional Commits.\n");
             }
             assert!(pending(&b));
             git(&f.b, &["switch", "--quiet", "main"]);
-            assert_eq!(b.pull().unwrap(), PullOutcome::Updated { from: old.clone(), to: remote });
+            assert_eq!(pull_now(&b).unwrap(), PullOutcome::Updated { from: old.clone(), to: remote });
             assert_at_upstream(&f);
             assert_eq!(git(&f.b, &["rev-parse", &other]), old);
         }
@@ -2232,7 +2265,7 @@ mod tests {
         assert_eq!(git(&f.b, &["rev-parse", "HEAD"]), moved);
         assert!(pending(&b));
         let before = snapshot(&f.b);
-        for result in [b.pull(), b.finish_pull().map(|_| PullOutcome::UpToDate)] {
+        for result in [pull_now(&b), finish_now(&b).map(|_| PullOutcome::UpToDate)] {
             let error = invalid(result);
             assert!(error.contains("another Git command moved it") && error.contains("sk1ll-pull.json"), "{error}");
             assert_eq!(snapshot(&f.b), before);
@@ -2253,7 +2286,7 @@ mod tests {
         let draft = b.draft().unwrap();
         // The removal goes first, `instructions/git.md` next.
         chmod(&f.b.join("instructions"), 0o555);
-        let result = b.pull();
+        let result = pull_now(&b);
         chmod(&f.b.join("instructions"), 0o755);
         match result {
             Err(Error::Io { path, .. }) => assert!(path.ends_with("instructions/git.md"), "{}", path.display()),
@@ -2266,13 +2299,14 @@ mod tests {
         // A save to a path pull already updated is a draft change now.
         let web = f.b.join("imported/web/SKILL.md");
         write(&web, "saved meanwhile\n");
-        let outcome = b.pull().unwrap();
-        assert_eq!(outcome, PullOutcome::Blocked { baseline: remote.clone(), items: vec![item("skill:web")] });
+        let outcome = pull_now(&repo(&f.b)).unwrap();
+        assert_eq!(outcome, PullOutcome::Updated { from: old, to: remote });
         assert_eq!(read(&web), "saved meanwhile\n");
-        fs::remove_dir_all(f.b.join("imported/web")).unwrap();
-        assert_eq!(b.pull().unwrap(), PullOutcome::Updated { from: old, to: remote });
-        assert_at_upstream(&f);
-        assert_eq!(b.draft().unwrap(), draft);
+        let after = b.draft().unwrap();
+        assert!(after.iter().any(|d| d.item == item("skill:web")));
+        for original in draft {
+            assert!(after.contains(&original));
+        }
     }
 
     /// Recovery entries of what pull replaced are in the git directory,
@@ -2282,7 +2316,7 @@ mod tests {
         let f = Fleet::new();
         let b = repo(&f.b);
         half_way_setup(&f);
-        assert!(matches!(b.pull().unwrap(), PullOutcome::Updated { .. }));
+        assert!(matches!(pull_now(&b).unwrap(), PullOutcome::Updated { .. }));
         let names: Vec<String> = WalkDir::new(&f.b)
             .into_iter()
             .filter_entry(|e| e.file_name() != ".git")
@@ -2295,5 +2329,268 @@ mod tests {
             !entries.is_empty() && entries.iter().all(|e| e.path.starts_with(f.b.join(".git").canonicalize().unwrap()))
         );
         assert!(!f.b.join(".git/sk1ll-pull-stage").exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn pull_probes_exchange_before_starting() {
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        write(&f.a.join("instructions/git.md"), "new\n");
+        commit_all(&f.a, "replace a rule");
+        a.push().unwrap();
+        let before = snapshot(&f.b);
+        pull::NO_EXCHANGE.set(true);
+        let result = pull_now(&b);
+        pull::NO_EXCHANGE.set(false);
+        assert!(invalid(result).contains("atomic file exchange"));
+        assert!(!pending(&b));
+        assert_eq!(snapshot(&f.b), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_keeps_open_writers_through_prune_and_adoption() {
+        use crate::sync::displaced::{self, Kind};
+        use std::io::Write;
+        use std::time::Duration;
+
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        let rel = "instructions/git.md";
+        write(&f.a.join(rel), "new rule\n");
+        write(&f.a.join("instructions/style.md"), "new style\n");
+        commit_all(&f.a, "replace both rules");
+        a.push().unwrap();
+        let path = f.b.join(rel);
+        let mut open = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        assert!(matches!(
+            b.pull_at(Before::File(1), || {
+                displaced::prune_with(Duration::ZERO, 0).unwrap();
+                open.write_all(b"saved while pull was running\n").unwrap();
+            })
+            .unwrap(),
+            PullOutcome::Updated { .. }
+        ));
+        let entry = displaced::changed().unwrap().into_iter().find(|e| e.kind == Kind::Draft).unwrap();
+        assert_eq!(entry.dest, path);
+        assert!(read(&entry.path).ends_with("saved while pull was running\n"));
+        let wrong = crate::EngineLock::acquire(&f.a).unwrap();
+        assert!(invalid(displaced::adopt(&b, &entry.id, &wrong)).contains("different repository"));
+        let lock = crate::EngineLock::acquire(&f.b).unwrap();
+        displaced::adopt(&b, &entry.id, &lock).unwrap();
+        open.write_all(b"saved after adoption\n").unwrap();
+        assert!(read(&path).ends_with("saved after adoption\n"));
+        assert!(displaced::get(&entry.id).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn draft_adoption_refuses_an_ignored_destination_absent_from_head() {
+        use crate::sync::displaced;
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        let rel = "instructions/git.md";
+        fs::remove_file(f.a.join(rel)).unwrap();
+        commit_all(&f.a, "remove the rule");
+        a.push().unwrap();
+        assert!(matches!(pull_now(&b).unwrap(), PullOutcome::Updated { .. }));
+        let entry = displaced::list().unwrap().into_iter().find(|e| e.dest == f.b.join(rel)).unwrap();
+        write(&f.b.join(".git/info/exclude"), &format!("/{rel}\n"));
+        write(&f.b.join(rel), "private replacement\n");
+        assert!(b.draft().unwrap().is_empty());
+        let lock = crate::EngineLock::acquire(&f.b).unwrap();
+        let before = snapshot(&f.b);
+        assert!(invalid(displaced::adopt(&b, &entry.id, &lock)).contains("local content"));
+        assert_eq!(snapshot(&f.b), before);
+        assert_eq!(read(&entry.path), "Use Conventional Commits.\n");
+        fs::remove_file(f.b.join(rel)).unwrap();
+        displaced::adopt(&b, &entry.id, &lock).unwrap();
+        assert_eq!(read(&f.b.join(rel)), "Use Conventional Commits.\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_displaced_during_removal_is_reported_and_preserved() {
+        use crate::sync::displaced;
+        use std::time::Duration;
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        let rel = "instructions/git.md";
+        fs::remove_file(f.a.join(rel)).unwrap();
+        commit_all(&f.a, "delete rule");
+        a.push().unwrap();
+        let dest = f.b.join(rel);
+        let result = b.pull_at(Before::Remove, || {
+            fs::remove_file(&dest).unwrap();
+            write(&dest.join("draft"), "important directory\n");
+        });
+        let Err(Error::Displaced { dest: from, kept, id }) = result else {
+            panic!("expected a displaced directory, got {result:?}");
+        };
+        assert_eq!(from, dest);
+        assert_eq!(read(&kept.join("draft")), "important directory\n");
+        assert!(displaced::get(&id).unwrap().changed);
+        // Even an old, malformed metadata file cannot make content prunable.
+        write(&kept.with_file_name("entry.json"), "{");
+        assert!(!displaced::prune_with(Duration::ZERO, 0).unwrap().contains(&id));
+        assert_eq!(read(&kept.join("draft")), "important directory\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resumed_pull_leaves_later_edits_to_published_paths_as_draft() {
+        for operation in ["add", "replace", "remove"] {
+            let f = Fleet::new();
+            let a = repo(&f.a);
+            let rel = if operation == "add" { "instructions/new.md" } else { "instructions/git.md" };
+            if operation == "remove" {
+                fs::remove_file(f.a.join(rel)).unwrap();
+            } else {
+                write(&f.a.join(rel), "new baseline\n");
+            }
+            commit_all(&f.a, operation);
+            a.push().unwrap();
+            assert!(repo(&f.b).pull_crashing_at(Before::Published).is_err());
+            let dest = f.b.join(rel);
+            match operation {
+                "add" => fs::remove_file(&dest).unwrap(),
+                "remove" => {
+                    use crate::sync::displaced;
+                    let entry = displaced::list().unwrap().into_iter().find(|e| e.dest == dest).unwrap();
+                    assert!(invalid(displaced::discard(&entry.id)).contains("pull pending"));
+                    write(&dest, "recreated after publication\n");
+                }
+                _ => {
+                    let temp = dest.with_extension("save");
+                    write(&temp, "saved after publication\n");
+                    fs::rename(&temp, &dest).unwrap();
+                    git(&f.b, &["add", rel]);
+                }
+            }
+            let b = repo(&f.b);
+            assert!(matches!(finish_now(&b).unwrap(), Some(PullOutcome::Updated { .. })), "{operation}");
+            assert!(!pending(&b));
+            assert_eq!(b.draft().unwrap().len(), 1, "{operation}");
+            match operation {
+                "add" => assert!(!dest.exists()),
+                "remove" => assert_eq!(read(&dest), "recreated after publication\n"),
+                _ => {
+                    assert_eq!(read(&dest), "saved after publication\n");
+                    assert_eq!(git(&f.b, &["show", &format!(":{rel}")]), "saved after publication");
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pull_replaces_a_nested_directory_with_a_file() {
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        write(&f.a.join("a/b/c"), "tracked\n");
+        commit_all(&f.a, "nested directory");
+        a.push().unwrap();
+        pull_now(&b).unwrap();
+        fs::create_dir_all(f.b.join("a/b/empty/deeper")).unwrap();
+        fs::remove_dir_all(f.a.join("a")).unwrap();
+        write(&f.a.join("a"), "now a file\n");
+        commit_all(&f.a, "replace nested directory");
+        a.push().unwrap();
+        assert!(matches!(pull_now(&b).unwrap(), PullOutcome::Updated { .. }));
+        assert_eq!(read(&f.b.join("a")), "now a file\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pull_recovers_byte_paths_and_full_length_leaf_names() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        let long = "x".repeat(255);
+        let names = [OsStr::from_bytes(b"invalid-\xff"), OsStr::new(&long)];
+        for path in names {
+            write(&f.a.join(path), "old\n");
+        }
+        commit_all(&f.a, "add unusual paths");
+        a.push().unwrap();
+        pull_now(&b).unwrap();
+        for path in names {
+            write(&f.a.join(path), "new\n");
+        }
+        commit_all(&f.a, "replace unusual paths");
+        a.push().unwrap();
+        assert!(b.pull_crashing_at(Before::Published).is_err());
+        finish_now(&repo(&f.b)).unwrap();
+        for path in names {
+            assert_eq!(read(&f.b.join(path)), "new\n");
+            let entry = crate::sync::displaced::list().unwrap().into_iter().find(|e| e.dest == f.b.join(path)).unwrap();
+            assert!(entry.id.len() < 255);
+            assert_eq!(read(&entry.path), "old\n");
+            assert!(serde_json::to_vec(&entry).is_ok());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pull_applies_mode_only_changes_and_recovers_a_racing_chmod() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        let rel = "instructions/git.md";
+        let path = f.b.join(rel);
+        git(&f.b, &["config", "core.fileMode", "false"]);
+        chmod(&f.a.join(rel), 0o755);
+        commit_all(&f.a, "make rule executable");
+        a.push().unwrap();
+        assert!(matches!(pull_now(&b).unwrap(), PullOutcome::Updated { .. }));
+        assert!(executable(&path));
+        chmod(&f.a.join(rel), 0o644);
+        commit_all(&f.a, "make rule nonexecutable");
+        a.push().unwrap();
+        let result = b.pull_at(Before::Swap, || chmod(&path, 0o700));
+        let Err(Error::Displaced { kept, .. }) = result else { panic!("{result:?}") };
+        assert_eq!(fs::metadata(&kept).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(read(&kept), read(&path));
+        assert!(!executable(&path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pull_accepts_a_case_only_rename_on_case_folding_filesystems() {
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        write(&f.a.join("lowercase"), "baseline\n");
+        commit_all(&f.a, "lowercase");
+        a.push().unwrap();
+        pull_now(&b).unwrap();
+        let alias = f.b.join("Lowercase");
+        let case_folding = alias.exists();
+        if !case_folding {
+            // On a case-sensitive filesystem a hard link with the exact
+            // new spelling is a distinct untracked obstruction.
+            write(&f.b.join(".git/info/exclude"), "/Lowercase\n");
+            fs::hard_link(f.b.join("lowercase"), &alias).unwrap();
+        }
+        git(&f.a, &["mv", "-f", "lowercase", "Lowercase"]);
+        git(&f.a, &["commit", "-qm", "change case"]);
+        a.push().unwrap();
+        assert_eq!(git(&f.a, &["ls-tree", "--name-only", "HEAD", "--", "Lowercase"]), "Lowercase");
+        if !case_folding {
+            assert!(matches!(pull_now(&b).unwrap(), PullOutcome::Blocked { .. }));
+            fs::remove_file(&alias).unwrap();
+        }
+        assert!(matches!(pull_now(&b).unwrap(), PullOutcome::Updated { .. }));
+        assert!(fs::read_dir(&f.b).unwrap().any(|e| e.unwrap().file_name() == "Lowercase"));
+    }
+
+    #[test]
+    fn pull_requires_the_repos_engine_lock() {
+        let f = Fleet::new();
+        let b = repo(&f.b);
+        let wrong = crate::EngineLock::acquire(&f.a).unwrap();
+        assert!(invalid(b.pull(&wrong)).contains("different repository"));
+        assert!(invalid(b.finish_pull(&wrong)).contains("different repository"));
     }
 }

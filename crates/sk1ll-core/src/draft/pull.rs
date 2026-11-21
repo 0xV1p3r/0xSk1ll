@@ -42,6 +42,9 @@ use crate::{Error, IoExt, Repo, Result, machine};
 mod journal;
 mod worktree;
 
+#[cfg(all(test, unix))]
+pub(super) use worktree::NO_EXCHANGE;
+
 use journal::Journal;
 use worktree::{Content, Node, Outcome, Worktree};
 
@@ -58,6 +61,10 @@ pub(super) enum Before {
     /// Inside a file's replacement: what was there is held in the recovery
     /// area and checked, and the new content goes in next.
     Swap,
+    /// Inside a removal, after checking the tracked leaf.
+    Remove,
+    /// A filesystem operation ran, before its completion is read.
+    Published,
     /// Every path is done; the index is next.
     Index,
     /// The index is updated; the branch moves next.
@@ -71,6 +78,7 @@ pub(super) enum Before {
 pub(super) type Hook<'a> = &'a mut dyn FnMut(Before) -> Result<()>;
 
 pub(super) fn run(repo: &Repo, hook: Hook) -> Result<PullOutcome> {
+    let _ = crate::sync::displaced::prune();
     with_pull(repo, |pull| pull.run(hook))
 }
 
@@ -79,9 +87,10 @@ pub(super) fn finish(repo: &Repo, hook: Hook) -> Result<Option<PullOutcome>> {
     if !pending(repo)? {
         return Ok(None);
     }
+    let _ = crate::sync::displaced::prune();
     with_pull(repo, |pull| {
-        let Some(journal) = Journal::load(pull)? else { return Ok(None) };
-        match pull.finish(&Worktree::open(&pull.root, &pull.git_dir)?, &journal, false, hook)? {
+        let Some(mut journal) = Journal::load(pull)? else { return Ok(None) };
+        match pull.finish(&Worktree::open(&pull.root, &pull.git_dir)?, &mut journal, false, hook)? {
             Finished::Blocked(items) => {
                 Ok(Some(PullOutcome::Blocked { baseline: journal.baseline, items: items.into_iter().collect() }))
             }
@@ -91,11 +100,20 @@ pub(super) fn finish(repo: &Repo, hook: Hook) -> Result<Option<PullOutcome>> {
     })
 }
 
+pub(super) fn journal_exists(git_dir: &Path) -> Result<bool> {
+    let path = journal::path(git_dir);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).at(path),
+    }
+}
+
 /// Whether a pull stopped half-way and left its journal.
 pub(super) fn pending(repo: &Repo) -> Result<bool> {
     let git_dir = Git::new(repo.root()).args(["rev-parse", "--absolute-git-dir"]).run()?;
     let git_dir = path_from_bytes(git_dir.strip_suffix(b"\n").unwrap_or(&git_dir));
-    Ok(fs::symlink_metadata(journal::path(&git_dir)).is_ok())
+    journal_exists(&git_dir)
 }
 
 /// Puts the content of a pull's recovery entry back at its path, as a draft
@@ -110,41 +128,26 @@ pub(super) fn adopt(repo: &Repo, entry: &crate::sync::displaced::Entry) -> Resul
         let path = entry.dest.strip_prefix(&root).map_err(|_| {
             Error::Invalid(format!("displaced entry `{}` is from outside {}", entry.id, root.display()))
         })?;
-        let spec = path.to_str().ok_or_else(|| {
-            Error::Invalid(format!("{} has a name that isn't UTF-8; copy it back by hand", entry.dest.display()))
-        })?;
-        if !status_paths(pull.git(), &[spec])?.is_empty() {
-            return Err(Error::Invalid(format!(
-                "{} has draft changes; commit or restore `{}` first, then adopt displaced entry `{}`",
-                entry.dest.display(),
-                pull.item(path),
-                entry.id
-            )));
-        }
-        let meta = fs::symlink_metadata(&entry.path).at(&entry.path)?;
-        let content = if meta.file_type().is_symlink() {
-            Content::Link(crate::git::path_bytes(&fs::read_link(&entry.path).at(&entry.path)?))
-        } else if meta.is_file() {
-            #[cfg(unix)]
-            let executable = std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o100 != 0;
-            #[cfg(not(unix))]
-            let executable = false;
-            Content::File { bytes: fs::read(&entry.path).at(&entry.path)?, executable }
-        } else {
-            return Err(Error::Invalid(format!("displaced entry `{}` is not a file", entry.id)));
-        };
+        let head = rev(pull.git(), "HEAD")?;
+        let tracked = head.as_deref().map(|head| pull.entry_at(head, path)).transpose()?.flatten();
+        let index = pull.index()?;
+        let staged = index.get(path).map(Vec::as_slice).unwrap_or_default();
         let tree = Worktree::open(&pull.root, &pull.git_dir)?;
         let node = tree.read(path)?;
-        let outcome = match node {
-            Node::Missing | Node::Directory => tree.create(usize::MAX, path, &content, &node)?,
-            Node::File { .. } | Node::Link(_) => tree.replace(usize::MAX, path, &node, &content, &mut |_| Ok(()))?,
-            Node::Other => return Err(Error::Invalid(format!("{} is not a file", entry.dest.display()))),
+        let convert = Convert::with_attributes(pull, None)?;
+        let clean = match &tracked {
+            Some(_) => convert.holds(&node, tracked.as_ref(), path)?,
+            None => node == Node::Missing,
         };
-        tree.clear();
-        match outcome {
-            Outcome::Done(displaced) => displaced.map_or(Ok(()), Err),
-            Outcome::Changed => Err(Error::Changed(format!("{} changed meanwhile; try again", entry.dest.display()))),
+        if !clean || !staged_as(staged, tracked.as_ref()) {
+            return Err(Error::Invalid(format!(
+                "{} has local content or a staged change. Move it aside or restore `{}` before adopting `{}`",
+                entry.dest.display(),
+                pull.item(path),
+                entry.id,
+            )));
         }
+        tree.adopt(path, &node, entry)
     })
 }
 
@@ -223,16 +226,6 @@ enum Finished {
     Blocked(BTreeSet<ItemRef>),
 }
 
-/// What [`Pull::update_path`] did.
-enum Step {
-    /// The path was already as the new commit has it.
-    Done,
-    /// The path was updated (see [`Finished::Updated`] for `displaced`).
-    Updated { displaced: Option<Error> },
-    /// The path holds neither version, so it was left alone.
-    Changed,
-}
-
 struct Pull<'a> {
     /// The skills repo, for messages.
     repo: &'a Path,
@@ -254,9 +247,9 @@ impl Pull<'_> {
     /// Finishes a pull that stopped half-way first, then pulls.
     fn run(&self, hook: Hook) -> Result<PullOutcome> {
         let resumed = match Journal::load(self)? {
-            Some(journal) => {
+            Some(mut journal) => {
                 let baseline = journal.baseline.clone();
-                match self.finish(&Worktree::open(&self.root, &self.git_dir)?, &journal, false, hook)? {
+                match self.finish(&Worktree::open(&self.root, &self.git_dir)?, &mut journal, false, hook)? {
                     Finished::Blocked(items) => {
                         return Ok(PullOutcome::Blocked { baseline, items: items.into_iter().collect() });
                     }
@@ -356,6 +349,7 @@ impl Pull<'_> {
         // Whatever stops a pull from starting has to stop it here, before
         // anything changes.
         let tree = Worktree::open(&self.root, &self.git_dir)?;
+        tree.preflight(&changes)?;
         if self.index()?.values().flatten().any(|(_, _, stage)| stage != "0") {
             return Err(Error::Invalid("the index has unresolved conflicts; resolve them before pulling".into()));
         }
@@ -366,11 +360,18 @@ impl Pull<'_> {
         if !matches!(refresh.status.code(), Some(0 | 1)) {
             return Err(git_error("update-index --refresh", &refresh.stderr));
         }
-        let journal = Journal { branch, old: head.clone(), target, baseline: remote.clone(), changes };
+        let mut journal = Journal {
+            branch,
+            old: head.clone(),
+            target,
+            baseline: remote.clone(),
+            changes,
+            operations: BTreeMap::new(),
+        };
         self.attributes_from(&journal, &journal.old)?;
         hook(Before::Journal)?;
         journal.write(self)?;
-        match self.finish(&tree, &journal, true, hook)? {
+        match self.finish(&tree, &mut journal, true, hook)? {
             Finished::Updated { to, displaced, .. } => Ok((PullOutcome::Updated { from: head, to }, displaced)),
             Finished::Blocked(items) => blocked(items),
         }
@@ -381,63 +382,83 @@ impl Pull<'_> {
     /// Never goes back: whatever stops it leaves the journal, for the next
     /// call to go on from there. Only a `fresh` journal that nothing was
     /// done for yet is removed again when a clash stops it.
-    fn finish(&self, tree: &Worktree, journal: &Journal, fresh: bool, hook: Hook) -> Result<Finished> {
+    fn finish(&self, tree: &Worktree, journal: &mut Journal, fresh: bool, hook: Hook) -> Result<Finished> {
         let branch = format!("refs/heads/{}", journal.branch);
         self.require_attached(&branch, journal)?;
         match rev(self.git(), &branch)? {
             Some(at) if at == journal.target => {
+                let mut displaced = None;
+                for i in 0..journal.changes.len() {
+                    let Some(operation) = journal.operations.get(&i) else {
+                        return Err(self.branch_moved(journal, Some(&at)));
+                    };
+                    let Some(Outcome::Done(entry)) = tree.completed(i, operation)? else {
+                        return Err(self.branch_moved(journal, Some(&at)));
+                    };
+                    displaced = displaced.or(entry);
+                }
                 journal.remove(self)?;
                 tree.clear();
                 let to = rev(self.git(), "HEAD")?.ok_or_else(|| Error::Invalid("HEAD is missing".into()))?;
-                return Ok(Finished::Updated { from: journal.old.clone(), to, displaced: None });
+                return Ok(Finished::Updated { from: journal.old.clone(), to, displaced });
             }
             Some(at) if at == journal.old => {}
             at => return Err(self.branch_moved(journal, at.as_deref())),
         }
         let convert = Convert::new(self, journal)?;
-        tree.tidy(journal, |entry, path| convert.content(entry, path))?;
         let (mut wrote, mut displaced) = (false, None);
-        let blocked = |items: BTreeSet<ItemRef>, wrote: bool| {
-            if fresh && !wrote {
+        let blocked = |items: BTreeSet<ItemRef>, wrote: bool, journal: &Journal| {
+            if fresh && !wrote && journal.operations.is_empty() {
                 journal.remove(self)?;
             }
-            tree.clear();
             Ok(Finished::Blocked(items))
         };
+        let mut pruned = false;
         for (n, i) in journal.order().into_iter().enumerate() {
+            if !pruned && journal.changes[i].new.is_some() {
+                tree.prune(journal.changes.iter().filter(|c| c.new.is_none()).map(|c| c.path.as_path()));
+                pruned = true;
+            }
             hook(Before::File(n))?;
             self.require_attached(&branch, journal)?;
-            let change = &journal.changes[i];
-            match self.update_path(tree, &convert, i, change, hook)? {
-                Step::Done => {}
-                Step::Updated { displaced: d } => {
+            match self.update_path(tree, &convert, journal, i, hook)? {
+                Outcome::Done(d) => {
                     wrote = true;
                     displaced = displaced.or(d);
                 }
-                Step::Changed => return blocked([self.item(&change.path)].into(), wrote),
+                Outcome::Changed => {
+                    if fresh && let Some(displaced) = displaced {
+                        return Err(displaced);
+                    }
+                    return blocked([self.item(&journal.changes[i].path)].into(), wrote, journal);
+                }
             }
         }
-        tree.prune(journal.changes.iter().filter(|c| c.new.is_none()).map(|c| c.path.as_path()));
+        if !pruned {
+            tree.prune(journal.changes.iter().filter(|c| c.new.is_none()).map(|c| c.path.as_path()));
+        }
 
         hook(Before::Index)?;
-        // Each path's entry is `old`'s, or already `target`'s; anything else
-        // was staged since the checks. Two-way read-tree takes `target`'s
-        // entries for the paths that still have `old`'s and keeps every
-        // other entry, so whatever the draft staged elsewhere stays staged.
+        // Two-way read-tree carries staged Draft entries through paths that
+        // agree on both sides. Make those sides agree if a path was staged
+        // since our initial check, including after a previous index update.
         let index = self.index()?;
-        let staged: BTreeSet<ItemRef> = journal
+        let staged: Vec<_> = journal
             .changes
             .iter()
             .filter(|c| {
                 let entries = index.get(&c.path).map(Vec::as_slice).unwrap_or_default();
                 !staged_as(entries, c.old.as_ref()) && !staged_as(entries, c.new.as_ref())
             })
-            .map(|c| self.item(&c.path))
+            .map(|c| &c.path)
             .collect();
-        if !staged.is_empty() {
-            return blocked(staged, wrote);
+        let index_target = self.index_target(journal, &staged)?;
+        let at = rev(self.git(), &branch)?;
+        if at.as_deref() != Some(journal.old.as_str()) {
+            return Err(self.branch_moved(journal, at.as_deref()));
         }
-        self.git().args(["read-tree", "-m", "-i", &journal.old, &journal.target]).run()?;
+        self.require_attached(&branch, journal)?;
+        self.git().args(["read-tree", "-m", "-i", &journal.old, &index_target]).run()?;
         // Fresh stat information spares later status calls hashing these
         // files again; it changes no entry, so it may fail.
         let _ = self.git().args(["update-index", "-q", "--refresh"]).output();
@@ -452,30 +473,90 @@ impl Pull<'_> {
         Ok(Finished::Updated { from: journal.old.clone(), to, displaced })
     }
 
+    /// For paths edited and staged after publication, use the same entry on
+    /// both sides of the index merge. This carries the staged entry through
+    /// as Draft, including a staged file/directory replacement.
+    fn index_target(&self, journal: &Journal, staged: &[&PathBuf]) -> Result<String> {
+        if staged.is_empty() {
+            return Ok(journal.target.clone());
+        }
+        let saved = journal
+            .changes
+            .iter()
+            .filter(|change| staged.iter().any(|path| path.starts_with(&change.path) || change.path.starts_with(path)));
+        let (mut remove, mut restore) = (Vec::new(), Vec::new());
+        let zero = "0".repeat(journal.target.len());
+        for change in saved {
+            let path = crate::git::path_bytes(&change.path);
+            remove.extend_from_slice(format!("0 {zero}\t").as_bytes());
+            remove.extend_from_slice(&path);
+            remove.push(0);
+            if let Some(old) = &change.old {
+                restore.extend_from_slice(format!("{} {}\t", old.mode, old.oid).as_bytes());
+                restore.extend_from_slice(&path);
+                restore.push(0);
+            }
+        }
+        remove.extend(restore);
+        let index = self.hooks.join("pull-index");
+        let git = || self.git().args(["-c", "core.splitIndex=false"]).env("GIT_INDEX_FILE", &index);
+        let result = (|| {
+            git().args(["read-tree", &journal.target]).run()?;
+            git().args(["update-index", "-z", "--index-info"]).stdin(remove).run()?;
+            git().arg("write-tree").text()
+        })();
+        let _ = fs::remove_file(&index);
+        result
+    }
+
     /// Brings one path from the journal's `old` to its `target`, if it is
     /// still at `old`; `i` is its place in the journal.
-    fn update_path(&self, tree: &Worktree, convert: &Convert, i: usize, change: &Change, hook: Hook) -> Result<Step> {
+    fn update_path(
+        &self,
+        tree: &Worktree,
+        convert: &Convert,
+        journal: &mut Journal,
+        i: usize,
+        hook: Hook,
+    ) -> Result<Outcome> {
+        if let Some(operation) = journal.operations.get(&i)
+            && let Some(outcome) = tree.completed(i, operation)?
+        {
+            return Ok(outcome);
+        }
+
+        let change = &journal.changes[i];
         let node = tree.read(&change.path)?;
-        if convert.holds(&node, change.new.as_ref(), &change.path, Side::Target)? {
-            return Ok(Step::Done);
+        if !convert.holds(&node, change.old.as_ref(), &change.path)? {
+            return Ok(Outcome::Changed);
         }
-        if !convert.holds(&node, change.old.as_ref(), &change.path, Side::Old)? {
-            return Ok(Step::Changed);
+        if !journal.operations.contains_key(&i) {
+            let content = change.new.as_ref().map(|entry| convert.content(entry, &change.path)).transpose()?;
+            let keep_mode = !convert.file_mode
+                && matches!((&change.old, &change.new), (Some(old), Some(new)) if old.mode == new.mode);
+            let operation = tree.prepare(i, &change.path, &node, content.as_ref(), keep_mode)?;
+            journal.record(self, i, operation)?;
         }
-        let outcome = match &change.new {
-            None => tree.remove(&change.path, &node)?,
-            Some(entry) => {
-                let content = convert.content(entry, &change.path)?;
-                match node {
-                    Node::Missing | Node::Directory => tree.create(i, &change.path, &content, &node)?,
-                    _ => tree.replace(i, &change.path, &node, &content, hook)?,
-                }
+        tree.apply(i, &journal.changes[i].path, &node, &journal.operations[&i], hook)
+    }
+
+    /// The exact leaf at `path`, without interpreting it as a Git pathspec.
+    fn entry_at(&self, head: &str, path: &Path) -> Result<Option<Entry>> {
+        let out = self.git().literal().args(["ls-tree", "-r", "-z", "--full-tree", head, "--"]).arg(path).run()?;
+        let want = crate::git::path_bytes(path);
+        for row in out.split(|b| *b == 0) {
+            let Some(tab) = row.iter().position(|b| *b == b'\t') else { continue };
+            if row[tab + 1..] != want {
+                continue;
             }
-        };
-        Ok(match outcome {
-            Outcome::Done(displaced) => Step::Updated { displaced },
-            Outcome::Changed => Step::Changed,
-        })
+            let header = std::str::from_utf8(&row[..tab]).map_err(|_| Error::Invalid("invalid tree entry".into()))?;
+            let fields: Vec<_> = header.split(' ').collect();
+            if let [mode, _, oid] = fields.as_slice() {
+                return Ok(Entry::new(mode, oid));
+            }
+            return Err(Error::Invalid("invalid tree entry".into()));
+        }
+        Ok(None)
     }
 
     /// `HEAD` must stay on `branch`: another Git command switched branches
@@ -504,14 +585,12 @@ impl Pull<'_> {
 
     fn branch_moved(&self, journal: &Journal, at: Option<&str>) -> Error {
         Error::Invalid(format!(
-            "can't finish the pull that moves `{}` from {} to {}: another Git command moved it to {}. Nothing was \
-             changed. Some files may already be as {} has them (see `git status`); to give up on that pull, \
-             remove {}",
+            "can't finish the pull that moves `{}` from {} to {}: another Git command moved it to {}. \
+             Return the branch to its original commit before resuming. Its recovery state is recorded in {}",
             journal.branch,
             short(&journal.old),
             short(&journal.target),
             at.map_or("nowhere".to_string(), short),
-            short(&journal.target),
             journal::path(&self.git_dir).display()
         ))
     }
@@ -738,7 +817,8 @@ impl Pull<'_> {
         for change in ours.iter().chain(changes).filter(|c| self.reaches_stage(c)) {
             items.insert(self.item(&change.path));
         }
-        for change in changes.iter().filter(|c| c.new.is_some() && self.obstructed(&c.path, tracked)) {
+        let removed: BTreeSet<_> = changes.iter().filter(|c| c.new.is_none()).map(|c| c.path.as_path()).collect();
+        for change in changes.iter().filter(|c| c.new.is_some() && self.obstructed(&c.path, tracked, &removed)) {
             items.insert(self.item(&change.path));
         }
         Ok(items)
@@ -764,20 +844,68 @@ impl Pull<'_> {
     /// `path`: a file or symlink above it, at it, or (for a directory there)
     /// anywhere below it. Untracked files are in the draft too, but ignored
     /// ones are only caught here.
-    fn obstructed(&self, path: &Path, tracked: &BTreeSet<PathBuf>) -> bool {
+    fn obstructed(&self, path: &Path, tracked: &BTreeSet<PathBuf>, removed: &BTreeSet<&Path>) -> bool {
+        let tracked_here = |p: &Path| {
+            tracked.contains(p)
+                || (!removed.is_empty() && self.actual_spelling(p).is_some_and(|p| removed.contains(p.as_path())))
+        };
         if let Some(parent) = self.non_directory_ancestor(path) {
-            return !tracked.contains(parent);
+            return !tracked_here(parent);
         }
         let abs = self.root.join(path);
         match fs::symlink_metadata(&abs) {
             Err(_) => false,
             Ok(m) if m.is_dir() => WalkDir::new(&abs).min_depth(1).into_iter().any(|e| {
                 e.map_or(true, |e| {
-                    !e.file_type().is_dir() && e.path().strip_prefix(&self.root).map_or(true, |p| !tracked.contains(p))
+                    !e.file_type().is_dir() && e.path().strip_prefix(&self.root).map_or(true, |p| !tracked_here(p))
                 })
             }),
-            Ok(_) => !tracked.contains(path),
+            Ok(_) => !tracked_here(path),
         }
+    }
+
+    /// Resolve the spelling the directory actually stores. Only a unique
+    /// inode match can stand in for an absent spelling on a case-folding
+    /// filesystem. A distinct, exactly named hard link is an obstruction.
+    #[cfg(unix)]
+    fn actual_spelling(&self, path: &Path) -> Option<PathBuf> {
+        use std::os::unix::fs::MetadataExt;
+
+        let mut resolved = PathBuf::new();
+        let mut components = path.components().peekable();
+        while let Some(component) = components.next() {
+            let dir = self.root.join(&resolved);
+            let name = component.as_os_str();
+            let requested = fs::symlink_metadata(dir.join(name)).ok()?;
+            if components.peek().is_some() && !requested.is_dir() {
+                return None;
+            }
+            let mut alias = None;
+            let mut count = 0;
+            for entry in fs::read_dir(&dir).ok()? {
+                let entry = entry.ok()?;
+                if entry.file_name() == name {
+                    alias = Some(entry.file_name());
+                    count = 1;
+                    break;
+                }
+                let meta = fs::symlink_metadata(entry.path()).ok()?;
+                if (meta.dev(), meta.ino()) == (requested.dev(), requested.ino()) {
+                    alias = Some(entry.file_name());
+                    count += 1;
+                }
+            }
+            if count != 1 {
+                return None;
+            }
+            resolved.push(alias?);
+        }
+        Some(resolved)
+    }
+
+    #[cfg(not(unix))]
+    fn actual_spelling(&self, _: &Path) -> Option<PathBuf> {
+        None
     }
 
     fn non_directory_ancestor<'a>(&self, path: &'a Path) -> Option<&'a Path> {
@@ -880,6 +1008,10 @@ struct Convert<'a> {
 impl<'a> Convert<'a> {
     fn new(pull: &'a Pull<'a>, journal: &Journal) -> Result<Self> {
         let attributes = journal.changes_attributes().then(|| (journal.old.clone(), journal.target.clone()));
+        Self::with_attributes(pull, attributes)
+    }
+
+    fn with_attributes(pull: &'a Pull<'a>, attributes: Option<(String, String)>) -> Result<Self> {
         Ok(Self { pull, attributes, file_mode: pull.flag("core.fileMode")?, symlinks: pull.flag("core.symlinks")? })
     }
 
@@ -895,7 +1027,7 @@ impl<'a> Convert<'a> {
     /// Whether `node` is what checking out `entry` at `path` gives, as git
     /// itself decides (filters and line endings included). With no entry,
     /// that is nothing, or a directory.
-    fn holds(&self, node: &Node, entry: Option<&Entry>, path: &Path, side: Side) -> Result<bool> {
+    fn holds(&self, node: &Node, entry: Option<&Entry>, path: &Path) -> Result<bool> {
         let Some(entry) = entry else { return Ok(matches!(node, Node::Missing | Node::Directory)) };
         let (bytes, filtered) = match (node, entry.mode.as_str()) {
             (Node::Link(target), SYMLINK) if self.symlinks => (target, false),
@@ -908,7 +1040,7 @@ impl<'a> Convert<'a> {
             }
             _ => return Ok(false),
         };
-        let git = self.git(side).args(["hash-object", "--stdin"]);
+        let git = self.git(Side::Old).args(["hash-object", "--stdin"]);
         let git = if filtered { git.arg(path_option(path)) } else { git.arg("--no-filters") };
         Ok(git.stdin(bytes.clone()).text()? == entry.oid)
     }

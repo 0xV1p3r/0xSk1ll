@@ -7,6 +7,7 @@
 //! git never prunes the replayed commits and merged blobs only that target
 //! reaches.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -46,6 +47,7 @@ pub(super) struct Journal {
     /// The remote commit `target` is built on, for a Blocked outcome.
     pub(super) baseline: String,
     pub(super) changes: Vec<Change>,
+    pub(super) operations: BTreeMap<usize, Operation>,
 }
 
 /// [`Journal`] as stored. Paths are git-quoted, so any bytes round-trip.
@@ -56,6 +58,7 @@ struct Stored {
     target: String,
     baseline: String,
     changes: Vec<StoredChange>,
+    operations: BTreeMap<usize, Operation>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -63,6 +66,20 @@ struct StoredChange {
     path: String,
     old: Option<Entry>,
     new: Option<Entry>,
+}
+
+/// A prepared operation, recorded before its first worktree mutation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) enum Operation {
+    Add,
+    Remove { recovery: String },
+    Replace { recovery: String, staged: Inode },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct Inode {
+    pub(super) device: u64,
+    pub(super) number: u64,
 }
 
 impl Journal {
@@ -83,30 +100,15 @@ impl Journal {
                 Ok(Change { path: crate::git::path_from_bytes(&raw), old: c.old, new: c.new })
             })
             .collect::<Result<_>>()?;
-        let Stored { branch, old, target, baseline, .. } = stored;
-        Ok(Some(Self { branch, old, target, baseline, changes }))
+        let Stored { branch, old, target, baseline, operations, .. } = stored;
+        Ok(Some(Self { branch, old, target, baseline, changes, operations }))
     }
 
     /// Anchors the target, then writes the journal where none is: another
     /// pull's journal is never replaced.
     pub(super) fn write(&self, pull: &Pull) -> Result<()> {
         pull.git().args(["update-ref", "-m", "sk1ll: pull", ANCHOR, &self.target]).run()?;
-        let stored = Stored {
-            branch: self.branch.clone(),
-            old: self.old.clone(),
-            target: self.target.clone(),
-            baseline: self.baseline.clone(),
-            changes: self
-                .changes
-                .iter()
-                .map(|c| StoredChange {
-                    path: quote_path(&path_bytes(&c.path)),
-                    old: c.old.clone(),
-                    new: c.new.clone(),
-                })
-                .collect(),
-        };
-        let body = serde_json::to_vec_pretty(&stored).map_err(|e| Error::Invalid(e.to_string()))?;
+        let body = self.body()?;
         let path = path(&pull.git_dir);
         let tmp = pull.git_dir.join(format!("{FILE}.{}", std::process::id()));
         crate::config_file::write_new(&tmp, &body)?;
@@ -120,6 +122,31 @@ impl Journal {
             Err(e) => return Err(e).at(&path),
         }
         sync_dir(&pull.git_dir)
+    }
+
+    fn body(&self) -> Result<Vec<u8>> {
+        let stored = Stored {
+            branch: self.branch.clone(),
+            old: self.old.clone(),
+            target: self.target.clone(),
+            baseline: self.baseline.clone(),
+            operations: self.operations.clone(),
+            changes: self
+                .changes
+                .iter()
+                .map(|c| StoredChange {
+                    path: quote_path(&path_bytes(&c.path)),
+                    old: c.old.clone(),
+                    new: c.new.clone(),
+                })
+                .collect(),
+        };
+        serde_json::to_vec_pretty(&stored).map_err(|e| Error::Invalid(e.to_string()))
+    }
+
+    pub(super) fn record(&mut self, pull: &Pull, index: usize, operation: Operation) -> Result<()> {
+        self.operations.insert(index, operation);
+        crate::config_file::replace_private(&path(&pull.git_dir), &self.body()?)
     }
 
     /// Removes the journal, then the anchor. Once the journal is gone, a

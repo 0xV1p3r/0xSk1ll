@@ -420,7 +420,13 @@ fn print_fleet(fleet: sk1ll_proto::FleetView) {
         };
         let mut notes = Vec::new();
         if let Some(r) = &m.report {
-            if r.blocked {
+            if let Some(items) = &r.pull_pending {
+                notes.push(if items.is_empty() {
+                    "pull pending".into()
+                } else {
+                    format!("pull pending, blocked by {}", names(items))
+                });
+            } else if r.blocked {
                 notes.push(format!("clashes: {}", names(&r.clashes)));
             }
             if !r.conflicts.is_empty() {
@@ -587,7 +593,12 @@ impl Daemon {
                 PullResult::Updated { from, to } => {
                     println!("baseline {} -> {}", from.as_deref().map_or("(none)", short), short(&to));
                 }
-                PullResult::Blocked { baseline, items } => bail!(
+                PullResult::Blocked { baseline, items, pending: true } => bail!(
+                    "pull pending at {}. Move aside any edits you want to keep, then restore or clear {} and pull again",
+                    short(&baseline),
+                    names(&items)
+                ),
+                PullResult::Blocked { baseline, items, pending: false } => bail!(
                     "blocked: baseline {} clashes with {}; commit or restore them (the daemon pulls again then)",
                     short(&baseline),
                     names(&items)
