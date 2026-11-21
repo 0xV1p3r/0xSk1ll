@@ -490,6 +490,10 @@ fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
+    if lock.is_some() && matches!(cli.cmd, Cmd::Sync { .. } | Cmd::Assign { .. } | Cmd::Adopt { .. }) {
+        harnesses::recover_pending(&cli, &machine_path, &assignment_path)?;
+    }
+
     let mut repo = if cli.cmd.git_only() { Repo::open_git_only(&repo_path)? } else { Repo::open(&repo_path)? };
     match cli.cmd {
         Cmd::Recover { command } => match command {

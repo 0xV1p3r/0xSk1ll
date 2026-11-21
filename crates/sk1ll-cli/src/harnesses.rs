@@ -20,7 +20,13 @@ use crate::{Cli, confirm};
 #[derive(Subcommand)]
 pub(crate) enum HarnessCmd {
     /// Rename a harness and move its Assignment
-    Rename { old: String, new: String },
+    Rename {
+        old: String,
+        new: String,
+        /// Replace an Assignment already stored for the new name
+        #[arg(long)]
+        replace: bool,
+    },
     /// Sync into a harness again
     Enable {
         name: String,
@@ -120,8 +126,9 @@ pub(crate) fn run(mut cli: Cli, repo: &Path, machine_path: &Path, assignment_pat
     let all = *all;
     let command = command.take();
     let Some(command) = command else { return list(machine_path, all, &mut std::io::stdout()) };
-    if let HarnessCmd::Rename { old, new } = command {
-        return rename(&cli, repo, machine_path, assignment_path, &old, &new);
+    if let HarnessCmd::Rename { old, new, replace } = command {
+        let request = sk1ll_core::harness_rename::RenameRequest { from: old, to: new, replace };
+        return rename(&cli, repo, machine_path, assignment_path, request);
     }
     let current = match &command {
         HarnessCmd::Add { name, .. } => {
@@ -137,6 +144,7 @@ pub(crate) fn run(mut cli: Cli, repo: &Path, machine_path: &Path, assignment_pat
     let Some(lock) = crate::lock_direct(repo)? else {
         bail!("{} is not a git repo; harnesses can be changed once the skills repo exists", repo.display());
     };
+    recover_pending(&cli, machine_path, assignment_path)?;
     let repo = Repo::open(repo)?;
     // `None` only for a joined machine still waiting for its assignment;
     // anything unreadable stops here, before machine.toml changes.
@@ -174,46 +182,72 @@ pub(crate) fn run(mut cli: Cli, repo: &Path, machine_path: &Path, assignment_pat
     Ok(())
 }
 
-fn rename(cli: &Cli, repo: &Path, machine: &Path, cache: &Path, from: &str, to: &str) -> Result<()> {
+fn rename(
+    cli: &Cli,
+    repo: &Path,
+    machine: &Path,
+    cache: &Path,
+    request: sk1ll_core::harness_rename::RenameRequest,
+) -> Result<()> {
+    use sk1ll_core::harness_rename::RenameIntent;
+    let (from, to) = (request.from.clone(), request.to.clone());
     #[cfg(unix)]
     if let Some(daemon) = crate::fleet::connect(cli, repo)? {
-        let rename = sk1ll_proto::HarnessRename { from: from.into(), to: to.into() };
-        let update = crate::fleet::runtime()?.block_on(daemon.client.rename_harness(&rename))?;
-        for error in &update.errors {
+        let renamed = crate::fleet::runtime()?.block_on(daemon.client.rename_harness(&request))?;
+        print_routed_rules(&renamed.routed_rules, &from);
+        println!("renamed harness {from} to {to}");
+        for error in &renamed.update.errors {
             eprintln!("{error}");
         }
-        println!("renamed harness {from} to {to}");
+        if !renamed.update.errors.is_empty() {
+            bail!("could not apply all placements");
+        }
         return Ok(());
     }
     let lock = crate::lock_direct(repo)?.ok_or_else(|| anyhow::anyhow!("{} is not a git repo", repo.display()))?;
-    let snapshot = sk1ll_core::config_file::Snapshot::take(machine)?;
-    let edit = MachineConfig::rename_harness(&snapshot, from, to)?;
     #[cfg(unix)]
-    if let Some(state) = crate::fleet::joined_state(cli).filter(|s| !s.revoked) {
-        crate::fleet::check_joined_repo(repo, &state)?;
+    {
         let cfg = crate::fleet::daemon_config(cli)?;
-        let write = sk1ll_proto::AssignmentWrite::RenameHarness(sk1ll_proto::HarnessRename {
-            from: from.into(),
-            to: to.into(),
-        });
-        crate::fleet::runtime()?.block_on(sk1ll_daemon::write_assignment_direct(&cfg, &lock, write))?;
-        edit.write(&snapshot).map_err(|e| {
-            anyhow::anyhow!("the Server moved the harness Assignment, but editing machine.toml failed: {e}")
-        })?;
-        println!("renamed harness {from} to {to}; run `sk1ll sync` to apply");
+        if let Some(state) = sk1ll_daemon::DaemonState::load(&cfg.state)? {
+            anyhow::ensure!(!state.revoked, "this machine was removed from the fleet");
+            crate::fleet::check_joined_repo(repo, &state)?;
+            let renamed =
+                crate::fleet::runtime()?.block_on(sk1ll_daemon::rename_harness_direct(&cfg, &state, &lock, request))?;
+            print_routed_rules(&renamed.routed_rules, &from);
+            println!("renamed harness {from} to {to}; run `sk1ll sync` to apply");
+            return Ok(());
+        }
+    }
+    let _ = cli;
+    let authoritative = sk1ll_core::Assignment::load(cache)?;
+    let intent = RenameIntent::prepare(machine, repo, request, &authoritative, None)?;
+    intent.apply_standalone(machine, cache)?;
+    print_routed_rules(&intent.routed_rules, &from);
+    println!("renamed harness {from} to {to}; run `sk1ll sync` to apply");
+    drop(lock);
+    Ok(())
+}
+
+pub(crate) fn recover_pending(cli: &Cli, machine: &Path, assignment: &Path) -> Result<()> {
+    use sk1ll_core::harness_rename::RenameIntent;
+    if !RenameIntent::exists(machine)? {
         return Ok(());
     }
-    let _ = (cli, lock);
-    let before = sk1ll_core::Assignment::load(cache)?;
-    let mut assignment = before.clone();
-    assignment.rename_harness(from, to);
-    assignment.save(cache)?;
-    if let Err(e) = edit.write(&snapshot) {
-        before.save(cache)?;
-        return Err(e.into());
+    #[cfg(unix)]
+    if sk1ll_daemon::DaemonState::load(&crate::fleet::daemon_config(cli)?.state)?.is_some() {
+        bail!("finish the pending Harness rename by repeating the rename or starting the daemon");
     }
-    println!("renamed harness {from} to {to}; run `sk1ll sync` to apply");
+    let _ = cli;
+    if let Some(intent) = RenameIntent::load(machine, None)? {
+        intent.apply_standalone(machine, assignment)?;
+    }
     Ok(())
+}
+
+fn print_routed_rules(rules: &[String], old: &str) {
+    if !rules.is_empty() {
+        eprintln!("Rules still routed to {old}. Update their harnesses frontmatter: {}", rules.join(", "));
+    }
 }
 
 /// The harnesses sync writes into; with `all`, also those it doesn't.

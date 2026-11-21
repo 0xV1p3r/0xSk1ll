@@ -191,3 +191,58 @@ fn recreated_derived_item_keeps_its_toggle_after_harness_rename() {
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("warning: no skill named `absent` in the repo"));
 }
+
+#[test]
+fn rename_requires_readable_membership_and_protects_destination_assignment() {
+    let fixture = Fixture::new();
+    let root = fixture.0.path();
+    let config = std::fs::read(root.join("machine.toml")).unwrap();
+    fixture.write("absent.json", "{broken");
+    let failed = error(fixture.command(&["harnesses", "rename", "a", "new-a"]).output().unwrap());
+    assert!(failed.contains("parsing") && failed.contains("absent.json"), "{failed}");
+    assert_eq!(std::fs::read(root.join("machine.toml")).unwrap(), config);
+    assert!(!root.join("assignment.json").exists());
+
+    std::fs::remove_file(root.join("absent.json")).unwrap();
+    let mut assignment = sk1ll_core::Assignment::default();
+    assignment.set_harness("a", true);
+    assignment.set_harness("new-a", false);
+    assignment.save(&root.join("assignment.json")).unwrap();
+    fixture.write("repo/instructions/routed.md", "---\nid: rule-id\nharnesses: [a]\n---\nrule");
+    let rejected = error(fixture.command(&["harnesses", "rename", "a", "new-a"]).output().unwrap());
+    assert!(rejected.contains("already has an Assignment"), "{rejected}");
+    assert_eq!(std::fs::read(root.join("machine.toml")).unwrap(), config);
+    let renamed = fixture.command(&["harnesses", "rename", "a", "new-a", "--replace"]).output().unwrap();
+    assert!(renamed.status.success(), "{renamed:?}");
+    assert!(String::from_utf8_lossy(&renamed.stderr).contains("Rules still routed to a"));
+    assert!(String::from_utf8_lossy(&renamed.stderr).contains("routed"));
+    let assignment = sk1ll_core::Assignment::load(&root.join("assignment.json")).unwrap();
+    assert!(!assignment.harnesses.contains_key("a"));
+    assert!(assignment.harness("new-a").new_skills_default);
+}
+
+#[test]
+fn standalone_sync_recovers_a_harness_rename_after_config_was_saved() {
+    use sk1ll_core::harness_rename::{RenameIntent, RenameRequest};
+    let fixture = Fixture::new();
+    let root = fixture.0.path();
+    let mut assignment = sk1ll_core::Assignment::default();
+    assignment.set_harness("a", false);
+    assignment.save(&root.join("assignment.json")).unwrap();
+    let config = root.join("machine.toml");
+    let pending = RenameIntent::prepare(
+        &config,
+        &root.join("repo"),
+        RenameRequest { from: "a".into(), to: "new-a".into(), replace: false },
+        &assignment,
+        None,
+    )
+    .unwrap();
+    pending.apply_config(&config).unwrap();
+
+    fixture.run(&["sync"]);
+    assert!(!RenameIntent::exists(&config).unwrap());
+    let saved = sk1ll_core::Assignment::load(&root.join("assignment.json")).unwrap();
+    assert!(!saved.harnesses.contains_key("a"));
+    assert!(!saved.harness("new-a").new_skills_default);
+}
