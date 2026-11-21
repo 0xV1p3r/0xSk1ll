@@ -34,6 +34,9 @@ impl From<sk1ll_core::Error> for Error {
                 kept.display()
             )),
             sk1ll_core::Error::Invalid(m) => Self::BadRequest(m),
+            sk1ll_core::Error::DuplicateItemId { .. } | sk1ll_core::Error::StrandedRename { .. } => {
+                Self::Conflict(e.to_string())
+            }
             sk1ll_core::Error::Changed(m) => Self::Conflict(m),
             e => Self::Internal(e.into()),
         }

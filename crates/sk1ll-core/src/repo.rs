@@ -43,6 +43,8 @@ pub enum RenameError {
     NotMoved(Error),
     /// The item has its new name, but writing its metadata failed.
     Moved(Error),
+    /// Neither the destination nor the original name could be published.
+    Stranded { path: PathBuf, publish: std::io::Error, rollback: std::io::Error },
 }
 
 impl std::fmt::Display for RenameError {
@@ -50,6 +52,11 @@ impl std::fmt::Display for RenameError {
         match self {
             Self::NotMoved(e) => e.fmt(f),
             Self::Moved(e) => write!(f, "renamed, but updating its metadata failed: {e}"),
+            Self::Stranded { path, publish, rollback } => write!(
+                f,
+                "rename failed ({publish}) and rollback failed ({rollback}). The item is staged at {}",
+                path.display()
+            ),
         }
     }
 }
@@ -61,6 +68,7 @@ impl From<RenameError> for Error {
         match e {
             RenameError::NotMoved(e) => e,
             RenameError::Moved(e) => Error::Invalid(format!("renamed, but updating its metadata failed: {e}")),
+            e @ RenameError::Stranded { .. } => Error::Invalid(e.to_string()),
         }
     }
 }
@@ -95,7 +103,7 @@ impl Repo {
             return Err(Error::Invalid("content directory is a symlink".into()));
         }
         fs::create_dir_all(parent).at(&path)?;
-        let id = ItemId::generate();
+        let id = self.new_item_id()?;
         if kind == "skill" {
             let stage = crate::source::unique(parent);
             fs::create_dir(&stage).at(&stage)?;
@@ -167,7 +175,7 @@ impl Repo {
                 (dest.clone(), dest)
             }
         };
-        if dest.symlink_metadata().is_ok() {
+        if dest.symlink_metadata().is_ok() && !case_alias(&from, &dest)? {
             return Err(Error::Invalid(format!("name `{to}` is taken")));
         }
         Ok((from, dest, file))
@@ -178,55 +186,44 @@ impl Repo {
     /// A failure says whether the item had moved by then.
     pub fn rename_item(&self, kind: &str, name: &str, to: &str) -> std::result::Result<(), RenameError> {
         let (from, dest, file) = self.rename_paths(kind, name, to).map_err(RenameError::NotMoved)?;
-        let skill_id = (kind == "skill" && ItemId::read_skill(&from).is_none()).then(|| ItemId::derived(kind, name));
-        let renamed_rule = if kind == "rule" {
-            let text = fs::read_to_string(&from).at(&from).map_err(RenameError::NotMoved)?;
-            let renamed = rename_frontmatter(&text, name, to);
-            if instructions::explicit_id(&text, &from).map_err(RenameError::NotMoved)?.is_none() {
-                let text = renamed.as_deref().unwrap_or(&text);
-                Some(instructions::with_id(text, &from, &ItemId::derived(kind, name)).map_err(RenameError::NotMoved)?)
+        let case_only = case_alias(&from, &dest).map_err(RenameError::NotMoved)?;
+        let relative = from.strip_prefix(&self.root).unwrap();
+        if self.resolved_ids().map_err(RenameError::NotMoved)?.get(relative).is_none_or(Option::is_none) {
+            return Err(RenameError::NotMoved(Error::Invalid(format!(
+                "`{name}` has an unassigned Item ID. Run `sk1ll sync` before renaming it"
+            ))));
+        }
+        let moved = if case_only {
+            let stage = rename_stage(&from);
+            crate::sync::rename_noreplace(&from, &stage).at(&stage).map_err(RenameError::NotMoved)?;
+            if let Err(publish) = crate::sync::rename_noreplace(&stage, &dest) {
+                if let Err(rollback) = crate::sync::rename_noreplace(&stage, &from) {
+                    return Err(RenameError::Stranded { path: stage, publish, rollback });
+                }
+                Err(publish)
             } else {
-                renamed
+                Ok(())
             }
         } else {
-            None
+            crate::sync::rename_noreplace(&from, &dest)
         };
-        crate::sync::rename_noreplace(&from, &dest).map_err(|e| {
-            RenameError::NotMoved(if e.kind() == std::io::ErrorKind::AlreadyExists {
+        if let Err(error) = moved {
+            return Err(RenameError::NotMoved(if error.kind() == std::io::ErrorKind::AlreadyExists {
                 Error::Invalid(format!("name `{to}` is taken"))
             } else {
-                Error::Io { path: dest.clone(), source: e }
-            })
-        })?;
-        if let Some(id) = skill_id {
-            id.write_skill(&dest).map_err(RenameError::Moved)?;
+                Error::Io { path: dest, source: error }
+            }));
         }
         // Only a regular file is rewritten: a symlinked SKILL.md points elsewhere.
         let Ok(meta) = file.symlink_metadata() else { return Ok(()) };
         if !meta.is_file() {
             return Ok(());
         }
-        let renamed = if kind == "rule" {
-            renamed_rule
-        } else {
-            fs::read_to_string(&file).ok().and_then(|text| rename_frontmatter(&text, name, to))
-        };
+        let renamed = fs::read_to_string(&file).ok().and_then(|text| rename_frontmatter(&text, name, to));
         let Some(renamed) = renamed else { return Ok(()) };
-        // A fresh, exclusively created name: a planted file or symlink at a
-        // predictable path must never be followed or overwritten.
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-        let tmp = file.with_file_name(format!("{}rename-{}-{nanos}", crate::source::STAGE_PREFIX, std::process::id()));
-        let staged = (|| {
-            use std::io::Write;
-            let mut out = fs::OpenOptions::new().write(true).create_new(true).open(&tmp).at(&tmp)?;
-            out.write_all(renamed.as_bytes()).at(&tmp)?;
-            out.set_permissions(meta.permissions()).at(&tmp)?;
-            fs::rename(&tmp, &file).at(&file)
-        })();
-        if staged.is_err() {
-            let _ = fs::remove_file(&tmp);
-        }
-        staged.map_err(RenameError::Moved)
+        crate::config_file::Staged::write(&file, renamed.as_bytes(), crate::config_file::existing_mode(&file))
+            .and_then(crate::config_file::Staged::replace)
+            .map_err(RenameError::Moved)
     }
 
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
@@ -380,21 +377,111 @@ impl Repo {
         self.root.join(IMPORTED_DIR)
     }
 
+    pub(crate) fn resolved_ids(&self) -> Result<crate::item_id::Claims> {
+        let claims = self.item_id_claims()?;
+        crate::item_id::check_claims(&claims)?;
+        Ok(claims)
+    }
+
+    /// Persists missing Item IDs while the caller holds the EngineLock.
+    pub fn assign_missing_ids(&self) -> Result<usize> {
+        self.assign_item_ids(|_| true)
+    }
+
+    pub(crate) fn assign_item_ids(&self, include: impl Fn(&Path) -> bool) -> Result<usize> {
+        crate::item_id::assign(&self.root, include, false)
+    }
+
+    /// Reassigns duplicate Item IDs as a Draft change while the caller holds
+    /// the EngineLock.
+    pub fn repair_ids(&self) -> Result<usize> {
+        crate::item_id::assign(&self.root, |_| true, true)
+    }
+
+    fn item_id_claims(&self) -> Result<crate::item_id::Claims> {
+        let manifest = Manifest::load(&self.root)?;
+        crate::item_id::claims_on_disk(&self.root, &manifest, |_| true)
+    }
+
+    pub(crate) fn new_item_id(&self) -> Result<ItemId> {
+        let ids = self.resolved_ids()?;
+        loop {
+            let id = ItemId::generate();
+            if !ids.values().flatten().any(|claimed| claimed == &id) {
+                return Ok(id);
+            }
+        }
+    }
+
+    pub(crate) fn check_item_id(&self, path: PathBuf, id: ItemId) -> Result<()> {
+        let mut claims = self.item_id_claims()?;
+        claims.insert(path, Some(id));
+        crate::item_id::check_claims(&claims)
+    }
+
     pub fn skills(&self) -> Result<Vec<Skill>> {
-        skill::discover_with(&self.root, &self.manifest)
+        skill::discover_with(&self.root, &self.resolved_ids()?)
     }
 
     pub fn rules(&self) -> Result<Vec<Rule>> {
-        instructions::discover(&self.root)
+        instructions::discover_with(&self.root, &self.resolved_ids()?)
+    }
+
+    pub fn content(&self) -> Result<(Vec<Skill>, Vec<Rule>)> {
+        let ids = self.resolved_ids()?;
+        Ok((skill::discover_with(&self.root, &ids)?, instructions::discover_with(&self.root, &ids)?))
     }
 
     /// The Item IDs of repo Skills and Rules. Personal skills take precedence
     /// over Imports of the same name, as they do for sync.
-    pub fn item_ids(&self) -> Result<Vec<(ItemRef, ItemId)>> {
-        let skills = self.skills()?.into_iter().map(|skill| (ItemRef::Skill(skill.name), skill.id));
-        let rules = self.rules()?.into_iter().map(|rule| (ItemRef::Rule(rule.name), rule.id));
-        Ok(skills.chain(rules).collect())
+    pub fn item_ids(&self) -> Result<Vec<(ItemRef, Option<ItemId>)>> {
+        let (skills, rules) = self.content()?;
+        Ok(skills
+            .into_iter()
+            .map(|s| (ItemRef::Skill(s.name), s.id))
+            .chain(rules.into_iter().map(|r| (ItemRef::Rule(r.name), r.id)))
+            .collect())
     }
+}
+
+const RENAME_STAGE: &str = ".sk1ll-stage-rename-";
+
+fn rename_stage(from: &Path) -> PathBuf {
+    let parent = from.parent().unwrap();
+    let stage = crate::source::unique(parent);
+    let nonce = stage.file_name().unwrap().to_string_lossy();
+    let original = from.file_name().unwrap().to_string_lossy();
+    parent.join(format!("{RENAME_STAGE}{}-{original}", nonce.trim_start_matches(crate::source::STAGE_PREFIX)))
+}
+
+pub(crate) fn check_rename_stage(path: &Path) -> Result<()> {
+    if path.file_name().is_some_and(|name| name.to_string_lossy().starts_with(RENAME_STAGE)) {
+        return Err(Error::StrandedRename { path: path.into() });
+    }
+    Ok(())
+}
+
+/// A case-insensitive lookup must alias the source, with no separate directory
+/// entry at the destination spelling (a distinct hard link can share an inode).
+pub(crate) fn case_alias(from: &Path, dest: &Path) -> Result<bool> {
+    let (Some(from_name), Some(dest_name)) =
+        (from.file_name().and_then(|n| n.to_str()), dest.file_name().and_then(|n| n.to_str()))
+    else {
+        return Ok(false);
+    };
+    if !from_name.eq_ignore_ascii_case(dest_name) || !dest.symlink_metadata().is_ok_and(|m| !m.is_symlink()) {
+        return Ok(false);
+    }
+    let parent = from.parent().unwrap();
+    for entry in fs::read_dir(parent).at(parent)? {
+        if entry.at(parent)?.file_name() == dest_name {
+            return Ok(false);
+        }
+    }
+    #[cfg(unix)]
+    return Ok(crate::sync::displaced::same_file(from, dest));
+    #[cfg(not(unix))]
+    Ok(from.canonicalize().at(from)? == dest.canonicalize().at(dest)?)
 }
 
 /// `text` with a frontmatter `name: <from>` line (quoted or not) set to `to`.
@@ -580,8 +667,8 @@ mod create_tests {
         assert!(dir.path().join("instructions/style.md").exists());
         let ids = repo.item_ids().unwrap();
         assert_eq!(ids.len(), 2);
-        assert!(ids.iter().all(|(_, id)| ulid::Ulid::from_string(&id.to_string()).is_ok()));
-        assert_eq!(ItemId::read_skill(&repo.personal_dir().join("new-skill")).as_ref(), Some(&ids[0].1));
+        assert!(ids.iter().all(|(_, id)| ulid::Ulid::from_string(&id.as_ref().unwrap().to_string()).is_ok()));
+        assert_eq!(ItemId::read_skill(&repo.personal_dir().join("new-skill")).unwrap().as_ref(), ids[0].1.as_ref());
         assert!(repo.create_item("rule", "style", "").is_err());
         assert!(repo.create_item("other", "x", "").is_err());
     }
@@ -655,7 +742,7 @@ mod create_tests {
         let text = fs::read_to_string(dir.path().join("personal/documents/SKILL.md")).unwrap();
         assert_eq!(text, "---\nname: documents\ndescription: \"PDF\"\n---\n\n");
         assert_eq!(fs::read_to_string(dir.path().join("personal/documents/notes.md")).unwrap(), "kept");
-        assert_eq!(ItemId::read_skill(&repo.personal_dir().join("documents")), Some(before.id));
+        assert_eq!(ItemId::read_skill(&repo.personal_dir().join("documents")).unwrap(), before.id);
         assert!(
             fs::read_dir(repo.personal_dir().join("documents"))
                 .unwrap()
@@ -663,12 +750,12 @@ mod create_tests {
         );
 
         // A `name:` that doesn't match the old name is left alone.
-        let rule_id = repo.rules().unwrap().remove(0).id;
+        let rule_id = repo.rules().unwrap().remove(0).id.unwrap();
         let rule = format!("---\nname: House\nid: \"{rule_id}\"\n---\nbody\n");
         fs::write(dir.path().join("instructions/style.md"), &rule).unwrap();
         repo.rename_item("rule", "style", "house-style").unwrap();
         assert_eq!(fs::read_to_string(dir.path().join("instructions/house-style.md")).unwrap(), rule);
-        assert_eq!(repo.rules().unwrap()[0].id, rule_id);
+        assert_eq!(repo.rules().unwrap()[0].id, Some(rule_id));
 
         repo.delete_item("skill", "documents").unwrap();
         repo.delete_item("rule", "house-style").unwrap();
@@ -678,34 +765,107 @@ mod create_tests {
     }
 
     #[test]
-    fn derived_ids_agree_across_repos_and_become_explicit_on_rename() {
+    fn reader_leaves_item_ids_unassigned_until_they_are_persisted() {
         let tmp = tempfile::tempdir().unwrap();
-        let hand_made = |dir: &str| {
-            let repo = Repo::init(&tmp.path().join(dir)).unwrap();
-            let skill = repo.personal_dir().join("style");
-            fs::create_dir(&skill).unwrap();
-            fs::write(skill.join("SKILL.md"), "Skill.\n").unwrap();
-            fs::write(repo.root().join("instructions/style.md"), "Rule.\n").unwrap();
-            fs::create_dir(repo.imported_dir().join("vendored")).unwrap();
-            fs::write(repo.imported_dir().join("vendored/SKILL.md"), "Import.\n").unwrap();
-            repo
-        };
-        let repo = hand_made("first");
-        let ids: std::collections::BTreeMap<_, _> = repo.item_ids().unwrap().into_iter().collect();
-        for (item, id) in hand_made("second").item_ids().unwrap() {
-            assert!(id.to_string().starts_with("d:"));
-            assert_eq!(ids[&item], id);
-        }
-        let skill = &ids[&ItemRef::Skill("style".into())];
-        let rule = &ids[&ItemRef::Rule("style".into())];
-        assert_ne!(skill, rule);
-        assert!(!repo.personal_dir().join("style").join(crate::skill::ID_FILE).exists());
+        let repo = Repo::init_committed(tmp.path()).unwrap();
+        let skill = repo.personal_dir().join("style");
+        fs::create_dir(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), "Skill.\n").unwrap();
+        fs::write(repo.root().join("instructions/style.md"), "Rule.\n").unwrap();
+        fs::write(repo.root().join(MANIFEST_FILE), "import = { vendored = { source = 'local' } }\n").unwrap();
+        assert!(repo.item_ids().unwrap().iter().all(|(_, id)| id.is_none()));
+        assert!(!skill.join(skill::ID_FILE).exists());
+        assert_eq!(repo.assign_missing_ids().unwrap(), 3);
+        let first = repo.item_ids().unwrap();
+        assert_eq!(repo.assign_missing_ids().unwrap(), 0);
+        assert_eq!(repo.item_ids().unwrap(), first);
+        assert!(first.iter().all(|(_, id)| ulid::Ulid::from_string(&id.as_ref().unwrap().to_string()).is_ok()));
+        let imported = Manifest::load(repo.root()).unwrap().import["vendored"].id.clone().unwrap();
+        assert!(ulid::Ulid::from_string(&imported.to_string()).is_ok());
         repo.rename_item("skill", "style", "new-style").unwrap();
-        repo.rename_item("rule", "style", "new-style").unwrap();
-        assert_eq!(ItemId::read_skill(&repo.personal_dir().join("new-style")).as_ref(), Some(skill));
-        assert_eq!(repo.rules().unwrap()[0].id, *rule);
+        assert_eq!(repo.skills().unwrap()[0].id, first[0].1);
         let diff = repo.diff(&ItemRef::Skill("new-style".into())).unwrap();
         assert!(diff.contains("+Skill.") && !diff.contains(crate::skill::ID_FILE));
+    }
+
+    #[test]
+    fn copied_skill_ids_report_both_paths_and_block_creation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::init(tmp.path()).unwrap();
+        repo.create_item("skill", "pdf", "PDF").unwrap();
+        let copy = repo.personal_dir().join("copy");
+        fs::create_dir(&copy).unwrap();
+        for file in ["SKILL.md", skill::ID_FILE] {
+            fs::copy(repo.personal_dir().join("pdf").join(file), copy.join(file)).unwrap();
+        }
+        let err = repo.item_ids().unwrap_err();
+        assert!(matches!(err, Error::DuplicateItemId { .. }));
+        for path in ["personal/pdf/.sk1ll-id", "personal/copy/.sk1ll-id"] {
+            assert!(err.to_string().contains(path), "{err}");
+        }
+        assert!(repo.create_item("rule", "style", "").is_err());
+        assert!(!repo.root().join("instructions/style.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unassigned_skill_stays_at_its_old_name_if_the_id_cannot_be_written() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::init(tmp.path()).unwrap();
+        let source = repo.personal_dir().join("pdf");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("SKILL.md"), "PDF\n").unwrap();
+        let before = repo.skills().unwrap()[0].id.clone();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o555)).unwrap();
+        let result = repo.rename_item("skill", "pdf", "docs");
+        let actual = if result.is_ok() { repo.personal_dir().join("docs") } else { source.clone() };
+        fs::set_permissions(&actual, fs::Permissions::from_mode(0o755)).unwrap();
+        // Users with DAC override can write despite the mode bits.
+        if let Err(error) = result {
+            assert!(matches!(error, RenameError::NotMoved(_)));
+            assert!(source.is_dir());
+            assert!(!repo.personal_dir().join("docs").exists());
+        }
+        if actual == source {
+            assert_eq!(repo.skills().unwrap()[0].id, before);
+        }
+    }
+
+    #[test]
+    fn an_interrupted_case_rename_reports_the_stage_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::init_committed(tmp.path()).unwrap();
+        repo.create_item("skill", "pdf", "").unwrap();
+        let original = repo.personal_dir().join("pdf");
+        let stage = rename_stage(&original);
+        fs::rename(&original, &stage).unwrap();
+        for error in [repo.draft().unwrap_err(), repo.skills().unwrap_err()] {
+            assert!(matches!(error, Error::StrandedRename { path } if path == stage));
+        }
+    }
+
+    #[test]
+    fn a_case_only_rename_keeps_the_id_and_uses_the_requested_spelling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::init_committed(tmp.path()).unwrap();
+        repo.create_item("rule", "pdf", "PDF").unwrap();
+        let id = repo.rules().unwrap()[0].id.clone();
+        let old = ItemRef::Rule("pdf".into());
+        let new = ItemRef::Rule("PDF".into());
+        repo.commit(std::slice::from_ref(&old), "Add Rule", None).unwrap();
+        repo.check_rename("rule", "pdf", "PDF").unwrap();
+        repo.rename_item("rule", "pdf", "PDF").unwrap();
+        let rules = repo.rules().unwrap();
+        assert_eq!(rules[0].id, id);
+        assert_eq!(rules[0].name, "PDF");
+        assert_eq!(rules.len(), 1);
+        repo.restore(&[old.clone(), new.clone()]).unwrap();
+        assert_eq!(repo.rules().unwrap()[0].name, "pdf");
+        repo.rename_item("rule", "pdf", "PDF").unwrap();
+        repo.commit(&[old, new.clone()], "Rename Rule", None).unwrap();
+        assert_eq!(crate::content::item_ids_at(repo.root(), "HEAD").unwrap(), [(new, id)].into());
+        assert!(repo.draft().unwrap().is_empty());
     }
 
     #[test]

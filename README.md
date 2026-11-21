@@ -22,7 +22,7 @@ For several machines, a self-hosted server acts as the git remote and holds the 
 
 ## Install
 
-Install Git 2.38 or newer and make sure `git` is on `PATH`.
+Install Git 2.40 or newer and make sure `git` is on `PATH`.
 
 Release builds target Linux and Apple silicon macOS. The [release page](https://github.com/0xV1p3r/0xSk1ll/releases) lists available archives:
 
@@ -83,6 +83,12 @@ sk1ll pull                           # fetch the new baseline, keep the draft on
 
 Commands take a bare skill or rule name, or `skill:<name>`, `rule:<name>`, `manifest` and `other:<path>`. `pull` never merges. If the new baseline changes an item that is also in your draft, `pull` changes nothing and marks the machine Blocked until you commit or restore that item.
 
+The daemon and mutating commands write a new Item ID for hand-made Skills, Rules,
+and Import entries that lack one. These writes are part of the Draft and get
+committed with the item. Read-only commands show unassigned IDs until then.
+If copying an item duplicates its ID, run `sk1ll repair-ids` and commit the
+repaired items.
+
 ## Commands
 
 | Command | What it does |
@@ -96,6 +102,7 @@ Commands take a bare skill or rule name, or `skill:<name>`, `rule:<name>`, `mani
 | `fork <name>` | Turn an import into a personal skill you can edit |
 | `edit <name>` | Open a personal skill or rule in `$VISUAL` or `$EDITOR` |
 | `list` | List repo content. Use `--json` to include Item IDs or `--unmanaged` to list unmanaged skills |
+| `repair-ids` | Keep the first claim to each Item ID by path and give duplicates fresh IDs in the Draft |
 | `status` | Import drift and pending sync actions |
 | `sync [--dry-run] [--force]` | Write skills and instructions into harnesses |
 | `render <harness>` | Print the instruction files a harness would receive |

@@ -184,6 +184,8 @@ enum Cmd {
         #[arg(long)]
         push: bool,
     },
+    /// Give duplicate Item IDs fresh IDs in the Draft
+    RepairIds,
     /// Push committed commits to origin
     Push,
     /// Discard draft items, returning them to the baseline
@@ -349,6 +351,7 @@ impl Cmd {
             | Self::Conflicts
             | Self::Remove { .. }
             | Self::Fork { .. }
+            | Self::RepairIds
             | Self::Commit { .. }
             | Self::Push
             | Self::Restore { .. }
@@ -486,16 +489,31 @@ fn run(cli: Cli) -> Result<()> {
         return daemon.run(cli.cmd, &repo_path);
     }
     let lock = if mutates { lock_direct(&repo_path)? } else { None };
+    let mut repo = if cli.cmd.git_only() { Repo::open_git_only(&repo_path)? } else { Repo::open(&repo_path)? };
+    if mutates
+        && !matches!(
+            cli.cmd,
+            Cmd::Commit { .. }
+                | Cmd::Restore { .. }
+                | Cmd::Pull
+                | Cmd::Push
+                | Cmd::RepairIds
+                | Cmd::Conflicts
+                | Cmd::Recover { command: RecoverCmd::List | RecoverCmd::Discard { .. } }
+        )
+    {
+        repo.assign_missing_ids()?;
+        repo = Repo::open(&repo_path)?;
+    }
     if matches!(cli.cmd, Cmd::Assign { .. }) && fleet::assign_direct(&cli, &repo_path, lock.as_ref())? {
         return Ok(());
     }
 
-    let mut repo = if cli.cmd.git_only() { Repo::open_git_only(&repo_path)? } else { Repo::open(&repo_path)? };
     match cli.cmd {
         Cmd::Recover { command } => match command {
             RecoverCmd::List => print_recovered(sync::displaced::list()?),
-            RecoverCmd::Adopt { id } => sync::displaced::adopt(&repo, &id)?,
-            RecoverCmd::Discard { id } => sync::displaced::discard(&id)?,
+            RecoverCmd::Adopt { id } => println!("adopted into {}", sync::displaced::adopt(&repo, &id)?.display()),
+            RecoverCmd::Discard { id } => sync::displaced::discard_from(&repo, &id)?,
         },
         Cmd::Conflicts => {
             let actions = sync::plan(&repo, &machine()?.harnesses(), &assignment()?, PlanOptions::default())?;
@@ -549,11 +567,13 @@ fn run(cli: Cli) -> Result<()> {
                     Origin::Personal => "personal",
                     Origin::Imported => "imported",
                 };
-                println!("{:<24} {:<10} {}", s.name, origin, s.description.unwrap_or_default());
+                let id = if s.id.is_none() { " [unassigned id]" } else { "" };
+                println!("{:<24} {:<10} {}{id}", s.name, origin, s.description.unwrap_or_default());
             }
             for f in repo.rules()? {
                 let scope = f.harnesses.map(|t| format!("[{}] ", t.join(", "))).unwrap_or_default();
-                println!("{:<24} {:<10} {scope}{}", f.name, "instr", f.description.unwrap_or_default());
+                let id = if f.id.is_none() { " [unassigned id]" } else { "" };
+                println!("{:<24} {:<10} {scope}{}{id}", f.name, "instr", f.description.unwrap_or_default());
             }
         }
         Cmd::Add { source, path, git_ref, list: true, .. } => {
@@ -685,7 +705,18 @@ fn run(cli: Cli) -> Result<()> {
                 println!("run `sk1ll push` to share it with the fleet");
             }
         }
+        Cmd::RepairIds => {
+            let count = repo.repair_ids()?;
+            repo.assign_missing_ids()?;
+            println!("reassigned {count} duplicate Item ID(s) in the Draft");
+        }
         Cmd::Push => {
+            repo.assign_missing_ids().map_err(|error| match error {
+                sk1ll_core::Error::DuplicateItemId { .. } => {
+                    anyhow::anyhow!("{error}. Run `sk1ll repair-ids` and commit the repaired items before pushing")
+                }
+                error => error.into(),
+            })?;
             repo.push()?;
             println!("pushed to origin");
         }
@@ -714,19 +745,28 @@ fn run(cli: Cli) -> Result<()> {
             let after: std::collections::BTreeSet<ItemRef> = repo.draft()?.into_iter().map(|d| d.item).collect();
             let discarded = before.difference(&after).cloned().collect();
             fleet::queue_discarded(daemon_state.as_deref(), lock.as_ref(), discarded)?;
+            // Restore also repairs repositories with damaged configuration.
+            if let Ok(restored) = Repo::open(&repo_path) {
+                restored.assign_missing_ids()?;
+            }
             println!("run `sk1ll sync` to apply");
         }
-        Cmd::Pull => match repo.pull()? {
-            PullOutcome::UpToDate => println!("already on the latest baseline"),
-            PullOutcome::Updated { from, to } => {
-                println!("baseline {} -> {}; run `sk1ll sync` to apply", short(&from), short(&to));
+        Cmd::Pull => {
+            match repo.pull()? {
+                PullOutcome::UpToDate => println!("already on the latest baseline"),
+                PullOutcome::Updated { from, to } => {
+                    println!("baseline {} -> {}; run `sk1ll sync` to apply", short(&from), short(&to));
+                }
+                PullOutcome::Blocked { baseline, items } => bail!(
+                    "blocked: baseline {} clashes with {}; commit or restore them, then pull again",
+                    short(&baseline),
+                    names(&items)
+                ),
             }
-            PullOutcome::Blocked { baseline, items } => bail!(
-                "blocked: baseline {} clashes with {}; commit or restore them, then pull again",
-                short(&baseline),
-                names(&items)
-            ),
-        },
+            if let Ok(updated) = Repo::open(&repo_path) {
+                updated.assign_missing_ids()?;
+            }
+        }
         Cmd::Adopt { harness, name } => {
             let harnesses = machine()?.harnesses();
             if !harnesses.contains_key(&harness) {
@@ -1461,6 +1501,20 @@ mod tests {
     }
 
     #[test]
+    fn list_and_status_report_duplicate_item_id_paths() {
+        let worktree = TestRepo::new().with_skill();
+        let repo = Repo::open(&worktree.0).unwrap();
+        repo.create_item("skill", "docs", "").unwrap();
+        fs::copy(worktree.0.join("personal/docs/.sk1ll-id"), worktree.0.join("personal/pdf/.sk1ll-id")).unwrap();
+        for command in ["list", "status"] {
+            let err = worktree.run(&[command]).unwrap_err().to_string();
+            for expected in ["duplicate Item ID", "personal/docs/.sk1ll-id", "personal/pdf/.sk1ll-id"] {
+                assert!(err.contains(expected), "{command}: {err}");
+            }
+        }
+    }
+
+    #[test]
     fn recovery_commands_work_with_damaged_configuration() {
         for deleted in [false, true] {
             for command in ["draft", "diff", "restore", "commit", "pull"] {
@@ -1481,7 +1535,14 @@ mod tests {
                     "commit" => vec![command, "manifest", "--author", "Test <test@example.com>"],
                     _ => vec![command],
                 };
-                assert!(repo.run(&args).is_ok(), "{command}, deleted={deleted}");
+                let result = repo.run(&args);
+                if command == "commit" && !deleted {
+                    // A commit cannot validate Import ID claims in invalid TOML.
+                    let error = result.unwrap_err().to_string();
+                    assert!(error.contains("sk1ll.toml"), "{error}");
+                } else {
+                    assert!(result.is_ok(), "{command}, deleted={deleted}: {result:?}");
+                }
                 if command == "restore" {
                     assert!(Repo::open(&repo.0).is_ok());
                 } else {

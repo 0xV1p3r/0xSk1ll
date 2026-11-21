@@ -32,28 +32,22 @@ pub struct Import {
     pub git_ref: String,
 }
 
-impl Import {
-    pub fn item_id(&self, name: &str) -> ItemId {
-        self.id.clone().unwrap_or_else(|| ItemId::derived("import", name))
-    }
-}
-
 fn default_ref() -> String {
     "HEAD".into()
 }
 
 impl Manifest {
-    pub(crate) fn import_id(&self, name: &str) -> ItemId {
-        self.import.get(name).map_or_else(|| ItemId::derived("import", name), |import| import.item_id(name))
-    }
-
     pub fn load(root: &Path) -> Result<Self> {
         let path = root.join(MANIFEST_FILE);
-        let text = fs::read_to_string(&path).at(&path)?;
-        let table: toml::Table =
-            toml::from_str(&text).map_err(|e| Error::Parse { path: path.clone(), message: e.to_string() })?;
-        reject_moved_keys(&table, &path)?;
-        toml::from_str(&text).map_err(|e| Error::Parse { path, message: e.to_string() })
+        Self::parse(&fs::read(&path).at(&path)?, &path)
+    }
+
+    pub(crate) fn parse(bytes: &[u8], path: &Path) -> Result<Self> {
+        let error = |message| Error::Parse { path: path.into(), message };
+        let text = std::str::from_utf8(bytes).map_err(|e| error(e.to_string()))?;
+        let table: toml::Table = toml::from_str(text).map_err(|e| error(e.to_string()))?;
+        reject_moved_keys(&table, path)?;
+        toml::from_str(text).map_err(|e| error(e.to_string()))
     }
 }
 
@@ -87,7 +81,7 @@ pub(crate) fn write_import(root: &Path, name: &str, import: &Import) -> Result<(
                 t.set_implicit(true);
                 Item::Table(t)
             })
-            .as_table_mut()
+            .as_table_like_mut()
             .ok_or_else(|| Error::Invalid("`import` in sk1ll.toml must be a table".into()))?;
         let mut t = Table::new();
         t["source"] = value(import.source.as_str());
@@ -104,21 +98,47 @@ pub(crate) fn write_import(root: &Path, name: &str, import: &Import) -> Result<(
 }
 
 pub(crate) fn remove_import(root: &Path, name: &str) -> Result<()> {
+    stage_remove_import(root, name)?.replace()
+}
+
+/// Checks and stages the manifest edit before the caller moves the Import.
+pub(crate) fn stage_remove_import(root: &Path, name: &str) -> Result<crate::config_file::Staged> {
+    stage_edit(root, |doc| {
+        let removed = match doc.get_mut("import") {
+            Some(imports) if imports.is_inline_table() => imports.as_inline_table_mut().unwrap().remove(name).is_some(),
+            Some(imports) if imports.is_table() => imports.as_table_mut().unwrap().remove(name).is_some(),
+            _ => false,
+        };
+        if removed { Ok(()) } else { Err(Error::Invalid(format!("no import named `{name}`"))) }
+    })
+}
+
+pub(crate) fn set_import_id(root: &Path, name: &str, id: &ItemId) -> Result<()> {
     edit(root, |doc| {
-        if let Some(t) = doc.get_mut("import").and_then(Item::as_table_mut) {
-            t.remove(name);
-        }
+        let import = doc
+            .get_mut("import")
+            .and_then(Item::as_table_like_mut)
+            .and_then(|imports| imports.get_mut(name))
+            .and_then(Item::as_table_like_mut)
+            .ok_or_else(|| Error::Invalid(format!("no import named `{name}`")))?;
+        import.insert("id", value(id.to_string()));
         Ok(())
     })
 }
 
 fn edit(root: &Path, f: impl FnOnce(&mut DocumentMut) -> Result<()>) -> Result<()> {
+    stage_edit(root, f)?.replace()
+}
+
+fn stage_edit(root: &Path, f: impl FnOnce(&mut DocumentMut) -> Result<()>) -> Result<crate::config_file::Staged> {
     let path = root.join(MANIFEST_FILE);
     let text = fs::read_to_string(&path).at(&path)?;
     let mut doc: DocumentMut =
         text.parse().map_err(|e: toml_edit::TomlError| Error::Parse { path: path.clone(), message: e.to_string() })?;
     f(&mut doc)?;
-    fs::write(&path, doc.to_string()).at(&path)
+    let updated = doc.to_string();
+    Manifest::parse(updated.as_bytes(), &path)?;
+    crate::config_file::Staged::write(&path, updated.as_bytes(), crate::config_file::existing_mode(&path))
 }
 
 #[cfg(test)]

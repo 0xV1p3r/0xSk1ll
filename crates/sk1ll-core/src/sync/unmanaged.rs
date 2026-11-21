@@ -195,7 +195,7 @@ pub fn publish(repo: &Repo, adoption: &Adoption) -> Result<()> {
         if hash_dir(&stage)? != adoption.hash {
             return Err(Error::Invalid("skill changed while being adopted; retry".into()));
         }
-        ItemId::generate().write_skill(&stage)?;
+        repo.new_item_id()?.write_skill(&stage)?;
         // Persist the complete copy before making it visible in the draft.
         durable_tree(&stage)?;
         #[cfg(test)]
@@ -236,7 +236,7 @@ pub fn rollback(repo: &Repo, adoption: &Adoption) -> Result<bool> {
         if hash_dir(&dest)? != adoption.hash {
             return Ok(false);
         }
-        if let Some(error) = remove_displacing(displaced::Kind::Skill, "adopt", &dest, expected.as_deref())? {
+        if let Some(error) = remove_displacing(repo, displaced::Kind::Skill, "adopt", &dest, expected.as_deref())? {
             return Err(error);
         }
     }
@@ -297,7 +297,9 @@ pub fn complete(repo: &Repo, harnesses: &BTreeMap<String, Harness>, adoption: &A
                 name: adoption.name.clone(),
                 mode: config.mode,
                 source: Some(source.clone()),
+                item_id: repo.resolved_ids()?.get(source.strip_prefix(repo.root()).unwrap()).cloned().flatten(),
                 expected,
+                metadata_only: false,
             },
             reason: None,
         };
@@ -364,10 +366,10 @@ mod tests {
         write(&tmp.path().join("c/pdf/SKILL.md"), "different");
         let adoption = prepare(&repo, &hs, "a", "pdf").unwrap();
         assert_eq!(adoption.locations.len(), 2);
-        let id = ItemId::read_skill(&repo.personal_dir().join("pdf")).unwrap();
+        let id = ItemId::read_skill(&repo.personal_dir().join("pdf")).unwrap().unwrap();
         assert!(ulid::Ulid::from_string(&id.to_string()).is_ok());
         prepare(&repo, &hs, "a", "pdf").unwrap();
-        assert_eq!(ItemId::read_skill(&repo.personal_dir().join("pdf")), Some(id));
+        assert_eq!(ItemId::read_skill(&repo.personal_dir().join("pdf")).unwrap(), Some(id));
         // The identical draft copy is a retryable Adopt, not a clash.
         assert!(!discover(&repo, &hs).unwrap()[0].clashes_with_repo);
         let mut assignment = Assignment::default();

@@ -70,7 +70,7 @@ command!(conflicts() -> Vec<ConflictView>, conflicts());
 command!(recovered() -> Vec<ConflictView>, recovered());
 command!(adopt(target: ConflictTarget) -> (), adopt(&target));
 command!(overwrite(target: ConflictTarget) -> (), overwrite(&target));
-command!(adopt_displaced(id: String) -> (), adopt_displaced(&id));
+command!(adopt_displaced(id: String) -> PathBuf, adopt_displaced(&id));
 command!(discard_displaced(id: String) -> (), discard_displaced(&id));
 command!(harnesses() -> Vec<HarnessView>, harnesses());
 command!(setup_harnesses() -> Vec<HarnessChoice>, setup_harnesses());

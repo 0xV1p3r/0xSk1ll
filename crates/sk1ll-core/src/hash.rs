@@ -6,11 +6,11 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::git::path_bytes;
-use crate::sync::COPY_SKIP;
+use crate::sync::{COPY_SKIP, IMPORT_COPY_SKIP};
 use crate::{IoExt, Result};
 
-/// Stable content hash of a skill directory (file paths + contents), ignoring
-/// `.git` and sk1ll's own marker file.
+/// Hash of the content deployable from a personal skill directory: file
+/// paths and contents, excluding Git metadata and sk1ll's marker and ID.
 ///
 /// Paths and symlink targets are hashed as their exact bytes on Unix, where
 /// `\` is an ordinary file-name character; only on Windows do `\` separators
@@ -18,24 +18,34 @@ use crate::{IoExt, Result};
 /// a `\` and whose symlink targets are valid UTF-8 (all but a handful of real
 /// trees), this is byte-for-byte the input of the
 /// earlier algorithm (lossy UTF-8, `\` always read as `/`), so the hashes in
-/// existing `.sk1ll-managed` markers and `sk1ll.lock` stay valid without a
+/// existing `.sk1ll-managed` markers for ordinary trees stay valid without a
 /// version prefix. The trees whose hash does change are exactly those the
 /// old hash couldn't tell apart from another tree (`a\b` vs `a/b`), so an old
 /// marker for one is ambiguous and showing it as a conflict is the safe
 /// reading.
 pub fn hash_dir(dir: &Path) -> Result<String> {
-    hash_dir_buffered(dir, &mut [0; BUFFER])
+    hash_dir_buffered(dir, COPY_SKIP, &mut [0; BUFFER])
+}
+
+/// Hash of all vendored content, including names that have meaning elsewhere.
+pub(crate) fn vendor_hash(dir: &Path) -> Result<String> {
+    hash_dir_buffered(dir, &[], &mut [0; BUFFER])
+}
+
+/// Hash of a harness copy. The personal skill's sidecar was filtered at copy time.
+pub(crate) fn copy_hash(dir: &Path) -> Result<String> {
+    hash_dir_buffered(dir, IMPORT_COPY_SKIP, &mut [0; BUFFER])
 }
 
 /// How much of a file is in memory at a time while it is hashed.
 const BUFFER: usize = 64 * 1024;
 
-fn hash_dir_buffered(dir: &Path, buf: &mut [u8]) -> Result<String> {
+fn hash_dir_buffered(dir: &Path, skip: &[&str], buf: &mut [u8]) -> Result<String> {
     let mut hasher = Sha256::new();
     let walker = WalkDir::new(dir)
         .sort_by_file_name()
         .into_iter()
-        .filter_entry(|e| e.depth() == 0 || !COPY_SKIP.iter().any(|name| e.file_name() == *name));
+        .filter_entry(|e| e.depth() == 0 || !skip.iter().any(|name| e.file_name() == *name));
     for entry in walker {
         let entry = entry.map_err(std::io::Error::from).at(dir)?;
         let rel = entry.path().strip_prefix(dir).unwrap_or(entry.path());
@@ -129,7 +139,7 @@ mod tests {
         let walker = WalkDir::new(dir)
             .sort_by_file_name()
             .into_iter()
-            .filter_entry(|e| e.depth() == 0 || !COPY_SKIP.iter().any(|name| e.file_name() == *name));
+            .filter_entry(|e| e.depth() == 0 || ![".git", ".sk1ll-managed"].iter().any(|name| e.file_name() == *name));
         for entry in walker {
             let entry = entry.unwrap();
             let rel = entry.path().strip_prefix(dir).unwrap().to_string_lossy().replace('\\', "/");
@@ -178,7 +188,11 @@ mod tests {
         write(&dir.join(crate::sync::MARKER), "ignored\n");
         #[cfg(unix)]
         std::os::unix::fs::symlink("refs/deep", dir.join("link")).unwrap();
-        assert_eq!(hash_dir(dir).unwrap(), legacy_hash_dir(dir));
+        #[cfg(unix)]
+        let legacy = "sha256:a21b4f51975084e6c1e3f116f62b3e64394781d07f70dd31ba60c9443335be85";
+        #[cfg(not(unix))]
+        let legacy = "sha256:8ed5df1f5253f60cbfa5445c2b5337744a48fd90fd08299698a2e4f2a7e59d7e";
+        assert_eq!(hash_dir(dir).unwrap(), legacy);
     }
 
     #[test]
@@ -194,7 +208,7 @@ mod tests {
         assert_eq!(hash_dir(dir).unwrap(), legacy);
         // Whatever the buffer, down to a byte at a time.
         for size in [1, 7, BUFFER - 1, 4 * BUFFER] {
-            assert_eq!(hash_dir_buffered(dir, &mut vec![0; size]).unwrap(), legacy, "buffer of {size}");
+            assert_eq!(hash_dir_buffered(dir, COPY_SKIP, &mut vec![0; size]).unwrap(), legacy, "buffer of {size}");
         }
     }
 
