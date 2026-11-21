@@ -100,7 +100,7 @@ Commands take a bare skill or rule name, or `skill:<name>`, `rule:<name>`, `mani
 | `sync [--dry-run] [--force]` | Write skills and instructions into harnesses |
 | `render <harness>` | Print the instruction files a harness would receive |
 | `harnesses [--all] [enable\|disable\|add\|remove]` | List the harnesses sync writes into and use `--all` to include disabled Harnesses and opt-in presets. The subcommands change `machine.toml` after previewing what stays in each Harness |
-| `assign <harness> skill\|rule <name> on\|off` | Toggle an item for one harness |
+| `assign <harness> skill\|rule <name> on\|off` | Toggle a local repo item for one harness |
 | `assign <harness> --default-skills on\|off` | Set the default for skills added later (`--default-rules` for rules) |
 | `assign <harness> --all on\|off` | Set every Skill and Rule and both defaults. With a Fleet, this includes Baseline items the Machine has yet to pull |
 | `conflicts` | List harness and recovery conflicts |
@@ -112,6 +112,9 @@ Commands take a bare skill or rule name, or `skill:<name>`, `rule:<name>`, `mani
 | `fleet` | Show every machine in the fleet |
 | `fleet invite` | Create a single-use join code and print the join command and expiry; `--scope self` limits the new machine to managing itself |
 | `fleet remove <machine>` | Remove a machine after confirming its id. Use `--yes` in scripts |
+| `harnesses rename <old> <new>` | Rename a Harness and move its Assignment |
+| `fleet orphans` | List orphan Assignment toggles |
+| `fleet prune-orphans [--machine <id>]` | Clear orphan toggles within your scope |
 | `fleet copy-assignment <source> <target>` | Preview and copy a joined Machine's Assignment. Use `--merge`, repeat `--map from=to`, or pass `--yes` in scripts |
 | `fleet log`, `fleet undo <entry-id>` | Filter the Assignment log by Machine, Harness, author or item, or undo one entry |
 | `completions <shell>` | Generate shell completions |

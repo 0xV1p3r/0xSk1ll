@@ -9,6 +9,11 @@ break compatibility.
 
 ### Added
 
+- List and clear orphan Assignment toggles in the desktop matrix or with
+  `sk1ll fleet orphans` and `sk1ll fleet prune-orphans`.
+- `sk1ll harnesses rename <old> <new>` moves a Harness's Assignment
+  and renames its table in `machine.toml`.
+
 - Edit Personal Skill text files and Rules in the desktop Library, with a diff
   before overwriting a concurrent disk edit and a link to review the Draft.
 - Choose a branch, tag or commit in Add Import. Preview upstream commits and
@@ -43,8 +48,7 @@ break compatibility.
 - `sk1ll assign <harness> --all on|off` sets every Skill and Rule and both
   defaults, including Baseline items the joined Machine has yet to pull.
   Settings offers to turn off the items before disabling a Harness so sync
-  can remove managed placements. Older Servers use the local item list and
-  warn that unpulled items may stay on.
+  can remove managed placements.
 - Opt-in presets for GitHub Copilot CLI (`copilot`), Cursor (`cursor`), Amp
   (`amp`), Kiro (`kiro`), Cline (`cline`) and Roo Code (`roo`), and Gemini's
   skills directory (`~/.gemini/skills`). They sync only while
@@ -59,6 +63,13 @@ break compatibility.
   preferred editor.
 
 ### Changed
+
+- Assignment toggles use Item IDs. Renaming a Skill or Rule preserves its
+  Assignment on every Machine. Deleting and recreating an item through sk1ll
+  creates a fresh ID. Hand-made items with derived IDs reuse the ID for
+  the same kind and name.
+- A Daemon sends its Machine's Assignment writes over the same WebSocket
+  as status, so Adopt reports its Draft before enabling it.
 
 - Add Import and `sk1ll add --list` show file sizes and warn about scripts,
   executable files, binaries and files over 1 MiB.
@@ -89,15 +100,16 @@ break compatibility.
 - A dangling symlink at the assignment snapshot is an error, not a missing
   snapshot.
 
+### Removed
+
+- Push-time toggle sweeping and the Restore notification outbox.
+- Assignment copying during item rename and its offline override.
+- Compatibility fallbacks for older Assignment and join-code formats.
+
 ### Fixed
 
 - Daemon state writes use exclusive private staging files. Failed desktop
   notifications keep their retry schedule across Daemon restarts.
-- Harness-wide Assignment and rename-copy require a current Baseline inventory.
-  A structured inventory refusal tells rename-copy to retry. Harness-wide
-  changes report skipped names, including when using an older Server. The CLI
-  and Settings show local placement errors after saving an Assignment. Settings
-  retries sync even when the revision is unchanged.
 - The Library keeps unsaved text through a Daemon disconnect and restores
   keyboard focus when editing ends.
 - Reviewed Import updates require a dedicated Daemon route. Harness Apply
@@ -107,9 +119,8 @@ break compatibility.
   earlier errors. Settings can open `machine.toml` even when it fails
   to parse.
 - The development GUI shows historical file contents after a working-copy save.
-- Assignment edits check revisions on supported authorities. The matrix warns
-  before unguarded bulk edits, and Copy Assignment can recover from a conflict
-  within the same dialog.
+- Assignment edits check revisions. Copy Assignment can recover from a
+  conflict within the same dialog.
 
 - When local edits prevent an Import update, the desktop app offers to fork
   the Import or overwrite the edits after confirmation.
@@ -119,24 +130,9 @@ break compatibility.
 - Machine entries in the desktop command palette open the selected Machine.
 - Desktop messages identify origin for standalone pushes, explain when Fleet
   deletions reach other Machines, and clarify how to join as the first Machine.
-- A push drops toggles only for the items it removed, and a push by a `self`
-  Machine only its own; other Machines' toggles stay and apply again when the
-  items come back. Unrelated pushes no longer drop toggles for drafts missing
-  from a Machine's latest status.
 - A push queued behind its Machine's removal is refused with `401`, and a
   removal waits for a push in progress. A delayed WebSocket upgrade or
   revocation for a removed token can't end a rejoined Machine's session.
-- If the Server cannot list either tree for a push, that push drops no
-  toggles. Later pushes leave those toggles alone. Repo reads have a
-  deadline and a 64 MiB output cap. Each push and Draft discard also has
-  a total read budget. A cancelled or timed-out read stops its git process
-  group.
-- A draft discard reads the baseline branch itself instead of the HEAD cached
-  after the last push, so a push whose HEAD read failed can't make it drop a
-  toggle for an item in the baseline. A failed read is no longer taken for an
-  empty repo. While the baseline can't be read, the server drops nothing and
-  closes the session with code 1013; the daemon keeps backing off and sends
-  its unacknowledged discards again.
 - An empty repo whose unborn HEAD named another branch takes pushes to the
   `main` branch the server creates in it.
 - Server reads of the repo ignore replacement objects, so a replacement ref
@@ -162,8 +158,7 @@ break compatibility.
   Bulk changes apply only at the displayed revision. Undo checks the
   revision and registration again, and skips Machines that left, rejoined
   or changed. The Server assigns a new registration ID at each join so
-  the matrix can discard late replies from a prior membership. Older
-  Servers without registration IDs do not offer guarded Undo.
+  the matrix can discard late replies from a prior membership.
 - A batch Import tries every selected skill instead of stopping at the first
   failure, even when the Daemon was unreachable for one, shows each as added,
   not added or not attempted (after Stop), reads back what reached the Draft
@@ -175,13 +170,6 @@ break compatibility.
 - An interrupted Adopt can be resumed from the Library. `GET /skills` marks
   the unmanaged variant that matches the existing personal copy as
   `resumable`; other variants stay blocked.
-- Renaming a Personal Skill or Rule copies this Machine's explicit toggles
-  to the new name first. The Server handles the copy for joined Machines,
-  and the Daemon handles it in standalone mode. Existing destination toggles
-  are preserved. If the copy fails or its outcome is uncertain, the Library
-  offers **Rename without copying Assignment**. If the copy succeeds and the
-  rename moves nothing, cleanup uses the copy's revision and registration.
-
 ## [0.1.0] - 2026-11-17
 
 The first release, for private testing. Linux only for the desktop app, the

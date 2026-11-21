@@ -11,6 +11,7 @@ These endpoints use the Daemon's local Unix socket. Shared Rust types are in
 {
   "name": "pdf",
   "item": "skill:pdf",
+  "id": "01KAC9SRJZ9Z5SSWRBQE76YS69",
   "type": "personal",
   "description": "Work with PDFs",
   "draft": "added",
@@ -23,7 +24,8 @@ These endpoints use the Daemon's local Unix socket. Shared Rust types are in
 ```
 
 `type` is `personal`, `import`, `rule`, or `unmanaged`. `item` is
-`skill:<name>` or `rule:<name>`, and is null for unmanaged Skills.
+`skill:<name>` or `rule:<name>`, and is null for unmanaged Skills. The Item ID
+field `id` is omitted for unmanaged Skills.
 `description` is a string or null. `draft` is `added`, `modified`, `deleted`,
 or null. `in_baseline` refers to the applied fleet Baseline, so an unpushed
 commit can still have `in_baseline: false` and `draft: null`.
@@ -165,14 +167,7 @@ same name. An identical personal copy is accepted so an interrupted Adopt can
 be retried: that variant is `resumable` in `GET /skills`, and the Library offers
 Resume adoption for it. Differing Harness copies stay unmanaged.
 
-The Server rejects toggles for unknown items, so Adopt first copies the selected
-content into `personal/<name>/` and reports the Draft. It waits for the Server to
-see it, then synchronously sets explicit `enabled: true` Assignment toggles in
-each Harness where that variant was found. A rejected Assignment rolls back
-only the repo copy this request created, and only while it still matches a
-source. Existing copies and concurrent edits are preserved. A crash between
-publication and Assignment leaves the original Harness copies untouched;
-retrying Adopt finishes the Assignment. Explicit enable toggles are idempotent.
+Adopt copies the selected content into `personal/<name>/` with a new Item ID. The Daemon sends a status with that ID before sending the Assignment request on the same WebSocket session. The request explicitly enables the item for each Harness with a matching copy. A definitive refusal rolls back only a copy created by that request, and only if it still matches a source. If the connection drops before the reply, the Draft keeps its ID so Adopt can retry.
 
 After the Server accepts Assignment, sync replaces the selected Harness copies
 through normal displacement, retaining originals in recovery. Other Harnesses
@@ -197,94 +192,33 @@ Draft. Errors use the existing non-2xx JSON body:
 
 ## Rename
 
-`POST /items/rename` takes:
+`POST /items/rename` renames a personal Skill or Rule in the Draft.
 
 ```json
-{"kind": "skill", "name": "pdf", "to": "docs"}
+{"kind": "skill", "name": "pdf", "to": "documents"}
 ```
 
-It copies this Machine's explicit toggles for the old name to the new one
-first, then renames the personal Skill or Rule in the Draft:
-
-```json
-{"item": "skill:docs", "migrated": ["claude"], "kept": ["codex"], "assignment_error": null}
-```
-
-The copy is made by the Assignment's authority, never described by the
-caller: the Server when joined (`POST /api/machines/{id}/assignment/copy`
-with `{"from": "skill:pdf", "to": "skill:docs"}`, which this local API does
-not expose), the Daemon itself when standalone (skipping toggles for a
-Harness this Machine no longer has). In one transaction it checks that `from`
-is an item this Machine can have and `to` is the same kind and not one yet,
-then copies the current explicit toggles of `from` to `to`, logged like any
-change. A Harness where `to` already has an explicit toggle keeps it and is
-listed in `kept`; `migrated` lists only the Harnesses whose toggle was
-written. The Daemon always asks, even when it sees no toggles to copy, so a
-toggle set on the old name just before is not missed. `assignment_error` is
-always null; it stays for older clients.
-
-When the copy can't be made, nothing is renamed and the request fails with
-HTTP 409 and the reason: offline, the Server refused it, or the Server is
-older and has no copy endpoint (HTTP 404, reported as "Assignment copy is not
-supported by this Server"). When the copy's response is lost or uncertain, the Daemon
-refuses the rename and leaves the Assignment alone. The error says the new
-name may already have copied toggles. Those toggles stay unused unless an
-item with that name appears. To rename anyway, send `"copy_assignment": false`.
-The new name uses any explicit toggles already present, and each Harness's
-default otherwise.
-
-When the rename then moves nothing (the new name appeared since it was
-checked, say), the Daemon removes the toggles the copy applied again, with the
-copy's `expected` revision and registration, so that a toggle someone changed
-meanwhile is left alone; the error says whether they were removed or kept, and
-in which Harnesses. When the item moved but rewriting its frontmatter `name:`
-failed, the rename stands with its copied toggles and the error says so.
-Standalone, a saved Assignment counts as written even when applying it fails
-afterwards; that failure shows in the status.
-
-Other Machines' toggles are not copied: once the rename is pushed, the old
-name's are dropped (`item_removed`) and the new name follows their defaults.
-The old name's toggles on this Machine also stay until that push, so restoring
-both Draft items undoes the rename. Toggles copied to the new name before the
-rename reaches the Draft survive a push meanwhile only because a push sweeps
-just the items it removed from the Baseline (delta-only sweeps), which never
-include the new name.
+It returns `{"item":"skill:documents"}`. The rename keeps the Item ID, so the
+Assignment follows the item on every Machine. Restore both Draft entries to
+undo a rename.
 
 ### Assignment writes
 
-`PUT /machines/{id}/assignment` (passed through to the Server when joined)
-also takes an optional `expected`: `{"revision": 7, "registration": "…"}`.
-The write applies only to that revision and, when given, that registration of
-the Machine; otherwise it fails with HTTP 409 and changes nothing. Standalone,
-a registration never matches.
+`GET /items` includes the `id` of each Skill and Rule for the Assignment matrix.
+`PUT /machines/{id}/assignment` accepts `changes` and an optional `expected`
+revision and registration. An item toggle takes `harness`, `kind`, `item_id`,
+`enabled` and the optional display `name`. A null `enabled` clears the explicit
+toggle. A default change takes `kind: "new_skills_default"` or
+`"new_rules_default"` and a boolean `enabled`.
 
-A 0.1.0 Server ignores it, and leaves `registration` out of `GET /fleet`, so the
-GUI offers matrix Undo only when it is there (or standalone). `GET /fleet` lists each Machine's
-`registration`, a random id that is new for every join, and the Server's
-`GET /machines/{id}/assignment` returns it too.
+A joined Daemon sends its own writes as `set_assignment` frames after the latest
+status. The server replies with `assignment_result`, the request's `req`, and the
+last status `seq` it processed for the session. Admin and cross-Machine writes
+use the server's REST API. Unknown Item IDs are accepted and inert.
 
-
-### Set a Harness's items and defaults
-
-Send `POST /api/machines/{id}/assignment/harness/{harness}` with
-`{"enabled": false}` (or `true`) to set both defaults and every Baseline item,
-reported draft, and unpushed item for that Machine in one transaction.
-It uses the same scope and change log as the assignment PUT. The response
-adds `skipped` for Skills and Rules with names the Server cannot accept as
-toggles. Both this endpoint and rename-copy return 503 if the current
-Baseline inventory cannot be read. The error body includes
-`"code": "inventory_unavailable"` for this refusal before any Assignment changes.
-Retry after the Server can read the inventory.
-
-The local endpoint `POST /assignment/harness/{harness}` targets the
-Daemon's own Machine and returns the assignment update in `update`. It
-applies the Server's snapshot and syncs locally before replying. The response
-lists ineligible item names in `skipped`, including in standalone mode. The
-`update.errors` list describes local sync failures after the Assignment was
-saved. A retry also attempts sync when the Assignment revision is unchanged
-and the previous placement failed. Standalone Assignment PUT also returns
-placement errors in `errors`. If the Server returns a 404 without a JSON body,
-the Daemon uses the local repo and warns that unpulled items may stay on.
+`POST /assignment/harness/{harness}` takes `{"enabled":false}` and sets both
+defaults and every explicit toggle for that Harness. It returns the
+Assignment update, including any local placement errors.
 
 ## Sync and instruction previews
 
