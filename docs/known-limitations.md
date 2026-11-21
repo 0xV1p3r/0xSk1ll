@@ -7,35 +7,34 @@ you can adopt or discard (`sk1ll recover`). The cases below are what that
 guarantee does not cover. Each one needs exceptional timing or an unusual
 filesystem. None of them was reproduced through normal editing.
 
-## A save that lands mid-swap on a rules or instructions file
+## A save that lands mid-swap on a block instructions file
 
 Some editors save by writing a temporary file and renaming it over the
-original. This is not the default in vim, VS Code or emacs. JetBrains does it
-on some save paths, and emacs does it with `file-precious-flag`. If such a save
-renames its file into place in the millisecond gap after sync's last check and
-before sync's own rename, sync's rename replaces the editor's file. For
-rules, sync checks the file's identity just before that rename. The
-editor's content is lost. The version before it is kept in recovery.
+original. If that rename lands after sync's last check of a block
+instructions file and before sync's own rename, sync can replace the
+editor's file. Recovery holds the version from before the editor's rename.
 
-This only applies to rules files and block instruction files. Skills are
-directories and are placed without replacing. Closing the gap needs
-`RENAME_EXCHANGE`, which is Linux-only.
+## Placement anchors and directory locks
 
-## Changes to placement metadata
+A skill symlink's ownership follows its target. Recreating the identical
+link counts as the same placement because it points to the same skill.
+Copied skills and rules use hard-link anchors. If an anchor is missing
+or no longer points to the file at the destination, the object is unmanaged.
 
-The next sync resolves interrupted placements using the identity recorded
-before each swap. A copied skill whose root `.sk1ll-placement` file has been
-deleted or changed becomes unmanaged. Copying the entire directory with
-its token and putting the clone back under the same name makes it look like
-the original placement. Rule files also look like the original if the
-filesystem reuses their device and inode and supplies no birth time.
+The directory lock assumes a filesystem with working locks between all
+writers. An NFS configuration without cross-host locking can admit two
+writers. Keep the lock file in place while a process holds it.
+
+Linux resolves staging paths through the pinned directory descriptor.
+On other platforms the private staging directory must stay at the same
+path while sync runs.
 
 ## A concurrent save in the Library editor
 
 The Daemon stages the editor's new text before checking the file's fingerprint
 again. If another process writes to the file between that final check and the
 rename, the editor's save replaces that write. This is the same timing gap as
-the one for rules files above.
+for block instructions files.
 
 ## A save to machine.toml at the moment sk1ll writes it
 
@@ -45,7 +44,7 @@ same file with the same bytes and permissions. It then renames the new file
 over that target. A symlink retargeted after the check can leave the write
 at the old target. A save that lands in the gap
 between that last check and the rename is replaced and lost, as described
-above for rules files. A save any earlier makes the change fail without
+above for block instructions files. A save any earlier makes the change fail without
 writing. A missing `machine.toml` is created only while nothing is there
 (with a hard link, which never replaces); on a filesystem without hard links
 the change fails and says so. ACLs and extended attributes of `machine.toml`
@@ -78,9 +77,10 @@ use a path traversal that could follow a concurrent symlink replacement.
 
 ## Filesystems without hard links
 
-Sync relies on `link(2)` to update or create a Rule file or block instructions
-file. On filesystems without hard links, such as FAT, these operations
-fail and leave the original in place. They never fall back to an unsafe write.
+Skill copies and rule files need hard links for their placement anchors.
+On filesystems without hard links, such as FAT, an existing object without
+an anchor is unmanaged and a new placement fails before changing the
+destination. Block instructions also use hard links for recovery.
 
 ## The recovery size cap
 

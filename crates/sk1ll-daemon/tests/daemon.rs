@@ -1467,7 +1467,7 @@ async fn displaced_conflicts_report_to_server_and_resolve() {
             "entry.json",
             &serde_json::json!({
                 "harness": HARNESS, "kind": "skill", "dest": m.skills().join("x"),
-                "version": 1, "expected": "", "displaced_at": 0
+                "version": 2, "expected": "", "displaced_at": 0
             })
             .to_string(),
         );

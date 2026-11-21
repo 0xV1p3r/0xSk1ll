@@ -44,6 +44,10 @@ pub(crate) struct Staged {
 }
 
 impl Staged {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Creates the staging file for `dest` (whose directory must exist):
     /// private while it is written if the caller sets `mode` on it later,
     /// else as the umask has it.

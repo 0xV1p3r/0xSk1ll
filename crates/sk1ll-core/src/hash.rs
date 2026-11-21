@@ -55,6 +55,42 @@ fn hash_dir_buffered(dir: &Path, buf: &mut [u8]) -> Result<String> {
     Ok(format!("sha256:{}", hex(&hasher.finalize())))
 }
 
+/// Fingerprints the entire recovery payload, including directory entries
+/// and their mode bits. Skill hash exclusions do not apply here.
+pub(crate) fn hash_payload(path: &Path) -> Result<String> {
+    let mut hash = Sha256::new();
+    let mut buffer = [0; BUFFER];
+    for entry in WalkDir::new(path).follow_root_links(false).sort_by_file_name() {
+        let entry = entry.map_err(std::io::Error::from).at(path)?;
+        let at = entry.path();
+        let rel = path_bytes(at.strip_prefix(path).unwrap_or(at));
+        hash.update((rel.len() as u64).to_le_bytes());
+        hash.update(rel);
+        let meta = fs::symlink_metadata(at).at(at)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            hash.update(meta.permissions().mode().to_le_bytes());
+        }
+        #[cfg(not(unix))]
+        hash.update([u8::from(meta.permissions().readonly())]);
+        if meta.is_symlink() {
+            hash.update(b"l");
+            let target = target_bytes(&fs::read_link(at).at(at)?);
+            hash.update((target.len() as u64).to_le_bytes());
+            hash.update(target);
+        } else if meta.is_dir() {
+            hash.update(b"d");
+        } else if meta.is_file() {
+            hash.update(b"f");
+            hash_file(&mut hash, at, &mut buffer).at(at)?;
+        } else {
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "unsupported recovery entry")).at(at);
+        }
+    }
+    Ok(format!("sha256:{}", hex(&hash.finalize())))
+}
+
 /// Feeds a file's length, then its bytes, to `hasher` without holding the
 /// whole file in memory.
 ///

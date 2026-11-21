@@ -351,7 +351,9 @@ mod tests {
         write(&dest.join(PLACEMENT_MARKER), &new_token().unwrap());
         let mut index = Index::default();
         index.set("marked", Some(copy_entry(&dest)), None);
-        save_index(&tmp.path().join("a"), &index).unwrap();
+        let dir = tmp.path().join("a");
+        save_index(&dir, &index).unwrap();
+        create_anchor(&dir, &index.entries["marked"], &dest.join(PLACEMENT_MARKER)).unwrap();
         let items = discover(&repo, &hs).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].variants.len(), 2);
