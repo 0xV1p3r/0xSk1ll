@@ -176,7 +176,7 @@ mod unix {
             let dest = self.root.join(path);
             let existing = matches!(old, Node::File { .. } | Node::Link(_));
             let recovery = || {
-                Displacing::begin(None, Kind::Draft, PULL, &dest, Some(&fingerprint(old)), &self.holder)
+                Displacing::begin(None, Kind::Draft, PULL, &dest, Some(&fingerprint(old)), None, &self.holder)
                     .map(|held| held.id().to_string())
             };
             let Some(content) = content else {
@@ -232,7 +232,7 @@ mod unix {
                     held
                 }
             };
-            Ok(Some(Outcome::Done(completed.finish()?)))
+            Ok(Some(Outcome::Done(completed.finish(false)?)))
         }
 
         pub(in super::super) fn apply(
@@ -305,7 +305,7 @@ mod unix {
                 publish(&entry.path, &parent, &name).map_err(io::Error::from).at(&dest)?;
                 return Displacing::forget_empty(&entry.id);
             }
-            let held = Displacing::begin(None, Kind::Draft, PULL, &dest, Some(&fingerprint(node)), &self.holder)?;
+            let held = Displacing::begin(None, Kind::Draft, PULL, &dest, Some(&fingerprint(node)), None, &self.holder)?;
             if let Err(error) = exchange(&entry.path, &parent, &name) {
                 held.abandon();
                 return Err(io::Error::from(error)).at(&dest);
@@ -315,7 +315,7 @@ mod unix {
             // original recovery entry. Neither name is ever unlinked here.
             held.take(&entry.path)?;
             Displacing::forget_empty(&entry.id)?;
-            held.finish()?.map_or(Ok(()), Err)
+            held.finish(false)?.map_or(Ok(()), Err)
         }
 
         fn slot(&self, i: usize) -> PathBuf {

@@ -7,25 +7,34 @@ you can adopt or discard (`sk1ll recover`). The cases below are what that
 guarantee does not cover. Each one needs exceptional timing or an unusual
 filesystem. None of them was reproduced through normal editing.
 
-## A save that lands mid-swap on a rules or instructions file
+## A save that lands mid-swap on a block instructions file
 
 Some editors save by writing a temporary file and renaming it over the
-original. This is not the default in vim, VS Code or emacs. JetBrains does it
-on some save paths, and emacs does it with `file-precious-flag`. If such a save
-renames its file into place in the millisecond gap after sync's last check and
-before sync's own rename, sync's rename replaces the editor's file. The
-editor's content is lost. The version before it is kept in recovery.
+original. If that rename lands after sync's last check of a block
+instructions file and before sync's own rename, sync can replace the
+editor's file. Recovery holds the version from before the editor's rename.
 
-This only applies to rules files and block instruction files. Skills are
-directories and are placed without replacing. Closing the gap needs
-`RENAME_EXCHANGE`, which is Linux-only.
+## Placement anchors and directory locks
+
+A skill symlink's ownership follows its target. Recreating the identical
+link counts as the same placement because it points to the same skill.
+Copied skills and rules use hard-link anchors. If an anchor is missing
+or no longer points to the file at the destination, the object is unmanaged.
+
+The directory lock assumes a filesystem with working locks between all
+writers. An NFS configuration without cross-host locking can admit two
+writers. Keep the lock file in place while a process holds it.
+
+Linux resolves staging paths through the pinned directory descriptor.
+On other platforms the private staging directory must stay at the same
+path while sync runs.
 
 ## A concurrent save in the Library editor
 
 The Daemon stages the editor's new text before checking the file's fingerprint
 again. If another process writes to the file between that final check and the
 rename, the editor's save replaces that write. This is the same timing gap as
-the one for rules files above.
+for block instructions files.
 
 ## A save to machine.toml at the moment sk1ll writes it
 
@@ -35,7 +44,7 @@ same file with the same bytes and permissions. It then renames the new file
 over that target. A symlink retargeted after the check can leave the write
 at the old target. A save that lands in the gap
 between that last check and the rename is replaced and lost, as described
-above for rules files. A save any earlier makes the change fail without
+above for block instructions files. A save any earlier makes the change fail without
 writing. A missing `machine.toml` is created only while nothing is there
 (with a hard link, which never replaces); on a filesystem without hard links
 the change fails and says so. ACLs and extended attributes of `machine.toml`
@@ -48,7 +57,11 @@ On Linux, directories are placed with `renameat2(RENAME_NOREPLACE)`. On macOS
 they use `renamex_np(RENAME_EXCL)`. On other platforms, or filesystems that
 reject those calls, sync checks the destination and then renames. In that case
 an *empty* directory created in the gap can be replaced. A directory with
-content in it is never replaced.
+content in it is never replaced. Files and symlinks fall back to a hard link
+or a new symlink at the destination, which never replaces anything. The old
+name is then unlinked, so a concurrent rename onto that old name in the gap
+can be lost. The same fallback applies when sync detaches an incumbent into
+its backup slot.
 
 ## First baseline and join recovery
 
@@ -91,20 +104,49 @@ loss is unsupported. Keep external Git commands that switch branches or
 write the index out of the repo during Pull. Pull checks the branch again
 before writing the index, and another Git command can still race that check.
 
+## Extended attributes and alternate data streams
+
+The fingerprint that decides whether placed content is unchanged includes
+extended attributes (and with them, ACLs) on Linux and macOS. A change to
+an attribute therefore counts as an edit, including one the system adds
+by itself, such as a relabel or a macOS provenance attribute. On Windows
+alternate data streams are not covered, and on other Unix systems neither are
+extended attributes. A change to either alone can be lost when sync replaces
+or prunes the file.
+
 ## Filesystems without hard links
 
-Sync relies on `link(2)` to update or create a Rule file or block instructions
-file. On filesystems without hard links, such as FAT, these operations
-fail and leave the original in place. They never fall back to an unsafe write.
+Skill copies and rule files need hard links for their placement anchors.
+On filesystems without hard links, such as FAT, an existing object without
+an anchor is unmanaged and a new placement fails before changing the
+destination. Block instructions also use hard links for recovery.
 
 ## The recovery size cap
 
-Unchanged harness recovery copies are pruned after a 10-minute grace period.
-Changed copies and Draft recovery entries from Pull stay until you adopt or
-discard them. Above `SK1LL_DISPLACED_MAX` (default 1 GiB), pruning can remove
-the oldest unchanged harness copies earlier. A write through a file still
-held open after it was pruned is lost. A new copy can put recovery above the
-cleanup target until the next prune.
+Recovery prunes backups after a 10-minute grace period if they still match
+their placement fingerprints. A backup with changes or without a placement
+fingerprint stays until explicit discard, and so does every Draft recovery
+entry from Pull. Above `SK1LL_DISPLACED_MAX`
+(default 1 GiB), the oldest unchanged backups can be pruned before the grace
+period ends. Pruning rechecks the payload and then every entry's metadata.
+A write through a still-open file descriptor after that last check can be
+lost, whether pruning happens after the grace period or to meet the size
+cap.
+
+Superseded ownership indexes are saved under `.sk1ll-state/index-history/`.
+Directory recovery checks them after the same grace period and keeps any
+that changed. This history sits outside the size cap.
+
+Pruning never deletes a directory recursively. It unlinks only the files and
+symlinks the fingerprint covered, each after checking that its metadata is
+unchanged, and then removes each directory only while it is empty. A file
+added, or changed, after the check stops the removal. The rest of the backup
+stays in recovery, marked changed. Files already unlinked by then are gone,
+and they matched the fingerprint. `sk1ll recover discard` is the one
+recursive deletion, and it runs only on request.
+
+The cap is a cleanup target, not a strict ceiling. It is checked before a
+new copy is added, so recovery can sit above the cap until the next prune.
 
 ## Content browsing outside Unix
 

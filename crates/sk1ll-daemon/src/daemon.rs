@@ -836,7 +836,7 @@ impl Daemon {
         // Sync waits for every item to have an Item ID; the report doesn't.
         let mut ids_ready = true;
         if !pending && reviewed.is_none() {
-            sync::recover(lock, &harnesses)?;
+            sync::recover(Some(lock), &harnesses)?;
             Self::recover_imports(&root)?;
             // After the pull is finished: a pending pull's tree is partial, and
             // writing into it could block the paths it still has to update.
@@ -1614,7 +1614,7 @@ impl Daemon {
             let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
             // Recovery may restore a source or change a placement. Compare the
             // plan for the recovered state, before applying any placements.
-            sync::recover(lock, &harnesses)?;
+            sync::recover(Some(lock), &harnesses)?;
             Self::recover_imports(root)?;
             let repo = Repo::open(root)?;
             repo.assign_missing_ids()?;
@@ -2456,26 +2456,26 @@ fn conflict_view(a: &Action) -> ConflictView {
 }
 
 /// Newest mtime of `path` and everything under it (directories too, so a
-/// deleted file counts), without following symlinks; the management marker
-/// and `.git` are skipped. Bounded, so a huge tree can't stall `/conflicts`.
+/// deleted file counts), without following symlinks or looking at what a
+/// skill's hash leaves out. Bounded, so a huge tree can't stall `/conflicts`.
 fn modified_at(path: &Path) -> Option<u64> {
     let seconds =
         |m: &std::fs::Metadata| m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs());
     let meta = std::fs::symlink_metadata(path).ok()?;
     let (mut newest, mut stack, mut budget) = (seconds(&meta), Vec::new(), 10_000usize);
     if meta.is_dir() {
-        stack.push(path.to_path_buf());
+        stack.push((path.to_path_buf(), 1));
     }
-    while let Some(dir) = stack.pop() {
+    while let Some((dir, depth)) = stack.pop() {
         for entry in std::fs::read_dir(&dir).ok()?.flatten() {
             budget = budget.checked_sub(1)?;
-            if [sync::MARKER, ".git", sk1ll_core::skill::ID_FILE].iter().any(|name| entry.file_name() == *name) {
+            if sync::excluded_from_personal_skill(depth, &entry.file_name()) {
                 continue;
             }
             let Ok(meta) = entry.metadata() else { continue };
             newest = newest.max(seconds(&meta));
             if meta.is_dir() {
-                stack.push(entry.path());
+                stack.push((entry.path(), depth + 1));
             }
         }
     }
@@ -2916,6 +2916,7 @@ mod tests {
                 item_id: None,
                 metadata_only: false,
                 expected: None,
+                expected_index: None,
             },
             reason: None,
         };
@@ -3111,14 +3112,18 @@ mod tests {
                 std::fs::read_to_string(source.join("SKILL.md")).unwrap(),
                 if scenario == "edit_source" { "later edit" } else { "original" }
             );
-            assert!(!source.join(".sk1ll-managed").exists());
+            assert!(!source.parent().unwrap().join(sync::INDEX_PATH).exists());
             if scenario == "new" {
                 assert!(!destination.exists());
                 accept.store(true, Ordering::SeqCst);
                 d.blocking(|d, eng| d.adopt(eng, ConflictTarget { harness: "h".into(), name: "pdf".into() }))
                     .await
                     .unwrap();
-                assert!(source.join(".sk1ll-managed").is_file());
+                let index = std::fs::read(source.parent().unwrap().join(sync::INDEX_PATH)).unwrap();
+                let index: serde_json::Value = serde_json::from_slice(&index).unwrap();
+                assert_eq!(index["entries"]["pdf"]["kind"], "copy");
+                let token = std::fs::read_to_string(source.join(sync::PLACEMENT_MARKER)).unwrap();
+                assert_eq!(index["entries"]["pdf"]["token"], token);
             } else {
                 assert_eq!(
                     std::fs::read_to_string(destination.join("SKILL.md")).unwrap(),

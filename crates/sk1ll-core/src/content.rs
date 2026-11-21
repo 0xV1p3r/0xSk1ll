@@ -364,8 +364,17 @@ fn is_sidecar(name: &std::ffi::OsStr) -> bool {
     name.to_str().is_some_and(|name| name.eq_ignore_ascii_case(crate::skill::ID_FILE))
 }
 
-fn hidden(name: &std::ffi::OsStr) -> bool {
-    is_sidecar(name) || name == ".sk1ll-tmp" || crate::sync::IMPORT_COPY_SKIP.iter().any(|skip| name == *skip)
+/// Whether an item's tree leaves out the entry `name`, found `depth`
+/// levels below the item's root (1: directly inside it): what skill hashes
+/// and copies leave out, a personal skill's Item ID sidecar, and sk1ll's
+/// scratch directory.
+fn reserved_name(depth: usize, name: &std::ffi::OsStr) -> bool {
+    is_sidecar(name) || crate::sync::excluded_from_skill(depth, name) || name == ".sk1ll-tmp"
+}
+
+/// Names no item can have: sk1ll's own entries in the directories it manages.
+fn reserved_item(name: &str) -> bool {
+    matches!(name, ".git" | ".sk1ll-state" | ".sk1ll-tmp")
 }
 
 pub fn tree(repo: &Repo, harnesses: &BTreeMap<String, Harness>, query: &ContentQuery) -> Result<Vec<FileEntry>> {
@@ -384,7 +393,7 @@ pub fn tree(repo: &Repo, harnesses: &BTreeMap<String, Harness>, query: &ContentQ
             let walker = WalkDir::new(&root)
                 .sort_by_file_name()
                 .into_iter()
-                .filter_entry(|e| e.depth() == 0 || !hidden(e.file_name()));
+                .filter_entry(|e| e.depth() == 0 || !reserved_name(e.depth(), e.file_name()));
             #[cfg(test)]
             before_access();
             for entry in walker {
@@ -415,7 +424,12 @@ pub fn tree(repo: &Repo, harnesses: &BTreeMap<String, Harness>, query: &ContentQ
                 let path = Path::new(&path);
                 if !path.starts_with(&root)
                     || path == base
-                    || path.strip_prefix(base).unwrap().components().any(|c| hidden(c.as_os_str()))
+                    || path
+                        .strip_prefix(base)
+                        .unwrap()
+                        .components()
+                        .enumerate()
+                        .any(|(depth, c)| reserved_name(depth + 1, c.as_os_str()))
                 {
                     continue;
                 }
@@ -554,7 +568,9 @@ pub fn write_file(repo: &Repo, request: &WriteFileRequest) -> Result<bool> {
     {
         let query = &request.file;
         let rel = relative(&query.path)?;
-        if crate::source::is_staging_path(rel) || rel.components().any(|c| hidden(c.as_os_str())) {
+        if crate::source::is_staging_path(rel)
+            || rel.components().enumerate().any(|(depth, c)| reserved_name(depth + 1, c.as_os_str()))
+        {
             return Err(Error::Invalid("cannot edit a reserved file".into()));
         }
         if query.content.item.starts_with("unmanaged:") {
@@ -563,7 +579,7 @@ pub fn write_file(repo: &Repo, request: &WriteFileRequest) -> Result<bool> {
         let item: ItemRef = query.content.item.parse()?;
         let name = item.name();
         if relative(name)?.file_name().is_none_or(|leaf| leaf != name)
-            || matches!(name, ".git" | ".sk1ll-managed" | ".sk1ll-tmp")
+            || reserved_item(name)
             || crate::source::is_staging_path(Path::new(name))
         {
             return Err(Error::Invalid("invalid item name".into()));
@@ -795,6 +811,37 @@ mod tests {
         assert_eq!(read(&repo, "skill:pdf", "data.txt").unwrap().text.as_deref(), Some("draft data"));
         assert!(read(&repo, "skill:pdf", "SKILL.md").is_err());
     }
+    /// sk1ll's names inside a skill are its content, browsed and edited like
+    /// any other; only `.git`, the scratch directory and a copy's placement
+    /// marker at the root are left out.
+    #[test]
+    fn sk1ll_names_below_a_skills_root_are_browsed_and_edited() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::init(tmp.path()).unwrap();
+        let root = repo.personal_dir().join("pdf");
+        write(&root.join("SKILL.md"), "skill");
+        write(&root.join(crate::sync::PLACEMENT_MARKER), "token");
+        write(&root.join("x/.sk1ll-state/f"), "state");
+        write(&root.join("x/.sk1ll-placement"), "not a marker");
+        write(&root.join(".git/HEAD"), "ref");
+        write(&root.join("x/.sk1ll-tmp/scratch"), "scratch");
+        let paths: Vec<_> =
+            tree(&repo, &BTreeMap::new(), &query("skill:pdf")).unwrap().into_iter().map(|e| e.path).collect();
+        assert_eq!(paths, ["SKILL.md", "x", "x/.sk1ll-placement", "x/.sk1ll-state", "x/.sk1ll-state/f"]);
+        assert_eq!(read(&repo, "skill:pdf", "x/.sk1ll-state/f").unwrap().text.as_deref(), Some("state"));
+        #[cfg(unix)]
+        {
+            let edit = |path: &str| {
+                let expected = read(&repo, "skill:pdf", path).unwrap().fingerprint.unwrap();
+                let file = FileQuery { content: query("skill:pdf"), path: path.into() };
+                write_file(&repo, &WriteFileRequest { file, content: "edited".into(), expected })
+            };
+            assert!(edit("x/.sk1ll-state/f").unwrap());
+            assert_eq!(fs::read_to_string(root.join("x/.sk1ll-state/f")).unwrap(), "edited");
+            assert!(edit(crate::sync::PLACEMENT_MARKER).unwrap_err().to_string().contains("reserved"));
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn ancestor_swap_cannot_redirect_file_or_tree() {

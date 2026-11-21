@@ -21,7 +21,6 @@ use serde::Serialize;
 
 use crate::hash::hash_str;
 use crate::skill::{frontmatter_field, split_frontmatter};
-use crate::sync::MARKER;
 use crate::{Error, IoExt, ItemId, Result};
 
 pub const INSTRUCTIONS_DIR: &str = "instructions";
@@ -403,29 +402,6 @@ pub(crate) fn restore_metadata(
     };
     validate_edit(&content, path)?;
     Ok(content)
-}
-
-/// Hashes of the rule files 0xSk1ll wrote, stored as `<dir>/.sk1ll-managed`.
-pub(crate) type RulesIndex = BTreeMap<String, String>;
-
-pub(crate) fn load_rules_index(dir: &Path) -> Result<RulesIndex> {
-    let path = dir.join(MARKER);
-    match read_optional(&path)? {
-        Some(text) => toml::from_str(&text).map_err(|e| Error::Parse { path, message: e.to_string() }),
-        None => Ok(RulesIndex::new()),
-    }
-}
-
-pub(crate) fn save_rules_index(dir: &Path, index: &RulesIndex) -> Result<()> {
-    let path = dir.join(MARKER);
-    if index.is_empty() {
-        return match fs::remove_file(&path) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e).at(&path),
-            _ => Ok(()),
-        };
-    }
-    let body = toml::to_string(index).map_err(|e| Error::Parse { path: path.clone(), message: e.to_string() })?;
-    write_file(&path, &format!("# Rule files managed by 0xSk1ll. Do not edit.\n{body}"))
 }
 
 /// The managed block within a harness instructions file.
@@ -848,21 +824,5 @@ mod tests {
         assert!(block(&edited).unwrap().edited());
         assert!(find_block("<!-- 0xSk1ll:begin x -->\nno end", Path::new("f")).is_err());
         assert!(block("text mentioning <!-- 0xSk1ll:begin inline").is_none());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn bookkeeping_writes_never_follow_a_planted_temp_name() {
-        let tmp = tempfile::tempdir().unwrap();
-        let victim = tmp.path().join("victim");
-        fs::write(&victim, "victim\n").unwrap();
-        let planted = tmp.path().join(format!(".{MARKER}.sk1ll-tmp"));
-        std::os::unix::fs::symlink(&victim, &planted).unwrap();
-        let index = RulesIndex::from([("git.md".to_string(), "sha256:1".to_string())]);
-        save_rules_index(tmp.path(), &index).unwrap();
-        assert_eq!(load_rules_index(tmp.path()).unwrap(), index);
-        assert!(fs::symlink_metadata(tmp.path().join(MARKER)).unwrap().file_type().is_file(), "never a symlink");
-        assert_eq!(fs::read_to_string(&victim).unwrap(), "victim\n");
-        assert!(fs::symlink_metadata(&planted).unwrap().file_type().is_symlink());
     }
 }
