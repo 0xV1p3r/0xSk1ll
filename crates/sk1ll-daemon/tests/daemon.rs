@@ -973,6 +973,30 @@ async fn reconnecting_reports_fresh_local_state_first() {
     assert_eq!(report.drafts, [ItemRef::Skill("new".into())]);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconnecting_does_not_send_status_until_refresh_succeeds() {
+    let server = FakeServer::new().await;
+    let mut m = solo("solo", &server.url(), Some(snapshot(1, &[]))).with_env("SK1LL_RECONCILE_INTERVAL", "1h");
+    m.write("personal/w/SKILL.md", "draft");
+    let config = Machine::machine_config(m.home.path());
+    let good = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, "[broken").unwrap();
+    m.start().await;
+    let (mut ws, _) = server.accept().await;
+    if let Ok(Some(Ok(Message::Text(text)))) = tokio::time::timeout(Duration::from_millis(700), ws.next()).await {
+        panic!("a failed refresh sent status: {text}");
+    }
+    let status = m.status().await;
+    assert!(status.last_error.as_deref().unwrap_or_default().contains("machine.toml"), "{status:?}");
+
+    std::fs::write(config, good).unwrap();
+    let (mut ws, _) = server.accept().await;
+    let DaemonMessage::Status(report) = next_message(&mut ws).await else { panic!("expected status") };
+    assert_eq!(report.seq, 1);
+    assert!(report.drafts.contains(&ItemRef::Skill("w".into())));
+    assert!(report.items.iter().any(|item| item.id == skill_id("w")));
+}
+
 /// Connecting costs one refresh (the one before the first status) when
 /// nothing changed: no extra refresh for a catch-up pull
 /// that moved nothing, or for the server's nudge for the baseline in use.
@@ -2343,13 +2367,14 @@ async fn clients_of_another_local_api_version_are_told_to_restart_the_daemon() {
     let request = |version: &str| {
         format!("GET /status HTTP/1.1\r\nHost: localhost\r\nsk1ll-api: {version}\r\nConnection: close\r\n\r\n")
     };
-    for (version, expected) in [("1", "HTTP/1.1 200"), ("2", "HTTP/1.1 426")] {
+    let version = sk1ll_daemon::client::API_VERSION;
+    for (version, expected) in [(version, "HTTP/1.1 200"), (version + 1, "HTTP/1.1 426")] {
         let mut stream = tokio::net::UnixStream::connect(m.client.socket()).await.unwrap();
-        stream.write_all(request(version).as_bytes()).await.unwrap();
+        stream.write_all(request(&version.to_string()).as_bytes()).await.unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).await.unwrap();
         assert!(response.starts_with(expected), "{version}: {response}");
-        if version == "2" {
+        if expected == "HTTP/1.1 426" {
             assert!(response.contains("restart the daemon"), "{response}");
         }
     }

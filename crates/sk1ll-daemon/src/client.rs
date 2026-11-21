@@ -237,7 +237,7 @@ pub struct RestoreRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestoreResponse {
-    /// Items that left the draft (reported to the server as `draft_discarded`).
+    /// Items that left the Draft after Restore.
     pub discarded: Vec<ItemRef>,
 }
 

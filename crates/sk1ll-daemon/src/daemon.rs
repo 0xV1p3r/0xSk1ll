@@ -1105,8 +1105,7 @@ impl Daemon {
         Ok(CommitResponse { sha, items, message, pushed, push_error })
     }
 
-    /// Restores draft items, then queues `draft_discarded` durably. The server
-    /// session sends the updated status before it.
+    /// Restores draft items and refreshes the local state.
     pub(crate) fn restore(&self, eng: &mut Engine, req: RestoreRequest) -> Result<RestoreResponse> {
         self.ensure_managed(eng)?;
         self.lock_repo(eng)?;
