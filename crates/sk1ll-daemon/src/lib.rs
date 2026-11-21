@@ -7,7 +7,7 @@
 //! - File watches and periodic reconciliation apply local changes in both modes.
 //! - Standalone commits stay local; explicit push/pull use the repo's origin.
 //! - Joined commits push immediately or queue while offline. Assignment arrives
-//!   as revisioned snapshots, and discarded drafts are delivered via an outbox.
+//!   as revisioned snapshots, and writes follow the status on the same session.
 //! - Conflicts are reported, never overwritten without an explicit action.
 //! - Fleet credentials live in daemon.json; git gets them through the process
 //!   environment ([`auth`]). Standalone never opens a server session.
@@ -21,7 +21,6 @@ mod error;
 pub mod gitx;
 pub mod join;
 mod notifications;
-mod outbox;
 mod server;
 pub mod service;
 pub mod state;
@@ -34,7 +33,7 @@ use anyhow::{Context, bail};
 pub use config::{Config, locate_repo, parse_duration};
 use daemon::Daemon;
 pub use join::{JoinOptions, Joined, join, join_or_rejoin};
-pub use server::{set_assignment_direct, set_harness_assignment_direct};
+pub use server::write_assignment_direct;
 pub use state::DaemonState;
 
 static PREPARED: AtomicBool = AtomicBool::new(false);

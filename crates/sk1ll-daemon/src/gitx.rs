@@ -111,10 +111,11 @@ fn fetch_all(dir: &Path, env: Env) -> anyhow::Result<()> {
 }
 
 fn no_fleet_branch(others: &[String]) -> anyhow::Error {
-    anyhow::anyhow!(
-        "the server has no `{FLEET_BRANCH}` branch (it has {}); its baseline must be on it",
-        others.join(", ")
-    )
+    if others.is_empty() {
+        anyhow::anyhow!("the server has no commits on `{FLEET_BRANCH}`")
+    } else {
+        anyhow::anyhow!("the server has no `{FLEET_BRANCH}` branch (it has {})", others.join(", "))
+    }
 }
 
 /// The branches origin had at the last [`fetch_all`].
@@ -316,8 +317,6 @@ pub(crate) fn adopt_first_baseline_over_init(dir: &Path) -> anyhow::Result<Optio
 pub enum Setup {
     /// Cloned the server's repo.
     Cloned,
-    /// The server's repo is empty: cloned it and laid out a new skills repo as draft.
-    Initialized,
     /// An existing clone of the server's repo; its origin was updated.
     Adopted,
 }
@@ -377,7 +376,7 @@ fn check_fleet_branch(dir: &Path) -> anyhow::Result<()> {
 /// For an existing clone being adopted at join: fetches the server and checks
 /// that the clone's history and the server's `main` share a commit, so the
 /// first pull or push can't go off on a history of its own. A clone without
-/// commits, or an empty server (only older servers start without a commit), passes.
+/// commits has no local history to check.
 /// `env` authenticates git, as for [`ensure_clone`].
 pub fn check_shares_history(dir: &Path, env: &[(String, String)]) -> anyhow::Result<()> {
     check_fleet_branch(dir)?;
@@ -387,9 +386,6 @@ pub fn check_shares_history(dir: &Path, env: &[(String, String)]) -> anyhow::Res
     };
     let Some(remote) = remote_head(dir)? else {
         let others = remote_branches(dir)?;
-        if others.is_empty() {
-            return Ok(());
-        }
         return Err(no_fleet_branch(&others));
     };
     if output(dir, &["merge-base", &head, &remote], &[])?.status.success() {
@@ -425,17 +421,6 @@ pub fn ensure_clone(dir: &Path, remote: &str, env: &[(String, String)]) -> anyho
         Setup::Cloned
     };
     private_config(dir)?;
-    if rev(dir, "HEAD")?.is_none() {
-        // An empty server (older servers start without a commit): start a skills
-        // repo on `main`; it is pushed by the first commit.
-        if branch(dir)?.as_deref() != Some(FLEET_BRANCH) {
-            run(dir, &["symbolic-ref", "HEAD", &format!("refs/heads/{FLEET_BRANCH}")])?;
-        }
-        if !dir.join(sk1ll_core::manifest::MANIFEST_FILE).exists() {
-            Repo::init(dir)?;
-            return Ok(if setup == Setup::Cloned { Setup::Initialized } else { setup });
-        }
-    }
     Ok(setup)
 }
 
@@ -573,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_server_clone_blocks_every_first_baseline_obstruction() {
+    fn an_unborn_clone_blocks_every_first_baseline_obstruction() {
         use std::os::unix::fs::symlink;
         for scenario in [
             "ancestor-file",
@@ -588,7 +573,8 @@ mod tests {
                 let remote = tmp.path().join("empty.git");
                 git(tmp.path(), &["init", "--quiet", "--bare", "-b", "main", remote.to_str().unwrap()]);
                 let clone = tmp.path().join("clone");
-                assert_eq!(ensure_clone(&clone, remote.to_str().unwrap(), &[]).unwrap(), Setup::Initialized);
+                git(tmp.path(), &["clone", "--quiet", remote.to_str().unwrap(), clone.to_str().unwrap()]);
+                Repo::init(&clone).unwrap();
                 let seed = tmp.path().join("seed");
                 Repo::init(&seed).unwrap();
                 std::fs::create_dir_all(seed.join("personal/pdf")).unwrap();
@@ -791,12 +777,13 @@ mod tests {
     }
 
     #[test]
-    fn empty_server_clone_adopts_an_unobstructed_baseline_and_keeps_unrelated_drafts() {
+    fn an_unborn_clone_adopts_the_baseline_and_keeps_unrelated_drafts() {
         let tmp = tempfile::tempdir().unwrap();
         let remote = tmp.path().join("empty.git");
         git(tmp.path(), &["init", "--quiet", "--bare", "-b", "main", remote.to_str().unwrap()]);
         let clone = tmp.path().join("clone");
-        assert_eq!(ensure_clone(&clone, remote.to_str().unwrap(), &[]).unwrap(), Setup::Initialized);
+        git(tmp.path(), &["clone", "--quiet", remote.to_str().unwrap(), clone.to_str().unwrap()]);
+        Repo::init(&clone).unwrap();
         let seed = tmp.path().join("seed");
         Repo::init(&seed).unwrap();
         std::fs::create_dir_all(seed.join("personal/pdf")).unwrap();
@@ -843,10 +830,10 @@ mod tests {
         assert_eq!(ensure_clone(&clone, &remote, &[]).unwrap(), Setup::Adopted);
         check_shares_history(&clone, &[]).unwrap();
 
-        // An empty (older) server has no history to share yet.
+        // A server must have a Baseline commit before a clone can join.
         let empty = tmp.path().join("empty.git");
         git(tmp.path(), &["init", "--quiet", "--bare", "-b", "main", empty.to_str().unwrap()]);
         git(&own, &["remote", "set-url", REMOTE, empty.to_str().unwrap()]);
-        check_shares_history(&own, &[]).unwrap();
+        assert!(check_shares_history(&own, &[]).unwrap_err().to_string().contains("no commits on `main`"));
     }
 }
