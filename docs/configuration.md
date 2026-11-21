@@ -131,6 +131,11 @@ An edit to `machine.toml` by hand has the same effect on sync, without the previ
 
 ## Rules
 
+A Rule's `id:` frontmatter is its Item ID. The daemon or a mutating command
+writes one if the Rule was created by hand. The write appears in the Draft.
+A read-only sync preview uses the Harness default for a Rule with an
+unassigned ID. Rendering strips `id:` and `harnesses:` from Harness files.
+
 Each `instructions/<name>.md` file is one rule. Frontmatter is optional:
 
 ```markdown
@@ -152,7 +157,7 @@ Harnesses don't share one global `AGENTS.md`, so each harness sets an `instructi
 | `block` (default) | One marked block inside a single file. Sync leaves the rest of the file alone and follows symlinks, so dotfile-managed files keep working. | `~/.codex/AGENTS.md`, `~/.config/opencode/AGENTS.md`, `~/.gemini/GEMINI.md` |
 | `rules` | One copied file per rule, listed in a hidden `.sk1ll-managed` index | `~/.claude/rules/`, which Claude Code loads for every project |
 
-The `rules` format keeps each rule's frontmatter except `harnesses`, so Claude's `paths:` key still scopes a rule to matching files. It copies instead of symlinking because Claude Code skips symlinked rule files in some sessions (Cowork). Sync never touches rule files you wrote yourself and reports a name clash as a conflict.
+The `rules` format keeps each Rule's frontmatter except for `id:` and `harnesses:`, so Claude's `paths:` key still scopes a rule to matching files. It copies instead of symlinking because Claude Code skips symlinked rule files in some sessions (Cowork). Sync never touches rule files you wrote yourself and reports a name clash as a conflict.
 
 `sk1ll render <harness>` prints what a harness would receive.
 
