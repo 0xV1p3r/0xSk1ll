@@ -33,7 +33,7 @@ use anyhow::{Context, bail};
 pub use config::{Config, locate_repo, parse_duration};
 use daemon::Daemon;
 pub use join::{JoinOptions, Joined, join, join_or_rejoin};
-pub use server::write_assignment_direct;
+pub use server::{rename_harness_direct, write_assignment_direct};
 pub use state::DaemonState;
 
 static PREPARED: AtomicBool = AtomicBool::new(false);

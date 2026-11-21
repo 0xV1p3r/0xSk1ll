@@ -40,11 +40,18 @@ impl std::fmt::Debug for DaemonState {
 }
 
 impl DaemonState {
+    pub(crate) fn rename_authority(&self) -> String {
+        sk1ll_core::hash::hash_str(&format!("{}\0{}\0{}", self.server_url, self.machine_id, self.token))
+    }
+
     /// `None` if the machine hasn't joined.
     pub fn load(path: &Path) -> anyhow::Result<Option<Self>> {
         match fs::read_to_string(path) {
             Ok(text) => Ok(Some(serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match fs::symlink_metadata(path) {
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                _ => Err(e).with_context(|| format!("reading {}", path.display())),
+            },
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
     }

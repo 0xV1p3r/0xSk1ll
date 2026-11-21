@@ -623,6 +623,14 @@ pub struct DeleteItemRequest {
     pub kind: String,
     pub name: String,
 }
+pub use sk1ll_core::harness_rename::RenameRequest as HarnessRenameRequest;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessRenameResult {
+    pub update: AssignmentUpdate,
+    pub routed_rules: Vec<String>,
+}
+
 /// Renames an item in the Draft while keeping its Item ID.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenameItemRequest {
@@ -1057,7 +1065,7 @@ impl Client {
         self.post("/join-codes", &JoinCodeRequest { scope }).await
     }
 
-    pub async fn rename_harness(&self, rename: &sk1ll_proto::HarnessRename) -> Result<AssignmentUpdate> {
+    pub async fn rename_harness(&self, rename: &HarnessRenameRequest) -> Result<HarnessRenameResult> {
         self.post("/assignment/rename-harness", rename).await
     }
 

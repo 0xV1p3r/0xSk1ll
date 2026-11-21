@@ -40,9 +40,9 @@ use sk1ll_core::{
     EngineLock, HarnessChange, HarnessOrigin, ItemRef, MachineConfig, PullOutcome, Repo, default_commit_message,
     machine_author,
 };
-use sk1ll_core::{harness_change, imports};
+use sk1ll_core::{harness_change, harness_rename::RenameIntent, imports};
 use sk1ll_proto::{AssignmentSnapshot, AssignmentUpdate, AssignmentWrite, ConflictRef, MachineReport, headline};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{Notify, broadcast, mpsc, watch};
 
 use crate::client::{
     AddImportRequest, ChangeKind, CommitMessage, CommitRequest, CommitResponse, ConflictTarget, ConflictView,
@@ -110,6 +110,7 @@ pub(crate) struct Daemon {
     view: watch::Sender<StatusView>,
     events: broadcast::Sender<Event>,
     pub(crate) assignment_session: watch::Sender<Option<mpsc::Sender<crate::server::SessionWrite>>>,
+    pub(crate) restart_assignment_session: Notify,
     connected: AtomicBool,
     /// A pull has confirmed that the Machine is clear of baseline clashes.
     pub(crate) pull_cleared_blocked: AtomicBool,
@@ -233,6 +234,7 @@ impl Daemon {
             view: watch::channel(view).0,
             events: broadcast::channel(256).0,
             assignment_session: watch::channel(None).0,
+            restart_assignment_session: Notify::new(),
             connected: AtomicBool::new(false),
             pull_cleared_blocked: AtomicBool::new(false),
             auth_rejected: Mutex::new(None),
@@ -275,6 +277,9 @@ impl Daemon {
     /// Publishes local file edits through the same snapshot the engine's
     /// readers use. The separate revision file never becomes fleet state.
     fn reload_local_assignment(&self) -> Result<()> {
+        if let Some(intent) = RenameIntent::load(&self.cfg.machine_config, None)? {
+            intent.apply_standalone(&self.cfg.machine_config, &self.cfg.assignment)?;
+        }
         let assignment = sk1ll_core::Assignment::load(&self.cfg.assignment)?;
         let previous = self.snapshot();
         if previous.as_ref().is_some_and(|s| s.assignment == assignment) {
@@ -300,12 +305,12 @@ impl Daemon {
         use sk1ll_proto::ToggleKind;
         self.ensure_managed(eng)?;
         self.lock_repo(eng)?;
+        // An edit made outside the daemon counts as a newer revision.
+        self.reload_local_assignment()?;
         let repo = Repo::open(Self::root(eng))?;
         let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
         let skills: Vec<_> = repo.skills()?.into_iter().map(|s| s.id).collect();
         let rules: Vec<_> = repo.rules()?.into_iter().map(|r| r.id).collect();
-        // An edit made outside the daemon counts as a newer revision.
-        self.reload_local_assignment()?;
         if let Some(expected) = &changes.expected {
             let revision = self.snapshot().map_or(0, |s| s.revision);
             if expected.registration.is_some() {
@@ -390,6 +395,7 @@ impl Daemon {
                 AssignmentWrite::Harness { harness, enabled } => {
                     self.ensure_managed(eng)?;
                     self.lock_repo(eng)?;
+                    self.reload_local_assignment()?;
                     if !MachineConfig::load(&self.cfg.machine_config)?.harnesses().contains_key(&harness) {
                         return Err(Error::BadRequest(format!("unknown harness `{harness}`")));
                     }
@@ -408,6 +414,9 @@ impl Daemon {
                 AssignmentWrite::RenameHarness(_) => unreachable!("handled with the machine config edit"),
             };
         }
+        if RenameIntent::exists(&self.cfg.machine_config)? {
+            return Err(Error::Unavailable("waiting for the pending Harness rename to finish".into()));
+        }
         let mut update = tokio::runtime::Handle::current().block_on(crate::server::write_assignment(self, write))?;
         let snapshot =
             AssignmentSnapshot { revision: update.revision, assignment: update.assignment.clone(), registration: None };
@@ -422,41 +431,74 @@ impl Daemon {
     pub(crate) fn rename_harness(
         &self,
         eng: &mut Engine,
-        rename: sk1ll_proto::HarnessRename,
-    ) -> Result<AssignmentUpdate> {
-        use sk1ll_core::config_file::Snapshot;
+        request: crate::client::HarnessRenameRequest,
+    ) -> Result<crate::client::HarnessRenameResult> {
         self.ensure_managed(eng)?;
         self.lock_repo(eng)?;
-        let config = Snapshot::take(&self.cfg.machine_config)?;
-        let edit = MachineConfig::rename_harness(&config, &rename.from, &rename.to)?;
+        let config = &self.cfg.machine_config;
         if self.is_standalone() {
-            let before = sk1ll_core::Assignment::load(&self.cfg.assignment)?;
-            let mut assignment = before.clone();
-            assignment.rename_harness(&rename.from, &rename.to);
-            assignment.save(&self.cfg.assignment)?;
-            if let Err(e) = edit.write(&config) {
-                before.save(&self.cfg.assignment)?;
-                return Err(e.into());
-            }
+            let authoritative = sk1ll_core::Assignment::load(&self.cfg.assignment)?;
+            let intent = RenameIntent::prepare(config, Self::root(eng), request, &authoritative, None)?;
+            intent.apply_standalone(config, &self.cfg.assignment)?;
             let errors = self.saved_local_assignment(eng);
             let snap = self.snapshot().expect("standalone always has assignment");
-            return Ok(AssignmentUpdate {
-                revision: snap.revision,
-                assignment: snap.assignment.clone(),
-                entries: Vec::new(),
-                errors,
+            return Ok(crate::client::HarnessRenameResult {
+                update: AssignmentUpdate {
+                    revision: snap.revision,
+                    assignment: snap.assignment.clone(),
+                    entries: Vec::new(),
+                    errors,
+                },
+                routed_rules: intent.routed_rules,
             });
         }
-        let write = AssignmentWrite::RenameHarness(rename);
-        let mut update = tokio::runtime::Handle::current().block_on(crate::server::write_assignment(self, write))?;
-        edit.write(&config).map_err(|e| {
-            Error::Internal(anyhow::anyhow!(
-                "the Server moved the harness Assignment, but editing machine.toml failed: {e}"
-            ))
-        })?;
+        let state = self.ident.joined()?;
+        let runtime = tokio::runtime::Handle::current();
+        let intent = runtime.block_on(crate::server::prepare_rename(&self.cfg, state, request, &self.http))?;
+        intent.apply_config(config)?;
+        let result = runtime.block_on(crate::server::write_assignment(self, crate::server::rename_write(&intent)));
+        let routed_rules = intent.routed_rules.clone();
+        let update = match self.finish_harness_rename(eng, intent, result) {
+            Ok(update) => update,
+            Err(error) => {
+                self.restart_assignment_session.notify_one();
+                return Err(error);
+            }
+        };
+        Ok(crate::client::HarnessRenameResult { update, routed_rules })
+    }
+
+    pub(crate) fn pending_harness_rename(&self, eng: &mut Engine) -> Result<Option<RenameIntent>> {
+        let authority = self.ident.joined()?.rename_authority();
+        let config = &self.cfg.machine_config;
+        let Some(intent) = RenameIntent::load(config, Some(&authority))? else { return Ok(None) };
+        self.ensure_managed(eng)?;
+        self.lock_repo(eng)?;
+        intent.apply_config(config)?;
+        Ok(Some(intent))
+    }
+
+    pub(crate) fn finish_harness_rename(
+        &self,
+        eng: &mut Engine,
+        intent: RenameIntent,
+        result: Result<AssignmentUpdate>,
+    ) -> Result<AssignmentUpdate> {
+        // If the process stops after clearing the intent, startup must
+        // already have the Assignment for the new config.
+        if let Ok(update) = &result
+            && self.snapshot().is_none_or(|current| current.revision < update.revision)
+        {
+            crate::server::save_assignment_snapshot(&self.cfg, update)?;
+        }
+        let mut update = crate::server::resolve_rename(&self.cfg.machine_config, &intent, result)?;
         let snapshot =
             AssignmentSnapshot { revision: update.revision, assignment: update.assignment.clone(), registration: None };
-        update.errors = self.apply_assignment(eng, snapshot)?;
+        if self.snapshot().is_some_and(|current| current.revision >= snapshot.revision) {
+            update.errors = self.refresh_reporting(eng)?;
+        } else {
+            update.errors = self.apply_assignment(eng, snapshot)?;
+        }
         self.event(Event::Fleet);
         Ok(update)
     }
@@ -733,6 +775,10 @@ impl Daemon {
         }
         if self.is_standalone() {
             self.reload_local_assignment()?;
+        } else if let Ok(state) = self.ident.joined()
+            && RenameIntent::load(&self.cfg.machine_config, Some(&state.rename_authority()))?.is_some()
+        {
+            return Err(Error::Unavailable("waiting for the pending Harness rename to finish".into()));
         }
         tracing::debug!("refreshing the local state");
         eng.stale = true;
@@ -1226,14 +1272,43 @@ impl Daemon {
             let contents = batch.map(|out| parse_batch(&out, wanted.len(), DESCRIPTION_CAP)).unwrap_or_default();
             blobs.extend(wanted.into_iter().zip(contents).filter_map(|(object, bytes)| Some((object, bytes?))));
         }
-        let manifest = sk1ll_core::Manifest::load(root).unwrap_or_default();
+        let claims_at = |revision: Option<&str>, paths: &[String]| -> BTreeMap<_, _> {
+            revision
+                .map(|rev| sk1ll_core::item_id::committed_inventory(root, rev, paths).items)
+                .unwrap_or_default()
+                .into_iter()
+                .collect()
+        };
+        let baseline_ids = claims_at(baseline.as_deref(), &baseline_paths);
+        let head_ids = if head == baseline { baseline_ids.clone() } else { claims_at(head.as_deref(), &head_paths) };
+        let on_disk: BTreeMap<_, _> = sk1ll_core::item_id::working_inventory(root).items.into_iter().collect();
+        for item in on_disk.keys() {
+            inventory.entry(item.clone()).or_insert_with(|| entry(item.clone()));
+        }
+        let baseline_item_ids: BTreeSet<_> = baseline_ids.values().filter_map(Option::as_ref).collect();
+        let mut historical = Vec::new();
         for value in inventory.values_mut() {
-            value.id = sk1ll_core::content::item_id_on_disk(root, &manifest, &value.item).or_else(|| {
-                [head.as_deref(), baseline.as_deref().filter(|rev| Some(*rev) != head.as_deref())]
-                    .into_iter()
-                    .flatten()
-                    .find_map(|rev| sk1ll_core::content::item_id_at(root, rev, &value.item))
-            });
+            let old = baseline_ids.get(&value.item);
+            let committed = head_ids.get(&value.item);
+            let working = on_disk.get(&value.item);
+            value.id = working.or(committed).or(old).cloned().flatten();
+            value.in_baseline = match value.id.as_ref() {
+                Some(id) => baseline_item_ids.contains(id),
+                None => old.is_some_and(|id| id.is_none()),
+            };
+            if let (Some(Some(old)), Some(current)) = (old, working.or(committed))
+                && current.as_ref() != Some(old)
+            {
+                let mut previous = entry(value.item.clone());
+                previous.id = Some(old.clone());
+                previous.in_baseline = true;
+                previous.draft = (working != committed).then_some(ChangeKind::Deleted);
+                previous.unpushed = committed != Some(&previous.id);
+                historical.push(previous);
+                if working != committed {
+                    value.draft = Some(ChangeKind::Added);
+                }
+            }
             let ItemRef::Skill(name) = &value.item else { continue };
             for directory in SKILL_DIRS {
                 let path = format!("{directory}/{name}/SKILL.md");
@@ -1256,7 +1331,23 @@ impl Daemon {
                 }
             }
         }
-        Ok(inventory.into_values().collect())
+        let mut by_id = BTreeMap::new();
+        for value in historical.into_iter().chain(inventory.into_values()) {
+            let key = (value.id.clone(), value.id.is_none().then(|| value.item.clone()));
+            match by_id.entry(key) {
+                std::collections::btree_map::Entry::Occupied(mut item) => {
+                    if value.draft != Some(ChangeKind::Deleted) {
+                        item.insert(value);
+                    }
+                }
+                std::collections::btree_map::Entry::Vacant(item) => {
+                    item.insert(value);
+                }
+            }
+        }
+        let mut items: Vec<_> = by_id.into_values().collect();
+        items.sort_by(|a, b| a.item.cmp(&b.item).then(a.id.cmp(&b.id)));
+        Ok(items)
     }
 
     /// A reader: no engine mutex.
@@ -2036,20 +2127,34 @@ impl Daemon {
     }
 }
 
-pub(crate) fn repo_report(root: &Path, harnesses: Vec<String>) -> Result<MachineReport> {
-    let repo = Repo::open_git_only(root)?;
-    let items = Repo::open(root)
-        .unwrap_or_else(|_| repo.clone())
-        .item_ids()?
+pub(crate) fn repo_inventory(root: &Path, harnesses: Vec<String>) -> sk1ll_proto::InventoryReport {
+    let inventory = sk1ll_core::item_id::working_inventory(root);
+    let inventory_error = inventory.errors.first().map(|error| crate::auth::redact(error));
+    let items = inventory
+        .items
         .into_iter()
-        .map(|(item, id)| sk1ll_proto::ReportedItem { item, id })
+        .filter_map(|(item, id)| Some(sk1ll_proto::ReportedItem { item, id: id? }))
         .collect();
+    sk1ll_proto::InventoryReport {
+        items,
+        inventory_complete: inventory_error.is_none(),
+        inventory_error,
+        harnesses,
+        ..Default::default()
+    }
+}
+
+fn repo_report(root: &Path, harnesses: Vec<String>) -> Result<MachineReport> {
+    let repo = Repo::open_git_only(root)?;
+    let inventory = repo_inventory(root, harnesses);
     Ok(MachineReport {
         baseline: gitx::baseline(root)?,
         drafts: repo.draft()?.into_iter().map(|d| d.item).collect(),
         unpushed: gitx::unpushed_items(root)?,
-        harnesses,
-        items,
+        harnesses: inventory.harnesses,
+        items: inventory.items,
+        inventory_complete: inventory.inventory_complete,
+        inventory_error: inventory.inventory_error,
         ..Default::default()
     })
 }
@@ -2476,6 +2581,41 @@ fn copy_authored(from: &Path, to: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inventory_keeps_both_ids_when_a_draft_recreates_the_same_name() {
+        use sk1ll_core::git::Git;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let repo = Repo::init_committed(root).unwrap();
+        repo.create_item("skill", "pdf", "").unwrap();
+        let old = repo.skills().unwrap()[0].id.clone();
+        let git = |args: &[&str]| {
+            Git::new(root)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(["-c", "commit.gpgsign=false", "-c", "user.name=test", "-c", "user.email=test@example.com"])
+                .args(args)
+                .text()
+                .unwrap()
+        };
+        git(&["add", "--all"]);
+        git(&["commit", "--quiet", "-m", "baseline"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        git(&["update-ref", "refs/remotes/origin/main", &head]);
+        repo.delete_item("skill", "pdf").unwrap();
+        repo.create_item("skill", "pdf", "").unwrap();
+        let current = repo.skills().unwrap()[0].id.clone();
+        let items = Daemon::items(root).unwrap();
+        assert!(
+            items.iter().any(|i| i.id.as_ref() == Some(&old) && i.in_baseline && i.draft == Some(ChangeKind::Deleted))
+        );
+        assert!(
+            items
+                .iter()
+                .any(|i| i.id.as_ref() == Some(&current) && !i.in_baseline && i.draft == Some(ChangeKind::Added))
+        );
+    }
 
     #[test]
     fn inventory_reads_applied_baseline_and_never_refreshes_the_index() {

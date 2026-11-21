@@ -544,8 +544,8 @@ async fn set_harness_assignment(
 
 async fn rename_harness(
     State(d): St,
-    Json(rename): Json<sk1ll_proto::HarnessRename>,
-) -> Result<Json<sk1ll_proto::AssignmentUpdate>> {
+    Json(rename): Json<crate::client::HarnessRenameRequest>,
+) -> Result<Json<crate::client::HarnessRenameResult>> {
     Ok(Json(d.blocking(move |d, eng| d.rename_harness(eng, rename)).await?))
 }
 

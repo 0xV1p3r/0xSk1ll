@@ -13,9 +13,10 @@ use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::Response;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
+use sk1ll_core::harness_rename::{RenameIntent, RenameRequest};
 use sk1ll_proto::{
-    AssignmentOutcome, AssignmentSnapshot, AssignmentUpdate, AssignmentWrite, DaemonMessage, ErrorBody, MachineReport,
-    PROTOCOL_HEADER, PROTOCOL_VERSION, ServerMessage,
+    AssignmentOutcome, AssignmentSnapshot, AssignmentUpdate, AssignmentWrite, DaemonMessage, ErrorBody,
+    InventoryReport, MachineReport, PROTOCOL_HEADER, PROTOCOL_VERSION, ServerMessage,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::{self, Message, client::IntoClientRequest};
@@ -173,13 +174,19 @@ async fn session(d: &Arc<Daemon>, ws: Ws, inbox: &mpsc::UnboundedSender<ServerMe
     let (mut sink, mut stream) = ws.split();
     let mut view = d.subscribe_view();
     send(&mut sink, &DaemonMessage::Hello { machine_id: d.ident.machine_id().to_string() }).await?;
+    if let Some(intent) = d.blocking(|d, eng| d.pending_harness_rename(eng)).await? {
+        let result = exchange(&mut sink, &mut stream, 1, 0, rename_write(&intent)).await;
+        // Reconnect after a refusal too. The exchange consumed the
+        // unsolicited initial Assignment while waiting for this reply.
+        d.blocking(move |d, eng| d.finish_harness_rename(eng, intent, result)).await?;
+    }
     let mut sent = None;
     let mut seq = 0;
     send_report(&mut sink, refresh_report(d).await?, &mut sent, &mut seq).await?;
     let (sender, mut writes) = mpsc::channel::<SessionWrite>(16);
     d.assignment_session.send_replace(Some(sender));
     d.set_connection(Connection::Connected);
-    let mut next_request = 0;
+    let mut next_request = 1;
     let mut pending: BTreeMap<u64, (u64, oneshot::Sender<Result<AssignmentUpdate>>)> = BTreeMap::new();
     let catch_up = d.clone();
     tokio::spawn(async move {
@@ -230,13 +237,16 @@ async fn session(d: &Arc<Daemon>, ws: Ws, inbox: &mpsc::UnboundedSender<ServerMe
                 let report = view.borrow_and_update().report.clone();
                 send_report(&mut sink, report, &mut sent, &mut seq).await?;
             }
+            () = d.restart_assignment_session.notified() => return Ok(()),
             Some(request) = writes.recv() => {
                 pending.retain(|_, (_, reply)| !reply.is_closed());
                 if request.result.is_closed() {
                     continue;
                 }
-                let report = view.borrow_and_update().report.clone();
-                send_report(&mut sink, report, &mut sent, &mut seq).await?;
+                if !matches!(request.write, AssignmentWrite::RenameHarness(_)) {
+                    let report = view.borrow_and_update().report.clone();
+                    send_report(&mut sink, report, &mut sent, &mut seq).await?;
+                }
                 next_request += 1;
                 send(&mut sink, &DaemonMessage::SetAssignment { req: next_request, write: request.write }).await?;
                 pending.insert(next_request, (seq, request.result));
@@ -328,8 +338,135 @@ async fn request(
     req.send().await.map_err(|e| Error::Unavailable(redact(&format!("offline: the server is unreachable ({e})"))))
 }
 
-/// Open a short-lived session when the daemon is stopped. The engine lock
-/// excludes the daemon and keeps the status and write in the same repo state.
+pub(crate) async fn prepare_rename(
+    cfg: &Config,
+    state: &DaemonState,
+    request_body: RenameRequest,
+    http: &reqwest::Client,
+) -> Result<RenameIntent> {
+    let authority = state.rename_authority();
+    let config = &cfg.machine_config;
+    if let Some(intent) = RenameIntent::load(config, Some(&authority))? {
+        if intent.request == request_body {
+            return Ok(intent);
+        }
+        return Err(Error::Conflict("finish the pending Harness rename first".into()));
+    }
+    let path = format!("/machines/{}/assignment", crate::client::encode(&state.machine_id));
+    let response = request(http, state, Method::GET, &path, Bytes::new()).await?;
+    let snapshot: AssignmentSnapshot = response
+        .error_for_status()
+        .map_err(|e| Error::Unavailable(redact(&e.to_string())))?
+        .json()
+        .await
+        .map_err(|e| Error::Unavailable(redact(&e.to_string())))?;
+    Ok(RenameIntent::prepare(config, &state.repo, request_body, &snapshot.assignment, Some(&authority))?)
+}
+
+pub(crate) fn rename_write(intent: &RenameIntent) -> AssignmentWrite {
+    AssignmentWrite::RenameHarness(sk1ll_proto::HarnessRename {
+        from: intent.request.from.clone(),
+        to: intent.request.to.clone(),
+        replace: intent.request.replace,
+        operation_id: intent.operation_id.clone(),
+    })
+}
+
+fn definitive_refusal(error: &Error) -> bool {
+    matches!(error, Error::Upstream(status, _) if matches!(*status,
+        StatusCode::BAD_REQUEST | StatusCode::CONFLICT | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND))
+}
+
+pub(crate) fn resolve_rename(
+    config: &std::path::Path,
+    intent: &RenameIntent,
+    result: Result<AssignmentUpdate>,
+) -> Result<AssignmentUpdate> {
+    match result {
+        Ok(update) => {
+            intent.apply_config(config)?;
+            intent.finish(config)?;
+            Ok(update)
+        }
+        Err(error) => {
+            if definitive_refusal(&error) {
+                intent.rollback_config(config)?;
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn exchange(
+    sink: &mut Sink,
+    stream: &mut futures_util::stream::SplitStream<Ws>,
+    req: u64,
+    expected_seq: u64,
+    write: AssignmentWrite,
+) -> Result<AssignmentUpdate> {
+    send(sink, &DaemonMessage::SetAssignment { req, write })
+        .await
+        .map_err(|e| Error::Unavailable(redact(&e.to_string())))?;
+    tokio::time::timeout(REQUEST_TIMEOUT, async {
+        while let Some(frame) = stream.next().await {
+            let frame = frame.map_err(|e| Error::Unavailable(redact(&e.to_string())))?;
+            if let Message::Text(text) = frame
+                && let Ok(ServerMessage::AssignmentResult { req: id, seq, result }) = serde_json::from_str(&text)
+                && id == req
+            {
+                if seq != expected_seq {
+                    return Err(Error::Unavailable(
+                        "the Server confirmed Assignment after an unexpected status".into(),
+                    ));
+                }
+                return assignment_result(result);
+            }
+        }
+        Err(Error::Unavailable("the Server disconnected before confirming the Assignment".into()))
+    })
+    .await
+    .map_err(|_| Error::Unavailable("the Server did not confirm the Assignment in time".into()))?
+}
+
+pub async fn rename_harness_direct(
+    cfg: &Config,
+    state: &DaemonState,
+    _lock: &sk1ll_core::EngineLock,
+    request_body: RenameRequest,
+) -> anyhow::Result<crate::client::HarnessRenameResult> {
+    let http = http_client().build()?;
+    let intent = prepare_rename(cfg, state, request_body, &http).await?;
+    intent.apply_config(&cfg.machine_config)?;
+    let (mut sink, mut stream) = direct_session(state).await?;
+    let result = exchange(&mut sink, &mut stream, 1, 0, rename_write(&intent)).await;
+    // Persist the new authoritative Assignment before clearing the intent.
+    if let Ok(update) = &result {
+        save_assignment_snapshot(cfg, update)?;
+    }
+    let update = resolve_rename(&cfg.machine_config, &intent, result)?;
+    Ok(crate::client::HarnessRenameResult { update, routed_rules: intent.routed_rules })
+}
+
+async fn direct_session(state: &DaemonState) -> anyhow::Result<(Sink, futures_util::stream::SplitStream<Ws>)> {
+    anyhow::ensure!(!state.revoked, "this machine was removed from the fleet");
+    let ws = connect(state).await.map_err(|error| match error {
+        ConnectError::Unauthorized => anyhow::anyhow!("the Server refused this Machine's token"),
+        ConnectError::Other(message) => anyhow::anyhow!(message),
+    })?;
+    let (mut sink, stream) = ws.split();
+    send(&mut sink, &DaemonMessage::Hello { machine_id: state.machine_id.clone() }).await?;
+    Ok((sink, stream))
+}
+
+pub(crate) fn save_assignment_snapshot(cfg: &Config, update: &AssignmentUpdate) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let snap =
+        AssignmentSnapshot { revision: update.revision, assignment: update.assignment.clone(), registration: None };
+    crate::state::save_snapshot(&cfg.snapshot_path(), &snap)
+        .context("Server accepted the Assignment, but saving its snapshot failed")
+}
+
+/// Open a short-lived session when the daemon is stopped.
 pub async fn write_assignment_direct(
     cfg: &Config,
     _lock: &sk1ll_core::EngineLock,
@@ -337,32 +474,20 @@ pub async fn write_assignment_direct(
 ) -> anyhow::Result<AssignmentUpdate> {
     use anyhow::Context;
     let state = DaemonState::load(&cfg.state)?.context("this machine hasn't joined a fleet")?;
-    anyhow::ensure!(!state.revoked, "this machine was removed from the fleet");
-    let harnesses = sk1ll_core::MachineConfig::load(&cfg.machine_config)?.harnesses().into_keys().collect();
-    let report = crate::daemon::repo_report(&state.repo, harnesses)?;
-    let ws = connect(&state).await.map_err(|error| match error {
-        ConnectError::Unauthorized => anyhow::anyhow!("the Server refused this Machine's token"),
-        ConnectError::Other(message) => anyhow::anyhow!(message),
-    })?;
-    let (mut sink, mut stream) = ws.split();
-    send(&mut sink, &DaemonMessage::Hello { machine_id: state.machine_id }).await?;
-    send(&mut sink, &DaemonMessage::Status(MachineReport { seq: 1, ..report })).await?;
-    send(&mut sink, &DaemonMessage::SetAssignment { req: 1, write }).await?;
-    let update = tokio::time::timeout(REQUEST_TIMEOUT, async {
-        while let Some(frame) = stream.next().await {
-            if let Message::Text(text) = frame?
-                && let ServerMessage::AssignmentResult { req: 1, seq: 1, result } = serde_json::from_str(&text)?
-            {
-                return Ok::<_, anyhow::Error>(assignment_result(result)?);
-            }
+    let (mut sink, mut stream) = direct_session(&state).await?;
+    let authority = state.rename_authority();
+    if let Some(intent) = RenameIntent::load(&cfg.machine_config, Some(&authority))? {
+        intent.apply_config(&cfg.machine_config)?;
+        let result = exchange(&mut sink, &mut stream, 1, 0, rename_write(&intent)).await;
+        if let Ok(update) = &result {
+            save_assignment_snapshot(cfg, update)?;
         }
-        anyhow::bail!("the Server disconnected before confirming the Assignment")
-    })
-    .await
-    .context("the Server did not confirm the Assignment in time")??;
-    let snap =
-        AssignmentSnapshot { revision: update.revision, assignment: update.assignment.clone(), registration: None };
-    crate::state::save_snapshot(&cfg.snapshot_path(), &snap)
-        .context("Server accepted the Assignment, but saving its snapshot failed")?;
+        resolve_rename(&cfg.machine_config, &intent, result)?;
+    }
+    let harnesses = sk1ll_core::MachineConfig::load(&cfg.machine_config)?.harnesses().into_keys().collect();
+    let inventory = crate::daemon::repo_inventory(&state.repo, harnesses);
+    send(&mut sink, &DaemonMessage::Inventory(InventoryReport { seq: 1, ..inventory })).await?;
+    let update = exchange(&mut sink, &mut stream, 2, 1, write).await?;
+    save_assignment_snapshot(cfg, &update)?;
     Ok(update)
 }
