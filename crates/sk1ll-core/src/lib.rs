@@ -12,6 +12,7 @@ pub mod draft;
 pub mod engine;
 pub mod git;
 pub mod harness_change;
+pub mod harness_rename;
 pub mod hash;
 pub mod imports;
 pub mod instructions;
