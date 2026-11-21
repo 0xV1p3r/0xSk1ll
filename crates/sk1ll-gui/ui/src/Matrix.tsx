@@ -34,7 +34,7 @@ const loadMatrix = async (status: StatusView) => {
       if (!byId.has(id)) byId.set(id, { item, id, in_baseline: false, draft: null, unpushed: machine.report!.unpushed.includes(item), description: null });
     }
   }
-  const items = [...byId.values()];
+  const items = [...byId.values(), ...localItems.filter(item => item.id == null)];
   // Each Machine loads on its own: one that fails (removed meanwhile, say) leaves the others usable.
   const results = await Promise.allSettled(fleet.machines.map(machine => loadAssignment(machine)));
   const ids = fleet.machines.map(machine => machine.id);
@@ -164,7 +164,7 @@ function AuthorityMatrix({ revision, status, target, openLog }: MatrixProps) {
   const reportedName = (item: ItemView, machine: string) =>
     data.fleet.machines.find(row => row.id === machine)?.report?.items?.find(entry => entry.id === item.id)?.item;
   const available = (item: ItemView, machine: string) =>
-    item.in_baseline || !!reportedName(item, machine) || machine === status.machine_id;
+    item.id != null && (item.in_baseline || !!reportedName(item, machine) || machine === status.machine_id);
   const cell = (item: ItemView, machine: string, harness: string) => {
     const state = cellState(assignment(machine), harness, item.item, item.id);
     const defaults = assignment(machine).harnesses[harness] ?? emptyHarness();
@@ -172,7 +172,7 @@ function AuthorityMatrix({ revision, status, target, openLog }: MatrixProps) {
     const localOnly = !available(item, machine);
     const { kind, name } = splitItem(reportedName(item, machine) ?? item.item);
     const later = offline.has(machine) ? ` Applies when ${machine} reconnects.` : '';
-    const reason = localOnly ? `${state.explicit ? `${terms.explicit} Assignment` : terms.inheritedLong}. ${itemStateLabel(item)}. This Machine has no report of the item yet.`
+    const reason = item.id == null ? 'This item uses the Harness default until it has an Item ID.' : localOnly ? `${state.explicit ? `${terms.explicit} Assignment` : terms.inheritedLong}. ${itemStateLabel(item)}. This Machine has no report of the item yet.`
       : state.explicit ? `${terms.explicit} Assignment, ${differs ? 'overriding' : 'same as'} the Harness default. Use the reset button to inherit the default.${later}`
         : `${terms.inheritedLong}. Toggle to set an explicit Assignment.${later}`;
     const note = [differs && 'Overrides the Harness default.', later.trim()].filter(Boolean).join(' ');
@@ -347,7 +347,7 @@ function AuthorityMatrix({ revision, status, target, openLog }: MatrixProps) {
               <Switch.Thumb className="size-3.5 rounded-full bg-card shadow-sm transition-transform data-checked:translate-x-3.5" /></Switch.Root></label></TableCell>,
           g => <TableCell key={`${g.machine.id}/${g.loaded ? 'collapsed' : 'unavailable'}`} className="border-l" />)}
         </TableRow>)}
-        {items.map(item => <TableRow key={item.id!}>
+        {items.map(item => <TableRow key={item.id ?? item.item} data-item-id={item.id ?? undefined}>
           <TableHead scope="row" className="sticky left-0 z-10 h-14 min-w-60 max-w-80 bg-background py-2 pr-9 font-normal whitespace-normal">
             <div className="flex flex-wrap items-center gap-2"><span className="text-sm font-medium" title={item.id ?? undefined}>{splitItem(item.item).name}</span><KindBadge kind={splitItem(item.item).kind} />
               {new Set(columns.map(c => cellState(assignment(c.machine), c.harness, item.item, item.id).enabled)).size > 1 &&
@@ -357,7 +357,7 @@ function AuthorityMatrix({ revision, status, target, openLog }: MatrixProps) {
                 { label: 'Disable in all visible Harnesses', run: () => rowBulk(item, false) },
                 { label: 'Reset all to default', run: () => rowBulk(item, null) },
               ], !columns.length || columns.some(c => pending.get(c.machine)) || !columns.some(c => available(item, c.machine)))}</span>
-              {itemStateLabel(item) && <Badge variant="info">{itemStateLabel(item)}</Badge>}</div>
+              {item.draft === 'deleted' ? <Badge variant="info">Deleted in Draft</Badge> : itemStateLabel(item) && <Badge variant="info">{itemStateLabel(item)}</Badge>}</div>
             {item.description && <p className="mt-1 text-xs text-muted-foreground">{item.description}</p>}
           </TableHead>
           {segments(c => cell(item, c.machine, c.harness), g => {
@@ -380,14 +380,21 @@ function AuthorityMatrix({ revision, status, target, openLog }: MatrixProps) {
 
 function OrphanToggles({ revision, machine, changed }: { revision: number; machine?: MachineRow; changed: () => void }) {
   const resource = useResource(api.orphans, revision);
-  const count = resource.data?.orphans.length ?? 0;
-  if (count === 0) return null;
+  const orphans = resource.data?.orphans ?? [];
+  if (orphans.length === 0) return resource.error ? <ErrorNotice error={resource.error} /> : null;
   const self = machine?.scope === 'self';
-  const own = resource.data?.orphans.filter(orphan => orphan.machine === machine?.id).length ?? 0;
+  const clearable = self ? orphans.filter(orphan => orphan.machine === machine.id) : orphans;
   return <PanelToolbar>
-    <span className="text-sm">{count} {count === 1 ? 'toggle' : 'toggles'} for items that no longer exist</span>
-    {(!self || own > 0) && <Confirm label="Clear" title="Clear orphan toggles?"
-      description={self ? 'Clear orphan toggles for this Machine.' : 'Clear orphan toggles across the Fleet.'}
+    <span className="text-sm">{orphans.length} {orphans.length === 1 ? 'toggle' : 'toggles'} for items that no longer exist</span>
+    {clearable.length > 0 && <Confirm label="Clear" title="Clear orphan toggles?"
+      description={self ? 'Clear these orphan toggles for this Machine.' : 'Clear these orphan toggles across the Fleet.'}
+      body={<div className="max-h-64 overflow-auto"><Table aria-label="Orphan toggles">
+        <TableHeader><TableRow><TableHead>Item</TableHead><TableHead>Machine</TableHead><TableHead>Harness</TableHead></TableRow></TableHeader>
+        <TableBody>{clearable.map(orphan => <TableRow key={JSON.stringify([orphan.machine, orphan.harness, orphan.kind, orphan.item_id])}>
+          <TableCell title={orphan.item_id}>{orphan.name ?? orphan.item_id} <KindBadge kind={orphan.kind} /></TableCell>
+          <TableCell>{orphan.machine}</TableCell><TableCell>{orphan.harness}</TableCell>
+        </TableRow>)}</TableBody>
+      </Table></div>}
       confirmLabel="Clear" triggerVariant="outline" action={() => api.pruneOrphans()}
       onDone={() => { void resource.refresh(); changed(); }} />}
   </PanelToolbar>;

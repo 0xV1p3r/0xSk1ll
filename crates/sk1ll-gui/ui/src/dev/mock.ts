@@ -4,7 +4,7 @@ import type * as T from '../types';
 
 const now = Math.floor(Date.now() / 1000);
 const report = (overrides: Partial<T.MachineReport> = {}): T.MachineReport => ({
-  seq: 1, items: [], baseline: '9f3c2a17d4e1', drafts: [], unpushed: [], conflicts: [], harnesses: ['claude', 'codex'],
+  seq: 1, items: [], inventory_complete: true, baseline: '9f3c2a17d4e1', drafts: [], unpushed: [], conflicts: [], harnesses: ['claude', 'codex'],
   blocked: false, clashes: [], behind: false, ...overrides,
 });
 const harness = (skills: Record<string, boolean> = {}, rules: Record<string, boolean> = {}): T.HarnessAssignment =>
@@ -24,7 +24,7 @@ export function installMock(scenario: string) {
     auth_rejected_since: scenario === 'auth' ? now - 600 : null, report: local,
   };
   const machines: T.MachineRow[] = [
-    { id: 'workstation', registration: 'reg-workstation', status: status.headline, connected: true, joined_at: now - 86400 * 30, last_seen: now - 4, report: local },
+    { id: 'workstation', scope: scenario === 'self' ? 'self' : 'fleet', registration: 'reg-workstation', status: status.headline, connected: true, joined_at: now - 86400 * 30, last_seen: now - 4, report: local },
     { id: 'laptop', registration: 'reg-laptop', status: 'behind', connected: true, joined_at: now - 86400 * 12, last_seen: now - 40,
       report: report({ baseline: '1b2c3d4e5f60', behind: true, harnesses: ['claude'] }) },
     { id: 'ci-runner', registration: 'reg-ci-runner', status: 'offline', connected: false, joined_at: now - 86400 * 3, last_seen: now - 7200,
@@ -60,7 +60,7 @@ export function installMock(scenario: string) {
   let preferredEditor = 'code';
   const assignments: Record<string, T.AssignmentSnapshot> = {
     workstation: { revision: 42, harnesses: { claude: harness({ 'id-deploy': false, 'id-old-skill': true }, { 'id-style': true }), codex: harness({}, { 'id-security': true }) } },
-    laptop: { revision: 17, harnesses: { claude: harness({ 'id-code-review': true }) } },
+    laptop: { revision: 17, harnesses: { claude: harness({ 'id-code-review': true, ...scenario === 'self' && { 'id-laptop-orphan': true } }) } },
     'ci-runner': { revision: 9, harnesses: { codex: harness({}, {}) } },
     'build-box': { revision: 5, harnesses: { claude: harness(), codex: harness() } },
   };
@@ -88,6 +88,17 @@ export function installMock(scenario: string) {
     before: i % 2 ? null : true, after: i % 2 ? true : false,
     cause: i === 5 ? { type: 'undo', entry: 101 } : i === 6 ? { type: 'harness_added' } : { type: 'change' },
   } as T.LogEntry));
+  const orphanToggles = (): T.Orphan[] => {
+    const known = new Set(items.filter(item => item.in_baseline || item.draft !== 'deleted').map(item => item.id));
+    for (const machine of machines) {
+      if (machine.id === status.machine_id) continue;
+      for (const item of machine.report?.items ?? []) known.add(item.id);
+    }
+    return machines.flatMap(({ id: machine }) => Object.entries(assignments[machine]?.harnesses ?? {}).flatMap(([harness, h]) =>
+      (['skill', 'rule'] as const).flatMap(kind => Object.keys(kind === 'skill' ? h.skills : h.rules)
+        .filter(item_id => !known.has(item_id))
+        .map(item_id => ({ machine, harness, kind, item_id, name: log.find(entry => entry.item_id === item_id && entry.name)?.name ?? null })))));
+  };
   const harnesses: T.HarnessView[] = [
     { name: 'claude', origin: 'detected', harness: { skills: '~/.claude/skills', instructions: '~/.claude/CLAUDE.md', instructions_format: 'block', mode: 'symlink' } },
     { name: 'codex', origin: 'machine.toml', harness: { skills: '~/.codex/skills', instructions: '~/.codex/AGENTS.md', instructions_format: 'block', mode: 'copy' } },
@@ -285,16 +296,23 @@ export function installMock(scenario: string) {
         const { revision, ...assignment } = snapshot;
         return delay({ revision, assignment: structuredClone(assignment), entries: [] });
       }
-      case 'orphans':
-        return delay({ orphans: Object.hasOwn(assignments.workstation.harnesses.claude.skills, 'id-old-skill')
-          ? [{ machine: 'workstation', harness: 'claude', kind: 'skill', item_id: 'id-old-skill', name: 'old-skill' }] : [] });
+      case 'orphans': return delay({ orphans: orphanToggles() });
       case 'prune_orphans': {
-        delete assignments.workstation.harnesses.claude.skills['id-old-skill'];
-        assignments.workstation.revision++;
-        const entry: T.LogEntry = { id: (log[0]?.id ?? 0) + 1, at: now, author: 'workstation', machine: 'workstation',
-          harness: 'claude', kind: 'skill', item_id: 'id-old-skill', name: 'old-skill', before: true, after: null, cause: { type: 'orphan_pruned' } };
-        log.unshift(entry);
-        return delay({ entries: [entry] });
+        const self = machines.find(machine => machine.id === status.machine_id)?.scope === 'self';
+        const orphans = orphanToggles().filter(orphan => !self || orphan.machine === status.machine_id);
+        const changed = new Set<string>();
+        const entries = orphans.map((orphan, i): T.LogEntry => {
+          const h = assignments[orphan.machine].harnesses[orphan.harness];
+          const toggles = orphan.kind === 'skill' ? h.skills : h.rules;
+          const before = toggles[orphan.item_id];
+          delete toggles[orphan.item_id];
+          changed.add(orphan.machine);
+          return { ...orphan, id: (log[0]?.id ?? 0) + i + 1, at: now, author: status.machine_id,
+            before, after: null, cause: { type: 'orphan_pruned' } };
+        });
+        for (const machine of changed) assignments[machine].revision++;
+        log.unshift(...[...entries].reverse());
+        return delay({ entries });
       }
       case 'preview_assignment_copy':
       case 'copy_machine_assignment': {

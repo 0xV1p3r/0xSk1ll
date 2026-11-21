@@ -6,6 +6,7 @@ export type MachineStatus = 'offline' | 'blocked' | 'conflict' | 'behind' | 'dra
 export type Connection = 'connecting' | 'connected' | 'offline' | 'auth_rejected' | 'revoked' | 'standalone';
 export interface MachineReport {
   seq: number; items: { item: ItemRef; id: ItemId }[];
+  inventory_complete?: boolean; inventory_error?: string;
   baseline: string | null; drafts: ItemRef[]; unpushed: ItemRef[];
   conflicts: { item: ItemRef; harness: string }[]; harnesses: string[];
   blocked: boolean; clashes: ItemRef[]; behind: boolean;

@@ -649,7 +649,29 @@ it('clears orphan toggles and refreshes the count', async () => {
   expect(await screen.findByText('1 toggle for items that no longer exist')).toBeTruthy();
   fireEvent.click(screen.getByRole('button', { name: 'Clear' }));
   const confirm = await screen.findByRole('dialog', { name: 'Clear orphan toggles?' });
+  const list = within(confirm).getByRole('table', { name: 'Orphan toggles' });
+  expect(within(list).getByText('old')).toBeTruthy();
+  expect(within(list).getByText('a')).toBeTruthy();
+  expect(within(list).getByText('claude')).toBeTruthy();
   fireEvent.click(within(confirm).getByRole('button', { name: 'Clear' }));
   await waitFor(() => expect(screen.queryByText('1 toggle for items that no longer exist')).toBeNull());
   expect(api.pruneOrphans).toHaveBeenCalledOnce();
+});
+
+it('shows baseline and recreated Draft items with the same name as separate rows', async () => {
+  vi.mocked(api.items).mockResolvedValue([
+    { item: 'skill:pdf', id: 'pdf', in_baseline: true, draft: 'deleted', unpushed: false, description: null },
+    { item: 'skill:pdf', id: 'new-id', in_baseline: false, draft: 'added', unpushed: false, description: null },
+  ]);
+  await mount();
+  const baseline = screen.getByText('Deleted in Draft').closest('tr')!;
+  const draft = screen.getByText('Draft only').closest('tr')!;
+  expect(baseline.getAttribute('data-item-id')).toBe('pdf');
+  expect(draft.getAttribute('data-item-id')).toBe('new-id');
+  const cell = within(draft).getByRole('checkbox', { name: 'skill:pdf in a / claude, inherited' });
+  fireEvent.click(cell);
+  await waitFor(() => expect(api.setAssignment).toHaveBeenCalledWith('a', {
+    changes: [{ harness: 'claude', kind: 'skill', item_id: 'new-id', name: 'pdf', enabled: true }],
+    expected: { revision: 1, registration: 'r-a' },
+  }));
 });
