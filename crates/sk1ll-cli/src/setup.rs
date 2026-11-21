@@ -229,12 +229,10 @@ fn turn_everything_on(
     let state = DaemonState::load(&cfg.state)?.context("the join didn't store this machine's credentials")?;
     let repo = Repo::open(&state.repo)?;
     let harnesses: Vec<String> = MachineConfig::load(&cfg.machine_config)?.harnesses().into_keys().collect();
-    let skills: Vec<String> = repo.skills()?.into_iter().map(|s| s.name).collect();
-    let rules: Vec<String> = repo.rules()?.into_iter().map(|r| r.name).collect();
-    let changes = AssignmentChanges { changes: everything_on(&harnesses, &skills, &rules), ..Default::default() };
+    let changes = AssignmentChanges { changes: everything_on(&harnesses, &repo.item_ids()?), expected: None };
     if !via_daemon {
         let lock = crate::lock_direct(&state.repo)?.context("the joined repo is not a git repo")?;
-        rt.block_on(sk1ll_daemon::set_assignment_direct(cfg, &lock, &changes))?;
+        rt.block_on(sk1ll_daemon::write_assignment_direct(cfg, &lock, sk1ll_proto::AssignmentWrite::Changes(changes)))?;
         return Ok(());
     }
     // The daemon restarts itself with the new credentials first.
@@ -255,20 +253,27 @@ fn turn_everything_on(
 
 /// Defaults first: changing a default records each existing item's value as
 /// an explicit toggle, which the item toggles then set to on.
-fn everything_on(harnesses: &[String], skills: &[String], rules: &[String]) -> Vec<ToggleChange> {
-    let toggle = |harness: &String, kind, name: Option<&String>| ToggleChange {
-        harness: harness.clone(),
-        kind,
-        name: name.cloned(),
-        enabled: Some(true),
-    };
+fn everything_on(harnesses: &[String], items: &[(sk1ll_core::ItemRef, sk1ll_core::ItemId)]) -> Vec<ToggleChange> {
     harnesses
         .iter()
-        .flat_map(|h| {
-            [toggle(h, ToggleKind::NewSkillsDefault, None), toggle(h, ToggleKind::NewRulesDefault, None)]
+        .flat_map(|harness| {
+            let toggle = |kind, item_id, name| ToggleChange {
+                harness: harness.clone(),
+                kind,
+                item_id,
+                name,
+                enabled: Some(true),
+            };
+            [toggle(ToggleKind::NewSkillsDefault, None, None), toggle(ToggleKind::NewRulesDefault, None, None)]
                 .into_iter()
-                .chain(skills.iter().map(move |s| toggle(h, ToggleKind::Skill, Some(s))))
-                .chain(rules.iter().map(move |r| toggle(h, ToggleKind::Rule, Some(r))))
+                .chain(items.iter().filter_map(move |(item, id)| {
+                    let kind = match item {
+                        sk1ll_core::ItemRef::Skill(_) => ToggleKind::Skill,
+                        sk1ll_core::ItemRef::Rule(_) => ToggleKind::Rule,
+                        _ => return None,
+                    };
+                    Some(toggle(kind, Some(id.clone()), Some(item.name().into())))
+                }))
         })
         .collect()
 }
@@ -367,7 +372,13 @@ mod tests {
 
     #[test]
     fn everything_on_sets_defaults_before_items() {
-        let changes = everything_on(&["claude".into()], &["pdf".into()], &["git".into()]);
+        let changes = everything_on(
+            &["claude".into()],
+            &[
+                (sk1ll_core::ItemRef::Skill("pdf".into()), "pdf-id".parse().unwrap()),
+                (sk1ll_core::ItemRef::Rule("git".into()), "git-id".parse().unwrap()),
+            ],
+        );
         let kinds: Vec<_> = changes.iter().map(|c| (c.kind, c.name.as_deref())).collect();
         assert_eq!(
             kinds,

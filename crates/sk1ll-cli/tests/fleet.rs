@@ -98,16 +98,15 @@ async fn respond(State((requests, mode)): State<FakeState>, request: Request) ->
     let reply = match (parts.method.as_str(), parts.uri.path()) {
         ("GET", "/harnesses") => json!([{"name": "claude", "harness": {}, "origin": "local"}]),
         ("POST", "/assignment/harness/claude") if body.as_ref() == br#"{"enabled":true}"# => json!({
-            "update": {"assignment": {"harnesses": {}}, "revision": 9, "entries": [],
-                "errors": ["could not place pdf", "could not place style"]}
+            "assignment": {"harnesses": {}}, "revision": 9, "entries": [],
+            "errors": ["could not place pdf", "could not place style"]
         }),
         ("POST", "/assignment/harness/claude") => json!({
-            "update": {"assignment": {"harnesses": {}}, "revision": 8, "entries": []},
-            "warning": "Unpulled items may stay on."
+            "assignment": {"harnesses": {}}, "revision": 8, "entries": []
         }),
         ("GET", "/fleet") => json!({
             "baseline": "0123456789abcdef",
-            "machines": [{"id": "box", "status": "offline", "connected": false, "joined_at": 1700000000}]
+            "machines": [{"id": "box", "status": "offline", "connected": false, "joined_at": 1700000000, "scope": "fleet", "registration": "box-reg"}]
         }),
         ("GET", "/status") => json!({
             "machine_id": "box", "server_url": "https://fleet.example", "mode": mode,
@@ -118,6 +117,10 @@ async fn respond(State((requests, mode)): State<FakeState>, request: Request) ->
             let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
             json!({"code": "ONCE", "expires_at": 1700086400, "scope": request["scope"]})
         }
+        ("GET", "/assignment/orphans") => json!({"orphans": [{
+            "machine": "box", "harness": "claude", "kind": "skill", "item_id": "stale-id", "name": "old"
+        }]}),
+        ("POST", "/assignment/orphans/prune") => json!({"entries": []}),
         ("GET", "/log") => json!([{
             "id": 41, "at": 1700000000, "machine": "box", "harness": "claude", "author": "admin",
             "kind": "skill", "name": "pdf", "before": false, "after": true, "cause": {"type": "change"}
@@ -244,16 +247,16 @@ fn bash_completions_include_fleet_commands() {
     let out = Command::new(env!("CARGO_BIN_EXE_sk1ll")).args(["completions", "bash"]).output().unwrap();
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for name in ["invite", "remove", "log", "undo"] {
+    assert!(stdout.contains("prune-orphans"));
+    for name in ["invite", "remove", "orphans", "log", "undo"] {
         assert!(stdout.contains(&format!("__fleet__subcmd__{name}")), "{name} missing from Bash completions");
     }
 }
 
 #[test]
-fn assign_all_uses_the_harness_endpoint_and_displays_legacy_warning() {
+fn assign_all_uses_the_harness_endpoint() {
     let daemon = FakeDaemon::start();
     let out = daemon.run_cli(&["--repo", "/repo", "assign", "claude", "--all", "off"]);
-    assert!(String::from_utf8_lossy(&out.stderr).contains("warning: Unpulled items may stay on."));
     stdout(out);
     daemon.assert_requests(&[
         ("GET", "/status", &[], ""),
@@ -274,4 +277,16 @@ fn assign_all_reports_saved_revision_and_placement_failures() {
         let stderr = String::from_utf8(out.stderr).unwrap();
         assert!(stderr.contains("could not place pdf") && stderr.contains("could not place style"));
     }
+}
+
+#[test]
+fn fleet_lists_and_prunes_orphans_with_an_optional_machine() {
+    let daemon = FakeDaemon::start();
+    let listed = stdout(daemon.run(&["orphans"]));
+    assert!(listed.contains("stale-id") && listed.contains("old"), "{listed}");
+    assert!(stdout(daemon.run(&["prune-orphans", "--machine", "box"])).contains("cleared 0 orphan toggle"));
+    daemon.assert_requests(&[
+        ("GET", "/assignment/orphans", &[], ""),
+        ("POST", "/assignment/orphans/prune", &[], r#"{"machine":"box"}"#),
+    ]);
 }

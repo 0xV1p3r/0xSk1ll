@@ -19,6 +19,8 @@ use crate::{Cli, confirm};
 
 #[derive(Subcommand)]
 pub(crate) enum HarnessCmd {
+    /// Rename a harness and move its Assignment
+    Rename { old: String, new: String },
     /// Sync into a harness again
     Enable {
         name: String,
@@ -83,6 +85,7 @@ impl HarnessCmd {
     /// The change and its options; `add` starts from `current`, the harness as it is now.
     fn split(self, current: Option<Harness>) -> (HarnessChange, ChangeOpts) {
         match self {
+            Self::Rename { .. } => unreachable!("renames are applied separately"),
             Self::Enable { name, opts } => (HarnessChange::Enable { name }, opts),
             Self::Disable { name, opts } => (HarnessChange::Disable { name }, opts),
             Self::Remove { name, opts } => (HarnessChange::Remove { name }, opts),
@@ -117,6 +120,9 @@ pub(crate) fn run(mut cli: Cli, repo: &Path, machine_path: &Path, assignment_pat
     let all = *all;
     let command = command.take();
     let Some(command) = command else { return list(machine_path, all, &mut std::io::stdout()) };
+    if let HarnessCmd::Rename { old, new } = command {
+        return rename(&cli, repo, machine_path, assignment_path, &old, &new);
+    }
     let current = match &command {
         HarnessCmd::Add { name, .. } => {
             MachineConfig::load(machine_path)?.choices().into_iter().find(|c| c.name == *name).map(|c| c.harness)
@@ -165,6 +171,48 @@ pub(crate) fn run(mut cli: Cli, repo: &Path, machine_path: &Path, assignment_pat
         bail!("machine.toml changed, but {failed} step(s) failed");
     }
     println!("harnesses in sync");
+    Ok(())
+}
+
+fn rename(cli: &Cli, repo: &Path, machine: &Path, cache: &Path, from: &str, to: &str) -> Result<()> {
+    #[cfg(unix)]
+    if let Some(daemon) = crate::fleet::connect(cli, repo)? {
+        let rename = sk1ll_proto::HarnessRename { from: from.into(), to: to.into() };
+        let update = crate::fleet::runtime()?.block_on(daemon.client.rename_harness(&rename))?;
+        for error in &update.errors {
+            eprintln!("{error}");
+        }
+        println!("renamed harness {from} to {to}");
+        return Ok(());
+    }
+    let lock = crate::lock_direct(repo)?.ok_or_else(|| anyhow::anyhow!("{} is not a git repo", repo.display()))?;
+    let snapshot = sk1ll_core::config_file::Snapshot::take(machine)?;
+    let edit = MachineConfig::rename_harness(&snapshot, from, to)?;
+    #[cfg(unix)]
+    if let Some(state) = crate::fleet::joined_state(cli).filter(|s| !s.revoked) {
+        crate::fleet::check_joined_repo(repo, &state)?;
+        let cfg = crate::fleet::daemon_config(cli)?;
+        let write = sk1ll_proto::AssignmentWrite::RenameHarness(sk1ll_proto::HarnessRename {
+            from: from.into(),
+            to: to.into(),
+        });
+        crate::fleet::runtime()?.block_on(sk1ll_daemon::write_assignment_direct(&cfg, &lock, write))?;
+        edit.write(&snapshot).map_err(|e| {
+            anyhow::anyhow!("the Server moved the harness Assignment, but editing machine.toml failed: {e}")
+        })?;
+        println!("renamed harness {from} to {to}; run `sk1ll sync` to apply");
+        return Ok(());
+    }
+    let _ = (cli, lock);
+    let before = sk1ll_core::Assignment::load(cache)?;
+    let mut assignment = before.clone();
+    assignment.rename_harness(from, to);
+    assignment.save(cache)?;
+    if let Err(e) = edit.write(&snapshot) {
+        before.save(cache)?;
+        return Err(e.into());
+    }
+    println!("renamed harness {from} to {to}; run `sk1ll sync` to apply");
     Ok(())
 }
 
@@ -385,7 +433,10 @@ mod tests {
         assert!(!skills.join("pdf").exists());
         sk1ll(root, &["harnesses", "disable", "h", "--yes"]).unwrap();
         let assignment = sk1ll_core::Assignment::load(&root.join("assignment.json")).unwrap();
-        assert!(!assignment.skill_enabled("h", "pdf") && !assignment.skill_enabled("h", "added-later"));
+        assert!(
+            !assignment.skill_enabled("h", &sk1ll_core::ItemId::derived("skill", "pdf"))
+                && !assignment.skill_enabled("h", &sk1ll_core::ItemId::derived("skill", "added-later"))
+        );
 
         sk1ll(root, &["harnesses", "remove", "h", "--yes"]).unwrap();
         assert!(!fs::read_to_string(root.join("machine.toml")).unwrap().contains("[harnesses.h]"));

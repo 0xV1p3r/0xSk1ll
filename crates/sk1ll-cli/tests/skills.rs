@@ -67,8 +67,9 @@ fn unmanaged_list_and_adopt_preserve_differing_variants_and_assignment() {
     let root = fixture.0.path();
     assert_eq!(std::fs::read_to_string(root.join("repo/personal/pdf/SKILL.md")).unwrap(), "same");
     let assignment = sk1ll_core::Assignment::load(&root.join("assignment.json")).unwrap();
-    assert!(assignment.skill_enabled("a", "pdf") && assignment.skill_enabled("b", "pdf"));
-    assert!(!assignment.skill_enabled("c", "pdf"));
+    let pdf = sk1ll_core::Repo::open(root.join("repo")).unwrap().skills().unwrap()[0].id.clone();
+    assert!(assignment.skill_enabled("a", &pdf) && assignment.skill_enabled("b", &pdf));
+    assert!(!assignment.skill_enabled("c", &pdf));
     assert!(root.join("a/pdf/.sk1ll-managed").is_file() && root.join("b/pdf/.sk1ll-managed").is_file());
     assert_eq!(std::fs::read_to_string(root.join("c/pdf/SKILL.md")).unwrap(), "different");
     assert!(error(fixture.command(&["adopt", "c", "pdf"]).output().unwrap()).contains("already exists"));
@@ -125,7 +126,6 @@ fn direct_adoption_rejects_a_repo_other_than_the_joined_repo() {
     assert!(message.contains("selected repo") && message.contains("joined repo"), "{message}");
     assert!(!joined.personal_dir().join("second").exists());
     assert!(!root.join("repo/personal/second").exists());
-    assert!(!root.join("daemon-outbox.json").exists());
     assert_eq!(std::fs::read_to_string(root.join("a/second/SKILL.md")).unwrap(), "unmanaged user content");
 }
 
@@ -150,12 +150,11 @@ fn joined_adoption_requires_a_running_connected_daemon() {
     );
     assert!(!root.join("repo/personal/pdf").exists());
     assert!(!root.join("assignment.json").exists());
-    assert!(!root.join("daemon-outbox.json").exists());
     assert_eq!(std::fs::read_to_string(root.join("a/pdf/SKILL.md")).unwrap(), "unmanaged user content");
 }
 
 #[test]
-fn daemonless_assign_all_pins_and_reports_skipped_names() {
+fn daemonless_assign_all_reaches_items_with_spaces() {
     let fixture = Fixture::new();
     fixture.write("repo/personal/old name/SKILL.md", "Legacy");
     fixture.write("repo/personal/pdf/SKILL.md", "PDF");
@@ -163,12 +162,32 @@ fn daemonless_assign_all_pins_and_reports_skipped_names() {
     let out = fixture.command(&["assign", "a", "--all", "off"]).output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stderr}");
-    assert!(stderr.contains("old name"));
-    assert!(stderr.contains("old rule"));
     let assignment = sk1ll_core::Assignment::load(&fixture.0.path().join("assignment.json")).unwrap();
-    assert!(assignment.skill_enabled("a", "old name"));
-    assert!(assignment.rule_enabled("a", "old rule"));
-    assert!(!assignment.skill_enabled("a", "pdf"));
-    assert!(!assignment.skill_enabled("a", "future"));
-    assert!(!assignment.rule_enabled("a", "future"));
+    assert!(!assignment.skill_enabled("a", &sk1ll_core::ItemId::derived("skill", "old name")));
+    assert!(!assignment.rule_enabled("a", &sk1ll_core::ItemId::derived("rule", "old rule")));
+    assert!(!assignment.skill_enabled("a", &sk1ll_core::ItemId::derived("skill", "pdf")));
+    assert!(!assignment.skill_enabled("a", &sk1ll_core::ItemId::derived("skill", "future")));
+    assert!(!assignment.rule_enabled("a", &sk1ll_core::ItemId::derived("rule", "future")));
+}
+
+#[test]
+fn recreated_derived_item_keeps_its_toggle_after_harness_rename() {
+    let fixture = Fixture::new();
+    let root = fixture.0.path();
+    fixture.write("repo/personal/pdf/SKILL.md", "PDF");
+    fixture.run(&["assign", "a", "skill", "pdf", "off"]);
+    std::fs::remove_dir_all(root.join("repo/personal/pdf")).unwrap();
+    fixture.write("repo/personal/pdf/SKILL.md", "Recreated PDF");
+    fixture.run(&["harnesses", "rename", "a", "new-a"]);
+    let assignment = sk1ll_core::Assignment::load(&root.join("assignment.json")).unwrap();
+    assert!(!assignment.harnesses.contains_key("a"));
+    assert!(!assignment.skill_enabled("new-a", &sk1ll_core::ItemId::derived("skill", "pdf")));
+    let machine = sk1ll_core::MachineConfig::load(&root.join("machine.toml")).unwrap();
+    assert!(machine.harnesses().contains_key("new-a"));
+    fixture.run(&["sync"]);
+    assert!(!root.join("a/pdf").exists());
+
+    let out = fixture.command(&["assign", "new-a", "skill", "absent", "on"]).output().unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("warning: no skill named `absent` in the repo"));
 }
