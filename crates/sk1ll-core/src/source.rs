@@ -455,7 +455,7 @@ fn settle(dest: &Path, backup: &Path, locked: Option<&str>) -> Result<bool> {
         Err(e) => return Err(e).at(dest),
         Ok(meta) => meta,
     };
-    let hash = |dir: &Path| crate::hash::hash_dir(dir).ok();
+    let hash = |dir: &Path| crate::hash::vendor_hash(dir).ok();
     let recorded = |dir: &Path| locked.is_some() && hash(dir).as_deref() == locked;
     if meta.is_dir() && recorded(dest) {
         fs::remove_dir_all(backup).at(backup)?;

@@ -201,6 +201,8 @@ struct Status {
     head_paths: BTreeSet<PathBuf>,
     /// Changed path -> untracked.
     changed: BTreeMap<PathBuf, bool>,
+    /// Old spellings Git can still open on a case-insensitive filesystem.
+    case_removed: BTreeSet<PathBuf>,
 }
 
 impl Repo {
@@ -257,7 +259,22 @@ impl Repo {
         // A commit is only useful if it can be pushed, and that needs the fleet branch.
         self.on_fleet_branch()?;
         let (selected, st) = self.select(items, "committed")?;
-        let paths: Vec<&PathBuf> = selected.iter().flat_map(|d| &d.paths).collect();
+        let (case_removed, paths): (Vec<&PathBuf>, Vec<&PathBuf>) =
+            selected.iter().flat_map(|d| &d.paths).partition(|path| st.case_removed.contains(*path));
+        let update_index = |index: Option<&Path>| -> Result<()> {
+            let git = || {
+                let git = self.git().args(["-c", "core.ignoreCase=false"]);
+                match index {
+                    Some(index) => git.env("GIT_INDEX_FILE", index),
+                    None => git,
+                }
+            };
+            if !case_removed.is_empty() {
+                git().args(["update-index", "--force-remove", "-z", "--stdin"]).stdin(nul_list(&case_removed)).run()?;
+            }
+            git().args(UPDATE_INDEX).stdin(nul_list(&paths)).run()?;
+            Ok(())
+        };
 
         // Build the commit in a throwaway index so the real one is untouched.
         let index = PathBuf::from(
@@ -270,11 +287,13 @@ impl Repo {
                 Some(h) => g().args(["read-tree", h]).run()?,
                 None => g().args(["read-tree", "--empty"]).run()?,
             };
-            g().args(UPDATE_INDEX).stdin(nul_list(&paths)).run()?;
+            update_index(Some(&index))?;
             g().arg("write-tree").text()
         })();
         let _ = fs::remove_file(&index);
         let tree = tree?;
+        let claims = crate::item_id::claims_at(self.root(), &tree, |_| true, true)?;
+        crate::item_id::check_claims(&claims).map_err(|e| duplicate_after(e, "commit"))?;
         if let Some(h) = &st.head
             && self.git().args(["rev-parse", &format!("{h}^{{tree}}")]).text()? == tree
         {
@@ -292,7 +311,7 @@ impl Repo {
         }
         update.run()?;
         // The committed paths now match HEAD; bring the real index in line for them only.
-        self.git().args(UPDATE_INDEX).stdin(nul_list(&paths)).run()?;
+        update_index(None)?;
         Ok(sha)
     }
 
@@ -315,11 +334,29 @@ impl Repo {
                 "there is no baseline to restore the manifest to; commit it first (it would delete {MANIFEST_FILE})"
             )));
         }
+        let selected_items: BTreeSet<_> = selected.iter().map(|d| &d.item).collect();
+        let restores_manifest = selected_items.contains(&ItemRef::Manifest);
+        let restores = |path: &Path| selected_items.contains(&crate::item_id::item_for_path(path));
+        let manifest =
+            if restores_manifest { crate::Manifest::default() } else { crate::item_id::manifest_on_disk(self.root())? };
+        let mut claims = crate::item_id::claims_on_disk(self.root(), &manifest, |path| !restores(path))?;
+        if let Some(head) = &st.head {
+            for (path, id) in crate::item_id::claims_at(self.root(), head, restores, restores_manifest)? {
+                if id.is_some() {
+                    claims.insert(path, id);
+                } else {
+                    claims.entry(path).or_default();
+                }
+            }
+        }
+        crate::item_id::check_claims(&claims).map_err(|e| duplicate_after(e, "restore"))?;
         // Ignored files aren't in the draft, but git would delete or overwrite
         // one that sits at, under or above a path being restored.
         let ignored = self.ignored_paths()?;
         for d in &selected {
-            let clash = d.paths.iter().find_map(|p| ignored.iter().find(|i| i.starts_with(p) || p.starts_with(i)));
+            let clash = d.paths.iter().find_map(|p| {
+                ignored.iter().find(|i| (i.starts_with(p) || p.starts_with(i)) && !(i == &p && is_sidecar(p)))
+            });
             if let Some(i) = clash {
                 return Err(Error::Invalid(format!(
                     "`{}` can't be restored: that would delete or replace the ignored `{}`; move it out of the way first",
@@ -673,7 +710,8 @@ impl Repo {
         let items = groups
             .into_iter()
             .map(|(item, paths)| {
-                let change = match (in_head.contains(&item), self.in_tree(&item, &paths)) {
+                let exists = !paths.iter().all(|path| st.case_removed.contains(path)) && self.in_tree(&item, &paths);
+                let change = match (in_head.contains(&item), exists) {
                     (true, true) => Change::Modified,
                     (false, true) => Change::Added,
                     (_, false) => Change::Deleted,
@@ -734,7 +772,17 @@ impl Repo {
         let out = self
             .git()
             .literal()
-            .args(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames", "--", "."])
+            .args([
+                "-c",
+                "core.ignoreCase=false",
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--no-renames",
+                "--",
+                ".",
+            ])
             .run()?;
         let mut changed = BTreeMap::new();
         let mut add = |raw: &[u8], untracked: bool| {
@@ -758,7 +806,68 @@ impl Repo {
             }
             add(&entry[3..], entry[0] == b'?');
         }
-        Ok(Status { head, head_paths, changed })
+        // Identity is part of a personal skill even when a user's ignore rule
+        // hides it. update-index takes these exact paths, bypassing ignores.
+        let personal = self.personal_dir();
+        if personal.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+            for (dir, ty) in crate::item_id::entries(&personal)? {
+                if !ty.is_dir() || !dir.join("SKILL.md").is_file() {
+                    continue;
+                }
+                let sidecar = dir.join(crate::skill::ID_FILE);
+                let relative = sidecar.strip_prefix(self.root()).unwrap();
+                if !head_paths.contains(relative)
+                    && !crate::source::is_staging_path(relative)
+                    && sidecar.symlink_metadata().is_ok()
+                {
+                    changed.entry(relative.into()).or_insert(true);
+                }
+            }
+        }
+        let case_removed = self.case_removals(&head_paths, &changed)?;
+        changed.extend(case_removed.iter().map(|path| (path.clone(), false)));
+        Ok(Status { head, head_paths, changed, case_removed })
+    }
+
+    fn case_removals(&self, head: &BTreeSet<PathBuf>, changed: &BTreeMap<PathBuf, bool>) -> Result<BTreeSet<PathBuf>> {
+        let item_path = |path: &Path| match ItemRef::for_path(path) {
+            ItemRef::Skill(name) if path.starts_with(PERSONAL_DIR) => Some(Path::new(PERSONAL_DIR).join(name)),
+            ItemRef::Rule(_) => Some(path.to_path_buf()),
+            _ => None,
+        };
+        let mut added = BTreeMap::<String, BTreeSet<PathBuf>>::new();
+        for path in changed.keys() {
+            if !head.contains(path)
+                && let Some(item) = item_path(path)
+            {
+                added.entry(item.to_string_lossy().to_ascii_lowercase()).or_default().insert(item);
+            }
+        }
+        let mut removed_items = BTreeSet::new();
+        for old in head.iter().filter_map(|path| item_path(path)).collect::<BTreeSet<_>>() {
+            if let Some(candidates) = added.get(&old.to_string_lossy().to_ascii_lowercase()) {
+                for new in candidates {
+                    if old != *new && crate::repo::case_alias(&self.root().join(new), &self.root().join(&old))? {
+                        removed_items.insert(old.clone());
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(head.iter().filter(|p| item_path(p).is_some_and(|item| removed_items.contains(&item))).cloned().collect())
+    }
+}
+
+fn is_sidecar(path: &Path) -> bool {
+    path.starts_with(PERSONAL_DIR) && path.components().count() == 3 && path.ends_with(crate::skill::ID_FILE)
+}
+
+fn duplicate_after(error: Error, operation: &str) -> Error {
+    match error {
+        Error::DuplicateItemId { .. } => {
+            Error::Invalid(format!("can't {operation}: {error}. For a rename or fork, select both sides together"))
+        }
+        error => error,
     }
 }
 
@@ -892,6 +1001,48 @@ mod tests {
 
     fn read(path: &Path) -> String {
         fs::read_to_string(path).unwrap()
+    }
+
+    #[test]
+    fn one_side_of_an_explicit_id_rename_cannot_be_committed_or_restored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::init_committed(tmp.path()).unwrap();
+        let old = ItemRef::Skill("pdf".into());
+        let new = ItemRef::Skill("docs".into());
+        repo.create_item("skill", "pdf", "PDF").unwrap();
+        let baseline = repo.commit(std::slice::from_ref(&old), "Add PDF", None).unwrap();
+        let id = repo.skills().unwrap()[0].id.clone();
+        repo.rename_item("skill", "pdf", "docs").unwrap();
+        let commit_error = repo.commit(std::slice::from_ref(&new), "Add docs", None).unwrap_err();
+        let restore_error = repo.restore(std::slice::from_ref(&old)).unwrap_err();
+        for err in [commit_error, restore_error] {
+            let message = err.to_string();
+            for expected in ["both sides", "personal/pdf/.sk1ll-id", "personal/docs/.sk1ll-id"] {
+                assert!(message.contains(expected), "{message}");
+            }
+        }
+        assert_eq!(git(repo.root(), &["rev-parse", "HEAD"]), baseline);
+        assert_eq!(repo.skills().unwrap()[0].name, "docs");
+        repo.restore(&[old.clone(), new.clone()]).unwrap();
+        assert_eq!(repo.skills().unwrap()[0].name, "pdf");
+        repo.rename_item("skill", "pdf", "docs").unwrap();
+        repo.commit(&[old, new], "Rename PDF", None).unwrap();
+        assert_eq!(crate::content::item_ids_at(repo.root(), "HEAD").unwrap()[&ItemRef::Skill("docs".into())], id);
+        assert!(repo.draft().unwrap().is_empty());
+    }
+
+    #[test]
+    fn item_commit_tracks_an_ignored_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::init_committed(tmp.path()).unwrap();
+        write(&repo.root().join(".gitignore"), ".sk1ll-*\n");
+        repo.create_item("skill", "pdf", "PDF").unwrap();
+        let sidecar = "personal/pdf/.sk1ll-id";
+        assert_eq!(git(repo.root(), &["check-ignore", sidecar]), sidecar);
+        let id = repo.skills().unwrap()[0].id.to_string();
+        repo.commit(&[ItemRef::Skill("pdf".into())], "Add PDF", None).unwrap();
+        assert_eq!(git(repo.root(), &["show", &format!("HEAD:{sidecar}")]), id);
+        assert!(repo.draft().unwrap().iter().all(|change| matches!(change.item, ItemRef::Other(_))));
     }
 
     /// A bare origin and two clones: `a` with a local git identity, `b` without one.

@@ -1825,7 +1825,14 @@ async fn unmanaged_adoption_retries_after_crash_between_publication_and_assignme
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gui_creation_import_inventory_check_and_conflict_diff() {
     use sk1ll_daemon::client::{ConflictDiffRequest, CreateItemRequest};
-    let mut m = solo("gui", "http://127.0.0.1:1", Some(snapshot(1, &["x"])));
+    let mut snap = snapshot(1, &["x"]);
+    snap.assignment.set_rule(HARNESS, "diff-rule", true);
+    let mut m = solo("gui", "http://127.0.0.1:1", Some(snap));
+    m.write("personal/x/.sk1ll-id", "x-id\n");
+    m.write(
+        "instructions/diff-rule.md",
+        &format!("---\nid: diff-rule-id\nharnesses: [{HARNESS}]\npaths: [src/**]\n---\nDraft rule.\n"),
+    );
     m.start().await;
     m.client
         .create_item(&CreateItemRequest {
@@ -1893,6 +1900,21 @@ async fn gui_creation_import_inventory_check_and_conflict_diff() {
     assert!(diff.diff.contains("-Harness edit"), "{}", diff.diff);
     assert!(diff.diff.contains("+x"), "{}", diff.diff);
     assert!(!diff.diff.contains(".sk1ll-managed"), "{}", diff.diff);
+    assert!(!diff.diff.contains(".sk1ll-id"), "{}", diff.diff);
+
+    let rule_dir = m.home.path().join("agent/rules");
+    let rule = rule_dir.join("diff-rule.md");
+    eventually(|| async { std::fs::read_to_string(&rule).ok() }).await;
+    write(&rule_dir, "diff-rule.md", "---\npaths: [src/**]\n---\n\nHarness rule.\n");
+    eventually(|| async { m.client.conflicts().await.ok().filter(|v| v.iter().any(|v| v.name == "diff-rule")) }).await;
+    let rule_diff = m
+        .client
+        .conflict_diff(&ConflictDiffRequest { harness: Some(HARNESS.into()), name: Some("diff-rule".into()), id: None })
+        .await
+        .unwrap()
+        .diff;
+    assert!(rule_diff.contains("-Harness rule.") && rule_diff.contains("+Draft rule."), "{rule_diff}");
+    assert!(!rule_diff.contains("diff-rule-id") && !rule_diff.contains("harnesses:"), "{rule_diff}");
     m.client.remove_import("external").await.unwrap();
     assert!(m.client.imports().await.unwrap().imports.is_empty());
     assert!(!m.repo().join("imported/external").exists());

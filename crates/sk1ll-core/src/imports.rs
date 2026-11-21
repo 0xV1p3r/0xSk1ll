@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::hash::hash_dir;
+use crate::hash::vendor_hash;
 use crate::lock::LockEntry;
 use crate::manifest::{self, Import};
 use crate::skill::IMPORTED_DIR;
@@ -109,7 +109,11 @@ impl Repo {
     /// after staging, and the install never replaces anything.
     pub fn add_import(&mut self, name: &str, mut import: Import) -> Result<UpdateReport> {
         self.check_free(name)?;
-        import.id.get_or_insert_with(ItemId::generate);
+        if let Some(id) = &import.id {
+            self.check_item_id(Path::new(skill::IMPORTED_DIR).join(name), id.clone())?;
+        } else {
+            import.id = Some(self.new_item_id()?);
+        }
         let cache = source::fetch(&import.source, self.root())?;
         let commit = source::resolve_commit(&cache, &import.git_ref)?;
         let staged = source::stage(&cache, &commit, &import, self.root(), &self.imported_dir())?;
@@ -176,7 +180,7 @@ impl Repo {
         fetched.stage()?;
         self.check_free(&name)?;
         let mut import = fetched.import()?;
-        import.id = Some(ItemId::generate());
+        import.id = Some(self.new_item_id()?);
         let staged = fetched.staged.take().expect("staged above");
         staged.install_new(&self.imported_dir().join(&name))?;
         let report = self.lock_vendored(&name, &import, fetched.resolved.commit.clone())?;
@@ -308,7 +312,7 @@ impl Repo {
                 let state = match lock {
                     _ if !dir.is_dir() => ImportState::Missing,
                     None => ImportState::Missing,
-                    Some(entry) if hash_dir(&dir)? == entry.hash => ImportState::Clean,
+                    Some(entry) if vendor_hash(&dir)? == entry.hash => ImportState::Clean,
                     Some(_) => ImportState::Modified,
                 };
                 Ok(ImportStatus { name: name.clone(), state, commit: lock.map(|e| e.commit.clone()) })
@@ -353,27 +357,61 @@ impl Repo {
         validate_name(name)?;
         let from = self.imported_dir().join(name);
         let to = self.personal_dir().join(name);
-        if !from.is_dir() {
-            return Err(Error::Invalid(format!("no vendored import named `{name}`")));
+        for parent in [self.imported_dir(), self.personal_dir()] {
+            if !parent.symlink_metadata().at(&parent)?.is_dir() {
+                return Err(Error::Invalid(format!("{} is not a content directory", parent.display())));
+            }
         }
-        if to.exists() {
+        if !from.symlink_metadata().is_ok_and(|meta| meta.is_dir()) {
+            return Err(Error::Invalid(format!("{} is not a vendored import directory", from.display())));
+        }
+        if to.symlink_metadata().is_ok() {
             return Err(Error::Invalid(format!("personal skill `{name}` already exists")));
         }
-        let id = self.manifest.import_id(name);
+        let id = self
+            .resolved_ids()?
+            .get(Path::new(skill::IMPORTED_DIR).join(name).as_path())
+            .cloned()
+            .ok_or_else(|| Error::Invalid(format!("no vendored import named `{name}`")))?;
+        let sidecar = to.join(skill::ID_FILE);
+        let backup = source::unique(&to);
         crate::sync::rename_noreplace(&from, &to).at(&to)?;
-        if let Err(error) = id.write_skill(&to) {
+        let mut saved = false;
+        let result = (|| {
+            if sidecar.symlink_metadata().is_ok() {
+                crate::sync::rename_noreplace(&sidecar, &backup).at(&sidecar)?;
+                saved = true;
+            }
+            id.write_skill(&to)?;
+            manifest::remove_import(self.root(), name)
+        })();
+        if let Err(error) = result {
+            if saved {
+                fs::rename(&backup, &sidecar).at(&sidecar)?;
+            } else if sidecar.symlink_metadata().is_ok() {
+                // Only remove a sidecar we made, never the one we failed to save.
+                if ItemId::read_skill(&to).is_ok_and(|found| found.as_ref() == Some(&id)) {
+                    fs::remove_file(&sidecar).at(&sidecar)?;
+                }
+            }
             crate::sync::rename_noreplace(&to, &from).at(&from)?;
             return Err(error);
         }
+        if saved {
+            if backup.symlink_metadata().at(&backup)?.is_dir() {
+                fs::remove_dir_all(&backup).at(&backup)?;
+            } else {
+                fs::remove_file(&backup).at(&backup)?;
+            }
+        }
         self.manifest.import.remove(name);
-        manifest::remove_import(self.root(), name)?;
         self.lock.skills.remove(name);
         self.lock.save(self.root())
     }
 
     /// Records `name`'s freshly vendored content at `commit` in the lockfile.
     fn lock_vendored(&mut self, name: &str, import: &Import, commit: String) -> Result<UpdateReport> {
-        let hash = hash_dir(&self.imported_dir().join(name))?;
+        let hash = vendor_hash(&self.imported_dir().join(name))?;
         let old = self.lock.skills.insert(
             name.to_string(),
             LockEntry {
@@ -838,6 +876,50 @@ mod tests {
         assert!(!repo.manifest.import.contains_key("x"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn fork_rejects_symlinked_paths_before_touching_the_import() {
+        use std::os::unix::fs::symlink;
+        for linked in ["entry", "imported", "personal"] {
+            let src = Source::new();
+            let mut repo = src.repo();
+            repo.add_link(None, &src.origin(), Some("skills/pdf"), None, None).unwrap();
+            let dir = match linked {
+                "entry" => repo.imported_dir().join("pdf"),
+                "imported" => repo.imported_dir(),
+                _ => repo.personal_dir(),
+            };
+            let outside = src.tmp.path().join("outside");
+            fs::rename(&dir, &outside).unwrap();
+            symlink(&outside, &dir).unwrap();
+            let manifest = fs::read(repo.root().join("sk1ll.toml")).unwrap();
+            assert!(repo.fork("pdf").is_err(), "{linked}");
+            assert!(dir.symlink_metadata().unwrap().is_symlink());
+            assert_eq!(fs::read(repo.root().join("sk1ll.toml")).unwrap(), manifest);
+            assert!(!outside.join(".sk1ll-id").exists());
+            assert!(!outside.join("pdf/.sk1ll-id").exists());
+        }
+    }
+
+    #[test]
+    fn a_local_vendor_sidecar_edit_blocks_update() {
+        let src = Source::new();
+        let mut repo = src.repo();
+        let leaf = "skills/pdf/.sk1ll-id";
+        let origin = src.tmp.path().join("origin");
+        fs::write(origin.join(leaf), "upstream\n").unwrap();
+        commit_all(&origin);
+        repo.add_link(None, &src.origin(), Some("skills/pdf"), None, None).unwrap();
+        let path = repo.imported_dir().join("pdf/.sk1ll-id");
+        assert_eq!(repo.import_status().unwrap()[0].state, ImportState::Clean);
+        fs::write(&path, "local\n").unwrap();
+        assert_eq!(repo.import_status().unwrap()[0].state, ImportState::Modified);
+        assert!(repo.update(Some("pdf"), false).unwrap_err().to_string().contains("locally modified"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "local\n");
+        repo.update(Some("pdf"), true).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "upstream\n");
+    }
+
     #[test]
     fn add_records_an_id_and_fork_carries_it_into_the_personal_skill() {
         let src = Source::new();
@@ -857,7 +939,7 @@ mod tests {
         let skill = repo.skills().unwrap().remove(0);
         assert_eq!(skill.origin, crate::Origin::Personal);
         assert_eq!(skill.id, id);
-        assert_eq!(ItemId::read_skill(&skill.path), Some(id));
+        assert_eq!(ItemId::read_skill(&skill.path).unwrap(), Some(id));
         assert!(!repo.manifest.import.contains_key("pdf"));
     }
 
@@ -915,7 +997,7 @@ mod tests {
         let r = repo.add_fetched(None, web).unwrap();
         assert_eq!((r.name.as_str(), r.new_commit.as_str()), ("web", commit.as_str()));
         assert!(repo.imported_dir().join("web/SKILL.md").is_file());
-        assert_eq!(repo.lock.skills["web"].hash, crate::hash::hash_dir(&repo.imported_dir().join("web")).unwrap());
+        assert_eq!(repo.lock.skills["web"].hash, crate::hash::vendor_hash(&repo.imported_dir().join("web")).unwrap());
         assert_eq!(stages(&repo), 0, "installed or dropped, nothing staged is left behind");
     }
 
@@ -984,7 +1066,7 @@ mod tests {
         assert_eq!(runs(), fetched_runs, "installing ran no filter");
         let text = fs::read_to_string(repo.imported_dir().join("pdf/SKILL.md")).unwrap();
         assert!(text.contains("Work with smudged"), "{text}");
-        assert_eq!(repo.lock.skills["pdf"].hash, crate::hash::hash_dir(&repo.imported_dir().join("pdf")).unwrap());
+        assert_eq!(repo.lock.skills["pdf"].hash, crate::hash::vendor_hash(&repo.imported_dir().join("pdf")).unwrap());
     }
 
     #[test]
@@ -1241,7 +1323,7 @@ mod tests {
             let err = repo.recover_imports().unwrap_err().to_string();
             assert!(err.contains(&backup.display().to_string()) && err.contains(&dest.display().to_string()), "{err}");
             assert!(err.contains("is the recorded version") && err.contains("sync again"), "{case}: {err}");
-            assert_eq!(crate::hash::hash_dir(&backup).unwrap(), repo.lock.skills["pdf"].hash, "{case}");
+            assert_eq!(crate::hash::vendor_hash(&backup).unwrap(), repo.lock.skills["pdf"].hash, "{case}");
             assert!(fs::symlink_metadata(&dest).is_ok(), "{case}: left alone");
             // An update starting on top of it refuses the same way.
             let err = repo.update(Some("pdf"), true).unwrap_err().to_string();
@@ -1265,6 +1347,6 @@ mod tests {
         // Nothing installed: the backup is put back.
         restore(&|_: &Path| {});
         assert_eq!(repo.recover_imports().unwrap(), ["pdf"]);
-        assert_eq!(crate::hash::hash_dir(&dest).unwrap(), repo.lock.skills["pdf"].hash);
+        assert_eq!(crate::hash::vendor_hash(&dest).unwrap(), repo.lock.skills["pdf"].hash);
     }
 }

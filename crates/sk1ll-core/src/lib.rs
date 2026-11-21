@@ -60,6 +60,8 @@ pub enum Error {
     Parse { path: PathBuf, message: String },
     #[error("`git {args}` failed: {stderr}")]
     Git { args: String, stderr: String },
+    #[error("duplicate Item ID `{id}` at {} and {}", first.display(), second.display())]
+    DuplicateItemId { id: ItemId, first: PathBuf, second: PathBuf },
     #[error("{0}")]
     Invalid(String),
     /// What an operation was planned from changed before it was made, so

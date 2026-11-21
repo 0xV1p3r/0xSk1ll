@@ -1299,14 +1299,27 @@ impl Daemon {
             let contents = batch.map(|out| parse_batch(&out, wanted.len(), DESCRIPTION_CAP)).unwrap_or_default();
             blobs.extend(wanted.into_iter().zip(contents).filter_map(|(object, bytes)| Some((object, bytes?))));
         }
-        let manifest = sk1ll_core::Manifest::load(root).unwrap_or_default();
+        let disk_ids = sk1ll_core::content::item_ids_on_disk(root)?;
+        let mut missing: BTreeSet<_> = inventory
+            .keys()
+            .filter(|item| matches!(item, ItemRef::Skill(_) | ItemRef::Rule(_)) && !disk_ids.contains_key(*item))
+            .cloned()
+            .collect();
+        let mut historical = BTreeMap::new();
+        for revision in
+            [head.as_deref(), baseline.as_deref().filter(|rev| Some(*rev) != head.as_deref())].into_iter().flatten()
+        {
+            if missing.is_empty() {
+                break;
+            }
+            for (item, id) in sk1ll_core::content::item_ids_at(root, revision)? {
+                if missing.remove(&item) {
+                    historical.insert(item, id);
+                }
+            }
+        }
         for value in inventory.values_mut() {
-            value.id = sk1ll_core::content::item_id_on_disk(root, &manifest, &value.item).or_else(|| {
-                [head.as_deref(), baseline.as_deref().filter(|rev| Some(*rev) != head.as_deref())]
-                    .into_iter()
-                    .flatten()
-                    .find_map(|rev| sk1ll_core::content::item_id_at(root, rev, &value.item))
-            });
+            value.id = disk_ids.get(&value.item).or_else(|| historical.get(&value.item)).cloned();
             let ItemRef::Skill(name) = &value.item else { continue };
             for directory in SKILL_DIRS {
                 let path = format!("{directory}/{name}/SKILL.md");
@@ -1430,7 +1443,7 @@ impl Daemon {
         let repo = Repo::open(self.repo_root())?;
         let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
         let actions = sync::plan(&repo, &harnesses, &self.current_assignment()?, PlanOptions { force })?;
-        let sources = Self::sync_source_digests(&actions, sk1ll_core::hash::hash_dir)?;
+        let sources = Self::sync_source_digests(&actions, sync::deploy_hash)?;
         Self::sync_preview_result(&actions, &sources)
     }
 
@@ -1516,7 +1529,7 @@ impl Daemon {
             Self::recover_imports(root)?;
             let repo = Repo::open(root)?;
             let actions = sync::plan(&repo, &harnesses, &snapshot.assignment, PlanOptions { force })?;
-            let sources = Self::sync_source_digests(&actions, sk1ll_core::hash::hash_dir)?;
+            let sources = Self::sync_source_digests(&actions, sync::deploy_hash)?;
             let preview = Self::sync_preview_result(&actions, &sources)?;
             if preview.fingerprint.as_deref() != Some(fingerprint) {
                 return Ok(preview);
@@ -2617,9 +2630,21 @@ impl Daemon {
         let mut right = match &item {
             ItemRef::Skill(name) => {
                 let p = repo.root().join("personal").join(name);
-                if p.exists() { p } else { repo.root().join("imported").join(name) }
+                let source = if p.exists() { p } else { repo.root().join("imported").join(name) };
+                let path = temp.path().join("Draft");
+                if source.is_dir() {
+                    copy_authored(&source, &path).map_err(anyhow::Error::from)?;
+                }
+                path
             }
-            ItemRef::Rule(name) => repo.root().join("instructions").join(format!("{name}.md")),
+            ItemRef::Rule(name) => {
+                let path = temp.path().join("Draft");
+                if let Some(rule) = repo.rules()?.into_iter().find(|rule| &rule.name == name) {
+                    let (_, content) = sk1ll_core::instructions::render_rule(&rule);
+                    std::fs::write(&path, content).map_err(anyhow::Error::from)?;
+                }
+                path
+            }
             _ => {
                 let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
                 let assignment =
@@ -2711,7 +2736,11 @@ mod tests {
         write("sk1ll.toml", "");
         write("personal/base/SKILL.md", "---\ndescription: Baseline description\n---\nbase\n");
         write("personal/base/.sk1ll-id", "base-skill\n");
-        write("instructions/git.md", "---\nid: git-rule\n---\nbaseline rule\n");
+        write(
+            "instructions/git.md",
+            &format!("---\nid: git-rule\n---\n{}", "x".repeat(sk1ll_core::content::MAX_FILE_BYTES as usize)),
+        );
+
         write("imported/vendored/SKILL.md", "---\ndescription: Imported description\n---\n");
         write("personal/my skill/SKILL.md", "---\ndescription: 'Spaced'\n---\n\x00\nbody\n");
         write("personal/huge/SKILL.md", &format!("---\ndescription: Too big\n---\n{}", "x".repeat(DESCRIPTION_CAP)));
@@ -2750,6 +2779,10 @@ mod tests {
         assert_eq!(find("skill:local").draft, Some(ChangeKind::Added));
         assert_eq!(std::fs::read(root.join(".git/index")).unwrap(), index_before);
         assert_eq!(git(&["rev-parse", "HEAD"]), head_before);
+
+        write("sk1ll.toml", "[import.vendored]\nid = 42\n");
+        assert!(Daemon::items(root).unwrap_err().to_string().contains("sk1ll.toml"));
+        write("sk1ll.toml", "");
 
         // A fetched but clashing Baseline has not been applied locally.
         git(&["checkout", "-qb", "remote", baseline.trim()]);
@@ -2805,6 +2838,7 @@ mod tests {
                 name: source.into(),
                 mode: sk1ll_core::LinkMode::Copy,
                 source: Some(source.into()),
+                item_id: None,
                 expected: None,
             },
             reason: None,

@@ -1461,6 +1461,20 @@ mod tests {
     }
 
     #[test]
+    fn list_and_status_report_duplicate_item_id_paths() {
+        let worktree = TestRepo::new().with_skill();
+        let repo = Repo::open(&worktree.0).unwrap();
+        repo.create_item("skill", "docs", "").unwrap();
+        fs::copy(worktree.0.join("personal/docs/.sk1ll-id"), worktree.0.join("personal/pdf/.sk1ll-id")).unwrap();
+        for command in ["list", "status"] {
+            let err = worktree.run(&[command]).unwrap_err().to_string();
+            for expected in ["duplicate Item ID", "personal/docs/.sk1ll-id", "personal/pdf/.sk1ll-id"] {
+                assert!(err.contains(expected), "{command}: {err}");
+            }
+        }
+    }
+
+    #[test]
     fn recovery_commands_work_with_damaged_configuration() {
         for deleted in [false, true] {
             for command in ["draft", "diff", "restore", "commit", "pull"] {
@@ -1481,7 +1495,14 @@ mod tests {
                     "commit" => vec![command, "manifest", "--author", "Test <test@example.com>"],
                     _ => vec![command],
                 };
-                assert!(repo.run(&args).is_ok(), "{command}, deleted={deleted}");
+                let result = repo.run(&args);
+                if command == "commit" && !deleted {
+                    // A commit cannot validate Import ID claims in invalid TOML.
+                    let error = result.unwrap_err().to_string();
+                    assert!(error.contains("sk1ll.toml"), "{error}");
+                } else {
+                    assert!(result.is_ok(), "{command}, deleted={deleted}: {result:?}");
+                }
                 if command == "restore" {
                     assert!(Repo::open(&repo.0).is_ok());
                 } else {

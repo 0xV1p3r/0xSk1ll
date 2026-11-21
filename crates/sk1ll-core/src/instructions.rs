@@ -60,21 +60,18 @@ impl Rule {
 }
 
 pub fn discover(root: &Path) -> Result<Vec<Rule>> {
-    let dir = root.join(INSTRUCTIONS_DIR);
-    if !dir.is_dir() {
-        return Ok(Vec::new());
-    }
-    let mut paths = Vec::new();
-    for entry in fs::read_dir(&dir).at(&dir)? {
-        let path = entry.at(&dir)?.path();
-        if path.is_file() && path.extension().is_some_and(|e| e == "md") {
-            paths.push(path);
-        }
-    }
+    let manifest = crate::item_id::manifest_on_disk(root)?;
+    let ids = crate::item_id::resolve(crate::item_id::claims_on_disk(root, &manifest, |_| true)?)?;
+    discover_with(root, &ids)
+}
+
+pub(crate) fn discover_with(root: &Path, ids: &crate::item_id::Resolved) -> Result<Vec<Rule>> {
+    let mut paths: Vec<_> = ids.keys().filter(|path| path.starts_with(INSTRUCTIONS_DIR)).collect();
     paths.sort();
     paths
         .into_iter()
-        .map(|path| {
+        .map(|relative| {
+            let path = root.join(relative);
             let text =
                 read_optional(&path)?.ok_or_else(|| Error::Invalid(format!("{} no longer exists", path.display())))?;
             let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
@@ -84,7 +81,7 @@ pub fn discover(root: &Path) -> Result<Vec<Rule>> {
             let (rule_frontmatter, metadata_source) =
                 split_metadata(split_frontmatter(&text).0.unwrap_or_default(), &path, &METADATA_KEYS)?;
             Ok(Rule {
-                id: explicit_id(&text, &path)?.unwrap_or_else(|| ItemId::derived("rule", &name)),
+                id: ids[relative].clone(),
                 name,
                 description: frontmatter_field(&text, "description"),
                 harnesses,
@@ -307,47 +304,77 @@ pub(crate) fn with_id(text: &str, path: &Path, id: &ItemId) -> Result<String> {
     Ok(format!("{}{updated}{}", &text[..start], &text[start + frontmatter.len()..]))
 }
 
-/// Puts back the metadata stripped by `render_rule`, keeping the adopted
-/// content's own Item ID or harness routing where present.
-pub(crate) fn restore_metadata(rule: &Rule, text: &str) -> String {
-    let key = &rule.metadata_source;
-    if key.is_empty() {
-        return text.to_string();
+/// Reads only the Rule's frontmatter. The body may exceed the editor limit.
+pub(crate) fn read_explicit_id(reader: impl std::io::Read, path: &Path) -> Result<Option<ItemId>> {
+    use std::io::{BufRead, BufReader, Read};
+    let mut reader = BufReader::new(reader);
+    let mut text = Vec::new();
+    reader.by_ref().take(5).read_until(b'\n', &mut text).at(path)?;
+    if !matches!(text.as_slice(), b"---\n" | b"---\r\n") {
+        return Ok(None);
     }
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line).at(path)? == 0 {
+            return Err(Error::Parse { path: path.into(), message: "unterminated Rule frontmatter".into() });
+        }
+        text.extend_from_slice(&line);
+        let value =
+            std::str::from_utf8(&line).map_err(|e| Error::Parse { path: path.into(), message: e.to_string() })?;
+        if value.trim() == "---" {
+            return explicit_id(std::str::from_utf8(&text).expect("validated lines"), path);
+        }
+    }
+}
+
+/// Keeps the repo's identity and fills in routing omitted by the harness.
+pub(crate) fn restore_metadata(
+    rule: Option<&Rule>,
+    text: &str,
+    path: &Path,
+    recovered_id: Option<&ItemId>,
+) -> Result<String> {
+    parse_harnesses(text, path)?;
+    explicit_id(text, path)?;
     let (frontmatter, body) = split_frontmatter(text);
-    let filtered;
-    let key = if let Some(f) = frontmatter {
-        let Ok(mapping) = frontmatter_mapping(f, &rule.path) else { return text.to_string() };
-        let mut keep = Vec::new();
-        if FRONTMATTER_KEYS.iter().all(|k| !mapping.contains_key(*k)) {
-            keep.extend(FRONTMATTER_KEYS);
+    let source = frontmatter.unwrap_or_default();
+    let mut mapping = frontmatter_mapping(source, path)?;
+    let had_routing = FRONTMATTER_KEYS.iter().any(|key| mapping.contains_key(*key));
+    let mut added = String::new();
+    let mut replaced_id = mapping.remove("id").is_some();
+    if let Some(rule) = rule {
+        let metadata = frontmatter_mapping(&rule.metadata_source, path)?;
+        for (key, value) in metadata {
+            if key.as_str() == Some("id") || !had_routing {
+                mapping.insert(key, value);
+            }
         }
-        if !mapping.contains_key("id") {
-            keep.push("id");
-        }
-        let Ok((_, metadata)) = split_metadata(key, &rule.path, &keep) else { return text.to_string() };
-        filtered = metadata;
-        &filtered
+        let keys = if had_routing { &["id"][..] } else { &METADATA_KEYS[..] };
+        added = split_metadata(&rule.metadata_source, path, keys)?.1;
+    } else if let Some(id) = recovered_id {
+        mapping.insert("id".into(), id.to_string().into());
+        replaced_id = true;
+    }
+    let candidate = format!("{added}{source}");
+    let content = if !replaced_id && candidate.is_empty() {
+        text.to_string()
     } else {
-        key
-    };
-    if key.is_empty() {
-        return text.to_string();
-    }
-    let restored = match frontmatter {
-        Some(f) => format!("---\n{key}{f}---\n{body}"),
-        None => format!("---\n{key}---\n{text}"),
-    };
-    // An edited rule may use a different mapping style or invalid input.
-    if frontmatter_mapping(split_frontmatter(&restored).0.unwrap_or_default(), &rule.path).is_err() {
-        if frontmatter_mapping(key, &rule.path).is_ok_and(|mapping| mapping.contains_key("id"))
-            && let Ok(with_id) = with_id(text, &rule.path, &rule.id)
+        let metadata = if !replaced_id
+            && frontmatter_mapping(&candidate, path).ok().as_ref() == Some(&mapping)
+            && split_metadata(&candidate, path, &METADATA_KEYS).is_ok()
         {
-            return with_id;
-        }
-        return text.to_string();
-    }
-    restored
+            candidate
+        } else if mapping.is_empty() {
+            String::new()
+        } else {
+            serde_yaml_ng::to_string(&mapping)
+                .map_err(|e| Error::Parse { path: path.into(), message: e.to_string() })?
+        };
+        if metadata.is_empty() { body.to_string() } else { format!("---\n{metadata}---\n{body}") }
+    };
+    validate_edit(&content, path)?;
+    Ok(content)
 }
 
 /// Hashes of the rule files 0xSk1ll wrote, stored as `<dir>/.sk1ll-managed`.
@@ -506,7 +533,7 @@ mod tests {
         let expected: serde_yaml_ng::Value = serde_yaml_ng::from_str(metadata).unwrap();
         assert_eq!(actual, expected);
 
-        let restored = restore_metadata(&rule, &rendered);
+        let restored = restore_metadata(Some(&rule), &rendered, &rule.path, None).unwrap();
         let original = frontmatter_mapping(split_frontmatter(raw).0.unwrap(), &rule.path).unwrap();
         let restored_mapping = frontmatter_mapping(split_frontmatter(&restored).0.unwrap(), &rule.path).unwrap();
         assert_eq!(restored_mapping, original);
@@ -573,7 +600,11 @@ mod tests {
                     let rendered = render_rule(&rule).1;
                     assert_eq!(rendered, "Body.\n");
                     assert_eq!(
-                        parse_harnesses(&restore_metadata(&rule, &rendered), &rule.path).unwrap(),
+                        parse_harnesses(
+                            &restore_metadata(Some(&rule), &rendered, &rule.path, None).unwrap(),
+                            &rule.path
+                        )
+                        .unwrap(),
                         rule.harnesses
                     );
                 }
@@ -676,7 +707,7 @@ mod tests {
                         assert_eq!(rule.applies_to("other"), routing.is_empty());
                         let rendered = render_rule(rule).1;
                         assert_eq!(rendered, format!("---\n{metadata}---\n\nScoped.\n"));
-                        let restored = restore_metadata(rule, &rendered);
+                        let restored = restore_metadata(Some(rule), &rendered, &rule.path, None).unwrap();
                         fs::write(&path, &restored).unwrap();
                         assert_eq!(discover(tmp.path()).unwrap()[0].harnesses, rule.harnesses);
                         assert!(restored.contains(metadata));
@@ -770,9 +801,15 @@ mod tests {
 
         let f = frag("---\nharnesses:\n  - claude\npaths: [x]\n---\nDo X.\n");
         let edited = "---\npaths: [x]\n---\n\nDo X better.\n";
-        assert_eq!(restore_metadata(&f, edited), "---\nharnesses:\n  - claude\npaths: [x]\n---\n\nDo X better.\n");
-        assert_eq!(restore_metadata(&f, "Plain.\n"), "---\nharnesses:\n  - claude\n---\nPlain.\n");
-        assert_eq!(restore_metadata(&frag("Plain."), edited), edited);
+        assert_eq!(
+            restore_metadata(Some(&f), edited, &f.path, None).unwrap(),
+            "---\nharnesses:\n  - claude\npaths: [x]\n---\n\nDo X better.\n"
+        );
+        assert_eq!(
+            restore_metadata(Some(&f), "Plain.\n", &f.path, None).unwrap(),
+            "---\nharnesses:\n  - claude\n---\nPlain.\n"
+        );
+        assert_eq!(restore_metadata(Some(&frag("Plain.")), edited, Path::new("r.md"), None).unwrap(), edited);
     }
 
     #[test]
