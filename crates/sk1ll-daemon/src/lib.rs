@@ -65,6 +65,8 @@ pub unsafe fn prepare_process(cfg: &Config) -> anyhow::Result<()> {
             unsafe { std::env::set_var(k, v) };
         }
     }
+    // Core's recovery area and import cache follow the configuration too.
+    sk1ll_core::paths::use_dirs(sk1ll_core::paths::Dirs { state: cfg.state_dir.clone(), cache: cfg.cache_dir.clone() });
     PREPARED.store(true, Ordering::SeqCst);
     Ok(())
 }

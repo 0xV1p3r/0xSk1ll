@@ -2340,9 +2340,9 @@ pub mod displaced {
         pub changed: bool,
     }
 
-    /// `$XDG_STATE_HOME/sk1ll/displaced` (the platform's state directory,
-    /// else its data directory): the index of all entries, and entries
-    /// older versions kept here.
+    /// `displaced` in sk1ll's state directory ([`crate::paths::state_dir`],
+    /// `$XDG_STATE_HOME/sk1ll` by default): the index of all entries, and
+    /// entries older versions kept here.
     pub fn root() -> Result<PathBuf> {
         #[cfg(test)]
         if let Some(root) = TEST_ROOT.with_borrow(Clone::clone) {
@@ -2351,10 +2351,7 @@ pub mod displaced {
         #[cfg(test)]
         return Ok(DEFAULT_TEST_ROOT.with(|root| root.path().to_path_buf()));
         #[cfg(not(test))]
-        dirs::state_dir()
-            .or_else(dirs::data_dir)
-            .map(|d| d.join("sk1ll").join("displaced"))
-            .ok_or_else(|| Error::Invalid("cannot determine the state directory for displaced content".into()))
+        Ok(crate::paths::state_dir()?.join("displaced"))
     }
 
     fn placement_path(kind: Kind, dest: &Path) -> Result<PathBuf> {

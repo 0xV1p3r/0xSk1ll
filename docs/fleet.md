@@ -172,7 +172,8 @@ The table lists Linux paths. On macOS, config and data use `~/Library/Applicatio
 | `SK1LL_DAEMON_SOCKET` | `$XDG_RUNTIME_DIR/sk1ll/daemon.sock` | Local API socket |
 | `SK1LL_MACHINE_CONFIG` | `~/.config/sk1ll/machine.toml` | Harness configuration |
 | `SK1LL_ASSIGNMENT` | `~/.cache/sk1ll/assignment.json` | Local assignment in standalone; server mirror when joined |
-| `SK1LL_STATE_DIR` | `~/.local/state/sk1ll` (`$XDG_STATE_HOME/sk1ll`; on macOS the data directory's `sk1ll`) | The machine lock's files (`locks/`) and a pending Harness rename (`harness-rename/`), each named by a hash of the real path of the file it is about |
+| `SK1LL_STATE_DIR` | `~/.local/state/sk1ll` (`$XDG_STATE_HOME/sk1ll`; on macOS the data directory's `sk1ll`) | The machine lock's files (`locks/`) and a pending Harness rename (`harness-rename/`), each named by a hash of the real path of the file it is about, and the recovery area's index (`displaced/`) |
+| `SK1LL_CACHE_DIR` | `~/.cache/sk1ll` (`$XDG_CACHE_HOME/sk1ll`) | Import sources fetched into `git/` |
 | `SK1LL_REPO` | nearest skills repo, else `~/.local/share/sk1ll/repo` | Standalone repo path; joined machines use `daemon.json` |
 | `SK1LL_PULL_INTERVAL` | `5m` | Fallback pull interval while connected |
 | `SK1LL_DEBOUNCE` | `300ms` | Quiet time before reacting to file changes |

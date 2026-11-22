@@ -699,7 +699,7 @@ fn cache_dir_for(url: &str) -> PathBuf {
     if let Some(root) = TEST_CACHE.with_borrow(Clone::clone) {
         return root.join(&digest[..16]);
     }
-    dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("sk1ll").join("git").join(&digest[..16])
+    crate::paths::cache_dir().unwrap_or_else(|_| std::env::temp_dir().join("sk1ll")).join("git").join(&digest[..16])
 }
 
 fn git(dir: &Path, args: &[&str], env: &[(&str, &Path)]) -> Result<String> {

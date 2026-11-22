@@ -71,11 +71,10 @@ impl Default for HarnessAssignment {
 }
 
 impl Assignment {
-    /// `$XDG_CACHE_HOME/sk1ll/assignment.json` (or the platform equivalent).
+    /// `assignment.json` in sk1ll's cache directory ([`crate::paths::cache_dir`],
+    /// `$XDG_CACHE_HOME/sk1ll` by default).
     pub fn default_path() -> Result<PathBuf> {
-        dirs::cache_dir()
-            .map(|d| d.join("sk1ll").join(ASSIGNMENT_FILE))
-            .ok_or_else(|| Error::Invalid("cannot determine the cache directory".into()))
+        Ok(crate::paths::cache_dir()?.join(ASSIGNMENT_FILE))
     }
 
     /// Loads `path`; a missing file is the all-enabled default.

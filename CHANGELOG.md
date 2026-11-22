@@ -130,6 +130,11 @@ break compatibility.
 
 ### Fixed
 
+- The recovery area's index and the import cache follow `SK1LL_STATE_DIR`
+  and the new `SK1LL_CACHE_DIR` (and the daemon's configuration) instead of
+  always the platform's directories. The test suite no longer writes under
+  the real home directory, and `scripts/check-test-home.sh`, which CI runs,
+  fails if any test does.
 - Restoring both sides of a case-only Skill or Rule rename on a
   case-insensitive filesystem puts the Baseline's spelling back, even when
   the directory holds an ignored file, with no-replace renames that move

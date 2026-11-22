@@ -21,6 +21,7 @@ pub mod item_id;
 pub mod lock;
 pub mod machine;
 pub mod manifest;
+pub mod paths;
 pub mod placement;
 pub mod real_path;
 pub mod redact;

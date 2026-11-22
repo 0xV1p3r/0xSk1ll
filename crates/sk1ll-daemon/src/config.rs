@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
+#[cfg(not(test))]
 use sk1ll_core::{Assignment, MachineConfig};
 
 /// How often a full reconcile runs by default (see [`Config::full_reconcile_every`]).
@@ -26,6 +27,9 @@ pub struct Config {
     /// rename (`harness-rename/`), each named by the hash of the real path of
     /// the file it is about, so none of them lands beside a user's file.
     pub state_dir: PathBuf,
+    /// sk1ll's own cache directory (`SK1LL_CACHE_DIR`, default
+    /// `$XDG_CACHE_HOME/sk1ll`): import sources are fetched into `git/`.
+    pub cache_dir: PathBuf,
     /// Local API socket (`SK1LL_DAEMON_SOCKET`, default
     /// `$XDG_RUNTIME_DIR/sk1ll/daemon.sock`, else `run/daemon.sock` in the
     /// config dir, as on macOS). Its directory must be ours and mode 0700.
@@ -56,15 +60,50 @@ pub struct Config {
 }
 
 impl Config {
-    /// Defaults from the platform's config, cache and runtime dirs.
+    /// Defaults from the platform's config, cache and runtime dirs. In this
+    /// crate's own tests, from a temporary directory instead, which core's
+    /// state and cache directories follow too: no test reaches the real
+    /// home directory.
     pub fn new() -> anyhow::Result<Self> {
-        Ok(Self {
+        #[cfg(test)]
+        {
+            let home = test_home();
+            Ok(Self::with_paths(
+                home.join("config/daemon.json"),
+                home.join("config/machine.toml"),
+                home.join("cache/assignment.json"),
+                home.join("state"),
+                home.join("cache"),
+                home.join("run/daemon.sock"),
+            ))
+        }
+        #[cfg(not(test))]
+        Ok(Self::with_paths(
+            config_dir()?.join("daemon.json"),
+            MachineConfig::default_path()?,
+            Assignment::default_path()?,
+            sk1ll_core::paths::state_dir()?,
+            sk1ll_core::paths::cache_dir()?,
+            Self::default_socket()?,
+        ))
+    }
+
+    fn with_paths(
+        state: PathBuf,
+        machine_config: PathBuf,
+        assignment: PathBuf,
+        state_dir: PathBuf,
+        cache_dir: PathBuf,
+        socket: PathBuf,
+    ) -> Self {
+        Self {
             repo: None,
-            state: config_dir()?.join("daemon.json"),
-            machine_config: MachineConfig::default_path()?,
-            assignment: Assignment::default_path()?,
-            state_dir: default_state_dir()?,
-            socket: Self::default_socket()?,
+            state,
+            machine_config,
+            assignment,
+            state_dir,
+            cache_dir,
+            socket,
             pull_every: Duration::from_secs(300),
             debounce: Duration::from_millis(300),
             debounce_max: Duration::from_secs(2),
@@ -73,7 +112,7 @@ impl Config {
             auth_warn_after: Duration::from_secs(24 * 3600),
             reconnect_min: Duration::from_millis(500),
             reconnect_max: Duration::from_secs(60),
-        })
+        }
     }
 
     /// [`Config::new`] adjusted by `SK1LL_*` environment variables.
@@ -94,6 +133,9 @@ impl Config {
         }
         if let Some(v) = var("SK1LL_STATE_DIR") {
             cfg.state_dir = v.into();
+        }
+        if let Some(v) = var("SK1LL_CACHE_DIR") {
+            cfg.cache_dir = v.into();
         }
         if let Some(v) = var("SK1LL_DAEMON_SOCKET") {
             cfg.socket = v.into();
@@ -165,8 +207,17 @@ impl Config {
     }
 }
 
-fn default_state_dir() -> anyhow::Result<PathBuf> {
-    dirs::state_dir().or_else(dirs::data_dir).map(|d| d.join("sk1ll")).context("cannot determine the state directory")
+/// The temporary home of this crate's tests (see [`Config::new`]).
+#[cfg(test)]
+pub(crate) fn test_home() -> &'static std::path::Path {
+    static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let dirs = sk1ll_core::paths::Dirs { state: home.path().join("state"), cache: home.path().join("cache") };
+        sk1ll_core::paths::use_dirs(dirs);
+        home
+    })
+    .path()
 }
 
 fn config_dir() -> anyhow::Result<PathBuf> {

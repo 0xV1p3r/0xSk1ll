@@ -242,7 +242,7 @@ pub struct CommitResponse {
     pub pushed: bool,
     pub push_error: Option<String>,
     /// The server refused the push for good: pushing again won't help.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub push_refused: bool,
 }
 

@@ -42,12 +42,14 @@ pnpm build           # needed before cargo, because the GUI embeds ui/dist
 cd ../../..
 cargo fmt --all --check
 cargo build --workspace
-cargo test --workspace
+cargo test --workspace         # or scripts/check-test-home.sh, as CI runs it
 cargo clippy --workspace --all-targets -- -D warnings
 python3 crates/sk1ll-gui/tests/test_dev_fleet.py
 ```
 
 The CLI's command tests run the `sk1ll` binary, each with its own `HOME` and XDG directories: every command runs the engine, which reconciles, and would otherwise find your own harnesses through the presets.
+
+No test may write under the real home directory: tests get temporary directories, and in-process engines in the daemon's and core's own tests default every path (core's state and cache directories included) to one. `scripts/check-test-home.sh` runs `cargo test --workspace` with `HOME` set to an empty directory and the XDG variables unset, and fails if anything appears there.
 
 A few tests need a case-insensitive filesystem (macOS's default APFS) and return early elsewhere, such as restoring both sides of a case-only rename; on Linux only the pieces they are built from run (the respelling move, the alias check). The macOS CI job runs them.
 
