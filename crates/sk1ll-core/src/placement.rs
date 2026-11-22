@@ -8,6 +8,33 @@ pub fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
     crate::sync::rename_noreplace(from, to)
 }
 
+/// Detach the incumbent into the caller's vacant private recovery slot.
+/// Something already in the slot stays, and so does the incumbent.
+pub(crate) fn detach(src: &Path, backup: &Path) -> std::io::Result<()> {
+    rename_noreplace(src, backup)
+}
+
+/// Move the incumbent, validate the object that actually moved, then make
+/// the replacement visible only at a vacant name. The caller owns recovery
+/// of the backup on success or failure.
+pub(crate) fn swap_managed<E>(
+    stage: Option<&Path>,
+    dest: &Path,
+    backup: Option<&Path>,
+    before_publish: impl FnOnce() -> Result<(), E>,
+) -> std::io::Result<Result<(), E>> {
+    if let Some(backup) = backup {
+        detach(dest, backup)?;
+    }
+    if let Err(error) = before_publish() {
+        return Ok(Err(error));
+    }
+    if let Some(stage) = stage {
+        rename_noreplace(stage, dest)?;
+    }
+    Ok(Ok(()))
+}
+
 #[cfg(unix)]
 mod unix {
     use rustix::fs::{self as fd, AtFlags, Mode, OFlags};
@@ -51,7 +78,7 @@ mod unix {
             Ok(Self(open_directory(path, create)?))
         }
 
-        fn parent(&self, path: &Path, create: bool) -> io::Result<(OwnedFd, OsString)> {
+        pub(crate) fn parent(&self, path: &Path, create: bool) -> io::Result<(OwnedFd, OsString)> {
             let parts: Vec<_> = path.components().collect();
             if parts.is_empty() || parts.iter().any(|p| !matches!(p, Component::Normal(_))) {
                 return Err(io::Error::other("file path must be relative and normalized"));
@@ -176,5 +203,34 @@ impl Directory {
     }
     pub fn create_file(&self, _: &Path, _: &[u8], _: bool) -> std::io::Result<()> {
         Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Detaching never replaces what is in the backup slot, file or directory.
+    #[test]
+    fn detach_never_replaces_an_occupied_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        for dir in [false, true] {
+            let (src, backup) = (tmp.path().join(format!("src-{dir}")), tmp.path().join(format!("slot-{dir}")));
+            if dir {
+                std::fs::create_dir(&src).unwrap();
+                std::fs::create_dir(&backup).unwrap();
+            } else {
+                std::fs::write(&src, "incumbent").unwrap();
+                std::fs::write(&backup, "occupant").unwrap();
+            }
+            assert_eq!(detach(&src, &backup).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+            assert!(src.exists() && backup.exists());
+            if !dir {
+                assert_eq!(std::fs::read_to_string(&backup).unwrap(), "occupant");
+            }
+            let vacant = tmp.path().join(format!("vacant-{dir}"));
+            detach(&src, &vacant).unwrap();
+            assert!(!src.exists() && vacant.exists());
+        }
     }
 }

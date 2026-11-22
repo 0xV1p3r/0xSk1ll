@@ -22,6 +22,8 @@ For several machines, a self-hosted server acts as the git remote and holds the 
 
 ## Install
 
+Install Git 2.40 or newer and make sure `git` is on `PATH`.
+
 Release builds target Linux and Apple silicon macOS. The [release page](https://github.com/0xV1p3r/0xSk1ll/releases) lists available archives:
 
 - `sk1ll-<version>-x86_64-linux.tar.gz` with `sk1ll`, the desktop app `sk1ll-gui`, `sk1ll-server` and the systemd unit, and an `aarch64` archive without the app,
@@ -35,11 +37,11 @@ tar -xzf sk1ll-0.1.0-x86_64-linux.tar.gz
 install -Dm755 sk1ll-0.1.0-x86_64-linux/sk1ll -t ~/.local/bin        # and sk1ll-gui for the app
 ```
 
-Or install the `.deb` with `sudo apt install ./0xSk1ll_0.1.0_amd64.deb`. `sk1ll` needs `git` on `PATH`; the app needs GTK 3 and WebKitGTK 4.1.
+Or install the `.deb` with `sudo apt install ./0xSk1ll_0.1.0_amd64.deb`. The app needs GTK 3 and WebKitGTK 4.1.
 
-On macOS, verify the download with `shasum -a 256 -c SHA256SUMS --ignore-missing`. Extract the archive, copy `0xSk1ll.app` to Applications and put the CLI binaries on your `PATH` if you use them from a terminal. Git must be on `PATH`. The app is unsigned and unnotarized. If Gatekeeper blocks a copy you verified, try opening it once and then use Open Anyway in System Settings → Privacy & Security. macOS builds run in CI and have had no manual testing.
+On macOS, verify the download with `shasum -a 256 -c SHA256SUMS --ignore-missing`. Extract the archive, copy `0xSk1ll.app` to Applications and put the CLI binaries on your `PATH` if you use them from a terminal. The app is unsigned and unnotarized. If Gatekeeper blocks a copy you verified, try opening it once and then use Open Anyway in System Settings → Privacy & Security. macOS builds run in CI and have had no manual testing.
 
-To build from source instead, run `cargo install --path crates/sk1ll-cli`, which installs `sk1ll` to `~/.cargo/bin`. The CLI builds on any platform in standalone mode. The daemon, `join` and `fleet` need Unix.
+To build from source instead, run `cargo install --path crates/sk1ll-cli`, which installs `sk1ll` to `~/.cargo/bin`. sk1ll needs Unix (Linux or macOS): without a running daemon, each command runs the daemon's engine in its own process.
 
 ## Quick start
 
@@ -79,7 +81,24 @@ sk1ll restore pdf                    # discard one item's draft
 sk1ll pull                           # fetch the new baseline, keep the draft on top
 ```
 
-Commands take a bare skill or rule name, or `skill:<name>`, `rule:<name>`, `manifest` and `other:<path>`. `pull` never merges. If the new baseline changes an item that is also in your draft, `pull` changes nothing and marks the machine Blocked until you commit or restore that item.
+Commands take a bare skill or rule name, or `skill:<name>`, `rule:<name>`, `manifest` and `other:<path>`. `pull` never merges. If the new baseline changes an item that is also in your draft, `pull` changes nothing and marks the machine Blocked. An unpushed commit that conflicts with the new baseline is turned back into draft changes first (only the branch moves; no file changes), so it blocks the pull the same way. To get past it:
+
+```sh
+sk1ll restore pdf          # your version goes to recovery; prints its entry ids
+sk1ll pull
+sk1ll recover adopt <id>   # your version comes back as draft on the new baseline
+sk1ll diff pdf             # merge by hand if needed, then commit
+```
+
+The daemon and mutating commands write a new Item ID for hand-made Skills, Rules,
+and Import entries that lack one. These writes are part of the Draft and get
+committed with the item. Read-only commands show unassigned IDs until then.
+If copying an item duplicates its ID, run `sk1ll repair-ids` and commit the
+repaired items.
+
+Pull requires Git 2.40 or later, and 2.42 when the new Baseline changes a `.gitattributes` file. It updates only the working-tree paths the new Baseline changes, one at a time, and leaves the Draft where it is. Replayed commits get this Machine as their committer and lose their signatures. Pull drops commits that become empty and keeps commits that started empty. Pull refuses unpushed merge commits, submodules and sparse checkouts. File changes need atomic filesystem operations on Linux or macOS. Pull checks for support before it starts changing files.
+
+If Pull stops partway through, the next `sk1ll pull` or Daemon reconcile resumes it. Edits to paths it already updated stay as Draft on the new Baseline. While Pull is pending, `git status` shows the partially updated tree, and `sk1ll commit`, `sk1ll sync`, `sk1ll push` and `sk1ll repair-ids` refuse to run. A harness change is saved but syncs once the Pull finishes. Restoring an item a Pull is Blocked on, or that blocks a pending Pull, keeps your version in recovery. Pull recovery entries stay until you adopt or discard them.
 
 ## Commands
 
@@ -93,16 +112,17 @@ Commands take a bare skill or rule name, or `skill:<name>`, `rule:<name>`, `mani
 | `remove <name>` | Remove an import |
 | `fork <name>` | Turn an import into a personal skill you can edit |
 | `edit <name>` | Open a personal skill or rule in `$VISUAL` or `$EDITOR` |
-| `list [--unmanaged]` | List repo content, or skills in harnesses that sk1ll doesn't manage |
+| `list` | List repo content. Use `--json` to include Item IDs or `--unmanaged` to list unmanaged skills |
+| `repair-ids` | Give each item that shares an Item ID, or has none, a fresh one in the Draft; of items sharing one, the item that holds it in the Baseline keeps it (else the first by path) |
 | `status` | Import drift and pending sync actions |
 | `sync [--dry-run] [--force]` | Write skills and instructions into harnesses |
 | `render <harness>` | Print the instruction files a harness would receive |
 | `harnesses [--all] [enable\|disable\|add\|remove]` | List the harnesses sync writes into and use `--all` to include disabled Harnesses and opt-in presets. The subcommands change `machine.toml` after previewing what stays in each Harness |
-| `assign <harness> skill\|rule <name> on\|off` | Toggle an item for one harness |
+| `assign <harness> skill\|rule <name> on\|off` | Toggle a local repo item for one harness |
 | `assign <harness> --default-skills on\|off` | Set the default for skills added later (`--default-rules` for rules) |
 | `assign <harness> --all on\|off` | Set every Skill and Rule and both defaults. With a Fleet, this includes Baseline items the Machine has yet to pull |
 | `conflicts` | List harness and recovery conflicts |
-| `adopt <harness> <name>` | Copy a hand edit or an unmanaged skill into the draft |
+| `adopt <harness> <name>` | Copy a hand edit or an unmanaged skill into the draft. A hand edit goes into the item it was placed from, found by its Item ID even if it was renamed since |
 | `recover list\|adopt\|discard` | Inspect content that sync moved aside |
 | `draft`, `diff`, `commit`, `push`, `restore`, `pull` | Draft workflow, see above |
 | `join <server-url> <code>` | Join a fleet and clone its repo; `--admin-token` instead of a code for the first machine |
@@ -110,11 +130,14 @@ Commands take a bare skill or rule name, or `skill:<name>`, `rule:<name>`, `mani
 | `fleet` | Show every machine in the fleet |
 | `fleet invite` | Create a single-use join code and print the join command and expiry; `--scope self` limits the new machine to managing itself |
 | `fleet remove <machine>` | Remove a machine after confirming its id. Use `--yes` in scripts |
+| `harnesses rename <old> <new> [--replace]` | Rename a Harness and move its Assignment |
+| `fleet orphans` | List orphan Assignment toggles |
+| `fleet prune-orphans [--machine <id>]` | Clear orphan toggles within your scope |
 | `fleet copy-assignment <source> <target>` | Preview and copy a joined Machine's Assignment. Use `--merge`, repeat `--map from=to`, or pass `--yes` in scripts |
 | `fleet log`, `fleet undo <entry-id>` | Filter the Assignment log by Machine, Harness, author or item, or undo one entry |
 | `completions <shell>` | Generate shell completions |
 
-`sk1ll <command> --help` lists every flag.
+`sk1ll <command> --help` lists every flag. `sync` exits non-zero while it leaves a conflict alone, and `sync --force` prints the recovery id it kept each overwritten edit under. `SK1LL_*` variables set to an empty value count as unset.
 
 ## Documentation
 

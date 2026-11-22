@@ -8,7 +8,7 @@ import { toast } from './toast';
 import type { Assignment, AssignmentUpdate, StatusView } from './types';
 
 vi.mock('./api', () => ({ api: {
-  fleet: vi.fn(), items: vi.fn(), assignment: vi.fn(), setAssignment: vi.fn(),
+  fleet: vi.fn(), items: vi.fn(), orphans: vi.fn(), pruneOrphans: vi.fn(), assignment: vi.fn(), setAssignment: vi.fn(),
 }, errorMessage: (error: unknown) => error instanceof Error ? error.message : String(error),
 errorStatus: (error: unknown) => (error as { status?: number }).status }));
 vi.mock('./toast', () => ({ toast: vi.fn() }));
@@ -30,7 +30,8 @@ beforeEach(() => {
   vi.mocked(api.fleet).mockResolvedValue({ baseline: 'abc', machines: ['a', 'b'].map(id => ({
     id, status: 'in_sync', connected: true, joined_at: 1, last_seen: 1, report: null, registration: `r-${id}`,
   })) });
-  vi.mocked(api.items).mockResolvedValue([{ item: 'skill:pdf', in_baseline: true, draft: null, unpushed: false, description: null }]);
+  vi.mocked(api.orphans).mockResolvedValue({ orphans: [] });
+  vi.mocked(api.items).mockResolvedValue([{ item: 'skill:pdf', id: 'pdf', in_baseline: true, draft: null, unpushed: false, description: null }]);
   vi.mocked(api.assignment).mockResolvedValue(snapshot());
   vi.mocked(api.setAssignment).mockResolvedValue(snapshot());
 });
@@ -127,8 +128,8 @@ describe('Assignment response cache', () => {
   });
   it('labels unpushed Commits and Draft-only additions consistently', async () => {
     vi.mocked(api.items).mockResolvedValue([
-      { item: 'skill:queued', in_baseline: false, draft: null, unpushed: true, description: null },
-      { item: 'skill:local', in_baseline: false, draft: 'added', unpushed: false, description: null },
+      { item: 'skill:queued', id: 'queued', in_baseline: false, draft: null, unpushed: true, description: null },
+      { item: 'skill:local', id: 'local', in_baseline: false, draft: 'added', unpushed: false, description: null },
     ]);
     render(<Matrix revision={0} status={status} />);
     const queued = (await screen.findByText('queued')).closest('tr')!;
@@ -198,7 +199,7 @@ describe('a Machine whose Assignment fails to load', () => {
     await act(async () => { save.resolve(snapshot(true, 2)); });
     expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Enabled pdf in 1 Harness' }));
     expect(api.setAssignment).toHaveBeenCalledTimes(1);
-    expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: true }], expected: { revision: 1, registration: 'r-a' } });
+    expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', item_id: 'pdf', name: 'pdf', enabled: true }], expected: { revision: 1, registration: 'r-a' } });
     await act(async () => { vi.mocked(toast).mock.calls[0][0].action!.run(); });
     expect(api.setAssignment).toHaveBeenCalledTimes(2);
     expect(vi.mocked(api.setAssignment).mock.calls.every(([machine]) => machine === 'a')).toBe(true);
@@ -212,8 +213,8 @@ describe('a Machine whose Assignment fails to load', () => {
 
 it('filters by description and kind and shows friendly names', async () => {
   vi.mocked(api.items).mockResolvedValue([
-    { item: 'skill:pdf', in_baseline: true, draft: null, unpushed: false, description: 'Read documents' },
-    { item: 'rule:safety', in_baseline: true, draft: null, unpushed: false, description: 'Review changes' },
+    { item: 'skill:pdf', id: 'pdf', in_baseline: true, draft: null, unpushed: false, description: 'Read documents' },
+    { item: 'rule:safety', id: 'safety', in_baseline: true, draft: null, unpushed: false, description: 'Review changes' },
   ]);
   await mount();
   expect(screen.getByText('pdf')).toBeTruthy();
@@ -237,8 +238,8 @@ it('marks mixed states and batches row changes once per machine', async () => {
   fireEvent.click(await screen.findByRole('menuitem', { name: 'Enable in all visible Harnesses' }));
   await waitFor(() => expect(api.setAssignment).toHaveBeenCalledTimes(2));
   for (const machine of ['a', 'b']) expect(api.setAssignment).toHaveBeenCalledWith(machine, { changes: [
-    { harness: 'claude', kind: 'skill', name: 'pdf', enabled: true },
-    { harness: 'codex', kind: 'skill', name: 'pdf', enabled: true },
+    { harness: 'claude', kind: 'skill', item_id: 'pdf', name: 'pdf', enabled: true },
+    { harness: 'codex', kind: 'skill', item_id: 'pdf', name: 'pdf', enabled: true },
   ], expected: { revision: 1, registration: `r-${machine}` } });
 });
 
@@ -252,18 +253,18 @@ it('persists hidden machines and limits column bulk changes to filtered items', 
   fireEvent.click(screen.getByRole('button', { name: 'Actions for a / claude' }));
   fireEvent.click(await screen.findByRole('menuitem', { name: 'Disable all visible items' }));
   await waitFor(() => expect(api.setAssignment).toHaveBeenCalledTimes(1));
-  expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: false }], expected: { revision: 1, registration: 'r-a' } });
+  expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', item_id: 'pdf', name: 'pdf', enabled: false }], expected: { revision: 1, registration: 'r-a' } });
 });
 
 it('resets row overrides optimistically and skips unavailable remote Draft items', async () => {
-  vi.mocked(api.items).mockResolvedValue([{ item: 'skill:pdf', in_baseline: false, draft: 'added', unpushed: false, description: null }]);
+  vi.mocked(api.items).mockResolvedValue([{ item: 'skill:pdf', id: 'pdf', in_baseline: false, draft: 'added', unpushed: false, description: null }]);
   const save = deferred<AssignmentUpdate>();
   vi.mocked(api.setAssignment).mockReturnValue(save.promise);
   await mount();
   fireEvent.click(screen.getByRole('button', { name: 'Actions for skill:pdf' }));
   fireEvent.click(await screen.findByRole('menuitem', { name: 'Reset all to default' }));
   expect(api.setAssignment).toHaveBeenCalledTimes(1);
-  expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: null }], expected: { revision: 1, registration: 'r-a' } });
+  expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', item_id: 'pdf', name: 'pdf', enabled: null }], expected: { revision: 1, registration: 'r-a' } });
   expect((await screen.findByRole('checkbox', { name: 'skill:pdf in a / claude, inherited' })).className).toContain('border-dashed');
   const reset = snapshot(false, 2);
   reset.assignment.harnesses.claude.skills = {};
@@ -283,7 +284,7 @@ it('describes explicit values that override the Harness default and clears the n
   const inherited = await screen.findByRole('checkbox', { name: 'skill:pdf in a / claude, inherited' });
   expect(inherited.hasAttribute('aria-description')).toBe(false);
   expect(inherited.getAttribute('aria-checked')).toBe('false');
-  expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: null }], expected: { revision: 1, registration: 'r-a' } });
+  expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', item_id: 'pdf', name: 'pdf', enabled: null }], expected: { revision: 1, registration: 'r-a' } });
   const reset = snapshot(false, 2);
   reset.assignment.harnesses.claude.skills = {};
   vi.mocked(api.assignment).mockResolvedValue(reset);
@@ -364,8 +365,8 @@ it('undo restores explicit and inherited values only for accepted Machines', asy
   await act(async () => { action.run(); });
   expect(api.setAssignment).toHaveBeenCalledTimes(3);
   expect(api.setAssignment).toHaveBeenLastCalledWith('a', { changes: [
-    { harness: 'claude', kind: 'skill', name: 'pdf', enabled: false },
-    { harness: 'codex', kind: 'skill', name: 'pdf', enabled: null },
+    { harness: 'claude', kind: 'skill', item_id: 'pdf', name: 'pdf', enabled: false },
+    { harness: 'codex', kind: 'skill', item_id: 'pdf', name: 'pdf', enabled: null },
   ], expected: { revision: 2, registration: 'r-a' } });
   expect(toast).toHaveBeenLastCalledWith(expect.objectContaining({ title: 'Restored 2 Assignments', tone: 'default' }));
 });
@@ -382,7 +383,7 @@ it('undo is refused by the authority when the Assignment changed meanwhile, then
   const reads = vi.mocked(api.assignment).mock.calls.length;
   await act(async () => { vi.mocked(toast).mock.calls[0][0].action!.run(); });
   await waitFor(() => expect(toast).toHaveBeenLastCalledWith(expect.objectContaining({ title: 'Undo is no longer available' })));
-  expect(api.setAssignment).toHaveBeenLastCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: false }], expected: { revision: 2, registration: 'r1' } });
+  expect(api.setAssignment).toHaveBeenLastCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', item_id: 'pdf', name: 'pdf', enabled: false }], expected: { revision: 2, registration: 'r1' } });
   // No Machine error: the matrix reloads instead.
   expect(screen.queryByText(/changed since revision/)).toBeNull();
   await waitFor(() => expect(vi.mocked(api.assignment).mock.calls.length).toBeGreaterThan(reads));
@@ -412,10 +413,12 @@ it('refuses an Assignment read for another registration than the Fleet listed', 
 
 it('assigns Draft-only items locally in standalone without requesting fleet', async () => {
   localStorage.setItem('assignment-matrix-machines', '["other"]');
-  vi.mocked(api.items).mockResolvedValue([{ item: 'skill:pdf', in_baseline: false, draft: 'added', unpushed: false, description: null }]);
-  render(<Matrix revision={0} status={{ ...status, mode: 'standalone', report: { baseline: null, harnesses: ['claude'] } } as StatusView} />);
-  fireEvent.click(await screen.findByRole('checkbox', { name: 'skill:pdf in a / claude, explicit' }));
-  await waitFor(() => expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: true }], expected: { revision: 1 } }));
+  vi.mocked(api.items).mockResolvedValue([{ item: 'skill:pdf', id: 'pdf', in_baseline: false, draft: 'added', unpushed: false, description: null }]);
+  render(<Matrix revision={0} status={{ ...status, mode: 'standalone', report: { seq: 1, items: [], baseline: null, drafts: [], unpushed: [], conflicts: [], blocked: false, clashes: [], behind: false, harnesses: ['claude'] } } as StatusView} />);
+  const toggle = await screen.findByRole('checkbox', { name: 'skill:pdf in a / claude, explicit' });
+  await act(async () => {});
+  fireEvent.click(toggle);
+  await waitFor(() => expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', item_id: 'pdf', name: 'pdf', enabled: true }], expected: { revision: 1 } }));
   expect(api.fleet).not.toHaveBeenCalled();
   expect(api.assignment).toHaveBeenCalledWith('a');
   expect(vi.mocked(api.assignment).mock.calls.every(([machine]) => machine === 'a')).toBe(true);
@@ -426,7 +429,7 @@ it.each([
   { mode: 'joined', server_url: 'https://other.example', machine_id: 'a' },
   { mode: 'joined', server_url: 'https://fleet.example', machine_id: 'b' },
 ] as const)('resets cached revisions and pending writes when authority becomes %j', async identity => {
-  const previous = { ...status, mode: identity.mode === 'joined' && identity.server_url === 'https://fleet.example' && identity.machine_id === 'a' ? 'standalone' : 'joined', server_url: 'https://fleet.example', report: { baseline: null, harnesses: ['claude'] } } as StatusView;
+  const previous = { ...status, mode: identity.mode === 'joined' && identity.server_url === 'https://fleet.example' && identity.machine_id === 'a' ? 'standalone' : 'joined', server_url: 'https://fleet.example', report: { seq: 1, items: [], baseline: null, drafts: [], unpushed: [], conflicts: [], blocked: false, clashes: [], behind: false, harnesses: ['claude'] } } as StatusView;
   const initial = deferred<AssignmentUpdate>();
   vi.mocked(api.assignment).mockReturnValue(initial.promise);
   const save = deferred<AssignmentUpdate>();
@@ -456,7 +459,7 @@ it.each([
 ].flatMap(identity => ['completion', 'undo'].map(phase => ({ ...identity, phase }))))('scopes bulk $phase across a $field change', async ({ phase, next }) => {
   const save = deferred<AssignmentUpdate>();
   vi.mocked(api.setAssignment).mockReturnValue(save.promise);
-  const identity = { ...status, mode: 'joined', server_url: 'https://fleet.example', report: { baseline: null, harnesses: ['claude'] } } as StatusView;
+  const identity = { ...status, mode: 'joined', server_url: 'https://fleet.example', report: { seq: 1, items: [], baseline: null, drafts: [], unpushed: [], conflicts: [], blocked: false, clashes: [], behind: false, harnesses: ['claude'] } } as StatusView;
   const view = render(<Matrix revision={0} status={identity} />);
   await screen.findByRole('checkbox', { name: 'skill:pdf in a / claude, explicit' });
   fireEvent.click(screen.getByRole('button', { name: 'Actions for skill:pdf' }));
@@ -592,19 +595,6 @@ describe('Machine-indexed state', () => {
     await waitFor(() => expect(api.setAssignment).toHaveBeenCalledTimes(3));
     expect(vi.mocked(api.setAssignment).mock.calls.slice(2).map(([machine]) => machine)).toEqual(['b']);
   });
-  it('offers no Undo against a Server that reports no registrations, which ignores `expected`', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValueOnce(true);
-    // A 0.1.0 Server leaves `registration` out of the Fleet view.
-    vi.mocked(api.fleet).mockResolvedValue(fleet([['a', 1], ['b', 1]]));
-    vi.mocked(api.setAssignment).mockResolvedValue(snapshot(true, 2));
-    await mount();
-    fireEvent.click(screen.getByRole('button', { name: 'Actions for skill:pdf' }));
-    fireEvent.click(await screen.findByRole('menuitem', { name: 'Enable in all visible Harnesses' }));
-    await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Enabled pdf in 2 Harnesses' })));
-    expect(vi.mocked(toast).mock.calls[0][0].action).toBeUndefined();
-    expect(api.setAssignment).toHaveBeenCalledWith('a', { changes: [{ harness: 'claude', kind: 'skill', name: 'pdf', enabled: true }] });
-    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('may overwrite'));
-  });
   it('refuses a bulk change when the Assignment changed since it was shown', async () => {
     vi.mocked(api.setAssignment).mockImplementation(async machine => {
       if (machine === 'b') throw Object.assign(new Error('the assignment of `b` changed since revision 1 (now 2); reload it'), { status: 409 });
@@ -631,4 +621,57 @@ it('refreshes after a single guarded edit conflicts', async () => {
   expect(api.setAssignment).toHaveBeenCalledWith('a', expect.objectContaining({ expected: { revision: 1, registration: 'r-a' } }));
   await waitFor(() => expect(enabled('a')).toBe(true));
   expect(vi.mocked(api.assignment).mock.calls.filter(([id]) => id === 'a')).toHaveLength(2);
+});
+
+it('uses the same toggle when the item appears under a new name', async () => {
+  vi.mocked(api.items).mockResolvedValue([
+    { item: 'skill:pdf', id: 'pdf', in_baseline: true, draft: 'deleted', unpushed: false, description: null },
+    { item: 'skill:documents', id: 'pdf', in_baseline: false, draft: 'added', unpushed: false, description: null },
+  ]);
+  render(<Matrix revision={0} status={status} />);
+  const renamed = await screen.findByRole('checkbox', { name: 'skill:documents in b / claude, explicit' });
+  expect(renamed.getAttribute('aria-checked')).toBe('false');
+  expect(screen.queryByRole('row', { name: /^pdf/ })).toBeNull();
+  fireEvent.click(renamed);
+  await waitFor(() => expect(api.setAssignment).toHaveBeenCalledWith('b', {
+    changes: [{ harness: 'claude', kind: 'skill', item_id: 'pdf', name: 'documents', enabled: true }],
+    expected: { revision: 1, registration: 'r-b' },
+  }));
+});
+
+it('clears orphan toggles and refreshes the count', async () => {
+  vi.mocked(api.orphans).mockResolvedValue({ orphans: [{ machine: 'a', harness: 'claude', kind: 'skill', item_id: 'gone', name: 'old' }] });
+  vi.mocked(api.pruneOrphans).mockImplementation(async () => {
+    vi.mocked(api.orphans).mockResolvedValue({ orphans: [] });
+    return { entries: [] };
+  });
+  await mount();
+  expect(await screen.findByText('1 toggle for items that no longer exist')).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: 'Clear' }));
+  const confirm = await screen.findByRole('dialog', { name: 'Clear orphan toggles?' });
+  const list = within(confirm).getByRole('table', { name: 'Orphan toggles' });
+  expect(within(list).getByText('old')).toBeTruthy();
+  expect(within(list).getByText('a')).toBeTruthy();
+  expect(within(list).getByText('claude')).toBeTruthy();
+  fireEvent.click(within(confirm).getByRole('button', { name: 'Clear' }));
+  await waitFor(() => expect(screen.queryByText('1 toggle for items that no longer exist')).toBeNull());
+  expect(api.pruneOrphans).toHaveBeenCalledOnce();
+});
+
+it('shows baseline and recreated Draft items with the same name as separate rows', async () => {
+  vi.mocked(api.items).mockResolvedValue([
+    { item: 'skill:pdf', id: 'pdf', in_baseline: true, draft: 'deleted', unpushed: false, description: null },
+    { item: 'skill:pdf', id: 'new-id', in_baseline: false, draft: 'added', unpushed: false, description: null },
+  ]);
+  await mount();
+  const baseline = screen.getByText('Deleted in Draft').closest('tr')!;
+  const draft = screen.getByText('Draft only').closest('tr')!;
+  expect(baseline.getAttribute('data-item-id')).toBe('pdf');
+  expect(draft.getAttribute('data-item-id')).toBe('new-id');
+  const cell = within(draft).getByRole('checkbox', { name: 'skill:pdf in a / claude, inherited' });
+  fireEvent.click(cell);
+  await waitFor(() => expect(api.setAssignment).toHaveBeenCalledWith('a', {
+    changes: [{ harness: 'claude', kind: 'skill', item_id: 'new-id', name: 'pdf', enabled: true }],
+    expected: { revision: 1, registration: 'r-a' },
+  }));
 });

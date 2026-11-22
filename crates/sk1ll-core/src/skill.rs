@@ -2,22 +2,24 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use crate::{IoExt, Result};
+use crate::{ItemId, Result};
 
 pub const PERSONAL_DIR: &str = "personal";
 pub const IMPORTED_DIR: &str = "imported";
+pub const ID_FILE: &str = ".sk1ll-id";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Origin {
     Personal,
     Imported,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Skill {
+    pub id: Option<ItemId>,
     pub name: String,
     pub origin: Origin,
     pub path: PathBuf,
@@ -28,28 +30,31 @@ pub struct Skill {
 
 /// All skills in the repo, by name. Personal skills take precedence.
 pub fn discover(root: &Path) -> Result<Vec<Skill>> {
+    let manifest = crate::item_id::manifest_on_disk(root)?;
+    let ids = crate::item_id::claims_on_disk(root, &manifest, |_| true)?;
+    crate::item_id::check_claims(&ids)?;
+    discover_with(root, &ids)
+}
+
+pub(crate) fn discover_with(root: &Path, ids: &crate::item_id::Claims) -> Result<Vec<Skill>> {
     let mut skills = BTreeMap::new();
-    for (origin, sub) in [(Origin::Imported, IMPORTED_DIR), (Origin::Personal, PERSONAL_DIR)] {
-        let dir = root.join(sub);
-        if !dir.is_dir() {
+    for (relative, id) in ids {
+        let origin = if relative.starts_with(IMPORTED_DIR) {
+            Origin::Imported
+        } else if relative.starts_with(PERSONAL_DIR) {
+            Origin::Personal
+        } else {
+            continue;
+        };
+        let path = root.join(relative);
+        let skill_md = path.join("SKILL.md");
+        if !skill_md.is_file() {
             continue;
         }
-        for entry in fs::read_dir(&dir).at(&dir)? {
-            let path = entry.at(&dir)?.path();
-            if path.file_name().is_some_and(|n| crate::source::is_staging_path(Path::new(n))) {
-                continue;
-            }
-            let skill_md = path.join("SKILL.md");
-            if !skill_md.is_file() {
-                continue;
-            }
-            let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
-                continue;
-            };
-            let description = fs::read_to_string(&skill_md).ok().and_then(|t| frontmatter_field(&t, "description"));
-            let shadows_import = origin == Origin::Personal && skills.contains_key(&name);
-            skills.insert(name.clone(), Skill { name, origin, path, description, shadows_import });
-        }
+        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let description = fs::read_to_string(&skill_md).ok().and_then(|t| frontmatter_field(&t, "description"));
+        let shadows_import = origin == Origin::Personal && skills.contains_key(&name);
+        skills.insert(name.clone(), Skill { id: id.clone(), name, origin, path, description, shadows_import });
     }
     Ok(skills.into_values().collect())
 }

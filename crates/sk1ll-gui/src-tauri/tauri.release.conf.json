@@ -6,6 +6,6 @@
     "category": "DeveloperTool",
     "shortDescription": "Agent skills and instructions, synced into every harness",
     "externalBin": ["binaries/sk1ll"],
-    "linux": { "deb": { "depends": ["git"] } }
+    "linux": { "deb": { "depends": ["git (>= 1:2.40)"] } }
   }
 }

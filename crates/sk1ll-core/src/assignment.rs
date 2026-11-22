@@ -1,8 +1,13 @@
 //! Assignment: which skills and rules are enabled in which harness.
 //!
-//! The fleet-wide assignment will live on the server (ADR 0001). Until then this
-//! is this machine's slice of it, keyed by harness name and kept as a local
-//! cache file. A missing file means everything is enabled everywhere.
+//! Toggles are keyed by [`ItemId`] (ADR 0006), so a rename never touches the
+//! assignment, and a toggle for an id no item has is inert. Skills and rules
+//! are kept apart: the new-items defaults are per kind, and a toggle's kind
+//! is known without looking up its item. Imports are skills.
+//!
+//! The fleet-wide assignment lives on the server (ADR 0001); this is one
+//! machine's slice of it, keyed by harness name and kept as a local file. A
+//! missing file means everything is enabled everywhere.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -10,7 +15,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::instructions::write_file;
-use crate::{Error, Result};
+use crate::{Error, ItemId, Result};
 
 pub const ASSIGNMENT_FILE: &str = "assignment.json";
 
@@ -30,9 +35,9 @@ pub struct HarnessAssignment {
     #[serde(default = "yes")]
     pub new_rules_default: bool,
     #[serde(default)]
-    pub skills: BTreeMap<String, bool>,
+    pub skills: BTreeMap<ItemId, bool>,
     #[serde(default)]
-    pub rules: BTreeMap<String, bool>,
+    pub rules: BTreeMap<ItemId, bool>,
 }
 
 fn yes() -> bool {
@@ -45,12 +50,17 @@ impl HarnessAssignment {
     const ALL_ENABLED: Self =
         Self { new_skills_default: true, new_rules_default: true, skills: BTreeMap::new(), rules: BTreeMap::new() };
 
-    pub fn skill_enabled(&self, name: &str) -> bool {
-        self.skills.get(name).copied().unwrap_or(self.new_skills_default)
+    /// A harness that starts with nothing enabled.
+    pub fn all_off() -> Self {
+        Self { new_skills_default: false, new_rules_default: false, ..Self::ALL_ENABLED }
     }
 
-    pub fn rule_enabled(&self, name: &str) -> bool {
-        self.rules.get(name).copied().unwrap_or(self.new_rules_default)
+    pub fn skill_enabled(&self, id: &ItemId) -> bool {
+        self.skills.get(id).copied().unwrap_or(self.new_skills_default)
+    }
+
+    pub fn rule_enabled(&self, id: &ItemId) -> bool {
+        self.rules.get(id).copied().unwrap_or(self.new_rules_default)
     }
 }
 
@@ -61,20 +71,43 @@ impl Default for HarnessAssignment {
 }
 
 impl Assignment {
-    /// `$XDG_CACHE_HOME/sk1ll/assignment.json` (or the platform equivalent).
+    /// `assignment.json` in sk1ll's cache directory ([`crate::paths::cache_dir`],
+    /// `$XDG_CACHE_HOME/sk1ll` by default).
     pub fn default_path() -> Result<PathBuf> {
-        dirs::cache_dir()
-            .map(|d| d.join("sk1ll").join(ASSIGNMENT_FILE))
-            .ok_or_else(|| Error::Invalid("cannot determine the cache directory".into()))
+        Ok(crate::paths::cache_dir()?.join(ASSIGNMENT_FILE))
     }
 
     /// Loads `path`; a missing file is the all-enabled default.
     pub fn load(path: &Path) -> Result<Self> {
-        match crate::config_file::read_text(path, true)? {
-            Some(text) => serde_json::from_str(&text)
-                .map_err(|e| Error::Parse { path: path.to_path_buf(), message: e.to_string() }),
-            None => Ok(Self::default()),
+        Ok(Self::observe(path)?.1)
+    }
+
+    /// The file's exact bytes (`None`: there is none) and what they hold,
+    /// read once: what a compare-and-swap of the file compares against.
+    pub fn observe(path: &Path) -> Result<(Option<Vec<u8>>, Self)> {
+        let bytes = crate::config_file::read_regular(path, true)?;
+        let assignment = match &bytes {
+            Some(bytes) => {
+                let parse = |message: String| Error::Parse { path: path.to_path_buf(), message };
+                let text = std::str::from_utf8(bytes).map_err(|e| parse(e.to_string()))?;
+                serde_json::from_str(text).map_err(|e| parse(e.to_string()))?
+            }
+            None => Self::default(),
+        };
+        Ok((bytes, assignment))
+    }
+
+    /// Saves `self` over the file only if it still holds exactly `expected`
+    /// (`None`: there is no file), the bytes what is saved was derived from;
+    /// `false`, with nothing written, if not. The file is replaced
+    /// atomically, so only a write landing between the check and the rename
+    /// can still be replaced.
+    pub fn swap(&self, path: &Path, expected: Option<&[u8]>) -> Result<bool> {
+        if crate::config_file::read_regular(path, true)?.as_deref() != expected {
+            return Ok(false);
         }
+        self.save(path)?;
+        Ok(true)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -88,35 +121,35 @@ impl Assignment {
         self.harnesses.get(harness).unwrap_or(&ALL_ENABLED)
     }
 
-    pub fn skill_enabled(&self, harness: &str, name: &str) -> bool {
-        self.harness(harness).skill_enabled(name)
+    pub fn skill_enabled(&self, harness: &str, id: &ItemId) -> bool {
+        self.harness(harness).skill_enabled(id)
     }
 
-    pub fn rule_enabled(&self, harness: &str, name: &str) -> bool {
-        self.harness(harness).rule_enabled(name)
+    pub fn rule_enabled(&self, harness: &str, id: &ItemId) -> bool {
+        self.harness(harness).rule_enabled(id)
     }
 
-    pub fn set_skill(&mut self, harness: &str, name: &str, enabled: bool) {
-        self.entry(harness).skills.insert(name.to_string(), enabled);
+    pub fn set_skill(&mut self, harness: &str, id: &ItemId, enabled: bool) {
+        self.entry(harness).skills.insert(id.clone(), enabled);
     }
 
-    pub fn set_rule(&mut self, harness: &str, name: &str, enabled: bool) {
-        self.entry(harness).rules.insert(name.to_string(), enabled);
+    pub fn set_rule(&mut self, harness: &str, id: &ItemId, enabled: bool) {
+        self.entry(harness).rules.insert(id.clone(), enabled);
     }
 
     /// Records current values for existing skills before changing their default.
-    pub fn materialize_skills(&mut self, harness: &str, names: &[String]) {
+    pub fn materialize_skills(&mut self, harness: &str, ids: &[ItemId]) {
         let a = self.entry(harness);
-        for name in names {
-            a.skills.entry(name.clone()).or_insert(a.new_skills_default);
+        for id in ids {
+            a.skills.entry(id.clone()).or_insert(a.new_skills_default);
         }
     }
 
     /// Records current values for existing rules before changing their default.
-    pub fn materialize_rules(&mut self, harness: &str, names: &[String]) {
+    pub fn materialize_rules(&mut self, harness: &str, ids: &[ItemId]) {
         let a = self.entry(harness);
-        for name in names {
-            a.rules.entry(name.clone()).or_insert(a.new_rules_default);
+        for id in ids {
+            a.rules.entry(id.clone()).or_insert(a.new_rules_default);
         }
     }
 
@@ -130,6 +163,30 @@ impl Assignment {
         self.entry(harness).new_rules_default = enabled;
     }
 
+    /// Sets both defaults and every explicit toggle of `harness`, so that
+    /// every item, known here or not, has that value there.
+    pub fn set_harness(&mut self, harness: &str, enabled: bool) {
+        let a = self.entry(harness);
+        a.new_skills_default = enabled;
+        a.new_rules_default = enabled;
+        a.skills.values_mut().chain(a.rules.values_mut()).for_each(|v| *v = enabled);
+    }
+
+    /// Moves `from`'s toggles and defaults to `to`, replacing any `to` had.
+    /// `false` if `from` has no entry (it was all-enabled; so is `to` then).
+    pub fn rename_harness(&mut self, from: &str, to: &str) -> bool {
+        match self.harnesses.remove(from) {
+            Some(a) => {
+                self.harnesses.insert(to.to_string(), a);
+                true
+            }
+            None => {
+                self.harnesses.remove(to);
+                false
+            }
+        }
+    }
+
     fn entry(&mut self, harness: &str) -> &mut HarnessAssignment {
         self.harnesses.entry(harness.to_string()).or_default()
     }
@@ -140,46 +197,82 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn id(s: &str) -> ItemId {
+        ItemId::from_text(s).unwrap()
+    }
+
     #[test]
     fn materializing_preserves_existing_items_when_defaults_change() {
         let mut a = Assignment::default();
-        a.set_skill("h", "off", false);
-        a.set_rule("h", "off", false);
-        let names = vec!["implicit".to_string(), "off".to_string()];
-        a.materialize_skills("h", &names);
-        a.materialize_rules("h", &names);
+        let (implicit, off, later, new) = (id("implicit"), id("off"), id("later"), id("new"));
+        a.set_skill("h", &off, false);
+        a.set_rule("h", &off, false);
+        let ids = vec![implicit.clone(), off.clone()];
+        a.materialize_skills("h", &ids);
+        a.materialize_rules("h", &ids);
         a.set_new_skills_default("h", false);
         a.set_new_rules_default("h", false);
-        assert!(a.skill_enabled("h", "implicit") && a.rule_enabled("h", "implicit"));
-        assert!(!a.skill_enabled("h", "off") && !a.rule_enabled("h", "off"));
-        assert!(!a.skill_enabled("h", "later") && !a.rule_enabled("h", "later"));
-        let names = vec!["implicit".to_string(), "later".to_string()];
-        a.materialize_skills("h", &names);
-        a.materialize_rules("h", &names);
+        assert!(a.skill_enabled("h", &implicit) && a.rule_enabled("h", &implicit));
+        assert!(!a.skill_enabled("h", &off) && !a.rule_enabled("h", &off));
+        assert!(!a.skill_enabled("h", &later) && !a.rule_enabled("h", &later));
+        let ids = vec![implicit, later.clone()];
+        a.materialize_skills("h", &ids);
+        a.materialize_rules("h", &ids);
         a.set_new_skills_default("h", true);
         a.set_new_rules_default("h", true);
-        assert!(!a.skill_enabled("h", "later") && !a.rule_enabled("h", "later"));
-        assert!(a.skill_enabled("h", "new") && a.rule_enabled("h", "new"));
+        assert!(!a.skill_enabled("h", &later) && !a.rule_enabled("h", &later));
+        assert!(a.skill_enabled("h", &new) && a.rule_enabled("h", &new));
     }
 
     #[test]
     fn toggles_override_defaults() {
         let mut a = Assignment::default();
-        assert!(a.skill_enabled("claude", "pdf") && a.rule_enabled("claude", "git"));
+        let (pdf, git, other) = (id("pdf"), id("git"), id("other"));
+        assert!(a.skill_enabled("claude", &pdf) && a.rule_enabled("claude", &git));
 
-        a.set_skill("claude", "pdf", false);
+        a.set_skill("claude", &pdf, false);
         a.set_new_skills_default("codex", false);
-        a.set_skill("codex", "pdf", true);
+        a.set_skill("codex", &pdf, true);
         a.set_new_rules_default("codex", false);
-        assert!(!a.skill_enabled("claude", "pdf"));
-        assert!(a.skill_enabled("claude", "other"));
-        assert!(a.skill_enabled("codex", "pdf"));
-        assert!(!a.skill_enabled("codex", "other"));
-        assert!(!a.rule_enabled("codex", "git"));
+        assert!(!a.skill_enabled("claude", &pdf));
+        assert!(a.skill_enabled("claude", &other));
+        assert!(a.skill_enabled("codex", &pdf));
+        assert!(!a.skill_enabled("codex", &other));
+        assert!(!a.rule_enabled("codex", &git));
+        // Kinds are apart: a skill toggle never decides a rule.
+        assert!(a.rule_enabled("claude", &pdf));
 
-        a.set_rule("codex", "git", true);
-        assert!(a.rule_enabled("codex", "git"));
-        assert!(a.skill_enabled("gemini", "pdf"));
+        a.set_rule("codex", &git, true);
+        assert!(a.rule_enabled("codex", &git));
+        assert!(a.skill_enabled("gemini", &pdf));
+    }
+
+    #[test]
+    fn setting_a_harness_reaches_every_item() {
+        let mut a = Assignment::default();
+        let (on, off, unknown) = (id("on"), id("off"), id("unknown"));
+        a.set_skill("h", &on, true);
+        a.set_rule("h", &off, false);
+        a.set_skill("other", &on, true);
+        a.set_harness("h", false);
+        assert!(!a.skill_enabled("h", &on) && !a.skill_enabled("h", &unknown) && !a.rule_enabled("h", &unknown));
+        a.set_harness("h", true);
+        assert!(a.rule_enabled("h", &off) && a.skill_enabled("h", &unknown));
+        assert!(a.skill_enabled("other", &on));
+    }
+
+    #[test]
+    fn renaming_a_harness_moves_its_toggles() {
+        let mut a = Assignment::default();
+        let pdf = id("pdf");
+        a.set_skill("old", &pdf, false);
+        a.set_new_rules_default("old", false);
+        a.set_skill("new", &pdf, true);
+        assert!(a.rename_harness("old", "new"));
+        assert!(!a.harnesses.contains_key("old"));
+        assert!(!a.skill_enabled("new", &pdf) && !a.harness("new").new_rules_default);
+        assert!(!a.rename_harness("missing", "new"));
+        assert!(a.skill_enabled("new", &pdf), "an all-enabled harness renames to an all-enabled one");
     }
 
     #[test]
@@ -189,14 +282,16 @@ mod tests {
         assert_eq!(Assignment::load(&path).unwrap(), Assignment::default());
 
         let mut a = Assignment::default();
-        a.set_skill("claude", "pdf", false);
+        a.set_skill("claude", &id("01J0000000000000000000PDF0"), false);
         a.set_new_rules_default("claude", false);
         a.save(&path).unwrap();
         assert_eq!(Assignment::load(&path).unwrap(), a);
 
         fs::write(&path, r#"{"harnesses":{"claude":{"skills":{"x":false}}}}"#).unwrap();
         let partial = Assignment::load(&path).unwrap();
-        assert!(!partial.skill_enabled("claude", "x"));
+        assert!(!partial.skill_enabled("claude", &id("x")));
         assert!(partial.harness("claude").new_skills_default);
+        fs::write(&path, r#"{"harnesses":{"claude":{"skills":{"":false}}}}"#).unwrap();
+        assert!(Assignment::load(&path).is_err(), "an empty id is refused");
     }
 }

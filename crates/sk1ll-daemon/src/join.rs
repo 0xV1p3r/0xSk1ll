@@ -9,8 +9,8 @@ use sk1ll_proto::{AssignmentSnapshot, ErrorBody, JoinCode, JoinRequest, JoinResp
 
 use crate::Config;
 use crate::client::{Client, JoinApiRequest};
-use crate::gitx::{self, Setup};
 use crate::state::{self, DaemonState};
+use sk1ll_core::git::plumbing::{self, Setup};
 
 #[derive(Clone)]
 pub struct JoinOptions {
@@ -62,8 +62,10 @@ pub(crate) struct Registered {
 /// Joins the fleet: registers this machine and its harnesses with the server,
 /// stores the token (0600) and the assignment snapshot, and clones the
 /// server's repo (or adopts an existing clone of it). The repo path is checked
-/// before the code is spent.
+/// before the code is spent. Holds the machine lock throughout, so no engine
+/// runs on the Machine meanwhile.
 pub async fn join(cfg: &Config, opts: JoinOptions) -> anyhow::Result<Joined> {
+    let _machine = crate::MachineLock::acquire(cfg)?;
     let reg = register(cfg, &opts, false).await?;
     reg.persist(cfg)?;
     tokio::task::spawn_blocking(move || reg.set_up_repo()).await?
@@ -135,7 +137,7 @@ async fn register_with_timeout(
 pub(crate) async fn register_standalone(cfg: &Config, opts: &JoinOptions) -> anyhow::Result<(Registered, PathBuf)> {
     let url = opts.server_url.trim().trim_end_matches('/');
     let repo = absolute(&opts.repo)?;
-    gitx::check_standalone_join(&repo, &format!("{url}{REPO_PATH}"))?;
+    plumbing::check_standalone_join(&repo, &format!("{url}{REPO_PATH}"))?;
     let machine = MachineConfig::load(&cfg.machine_config)?;
     let id = opts.machine_id.as_deref().unwrap_or(&machine.id);
     // Repeating the original request after a local failure uses the issued
@@ -176,7 +178,7 @@ async fn register_inner(
     if !(server_url.starts_with("http://") || server_url.starts_with("https://")) {
         bail!("the server URL must start with http:// or https:// (got `{}`)", crate::auth::redact(&server_url));
     }
-    if crate::state::has_credentials(&server_url) {
+    if plumbing::has_credentials(&server_url) {
         bail!("the server URL must not contain credentials");
     }
     if insecure_http(&server_url) {
@@ -196,9 +198,9 @@ async fn register_inner(
     let repo = absolute(&opts.repo)?;
     let remote = format!("{server_url}{REPO_PATH}");
     if standalone {
-        gitx::check_standalone_join(&repo, &remote)?;
+        plumbing::check_standalone_join(&repo, &remote)?;
     } else {
-        gitx::check_repo_path(&repo, &remote)?;
+        plumbing::check_repo_path(&repo, &remote)?;
     }
 
     // Joining a machine without a repo is its first-run setup: it takes up
@@ -238,18 +240,29 @@ async fn register_inner(
         tracing::warn!("the server serves its repo at {}, not {REPO_PATH}", joined.repo_path);
     }
     Ok(Registered {
-        state: DaemonState { machine_id: joined.machine_id, server_url, token: joined.token, repo, revoked: false },
+        state: DaemonState::new(joined.machine_id, server_url, joined.token, repo),
         snapshot: AssignmentSnapshot { revision: joined.revision, assignment: joined.assignment, registration: None },
         harnesses,
     })
 }
 
 #[cfg(test)]
+type PersistHook = Box<dyn FnOnce() -> anyhow::Result<()>>;
+
+#[cfg(test)]
 thread_local! {
     static BEFORE_CREDENTIALS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
+    /// Runs in [`Registered::persist`] between the snapshot and the
+    /// credentials: an error stands for the process stopping there.
+    static AFTER_SNAPSHOT: std::cell::RefCell<Option<PersistHook>> = Default::default();
 }
 
 impl Registered {
+    #[cfg(test)]
+    pub(crate) fn for_test(state: DaemonState, snapshot: AssignmentSnapshot) -> Self {
+        Self { state, snapshot, harnesses: Vec::new() }
+    }
+
     pub(crate) fn state(&self) -> &DaemonState {
         &self.state
     }
@@ -270,11 +283,16 @@ impl Registered {
         Ok(path)
     }
 
-    /// Stores the token and the assignment snapshot. The token is shown only
-    /// once, so this comes before anything else that can fail.
+    /// Stores the assignment snapshot, then the token. The token is shown
+    /// only once, so this comes before anything else that can fail. The
+    /// snapshot is tagged with the new registration and written first: a
+    /// stop in between leaves the old credentials, which ignore it, never the
+    /// new credentials with the old registration's snapshot.
     pub(crate) fn persist(&self, cfg: &Config) -> anyhow::Result<()> {
+        state::save_snapshot(&cfg.snapshot_path(), &self.snapshot, Some(&self.state.registration_key()))?;
+        #[cfg(test)]
+        AFTER_SNAPSHOT.with_borrow_mut(|hook| hook.take().map_or(Ok(()), |hook| hook()))?;
         self.state.save(&cfg.state)?;
-        state::save_snapshot(&cfg.snapshot_path(), &self.snapshot)?;
         // The CLI's read-only commands read the cache; it is only a mirror.
         if let Err(e) = self.snapshot.assignment.save(&cfg.assignment) {
             tracing::warn!("writing the assignment cache {}: {e}", cfg.assignment.display());
@@ -282,11 +300,28 @@ impl Registered {
         Ok(())
     }
 
+    /// A registration that is not used after all: best effort, asks the
+    /// server to remove it again with its own token. If the server can't be
+    /// reached, it stays in the Fleet as a Machine that never connects,
+    /// for an admin to remove.
+    pub(crate) async fn discard(&self, http: &reqwest::Client) {
+        let url = format!("{}/api/machines/{}", self.state.server_url, self.state.machine_id);
+        let sent = http.delete(url).bearer_auth(&self.state.token).timeout(std::time::Duration::from_secs(10)).send();
+        match sent.await.map(|r| r.error_for_status()) {
+            Ok(Ok(_)) => tracing::info!("removed the unused registration `{}` again", self.state.machine_id),
+            Ok(Err(e)) | Err(e) => tracing::warn!(
+                "the unused registration `{}` stays in the Fleet until it is removed: {}",
+                self.state.machine_id,
+                crate::auth::redact(&e.to_string())
+            ),
+        }
+    }
+
     /// Build the replacement privately and lock it before it can become live.
     pub(crate) fn prepare_standalone_repo(&self) -> anyhow::Result<StandaloneRepo> {
         let repo = &self.state.repo;
-        gitx::check_standalone_join(repo, &self.state.repo_url())?;
-        let pristine = gitx::is_pristine_init(repo)?;
+        plumbing::check_standalone_join(repo, &self.state.repo_url())?;
+        let pristine = plumbing::is_pristine_init(repo)?;
         let exists = repo.symlink_metadata().is_ok();
         let empty = exists && std::fs::read_dir(repo)?.next().is_none();
         if !pristine && exists && !empty {
@@ -317,7 +352,11 @@ impl Registered {
     /// snapshot and mirror succeed, restoring every earlier file on failure.
     pub(crate) fn persist_standalone(&self, cfg: &Config) -> anyhow::Result<()> {
         let mut files = [
-            ActivationFile::stage(cfg.snapshot_path(), &self.snapshot, true)?,
+            ActivationFile::stage(
+                cfg.snapshot_path(),
+                &state::StoredSnapshot::new(&self.snapshot, Some(&self.state.registration_key())),
+                true,
+            )?,
             ActivationFile::stage(cfg.assignment.clone(), &self.snapshot.assignment, true)?,
             ActivationFile::stage(cfg.state.clone(), &self.state, false)?,
         ];
@@ -353,13 +392,13 @@ impl Registered {
 
     fn set_up_repo_at(&self, repo: &Path) -> anyhow::Result<Joined> {
         let env = crate::auth::git_credentials_env(&self.state);
-        let setup = gitx::ensure_clone(repo, &self.state.repo_url(), &env).with_context(|| {
+        let setup = plumbing::ensure_clone(repo, &self.state.repo_url(), &env).with_context(|| {
             format!("joined, but setting up {} failed; the daemon retries at startup", repo.display())
         })?;
         // An existing clone must continue the server's history (its branch was
         // checked before the code was spent; its history needs the server).
         if setup == Setup::Adopted {
-            gitx::check_shares_history(repo, &env)
+            plumbing::check_shares_history(repo, &env)
                 .with_context(|| format!("joined, but the existing clone at {} can't be used", repo.display()))?;
         }
         Ok(Joined {
@@ -387,12 +426,18 @@ struct Replacement {
     published: bool,
 }
 impl StandaloneRepo {
+    /// Whether publishing moves a private clone into place (else the
+    /// existing clone is used where it is).
+    pub(crate) fn replaces(&self) -> bool {
+        self.replacement.is_some()
+    }
+
     pub(crate) fn publish(&mut self) -> anyhow::Result<()> {
         let Some(r) = &mut self.replacement else { return Ok(()) };
         if r.had_original {
             // Refuse edits made while the private clone was being built.
             let empty = std::fs::read_dir(&r.repo)?.next().is_none();
-            if !empty && !gitx::is_pristine_init(&r.repo)? {
+            if !empty && !plumbing::is_pristine_init(&r.repo)? {
                 bail!("the standalone repo changed during join; move the draft aside and retry");
             }
             sk1ll_core::placement::rename_noreplace(&r.repo, &r.area.join("repo"))?;
@@ -505,6 +550,7 @@ mod tests {
                 token: "secret".into(),
                 repo: root.join("repo"),
                 revoked: false,
+                record: Default::default(),
             },
             snapshot: AssignmentSnapshot { revision: 42, ..Default::default() },
             harnesses: vec![],
@@ -517,7 +563,7 @@ mod tests {
         let reg = registration(tmp.path());
         let seed = tmp.path().join("seed");
         sk1ll_core::Repo::init(&seed).unwrap();
-        let git = |dir: &Path, args: &[&str]| gitx::run(dir, args).unwrap();
+        let git = |dir: &Path, args: &[&str]| plumbing::run(dir, args).unwrap();
         git(&seed, &["add", "-A"]);
         git(
             &seed,
@@ -557,6 +603,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let reg = registration(tmp.path());
         let mut cfg = Config::new().unwrap();
+        cfg.state_dir = tmp.path().join("sk1ll-state");
         cfg.state = tmp.path().join("daemon.json");
         cfg.assignment = tmp.path().join("assignment.json");
         std::fs::write(cfg.snapshot_path(), "original snapshot").unwrap();
@@ -580,6 +627,41 @@ mod tests {
         assert_eq!(std::fs::read(cfg.state.join("notes")).unwrap(), b"private");
     }
 
+    /// A stop between the rejoin's two writes never leaves the new
+    /// credentials with the old registration's snapshot: the snapshot comes
+    /// first and belongs to the new registration, which the old credentials
+    /// don't load.
+    #[test]
+    fn a_rejoin_stopped_half_way_never_pairs_new_credentials_with_the_old_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = Config::new().unwrap();
+        cfg.state_dir = tmp.path().join("sk1ll-state");
+        cfg.state = tmp.path().join("daemon.json");
+        cfg.assignment = tmp.path().join("assignment.json");
+        let old = DaemonState::new("a".into(), "http://h".into(), "old".into(), tmp.path().join("repo"));
+        old.save(&cfg.state).unwrap();
+        let mut toggles = AssignmentSnapshot { revision: 50, ..Default::default() };
+        toggles.assignment.set_harness("h", true);
+        state::save_snapshot(&cfg.snapshot_path(), &toggles, Some(&old.registration_key())).unwrap();
+
+        let mut reg = registration(tmp.path());
+        reg.state.token = "new".into();
+        reg.snapshot = AssignmentSnapshot { revision: 7, ..Default::default() };
+        AFTER_SNAPSHOT.with_borrow_mut(|hook| *hook = Some(Box::new(|| anyhow::bail!("the process stopped"))));
+        assert!(reg.persist(&cfg).is_err());
+        let stored = DaemonState::load(&cfg.state).unwrap().unwrap();
+        assert_eq!(stored.token, "old", "the old credentials are still there");
+        let snapshot = state::load_snapshot(&cfg.snapshot_path(), Some(&stored.registration_key())).unwrap();
+        assert_eq!(snapshot, None, "the old registration doesn't take up the new one's snapshot");
+
+        reg.persist(&cfg).unwrap();
+        let stored = DaemonState::load(&cfg.state).unwrap().unwrap();
+        assert_eq!(stored.token, "new");
+        let snapshot = state::load_snapshot(&cfg.snapshot_path(), Some(&stored.registration_key())).unwrap();
+        assert_eq!(snapshot.unwrap().revision, 7, "a higher old revision never masks the new snapshot");
+        assert_eq!(state::load_snapshot(&cfg.snapshot_path(), Some(&old.registration_key())).unwrap(), None);
+    }
+
     #[tokio::test]
     async fn stalled_join_times_out() {
         let tmp = tempfile::tempdir().unwrap();
@@ -590,6 +672,7 @@ mod tests {
             std::future::pending::<()>().await;
         });
         let mut cfg = Config::new().unwrap();
+        cfg.state_dir = tmp.path().join("sk1ll-state");
         cfg.state = tmp.path().join("state");
         cfg.machine_config = tmp.path().join("machine.toml");
         let opts = JoinOptions {

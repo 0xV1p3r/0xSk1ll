@@ -2,7 +2,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
+#[cfg(not(test))]
 use sk1ll_core::{Assignment, MachineConfig};
+
+/// How often a full reconcile runs by default (see [`Config::full_reconcile_every`]).
+pub const FULL_RECONCILE_EVERY: Duration = Duration::from_secs(600);
 
 /// Daemon settings: where its files live and how often it does things.
 #[derive(Debug, Clone)]
@@ -17,6 +21,15 @@ pub struct Config {
     /// Assignment cache (`SK1LL_ASSIGNMENT`, default `~/.cache/sk1ll/assignment.json`).
     /// Authoritative in standalone; a mirror of the server snapshot when joined.
     pub assignment: PathBuf,
+    /// sk1ll's own state directory (`SK1LL_STATE_DIR`, default
+    /// `$XDG_STATE_HOME/sk1ll`, else the platform's data directory's
+    /// `sk1ll`): the machine lock's files (`locks/`) and a pending Harness
+    /// rename (`harness-rename/`), each named by the hash of the real path of
+    /// the file it is about, so none of them lands beside a user's file.
+    pub state_dir: PathBuf,
+    /// sk1ll's own cache directory (`SK1LL_CACHE_DIR`, default
+    /// `$XDG_CACHE_HOME/sk1ll`): import sources are fetched into `git/`.
+    pub cache_dir: PathBuf,
     /// Local API socket (`SK1LL_DAEMON_SOCKET`, default
     /// `$XDG_RUNTIME_DIR/sk1ll/daemon.sock`, else `run/daemon.sock` in the
     /// config dir, as on macOS). Its directory must be ours and mode 0700.
@@ -31,6 +44,11 @@ pub struct Config {
     /// Local re-sync of the harnesses, whether or not the server is reachable
     /// (`SK1LL_RECONCILE_INTERVAL`, default `60s`).
     pub reconcile_every: Duration,
+    /// A reconcile that plans and rehashes everything, whatever the input
+    /// fingerprint and the hash cache say, at most this long after the last
+    /// one (`SK1LL_FULL_RECONCILE_INTERVAL`, default `10m`): what metadata
+    /// misses is noticed by then, give or take one `reconcile_every`.
+    pub full_reconcile_every: Duration,
     /// After the server has rejected the token this long, `/status` says the
     /// machine was probably removed (`SK1LL_AUTH_WARN_AFTER`, default `24h`).
     /// It is never revoked automatically.
@@ -42,22 +60,59 @@ pub struct Config {
 }
 
 impl Config {
-    /// Defaults from the platform's config, cache and runtime dirs.
+    /// Defaults from the platform's config, cache and runtime dirs. In this
+    /// crate's own tests, from a temporary directory instead, which core's
+    /// state and cache directories follow too: no test reaches the real
+    /// home directory.
     pub fn new() -> anyhow::Result<Self> {
-        Ok(Self {
+        #[cfg(test)]
+        {
+            let home = test_home();
+            Ok(Self::with_paths(
+                home.join("config/daemon.json"),
+                home.join("config/machine.toml"),
+                home.join("cache/assignment.json"),
+                home.join("state"),
+                home.join("cache"),
+                home.join("run/daemon.sock"),
+            ))
+        }
+        #[cfg(not(test))]
+        Ok(Self::with_paths(
+            config_dir()?.join("daemon.json"),
+            MachineConfig::default_path()?,
+            Assignment::default_path()?,
+            sk1ll_core::paths::state_dir()?,
+            sk1ll_core::paths::cache_dir()?,
+            Self::default_socket()?,
+        ))
+    }
+
+    fn with_paths(
+        state: PathBuf,
+        machine_config: PathBuf,
+        assignment: PathBuf,
+        state_dir: PathBuf,
+        cache_dir: PathBuf,
+        socket: PathBuf,
+    ) -> Self {
+        Self {
             repo: None,
-            state: config_dir()?.join("daemon.json"),
-            machine_config: MachineConfig::default_path()?,
-            assignment: Assignment::default_path()?,
-            socket: Self::default_socket()?,
+            state,
+            machine_config,
+            assignment,
+            state_dir,
+            cache_dir,
+            socket,
             pull_every: Duration::from_secs(300),
             debounce: Duration::from_millis(300),
             debounce_max: Duration::from_secs(2),
             reconcile_every: Duration::from_secs(60),
+            full_reconcile_every: FULL_RECONCILE_EVERY,
             auth_warn_after: Duration::from_secs(24 * 3600),
             reconnect_min: Duration::from_millis(500),
             reconnect_max: Duration::from_secs(60),
-        })
+        }
     }
 
     /// [`Config::new`] adjusted by `SK1LL_*` environment variables.
@@ -76,6 +131,12 @@ impl Config {
         if let Some(v) = var("SK1LL_ASSIGNMENT") {
             cfg.assignment = v.into();
         }
+        if let Some(v) = var("SK1LL_STATE_DIR") {
+            cfg.state_dir = v.into();
+        }
+        if let Some(v) = var("SK1LL_CACHE_DIR") {
+            cfg.cache_dir = v.into();
+        }
         if let Some(v) = var("SK1LL_DAEMON_SOCKET") {
             cfg.socket = v.into();
         }
@@ -89,6 +150,7 @@ impl Config {
         dur("SK1LL_DEBOUNCE", &mut cfg.debounce)?;
         dur("SK1LL_DEBOUNCE_MAX", &mut cfg.debounce_max)?;
         dur("SK1LL_RECONCILE_INTERVAL", &mut cfg.reconcile_every)?;
+        dur("SK1LL_FULL_RECONCILE_INTERVAL", &mut cfg.full_reconcile_every)?;
         dur("SK1LL_AUTH_WARN_AFTER", &mut cfg.auth_warn_after)?;
         dur("SK1LL_RECONNECT_MAX", &mut cfg.reconnect_max)?;
         cfg.reconnect_min = cfg.reconnect_min.min(cfg.reconnect_max);
@@ -102,9 +164,32 @@ impl Config {
         self.state.with_file_name("daemon-assignment.json")
     }
 
-    /// Undelivered `draft_discarded` messages, next to the state file.
-    pub fn outbox_path(&self) -> PathBuf {
-        self.state.with_file_name("daemon-outbox.json")
+    /// A standalone Machine's Assignment revision, next to the state file.
+    pub fn standalone_assignment_path(&self) -> PathBuf {
+        self.state.with_file_name("standalone-assignment.json")
+    }
+
+    /// The notifications already shown, next to the state file.
+    pub fn notifications_path(&self) -> PathBuf {
+        self.state.with_extension("notifications.json")
+    }
+
+    /// Every file an engine for this Machine may write, outside the repo,
+    /// the harness directories (which have locks of their own) and
+    /// [`Config::state_dir`]: what the machine lock covers
+    /// ([`crate::MachineLock`]). A pending Harness rename is kept in the
+    /// state directory under `machine.toml`'s real path, so `machine.toml`'s
+    /// lock covers it.
+    pub fn machine_files(&self) -> Vec<PathBuf> {
+        vec![
+            self.state.clone(),
+            self.machine_config.clone(),
+            self.assignment.clone(),
+            self.snapshot_path(),
+            self.standalone_assignment_path(),
+            crate::state::standalone_record_path(&self.state),
+            self.notifications_path(),
+        ]
     }
 
     /// `SK1LL_DAEMON_SOCKET`, else `$XDG_RUNTIME_DIR/sk1ll/daemon.sock`, else
@@ -120,6 +205,19 @@ impl Config {
             None => Ok(config_dir()?.join("run").join("daemon.sock")),
         }
     }
+}
+
+/// The temporary home of this crate's tests (see [`Config::new`]).
+#[cfg(test)]
+pub(crate) fn test_home() -> &'static std::path::Path {
+    static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let dirs = sk1ll_core::paths::Dirs { state: home.path().join("state"), cache: home.path().join("cache") };
+        sk1ll_core::paths::use_dirs(dirs);
+        home
+    })
+    .path()
 }
 
 fn config_dir() -> anyhow::Result<PathBuf> {

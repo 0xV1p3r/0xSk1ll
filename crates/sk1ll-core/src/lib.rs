@@ -5,6 +5,7 @@
 //! IPC boundary (e.g. Tauri commands) unchanged.
 
 pub mod assignment;
+pub mod baseline_check;
 pub mod bundled;
 pub mod config_file;
 pub mod content;
@@ -12,13 +13,18 @@ pub mod draft;
 pub mod engine;
 pub mod git;
 pub mod harness_change;
+pub mod harness_rename;
 pub mod hash;
 pub mod imports;
 pub mod instructions;
+pub mod item_id;
 pub mod lock;
 pub mod machine;
 pub mod manifest;
+pub mod paths;
 pub mod placement;
+pub mod real_path;
+pub mod redact;
 pub mod repo;
 pub mod skill;
 pub mod source;
@@ -36,6 +42,7 @@ pub use imports::{
     FetchedLink, FetchedUpdates, ImportState, ImportStatus, ResolvedSource, SkillCandidate, UpdateReport, UpdateTargets,
 };
 pub use instructions::Rule;
+pub use item_id::ItemId;
 pub use lock::{LockEntry, Lockfile};
 pub use machine::{
     EffectiveHarness, Harness, HarnessChange, HarnessChoice, HarnessEntry, HarnessOrigin, InstructionsFormat, LinkMode,
@@ -58,18 +65,40 @@ pub enum Error {
     Parse { path: PathBuf, message: String },
     #[error("`git {args}` failed: {stderr}")]
     Git { args: String, stderr: String },
+    #[error("duplicate Item ID `{id}` at {} and {}", first.display(), second.display())]
+    DuplicateItemId { id: ItemId, first: PathBuf, second: PathBuf },
+    #[error("interrupted rename left an item staged at {}. Move it to its intended name before retrying", path.display())]
+    StrandedRename { path: PathBuf },
     #[error("{0}")]
     Invalid(String),
+    /// A pull stopped half-way (its journal is still there): its tree is
+    /// partial, so nothing that writes Item IDs, syncs or pushes may run
+    /// until the pull is finished.
+    #[error(
+        "a pull stopped half-way and has to finish first: restore what blocks it (copy edits you want to keep aside \
+         first), then run `sk1ll pull`"
+    )]
+    PullPending,
+    /// The Baseline a pull would move onto (`baseline`) writes `paths`
+    /// through a git filter driver, which the skills repo doesn't support
+    /// (the server has no LFS endpoint). The pull changed nothing; `items`:
+    /// those `paths` belong to.
+    #[error(
+        "the skills repo uses a git filter driver (e.g. Git LFS) on {}; sk1ll doesn't support filter drivers in the \
+         skills repo — remove `filter=` from .gitattributes",
+        paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+    )]
+    FilterDriver { baseline: String, paths: Vec<PathBuf>, items: Vec<ItemRef> },
     /// What an operation was planned from changed before it was made, so
     /// nothing was done: look again (re-read, preview again) and retry.
     #[error("{0}")]
     Changed(String),
-    /// Sync replaced or removed `dest`, but the content it displaced was
-    /// written to while that happened. Nothing is lost: that content is kept,
-    /// never pruned, in the recovery area at `kept` (see [`sync::displaced`])
-    /// until it is adopted or discarded by `id`.
+    /// Sync (or pull, in the skills repo) replaced or removed `dest`, but the
+    /// content it displaced was written to while that happened. Nothing is
+    /// lost: that content is kept, never pruned, in the recovery area at
+    /// `kept` (see [`sync::displaced`]) until it is adopted or discarded by `id`.
     #[error(
-        "{} was written to while sync replaced it; that version is kept at {} (adopt or discard displaced \
+        "{} was written to while sk1ll replaced it; that version is kept at {} (adopt or discard displaced \
          entry `{id}`)",
         dest.display(),
         kept.display()

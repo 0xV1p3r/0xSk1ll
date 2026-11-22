@@ -4,7 +4,7 @@ import type * as T from '../types';
 
 const now = Math.floor(Date.now() / 1000);
 const report = (overrides: Partial<T.MachineReport> = {}): T.MachineReport => ({
-  baseline: '9f3c2a17d4e1', drafts: [], unpushed: [], conflicts: [], harnesses: ['claude', 'codex'],
+  seq: 1, items: [], inventory_complete: true, baseline: '9f3c2a17d4e1', drafts: [], unpushed: [], conflicts: [], harnesses: ['claude', 'codex'],
   blocked: false, clashes: [], behind: false, ...overrides,
 });
 const harness = (skills: Record<string, boolean> = {}, rules: Record<string, boolean> = {}): T.HarnessAssignment =>
@@ -21,10 +21,10 @@ export function installMock(scenario: string) {
     headline: empty ? 'in_sync' : 'conflict', connection: standalone ? 'standalone' : scenario === 'auth' ? 'auth_rejected' : 'connected',
     last_error: scenario === 'auth' ? 'Server returned 401 Unauthorized' : null, revoked: scenario === 'revoked',
     server_baseline: '9f3c2a17d4e1', assignment_revision: 42, awaiting_assignment: scenario === 'awaiting',
-    auth_rejected_since: scenario === 'auth' ? now - 600 : null, pending_discards: 0, report: local,
+    auth_rejected_since: scenario === 'auth' ? now - 600 : null, report: local,
   };
   const machines: T.MachineRow[] = [
-    { id: 'workstation', registration: 'reg-workstation', status: status.headline, connected: true, joined_at: now - 86400 * 30, last_seen: now - 4, report: local },
+    { id: 'workstation', scope: scenario === 'self' ? 'self' : 'fleet', registration: 'reg-workstation', status: status.headline, connected: true, joined_at: now - 86400 * 30, last_seen: now - 4, report: local },
     { id: 'laptop', registration: 'reg-laptop', status: 'behind', connected: true, joined_at: now - 86400 * 12, last_seen: now - 40,
       report: report({ baseline: '1b2c3d4e5f60', behind: true, harnesses: ['claude'] }) },
     { id: 'ci-runner', registration: 'reg-ci-runner', status: 'offline', connected: false, joined_at: now - 86400 * 3, last_seen: now - 7200,
@@ -33,12 +33,15 @@ export function installMock(scenario: string) {
       report: report({ blocked: true, clashes: ['skill:deploy'], drafts: ['skill:deploy'] }) },
   ];
   const items: T.ItemView[] = empty ? [] : [
-    { item: 'skill:code-review', in_baseline: true, draft: null, unpushed: false, description: 'Reviews a diff for correctness bugs and suggests fixes.' },
-    { item: 'skill:deploy', in_baseline: true, draft: null, unpushed: false, description: 'Builds and ships the server container.' },
-    { item: 'skill:release-notes', in_baseline: false, draft: 'added', unpushed: true, description: 'Drafts release notes from merged pull requests.' },
-    { item: 'rule:style', in_baseline: true, draft: 'modified', unpushed: false, description: 'House code style rules shared by every Harness.' },
-    { item: 'rule:security', in_baseline: true, draft: null, unpushed: false, description: null },
+    { item: 'skill:code-review', id: 'id-code-review', in_baseline: true, draft: null, unpushed: false, description: 'Reviews a diff for correctness bugs and suggests fixes.' },
+    { item: 'skill:deploy', id: 'id-deploy', in_baseline: true, draft: null, unpushed: false, description: 'Builds and ships the server container.' },
+    { item: 'skill:release-notes', id: 'id-release-notes', in_baseline: false, draft: 'added', unpushed: true, description: 'Drafts release notes from merged pull requests.' },
+    { item: 'rule:style', id: 'id-style', in_baseline: true, draft: 'modified', unpushed: false, description: 'House code style rules shared by every Harness.' },
+    { item: 'rule:security', id: 'id-security', in_baseline: true, draft: null, unpushed: false, description: null },
   ];
+  local.items = items.flatMap(({ item, id }) => id == null ? [] : [{ item, id }]);
+  let nextId = 0;
+  const newId = () => `new-${++nextId}`;
   const content: T.ContentEntry[] = empty ? [] : [
     ...items.map((item): T.ContentEntry => {
       const [kind, name] = item.item.split(':');
@@ -56,8 +59,8 @@ export function installMock(scenario: string) {
   ];
   let preferredEditor = 'code';
   const assignments: Record<string, T.AssignmentSnapshot> = {
-    workstation: { revision: 42, harnesses: { claude: harness({ deploy: false }, { style: true }), codex: harness({}, { security: true }) } },
-    laptop: { revision: 17, harnesses: { claude: harness({ 'code-review': true }) } },
+    workstation: { revision: 42, harnesses: { claude: harness({ 'id-deploy': false, 'id-old-skill': true }, { 'id-style': true }), codex: harness({}, { 'id-security': true }) } },
+    laptop: { revision: 17, harnesses: { claude: harness({ 'id-code-review': true, ...scenario === 'self' && { 'id-laptop-orphan': true } }) } },
     'ci-runner': { revision: 9, harnesses: { codex: harness({}, {}) } },
     'build-box': { revision: 5, harnesses: { claude: harness(), codex: harness() } },
   };
@@ -80,10 +83,22 @@ export function installMock(scenario: string) {
   const log: T.LogEntry[] = empty ? [] : Array.from({ length: 8 }, (_, i) => ({
     id: 120 - i, at: now - i * 2400, author: i % 3 ? 'dev@workstation' : 'ops@laptop', machine: ['workstation', 'laptop'][i % 2],
     harness: ['claude', 'codex'][i % 2], kind: i === 3 ? 'new_skills_default' : i % 2 ? 'rule' : 'skill',
+    item_id: i === 3 ? null : `id-${['deploy', 'style', 'code-review', null, 'security', 'release-notes', 'deploy', 'style'][i]}`,
     name: i === 3 ? null : ['deploy', 'style', 'code-review', null, 'security', 'release-notes', 'deploy', 'style'][i],
     before: i % 2 ? null : true, after: i % 2 ? true : false,
     cause: i === 5 ? { type: 'undo', entry: 101 } : i === 6 ? { type: 'harness_added' } : { type: 'change' },
   } as T.LogEntry));
+  const orphanToggles = (): T.Orphan[] => {
+    const known = new Set(items.filter(item => item.in_baseline || item.draft !== 'deleted').map(item => item.id));
+    for (const machine of machines) {
+      if (machine.id === status.machine_id) continue;
+      for (const item of machine.report?.items ?? []) known.add(item.id);
+    }
+    return machines.flatMap(({ id: machine }) => Object.entries(assignments[machine]?.harnesses ?? {}).flatMap(([harness, h]) =>
+      (['skill', 'rule'] as const).flatMap(kind => Object.keys(kind === 'skill' ? h.skills : h.rules)
+        .filter(item_id => !known.has(item_id))
+        .map(item_id => ({ machine, harness, kind, item_id, name: log.find(entry => entry.item_id === item_id && entry.name)?.name ?? null })))));
+  };
   const harnesses: T.HarnessView[] = [
     { name: 'claude', origin: 'detected', harness: { skills: '~/.claude/skills', instructions: '~/.claude/CLAUDE.md', instructions_format: 'block', mode: 'symlink' } },
     { name: 'codex', origin: 'machine.toml', harness: { skills: '~/.codex/skills', instructions: '~/.codex/AGENTS.md', instructions_format: 'block', mode: 'copy' } },
@@ -113,19 +128,6 @@ export function installMock(scenario: string) {
   let fileRevision = 0;
   let running = scenario !== 'unreachable';
   const delay = <V,>(value: V, ms = 250) => new Promise<V>(resolve => setTimeout(() => resolve(value), ms));
-  // The authority copies this Machine's toggles for `from` to the new name first, keeping toggles the new name already has; the rename is refused when it can't be asked.
-  const copyAssignment = (kind: string, from: string, to: string) => {
-    if (status.connection !== 'connected' && status.connection !== 'standalone') return null;
-    const harnesses = Object.entries(assignments[status.machine_id]?.harnesses ?? {}).filter(([, h]) => from in (kind === 'skill' ? h.skills : h.rules));
-    const migrated: string[] = [], kept: string[] = [];
-    for (const [name, h] of harnesses) {
-      const toggles = kind === 'skill' ? h.skills : h.rules;
-      if (Object.hasOwn(toggles, to)) kept.push(name); else { toggles[to] = toggles[from]; migrated.push(name); }
-    }
-    if (migrated.length) assignments[status.machine_id].revision++;
-    return { migrated, kept };
-  };
-
   let syncPending = !empty;
   mockIPC((cmd, args) => {
     if (cmd === 'render_instructions') {
@@ -170,7 +172,7 @@ export function installMock(scenario: string) {
         if (content.some(e => e.item === item)) return Promise.reject({ message: 'Name is taken' });
         const path = r.kind === 'skill' ? `personal/${r.name}/SKILL.md` : `instructions/${r.name}.md`;
         content.push({ name: r.name, item, type: r.kind === 'skill' ? 'personal' : 'rule', description: r.description ?? null, draft: 'added', in_baseline: false, path: `${status.repo}/${path}`, enabled_harnesses: [], clashes_with_repo: false, variants: [] });
-        items.push({ item, in_baseline: false, draft: 'added', unpushed: false, description: r.description ?? null });
+        items.push({ item, id: newId(), in_baseline: false, draft: 'added', unpushed: false, description: r.description ?? null });
         draft.push({ item, change: 'added', paths: [path], fingerprint: `created-${r.name}` }); local.drafts.push(item);
         return delay(undefined);
       }
@@ -182,8 +184,6 @@ export function installMock(scenario: string) {
         const to = cmd === 'rename_item' ? `${r.kind}:${r.to}` : null;
         if (to && (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(r.to) || r.to.includes('..'))) return Promise.reject({ message: `invalid skill name \`${r.to}\`` });
         if (to && content.some(e => e.item === to || (r.kind === 'skill' && e.type === 'import' && e.name === r.to))) return Promise.reject({ message: `name \`${r.to}\` is taken` });
-        const copied = to && r.copy_assignment !== false ? copyAssignment(r.kind, r.name, r.to) : { migrated: [], kept: [] };
-        if (!copied) return Promise.reject({ status: 409, message: `\`${r.name}\` was not renamed: its Assignment could not be copied to \`${r.to}\`: offline: the Server is unreachable. Try again, or rename without copying the Assignment` });
         const path = (name: string) => r.kind === 'skill' ? `personal/${name}/SKILL.md` : `instructions/${name}.md`;
         const pending = draft.findIndex(d => d.item === item);
         // Deleting a never-committed item leaves nothing in the Draft.
@@ -192,6 +192,7 @@ export function installMock(scenario: string) {
         if (!added) draft.push({ item, change: 'deleted', paths: [path(r.name)], fingerprint: `deleted-${r.name}` });
         local.drafts = local.drafts.filter(d => d !== item); if (!added) local.drafts.push(item);
         const index = items.findIndex(i => i.item === item);
+        const id = items[index]?.id ?? newId();
         content.splice(content.indexOf(entry), 1);
         if (!to) {
           if (added) items.splice(index, 1); else if (index >= 0) items[index].draft = 'deleted';
@@ -199,9 +200,9 @@ export function installMock(scenario: string) {
         }
         content.push({ ...entry, name: r.to, item: to, draft: 'added', in_baseline: false, path: `${status.repo}/${path(r.to).replace(/\/SKILL\.md$/, '')}` });
         if (index >= 0) { if (added) items.splice(index, 1); else items[index].draft = 'deleted'; }
-        items.push({ item: to, in_baseline: false, draft: 'added', unpushed: false, description: entry.description });
+        items.push({ item: to, id, in_baseline: false, draft: 'added', unpushed: false, description: entry.description });
         draft.push({ item: to, change: 'added', paths: [path(r.to)], fingerprint: `renamed-${r.to}` }); local.drafts.push(to);
-        return delay({ item: to, ...copied, assignment_error: null });
+        return delay({ item: to });
       }
       case 'conflict_diff': {
         const r = a.request as T.ConflictDiffRequest;
@@ -238,7 +239,9 @@ export function installMock(scenario: string) {
       }
       case 'check_imports': imports.checked_at = Math.floor(Date.now() / 1000); return delay(imports);
       case 'status': return delay(status, 60);
-      case 'fleet': return delay({ baseline: '9f3c2a17d4e1', machines: empty ? machines.slice(0, 1) : machines });
+      case 'fleet':
+        local.items = items.flatMap(({ item, id, draft }) => id == null || draft === 'deleted' ? [] : [{ item, id }]);
+        return delay({ baseline: '9f3c2a17d4e1', machines: empty ? machines.slice(0, 1) : machines });
       case 'items': return delay(items);
       case 'skills': return delay(structuredClone(content));
       case 'skill_tree': {
@@ -271,7 +274,7 @@ export function installMock(scenario: string) {
         if (!entry) return Promise.reject({ message: 'Skill no longer exists' });
         entry.type = 'personal'; entry.item = `skill:${name}`; entry.draft = cmd === 'fork' ? 'modified' : 'added';
         entry.path = `${status.repo}/personal/${name}`; entry.variants = []; entry.enabled_harnesses = ['claude'];
-        if (!items.some(item => item.item === entry.item)) items.push({ item: entry.item, in_baseline: false, draft: entry.draft, unpushed: false, description: entry.description });
+        if (!items.some(item => item.item === entry.item)) items.push({ item: entry.item, id: newId(), in_baseline: false, draft: entry.draft, unpushed: false, description: entry.description });
         draft.push({ item: entry.item, change: entry.draft, paths: [`personal/${name}/SKILL.md`], fingerprint: 'converted' });
         local.drafts.push(entry.item);
         return delay(undefined);
@@ -286,13 +289,30 @@ export function installMock(scenario: string) {
         const h = snapshot.harnesses[a.harness as string] ??= harness();
         h.new_skills_default = enabled;
         h.new_rules_default = enabled;
-        for (const { item } of items) {
-          const [kind, name] = item.split(':');
-          (kind === 'rule' ? h.rules : h.skills)[name] = enabled;
+        for (const toggles of [h.skills, h.rules]) {
+          for (const id of Object.keys(toggles)) toggles[id] = enabled;
         }
         snapshot.revision++;
         const { revision, ...assignment } = snapshot;
-        return delay({ update: { revision, assignment: structuredClone(assignment), entries: [] }, warning: null });
+        return delay({ revision, assignment: structuredClone(assignment), entries: [] });
+      }
+      case 'orphans': return delay({ orphans: orphanToggles() });
+      case 'prune_orphans': {
+        const self = machines.find(machine => machine.id === status.machine_id)?.scope === 'self';
+        const orphans = orphanToggles().filter(orphan => !self || orphan.machine === status.machine_id);
+        const changed = new Set<string>();
+        const entries = orphans.map((orphan, i): T.LogEntry => {
+          const h = assignments[orphan.machine].harnesses[orphan.harness];
+          const toggles = orphan.kind === 'skill' ? h.skills : h.rules;
+          const before = toggles[orphan.item_id];
+          delete toggles[orphan.item_id];
+          changed.add(orphan.machine);
+          return { ...orphan, id: (log[0]?.id ?? 0) + i + 1, at: now, author: status.machine_id,
+            before, after: null, cause: { type: 'orphan_pruned' } };
+        });
+        for (const machine of changed) assignments[machine].revision++;
+        log.unshift(...[...entries].reverse());
+        return delay({ entries });
       }
       case 'preview_assignment_copy':
       case 'copy_machine_assignment': {
@@ -309,11 +329,11 @@ export function installMock(scenario: string) {
           return Promise.reject({ status: 409, message: 'Assignment changed since the preview' });
         const next = structuredClone(target.harnesses);
         const entries: T.LogEntry[] = [];
-        const record = (harness: string, kind: T.ToggleKind, name: string | null, before: boolean | null, after: boolean | null) => {
+        const record = (harness: string, kind: T.ToggleKind, item_id: string | null, before: boolean | null, after: boolean | null) => {
           if (before === after) return;
           entries.push({ id: Math.max(0, ...log.map(entry => entry.id)) + entries.length + 1,
             at: Math.floor(Date.now() / 1000), author: status.machine_id, machine: a.machine as string,
-            harness, kind, name, before, after, cause: { type: 'change' } });
+            harness, kind, item_id, name: items.find(item => item.id === item_id)?.item.split(':')[1] ?? null, before, after, cause: { type: 'change' } });
         };
         for (const mapping of copy.harnesses ?? []) {
           const src = source.harnesses[mapping.from], dest = next[mapping.to] ??= harness();
@@ -357,7 +377,7 @@ export function installMock(scenario: string) {
           const h = snapshot.harnesses[change.harness] ??= harness();
           if (change.kind === 'skill' || change.kind === 'rule') {
             const map = change.kind === 'skill' ? h.skills : h.rules;
-            if (change.enabled === null) delete map[change.name!]; else map[change.name!] = change.enabled;
+            if (change.enabled === null) delete map[change.item_id!]; else map[change.item_id!] = change.enabled;
           } else h[change.kind] = !!change.enabled;
         }
         snapshot.revision++;
@@ -423,7 +443,7 @@ export function installMock(scenario: string) {
           return Promise.reject({ message: 'Import name already exists', status: 409, unreachable: false });
         imports.imports.push({ name: request.name, source: request.source, ref: request.ref, path: request.path, locked: request.commit ?? 'c0ffee1234567890' });
         content.push({ name: request.name, item: `skill:${request.name}`, type: 'import', description: null, draft: 'added', in_baseline: false, path: `${status.repo}/imported/${request.name}`, enabled_harnesses: [], clashes_with_repo: false, variants: [] });
-        items.push({ item: `skill:${request.name}`, in_baseline: false, draft: 'added', unpushed: false, description: null });
+        items.push({ item: `skill:${request.name}`, id: newId(), in_baseline: false, draft: 'added', unpushed: false, description: null });
         draft.push({ item: `skill:${request.name}`, change: 'added', paths: [`imported/${request.name}/SKILL.md`], fingerprint: 'new' });
         return delay({ name: request.name, old_commit: null, new_commit: 'c0ffee1234567890', changed: true });
       }
@@ -432,7 +452,7 @@ export function installMock(scenario: string) {
         const term = q.item?.toLowerCase() ?? '';
         const rows = log.filter(e => (!q.machine || e.machine === q.machine) && (!q.harness || e.harness === q.harness)
           && (!q.author || e.author === q.author) && (q.before === undefined || e.id < q.before)
-          && `${e.kind}:${e.name ?? ''}`.toLowerCase().includes(term));
+          && (`${e.kind}:${e.name ?? ''}`.toLowerCase().includes(term) || e.item_id?.toLowerCase().includes(term)));
         return delay(rows.slice(0, Math.min(Math.max(q.limit ?? 100, 1), 1000)));
       }
       case 'log_facets': {

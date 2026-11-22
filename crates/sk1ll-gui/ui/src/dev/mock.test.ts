@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { expect, it, vi } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import { mockIPC } from '@tauri-apps/api/mocks';
 import { installMock } from './mock';
 import type * as T from '../types';
@@ -58,4 +58,29 @@ it('provides reviewed dev workflows and rejects unknown commands', async () => {
   } finally {
     vi.useRealTimers();
   }
+});
+
+afterEach(() => vi.useRealTimers());
+
+it('lists orphans from the mock Assignment and prunes only the permitted scope', async () => {
+  vi.useFakeTimers();
+  installMock('self');
+  const handler = vi.mocked(mockIPC).mock.calls.at(-1)![0];
+  async function invoke<V>(command: string, args?: Record<string, unknown>) {
+    const result = handler(command, args ?? {});
+    await vi.runAllTimersAsync();
+    return await result as V;
+  }
+
+  const before = await invoke<T.OrphansView>('orphans');
+  expect(before.orphans.map(orphan => orphan.machine)).toEqual(['workstation', 'laptop']);
+  const cleared = await invoke<T.OrphansPruned>('prune_orphans');
+  expect(cleared.entries.map(entry => entry.machine)).toEqual(['workstation']);
+  const after = await invoke<T.OrphansView>('orphans');
+  expect(after.orphans.map(orphan => orphan.machine)).toEqual(['laptop']);
+  const revision = (await invoke<T.AssignmentSnapshot>('assignment', { machine: 'workstation' })).revision;
+  const log = await invoke<T.LogEntry[]>('log');
+  expect((await invoke<T.OrphansPruned>('prune_orphans')).entries).toEqual([]);
+  expect((await invoke<T.AssignmentSnapshot>('assignment', { machine: 'workstation' })).revision).toBe(revision);
+  expect(await invoke<T.LogEntry[]>('log')).toEqual(log);
 });

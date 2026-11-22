@@ -13,7 +13,7 @@ vi.mock('./Skills', () => ({
     editor={{ query: { item: 'skill:pdf' }, writable: true, setEditing: () => {}, changed: () => {},
       guard: state => { fileEditState.current = state; }, reload: () => {} }} />,
 }));
-const status: StatusView = { mode: 'standalone', has_origin: false, repo_ready: true, machine_id: 'local', server_url: null, repo: '/skills', headline: 'in_sync', connection: 'standalone', last_error: null, revoked: false, server_baseline: null, assignment_revision: 0, awaiting_assignment: false, auth_rejected_since: null, pending_discards: 0, report: { baseline: null, drafts: [], unpushed: [], conflicts: [], harnesses: [], blocked: false, clashes: [], behind: false } };
+const status: StatusView = { mode: 'standalone', has_origin: false, repo_ready: true, machine_id: 'local', server_url: null, repo: '/skills', headline: 'in_sync', connection: 'standalone', last_error: null, revoked: false, server_baseline: null, assignment_revision: 0, awaiting_assignment: false, auth_rejected_since: null, report: { seq: 1, items: [], baseline: null, drafts: [], unpushed: [], conflicts: [], harnesses: [], blocked: false, clashes: [], behind: false } };
 beforeEach(() => {
   vi.resetAllMocks();
   vi.stubGlobal('matchMedia', vi.fn(() => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() })));

@@ -3,7 +3,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -111,7 +110,7 @@ fn enabled(d: &Daemon) -> bool {
 pub(crate) async fn run(d: Arc<Daemon>) {
     let (imports, mut failures) = watch::channel(None);
     tokio::join!(poll_imports(&d, imports), async {
-        let path = d.cfg.state.with_extension("notifications.json");
+        let path = d.cfg.notifications_path();
         let mut history = load(&path);
         let mut status = d.subscribe_view();
         let mut rejected_since = None;
@@ -138,11 +137,9 @@ pub(crate) async fn run(d: Arc<Daemon>) {
                 view.report.clashes.iter().map(ToString::to_string).collect()
             };
             let observations = [
-                // Before the first pull, an empty report cannot prove a Blocked state cleared.
-                (
-                    Kind::Blocked,
-                    (view.report.blocked || d.pull_cleared_blocked.load(Ordering::Relaxed)).then_some(blocked),
-                ),
+                // The daemon remembers Blocked across restarts, so even its
+                // first report says whether the Machine is.
+                (Kind::Blocked, Some(blocked)),
                 (
                     Kind::Conflict,
                     (view.repo_ready && !view.awaiting_assignment && !view.revoked).then(|| {
@@ -196,7 +193,9 @@ async fn poll_imports(d: &Arc<Daemon>, failures: watch::Sender<Option<Items>>) {
         if !enabled(d) || view.revoked || !view.repo_ready {
             continue;
         }
-        let result = if d.is_standalone() && last_local.is_none_or(|last| last.elapsed() >= Duration::from_secs(3600)) {
+        let result = if !d.remote.checks_imports()
+            && last_local.is_none_or(|last| last.elapsed() >= Duration::from_secs(3600))
+        {
             last_local = Some(tokio::time::Instant::now());
             d.local_imports(true).await
         } else {

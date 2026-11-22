@@ -295,13 +295,24 @@ fn explain_github_failure(source: &str, e: Error) -> Error {
 /// Waits for, then holds, the lock on `cache` (an OS file lock on a file
 /// next to it, so it also covers other processes and a cache not cloned
 /// yet). Released when dropped.
-pub(crate) fn lock_cache(cache: &Path) -> Result<fs::File> {
+pub(crate) fn lock_cache(cache: &Path) -> Result<CacheLock> {
     let mut path = cache.as_os_str().to_owned();
     path.push(".lock");
     let path = PathBuf::from(path);
     let file = fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path).at(&path)?;
     file.lock().at(&path)?;
-    Ok(file)
+    Ok(CacheLock(file))
+}
+
+/// A held [`lock_cache`] lock.
+pub(crate) struct CacheLock(fs::File);
+
+impl Drop for CacheLock {
+    fn drop(&mut self) {
+        // As for the engine lock: a child forked meanwhile shares the lock
+        // until it reaches exec, so it is released explicitly.
+        let _ = self.0.unlock();
+    }
 }
 
 /// Prefix of staging directories. Draft, skill discovery and the daemon's
@@ -354,7 +365,9 @@ pub(crate) fn unique(dir: &Path) -> PathBuf {
 /// (shared by its worktrees), once. Best effort: draft and discovery ignore
 /// staging paths themselves too.
 pub(crate) fn exclude_stages(root: &Path) {
-    let Ok(common) = Git::new(root).args(["rev-parse", "--path-format=absolute", "--git-common-dir"]).text() else {
+    let Ok(common) =
+        Git::repo(root).and_then(|git| git.args(["rev-parse", "--path-format=absolute", "--git-common-dir"]).text())
+    else {
         return;
     };
     let info = Path::new(&common).join("info");
@@ -455,7 +468,7 @@ fn settle(dest: &Path, backup: &Path, locked: Option<&str>) -> Result<bool> {
         Err(e) => return Err(e).at(dest),
         Ok(meta) => meta,
     };
-    let hash = |dir: &Path| crate::hash::hash_dir(dir).ok();
+    let hash = |dir: &Path| crate::hash::vendor_hash(dir).ok();
     let recorded = |dir: &Path| locked.is_some() && hash(dir).as_deref() == locked;
     if meta.is_dir() && recorded(dest) {
         fs::remove_dir_all(backup).at(backup)?;
@@ -686,7 +699,7 @@ fn cache_dir_for(url: &str) -> PathBuf {
     if let Some(root) = TEST_CACHE.with_borrow(Clone::clone) {
         return root.join(&digest[..16]);
     }
-    dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("sk1ll").join("git").join(&digest[..16])
+    crate::paths::cache_dir().unwrap_or_else(|_| std::env::temp_dir().join("sk1ll")).join("git").join(&digest[..16])
 }
 
 fn git(dir: &Path, args: &[&str], env: &[(&str, &Path)]) -> Result<String> {

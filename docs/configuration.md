@@ -102,6 +102,7 @@ sk1ll harnesses enable gemini                     # sync into it again
 sk1ll harnesses add agents --skills ~/.agents/skills --mode copy
 sk1ll harnesses add codex --instructions ''       # adjust a preset; options left out keep their value
 sk1ll harnesses remove agents                     # drop the entry; a preset goes back to its defaults
+sk1ll harnesses rename agents team-agents         # rename a custom harness and move its Assignment
 ```
 
 Each change edits `machine.toml` in place, so comments and layout survive. Setting a value back to the preset's removes the override; a harness that was synced into stays on (with `enabled = true` if nothing else would keep it). Before writing, sk1ll shows two lists:
@@ -117,11 +118,13 @@ sk1ll sync                      # not needed when the daemon runs
 sk1ll harnesses disable kiro    # nothing is left behind now
 ```
 
-With a Fleet, both actions set every Baseline item and the Machine’s reported drafts and unpushed items. An older Server uses the local item list instead and warns that unpulled items may stay on.
+Harness-wide changes set both defaults and every stored toggle. Items without a toggle inherit the resulting default.
 
 In Settings, **Turn off this Harness's items first** in the preview does the same in the Assignment and waits for local sync before previewing again. A joined machine writes to the Server first.
 
-The change is then applied and the harnesses synced. It goes through the daemon when one manages the repo. The CLI asks for confirmation on a terminal. Pass `--yes` in scripts. Assignment is left unchanged, so turning a harness back on restores its toggles. A joined machine reports its new set of harnesses to the server with its next status.
+The change is then applied and the harnesses synced. It goes through the daemon when one manages the repo, else through the engine the command runs. The CLI asks for confirmation on a terminal. Pass `--yes` in scripts. Turning a Harness back on restores its toggles. Renaming a Harness moves both defaults and its toggles to the new name. Renaming a preset disables the original preset and gives the new custom Harness the same paths and settings. A joined machine reports its new set of harnesses to the server with its next status.
+
+A Harness rename records an intent before changing `machine.toml`. If the command loses its connection, the Daemon retries the move before reporting its Harnesses. You can also repeat the same rename. In standalone mode, the next sync finishes a pending rename using the local Assignment. Use `--replace` if the destination already has an Assignment you want to replace. The command lists Rules that still name the old Harness in `harnesses:`. Update those Rules separately to route them to the new Harness.
 
 Apply checks that `machine.toml` still matches the file, bytes and permissions seen at preview. If the check fails, preview again before applying. **Open configuration** in Settings works even if the file contains invalid TOML. If the file is missing, it creates it with mode 0600. sk1ll writes the new text to a temporary file only it created, next to the file (a symlinked `machine.toml` stays a link, and its target gets the new text), with the file's permissions (0600 for a new file) and, where allowed, its owner and group, then renames it into place. ACLs and extended attributes are not kept. A save that lands in the instant between that last check and the rename is lost; see [Known limitations](known-limitations.md).
 
@@ -130,6 +133,11 @@ If the sync after the change can't place something, the change itself still stan
 An edit to `machine.toml` by hand has the same effect on sync, without the preview. Content in a dropped location just stays there.
 
 ## Rules
+
+A Rule's `id:` frontmatter is its Item ID. The daemon or a mutating command
+writes one if the Rule was created by hand. The write appears in the Draft.
+A read-only sync preview uses the Harness default for a Rule with an
+unassigned ID. Rendering strips `id:` and `harnesses:` from Harness files.
 
 Each `instructions/<name>.md` file is one rule. Frontmatter is optional:
 
@@ -150,18 +158,20 @@ Harnesses don't share one global `AGENTS.md`, so each harness sets an `instructi
 | Format | What sync writes | Used by |
 |---|---|---|
 | `block` (default) | One marked block inside a single file. Sync leaves the rest of the file alone and follows symlinks, so dotfile-managed files keep working. | `~/.codex/AGENTS.md`, `~/.config/opencode/AGENTS.md`, `~/.gemini/GEMINI.md` |
-| `rules` | One copied file per rule, listed in a hidden `.sk1ll-managed` index | `~/.claude/rules/`, which Claude Code loads for every project |
+| `rules` | One copied file per rule, listed in a hidden `.sk1ll-state/index.json` index | `~/.claude/rules/`, which Claude Code loads for every project |
 
-The `rules` format keeps each rule's frontmatter except `harnesses`, so Claude's `paths:` key still scopes a rule to matching files. It copies instead of symlinking because Claude Code skips symlinked rule files in some sessions (Cowork). Sync never touches rule files you wrote yourself and reports a name clash as a conflict.
+The `rules` format keeps each Rule's frontmatter except for `id:` and `harnesses:`, so Claude's `paths:` key still scopes a rule to matching files. It copies instead of symlinking because Claude Code skips symlinked rule files in some sessions (Cowork). Sync never touches rule files you wrote yourself and reports a name clash as a conflict.
 
 `sk1ll render <harness>` prints what a harness would receive.
 
 ## Conflicts and adopt
 
-Sync records a hash for every block, rule file and copied skill it writes. If the harness copy no longer matches, sync reports a conflict instead of overwriting it. You then have two choices:
+Sync records the hashes of copied skills and rule files in `.sk1ll-state/index.json` in their respective directories. A block's hash is in its opening marker. When harness content differs from its recorded hash, sync reports a conflict and leaves the edit in place. You can resolve it in either of these ways.
 
-- `sk1ll adopt <harness> <name>` copies the edited skill or rule file back into the repo as a draft change and restores the rule's `harnesses:` key.
-- `sk1ll sync --force` overwrites the edit.
+- `sk1ll adopt <harness> <name>` copies the edited skill or rule file back into the repo as a draft change and restores the rule's `harnesses:` key. The repo version it replaces goes to recovery under the harness name `repo`, like content sync replaces.
+- `sk1ll sync --force` overwrites the edit. The edited copy, or the edited skill link, goes to recovery.
+
+Adopt copies a skill without its `.git` directories. sk1ll then owns only what it copied, so a harness copy that has a `.git` stays a conflict. A forced sync keeps that copy in recovery until you discard it. The same applies to a repo version with a `.git`, and `sk1ll recover adopt` keeps an entry whose `.git` it did not copy.
 
 A `block` mixes several rules, so it can't be adopted. Move that edit into `instructions/` by hand.
 
@@ -171,7 +181,7 @@ A `block` mixes several rules, so it can't be adopted. Move that edit into `inst
 
 ## Assignment
 
-Assignment decides which skills and rules each harness gets. Every item starts enabled. Each harness also has a default for items added later.
+Assignment decides which skills and rules each harness gets. Standalone items start enabled. A joined Machine without a copied Assignment starts with both defaults off.
 
 ```sh
 sk1ll assign claude skill pdf off           # one toggle
@@ -180,6 +190,23 @@ sk1ll assign codex --default-rules on       # default for new rules
 ```
 
 Changing a default first records every existing item's current value as an explicit toggle, so existing items keep their state.
+
+Item toggles use Item IDs. `sk1ll assign` resolves the name in the local repo and warns if the item you want to turn on is missing. A rename preserves the Item ID and keeps the Assignment across the Fleet. Deleting an item and creating it again gives it a new ID, so it follows the defaults. That holds for an item re-created by hand too: Item IDs are never derived from names, so the Daemon or the next mutating command writes it a fresh one. Until an item has an Item ID it has no toggle and follows the defaults. Changing a default records every item's value by Item ID, so it is refused while a pending Pull leaves an item without one.
+
+An `assignment.json` file has this shape. The keys under `skills` and `rules` are Item IDs. Imports use the `skills` map.
+
+```json
+{
+  "harnesses": {
+    "claude": {
+      "new_skills_default": true,
+      "new_rules_default": false,
+      "skills": { "01KAC9SRJZ9Z5SSWRBQE76YS69": false },
+      "rules": {}
+    }
+  }
+}
+```
 
 A standalone machine keeps assignment in `~/.cache/sk1ll/assignment.json` on Linux or `~/Library/Caches/sk1ll/assignment.json` on macOS (override with `--assignment` or `SK1LL_ASSIGNMENT`). The daemon watches this file and applies changes from either the GUI or CLI. Standalone Machines have no Assignment log. The desktop Assignment matrix offers revision-guarded Undo for bulk changes. [ADR 0004](adr/0004-standalone-assignment-is-machine-local.md) records this choice. A joined machine sends every change to the server, which keeps a log with per-entry undo. [ADR 0001](adr/0001-assignment-is-server-state.md) explains why assignment isn't stored in the repo.
 

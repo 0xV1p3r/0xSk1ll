@@ -21,10 +21,10 @@ const list = (values: string[] | undefined, none = 'None') => values?.length ? v
 const statusColor: Record<MachineStatus, string> = { in_sync: 'bg-success', drafting: 'bg-drafting', behind: 'bg-info', conflict: 'bg-warning', blocked: 'bg-destructive', offline: 'bg-muted-foreground' };
 const healthOrder: MachineStatus[] = ['in_sync', 'drafting', 'behind', 'conflict', 'blocked', 'offline'];
 function guidance(machine: MachineRow, local: boolean) {
-  if (!local) return { offline: 'Start its Daemon, or check its network path to the Server.', blocked: `Commit or Restore the clashing items on ${machine.id}, then Pull.`,
+  if (!local) return { offline: 'Start its Daemon, or check its network path to the Server.', blocked: `On ${machine.id}, Restore the clashing items (their version is kept in Recovery), Pull, then adopt it back from Recovery.`,
     conflict: `Resolve its Conflicts in the GUI on ${machine.id}.`, behind: 'Pulls the new Baseline once its Draft allows it.',
     drafting: 'Draft changes are live in its Harnesses.', in_sync: 'Up to date with the Fleet Baseline.' }[machine.status];
-  return { offline: 'Start the Daemon, or check its network path to the Server.', blocked: 'Commit or Restore clashing items, then Pull.', conflict: 'Review Conflicts to resolve edits in your Harnesses.',
+  return { offline: 'Start the Daemon, or check its network path to the Server.', blocked: 'Restore the clashing items (your version is kept in Recovery), Pull, then adopt it back from Recovery.', conflict: 'Review Conflicts to resolve edits in your Harnesses.',
     behind: 'Pull the new Baseline once your Draft allows it.', drafting: 'Review your Draft before Commit.', in_sync: 'Up to date with the Fleet Baseline.' }[machine.status];
 }
 function NextStep({ machine, navigate, changed }: {
@@ -57,6 +57,7 @@ function MachineDetails({ machine }: { machine: MachineRow }) {
     ...(report.clashes.length ? [['Clashes', list(report.clashes)] as [string, ReactNode]] : []),
     ...(report.blocked ? [['Blocked', 'Yes'] as [string, ReactNode]] : []),
     ...(report.behind ? [['Behind', 'Yes'] as [string, ReactNode]] : []),
+    ...(report.push_refused ? [['Push refused', report.push_refused] as [string, ReactNode]] : []),
   ]} />;
 }
 export function Fleet({ revision, machineId, initialMachine, serverUrl = null, localReport, unmanaged = [], discovery, navigate, changed, live }: {

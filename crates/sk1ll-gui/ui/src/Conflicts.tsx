@@ -15,6 +15,7 @@ function ConflictDiff({ entry, displaced }: { entry: ConflictView; displaced: bo
   const { data, error, loading } = useResource(load, 0);
   return <><p className="text-xs text-muted-foreground">− {displaced ? 'Recovered content' : 'Harness edit'} / + Draft</p>
     <ErrorNotice error={error} />{loading && <Loading rows={2} />}
+    {data?.target && <p className="text-xs break-all">Draft destination <code className="font-mono">{data.target}</code></p>}
     {data && <pre className="diff max-h-[32rem] overflow-auto rounded-lg border border-border bg-muted/40 p-3 font-mono text-xs" aria-label="Conflict diff">{data.diff ? <DiffLines diff={data.diff} /> : 'No differences.'}</pre>}</>;
 }
 function Conflict({ entry, displaced, changed, adopted, expanded }: {
@@ -45,7 +46,13 @@ function Conflict({ entry, displaced, changed, adopted, expanded }: {
         title={`Adopt ${entry.name} into the Draft?`}
         description={<>{displaced ? 'The recovered content' : `The ${entry.harness} Harness edit`} at <code className="font-mono break-all">{displaced ? entry.path ?? entry.dest : entry.dest}</code> replaces
           this item in this Machine's Draft. Any existing Draft changes to {entry.items.length ? entry.items.join(', ') : entry.name} are overwritten.</>}
-        action={() => displaced ? api.adoptDisplaced(entry.id!) : api.adopt(target)} onDone={() => { adopted(entry.name); toast({ title: `${entry.name} adopted into Draft` }); changed(); }} />
+        action={async () => {
+          const path = displaced ? await api.adoptDisplaced(entry.id!) : undefined;
+          if (!displaced) await api.adopt(target);
+          const name = path?.split(/[/\\]/).at(-1) ?? entry.name;
+          adopted(name);
+          toast({ title: `${name} adopted into Draft`, description: path });
+        }} onDone={changed} />
       <Confirm label={displaced ? 'Discard' : 'Overwrite'} triggerVariant="outline"
         ariaLabel={`${displaced ? 'Discard' : 'Overwrite'} ${entry.name} in ${entry.harness}`} title={`${displaced ? 'Discard' : 'Overwrite'} ${entry.name} in ${entry.harness}?`}
         description={displaced ? <>Permanently remove recovered content for {entry.name} from {entry.harness} at <code className="font-mono break-all">{entry.path ?? entry.dest}</code>. The Draft is unchanged.</>

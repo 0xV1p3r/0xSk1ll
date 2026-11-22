@@ -44,6 +44,10 @@ pub(crate) struct Staged {
 }
 
 impl Staged {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Creates the staging file for `dest` (whose directory must exist):
     /// private while it is written if the caller sets `mode` on it later,
     /// else as the umask has it.
@@ -168,13 +172,13 @@ fn set_mode(_: &File, _: u32) -> std::io::Result<()> {
 
 /// Makes a rename or link to `path` durable.
 #[cfg(unix)]
-fn sync_dir(path: &Path) -> Result<()> {
+pub(crate) fn sync_dir(path: &Path) -> Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     File::open(dir).and_then(|d| d.sync_all()).at(dir)
 }
 
 #[cfg(not(unix))]
-fn sync_dir(_: &Path) -> Result<()> {
+pub(crate) fn sync_dir(_: &Path) -> Result<()> {
     Ok(())
 }
 

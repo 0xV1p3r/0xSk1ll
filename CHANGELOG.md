@@ -9,6 +9,13 @@ break compatibility.
 
 ### Added
 
+- List and clear orphan Assignment toggles in the desktop matrix or with
+  `sk1ll fleet orphans` and `sk1ll fleet prune-orphans`.
+- `sk1ll repair-ids` gives items that share an Item ID fresh ones in the
+  Draft. Commit and Pull refuse duplicate Item IDs.
+- `sk1ll harnesses rename <old> <new>` moves a Harness's Assignment
+  and renames its table in `machine.toml`.
+
 - Edit Personal Skill text files and Rules in the desktop Library, with a diff
   before overwriting a concurrent disk edit and a link to review the Draft.
 - Choose a branch, tag or commit in Add Import. Preview upstream commits and
@@ -43,8 +50,7 @@ break compatibility.
 - `sk1ll assign <harness> --all on|off` sets every Skill and Rule and both
   defaults, including Baseline items the joined Machine has yet to pull.
   Settings offers to turn off the items before disabling a Harness so sync
-  can remove managed placements. Older Servers use the local item list and
-  warn that unpulled items may stay on.
+  can remove managed placements.
 - Opt-in presets for GitHub Copilot CLI (`copilot`), Cursor (`cursor`), Amp
   (`amp`), Kiro (`kiro`), Cline (`cline`) and Roo Code (`roo`), and Gemini's
   skills directory (`~/.gemini/skills`). They sync only while
@@ -59,6 +65,29 @@ break compatibility.
   preferred editor.
 
 ### Changed
+
+- Every `sk1ll` command goes through the daemon's engine: the running
+  daemon's, else one the command runs in its own process (ADR 0008). Without
+  a daemon, commands now sync the harnesses as the daemon would, `fleet`
+  commands work, and a joined Machine connects to the server only for
+  Assignment writes, renames and unmanaged Adopt. The CLI needs Unix.
+- Assignment toggles use Item IDs. Renaming a Skill or Rule preserves its
+  Assignment on every Machine. Item IDs are always explicit: the daemon and
+  mutating commands write a fresh ID to any item that lacks one, so an item
+  deleted and re-created, by hand or through sk1ll, starts from the
+  defaults.
+- Pull rolls forward: it replays unpushed commits without touching the
+  working tree, then updates only the paths the new Baseline changes. An
+  interrupted Pull is finished by the next `sk1ll pull` or Daemon refresh,
+  and content it replaced goes to the recovery area. sk1ll needs Git 2.40
+  or later.
+- A Daemon sends its Machine's Assignment writes over the same WebSocket
+  as status, so Adopt reports its Draft before enabling it.
+- The skills repo no longer supports git filter drivers (Git LFS): the
+  server has no LFS endpoint. A pull onto a Baseline that writes a file
+  through one stays Blocked and says to remove `filter=` from
+  `.gitattributes`, and the server refuses such a push. Pull, the clone and
+  the first Baseline run no filter driver. Imports keep their LFS handling.
 
 - Add Import and `sk1ll add --list` show file sizes and warn about scripts,
   executable files, binaries and files over 1 MiB.
@@ -89,15 +118,84 @@ break compatibility.
 - A dangling symlink at the assignment snapshot is an error, not a missing
   snapshot.
 
+### Removed
+
+- The pull's filter-driver conversion cache (`.git/sk1ll-pull-filtered/`)
+  and its retries.
+- The `inventory` WebSocket frame, which nothing sent since every command
+  runs through an engine that reports full status.
+- Push-time toggle sweeping and the Restore notification outbox.
+- Assignment copying during item rename and its offline override.
+- Compatibility fallbacks for older Assignment and join-code formats.
+
 ### Fixed
 
+- CLI messages: `sk1ll status` says when the Machine is Blocked (and how
+  to clear it), behind, or had a push refused; `sync` exits non-zero while
+  it leaves conflicts alone and `sync --force` says which recovery entry
+  kept each edit; status and sync print rules the same way
+  (`rule git -> <path>`); every duplicate Item ID error suggests
+  `sk1ll repair-ids`; renaming a harness onto one that exists no longer
+  suggests `--replace`, which can't help there, and `harnesses rename`
+  accepts `--yes`; empty `SK1LL_*` variables count as unset; a `--repo`
+  that isn't there is named as missing; `sk1ll init` beside a daemon for
+  another repo says so; `fleet log` prints dates and readable causes; the
+  `recover` subcommands and their `<ID>` have help; a standalone commit
+  without `origin` no longer tells you to push to a fleet; adopting a rule
+  no longer adds a blank line after its frontmatter.
+- The recovery area's index and the import cache follow `SK1LL_STATE_DIR`
+  and the new `SK1LL_CACHE_DIR` (and the daemon's configuration) instead of
+  always the platform's directories. The test suite no longer writes under
+  the real home directory, and `scripts/check-test-home.sh`, which CI runs,
+  fails if any test does.
+- Restoring both sides of a case-only Skill or Rule rename on a
+  case-insensitive filesystem puts the Baseline's spelling back, even when
+  the directory holds an ignored file, with no-replace renames that move
+  everything in it along.
+- A commit can repair Item ID metadata the Baseline can't read (a manifest
+  committed as invalid TOML, a rule with broken frontmatter): it is checked
+  against the rest of `HEAD`, and the tree it makes is checked strictly.
+- `sk1ll adopt` of a hand edit finds its target by the Item ID the
+  placement recorded, as recovery's Adopt does: an edit to the harness copy
+  of a skill or rule renamed since goes into the renamed item instead of
+  recreating the old name. An ID that leads to no item, or to several, is
+  refused with what was found.
+- `sk1ll commit` refuses a tree the server would refuse for good (items
+  without an Item ID of their own, files through a filter driver), with the
+  server's own check and message. A push the server refuses anyway is no
+  longer reported as queued or retried after a pull: the command fails, and
+  status, `sk1ll fleet` and the app show *push refused* with the reason
+  until a fix is committed on top.
+- Rewriting a block instructions file (a rule toggled or changed) no
+  longer leaves a recovery entry that is never pruned each time; only a
+  forced rewrite of a block edited by hand keeps the old file, marked
+  changed, until it is adopted or discarded.
+- `sk1ll draft`, `sk1ll conflicts` and `sk1ll recover list` only read:
+  without a daemon they no longer write missing Item IDs or sync the
+  harnesses, they answer beside another engine (a daemon for another repo
+  included), and their Draft, conflicts and recovery entries are planned in
+  memory. On a joined Machine they read another selected repo as a
+  standalone one.
+- `sk1ll commit` of an item the pull is Blocked on no longer says the daemon
+  pushes it when it can: the pull before the push turns such a commit back
+  into Draft, and the command fails saying so and how to go on.
+- A Blocked Machine that committed the clashing item could only get out
+  with `git reset`: pull refused it with a hint to commit or restore, and
+  restore found nothing in the Draft. Pull now turns an unpushed commit
+  that conflicts with the new Baseline (and the commits after it) back into
+  Draft changes, moving only the branch, and is Blocked on them as on any
+  Draft clash. Restoring an item a pull is Blocked on keeps your version in
+  recovery, to bring back with `sk1ll recover adopt` after the pull. Every
+  Blocked message in the CLI, the push error and the app now gives that
+  route.
+- The daemon starts when its state file holds a pull record it can't read
+  (a pending pull another version recorded without its Baseline): it drops
+  that record with a warning and derives the pull's state from its journal
+  and `HEAD`.
+- A conflict's diff requested while the daemon was busy no longer answers
+  that the conflict is gone.
 - Daemon state writes use exclusive private staging files. Failed desktop
   notifications keep their retry schedule across Daemon restarts.
-- Harness-wide Assignment and rename-copy require a current Baseline inventory.
-  A structured inventory refusal tells rename-copy to retry. Harness-wide
-  changes report skipped names, including when using an older Server. The CLI
-  and Settings show local placement errors after saving an Assignment. Settings
-  retries sync even when the revision is unchanged.
 - The Library keeps unsaved text through a Daemon disconnect and restores
   keyboard focus when editing ends.
 - Reviewed Import updates require a dedicated Daemon route. Harness Apply
@@ -107,9 +205,8 @@ break compatibility.
   earlier errors. Settings can open `machine.toml` even when it fails
   to parse.
 - The development GUI shows historical file contents after a working-copy save.
-- Assignment edits check revisions on supported authorities. The matrix warns
-  before unguarded bulk edits, and Copy Assignment can recover from a conflict
-  within the same dialog.
+- Assignment edits check revisions. Copy Assignment can recover from a
+  conflict within the same dialog.
 
 - When local edits prevent an Import update, the desktop app offers to fork
   the Import or overwrite the edits after confirmation.
@@ -119,24 +216,9 @@ break compatibility.
 - Machine entries in the desktop command palette open the selected Machine.
 - Desktop messages identify origin for standalone pushes, explain when Fleet
   deletions reach other Machines, and clarify how to join as the first Machine.
-- A push drops toggles only for the items it removed, and a push by a `self`
-  Machine only its own; other Machines' toggles stay and apply again when the
-  items come back. Unrelated pushes no longer drop toggles for drafts missing
-  from a Machine's latest status.
 - A push queued behind its Machine's removal is refused with `401`, and a
   removal waits for a push in progress. A delayed WebSocket upgrade or
   revocation for a removed token can't end a rejoined Machine's session.
-- If the Server cannot list either tree for a push, that push drops no
-  toggles. Later pushes leave those toggles alone. Repo reads have a
-  deadline and a 64 MiB output cap. Each push and Draft discard also has
-  a total read budget. A cancelled or timed-out read stops its git process
-  group.
-- A draft discard reads the baseline branch itself instead of the HEAD cached
-  after the last push, so a push whose HEAD read failed can't make it drop a
-  toggle for an item in the baseline. A failed read is no longer taken for an
-  empty repo. While the baseline can't be read, the server drops nothing and
-  closes the session with code 1013; the daemon keeps backing off and sends
-  its unacknowledged discards again.
 - An empty repo whose unborn HEAD named another branch takes pushes to the
   `main` branch the server creates in it.
 - Server reads of the repo ignore replacement objects, so a replacement ref
@@ -162,8 +244,7 @@ break compatibility.
   Bulk changes apply only at the displayed revision. Undo checks the
   revision and registration again, and skips Machines that left, rejoined
   or changed. The Server assigns a new registration ID at each join so
-  the matrix can discard late replies from a prior membership. Older
-  Servers without registration IDs do not offer guarded Undo.
+  the matrix can discard late replies from a prior membership.
 - A batch Import tries every selected skill instead of stopping at the first
   failure, even when the Daemon was unreachable for one, shows each as added,
   not added or not attempted (after Stop), reads back what reached the Draft
@@ -175,13 +256,6 @@ break compatibility.
 - An interrupted Adopt can be resumed from the Library. `GET /skills` marks
   the unmanaged variant that matches the existing personal copy as
   `resumable`; other variants stay blocked.
-- Renaming a Personal Skill or Rule copies this Machine's explicit toggles
-  to the new name first. The Server handles the copy for joined Machines,
-  and the Daemon handles it in standalone mode. Existing destination toggles
-  are preserved. If the copy fails or its outcome is uncertain, the Library
-  offers **Rename without copying Assignment**. If the copy succeeds and the
-  rename moves nothing, cleanup uses the copy's revision and registration.
-
 ## [0.1.0] - 2026-11-17
 
 The first release, for private testing. Linux only for the desktop app, the

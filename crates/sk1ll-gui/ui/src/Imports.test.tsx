@@ -96,7 +96,7 @@ it('leaves all candidates unchecked for a repository', async () => {
   expect(screen.queryByLabelText('Name for pdf')).toBeNull();
 });
 it('blocks taken, inventory, duplicate and invalid names', async () => {
-  vi.mocked(api.items).mockResolvedValue([{ item: 'skill:existing', in_baseline: true, draft: null, unpushed: false, description: null }]);
+  vi.mocked(api.items).mockResolvedValue([{ item: 'skill:existing', id: 'existing', in_baseline: true, draft: null, unpushed: false, description: null }]);
   await resolve([candidate('pdf', true), candidate('writing')]);
   fireEvent.click(screen.getByRole('checkbox', { name: 'Select pdf' }));
   expect(confirm().disabled).toBe(true);
@@ -185,7 +185,7 @@ it('checks names with the Daemon again before a retry and still adds the others'
   fireEvent.click(confirm());
   const retry = await screen.findByRole('button', { name: 'Retry 2 Skills' });
   // Meanwhile another client took one name.
-  vi.mocked(api.items).mockResolvedValue([{ item: 'skill:pdf', in_baseline: false, draft: 'added', unpushed: false, description: null }]);
+  vi.mocked(api.items).mockResolvedValue([{ item: 'skill:pdf', id: 'pdf', in_baseline: false, draft: 'added', unpushed: false, description: null }]);
   fireEvent.click(retry);
   expect(await screen.findByText('csv added into Draft.')).toBeTruthy();
   expect(screen.getByText('pdf not added: This name is taken now. Pick another, then retry.')).toBeTruthy();
@@ -221,7 +221,7 @@ it('asks to review the Draft when what landed cannot be read back', async () => 
 it('rechecks name clashes against the refreshed inventory before a retry', async () => {
   vi.mocked(api.addImport).mockRejectedValueOnce('Name already exists');
   await resolve([candidate('pdf')]);
-  vi.mocked(api.items).mockResolvedValue([{ item: 'skill:pdf', in_baseline: false, draft: 'added', unpushed: false, description: null }]);
+  vi.mocked(api.items).mockResolvedValue([{ item: 'skill:pdf', id: 'pdf', in_baseline: false, draft: 'added', unpushed: false, description: null }]);
   fireEvent.click(confirm());
   expect(await screen.findByText('This name is already taken.')).toBeTruthy();
   // A clash remembered from the last check never disables Retry: it checks again.
@@ -235,7 +235,7 @@ it('rechecks name clashes against the refreshed inventory before a retry', async
   expect(await screen.findByText('pdf-two added into Draft.')).toBeTruthy();
 });
 it('lets a deleted Draft item\'s name be reused', async () => {
-  vi.mocked(api.items).mockResolvedValue([{ item: 'skill:pdf', in_baseline: true, draft: 'deleted', unpushed: false, description: null }]);
+  vi.mocked(api.items).mockResolvedValue([{ item: 'skill:pdf', id: 'pdf', in_baseline: true, draft: 'deleted', unpushed: false, description: null }]);
   vi.mocked(api.imports).mockResolvedValue({ checked_at: null, updates: [{ name: 'pdf', source: 'github:test/repo', ref: 'main', locked: 'a', upstream: 'b' }], errors: [] });
   await resolve([candidate('pdf')]);
   expect(confirm().disabled).toBe(false);
@@ -263,7 +263,7 @@ it('changes the source while preserving Link and Path and clearing candidates', 
   expect(api.resolveImport).toHaveBeenLastCalledWith({ link: 'github:test/other', path: 'skills/pdf' });
 });
 it.each([[true, 'On'], [false, 'Off'], [null, 'Default']] as const)('names the restored %s value and Assignment in success feedback', async (before, label) => {
-  vi.mocked(api.log).mockResolvedValue([{ id: 7, machine: 'laptop', harness: 'claude', kind: 'skill', name: 'pdf', before, after: !before, at: 1, author: 'user', cause: { type: 'change' } }]);
+  vi.mocked(api.log).mockResolvedValue([{ id: 7, machine: 'laptop', harness: 'claude', kind: 'skill', item_id: 'pdf', name: 'pdf', before, after: !before, at: 1, author: 'user', cause: { type: 'change' } }]);
   vi.mocked(api.undo).mockResolvedValue({ assignment: { harnesses: {} }, revision: 2, entries: [] });
   render(<Log revision={0} changed={changed} />);
   fireEvent.click(await screen.findByRole('button', { name: `Restore ${label} for log entry 7: skill:pdf on laptop / claude` }));
@@ -357,13 +357,13 @@ it('opens Add Import directly when requested from Skills', async () => {
   await waitFor(() => expect(document.activeElement).toBe(screen.getByLabelText('Link')));
 });
 it('returns focus to Create join code on close', async () => {
-  vi.mocked(api.joinCode).mockResolvedValue({ code: 'single-use', expires_at: null, scope: null });
+  vi.mocked(api.joinCode).mockResolvedValue({ code: 'single-use', expires_at: 1_800_000_000, scope: 'fleet' });
   render(<JoinCodeButton label="Create join code" serverUrl="https://example.com" />);
   const trigger = screen.getByRole('button', { name: 'Create join code' });
   trigger.focus(); fireEvent.click(trigger);
   const dialog = await screen.findByRole('dialog');
   expect(within(dialog).getByText('sk1ll join https://example.com single-use')).toBeTruthy();
-  expect(within(dialog).getByText(/expires after 24 hours by default/)).toBeTruthy();
+  expect(within(dialog).getByText(/expires/)).toBeTruthy();
   fireEvent.keyDown(dialog, { key: 'Escape' });
   await waitFor(() => expect(document.activeElement).toBe(trigger));
 });
@@ -378,7 +378,6 @@ it('creates a Self-only join code and shows its exact expiry', async () => {
   expect(api.joinCode).toHaveBeenCalledWith('self');
   expect(within(dialog).getByText(new RegExp(`expires ${new Date(1_800_000_000_000).toLocaleString().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))).toBeTruthy();
   expect(within(dialog).getByText('Only itself.')).toBeTruthy();
-  expect(within(dialog).queryByText(/24 hours by default/)).toBeNull();
 });
 it('tells a Self-only Machine it cannot create join codes', () => {
   render(<JoinCodeButton label="Create join code" serverUrl="https://example.com" scope="self" />);
@@ -395,7 +394,7 @@ it('shows Imports the Server skipped, with the reason', async () => {
 });
 it('confirms Restore and guards repeated requests while pending', async () => {
   let finish!: () => void;
-  vi.mocked(api.log).mockResolvedValue([{ id: 7, machine: 'laptop', harness: 'claude', kind: 'skill', name: 'pdf', before: true, after: false, at: 1, author: 'user', cause: { type: 'change' } }]);
+  vi.mocked(api.log).mockResolvedValue([{ id: 7, machine: 'laptop', harness: 'claude', kind: 'skill', item_id: 'pdf', name: 'pdf', before: true, after: false, at: 1, author: 'user', cause: { type: 'change' } }]);
   vi.mocked(api.undo).mockImplementation(() => new Promise(resolve => { finish = () => resolve({ assignment: { harnesses: {} }, revision: 2, entries: [] }); }));
   render(<Log revision={0} changed={changed} />);
   fireEvent.click(await screen.findByRole('button', { name: /Restore On for log entry 7/ }));
@@ -410,13 +409,13 @@ it('confirms Restore and guards repeated requests while pending', async () => {
   await waitFor(() => expect(toast).toHaveBeenCalled());
 });
 it.each([false, true])('focuses the log region when the restored row is gone and empty is %s', async empty => {
-  vi.mocked(api.log).mockResolvedValue([{ id: 7, machine: 'laptop', harness: 'claude', kind: 'skill', name: 'pdf', before: true, after: false, at: 1, author: 'user', cause: { type: 'change' } }]);
+  vi.mocked(api.log).mockResolvedValue([{ id: 7, machine: 'laptop', harness: 'claude', kind: 'skill', item_id: 'pdf', name: 'pdf', before: true, after: false, at: 1, author: 'user', cause: { type: 'change' } }]);
   vi.mocked(api.undo).mockResolvedValue({ assignment: { harnesses: {} }, revision: 2, entries: [] });
   const view = render(<Log revision={0} changed={changed} />);
   fireEvent.click(await screen.findByRole('button', { name: /Restore On for log entry 7/ }));
   fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Restore' }));
   await waitFor(() => expect(toast).toHaveBeenCalled());
-  vi.mocked(api.log).mockResolvedValue(empty ? [] : [{ id: 8, machine: 'laptop', harness: 'claude', kind: 'skill', name: 'other', before: true, after: false, at: 2, author: 'user', cause: { type: 'change' } }]);
+  vi.mocked(api.log).mockResolvedValue(empty ? [] : [{ id: 8, machine: 'laptop', harness: 'claude', kind: 'skill', item_id: 'other', name: 'other', before: true, after: false, at: 2, author: 'user', cause: { type: 'change' } }]);
   view.rerender(<Log revision={1} changed={changed} />);
   if (empty) await screen.findByText('No log entries');
   else await screen.findByRole('button', { name: /Restore On for log entry 8/ });
@@ -455,7 +454,7 @@ it('loads conflict diffs on expansion and uses recovery ids', async () => {
   expect(screen.getAllByText('+draft')[0].getAttribute('data-kind')).toBe('add');
 });
 it('queries the server by machine, Harness, author and item', async () => {
-  const base = { kind: 'skill' as const, before: true, after: false, at: 1, cause: { type: 'change' as const } };
+  const base = { kind: 'skill' as const, item_id: 'skill-id', before: true, after: false, at: 1, cause: { type: 'change' as const } };
   vi.mocked(api.log).mockResolvedValue([{ ...base, id: 1, machine: 'laptop', harness: 'claude', author: 'alice', name: 'pdf' }, { ...base, id: 2, machine: 'desktop', harness: 'codex', author: 'bob', name: 'writing' }]);
   render(<Log revision={0} changed={changed} />);
   await screen.findByText('pdf');
@@ -470,8 +469,8 @@ it('queries the server by machine, Harness, author and item', async () => {
 it('does not offer Restore for a removed Machine', async () => {
   vi.mocked(api.fleet).mockResolvedValue({ baseline: null, machines: [{ id: 'laptop' } as never] });
   vi.mocked(api.log).mockResolvedValue([
-    { id: 7, machine: 'laptop', harness: 'claude', kind: 'skill', name: 'pdf', before: true, after: false, at: 1, author: 'user', cause: { type: 'change' } },
-    { id: 8, machine: 'old-box', harness: 'claude', kind: 'skill', name: 'pdf', before: true, after: false, at: 2, author: 'user', cause: { type: 'change' } }]);
+    { id: 7, machine: 'laptop', harness: 'claude', kind: 'skill', item_id: 'pdf', name: 'pdf', before: true, after: false, at: 1, author: 'user', cause: { type: 'change' } },
+    { id: 8, machine: 'old-box', harness: 'claude', kind: 'skill', item_id: 'pdf', name: 'pdf', before: true, after: false, at: 2, author: 'user', cause: { type: 'change' } }]);
   render(<Log revision={0} changed={changed} />);
   await screen.findByRole('button', { name: /Restore On for log entry 7/ });
   expect(await screen.findByText('Machine removed')).toBeTruthy();

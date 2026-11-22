@@ -374,7 +374,7 @@ impl MachineConfig {
         Self::parse(&snapshot.text()?, snapshot.path())
     }
 
-    fn parse(text: &str, path: &Path) -> Result<Self> {
+    pub(crate) fn parse(text: &str, path: &Path) -> Result<Self> {
         let mut config: Self =
             toml::from_str(text).map_err(|e| Error::Parse { path: path.to_path_buf(), message: e.to_string() })?;
         if config.id.trim().is_empty() {
@@ -547,6 +547,49 @@ impl MachineConfig {
     /// of it as written. Changes nothing on disk; see [`ConfigEdit::write`].
     pub fn edit(snapshot: &Snapshot, change: &HarnessChange) -> Result<ConfigEdit> {
         home_or_none(|home| Self::edit_in(snapshot, change, home))
+    }
+
+    /// Renames a harness in machine.toml. A renamed preset becomes a custom
+    /// harness with the same settings, and the original preset is disabled.
+    pub fn rename_harness(snapshot: &Snapshot, from: &str, to: &str) -> Result<ConfigEdit> {
+        check_name(to)?;
+        let before = Self::from_snapshot(snapshot)?;
+        if before.harnesses.contains_key(to) || preset(to).is_some() {
+            return Err(Error::Invalid(format!(
+                "harness `{to}` already exists on this Machine; rename to a name no harness has (or remove `{to}` \
+                 first with `sk1ll harnesses remove {to}`)"
+            )));
+        }
+        let mut doc = ConfigDoc::parse(&snapshot.text()?, snapshot.path())?;
+        if let Some(preset) = preset(from).filter(|_| !before.custom(from)) {
+            let entry = before.harnesses.get(from);
+            let choice = before.choices().into_iter().find(|choice| choice.name == from).unwrap();
+            if entry.is_none() && !choice.enabled {
+                return Err(Error::Invalid(format!("no configured or enabled harness `{from}`")));
+            }
+            let harness = entry.map_or_else(|| preset.harness(), |entry| merge(preset.harness(), entry));
+            let table = doc.entry(to)?;
+            for (key, path) in [("skills", harness.skills), ("instructions", harness.instructions)] {
+                if let Some(path) = path {
+                    table[key] = toml_edit::value(path);
+                }
+            }
+            table["instructions_format"] = toml_edit::value(format_name(harness.instructions_format));
+            table["mode"] = toml_edit::value(mode_name(harness.mode));
+            if !choice.enabled {
+                table["enabled"] = toml_edit::value(false);
+            }
+        } else {
+            let table = doc.harnesses()?.ok_or_else(|| Error::Invalid(format!("no harness `{from}`")))?;
+            let item = table.remove(from).ok_or_else(|| Error::Invalid(format!("no harness `{from}`")))?;
+            table.insert(to, item);
+        }
+        if preset(from).is_some() {
+            doc.entry(from)?["enabled"] = toml_edit::value(false);
+        }
+        let text = doc.doc.to_string();
+        let config = Self::parse(&text, snapshot.path())?;
+        Ok(ConfigEdit { text, config })
     }
 
     /// Makes `change` to the `machine.toml` at `path`.

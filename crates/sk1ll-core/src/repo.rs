@@ -5,7 +5,7 @@ use crate::instructions::{self, INSTRUCTIONS_DIR, Rule};
 use crate::lock::Lockfile;
 use crate::manifest::{MANIFEST_FILE, Manifest};
 use crate::skill::{self, IMPORTED_DIR, PERSONAL_DIR, Skill};
-use crate::{Error, IoExt, Result};
+use crate::{Error, IoExt, ItemId, ItemRef, Result};
 
 /// The message of the commit [`Repo::init_committed`] makes.
 const INIT_COMMIT_MESSAGE: &str = "Initialize skills repo";
@@ -41,15 +41,22 @@ pub enum RenameError {
     /// Nothing was renamed: the new name was taken (it may have appeared
     /// since a [`Repo::check_rename`]), say.
     NotMoved(Error),
-    /// The item has its new name, but rewriting its frontmatter `name:` failed.
+    /// The item has its new name, but writing its metadata failed.
     Moved(Error),
+    /// Neither the destination nor the original name could be published.
+    Stranded { path: PathBuf, publish: std::io::Error, rollback: std::io::Error },
 }
 
 impl std::fmt::Display for RenameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotMoved(e) => e.fmt(f),
-            Self::Moved(e) => write!(f, "renamed, but updating its frontmatter failed: {e}"),
+            Self::Moved(e) => write!(f, "renamed, but updating its metadata failed: {e}"),
+            Self::Stranded { path, publish, rollback } => write!(
+                f,
+                "rename failed ({publish}) and rollback failed ({rollback}). The item is staged at {}",
+                path.display()
+            ),
         }
     }
 }
@@ -60,7 +67,8 @@ impl From<RenameError> for Error {
     fn from(e: RenameError) -> Self {
         match e {
             RenameError::NotMoved(e) => e,
-            RenameError::Moved(e) => Error::Invalid(format!("renamed, but updating its frontmatter failed: {e}")),
+            RenameError::Moved(e) => Error::Invalid(format!("renamed, but updating its metadata failed: {e}")),
+            e @ RenameError::Stranded { .. } => Error::Invalid(e.to_string()),
         }
     }
 }
@@ -95,15 +103,24 @@ impl Repo {
             return Err(Error::Invalid("content directory is a symlink".into()));
         }
         fs::create_dir_all(parent).at(&path)?;
-        let file = if kind == "skill" {
-            fs::create_dir(&path).at(&path)?;
-            path.join("SKILL.md")
+        let id = self.new_item_id()?;
+        if kind == "skill" {
+            let stage = crate::source::unique(parent);
+            fs::create_dir(&stage).at(&stage)?;
+            let file = stage.join("SKILL.md");
+            let created = fs::write(&file, body)
+                .at(&file)
+                .and_then(|()| id.write_skill(&stage))
+                .and_then(|()| crate::sync::rename_noreplace(&stage, &path).at(&path));
+            if created.is_err() {
+                let _ = fs::remove_dir_all(&stage);
+            }
+            created
         } else {
-            path
-        };
-        use std::io::Write;
-        let mut out = fs::OpenOptions::new().write(true).create_new(true).open(&file).at(&file)?;
-        out.write_all(body.as_bytes()).at(&file)
+            let text = instructions::with_id(body, &path, &id)?;
+            let staged = crate::config_file::Staged::write(&path, text.as_bytes(), None)?;
+            if staged.place_new()? { Ok(()) } else { Err(Error::Invalid(format!("name `{name}` is taken"))) }
+        }
     }
 
     /// An existing personal Skill directory or Rule file. Imports are removed
@@ -140,6 +157,8 @@ impl Repo {
     /// The item to rename, its destination and the file whose frontmatter
     /// names it.
     fn rename_paths(&self, kind: &str, name: &str, to: &str) -> Result<(PathBuf, PathBuf, PathBuf)> {
+        // It moves the item and its Item ID: not inside a pending pull's partial tree.
+        self.require_no_pending_pull()?;
         let from = self.personal_item(kind, name)?;
         crate::imports::validate_name(to)?;
         if name == to {
@@ -158,49 +177,55 @@ impl Repo {
                 (dest.clone(), dest)
             }
         };
-        if dest.symlink_metadata().is_ok() {
+        if dest.symlink_metadata().is_ok() && !case_alias(&from, &dest)? {
             return Err(Error::Invalid(format!("name `{to}` is taken")));
         }
         Ok((from, dest, file))
     }
 
     /// Renames a personal Skill or Rule in the Draft (the old name deleted, the
-    /// new one added) and updates a frontmatter `name:` that matched the old name.
+    /// new one added), keeping its Item ID and updating a matching frontmatter `name:`.
     /// A failure says whether the item had moved by then.
     pub fn rename_item(&self, kind: &str, name: &str, to: &str) -> std::result::Result<(), RenameError> {
         let (from, dest, file) = self.rename_paths(kind, name, to).map_err(RenameError::NotMoved)?;
-        crate::sync::rename_noreplace(&from, &dest).map_err(|e| {
-            RenameError::NotMoved(if e.kind() == std::io::ErrorKind::AlreadyExists {
+        let case_only = case_alias(&from, &dest).map_err(RenameError::NotMoved)?;
+        let relative = from.strip_prefix(&self.root).unwrap();
+        if self.resolved_ids().map_err(RenameError::NotMoved)?.get(relative).is_none_or(Option::is_none) {
+            return Err(RenameError::NotMoved(Error::Invalid(format!(
+                "`{name}` has an unassigned Item ID. Run `sk1ll sync` before renaming it"
+            ))));
+        }
+        let moved = if case_only {
+            let stage = rename_stage(&from);
+            crate::sync::rename_noreplace(&from, &stage).at(&stage).map_err(RenameError::NotMoved)?;
+            if let Err(publish) = crate::sync::rename_noreplace(&stage, &dest) {
+                if let Err(rollback) = crate::sync::rename_noreplace(&stage, &from) {
+                    return Err(RenameError::Stranded { path: stage, publish, rollback });
+                }
+                Err(publish)
+            } else {
+                Ok(())
+            }
+        } else {
+            crate::sync::rename_noreplace(&from, &dest)
+        };
+        if let Err(error) = moved {
+            return Err(RenameError::NotMoved(if error.kind() == std::io::ErrorKind::AlreadyExists {
                 Error::Invalid(format!("name `{to}` is taken"))
             } else {
-                Error::Io { path: dest.clone(), source: e }
-            })
-        })?;
+                Error::Io { path: dest, source: error }
+            }));
+        }
         // Only a regular file is rewritten: a symlinked SKILL.md points elsewhere.
         let Ok(meta) = file.symlink_metadata() else { return Ok(()) };
-        let Some(renamed) = meta
-            .is_file()
-            .then(|| fs::read_to_string(&file).ok())
-            .flatten()
-            .and_then(|text| rename_frontmatter(&text, name, to))
-        else {
+        if !meta.is_file() {
             return Ok(());
-        };
-        // A fresh, exclusively created name: a planted file or symlink at a
-        // predictable path must never be followed or overwritten.
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-        let tmp = file.with_file_name(format!("{}rename-{}-{nanos}", crate::source::STAGE_PREFIX, std::process::id()));
-        let staged = (|| {
-            use std::io::Write;
-            let mut out = fs::OpenOptions::new().write(true).create_new(true).open(&tmp).at(&tmp)?;
-            out.write_all(renamed.as_bytes()).at(&tmp)?;
-            out.set_permissions(meta.permissions()).at(&tmp)?;
-            fs::rename(&tmp, &file).at(&file)
-        })();
-        if staged.is_err() {
-            let _ = fs::remove_file(&tmp);
         }
-        staged.map_err(RenameError::Moved)
+        let renamed = fs::read_to_string(&file).ok().and_then(|text| rename_frontmatter(&text, name, to));
+        let Some(renamed) = renamed else { return Ok(()) };
+        crate::config_file::Staged::write(&file, renamed.as_bytes(), crate::config_file::existing_mode(&file))
+            .and_then(crate::config_file::Staged::replace)
+            .map_err(RenameError::Moved)
     }
 
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
@@ -254,7 +279,8 @@ impl Repo {
         if !dir.join(".git").exists() && !layout.contains(&true) {
             return false;
         }
-        let git = || crate::git::Git::new(dir);
+        let Ok(repo) = crate::git::RepoGit::open(dir) else { return false };
+        let git = || repo.git();
         // `HEAD:./path` is relative to `dir`, wherever the worktree's top is.
         if git().args(["cat-file", "-e", &format!("HEAD:./{MANIFEST_FILE}")]).succeeds().unwrap_or(false) {
             return true;
@@ -354,13 +380,163 @@ impl Repo {
         self.root.join(IMPORTED_DIR)
     }
 
+    pub(crate) fn resolved_ids(&self) -> Result<crate::item_id::Claims> {
+        let claims = self.item_id_claims()?;
+        crate::item_id::check_claims(&claims)?;
+        Ok(claims)
+    }
+
+    /// Persists missing Item IDs while the caller holds the EngineLock.
+    pub fn assign_missing_ids(&self) -> Result<usize> {
+        self.assign_item_ids(|_| true)
+    }
+
+    /// Every Item ID write goes through here or [`repair_ids`](Self::repair_ids):
+    /// neither writes into a pending pull's partial tree.
+    pub(crate) fn assign_item_ids(&self, include: impl Fn(&Path) -> bool) -> Result<usize> {
+        self.require_no_pending_pull()?;
+        crate::item_id::assign(&self.root, include, crate::item_id::Mode::Missing)
+    }
+
+    /// Reassigns duplicate Item IDs as a Draft change while the caller holds
+    /// the EngineLock. Of the items sharing an ID, the one that has it at its
+    /// path in the Baseline keeps it (ADR 0006).
+    pub fn repair_ids(&self) -> Result<usize> {
+        self.require_no_pending_pull()?;
+        let baseline = self.baseline_claims()?;
+        crate::item_id::assign(&self.root, |_| true, crate::item_id::Mode::Repair { baseline: &baseline })
+    }
+
+    fn item_id_claims(&self) -> Result<crate::item_id::Claims> {
+        let manifest = Manifest::load(&self.root)?;
+        crate::item_id::claims_on_disk(&self.root, &manifest, |_| true)
+    }
+
+    pub(crate) fn new_item_id(&self) -> Result<ItemId> {
+        let ids = self.resolved_ids()?;
+        loop {
+            let id = ItemId::generate();
+            if !ids.values().flatten().any(|claimed| claimed == &id) {
+                return Ok(id);
+            }
+        }
+    }
+
+    pub(crate) fn check_item_id(&self, path: PathBuf, id: ItemId) -> Result<()> {
+        let mut claims = self.item_id_claims()?;
+        claims.insert(path, Some(id));
+        crate::item_id::check_claims(&claims)
+    }
+
     pub fn skills(&self) -> Result<Vec<Skill>> {
-        skill::discover(&self.root)
+        skill::discover_with(&self.root, &self.resolved_ids()?)
     }
 
     pub fn rules(&self) -> Result<Vec<Rule>> {
-        instructions::discover(&self.root)
+        instructions::discover_with(&self.root, &self.resolved_ids()?)
     }
+
+    pub fn content(&self) -> Result<(Vec<Skill>, Vec<Rule>)> {
+        let ids = self.resolved_ids()?;
+        Ok((skill::discover_with(&self.root, &ids)?, instructions::discover_with(&self.root, &ids)?))
+    }
+
+    /// The Item IDs of repo Skills and Rules. Personal skills take precedence
+    /// over Imports of the same name, as they do for sync.
+    pub fn item_ids(&self) -> Result<Vec<(ItemRef, Option<ItemId>)>> {
+        let (skills, rules) = self.content()?;
+        Ok(skills
+            .into_iter()
+            .map(|s| (ItemRef::Skill(s.name), s.id))
+            .chain(rules.into_iter().map(|r| (ItemRef::Rule(r.name), r.id)))
+            .collect())
+    }
+}
+
+const RENAME_STAGE: &str = ".sk1ll-stage-rename-";
+
+fn rename_stage(from: &Path) -> PathBuf {
+    let parent = from.parent().unwrap();
+    let stage = crate::source::unique(parent);
+    let nonce = stage.file_name().unwrap().to_string_lossy();
+    let original = from.file_name().unwrap().to_string_lossy();
+    parent.join(format!("{RENAME_STAGE}{}-{original}", nonce.trim_start_matches(crate::source::STAGE_PREFIX)))
+}
+
+pub(crate) fn check_rename_stage(path: &Path) -> Result<()> {
+    if path.file_name().is_some_and(|name| name.to_string_lossy().starts_with(RENAME_STAGE)) {
+        return Err(Error::StrandedRename { path: path.into() });
+    }
+    Ok(())
+}
+
+/// The spelling the directory holding `wanted` stores it by, if that is
+/// another one that only differs in case and is the same file (a
+/// case-insensitive filesystem): `personal/PDF` where `personal/pdf` was
+/// asked for. `None` if the exact spelling is there, or nothing is.
+pub(crate) fn stored_spelling(wanted: &Path) -> Result<Option<PathBuf>> {
+    let (Some(parent), Some(name)) = (wanted.parent(), wanted.file_name().and_then(|n| n.to_str())) else {
+        return Ok(None);
+    };
+    let Ok(entries) = fs::read_dir(parent) else { return Ok(None) };
+    let mut found = None;
+    for entry in entries {
+        let entry = entry.at(parent)?.file_name();
+        if entry == name {
+            return Ok(None);
+        }
+        if entry.to_str().is_some_and(|stored| stored.eq_ignore_ascii_case(name)) {
+            found = Some(parent.join(entry));
+        }
+    }
+    match found {
+        Some(stored) if case_alias(&stored, wanted)? => Ok(Some(stored)),
+        _ => Ok(None),
+    }
+}
+
+/// Renames `stored` to `wanted`, names that differ only in case, through a
+/// stage of its own and with no-replace renames only, so whatever is in it
+/// (ignored files included) moves along and nothing at either name is ever
+/// replaced: a case-insensitive filesystem sees one name for both.
+pub(crate) fn respell(stored: &Path, wanted: &Path) -> Result<()> {
+    let stage = rename_stage(stored);
+    crate::sync::rename_noreplace(stored, &stage).at(&stage)?;
+    if let Err(publish) = crate::sync::rename_noreplace(&stage, wanted) {
+        if let Err(rollback) = crate::sync::rename_noreplace(&stage, stored) {
+            return Err(Error::Invalid(format!(
+                "{} could not be renamed to {} ({publish}) or back ({rollback}); it is left at {}",
+                stored.display(),
+                wanted.display(),
+                stage.display()
+            )));
+        }
+        return Err(Error::Io { path: wanted.to_path_buf(), source: publish });
+    }
+    Ok(())
+}
+
+/// A case-insensitive lookup must alias the source, with no separate directory
+/// entry at the destination spelling (a distinct hard link can share an inode).
+pub(crate) fn case_alias(from: &Path, dest: &Path) -> Result<bool> {
+    let (Some(from_name), Some(dest_name)) =
+        (from.file_name().and_then(|n| n.to_str()), dest.file_name().and_then(|n| n.to_str()))
+    else {
+        return Ok(false);
+    };
+    if !from_name.eq_ignore_ascii_case(dest_name) || !dest.symlink_metadata().is_ok_and(|m| !m.is_symlink()) {
+        return Ok(false);
+    }
+    let parent = from.parent().unwrap();
+    for entry in fs::read_dir(parent).at(parent)? {
+        if entry.at(parent)?.file_name() == dest_name {
+            return Ok(false);
+        }
+    }
+    #[cfg(unix)]
+    return Ok(crate::sync::displaced::same_file(from, dest));
+    #[cfg(not(unix))]
+    Ok(from.canonicalize().at(from)? == dest.canonicalize().at(dest)?)
 }
 
 /// `text` with a frontmatter `name: <from>` line (quoted or not) set to `to`.
@@ -544,6 +720,10 @@ mod create_tests {
         }
         repo.create_item("rule", "style", "House style").unwrap();
         assert!(dir.path().join("instructions/style.md").exists());
+        let ids = repo.item_ids().unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.iter().all(|(_, id)| ulid::Ulid::from_string(&id.as_ref().unwrap().to_string()).is_ok()));
+        assert_eq!(ItemId::read_skill(&repo.personal_dir().join("new-skill")).unwrap().as_ref(), ids[0].1.as_ref());
         assert!(repo.create_item("rule", "style", "").is_err());
         assert!(repo.create_item("other", "x", "").is_err());
     }
@@ -611,32 +791,204 @@ mod create_tests {
         repo.create_item("skill", "other", "").unwrap();
         assert!(repo.rename_item("skill", "pdf", "other").is_err());
 
+        let before = repo.skills().unwrap().into_iter().find(|s| s.name == "pdf").unwrap();
         repo.rename_item("skill", "pdf", "documents").unwrap();
         assert!(!dir.path().join("personal/pdf").exists());
         let text = fs::read_to_string(dir.path().join("personal/documents/SKILL.md")).unwrap();
         assert_eq!(text, "---\nname: documents\ndescription: \"PDF\"\n---\n\n");
         assert_eq!(fs::read_to_string(dir.path().join("personal/documents/notes.md")).unwrap(), "kept");
+        assert_eq!(ItemId::read_skill(&repo.personal_dir().join("documents")).unwrap(), before.id);
         assert!(
-            fs::read_dir(dir.path().join("personal/documents")).unwrap().all(|e| !e
+            fs::read_dir(repo.personal_dir().join("documents"))
                 .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".sk1ll"))
+                .all(|e| !crate::source::is_staging_path(Path::new(&e.unwrap().file_name())))
         );
 
         // A `name:` that doesn't match the old name is left alone.
-        fs::write(dir.path().join("instructions/style.md"), "---\nname: House\n---\nbody\n").unwrap();
+        let rule_id = repo.rules().unwrap().remove(0).id.unwrap();
+        let rule = format!("---\nname: House\nid: \"{rule_id}\"\n---\nbody\n");
+        fs::write(dir.path().join("instructions/style.md"), &rule).unwrap();
         repo.rename_item("rule", "style", "house-style").unwrap();
-        assert_eq!(
-            fs::read_to_string(dir.path().join("instructions/house-style.md")).unwrap(),
-            "---\nname: House\n---\nbody\n"
-        );
+        assert_eq!(fs::read_to_string(dir.path().join("instructions/house-style.md")).unwrap(), rule);
+        assert_eq!(repo.rules().unwrap()[0].id, Some(rule_id));
 
         repo.delete_item("skill", "documents").unwrap();
         repo.delete_item("rule", "house-style").unwrap();
         assert!(!dir.path().join("personal/documents").exists());
         assert!(!dir.path().join("instructions/house-style.md").exists());
         assert!(dir.path().join("imported/vendored/SKILL.md").exists());
+    }
+
+    #[test]
+    fn reader_leaves_item_ids_unassigned_until_they_are_persisted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::init_committed(tmp.path()).unwrap();
+        let skill = repo.personal_dir().join("style");
+        fs::create_dir(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), "Skill.\n").unwrap();
+        fs::write(repo.root().join("instructions/style.md"), "Rule.\n").unwrap();
+        fs::write(repo.root().join(MANIFEST_FILE), "import = { vendored = { source = 'local' } }\n").unwrap();
+        assert!(repo.item_ids().unwrap().iter().all(|(_, id)| id.is_none()));
+        assert!(!skill.join(skill::ID_FILE).exists());
+        assert_eq!(repo.assign_missing_ids().unwrap(), 3);
+        let first = repo.item_ids().unwrap();
+        assert_eq!(repo.assign_missing_ids().unwrap(), 0);
+        assert_eq!(repo.item_ids().unwrap(), first);
+        assert!(first.iter().all(|(_, id)| ulid::Ulid::from_string(&id.as_ref().unwrap().to_string()).is_ok()));
+        let imported = Manifest::load(repo.root()).unwrap().import["vendored"].id.clone().unwrap();
+        assert!(ulid::Ulid::from_string(&imported.to_string()).is_ok());
+        repo.rename_item("skill", "style", "new-style").unwrap();
+        assert_eq!(repo.skills().unwrap()[0].id, first[0].1);
+        let diff = repo.diff(&ItemRef::Skill("new-style".into())).unwrap();
+        assert!(diff.contains("+Skill.") && !diff.contains(crate::skill::ID_FILE));
+    }
+
+    #[test]
+    fn copied_skill_ids_report_both_paths_and_block_creation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::init(tmp.path()).unwrap();
+        repo.create_item("skill", "pdf", "PDF").unwrap();
+        let copy = repo.personal_dir().join("copy");
+        fs::create_dir(&copy).unwrap();
+        for file in ["SKILL.md", skill::ID_FILE] {
+            fs::copy(repo.personal_dir().join("pdf").join(file), copy.join(file)).unwrap();
+        }
+        let err = repo.item_ids().unwrap_err();
+        assert!(matches!(err, Error::DuplicateItemId { .. }));
+        for path in ["personal/pdf/.sk1ll-id", "personal/copy/.sk1ll-id"] {
+            assert!(err.to_string().contains(path), "{err}");
+        }
+        assert!(repo.create_item("rule", "style", "").is_err());
+        assert!(!repo.root().join("instructions/style.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unassigned_skill_stays_at_its_old_name_if_the_id_cannot_be_written() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::init(tmp.path()).unwrap();
+        let source = repo.personal_dir().join("pdf");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("SKILL.md"), "PDF\n").unwrap();
+        let before = repo.skills().unwrap()[0].id.clone();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o555)).unwrap();
+        let result = repo.rename_item("skill", "pdf", "docs");
+        let actual = if result.is_ok() { repo.personal_dir().join("docs") } else { source.clone() };
+        fs::set_permissions(&actual, fs::Permissions::from_mode(0o755)).unwrap();
+        // Users with DAC override can write despite the mode bits.
+        if let Err(error) = result {
+            assert!(matches!(error, RenameError::NotMoved(_)));
+            assert!(source.is_dir());
+            assert!(!repo.personal_dir().join("docs").exists());
+        }
+        if actual == source {
+            assert_eq!(repo.skills().unwrap()[0].id, before);
+        }
+    }
+
+    #[test]
+    fn an_interrupted_case_rename_reports_the_stage_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::init_committed(tmp.path()).unwrap();
+        repo.create_item("skill", "pdf", "").unwrap();
+        let original = repo.personal_dir().join("pdf");
+        let stage = rename_stage(&original);
+        fs::rename(&original, &stage).unwrap();
+        for error in [repo.draft().unwrap_err(), repo.skills().unwrap_err()] {
+            assert!(matches!(error, Error::StrandedRename { path } if path == stage));
+        }
+    }
+
+    #[test]
+    fn a_case_only_rename_keeps_the_id_and_uses_the_requested_spelling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::init_committed(tmp.path()).unwrap();
+        repo.create_item("rule", "pdf", "PDF").unwrap();
+        let id = repo.rules().unwrap()[0].id.clone();
+        let old = ItemRef::Rule("pdf".into());
+        let new = ItemRef::Rule("PDF".into());
+        repo.commit(std::slice::from_ref(&old), "Add Rule", None).unwrap();
+        repo.check_rename("rule", "pdf", "PDF").unwrap();
+        repo.rename_item("rule", "pdf", "PDF").unwrap();
+        let rules = repo.rules().unwrap();
+        assert_eq!(rules[0].id, id);
+        assert_eq!(rules[0].name, "PDF");
+        assert_eq!(rules.len(), 1);
+        repo.restore(&[old.clone(), new.clone()]).unwrap();
+        assert_eq!(repo.rules().unwrap()[0].name, "pdf");
+        repo.rename_item("rule", "pdf", "PDF").unwrap();
+        repo.commit(&[old, new.clone()], "Rename Rule", None).unwrap();
+        assert_eq!(crate::content::item_ids_at(repo.root(), "HEAD").unwrap(), [(new, id)].into());
+        assert!(repo.draft().unwrap().is_empty());
+    }
+
+    /// Whether `dir`'s filesystem folds case (macOS's default APFS does).
+    fn folds_case(dir: &Path) -> bool {
+        let probe = dir.join("case-probe");
+        fs::write(&probe, "").unwrap();
+        let folds = dir.join("CASE-PROBE").exists();
+        fs::remove_file(probe).unwrap();
+        folds
+    }
+
+    /// Respelling moves the directory as a whole, ignored files and all,
+    /// through a stage of its own, and replaces nothing.
+    #[test]
+    fn respelling_moves_everything_and_replaces_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (stored, wanted) = (tmp.path().join("PDF"), tmp.path().join("pdf"));
+        fs::create_dir(&stored).unwrap();
+        fs::write(stored.join("SKILL.md"), "PDFs.\n").unwrap();
+        fs::write(stored.join("notes.tmp"), "ignored\n").unwrap();
+        respell(&stored, &wanted).unwrap();
+        let names: Vec<_> = fs::read_dir(tmp.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, ["pdf"]);
+        assert_eq!(fs::read_to_string(wanted.join("notes.tmp")).unwrap(), "ignored\n");
+        if !folds_case(tmp.path()) {
+            // Something of its own at the wanted spelling stays, and so does the stored one.
+            fs::create_dir(&stored).unwrap();
+            assert!(respell(&stored, &wanted).is_err());
+            assert!(stored.is_dir() && wanted.join("SKILL.md").is_file());
+        }
+    }
+
+    /// The stored spelling only counts where the filesystem folds case (it
+    /// is the same directory): on a case-sensitive one, `PDF` is another
+    /// directory than `pdf`, so nothing is respelled.
+    #[test]
+    fn a_stored_spelling_needs_a_case_folding_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("PDF")).unwrap();
+        let found = stored_spelling(&tmp.path().join("pdf")).unwrap();
+        match folds_case(tmp.path()) {
+            true => assert_eq!(found, Some(tmp.path().join("PDF"))),
+            false => assert_eq!(found, None),
+        }
+        assert_eq!(stored_spelling(&tmp.path().join("PDF")).unwrap(), None);
+    }
+
+    /// Restoring both sides of `pdf` -> `PDF` puts the Baseline's spelling
+    /// back even when the directory holds an ignored file, which keeps
+    /// restore from removing it. Only a case-insensitive filesystem (macOS)
+    /// gets there; elsewhere the two spellings are two directories.
+    #[test]
+    fn restoring_a_case_only_rename_restores_the_spelling() {
+        let tmp = tempfile::tempdir().unwrap();
+        if !folds_case(tmp.path()) {
+            return;
+        }
+        let repo = Repo::init_committed(tmp.path()).unwrap();
+        repo.create_item("skill", "pdf", "PDF").unwrap();
+        let old = ItemRef::Skill("pdf".into());
+        repo.commit(std::slice::from_ref(&old), "Add Skill", None).unwrap();
+        fs::write(tmp.path().join(".gitignore"), "*.tmp\n").unwrap();
+        repo.rename_item("skill", "pdf", "PDF").unwrap();
+        fs::write(repo.personal_dir().join("PDF/notes.tmp"), "ignored\n").unwrap();
+        repo.restore(&[old, ItemRef::Skill("PDF".into())]).unwrap();
+        let names: Vec<_> = fs::read_dir(repo.personal_dir()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, ["pdf"]);
+        assert!(repo.personal_dir().join("pdf/notes.tmp").is_file());
     }
 
     #[test]

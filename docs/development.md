@@ -4,21 +4,21 @@
 
 | Crate | Role |
 |---|---|
-| `sk1ll-core` | All repo, import, draft and sync logic. It prints nothing, and its public types are `Serialize`. |
-| `sk1ll-cli` | The `sk1ll` binary, a thin `clap` front end |
-| `sk1ll-daemon` | The per-machine daemon, its local API and the client the CLI and GUI use |
+| `sk1ll-core` | All repo, import, draft and sync logic, and the one git layer (`git`, its `plumbing`). It prints nothing, and its public types are `Serialize`. |
+| `sk1ll-cli` | The `sk1ll` binary, a `clap` client of the local API: of the running daemon, else of an engine it starts in its own process ([ADR 0008](adr/0008-cli-is-a-client-of-the-engine.md)) |
+| `sk1ll-daemon` | The per-machine daemon: its engine (over an `AssignmentStore` and a `Remote`), local API, in-process engine (`local`) and the client the CLI and GUI use |
 | `sk1ll-server` | The fleet server: git remote, assignment, machine status |
 | `sk1ll-proto` | Wire types shared by the server, daemon, CLI and GUI, with no I/O |
 | `sk1ll-gui/src-tauri` | The desktop app, see [Desktop GUI](gui.md) |
 
-`sync::plan` has no side effects. `sync::apply` checks the filesystem again before it changes anything. Sync only modifies:
+`sync::plan` has no side effects. `sync::apply` checks the filesystem and the index entry again before it changes anything. Sync only modifies existing harness content that it owns.
 
-- skill symlinks listed in the skills directory's `.sk1ll-managed-links` index,
-- skill copies marked with `.sk1ll-managed`,
-- its own block in instruction files,
-- rule files listed in a rules directory's `.sk1ll-managed` index.
+- A skill symlink must resolve to the target recorded in the skills directory's `.sk1ll-state/index.json`.
+- A copied skill's root `.sk1ll-placement` file must match the token and share an inode with its anchor in `.sk1ll-state/anchors/`.
+- A rule file must share an inode with its recorded anchor in the rules directory's `.sk1ll-state/anchors/`.
+- In block-format instructions, sync owns its marked block.
 
-An existing skill symlink enters the index only when its canonical target is the repo skill currently assigned to that harness.
+An existing skill symlink enters the index only when its canonical target is the repo skill currently assigned to that harness. Sync locks each managed directory while it recovers or writes placements. It records a pending placement or removal and the recovery entry before moving the incumbent. It validates the object that moved and publishes the replacement only at a vacant name. Recovery checks which object is at the destination and keeps the backup if a different object took its place. A read-only plan resolves pending ownership in memory. The index stores a full placement fingerprint, including directories and modes, separately from the source content hash. Recovery keeps a backup whose payload differs from that fingerprint or has no recorded placement.
 
 ## Isolated dev fleet
 
@@ -42,12 +42,20 @@ pnpm build           # needed before cargo, because the GUI embeds ui/dist
 cd ../../..
 cargo fmt --all --check
 cargo build --workspace
-cargo test --workspace
+cargo test --workspace         # or scripts/check-test-home.sh, as CI runs it
 cargo clippy --workspace --all-targets -- -D warnings
 python3 crates/sk1ll-gui/tests/test_dev_fleet.py
 ```
 
+The CLI's command tests run the `sk1ll` binary, each with its own `HOME` and XDG directories: every command runs the engine, which reconciles, and would otherwise find your own harnesses through the presets.
+
+No test may write under the real home directory: tests get temporary directories, and in-process engines in the daemon's and core's own tests default every path (core's state and cache directories included) to one. `scripts/check-test-home.sh` runs `cargo test --workspace` with `HOME` set to an empty directory and the XDG variables unset, and fails if anything appears there.
+
+A few tests need a case-insensitive filesystem (macOS's default APFS) and return early elsewhere, such as restoring both sides of a case-only rename; on Linux only the pieces they are built from run (the respelling move, the alias check). The macOS CI job runs them.
+
 The automated tests don't drive the desktop app. Test interactive GUI flows by hand against the dev fleet.
+
+Time sync planning with `cargo test -p sk1ll-core sync_plan_no_change -- --ignored --nocapture`.
 
 CI (`.github/workflows/ci.yml`) runs the same checks on Linux, plus `scripts/check-version.sh` and `gh actions-lock --verify`. The arm64 macOS job builds the UI and runs the workspace build, tests and clippy.
 

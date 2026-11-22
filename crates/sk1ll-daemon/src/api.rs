@@ -4,6 +4,7 @@
 
 use std::convert::Infallible;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
@@ -30,7 +31,6 @@ use crate::client::{
 use crate::daemon::Daemon;
 use crate::error::{Error, Result};
 use crate::join::{self, JoinOptions, Joined};
-use crate::server;
 
 type St = State<Arc<Daemon>>;
 
@@ -39,6 +39,8 @@ pub(crate) fn router(d: Arc<Daemon>) -> Router {
         .route("/status", get(status))
         .route("/init", post(init))
         .route("/items", get(items))
+        .route("/repo", get(repo_content))
+        .route("/items/editable", get(editable))
         .route("/skills", get(skills))
         .route("/skills/tree", get(skill_tree))
         .route(
@@ -69,6 +71,7 @@ pub(crate) fn router(d: Arc<Daemon>) -> Router {
         .route("/imports", get(imports))
         .route("/imports/check", post(check_imports))
         .route("/items/create", post(create_item))
+        .route("/items/repair-ids", post(repair_ids))
         .route("/items/delete", post(delete_item))
         .route("/items/rename", post(rename_item))
         .route("/conflicts/diff", post(conflict_diff))
@@ -88,6 +91,9 @@ pub(crate) fn router(d: Arc<Daemon>) -> Router {
         .route("/machines/{id}", delete(pass))
         .route("/machines/{id}/assignment", get(assignment).put(assignment))
         .route("/assignment/harness/{harness}", post(set_harness_assignment))
+        .route("/assignment/rename-harness", post(rename_harness))
+        .route("/assignment/orphans", get(pass))
+        .route("/assignment/orphans/prune", post(pass))
         .route("/machines/{id}/assignment/copy-from", post(pass))
         .route("/machines/{id}/assignment/copy-from/preview", post(pass))
         .route("/log", get(pass))
@@ -111,7 +117,7 @@ async fn check_api_version(request: Request, next: Next) -> Response {
                  restart the daemon so it runs the installed sk1ll (systemctl --user restart sk1ll-daemon)",
                 sk1ll_core::VERSION
             );
-            (StatusCode::UPGRADE_REQUIRED, Json(sk1ll_proto::ErrorBody { error, code: None })).into_response()
+            (StatusCode::UPGRADE_REQUIRED, Json(sk1ll_proto::ErrorBody { error })).into_response()
         }
         _ => next.run(request).await,
     }
@@ -224,24 +230,68 @@ impl axum::serve::Listener for PeerChecked {
     }
 }
 
-// Handlers that only read go through `Daemon::reading`, without the engine
-// mutex, so they answer while a pull or a push waits for the server.
+// Handlers that only read never wait for the engine mutex, so they answer
+// while a reconcile, a pull or a push runs: the Draft, the inventory, the
+// conflicts and the recovery area come from the published Snapshot (brought
+// up to date first when the engine is free, see `Daemon::caught_up`), and
+// the rest is read from the repo as it is, through `Daemon::reading`.
+//
+// What the CLI's previews ask for (`status`, `list`, `render`, `sync
+// --dry-run`, `diff`, `edit`, `harnesses`: `/repo`, `/skills`, `/sync`,
+// `/harnesses...`, `/draft/diff`, `/items/editable`) only reads, through
+// `Daemon::reading`, and never reconciles, here as in a read-only engine: a
+// preview changes nothing, not even what a reconcile would bring in line.
 
 async fn status(State(d): St) -> Json<StatusView> {
     Json(d.view())
 }
 
-async fn items(State(d): St) -> Result<Json<Vec<ItemView>>> {
-    // No mutable engine guard: inventory only reads git and the working tree.
-    let root = d.view().repo;
-    let inventory = tokio::task::spawn_blocking(move || Daemon::items(&root))
-        .await
-        .map_err(|e| Error::Internal(anyhow::anyhow!("inventory task failed: {e}")))??;
-    Ok(Json(inventory))
+/// `?fresh=true`: the caller acts on what it reads (`sk1ll restore --all`),
+/// so the read waits for a running engine operation and reconciles first
+/// (see `Daemon::fresh`) instead of answering from the last Snapshot.
+#[derive(Deserialize, Default)]
+struct ReadQuery {
+    #[serde(default)]
+    fresh: bool,
 }
 
-async fn draft(State(d): St) -> Result<Json<Vec<DraftEntry>>> {
-    Ok(Json(d.reading(|d| d.draft()).await?))
+impl ReadQuery {
+    async fn snapshot(&self, d: &Arc<Daemon>) -> Result<Arc<crate::daemon::Snapshot>> {
+        // A read-only engine never reconciles: it plans in memory instead.
+        if d.require_writer().is_err() {
+            return Ok(Arc::new(d.reading(|d| d.preview_snapshot()).await?));
+        }
+        if self.fresh { d.fresh().await } else { d.caught_up().await }
+    }
+}
+
+async fn items(State(d): St, Query(q): Query<ReadQuery>) -> Result<Json<Vec<ItemView>>> {
+    Ok(Json(q.snapshot(&d).await?.items()?))
+}
+
+/// Read from the working tree as it is: a preview (`sk1ll status`, `list`),
+/// so it never reconciles, and an item still without its Item ID shows
+/// without one. `?fresh=true` (see [`ReadQuery`]), for a caller about to
+/// act on it (`sk1ll assign`): it waits for the engine and reconciles
+/// first, so new items have their Item IDs.
+async fn repo_content(State(d): St, Query(q): Query<ReadQuery>) -> Result<Json<crate::client::RepoContent>> {
+    if q.fresh {
+        d.fresh().await?;
+    }
+    Ok(Json(d.reading(|d| d.repo_content()).await?))
+}
+
+#[derive(Deserialize)]
+struct EditableQuery {
+    item: String,
+}
+
+async fn editable(State(d): St, Query(q): Query<EditableQuery>) -> Result<Json<PathBuf>> {
+    Ok(Json(d.reading(move |d| d.editable(&q.item)).await?))
+}
+
+async fn draft(State(d): St, Query(q): Query<ReadQuery>) -> Result<Json<Vec<DraftEntry>>> {
+    Ok(Json(q.snapshot(&d).await?.draft()?))
 }
 
 async fn skills(State(d): St) -> Result<Json<Vec<sk1ll_core::content::ContentEntry>>> {
@@ -287,28 +337,32 @@ async fn commit_message(State(d): St, Query(q): Query<ItemsQuery>) -> Result<Jso
 }
 
 async fn commit(State(d): St, Json(req): Json<CommitRequest>) -> Result<Json<CommitResponse>> {
-    Ok(Json(d.blocking(move |d, eng| d.commit(eng, req)).await?))
+    Ok(Json(d.commit(req).await?))
+}
+
+async fn repair_ids(State(d): St) -> Result<Json<usize>> {
+    Ok(Json(d.blocking(move |d, eng| d.repair_ids(eng)).await?))
 }
 
 async fn restore(State(d): St, Json(req): Json<RestoreRequest>) -> Result<Json<RestoreResponse>> {
-    Ok(Json(d.blocking(move |d, eng| d.restore(eng, req)).await?))
+    Ok(Json(d.restore(req).await?))
 }
 
 async fn pull(State(d): St) -> Result<Json<PullResult>> {
-    Ok(Json(d.blocking(|d, eng| d.pull(eng)).await?))
+    Ok(Json(d.pull().await?))
 }
 
-async fn recovered(State(d): St) -> Result<Json<Vec<ConflictView>>> {
-    Ok(Json(d.reading(|d| d.recovered()).await?))
+async fn recovered(State(d): St, Query(q): Query<ReadQuery>) -> Result<Json<Vec<ConflictView>>> {
+    Ok(Json(q.snapshot(&d).await?.recovered()?))
 }
 
-async fn conflicts(State(d): St) -> Result<Json<Vec<ConflictView>>> {
-    Ok(Json(d.reading(|d| d.conflicts()).await?))
+async fn conflicts(State(d): St, Query(q): Query<ReadQuery>) -> Result<Json<Vec<ConflictView>>> {
+    Ok(Json(q.snapshot(&d).await?.conflicts()?))
 }
 
-async fn adopt_displaced(State(d): St, UrlPath(id): UrlPath<String>) -> Result<StatusCode> {
-    d.blocking(move |d, eng| d.resolve_displaced(eng, &id, true)).await?;
-    Ok(StatusCode::NO_CONTENT)
+async fn adopt_displaced(State(d): St, UrlPath(id): UrlPath<String>) -> Result<Json<PathBuf>> {
+    let target = d.blocking(move |d, eng| d.resolve_displaced(eng, &id, true)).await?;
+    Ok(Json(target.expect("a successful Adopt has a target")))
 }
 
 async fn discard_displaced(State(d): St, UrlPath(id): UrlPath<String>) -> Result<StatusCode> {
@@ -317,7 +371,7 @@ async fn discard_displaced(State(d): St, UrlPath(id): UrlPath<String>) -> Result
 }
 
 async fn adopt(State(d): St, Json(t): Json<ConflictTarget>) -> Result<StatusCode> {
-    d.blocking(move |d, eng| d.adopt(eng, t)).await?;
+    d.adopt(t).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -454,18 +508,18 @@ async fn render_instructions(State(d): St, UrlPath(name): UrlPath<String>) -> Re
 }
 
 async fn push(State(d): St) -> Result<Json<PushResult>> {
-    Ok(Json(d.blocking(|d, eng| d.push(eng)).await?))
+    Ok(Json(d.push().await?))
 }
 
 /// Joins again (after a removal, or while the server rejects the token), then
 /// restarts the daemon in place so the new credentials take effect.
 async fn join(State(d): St, Json(req): Json<JoinApiRequest>) -> Result<Json<Joined>> {
-    if !d.can_rejoin() {
+    let Some(world) = d.can_rejoin() else {
         return Err(Error::Conflict(format!(
             "this machine is in the fleet as `{}`; there is nothing to join",
             d.ident.machine_id()
         )));
-    }
+    };
     let opts = JoinOptions {
         server_url: req.server_url,
         code: req.code,
@@ -476,10 +530,10 @@ async fn join(State(d): St, Json(req): Json<JoinApiRequest>) -> Result<Json<Join
     };
     let joined = if d.is_standalone() {
         let repo = opts.repo.clone();
-        d.blocking(move |d, eng| d.check_standalone_join_request(eng, &repo)).await?;
+        d.blocking(move |d, _| d.check_standalone_join_request(&repo)).await?;
         let (reg, pending) =
             join::register_standalone(&d.cfg, &opts).await.map_err(|e| Error::Conflict(format!("{e:#}")))?;
-        let joined = d.blocking(move |d, eng| d.join_standalone(eng, reg)).await.map_err(|e| {
+        let joined = d.join_standalone(reg).await.map_err(|e| {
             Error::Conflict(format!("{e}; registration consumed the join code and reserved the machine id. Pending credentials are kept at {}. Fix the local obstruction and repeat the same join request to retry without a new code", pending.display()))
         })?;
         if let Err(e) = std::fs::remove_file(&pending) {
@@ -489,7 +543,7 @@ async fn join(State(d): St, Json(req): Json<JoinApiRequest>) -> Result<Json<Join
     } else {
         let replace = !d.is_revoked();
         let reg = join::register(&d.cfg, &opts, replace).await.map_err(|e| Error::BadRequest(format!("{e:#}")))?;
-        d.blocking(move |d, eng| d.rejoin(eng, reg)).await?
+        d.rejoin(reg, world).await?
     };
     let restart = d.clone();
     tokio::spawn(async move {
@@ -508,24 +562,14 @@ async fn assignment(
     OriginalUri(uri): OriginalUri,
     body: Bytes,
 ) -> Result<Response> {
-    if !d.is_standalone() {
+    if machine != d.ident.machine_id() {
         return pass(State(d), method, OriginalUri(uri), body).await;
     }
-    if machine != d.ident.machine_id() {
-        return Err(Error::Conflict("This Machine is standalone; join a Fleet to use this".into()));
-    }
     if method == Method::GET {
-        // Read through the engine so an external CLI file edit is visible.
-        let snap = d
-            .blocking(|d, eng| {
-                d.refresh(eng)?;
-                Ok(d.snapshot().expect("local assignment").as_ref().clone())
-            })
-            .await?;
-        return Ok(Json(snap).into_response());
+        return Ok(Json(d.store.get(&d).await?).into_response());
     }
     let changes = serde_json::from_slice(&body).map_err(|e| Error::BadRequest(e.to_string()))?;
-    let update = d.blocking(move |d, eng| d.set_local_assignment(eng, &changes)).await?;
+    let update = d.write_assignment(sk1ll_proto::AssignmentWrite::Changes(changes)).await?;
     Ok(Json(update).into_response())
 }
 
@@ -533,59 +577,22 @@ async fn set_harness_assignment(
     State(d): St,
     UrlPath(harness): UrlPath<String>,
     Json(body): Json<sk1ll_proto::SetHarnessAssignment>,
-) -> Result<Json<crate::client::HarnessAssignmentUpdate>> {
-    use crate::client::{HarnessAssignmentUpdate, LEGACY_HARNESS_ASSIGNMENT_WARNING};
-    if d.is_standalone() {
-        let (update, skipped) = d
-            .blocking(move |d, eng| {
-                let (changes, skipped) = d.harness_assignment_changes(eng, &harness, body)?;
-                Ok((d.set_local_assignment(eng, &changes)?, skipped))
-            })
-            .await?;
-        return Ok(Json(HarnessAssignmentUpdate { update, warning: skipped_warning(&skipped), skipped }));
-    }
-    let state = d.ident.joined()?;
-    let (mut update, warning, skipped) = match server::set_harness_assignment(&d.http, state, &harness, body).await? {
-        Some(result) => (result.update, skipped_warning(&result.skipped), result.skipped),
-        None => {
-            let (changes, skipped) =
-                d.blocking(move |d, eng| d.harness_assignment_changes(eng, &harness, body)).await?;
-            let update = server::change_assignment(&d.http, state, &changes).await.map_err(Error::Internal)?;
-            let mut warning = LEGACY_HARNESS_ASSIGNMENT_WARNING.to_string();
-            if let Some(names) = skipped_warning(&skipped) {
-                warning.push(' ');
-                warning.push_str(&names);
-            }
-            (update, Some(warning), skipped)
-        }
-    };
-    let snapshot = sk1ll_proto::AssignmentSnapshot {
-        revision: update.revision,
-        assignment: update.assignment.clone(),
-        registration: None,
-    };
-    update.errors = d
-        .blocking(move |d, eng| d.apply_assignment(eng, snapshot))
-        .await
-        .unwrap_or_else(|e| vec![crate::auth::redact(&format!("applying the saved Assignment: {e}"))]);
-    d.event(crate::client::Event::Fleet);
-    Ok(Json(HarnessAssignmentUpdate { update, warning, skipped }))
+) -> Result<Json<sk1ll_proto::AssignmentUpdate>> {
+    let write = sk1ll_proto::AssignmentWrite::Harness { harness, enabled: body.enabled };
+    Ok(Json(d.write_assignment(write).await?))
 }
 
-fn skipped_warning(skipped: &[sk1ll_proto::ItemRef]) -> Option<String> {
-    (!skipped.is_empty()).then(|| {
-        format!(
-            "Skipped items with ineligible names: {}",
-            skipped.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
-        )
-    })
+async fn rename_harness(
+    State(d): St,
+    Json(rename): Json<crate::client::HarnessRenameRequest>,
+) -> Result<Json<crate::client::HarnessRenameResult>> {
+    Ok(Json(d.rename_harness(rename).await?))
 }
 
 /// Server pass-through: same path and query under the server's `/api`.
 async fn pass(State(d): St, method: Method, OriginalUri(uri): OriginalUri, body: Bytes) -> Result<Response> {
-    d.ident.joined()?;
     let path = uri.path_and_query().map_or(uri.path(), |p| p.as_str());
-    server::proxy(&d, method, path, body).await
+    d.remote.proxy(&d, method, path, body).await
 }
 
 async fn events(State(d): St) -> impl IntoResponse {
@@ -620,8 +627,16 @@ async fn rename_item(
     Ok(Json(d.blocking(move |d, eng| d.rename_item(eng, req)).await?))
 }
 
+/// A conflict is named by what a client listed, or by what it just did in a
+/// harness: one missing from the last Snapshot (an engine operation was
+/// running, so the read could not catch up) is looked up in a fresh one
+/// before it counts as gone.
 async fn conflict_diff(State(d): St, Json(req): Json<crate::client::ConflictDiffRequest>) -> Result<Json<DiffView>> {
-    Ok(Json(d.reading(move |d| d.conflict_diff(&req)).await?))
+    let mut snapshot = d.caught_up().await?;
+    if req.id.is_none() && !matches!(snapshot.conflict(&req), Ok(Some(_))) {
+        snapshot = d.fresh().await?;
+    }
+    Ok(Json(d.reading(move |d| d.conflict_diff(&req, &snapshot)).await?))
 }
 
 async fn imports(State(d): St) -> Result<Json<crate::client::ImportsView>> {
@@ -630,8 +645,8 @@ async fn imports(State(d): St) -> Result<Json<crate::client::ImportsView>> {
 }
 
 pub(crate) async fn import_checks(d: &Daemon, mut view: crate::client::ImportsView) -> crate::client::ImportsView {
-    if !d.is_standalone()
-        && let Ok(response) = server::proxy(d, Method::GET, "/imports", Bytes::new()).await
+    if d.remote.checks_imports()
+        && let Ok(response) = d.remote.proxy(d, Method::GET, "/imports", Bytes::new()).await
         && response.status().is_success()
         && let Ok(bytes) = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024).await
         && let Ok(remote) = serde_json::from_slice::<sk1ll_proto::ImportsView>(&bytes)

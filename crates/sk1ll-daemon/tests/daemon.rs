@@ -3,7 +3,6 @@
 //! machine, each with its own HOME and XDG dirs and no global git config,
 //! driven through the daemon's local API.
 
-use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -15,9 +14,10 @@ use sk1ll_daemon::client::{
     AddImportRequest, Client, CommitRequest, CommitResponse, Connection, Event, ResolveImportRequest, RestoreRequest,
     StatusView,
 };
+use sk1ll_daemon::state::PullState;
 use sk1ll_proto::{
-    Assignment, AssignmentChanges, AssignmentSnapshot, DaemonMessage, FleetView, HarnessAssignment, ItemRef, LogCause,
-    LogEntry, MachineStatus, ServerMessage, ToggleChange, ToggleKind,
+    Assignment, AssignmentChanges, AssignmentSnapshot, DaemonMessage, FleetView, HarnessAssignment, ItemRef, LogEntry,
+    MachineStatus, ServerMessage, ToggleChange, ToggleKind,
 };
 use tokio_tungstenite::tungstenite::Message;
 
@@ -174,8 +174,14 @@ impl Machine {
     fn command(&self) -> Command {
         let h = self.home.path();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_sk1ll-daemon"));
-        for k in ["SK1LL_DAEMON_SOCKET", "SK1LL_DAEMON_STATE", "SK1LL_MACHINE_CONFIG", "SK1LL_ASSIGNMENT", "SK1LL_REPO"]
-        {
+        for k in [
+            "SK1LL_DAEMON_SOCKET",
+            "SK1LL_DAEMON_STATE",
+            "SK1LL_MACHINE_CONFIG",
+            "SK1LL_ASSIGNMENT",
+            "SK1LL_REPO",
+            "SK1LL_STATE_DIR",
+        ] {
             cmd.env_remove(k);
         }
         cmd.env("HOME", h)
@@ -214,10 +220,6 @@ impl Machine {
 
     fn snapshot_path(&self) -> PathBuf {
         self.home.path().join(CONFIG_DIR).join("sk1ll/daemon-assignment.json")
-    }
-
-    fn outbox_path(&self) -> PathBuf {
-        self.home.path().join(CONFIG_DIR).join("sk1ll/daemon-outbox.json")
     }
 
     fn cache_path(&self) -> PathBuf {
@@ -286,18 +288,30 @@ impl Machine {
         self.client.status().await.unwrap()
     }
 
+    /// Writes `rel` in the repo. A new personal skill gets the explicit
+    /// Item ID [`skill_id`] names, so tests can toggle it before a refresh
+    /// would write it one; IDs are never derived from names.
     fn write(&self, rel: &str, body: &str) {
         let path = self.repo().join(rel);
         write(path.parent().unwrap(), path.file_name().unwrap().to_str().unwrap(), body);
+        if let Some(name) = rel.strip_prefix("personal/").and_then(|p| p.strip_suffix("/SKILL.md")) {
+            let sidecar = path.parent().unwrap().join(".sk1ll-id");
+            if sidecar.symlink_metadata().is_err() {
+                std::fs::write(sidecar, format!("{}\n", skill_id(name))).unwrap();
+            }
+        }
     }
 
     fn harness_skill(&self, name: &str) -> Option<String> {
         std::fs::read_to_string(self.skills().join(name).join("SKILL.md")).ok()
     }
 
-    /// Commits every draft item.
+    /// Commits every draft item, once the Draft shows an edit made just
+    /// before: while an engine operation runs, readers answer from the
+    /// Snapshot of the last reconcile.
     async fn commit_all(&self) -> CommitResponse {
-        let items = self.client.draft().await.unwrap().into_iter().map(|d| d.item.to_string()).collect();
+        let draft = eventually(|| async { Some(self.client.draft().await.unwrap()).filter(|d| !d.is_empty()) }).await;
+        let items = draft.into_iter().map(|d| d.item.to_string()).collect();
         self.client.commit(&CommitRequest { items, ..Default::default() }).await.unwrap()
     }
 
@@ -327,6 +341,19 @@ impl Drop for Machine {
             eprintln!("---- daemon log of {} ----\n{log}", self.id);
         }
     }
+}
+
+fn assert_indexed_copy(dir: &Path, name: &str) {
+    let bytes = std::fs::read(dir.join(sk1ll_core::sync::INDEX_PATH)).unwrap();
+    let index: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let copy = dir.join(name);
+    let token = std::fs::read_to_string(copy.join(sk1ll_core::sync::PLACEMENT_MARKER)).unwrap();
+    let entry = &index["entries"][name];
+    assert_eq!(entry["kind"], "copy");
+    assert_eq!(entry["hash"], sk1ll_core::hash::hash_dir(&copy).unwrap());
+    assert_eq!(entry["token"], token);
+    assert!(entry["payload"].as_str().is_some_and(|hash| hash.starts_with("sha256:")));
+    assert_eq!(index["pending"], serde_json::json!({}));
 }
 
 fn write(dir: &Path, file: &str, body: &str) {
@@ -410,7 +437,7 @@ async fn next_message(ws: &mut FakeWs) -> DaemonMessage {
 
 /// Assignment of `agent` with exactly `on` enabled among x, y and z.
 fn snapshot(revision: u64, on: &[&str]) -> AssignmentSnapshot {
-    let skills: BTreeMap<String, bool> = ["x", "y", "z"].iter().map(|s| (s.to_string(), on.contains(s))).collect();
+    let skills = ["x", "y", "z"].iter().map(|s| (skill_id(s), on.contains(s))).collect();
     let h = HarnessAssignment { new_skills_default: false, new_rules_default: false, skills, ..Default::default() };
     let assignment = Assignment { harnesses: [(HARNESS.to_string(), h)].into() };
     AssignmentSnapshot { revision, assignment, registration: None }
@@ -432,17 +459,35 @@ fn solo(id: &str, server_url: &str, snap: Option<AssignmentSnapshot>) -> Machine
     git(m.home.path(), &["init", "--quiet", "--bare", origin.to_str().unwrap()]);
     git(&repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
     git(&repo, &["push", "--quiet", "-u", "origin", "main"]);
-    DaemonState { machine_id: id.into(), server_url: server_url.into(), token: "tok".into(), repo, revoked: false }
-        .save(&m.state_path())
-        .unwrap();
+    let state = DaemonState {
+        machine_id: id.into(),
+        server_url: server_url.into(),
+        token: "tok".into(),
+        repo,
+        revoked: false,
+        record: Default::default(),
+    };
+    state.save(&m.state_path()).unwrap();
     if let Some(snap) = snap {
-        write(m.snapshot_path().parent().unwrap(), "daemon-assignment.json", &serde_json::to_string(&snap).unwrap());
+        sk1ll_daemon::state::save_snapshot(&m.snapshot_path(), &snap, Some(&state.registration_key())).unwrap();
     }
     m
 }
 
+/// A fixed, explicit Item ID for the skill `name` in these tests. Items are
+/// never given derived IDs: a repo item that must have it is written it.
+fn skill_id(name: &str) -> sk1ll_core::ItemId {
+    sk1ll_core::ItemId::from_text(&format!("id-{name}")).unwrap()
+}
+
 fn toggle(name: &str, enabled: bool) -> ToggleChange {
-    ToggleChange { harness: HARNESS.into(), kind: ToggleKind::Skill, name: Some(name.into()), enabled: Some(enabled) }
+    ToggleChange {
+        harness: HARNESS.into(),
+        kind: ToggleKind::Skill,
+        item_id: Some(skill_id(name)),
+        name: Some(name.into()),
+        enabled: Some(enabled),
+    }
 }
 
 async fn assign(via: &Machine, machine: &str, changes: Vec<ToggleChange>) {
@@ -496,18 +541,16 @@ async fn harness_assignment_passes_through_to_the_fleet_and_reaches_sync() {
     let server = Server::start().await;
     let (_a, b, _) = fleet_of_two(&server).await;
     let on = b.client.set_harness_assignment(HARNESS, true).await.unwrap();
-    assert!(on.warning.is_none());
-    assert!(on.update.assignment.skill_enabled(HARNESS, "x"));
+    assert!(on.assignment.skill_enabled(HARNESS, &skill_id("x")));
     eventually(|| async { b.harness_skill("x").is_some().then_some(()) }).await;
     let off = b.client.set_harness_assignment(HARNESS, false).await.unwrap();
-    assert!(off.warning.is_none());
-    assert!(!off.update.assignment.skill_enabled(HARNESS, "x"));
-    assert!(off.update.entries.iter().any(|entry| entry.machine == "beta" && entry.name.as_deref() == Some("x")));
+    assert!(!off.assignment.skill_enabled(HARNESS, &skill_id("x")));
+    assert!(off.entries.iter().all(|entry| entry.machine == "beta"));
     eventually(|| async { b.harness_skill("x").is_none().then_some(()) }).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn standalone_harness_assignment_skips_ineligible_names() {
+async fn standalone_harness_assignment_reaches_items_with_spaces() {
     let mut m = Machine::new("solo");
     sk1ll_core::Repo::init(&m.repo()).unwrap();
     m.write("personal/pdf/SKILL.md", "valid");
@@ -515,116 +558,9 @@ async fn standalone_harness_assignment_skips_ineligible_names() {
     m.start().await;
 
     let result = m.client.set_harness_assignment(HARNESS, false).await.unwrap();
-    assert_eq!(result.skipped, [ItemRef::Skill("old name".into())]);
-    assert!(result.warning.as_deref().is_some_and(|warning| warning.contains("skill:old name")));
-    assert!(result.update.errors.is_empty());
-    assert!(!result.update.assignment.skill_enabled(HARNESS, "pdf"));
-    assert!(result.update.assignment.skill_enabled(HARNESS, "old name"));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn harness_assignment_applies_the_http_snapshot_without_websocket_delivery() {
-    use axum::{Json, Router, routing::post};
-
-    let app = Router::new().route(
-        "/api/machines/box/assignment/harness/agent",
-        post(|| async {
-            Json(sk1ll_proto::HarnessAssignmentResult {
-                update: sk1ll_proto::AssignmentUpdate {
-                    assignment: snapshot(2, &[]).assignment,
-                    revision: 2,
-                    entries: vec![],
-                    errors: Vec::new(),
-                },
-                skipped: vec![ItemRef::Skill("legacy name".into())],
-            })
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let mut m = solo("box", &url, Some(snapshot(1, &["x"])));
-    m.start().await;
-    eventually(|| async { m.harness_skill("x").is_some().then_some(()) }).await;
-
-    let config = Machine::machine_config(m.home.path());
-    let original = std::fs::read_to_string(&config).unwrap();
-    std::fs::write(&config, "broken = [").unwrap();
-    let failed = m.client.set_harness_assignment(HARNESS, false).await.unwrap();
-    assert_eq!(failed.update.revision, 2);
-    assert!(failed.update.errors.iter().any(|error| error.contains("machine.toml")));
-    assert!(m.harness_skill("x").is_some());
-    assert_eq!(m.status().await.assignment_revision, 2);
-
-    std::fs::write(&config, original).unwrap();
-    let result = m.client.set_harness_assignment(HARNESS, false).await.unwrap();
-
-    assert_eq!(result.update.revision, 2);
-    assert!(result.update.errors.is_empty());
-    assert!(m.harness_skill("x").is_none());
-    assert_eq!(m.status().await.assignment_revision, 2);
-
-    m.stop();
-    let cfg = sk1ll_daemon::Config { state: m.state_path(), ..sk1ll_daemon::Config::new().unwrap() };
-    let lock = sk1ll_core::EngineLock::acquire(&m.repo()).unwrap();
-    let direct = sk1ll_daemon::set_harness_assignment_direct(&cfg, &lock, HARNESS, false).await.unwrap().unwrap();
-    assert_eq!(direct.skipped, [ItemRef::Skill("legacy name".into())]);
-    assert_eq!(direct.update.revision, 2);
-    server.abort();
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn harness_assignment_falls_back_only_for_a_missing_legacy_route() {
-    use axum::{
-        Json, Router,
-        http::StatusCode,
-        routing::{post, put},
-    };
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    let calls = std::sync::Arc::new(AtomicUsize::new(0));
-    let puts = calls.clone();
-    let app = Router::new()
-        .route(
-            "/api/machines/box/assignment/harness/absent",
-            post(|| async {
-                (StatusCode::NOT_FOUND, Json(sk1ll_proto::ErrorBody { error: "machine absent".into(), code: None }))
-            }),
-        )
-        .route(
-            "/api/machines/box/assignment",
-            put(move |Json(body): Json<AssignmentChanges>| async move {
-                puts.fetch_add(1, Ordering::Relaxed);
-                assert_eq!(body.changes.len(), 5);
-                assert!(body.changes.iter().all(|change| change.harness == HARNESS && change.enabled == Some(false)));
-                assert!(body.changes.iter().any(|change| change.name.as_deref() == Some("x")));
-                Json(sk1ll_proto::AssignmentUpdate {
-                    assignment: snapshot(2, &[]).assignment,
-                    revision: 2,
-                    entries: vec![],
-                    errors: Vec::new(),
-                })
-            }),
-        );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let mut m = solo("box", &url, Some(snapshot(1, &["x"])));
-    m.write("personal/old name/SKILL.md", "legacy item");
-    m.start().await;
-    eventually(|| async { m.harness_skill("x").is_some().then_some(()) }).await;
-    let result = m.client.set_harness_assignment(HARNESS, false).await.unwrap();
-    assert!(m.harness_skill("x").is_none(), "the fake server never delivers a WebSocket snapshot");
-    let warning = result.warning.unwrap();
-    assert!(warning.contains("Unpulled items may stay on"));
-    assert!(warning.contains("old name"));
-    assert_eq!(result.skipped, [ItemRef::Skill("old name".into())]);
-    assert_eq!(result.update.revision, 2);
-    let error = m.client.set_harness_assignment("absent", false).await.unwrap_err();
-    assert_eq!(error.status, Some(404));
-    assert_eq!(error.message, "machine absent");
-    assert_eq!(calls.load(Ordering::Relaxed), 1);
-    server.abort();
+    assert!(result.errors.is_empty());
+    assert!(!result.assignment.skill_enabled(HARNESS, &skill_id("pdf")));
+    assert!(!result.assignment.skill_enabled(HARNESS, &skill_id("old name")));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -681,8 +617,8 @@ async fn join_codes_pass_their_scope_and_expiry_through() {
     a.join(&server).await;
     a.start_connected().await;
     let code = a.client.join_code(sk1ll_proto::Scope::SelfOnly).await.unwrap();
-    assert_eq!(code.scope, Some(sk1ll_proto::Scope::SelfOnly));
-    assert!(code.expires_at.is_some());
+    assert_eq!(code.scope, sk1ll_proto::Scope::SelfOnly);
+    assert!(code.expires_at > 0);
     let fleet = a.client.fleet().await.unwrap();
     assert_eq!(fleet.machines[0].scope, sk1ll_proto::Scope::Fleet);
 }
@@ -701,11 +637,11 @@ async fn assignment_change_reaches_another_harness_without_git() {
     let snapshot = a.client.assignment("beta").await.unwrap();
     assert!(snapshot.revision > 0);
     assert_eq!(snapshot, server.get::<AssignmentSnapshot>("/machines/beta/assignment").await);
-    assert!(!snapshot.assignment.skill_enabled(HARNESS, "x"));
+    assert!(!snapshot.assignment.skill_enabled(HARNESS, &skill_id("x")));
     assert_eq!(b.head(), base);
     assert_eq!(git(&b.repo(), &["reflog"]), reflog, "no git operation moved anything");
     let cached = Assignment::load(&b.home.path().join(CACHE_DIR).join("sk1ll/assignment.json")).unwrap();
-    assert_eq!(cached.harness(HARNESS).skills.get("x"), Some(&false), "the assignment is cached");
+    assert_eq!(cached.harness(HARNESS).skills.get(&skill_id("x")), Some(&false), "the assignment is cached");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -742,8 +678,8 @@ async fn offline_commits_are_queued_and_pushed_on_reconnect() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn blocked_pull_reports_clashes_and_keeps_files() {
-    let server = Server::start().await;
-    let (a, b, base) = fleet_of_two(&server).await;
+    let mut server = Server::start().await;
+    let (a, mut b, base) = fleet_of_two(&server).await;
 
     b.write("personal/x/SKILL.md", "x by beta\n");
     eventually(|| async {
@@ -766,6 +702,21 @@ async fn blocked_pull_reports_clashes_and_keeps_files() {
     assert_eq!(b.head(), base);
     eventually(|| async { (server.row("beta").await?.status == MachineStatus::Blocked).then_some(()) }).await;
 
+    // The state file remembers the block, so a daemon restarted while the
+    // server is away still reports it, before it could pull again.
+    assert!(matches!(&b.state().record.pull, PullState::Blocked { items, .. } if items == &s.report.clashes));
+    assert_eq!(b.state().record.server_baseline.as_deref(), Some(p.sha.as_str()));
+    b.stop();
+    server.stop();
+    b.start().await;
+    let s = b.status().await;
+    assert_ne!(s.connection, Connection::Connected);
+    assert!(s.report.blocked && s.report.behind, "{s:?}");
+    assert_eq!(s.report.clashes, [ItemRef::Skill("x".into())]);
+    assert_eq!(s.server_baseline.as_deref(), Some(p.sha.as_str()));
+    server.launch().await;
+    eventually(|| async { (b.status().await.connection == Connection::Connected).then_some(()) }).await;
+
     // Restoring the clashing item is a draft change: the pull is retried.
     b.client.restore(&RestoreRequest { items: vec!["x".into()], all: false }).await.unwrap();
     eventually(|| async {
@@ -774,36 +725,6 @@ async fn blocked_pull_reports_clashes_and_keeps_files() {
     })
     .await;
     assert_eq!(std::fs::read_to_string(b.repo().join("personal/x/SKILL.md")).unwrap(), "x by alpha\n");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn restore_sends_draft_discarded() {
-    let server = Server::start().await;
-    let (a, b, _) = fleet_of_two(&server).await;
-
-    b.write("personal/w/SKILL.md", "work in progress\n");
-    eventually(|| async {
-        server.row("beta").await?.report?.drafts.contains(&ItemRef::Skill("w".into())).then_some(())
-    })
-    .await;
-    // A draft-only skill can be assigned on its own machine, and is live there.
-    assign(&a, "beta", vec![toggle("w", true)]).await;
-    eventually(|| async { b.harness_skill("w").map(drop) }).await;
-
-    let restore = b.client.restore(&RestoreRequest { items: vec!["w".into()], all: false }).await.unwrap();
-    assert_eq!(restore.discarded, [ItemRef::Skill("w".into())]);
-    assert!(!b.repo().join("personal/w").exists());
-    eventually(|| async { (!b.skills().join("w").exists()).then_some(()) }).await;
-
-    // The server dropped the toggle because of `draft_discarded`, and logged it.
-    let entry = eventually(|| async {
-        let log: Vec<LogEntry> = server.get("/log?machine=beta").await;
-        log.into_iter().find(|e| e.cause == LogCause::ItemRemoved && e.name.as_deref() == Some("w"))
-    })
-    .await;
-    assert_eq!((entry.before, entry.after), (Some(true), None));
-    let assignment = server.get::<AssignmentSnapshot>("/machines/beta/assignment").await.assignment;
-    assert!(!assignment.harness(HARNESS).skills.contains_key("w"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1107,11 +1028,35 @@ async fn reconnecting_reports_fresh_local_state_first() {
     assert_eq!(report.drafts, [ItemRef::Skill("new".into())]);
 }
 
-/// Connecting costs one refresh (the one before the first status) when
-/// nothing changed: not one more for an empty outbox, for a catch-up pull
-/// that moved nothing, or for the server's nudge for the baseline in use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconnecting_does_not_send_status_until_refresh_succeeds() {
+    let server = FakeServer::new().await;
+    let mut m = solo("solo", &server.url(), Some(snapshot(1, &[]))).with_env("SK1LL_RECONCILE_INTERVAL", "1h");
+    m.write("personal/w/SKILL.md", "draft");
+    let config = Machine::machine_config(m.home.path());
+    let good = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, "[broken").unwrap();
+    m.start().await;
+    let (mut ws, _) = server.accept().await;
+    if let Ok(Some(Ok(Message::Text(text)))) = tokio::time::timeout(Duration::from_millis(700), ws.next()).await {
+        panic!("a failed refresh sent status: {text}");
+    }
+    let status = m.status().await;
+    assert!(status.last_error.as_deref().unwrap_or_default().contains("machine.toml"), "{status:?}");
+
+    std::fs::write(config, good).unwrap();
+    let (mut ws, _) = server.accept().await;
+    let DaemonMessage::Status(report) = next_message(&mut ws).await else { panic!("expected status") };
+    assert_eq!(report.seq, 1);
+    assert!(report.drafts.contains(&ItemRef::Skill("w".into())));
+    assert!(report.items.iter().any(|item| item.id == skill_id("w")));
+}
+
+/// Connecting costs no reconcile when nothing changed since the one at
+/// startup: not the one before the first status, not the catch-up pull that
+/// moved nothing, not the server's nudge for the baseline in use.
 #[tokio::test(flavor = "multi_thread")]
-async fn connecting_refreshes_once_when_nothing_changed() {
+async fn connecting_costs_no_reconcile_when_nothing_changed() {
     let server = FakeServer::new().await;
     // Neither the watcher nor the reconciliation refreshes during the test.
     let mut m = solo("solo", &server.url(), Some(snapshot(1, &[])))
@@ -1120,7 +1065,9 @@ async fn connecting_refreshes_once_when_nothing_changed() {
         .with_env("SK1LL_RECONCILE_INTERVAL", "1h")
         .with_env("RUST_LOG", "info,sk1ll_daemon=debug");
     let baseline = git(&m.repo(), &["rev-parse", "HEAD"]);
-    let refreshes = |m: &Machine| m.log().matches("refreshing the local state").count();
+    let refreshes = |m: &Machine| m.log().matches("reconciling: ").count();
+    // Inputs written moments ago are reconciled every time (the racy window).
+    tokio::time::sleep(sk1ll_core::hash::HashCache::RACY_WINDOW).await;
     m.start().await;
     for connection in 0..2 {
         let (mut ws, _) = server.accept().await;
@@ -1141,47 +1088,8 @@ async fn connecting_refreshes_once_when_nothing_changed() {
         assert_eq!(m.status().await.headline, MachineStatus::InSync);
         drop(ws);
         eventually(|| async { (m.status().await.connection == Connection::Offline).then_some(()) }).await;
-        if connection == 0 {
-            assert_eq!(refreshes(&m), 2, "one at startup, one on connecting");
-        } else {
-            assert_eq!(refreshes(&m), 3, "one more for the second connection");
-        }
+        assert_eq!(refreshes(&m), 1, "connection {connection}: only the one at startup");
     }
-}
-
-/// #8: a Restore made while offline is reported to the server even if the daemon
-/// restarts before it reconnects.
-#[tokio::test(flavor = "multi_thread")]
-async fn discarded_drafts_are_reported_after_a_restart() {
-    let mut server = Server::start().await;
-    let (a, mut b, _) = fleet_of_two(&server).await;
-    b.write("personal/w/SKILL.md", "work in progress\n");
-    eventually(|| async {
-        server.row("beta").await?.report?.drafts.contains(&ItemRef::Skill("w".into())).then_some(())
-    })
-    .await;
-    assign(&a, "beta", vec![toggle("w", true)]).await;
-    eventually(|| async { b.harness_skill("w").map(drop) }).await;
-
-    server.stop();
-    eventually(|| async { (b.status().await.connection == Connection::Offline).then_some(()) }).await;
-    let restore = b.client.restore(&RestoreRequest { items: vec!["w".into()], all: false }).await.unwrap();
-    assert_eq!(restore.discarded, [ItemRef::Skill("w".into())]);
-    assert_eq!(b.status().await.pending_discards, 1);
-    assert!(b.outbox_path().is_file(), "queued durably");
-    b.stop();
-
-    server.launch().await;
-    b.start().await;
-    eventually(|| async {
-        let log: Vec<LogEntry> = server.get("/log?machine=beta").await;
-        log.into_iter().find(|e| e.cause == LogCause::ItemRemoved && e.name.as_deref() == Some("w"))
-    })
-    .await;
-    eventually(|| async { (!b.outbox_path().exists()).then_some(()) }).await;
-    assert_eq!(b.status().await.pending_discards, 0);
-    let assignment = server.get::<AssignmentSnapshot>("/machines/beta/assignment").await.assignment;
-    assert!(!assignment.harness(HARNESS).skills.contains_key("w"));
 }
 
 /// #9: `join` while the daemon runs goes through it; it comes back
@@ -1211,104 +1119,6 @@ async fn joining_again_while_the_daemon_runs_resumes_management() {
     b.write("personal/q/SKILL.md", "q\n");
     assert!(b.commit(&["q"]).await.pushed, "git works with the new token");
     assert!(!b.log().contains(&state.token));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn failed_refresh_sends_no_status_or_discards() {
-    let server = FakeServer::new().await;
-    let mut m = solo("solo", &server.url(), Some(snapshot(1, &[]))).with_env("SK1LL_RECONCILE_INTERVAL", "1h");
-    write(m.outbox_path().parent().unwrap(), "daemon-outbox.json", r#"[{"id":1,"items":["skill:w"]}]"#);
-    m.write("personal/w/SKILL.md", "recreated\n");
-    let config = Machine::machine_config(m.home.path());
-    let good = std::fs::read_to_string(&config).unwrap();
-    std::fs::write(&config, "[broken").unwrap();
-    m.start().await;
-    let (mut ws, _) = server.accept().await;
-    if let Ok(Some(Ok(Message::Text(text)))) = tokio::time::timeout(Duration::from_millis(700), ws.next()).await {
-        panic!("a failed local refresh must not report or replay discards: {text}");
-    }
-    let status = m.status().await;
-    assert_eq!(status.pending_discards, 1);
-    assert!(status.last_error.as_deref().unwrap_or_default().contains("machine.toml"), "{status:?}");
-
-    std::fs::write(config, good).unwrap();
-    let (mut ws, _) = server.accept().await;
-    let DaemonMessage::Status(report) = next_message(&mut ws).await else { panic!("fresh status comes first") };
-    assert!(report.drafts.contains(&ItemRef::Skill("w".into())), "{report:?}");
-    eventually(|| async { (m.status().await.pending_discards == 0).then_some(()) }).await;
-    while let Ok(Some(Ok(Message::Text(text)))) = tokio::time::timeout(Duration::from_millis(300), ws.next()).await {
-        assert!(!matches!(serde_json::from_str::<DaemonMessage>(&text).unwrap(), DaemonMessage::DraftDiscarded { .. }));
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn discard_replay_skips_recreated_drafts_and_unpushed_items() {
-    let server = FakeServer::new().await;
-    let mut m = solo("solo", &server.url(), Some(snapshot(1, &[])));
-    m.write("personal/v/SKILL.md", "committed again\n");
-    git(&m.repo(), &["add", "personal/v"]);
-    git(&m.repo(), &["commit", "-qm", "commit v again"]);
-    m.write("personal/w/SKILL.md", "recreated draft\n");
-    write(
-        m.outbox_path().parent().unwrap(),
-        "daemon-outbox.json",
-        r#"[{"id":1,"items":["skill:w","skill:v","skill:gone"]}]"#,
-    );
-    m.start().await;
-    let (mut ws, _) = server.accept().await;
-    let DaemonMessage::Status(report) = next_message(&mut ws).await else { panic!("fresh status comes first") };
-    assert!(report.drafts.contains(&ItemRef::Skill("w".into())));
-    assert!(report.unpushed.contains(&ItemRef::Skill("v".into())));
-    let DaemonMessage::DraftDiscarded { id, items } = next_message(&mut ws).await else { panic!("expected discards") };
-    assert_eq!(items, [ItemRef::Skill("gone".into())]);
-    assert_eq!(m.status().await.pending_discards, 1);
-    ws.close(None).await.unwrap();
-    let (mut ws, _) = server.accept().await;
-    let _ = next_message(&mut ws).await;
-    let DaemonMessage::DraftDiscarded { id: replay, .. } = next_message(&mut ws).await else {
-        panic!("expected replay")
-    };
-    assert_eq!(replay, id);
-    ws.send(Message::text(serde_json::to_string(&ServerMessage::DraftDiscardApplied { id: id.unwrap() }).unwrap()))
-        .await
-        .unwrap();
-    eventually(|| async { (m.status().await.pending_discards == 0).then_some(()) }).await;
-}
-
-/// Review finding: a server that can't read the baseline closes with 1013
-/// instead of leaving a discard unacknowledged on a live session; the daemon
-/// comes back and sends every unacknowledged discard again.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_try_again_later_close_replays_every_unacknowledged_discard() {
-    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
-    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-
-    let server = FakeServer::new().await;
-    let mut m = solo("solo", &server.url(), Some(snapshot(1, &[])));
-    write(
-        m.outbox_path().parent().unwrap(),
-        "daemon-outbox.json",
-        r#"[{"id":1,"items":["skill:a"]},{"id":2,"items":["skill:b"]}]"#,
-    );
-    m.start().await;
-    let (mut ws, _) = server.accept().await;
-    let DaemonMessage::Status(_) = next_message(&mut ws).await else { panic!("fresh status comes first") };
-    let DaemonMessage::DraftDiscarded { id, .. } = next_message(&mut ws).await else { panic!("expected a discard") };
-    assert_eq!(id, Some(1));
-    let close = CloseFrame { code: CloseCode::Again, reason: "the baseline can't be read".into() };
-    ws.close(Some(close)).await.unwrap();
-
-    let (mut ws, _) = server.accept().await;
-    let _ = next_message(&mut ws).await;
-    let mut replayed = Vec::new();
-    for _ in 0..2 {
-        let DaemonMessage::DraftDiscarded { id, .. } = next_message(&mut ws).await else { panic!("expected replay") };
-        replayed.push(id.unwrap());
-        let applied = ServerMessage::DraftDiscardApplied { id: id.unwrap() };
-        ws.send(Message::text(serde_json::to_string(&applied).unwrap())).await.unwrap();
-    }
-    assert_eq!(replayed, [1, 2]);
-    eventually(|| async { (m.status().await.pending_discards == 0).then_some(()) }).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1403,9 +1213,16 @@ async fn the_startup_clone_gives_up_at_the_git_deadline() {
     let mut m =
         Machine::new("slow").with_env("SK1LL_GIT_TIMEOUT", "100ms").with_env("SK1LL_GIT_LOCAL_TIMEOUT", "100ms");
     let server_url = format!("http://127.0.0.1:{port}");
-    DaemonState { machine_id: "slow".into(), server_url, token: "tok".into(), repo: m.repo(), revoked: false }
-        .save(&m.state_path())
-        .unwrap();
+    DaemonState {
+        machine_id: "slow".into(),
+        server_url,
+        token: "tok".into(),
+        repo: m.repo(),
+        revoked: false,
+        record: Default::default(),
+    }
+    .save(&m.state_path())
+    .unwrap();
 
     // The local API only answers once startup (and so the clone) is done.
     let start = std::time::Instant::now();
@@ -1438,36 +1255,34 @@ async fn displaced_conflicts_report_to_server_and_resolve() {
     let mut m = solo("solo", &server.url(), Some(snapshot(1, &["x"])));
     let state = m.home.path().join(if cfg!(target_os = "macos") { DATA_DIR } else { "state" });
     m = m.with_env("XDG_STATE_HOME", state.to_str().unwrap());
-    // Two entries kept in the state directory by an older version, and one in
-    // the skills dir's own recovery area that the state directory's index
-    // doesn't know (it was lost): the daemon's recovery lists it again.
-    let recovery = state.join("sk1ll/displaced");
-    let area = m.skills().join(".sk1ll-tmp/displaced");
-    for (id, dir) in [("adopt-me", &recovery), ("discard-me", &recovery), ("found-again", &area)] {
-        let dir = dir.join(id);
-        write(&dir.join("content"), "SKILL.md", "recovered edit\n");
-        write(
-            &dir,
-            "entry.json",
-            &serde_json::json!({
-                "harness": HARNESS, "kind": "skill", "dest": m.skills().join("x"),
-                "expected": "", "displaced_at": 0
-            })
-            .to_string(),
-        );
-    }
     m.start().await;
     let (mut ws, _) = server.accept().await;
-    let DaemonMessage::Status(report) = next_message(&mut ws).await else { panic!("expected status") };
-    assert!(report.conflicts.iter().any(|c| c.harness == HARNESS && c.item == ItemRef::Skill("x".into())));
-    let entries = m.client.conflicts().await.unwrap();
-    assert_eq!(entries.iter().filter(|e| e.kind.as_deref() == Some("displaced")).count(), 3);
-    assert!(entries.iter().all(|e| e.path.is_some() && e.displaced_at == Some(0)));
-    m.client.adopt_displaced("adopt-me").await.unwrap();
-    assert_eq!(std::fs::read_to_string(m.repo().join("personal/x/SKILL.md")).unwrap(), "recovered edit\n");
-    assert_eq!(m.client.conflicts().await.unwrap().len(), 2);
-    m.client.discard_displaced("found-again").await.unwrap();
-    m.client.discard_displaced("discard-me").await.unwrap();
+    let DaemonMessage::Status(_) = next_message(&mut ws).await else { panic!("expected status") };
+    eventually(|| async { m.harness_skill("x").map(drop) }).await;
+    let mut open = std::fs::OpenOptions::new().append(true).open(m.skills().join("x/SKILL.md")).unwrap();
+    m.write("personal/x/SKILL.md", "draft v2\n");
+    let entry =
+        eventually(|| async { m.client.recovered().await.ok()?.into_iter().find(|entry| entry.name == "x") }).await;
+    use std::io::Write;
+    open.write_all(b"late harness edit\n").unwrap();
+    drop(open);
+    let id = entry.id.unwrap();
+    let index = state.join("sk1ll/displaced/.index").join(&id);
+    std::fs::remove_file(index).unwrap();
+    m.client.sync(&Default::default()).await.unwrap();
+    eventually(|| async {
+        m.status()
+            .await
+            .report
+            .conflicts
+            .iter()
+            .any(|c| c.harness == HARNESS && c.item == ItemRef::Skill("x".into()))
+            .then_some(())
+    })
+    .await;
+    let target = m.client.adopt_displaced(&id).await.unwrap();
+    assert_eq!(target, m.repo().join("personal/x"));
+    assert_eq!(std::fs::read_to_string(target.join("SKILL.md")).unwrap(), "x\nlate harness edit\n");
     assert!(m.client.conflicts().await.unwrap().is_empty());
     assert!(m.status().await.report.conflicts.is_empty());
 }
@@ -1625,10 +1440,11 @@ async fn a_hanging_fetch_blocks_no_other_call() {
     assert!(err.message.contains("timed out"), "{}", err.message);
 }
 
-/// A pull holds the engine mutex while its fetch waits for the server. The
-/// read-only endpoints don't take that mutex, so the GUI keeps answering.
+/// A pull's fetch waits for the server without the engine mutex, so the
+/// read-only endpoints (which never take it) and engine operations alike keep
+/// answering.
 #[tokio::test(flavor = "multi_thread")]
-async fn reads_answer_while_a_pull_holds_the_engine_mutex() {
+async fn reads_and_syncs_answer_while_a_pull_fetches() {
     use sk1ll_daemon::client::{ConflictDiffRequest, ContentQuery, FileQuery};
     // Never accepted: the daemon stays offline and pulls only when asked.
     let server = FakeServer::new().await;
@@ -1671,9 +1487,10 @@ async fn reads_answer_while_a_pull_holds_the_engine_mutex() {
     assert_eq!(m.client.harnesses().await.unwrap().len(), 1);
     assert!(!m.client.items().await.unwrap().is_empty());
     m.client.status().await.unwrap();
+    m.client.sync(&Default::default()).await.unwrap();
     let elapsed = started.elapsed();
-    assert!(elapsed < Duration::from_secs(3), "the reads waited {elapsed:?} for the pull");
-    assert!(!stuck.is_finished(), "the pull was still holding the engine mutex");
+    assert!(elapsed < Duration::from_secs(3), "the calls waited {elapsed:?} for the pull");
+    assert!(!stuck.is_finished(), "the pull was still fetching");
 
     let err = stuck.await.unwrap().unwrap_err();
     assert!(err.message.contains("timed out"), "{}", err.message);
@@ -1746,23 +1563,23 @@ async fn skills_api_browses_content_and_adopts_only_while_connected() {
         assert!(result.unwrap_err().message.contains("Adopt needs a connection to the Server"));
     }
     assert!(!m.repo().join("personal/pdf").exists());
-    assert!(!m.outbox_path().exists());
-    assert!(!m.skills().join("pdf/.sk1ll-managed").exists());
+    assert!(!m.skills().join(sk1ll_core::sync::INDEX_PATH).exists());
     assert!(m.harness_skill("pdf").unwrap().ends_with("same"));
     server.launch().await;
     eventually(|| async { (m.status().await.connection == Connection::Connected).then_some(()) }).await;
     m.client.adopt_unmanaged(&target).await.unwrap();
     assert!(m.repo().join("personal/pdf/SKILL.md").is_file());
-    assert!(!m.outbox_path().exists());
-    assert!(m.skills().join("pdf/.sk1ll-managed").is_file());
-    assert!(m.home.path().join("second/pdf/.sk1ll-managed").is_file());
+    assert_indexed_copy(&m.skills(), "pdf");
+    assert_indexed_copy(&m.home.path().join("second"), "pdf");
     // The entire operation may have completed before the local response was
     // lost. Repeating it must still succeed and keep its explicit Assignment.
     m.client.adopt_unmanaged(&target).await.unwrap();
 
     let snap = m.snapshot().unwrap();
-    assert!(!snap.assignment.skill_enabled("different", "pdf"));
-    assert!(!snap.assignment.skill_enabled("empty", "pdf"));
+    let pdf = sk1ll_core::Repo::open(m.repo()).unwrap().skills().unwrap().into_iter().find(|s| s.name == "pdf");
+    let pdf = pdf.unwrap().id.unwrap();
+    assert!(!snap.assignment.skill_enabled("different", &pdf));
+    assert!(!snap.assignment.skill_enabled("empty", &pdf));
     assert!(!m.home.path().join("empty/pdf").exists());
     assert_eq!(std::fs::read_to_string(m.home.path().join("different/pdf/SKILL.md")).unwrap(), "different");
     assert!(m.skills().join(".sk1ll-tmp/displaced").is_dir());
@@ -1813,19 +1630,29 @@ async fn unmanaged_adoption_retries_after_crash_between_publication_and_assignme
     // no intent or startup reconciliation; the original is still unmanaged.
     sk1ll_core::sync::unmanaged::prepare(&repo, &hs, HARNESS, "pdf").unwrap();
     m.start_connected().await;
-    assert!(!m.skills().join("pdf/.sk1ll-managed").exists());
+    assert!(!m.skills().join(sk1ll_core::sync::INDEX_PATH).exists());
     let target = ConflictTarget { harness: HARNESS.into(), name: "pdf".into() };
     m.client.adopt(&target).await.unwrap();
     let snap: AssignmentSnapshot = server.get(&format!("/machines/{}/assignment", m.id)).await;
-    assert!(snap.assignment.skill_enabled(HARNESS, "pdf"));
-    assert!(m.skills().join("pdf/.sk1ll-managed").is_file());
+    let pdf = sk1ll_core::Repo::open(m.repo()).unwrap().skills().unwrap().into_iter().find(|s| s.name == "pdf");
+    let pdf = pdf.unwrap().id.unwrap();
+    assert!(snap.assignment.skill_enabled(HARNESS, &pdf));
+    assert_indexed_copy(&m.skills(), "pdf");
     assert_eq!(m.harness_skill("pdf").unwrap(), "original user content");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gui_creation_import_inventory_check_and_conflict_diff() {
     use sk1ll_daemon::client::{ConflictDiffRequest, CreateItemRequest};
-    let mut m = solo("gui", "http://127.0.0.1:1", Some(snapshot(1, &["x"])));
+    let mut snap = snapshot(1, &["x"]);
+    snap.assignment.set_rule(HARNESS, &"diff-rule-id".parse().unwrap(), true);
+    // The Import added below gets its Item ID then: the default enables it.
+    snap.assignment.harnesses.get_mut(HARNESS).unwrap().new_skills_default = true;
+    let mut m = solo("gui", "http://127.0.0.1:1", Some(snap));
+    m.write(
+        "instructions/diff-rule.md",
+        &format!("---\nid: diff-rule-id\nharnesses: [{HARNESS}]\npaths: [src/**]\n---\nDraft rule.\n"),
+    );
     m.start().await;
     m.client
         .create_item(&CreateItemRequest {
@@ -1851,6 +1678,8 @@ async fn gui_creation_import_inventory_check_and_conflict_diff() {
     let upstream = tempfile::tempdir().unwrap();
     git(upstream.path(), &["init", "-q", "-b", "main"]);
     write(upstream.path(), "SKILL.md", "upstream v1\n");
+    write(upstream.path(), ".sk1ll-id", "vendored content\n");
+    std::os::unix::fs::symlink("SKILL.md", upstream.path().join("alias")).unwrap();
     git(upstream.path(), &["add", "."]);
     git(upstream.path(), &["commit", "-qm", "first"]);
     m.client
@@ -1892,207 +1721,62 @@ async fn gui_creation_import_inventory_check_and_conflict_diff() {
         .unwrap();
     assert!(diff.diff.contains("-Harness edit"), "{}", diff.diff);
     assert!(diff.diff.contains("+x"), "{}", diff.diff);
-    assert!(!diff.diff.contains(".sk1ll-managed"), "{}", diff.diff);
+    assert!(!diff.diff.contains(sk1ll_core::sync::PLACEMENT_MARKER), "{}", diff.diff);
+    assert!(!diff.diff.contains(".sk1ll-id"), "{}", diff.diff);
+
+    let rule_dir = m.home.path().join("agent/rules");
+    let rule = rule_dir.join("diff-rule.md");
+    eventually(|| async { std::fs::read_to_string(&rule).ok() }).await;
+    write(&rule_dir, "diff-rule.md", "---\npaths: [src/**]\n---\n\nHarness rule.\n");
+    eventually(|| async { m.client.conflicts().await.ok().filter(|v| v.iter().any(|v| v.name == "diff-rule")) }).await;
+    let rule_diff = m
+        .client
+        .conflict_diff(&ConflictDiffRequest { harness: Some(HARNESS.into()), name: Some("diff-rule".into()), id: None })
+        .await
+        .unwrap()
+        .diff;
+    assert!(rule_diff.contains("-Harness rule.") && rule_diff.contains("+Draft rule."), "{rule_diff}");
+    assert!(!rule_diff.contains("diff-rule-id") && !rule_diff.contains("harnesses:"), "{rule_diff}");
+    eventually(|| async { m.harness_skill("external") }).await;
+    let external = m.skills().join("external");
+    write(&external, ".sk1ll-id", "changed sidecar\n");
+    std::fs::remove_file(external.join("alias")).unwrap();
+    std::os::unix::fs::symlink(".sk1ll-id", external.join("alias")).unwrap();
+    let diff = m
+        .client
+        .conflict_diff(&ConflictDiffRequest { harness: Some(HARNESS.into()), name: Some("external".into()), id: None })
+        .await
+        .unwrap();
+    assert!(diff.diff.contains("-changed sidecar") && diff.diff.contains("+vendored content"), "{}", diff.diff);
+    assert!(diff.diff.contains("120000") && diff.diff.contains("alias"), "{}", diff.diff);
+    assert_eq!(diff.target, Some(m.repo().join("imported/external")));
     m.client.remove_import("external").await.unwrap();
     assert!(m.client.imports().await.unwrap().imports.is_empty());
     assert!(!m.repo().join("imported/external").exists());
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn deleting_and_renaming_are_draft_changes_and_renaming_offline_needs_an_opt_in() {
-    use sk1ll_daemon::client::{ChangeKind, DeleteItemRequest, RenameItemRequest};
-    let mut m = solo("items", "http://127.0.0.1:1", Some(snapshot(1, &["x"])));
-    m.write("instructions/style.md", "---\nname: style\n---\nRule\n");
-    git(&m.repo(), &["add", "."]);
-    git(&m.repo(), &["commit", "-qm", "rule"]);
-    m.start().await;
-    let delete = |kind: &str, name: &str| DeleteItemRequest { kind: kind.into(), name: name.into() };
-    let rename = |kind: &str, name: &str, to: &str| RenameItemRequest {
-        kind: kind.into(),
-        name: name.into(),
-        to: to.into(),
-        copy_assignment: true,
-    };
-
-    m.client.delete_item(&delete("skill", "y")).await.unwrap();
-    m.client.delete_item(&delete("rule", "style")).await.unwrap();
-    assert!(m.client.delete_item(&delete("skill", "y")).await.is_err(), "already deleted");
-    assert!(m.client.rename_item(&rename("skill", "x", "z")).await.is_err(), "taken");
-    // `x` is explicitly on here, but the Server is unreachable: nothing moves.
-    let refused = m.client.rename_item(&rename("skill", "x", "x2")).await.unwrap_err();
-    assert_eq!(refused.status, Some(409));
-    assert!(refused.message.contains("was not renamed") && refused.message.contains("offline"), "{refused}");
-    assert!(m.repo().join("personal/x").is_dir() && !m.repo().join("personal/x2").exists());
-    // Unless the rename goes ahead without the toggles.
-    let renamed = m
-        .client
-        .rename_item(&RenameItemRequest { copy_assignment: false, ..rename("skill", "x", "x2") })
-        .await
-        .unwrap();
-    assert_eq!(renamed.item, ItemRef::Skill("x2".into()));
-    assert!(renamed.migrated.is_empty() && renamed.kept.is_empty() && renamed.assignment_error.is_none());
-    // Even an item without explicit toggles here asks the Server first, which
-    // may have one this cache hasn't seen.
-    m.client
-        .create_item(&sk1ll_daemon::client::CreateItemRequest {
-            kind: "rule".into(),
-            name: "fresh".into(),
-            description: None,
-            bundled: None,
-        })
-        .await
-        .unwrap();
-    let refused = m.client.rename_item(&rename("rule", "fresh", "newer")).await.unwrap_err();
-    assert_eq!(refused.status, Some(409), "{refused}");
-    let plain = m
-        .client
-        .rename_item(&RenameItemRequest { copy_assignment: false, ..rename("rule", "fresh", "newer") })
-        .await
-        .unwrap();
-    assert_eq!((plain.migrated.len(), plain.assignment_error), (0, None));
-
-    let draft: BTreeMap<String, ChangeKind> =
-        m.client.draft().await.unwrap().into_iter().map(|d| (d.item.to_string(), d.change)).collect();
-    assert_eq!(
-        draft,
-        BTreeMap::from([
-            ("rule:newer".to_string(), ChangeKind::Added),
-            ("rule:style".to_string(), ChangeKind::Deleted),
-            ("skill:x".to_string(), ChangeKind::Deleted),
-            ("skill:x2".to_string(), ChangeKind::Added),
-            ("skill:y".to_string(), ChangeKind::Deleted),
-        ])
-    );
-    assert_eq!(std::fs::read_to_string(m.repo().join("personal/x2/SKILL.md")).unwrap(), "x\n");
-    eventually(|| async { (!m.skills().join("x").exists()).then_some(()) }).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn renaming_carries_this_machines_toggles_over() {
-    use sk1ll_daemon::client::RenameItemRequest;
-    let server = Server::start().await;
-    let mut a = Machine::new("alpha");
-    a.join(&server).await;
-    a.start_connected().await;
-    a.write("personal/x/SKILL.md", "---\nname: x\n---\nx v1\n");
-    a.write("personal/w/SKILL.md", "w\n");
-    a.write("personal/v/SKILL.md", "v\n");
-    assert!(a.commit_all().await.pushed);
-    assign(&a, "alpha", vec![toggle("x", true), toggle("w", true), toggle("v", true), toggle("w2", false)]).await;
-    eventually(|| async { a.harness_skill("x").map(drop) }).await;
-    let rename = |name: &str, to: &str| RenameItemRequest {
-        kind: "skill".into(),
-        name: name.into(),
-        to: to.into(),
-        copy_assignment: true,
-    };
-
-    let renamed = a.client.rename_item(&rename("x", "renamed")).await.unwrap();
-    assert_eq!(
-        (renamed.migrated.as_slice(), renamed.kept.as_slice(), renamed.assignment_error.as_deref()),
-        ([HARNESS.to_string()].as_slice(), [].as_slice(), None)
-    );
-    let snapshot = a.client.assignment("alpha").await.unwrap();
-    assert_eq!(snapshot.assignment.harness(HARNESS).skills.get("renamed"), Some(&true));
-    let text = eventually(|| async { a.harness_skill("renamed") }).await;
-    assert_eq!(text, "---\nname: renamed\n---\nx v1\n");
-    eventually(|| async { (!a.skills().join("x").exists()).then_some(()) }).await;
-
-    // A toggle the new name already has is kept, and not reported as copied.
-    let kept = a.client.rename_item(&rename("w", "w2")).await.unwrap();
-    assert_eq!((kept.migrated.len(), kept.kept.as_slice()), (0, [HARNESS.to_string()].as_slice()), "{kept:?}");
-    let snapshot = a.client.assignment("alpha").await.unwrap();
-    assert_eq!(snapshot.assignment.harness(HARNESS).skills.get("w2"), Some(&false));
-
-    // A rename that fails after the copy removes the toggles it wrote.
-    let personal = a.repo().join("personal");
-    let mode = |m: u32| std::fs::set_permissions(&personal, std::os::unix::fs::PermissionsExt::from_mode(m)).unwrap();
-    mode(0o555);
-    let failed = a.client.rename_item(&rename("v", "v2")).await.unwrap_err();
-    mode(0o755);
-    assert!(failed.message.contains("were removed again"), "{failed}");
-    assert!(a.repo().join("personal/v").is_dir() && !a.repo().join("personal/v2").exists());
-    let snapshot = a.client.assignment("alpha").await.unwrap();
-    assert_eq!(snapshot.assignment.harness(HARNESS).skills.get("v2"), None);
-    assert_eq!(snapshot.assignment.harness(HARNESS).skills.get("v"), Some(&true));
-
-    // The copy is an ordinary logged change, found through the log filters.
-    let query = sk1ll_proto::LogQuery {
-        item: Some("SKILL:renamed".into()),
-        author: Some("alpha".into()),
-        ..Default::default()
-    };
-    let log = a.client.log(&query).await.unwrap();
-    assert_eq!(log.len(), 1, "{log:?}");
-    assert_eq!((log[0].cause.clone(), log[0].after), (LogCause::Change, Some(true)));
-    let facets = a.client.log_facets().await.unwrap();
-    assert!(facets.harnesses.contains(&HARNESS.to_string()) && facets.machines == ["alpha"], "{facets:?}");
-    assert!(a.commit_all().await.pushed);
-    assert_eq!(
-        a.client.assignment("alpha").await.unwrap().assignment.harness(HARNESS).skills.get("renamed"),
-        Some(&true)
-    );
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn standalone_rename_copies_the_assignment_first() {
-    use sk1ll_daemon::client::RenameItemRequest;
-    let mut m = Machine::new("solo");
-    sk1ll_core::Repo::init(&m.repo()).unwrap();
-    for name in ["pdf", "csv", "md"] {
-        m.write(&format!("personal/{name}/SKILL.md"), name);
+async fn daemon_repairs_duplicate_ids_and_persists_handmade_ids_in_the_draft() {
+    let mut m = solo("repair", "http://127.0.0.1:1", Some(snapshot(1, &["x"])));
+    let source = m.repo().join("personal/x");
+    let copy = m.repo().join("personal/copy");
+    std::fs::create_dir(&copy).unwrap();
+    for file in ["SKILL.md", ".sk1ll-id"] {
+        std::fs::copy(source.join(file), copy.join(file)).unwrap();
     }
-    let mut assignment = Assignment::default();
-    for name in ["pdf", "csv", "md"] {
-        assignment.set_skill(HARNESS, name, false);
-        // A Harness this Machine no longer has takes no copy.
-        assignment.set_skill("gone", name, true);
-    }
-    assignment.set_skill(HARNESS, "tables", true);
-    assignment.save(&m.cache_path()).unwrap();
+    m.write("instructions/handmade.md", "Plain rule.\n");
     m.start().await;
-    let rename = |name: &str, to: &str| RenameItemRequest {
-        kind: "skill".into(),
-        name: name.into(),
-        to: to.into(),
-        copy_assignment: true,
-    };
-    let renamed = m.client.rename_item(&rename("pdf", "docs")).await.unwrap();
-    assert_eq!((renamed.migrated.as_slice(), renamed.kept.len()), ([HARNESS.to_string()].as_slice(), 0));
-    let local = Assignment::load(&m.cache_path()).unwrap();
-    assert_eq!(local.harness(HARNESS).skills.get("docs"), Some(&false));
-    assert_eq!(local.harness("gone").skills.get("docs"), None);
-    assert!(m.repo().join("personal/docs").is_dir());
-
-    // An explicit toggle for the new name is kept.
-    let kept = m.client.rename_item(&rename("csv", "tables")).await.unwrap();
-    assert_eq!((kept.migrated.len(), kept.kept.as_slice()), (0, [HARNESS.to_string()].as_slice()));
-    assert_eq!(Assignment::load(&m.cache_path()).unwrap().harness(HARNESS).skills.get("tables"), Some(&true));
-
-    // A rename that fails after the copy removes it again.
-    let personal = m.repo().join("personal");
-    let mode = |m: u32| std::fs::set_permissions(&personal, std::os::unix::fs::PermissionsExt::from_mode(m)).unwrap();
-    mode(0o555);
-    let failed = m.client.rename_item(&rename("md", "notes")).await.unwrap_err();
-    mode(0o755);
-    assert!(failed.message.contains("were removed again"), "{failed}");
-    let local = Assignment::load(&m.cache_path()).unwrap();
-    assert_eq!(local.harness(HARNESS).skills.get("notes"), None);
-    assert!(m.repo().join("personal/md").is_dir() && !m.repo().join("personal/notes").exists());
-
-    // A write for an older revision changes nothing (an Undo, say).
-    let revision = m.client.assignment("solo").await.unwrap().revision;
-    let guarded = |revision: u64, registration: Option<&str>| AssignmentChanges {
-        changes: vec![toggle("docs", true)],
-        expected: Some(sk1ll_proto::Expected { revision, registration: registration.map(Into::into) }),
-    };
-    let stale = m.client.set_assignment("solo", &guarded(revision - 1, None)).await.unwrap_err();
-    assert_eq!(stale.status, Some(409), "{stale}");
-    let other = m.client.set_assignment("solo", &guarded(revision, Some("joined"))).await.unwrap_err();
-    assert_eq!(other.status, Some(409), "{other}");
-    assert_eq!(Assignment::load(&m.cache_path()).unwrap().harness(HARNESS).skills.get("docs"), Some(&false));
-    let update = m.client.set_assignment("solo", &guarded(revision, None)).await.unwrap();
-    assert_eq!(update.assignment.harness(HARNESS).skills.get("docs"), Some(&true));
+    let error = m.client.items().await.unwrap_err();
+    assert!(error.message.contains("personal/copy/.sk1ll-id") && error.message.contains("personal/x/.sk1ll-id"));
+    // The copy, and the hand-made rule without one.
+    assert_eq!(m.client.repair_ids().await.unwrap(), 2);
+    let items = m.client.items().await.unwrap();
+    let get = |item| items.iter().find(|entry| entry.item == item).unwrap();
+    let copy = get(ItemRef::Skill("copy".into()));
+    let source = get(ItemRef::Skill("x".into()));
+    assert!(copy.id.is_some() && source.id.is_some() && copy.id != source.id);
+    assert!(get(ItemRef::Rule("handmade".into())).id.is_some());
+    assert_eq!(m.client.repair_ids().await.unwrap(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2180,7 +1864,6 @@ async fn standalone_starts_without_a_repo_and_init_creates_it() {
     assert!(m.repo().join("sk1ll.toml").is_file());
     assert!(m.status().await.repo_ready);
     assert!(!m.state_path().exists());
-    assert!(!m.outbox_path().exists());
     assert!(sk1ll_core::EngineLock::try_acquire(&m.repo()).unwrap().is_none());
     assert_eq!(m.client.init().await.unwrap_err().status, Some(409));
     let error = m.client.push().await.unwrap_err();
@@ -2205,6 +1888,7 @@ async fn standalone_syncs_and_keeps_assignment_local_across_restarts() {
         changes: vec![ToggleChange {
             harness: HARNESS.into(),
             kind: ToggleKind::Skill,
+            item_id: Some(skill_id("pdf")),
             name: Some("pdf".into()),
             enabled: Some(false),
         }],
@@ -2213,7 +1897,7 @@ async fn standalone_syncs_and_keeps_assignment_local_across_restarts() {
     let update = m.client.set_assignment("solo", &changes).await.unwrap();
     assert!(update.entries.is_empty());
     assert!(update.revision > original.revision);
-    assert!(!Assignment::load(&m.cache_path()).unwrap().skill_enabled(HARNESS, "pdf"));
+    assert!(!Assignment::load(&m.cache_path()).unwrap().skill_enabled(HARNESS, &skill_id("pdf")));
     assert!(m.harness_skill("pdf").is_none());
     assert!(!m.snapshot_path().exists(), "local snapshots must not become fleet snapshots");
     let revision = update.revision;
@@ -2223,7 +1907,7 @@ async fn standalone_syncs_and_keeps_assignment_local_across_restarts() {
     assert!(m.harness_skill("pdf").is_none());
     // A direct CLI assign atomically replaces this same file.
     let mut assignment = Assignment::load(&m.cache_path()).unwrap();
-    assignment.set_skill(HARNESS, "pdf", true);
+    assignment.set_skill(HARNESS, &skill_id("pdf"), true);
     assignment.save(&m.cache_path()).unwrap();
     eventually(|| async { (m.harness_skill("pdf").as_deref() == Some("edited")).then_some(()) }).await;
     assert!(m.status().await.assignment_revision > revision);
@@ -2235,6 +1919,7 @@ async fn standalone_syncs_and_keeps_assignment_local_across_restarts() {
                 changes: vec![ToggleChange {
                     harness: HARNESS.into(),
                     kind: ToggleKind::NewSkillsDefault,
+                    item_id: None,
                     name: None,
                     enabled: Some(false),
                 }],
@@ -2247,7 +1932,6 @@ async fn standalone_syncs_and_keeps_assignment_local_across_restarts() {
     m.client.sync(&Default::default()).await.unwrap();
     assert!(m.harness_skill("pdf").is_some());
     assert!(m.harness_skill("new").is_none());
-    assert!(!m.outbox_path().exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2265,10 +1949,10 @@ async fn standalone_adopts_unmanaged_skills_with_local_assignment() {
         .unwrap();
     assert_eq!(std::fs::read_to_string(m.repo().join("personal/pdf/SKILL.md")).unwrap(), "unmanaged");
     assert_eq!(m.harness_skill("pdf").as_deref(), Some("unmanaged"));
-    assert!(m.skills().join("pdf/.sk1ll-managed").is_file());
-    assert!(Assignment::load(&m.cache_path()).unwrap().skill_enabled(HARNESS, "pdf"));
+    assert_indexed_copy(&m.skills(), "pdf");
+    let pdf = sk1ll_core::Repo::open(m.repo()).unwrap().skills().unwrap()[0].id.clone().unwrap();
+    assert!(Assignment::load(&m.cache_path()).unwrap().skill_enabled(HARNESS, &pdf));
     assert!(m.client.draft().await.unwrap().iter().any(|d| d.item == ItemRef::Skill("pdf".into())));
-    assert!(!m.outbox_path().exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2303,7 +1987,163 @@ async fn standalone_commits_locally_and_pushes_and_pulls_its_own_origin() {
     assert!(matches!(m.client.pull().await.unwrap(), sk1ll_daemon::client::PullResult::Blocked { .. }));
     assert_eq!(m.status().await.headline, MachineStatus::Blocked);
     assert_eq!(std::fs::read_to_string(m.repo().join("personal/pdf/SKILL.md")).unwrap(), "local draft");
-    assert!(!m.outbox_path().exists());
+}
+
+/// A Baseline that writes a file through a filter driver (Git LFS) leaves
+/// the Machine Blocked on it, changes nothing and runs no driver, and the
+/// error says why.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pull_through_a_filter_driver_stays_blocked_and_says_why() {
+    let mut m = Machine::new("solo");
+    sk1ll_core::Repo::init(&m.repo()).unwrap();
+    let bare = m.home.path().join("origin.git");
+    git(m.home.path(), &["init", "--quiet", "--bare", "-b", "main", bare.to_str().unwrap()]);
+    git(&m.repo(), &["remote", "add", "origin", bare.to_str().unwrap()]);
+    let ran = m.home.path().join("driver-ran");
+    for key in ["clean", "smudge"] {
+        git(&m.repo(), &["config", &format!("filter.lfs.{key}"), &format!("touch {}; cat", ran.display())]);
+    }
+    m.write("personal/pdf/SKILL.md", "initial");
+    m.start().await;
+    m.commit_all().await;
+    assert!(m.client.push().await.unwrap().pushed);
+    let peer = m.home.path().join("peer");
+    git(m.home.path(), &["clone", "--quiet", bare.to_str().unwrap(), peer.to_str().unwrap()]);
+    write(&peer, ".gitattributes", "*.md filter=lfs\n");
+    write(&peer.join("personal/pdf"), "SKILL.md", "pdf v2");
+    git(&peer, &["-c", "filter.lfs.clean=cat", "add", "-A"]);
+    git(&peer, &["commit", "--quiet", "-m", "v2"]);
+    git(&peer, &["push", "--quiet", "origin", "main"]);
+    let before = m.head();
+
+    let error = m.client.pull().await.unwrap_err().to_string();
+    assert!(error.contains("filter driver") && error.contains("personal/pdf/SKILL.md"), "{error}");
+    let status = m.status().await;
+    assert_eq!(status.headline, MachineStatus::Blocked);
+    assert!(status.last_error.as_deref().unwrap_or_default().contains("filter="), "{status:?}");
+    assert_eq!(m.head(), before);
+    assert!(!m.repo().join(".git/sk1ll-pull.json").exists());
+    assert_eq!(std::fs::read_to_string(m.repo().join("personal/pdf/SKILL.md")).unwrap(), "initial");
+    assert!(!ran.exists(), "a filter driver ran");
+}
+
+/// sk1ll refuses to commit a tree the server would refuse; one committed
+/// by hand is refused by the server for good: the push isn't retried after
+/// a pull, the error says so, and status and the fleet show it until a fix
+/// is committed on top.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_push_the_server_refuses_for_good_is_reported_until_fixed() {
+    let server = Server::start().await;
+    let (a, _b, _) = fleet_of_two(&server).await;
+    a.write(".gitattributes", "*.bin filter=lfs\n");
+    a.write("personal/x/data.bin", "data\n");
+    let request = CommitRequest { items: vec!["x".into(), "other:.gitattributes".into()], ..Default::default() };
+    let error = a.client.commit(&request).await.unwrap_err().to_string();
+    assert!(error.contains("filter driver") && error.contains("personal/x/data.bin"), "{error}");
+    let before = server.head();
+
+    git(&a.repo(), &["add", "-A"]);
+    git(&a.repo(), &["commit", "--quiet", "-m", "by hand"]);
+    // As the server binary's check does (this embedded one runs none).
+    let hook = server.data.join("repo.git/hooks/pre-receive");
+    let refuse = "#!/bin/sh\nread -r old new ref\nif git cat-file -e \"$new:.gitattributes\" 2>/dev/null; then\n  \
+                  echo \"sk1ll-server: refusing $new: the skills repo uses a git filter driver\" >&2\n  exit 1\nfi\n";
+    std::fs::write(&hook, refuse).unwrap();
+    let error = a.client.push().await.unwrap_err().to_string();
+    assert!(error.contains("refused the push for good") && error.contains("filter driver"), "{error}");
+    assert_eq!(server.head(), before);
+    let status = a.status().await;
+    assert!(status.report.push_refused.as_deref().unwrap_or_default().contains("filter driver"), "{status:?}");
+    eventually(|| async { server.row("alpha").await?.report?.push_refused.map(drop) }).await;
+
+    std::fs::remove_file(a.repo().join(".gitattributes")).unwrap();
+    let fixed = a.commit(&["other:.gitattributes"]).await;
+    assert!(fixed.pushed, "{fixed:?}");
+    assert!(a.status().await.report.push_refused.is_none());
+    eventually(|| async { server.row("alpha").await?.report.filter(|r| r.push_refused.is_none()).map(drop) }).await;
+}
+
+/// A pull that stopped half-way (here: at a directory it can't write to)
+/// is finished by the daemon's next refresh, without another pull.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refresh_finishes_a_pull_that_stopped_half_way() {
+    use sk1ll_daemon::client::{PullResult, RenameItemRequest, SyncRequest};
+    use std::os::unix::fs::PermissionsExt;
+    let mut m = Machine::new("solo");
+    sk1ll_core::Repo::init(&m.repo()).unwrap();
+    let bare = m.home.path().join("origin.git");
+    git(m.home.path(), &["init", "--quiet", "--bare", "-b", "main", bare.to_str().unwrap()]);
+    git(&m.repo(), &["remote", "add", "origin", bare.to_str().unwrap()]);
+    m.write("personal/pdf/SKILL.md", "initial");
+    m.start().await;
+    m.commit_all().await;
+    assert!(m.client.push().await.unwrap().pushed);
+    let peer = m.home.path().join("peer");
+    git(m.home.path(), &["clone", "--quiet", bare.to_str().unwrap(), peer.to_str().unwrap()]);
+    write(&peer.join("instructions"), "git.md", "Use Conventional Commits.");
+    write(&peer.join("personal/pdf"), "SKILL.md", "remote edit");
+    git(&peer, &["add", "-A"]);
+    git(&peer, &["commit", "--quiet", "-m", "remote edit"]);
+    git(&peer, &["push", "--quiet", "origin", "main"]);
+    let remote = git(&peer, &["rev-parse", "HEAD"]);
+
+    let pdf = m.repo().join("personal/pdf");
+    let mode = |mode| std::fs::set_permissions(&pdf, std::fs::Permissions::from_mode(mode)).unwrap();
+    mode(0o555);
+    if std::fs::write(pdf.join("probe"), "").is_ok() {
+        return; // root writes into read-only directories
+    }
+    m.client.pull().await.unwrap_err();
+    let journal = m.repo().join(".git/sk1ll-pull.json");
+    assert!(journal.exists());
+    let rule = std::fs::read_to_string(m.repo().join("instructions/git.md")).unwrap();
+    assert_eq!(rule, "Use Conventional Commits.", "rolled forward, never back");
+    let report = m.status().await.report;
+    assert_eq!(report.pull_pending, Some(vec![]));
+    assert!(report.drafts.is_empty(), "the partial checkout is not a Draft");
+    assert_eq!(m.harness_skill("pdf").as_deref(), Some("initial"));
+    let error = m.client.sync(&SyncRequest { force: true, ..Default::default() }).await.unwrap_err();
+    assert!(error.to_string().contains("pull pending"), "{error}");
+    // Nor does anything write Item IDs into the partial tree meanwhile.
+    let error = m.client.repair_ids().await.unwrap_err();
+    assert!(error.to_string().contains("pull stopped half-way"), "{error}");
+    let rename = RenameItemRequest { kind: "skill".into(), name: "pdf".into(), to: "new-pdf".into() };
+    let error = m.client.rename_item(&rename).await.unwrap_err();
+    assert!(error.to_string().contains("pull stopped half-way"), "{error}");
+    assert!(pdf.join("SKILL.md").is_file() && !m.repo().join("personal/new-pdf").exists());
+
+    // An editor can still write to a file in the read-only directory.
+    m.write("personal/pdf/SKILL.md", "saved while pull was pending");
+    let pdf_item = ItemRef::Skill("pdf".into());
+    eventually(|| async {
+        let report = m.status().await.report;
+        (report.pull_pending.as_deref() == Some(std::slice::from_ref(&pdf_item))).then_some(())
+    })
+    .await;
+    assert_eq!(m.harness_skill("pdf").as_deref(), Some("initial"));
+    assert!(m.status().await.report.drafts.is_empty());
+    assert!(matches!(m.client.pull().await.unwrap(), PullResult::Blocked { pending: true, .. }));
+    m.write("personal/pdf/SKILL.md", "initial");
+    mode(0o755);
+
+    // Any refresh finishes it; this one follows a draft edit.
+    m.write("notes.txt", "a draft");
+    eventually(|| async { (m.head() == remote && !journal.exists()).then_some(()) }).await;
+    eventually(|| async { (m.harness_skill("pdf").as_deref() == Some("remote edit")).then_some(()) }).await;
+    assert_eq!(git(&m.repo(), &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    // The peer's Rule came without an Item ID: once the pull is done, the
+    // refresh writes one, as a Draft change.
+    assert_eq!(git(&m.repo(), &["status", "--porcelain"]), "M instructions/git.md\n?? notes.txt");
+    let rule = std::fs::read_to_string(m.repo().join("instructions/git.md")).unwrap();
+    assert!(rule.contains("id: ") && rule.ends_with("Use Conventional Commits."), "{rule}");
+    eventually(|| async {
+        let status = m.status().await;
+        (status.report.pull_pending.is_none() && status.headline != MachineStatus::Blocked).then_some(())
+    })
+    .await;
+    assert!(m.log().contains("finished a pull that had stopped half-way"), "{}", m.log());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2428,8 +2268,7 @@ async fn harnesses_change_after_setup_with_a_preview_of_what_stays() {
 
     // Turning a harness's items off first lets sync take them out; then disabling leaves nothing.
     let result = m.client.set_harness_assignment(HARNESS, false).await.unwrap();
-    assert!(result.warning.is_none());
-    assert!(!result.update.assignment.skill_enabled(HARNESS, "pdf"));
+    assert!(!result.assignment.skill_enabled(HARNESS, &skill_id("pdf")));
     eventually(|| async { m.harness_skill("pdf").is_none().then_some(()) }).await;
     let mut disable =
         HarnessChangeRequest { fingerprint: None, change: HarnessChange::Disable { name: HARNESS.into() } };
@@ -2643,6 +2482,7 @@ async fn standalone_join_revalidates_after_registration_and_keeps_local_authorit
                 changes: vec![ToggleChange {
                     harness: HARNESS.into(),
                     kind: ToggleKind::NewSkillsDefault,
+                    item_id: None,
                     name: None,
                     enabled: Some(false),
                 }],
@@ -2734,6 +2574,7 @@ async fn standalone_join_revalidates_after_registration_and_keeps_local_authorit
                 changes: vec![ToggleChange {
                     harness: HARNESS.into(),
                     kind: ToggleKind::Skill,
+                    item_id: Some(skill_id("draft")),
                     name: Some("draft".into()),
                     enabled: Some(true),
                 }],
@@ -2760,6 +2601,7 @@ async fn standalone_join_snapshot_failure_rolls_back_and_retries_pending_registr
                 changes: vec![ToggleChange {
                     harness: HARNESS.into(),
                     kind: ToggleKind::NewSkillsDefault,
+                    item_id: None,
                     name: None,
                     enabled: Some(false),
                 }],
@@ -2804,13 +2646,14 @@ async fn clients_of_another_local_api_version_are_told_to_restart_the_daemon() {
     let request = |version: &str| {
         format!("GET /status HTTP/1.1\r\nHost: localhost\r\nsk1ll-api: {version}\r\nConnection: close\r\n\r\n")
     };
-    for (version, expected) in [("1", "HTTP/1.1 200"), ("2", "HTTP/1.1 426")] {
+    let version = sk1ll_daemon::client::API_VERSION;
+    for (version, expected) in [(version, "HTTP/1.1 200"), (version + 1, "HTTP/1.1 426")] {
         let mut stream = tokio::net::UnixStream::connect(m.client.socket()).await.unwrap();
-        stream.write_all(request(version).as_bytes()).await.unwrap();
+        stream.write_all(request(&version.to_string()).as_bytes()).await.unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).await.unwrap();
         assert!(response.starts_with(expected), "{version}: {response}");
-        if version == "2" {
+        if expected == "HTTP/1.1 426" {
             assert!(response.contains("restart the daemon"), "{response}");
         }
     }
@@ -2897,7 +2740,8 @@ async fn skill_file_writes_require_current_personal_or_rule_text() {
     assert!(error.message.contains("Invalid Rule frontmatter"));
     request.content = "---\nharnesses: [claude]\n---\n# Valid".into();
     m.client.write_skill_file(&request).await.unwrap();
-    assert_eq!(m.client.skill_file(&request.file).await.unwrap().text.as_deref(), Some(request.content.as_str()));
+    let saved = m.client.skill_file(&request.file).await.unwrap().text.unwrap();
+    assert!(saved.contains("id:") && saved.contains("harnesses: [claude]") && saved.ends_with("# Valid"), "{saved}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3018,4 +2862,193 @@ async fn render_and_dry_run_use_the_current_draft_without_writing() {
     assert!(std::fs::read_to_string(&path).unwrap().contains("readable"));
     let files = m.client.render_instructions(HARNESS).await.unwrap();
     assert!(!files[0].differs && files[0].diff.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn offline_item_rename_keeps_both_machines_assignments() {
+    use sk1ll_daemon::client::RenameItemRequest;
+
+    let mut server = Server::start().await;
+    let (a, b, _) = fleet_of_two(&server).await;
+    assign(&a, "alpha", vec![toggle("x", true)]).await;
+    assign(&b, "beta", vec![toggle("x", true)]).await;
+    let before_a = a.client.assignment("alpha").await.unwrap();
+    let before_b = b.client.assignment("beta").await.unwrap();
+    server.stop();
+    eventually(|| async { (a.status().await.connection == Connection::Offline).then_some(()) }).await;
+    let renamed = a
+        .client
+        .rename_item(&RenameItemRequest { kind: "skill".into(), name: "x".into(), to: "new-x".into() })
+        .await
+        .unwrap();
+    assert_eq!(renamed.item, ItemRef::Skill("new-x".into()));
+    assert_eq!(
+        a.harness_skill("new-x").as_deref(),
+        Some(
+            "x v1
+"
+        )
+    );
+    server.launch().await;
+    eventually(|| async { (a.status().await.connection == Connection::Connected).then_some(()) }).await;
+    assert!(a.commit_all().await.pushed);
+    eventually(|| async { b.harness_skill("new-x").is_some().then_some(()) }).await;
+    assert_eq!(a.client.assignment("alpha").await.unwrap(), before_a);
+    assert_eq!(b.client.assignment("beta").await.unwrap(), before_b);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_id_is_inert_and_harness_rename_moves_explicit_toggles() {
+    let server = Server::start().await;
+    let (a, _b, _) = fleet_of_two(&server).await;
+    let mut unknown = toggle("x", true);
+    unknown.item_id = Some("absent-id".parse().unwrap());
+    let update =
+        a.client.set_assignment("alpha", &AssignmentChanges { changes: vec![unknown], expected: None }).await.unwrap();
+    assert_eq!(update.entries[0].item_id.as_ref().unwrap().to_string(), "absent-id");
+    assert!(a.harness_skill("x").is_none());
+    assign(&a, "alpha", vec![toggle("x", true)]).await;
+
+    let update = a
+        .client
+        .rename_harness(&sk1ll_daemon::client::HarnessRenameRequest {
+            from: HARNESS.into(),
+            to: "new-agent".into(),
+            replace: false,
+        })
+        .await
+        .unwrap();
+    let update = update.update;
+    assert!(!update.assignment.harnesses.contains_key(HARNESS));
+    assert!(update.assignment.skill_enabled("new-agent", &skill_id("x")));
+    assert!(!update.assignment.harness("new-agent").new_skills_default);
+    assert!(update.assignment.harness("new-agent").skills.contains_key(&"absent-id".parse().unwrap()));
+    assert_eq!(
+        a.harness_skill("x").as_deref(),
+        Some(
+            "x v1
+"
+        )
+    );
+    assert!(a.client.harnesses().await.unwrap().iter().any(|h| h.name == "new-agent"));
+    assert_eq!(a.client.assignment("alpha").await.unwrap().revision, update.revision);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recreated_personal_skill_gets_a_new_assignment_identity() {
+    use sk1ll_daemon::client::{CreateItemRequest, DeleteItemRequest};
+    let mut m = Machine::new("solo");
+    sk1ll_core::Repo::init(&m.repo()).unwrap();
+    m.start().await;
+    let create = CreateItemRequest { kind: "skill".into(), name: "pdf".into(), description: None, bundled: None };
+    m.client.create_item(&create).await.unwrap();
+    let id = || sk1ll_core::Repo::open(m.repo()).unwrap().skills().unwrap()[0].id.clone().unwrap();
+    let old = id();
+    let mut off = toggle("pdf", false);
+    off.item_id = Some(old.clone());
+    assign(&m, "solo", vec![off]).await;
+    assert!(m.harness_skill("pdf").is_none());
+    m.client.delete_item(&DeleteItemRequest { kind: "skill".into(), name: "pdf".into() }).await.unwrap();
+    m.client.create_item(&create).await.unwrap();
+    assert_ne!(id(), old);
+    assert!(m.harness_skill("pdf").is_some());
+    assert!(!m.client.assignment("solo").await.unwrap().assignment.skill_enabled(HARNESS, &old));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconnect_replays_harness_rename_before_first_status() {
+    use sk1ll_core::harness_rename::{RenameIntent, RenameRequest};
+    use sk1ll_proto::{AssignmentOutcome, AssignmentUpdate, AssignmentWrite};
+
+    let server = FakeServer::new().await;
+    let mut snap = snapshot(1, &[]);
+    let id: sk1ll_core::ItemId = "persisted-x".parse().unwrap();
+    snap.assignment.set_skill(HARNESS, &id, true);
+    let mut m = solo("solo", &server.url(), Some(snap.clone()));
+    m.write("personal/x/.sk1ll-id", "persisted-x");
+    let cfg = Machine::machine_config(m.home.path());
+    // sk1ll's state directory, as the daemon finds it from `XDG_STATE_HOME`.
+    let state = m.home.path().join(".local/state/sk1ll");
+    let authority = sk1ll_core::hash::hash_str(&format!("{}\0solo\0tok", server.url()));
+    let intent = RenameIntent::prepare(
+        &state,
+        &cfg,
+        &m.repo(),
+        RenameRequest { from: HARNESS.into(), to: "renamed".into(), replace: false },
+        &snap.assignment,
+        Some(&authority),
+    )
+    .unwrap();
+    let mut after = snap.assignment;
+    after.rename_harness(HARNESS, "renamed");
+
+    m.start().await;
+    let (mut socket, _) = server.accept().await;
+    let DaemonMessage::SetAssignment { write: AssignmentWrite::RenameHarness(first), .. } =
+        next_message(&mut socket).await
+    else {
+        panic!("send the rename before status")
+    };
+    assert_eq!(first.operation_id, intent.operation_id);
+    assert!(sk1ll_core::MachineConfig::load(&cfg).unwrap().harnesses().contains_key("renamed"));
+    drop(socket);
+
+    let (mut socket, _) = server.accept().await;
+    let DaemonMessage::SetAssignment { req, write: AssignmentWrite::RenameHarness(replayed) } =
+        next_message(&mut socket).await
+    else {
+        panic!("replay the rename before status")
+    };
+    assert_eq!(replayed, first);
+    let reply = ServerMessage::AssignmentResult {
+        req,
+        seq: 0,
+        result: AssignmentOutcome::Applied(AssignmentUpdate {
+            assignment: after,
+            revision: 2,
+            entries: vec![],
+            errors: vec![],
+        }),
+    };
+    socket.send(Message::text(serde_json::to_string(&reply).unwrap())).await.unwrap();
+    let DaemonMessage::Status(report) = next_message(&mut socket).await else { panic!("expected status after replay") };
+    assert_eq!(report.harnesses, ["renamed"]);
+    assert!(!RenameIntent::exists(&state, &cfg).unwrap());
+    assert!(m.snapshot().unwrap().assignment.skill_enabled("renamed", &id));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_rule_reports_partial_inventory_and_still_pulls() {
+    let server = Server::start().await;
+    let (mut a, b, _) = fleet_of_two(&server).await;
+    a.stop();
+    a.write("instructions/unreadable.md", "---\nid: [bad]\n---\nrule\n");
+    a.write("personal/ok/SKILL.md", "valid skill");
+    a.write("personal/ok/.sk1ll-id", "ok-id");
+    a.start_connected().await;
+    let first = eventually(|| async {
+        let report = server.row("alpha").await?.report?;
+        report.inventory_error.as_ref()?.contains("unreadable.md").then_some(report)
+    })
+    .await;
+    assert!(!first.inventory_complete);
+    assert!(first.items.iter().any(|item| item.id.to_string() == "ok-id"));
+    let response = server
+        .http
+        .post(format!("{}/api/assignment/orphans/prune", server.url()))
+        .bearer_auth(ADMIN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    b.write("notes", "a change to pull");
+    let pushed = b.commit_all().await;
+    assert!(pushed.pushed);
+    eventually(|| async {
+        let status = a.status().await;
+        (status.connection == Connection::Connected && status.report.baseline.as_deref() == Some(&pushed.sha))
+            .then_some(())
+    })
+    .await;
+    assert_eq!(std::fs::read_to_string(a.repo().join("notes")).unwrap(), "a change to pull");
 }

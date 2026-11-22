@@ -12,6 +12,18 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Some("--healthcheck") => std::process::exit(healthcheck()),
+        // Run by the bare repo's pre-receive hook, in the repo.
+        Some("--check-push") => {
+            let Some(commit) = std::env::args().nth(2) else {
+                eprintln!("sk1ll-server: --check-push needs the pushed commit");
+                std::process::exit(2);
+            };
+            if let Err(e) = sk1ll_server::check_push(std::path::Path::new("."), &commit).await {
+                eprintln!("sk1ll-server: {e:#}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         _ => {}
     }
     tracing_subscriber::fmt()

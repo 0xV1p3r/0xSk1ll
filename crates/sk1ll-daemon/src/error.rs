@@ -25,6 +25,20 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+impl Error {
+    /// The same failure, to report it again (a published read keeps one).
+    pub(crate) fn duplicate(&self) -> Self {
+        match self {
+            Self::BadRequest(m) => Self::BadRequest(m.clone()),
+            Self::NotFound(m) => Self::NotFound(m.clone()),
+            Self::Conflict(m) => Self::Conflict(m.clone()),
+            Self::Unavailable(m) => Self::Unavailable(m.clone()),
+            Self::Upstream(status, m) => Self::Upstream(*status, m.clone()),
+            Self::Internal(e) => Self::Internal(anyhow::anyhow!("{e:#}")),
+        }
+    }
+}
+
 impl From<sk1ll_core::Error> for Error {
     fn from(e: sk1ll_core::Error) -> Self {
         match e {
@@ -34,6 +48,10 @@ impl From<sk1ll_core::Error> for Error {
                 kept.display()
             )),
             sk1ll_core::Error::Invalid(m) => Self::BadRequest(m),
+            sk1ll_core::Error::DuplicateItemId { .. }
+            | sk1ll_core::Error::StrandedRename { .. }
+            | sk1ll_core::Error::PullPending
+            | sk1ll_core::Error::FilterDriver { .. } => Self::Conflict(e.to_string()),
             sk1ll_core::Error::Changed(m) => Self::Conflict(m),
             e => Self::Internal(e.into()),
         }
@@ -57,7 +75,7 @@ impl IntoResponse for Error {
             Self::Internal(e) => format!("{e:#}"),
             e => e.to_string(),
         };
-        (status, Json(ErrorBody { error, code: None })).into_response()
+        (status, Json(ErrorBody { error })).into_response()
     }
 }
 

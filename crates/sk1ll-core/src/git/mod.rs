@@ -18,12 +18,45 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::process::{Child, ChildStdout, Command, ExitStatus, Output, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::{Error, Result};
+
+pub mod config_env;
+mod filters;
+pub use filters::{RepoGit, filtered_paths};
+pub(crate) use filters::{configured_drivers, driver_paths};
+/// Unix only, like the daemon and the fleet that use it.
+#[cfg(unix)]
+pub mod plumbing;
+
+/// Oldest Git version sk1ll supports.
+pub const MIN_VERSION: (u32, u32) = (2, 40);
+
+/// The version reported by the git on PATH, without the "git version" prefix.
+pub fn version() -> Result<String> {
+    let output = Git::command(None).arg("--version").text()?;
+    output
+        .strip_prefix("git version ")
+        .map(str::to_owned)
+        .ok_or_else(|| Error::Invalid(format!("unexpected git version output: {output}")))
+}
+
+/// Require at least the given major and minor version.
+pub fn require_git(min: (u32, u32)) -> Result<()> {
+    let requirement = format!("Git {}.{} or newer is required on PATH", min.0, min.1);
+    let installed = version().map_err(|e| Error::Invalid(format!("{requirement}: {e}")))?;
+    let mut parts = installed.split('.');
+    let major_minor = parts.next().and_then(|major| Some((major.parse::<u32>().ok()?, parts.next()?.parse().ok()?)));
+    if major_minor.is_some_and(|installed| installed >= min) {
+        Ok(())
+    } else {
+        Err(Error::Invalid(format!("{requirement}; found {installed}")))
+    }
+}
 
 /// One git invocation, built up like [`Command`] and run under the deadline
 /// described in the module docs. Front-ends (the daemon) use it so that none
@@ -39,8 +72,14 @@ pub struct Git {
 impl Git {
     /// `git -C <dir>`.
     pub fn new(dir: &Path) -> Self {
+        Self::command(Some(dir))
+    }
+
+    fn command(dir: Option<&Path>) -> Self {
         let mut cmd = Command::new("git");
-        cmd.arg("-C").arg(dir);
+        if let Some(dir) = dir {
+            cmd.arg("-C").arg(dir);
+        }
         if cfg!(test) {
             // Unit tests must not depend on the developer's own git config.
             let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
@@ -50,6 +89,28 @@ impl Git {
         }
         cmd.env("LC_ALL", "C").env("LANGUAGE", "C");
         Self { cmd, args: Vec::new(), stdin: None, timeout: None }
+    }
+
+    /// `git -C <dir>` for pull, which checks and undoes its own steps: no
+    /// hooks (`no_hooks` is an empty directory), no autostash, no submodule
+    /// recursion, submodule changes never hidden, and no fsmonitor daemon
+    /// standing in for the file system, and no filter driver.
+    ///
+    /// `drivers`: the filter drivers git's configuration has, which are
+    /// turned off (see [`Git::without_filter_drivers`]).
+    pub(crate) fn for_pull(dir: &Path, no_hooks: &Path, drivers: &std::collections::BTreeSet<String>) -> Self {
+        let mut hooks = OsString::from("core.hooksPath=");
+        hooks.push(no_hooks);
+        let config = [
+            "merge.autoStash=false",
+            "rebase.autoStash=false",
+            "submodule.recurse=false",
+            "diff.ignoreSubmodules=none",
+            "core.fsmonitor=false",
+            "core.ignoreStat=false",
+            "core.quotePath=true",
+        ];
+        Self::new(dir).args(config.iter().flat_map(|c| ["-c", c])).arg("-c").arg(hooks).without_filter_drivers(drivers)
     }
 
     /// Takes pathspecs literally, so file names are never globs. Only for
@@ -98,7 +159,36 @@ impl Git {
 
     /// Runs git and returns its output whatever the exit status. Running out
     /// of time is an [`Error::Git`].
-    pub fn output(mut self) -> Result<Output> {
+    pub fn output(self) -> Result<Output> {
+        let (status, stdout, stderr) = self.output_with(|mut pipe| {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes)?;
+            Ok(bytes)
+        })?;
+        Ok(Output { status, stdout, stderr })
+    }
+
+    pub(crate) fn run_stream<T: Send + 'static>(
+        self,
+        read: impl FnOnce(ChildStdout) -> std::io::Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let args = self.describe();
+        let (status, value, stderr) = self.output_with(read)?;
+        if status.success() {
+            Ok(value)
+        } else {
+            Err(Error::Git { args, stderr: String::from_utf8_lossy(&stderr).trim().into() })
+        }
+    }
+
+    fn output_with<T: Send + 'static>(
+        mut self,
+        read: impl FnOnce(ChildStdout) -> std::io::Result<T> + Send + 'static,
+    ) -> Result<(ExitStatus, T, Vec<u8>)> {
+        enum Stream<T> {
+            Out(std::io::Result<T>),
+            Err(std::io::Result<Vec<u8>>),
+        }
         let describe = self.describe();
         let timeout = match self.timeout {
             Some(t) => t,
@@ -118,18 +208,18 @@ impl Git {
             _ => None,
         };
         let (tx, rx) = mpsc::channel();
-        for (stream, pipe) in [
-            (0, child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>)),
-            (1, child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>)),
-        ] {
-            let tx = tx.clone();
-            thread::spawn(move || {
-                let mut buf = Vec::new();
-                let res = pipe.map_or(Ok(0), |mut p| p.read_to_end(&mut buf));
-                let _ = tx.send((stream, res.map(|_| buf)));
-            });
-        }
-        drop(tx);
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let out_tx = tx.clone();
+        thread::spawn(move || {
+            let _ = out_tx.send(Stream::Out(read(stdout)));
+        });
+        thread::spawn(move || {
+            let mut pipe = stderr;
+            let mut bytes = Vec::new();
+            let result = pipe.read_to_end(&mut bytes).map(|_| bytes);
+            let _ = tx.send(Stream::Err(result));
+        });
 
         let deadline = timeout.map(|t| Instant::now() + t);
         let status = wait_until(&mut child, deadline).map_err(spawn_err)?;
@@ -140,16 +230,17 @@ impl Git {
         };
         // The pipes close once every process holding them is gone; a
         // straggler (a backgrounded grandchild) gets killed at the deadline.
-        let mut streams: [Option<Vec<u8>>; 2] = [None, None];
+        let (mut stdout, mut stderr) = (None, None);
         let mut killed_stragglers = false;
-        while streams.iter().any(Option::is_none) {
+        while stdout.is_none() || stderr.is_none() {
             let got = match deadline {
                 _ if timed_out || killed_stragglers => rx.recv_timeout(GRACE).map_err(|_| ()),
                 Some(d) => rx.recv_timeout(d.saturating_duration_since(Instant::now())).map_err(|_| ()),
                 None => rx.recv().map_err(|_| ()),
             };
             match got {
-                Ok((i, res)) => streams[i] = Some(res.map_err(spawn_err)?),
+                Ok(Stream::Out(value)) => stdout = Some(value),
+                Ok(Stream::Err(value)) => stderr = Some(value),
                 Err(()) if !killed_stragglers && !timed_out => {
                     kill_group(&mut child);
                     killed_stragglers = true;
@@ -157,7 +248,7 @@ impl Git {
                 Err(()) => break,
             }
         }
-        let [stdout, stderr] = streams.map(Option::unwrap_or_default);
+        let stderr = stderr.transpose().map_err(spawn_err)?.unwrap_or_default();
         let finished = !timed_out && !killed_stragglers;
         // Only join the writer once git is done with its input; after a
         // timeout it's left to finish (or fail) on its own. Git not reading
@@ -179,7 +270,10 @@ impl Git {
             }
             return Err(Error::Git { args: describe, stderr: msg });
         }
-        Ok(Output { status, stdout, stderr })
+        let stdout = stdout
+            .ok_or_else(|| spawn_err(std::io::Error::other("git stdout closed unexpectedly")))?
+            .map_err(spawn_err)?;
+        Ok((status, stdout, stderr))
     }
 
     /// Runs git; a non-zero exit is an [`Error::Git`]. Returns raw stdout.
@@ -389,7 +483,7 @@ pub(crate) fn path_from_bytes(raw: &[u8]) -> PathBuf {
 }
 
 /// Paths from git's NUL-separated (`-z`) output.
-pub(crate) fn split_paths(out: &[u8]) -> impl Iterator<Item = PathBuf> + '_ {
+pub fn split_paths(out: &[u8]) -> impl Iterator<Item = PathBuf> + '_ {
     out.split(|b| *b == 0).filter(|p| !p.is_empty()).map(path_from_bytes)
 }
 

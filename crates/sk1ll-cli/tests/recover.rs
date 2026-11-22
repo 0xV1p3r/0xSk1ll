@@ -18,7 +18,7 @@ fn recover_list_shows_displaced_content() {
     std::fs::write(
         entry.join("entry.json"),
         format!(
-            r#"{{"harness":"agent","kind":"rule","dest":"{}","expected":"","displaced_at":0}}"#,
+            r#"{{"version":3,"harness":"agent","kind":"rule","dest":"{}","expected":"","displaced_at":0}}"#,
             root.join("rule.md").display()
         ),
     )
@@ -35,6 +35,7 @@ fn recover_list_shows_displaced_content() {
             "list",
         ])
         .env("HOME", &root)
+        .env_remove("SK1LL_STATE_DIR")
         .env("XDG_STATE_HOME", root.join("state"))
         .output()
         .unwrap();

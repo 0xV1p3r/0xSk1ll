@@ -3,11 +3,13 @@
 //! runs standalone against the same repo and machine-local assignment as the
 //! direct CLI. Joined machines use the fleet's repo and assignment snapshots.
 //!
-//! - Core's engine lock stays held while the daemon manages a repo.
+//! - The machine lock ([`MachineLock`]) is held for the daemon's whole life,
+//!   taken before it reads any of the Machine's state; core's engine lock on
+//!   the repo too while it manages one.
 //! - File watches and periodic reconciliation apply local changes in both modes.
 //! - Standalone commits stay local; explicit push/pull use the repo's origin.
 //! - Joined commits push immediately or queue while offline. Assignment arrives
-//!   as revisioned snapshots, and discarded drafts are delivered via an outbox.
+//!   as revisioned snapshots, and writes follow the status on the same session.
 //! - Conflicts are reported, never overwritten without an explicit action.
 //! - Fleet credentials live in daemon.json; git gets them through the process
 //!   environment ([`auth`]). Standalone never opens a server session.
@@ -18,23 +20,25 @@ pub mod client;
 mod config;
 mod daemon;
 mod error;
-pub mod gitx;
 pub mod join;
+mod lifecycle;
+pub mod local;
+mod machine_lock;
 mod notifications;
-mod outbox;
+mod remote;
 mod server;
 pub mod service;
 pub mod state;
+mod store;
 mod watch;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, bail};
 pub use config::{Config, locate_repo, parse_duration};
 use daemon::Daemon;
 pub use join::{JoinOptions, Joined, join, join_or_rejoin};
-pub use server::{set_assignment_direct, set_harness_assignment_direct};
+pub use machine_lock::MachineLock;
 pub use state::DaemonState;
 
 static PREPARED: AtomicBool = AtomicBool::new(false);
@@ -61,23 +65,27 @@ pub unsafe fn prepare_process(cfg: &Config) -> anyhow::Result<()> {
             unsafe { std::env::set_var(k, v) };
         }
     }
+    // Core's recovery area and import cache follow the configuration too.
+    sk1ll_core::paths::use_dirs(sk1ll_core::paths::Dirs { state: cfg.state_dir.clone(), cache: cfg.cache_dir.clone() });
     PREPARED.store(true, Ordering::SeqCst);
     Ok(())
 }
 
+/// How long a starting daemon waits for a command's engine to end.
+const MACHINE_LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Runs until Ctrl-C / SIGTERM, standalone when daemon.json is absent.
-/// Fails if another process holds the repo's engine lock.
+/// Takes the machine lock before it reads anything of the Machine, waiting
+/// a while for a command's engine to end; fails if another process still
+/// holds it, or holds the repo's engine lock.
 ///
 /// [`prepare_process`] must have been called first.
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
     if !PREPARED.load(Ordering::SeqCst) {
         bail!("sk1ll_daemon::prepare_process must run before sk1ll_daemon::run");
     }
-    let state = DaemonState::load(&cfg.state)?;
-    let d = match state {
-        Some(state) => Daemon::new(cfg, state)?,
-        None => Daemon::standalone(cfg)?,
-    };
+    sk1ll_core::git::require_git(sk1ll_core::git::MIN_VERSION)?;
+    let d = Daemon::start(cfg, MACHINE_LOCK_PATIENCE).await?;
     let listener = api::bind(&d.cfg.socket).await?;
     tracing::info!("sk1ll daemon {}: local API on {}", sk1ll_core::VERSION, d.cfg.socket.display());
     let socket = d.cfg.socket.clone();
@@ -88,7 +96,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     if d.is_revoked() {
         tracing::warn!("this machine was removed from the fleet; not managing it (join again to resume)");
     } else {
-        match d.blocking(|d, eng| d.startup(eng)).await {
+        match d.startup().await {
             Err(error::Error::Conflict(e)) if e.contains("another sk1ll process") => {
                 let _ = std::fs::remove_file(&socket);
                 bail!("{e}; not starting");
@@ -96,11 +104,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             Err(e) => d.set_error(format!("startup: {e}")),
             Ok(()) => {}
         }
+        tokio::spawn(daemon::reconcile_loop(d.clone()));
         tokio::spawn(watch::run(d.clone()));
-        if !d.is_standalone() {
-            tokio::spawn(server::run(d.clone()));
-            tokio::spawn(periodic_pull(d.clone()));
-        }
+        d.remote.run(&d);
     }
     let notifications = tokio::spawn(notifications::run(d.clone()));
     let served = tokio::select! {
@@ -110,22 +116,6 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     notifications.abort();
     let _ = std::fs::remove_file(&socket);
     served
-}
-
-/// The fallback for missed nudges.
-async fn periodic_pull(d: Arc<Daemon>) {
-    let mut tick = tokio::time::interval(d.cfg.pull_every);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    tick.tick().await;
-    loop {
-        tick.tick().await;
-        if d.is_revoked() {
-            return;
-        }
-        if d.is_connected() {
-            let _ = d.blocking(|d, eng| d.pull(eng)).await;
-        }
-    }
 }
 
 async fn shutdown() {

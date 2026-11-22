@@ -4,9 +4,9 @@ A fleet is every machine that shares one skills repo. It has three parts:
 
 - The **server** is a Docker container. It hosts the canonical bare repo, stores assignment and machine status, and tells machines to pull after each push. It is the only git remote ([ADR 0002](adr/0002-server-is-the-git-remote.md)).
 - The **daemon** runs on each machine. It watches the repo and the harnesses, applies the draft and assignment, and is the only process that talks to the server. When the server is unreachable, it keeps working from the last assignment it received.
-- The **CLI and GUI** talk to the local daemon over a Unix socket.
+- The **CLI and GUI** talk to the local daemon over a Unix socket. Without a running daemon, a CLI command runs the same engine in its own process, which connects to the server only when the command needs it ([ADR 0008](adr/0008-cli-is-a-client-of-the-engine.md)).
 
-The daemon and fleet commands need Unix.
+The daemon and the CLI need Unix.
 
 ## Deploy the server
 
@@ -70,7 +70,7 @@ curl -fsS -X POST -H "Authorization: Bearer $SK1LL_SERVER_ADMIN_TOKEN" \
   | jq -er 'if .scope == "self" then .code else error("the server did not grant self scope") end'
 ```
 
-The response holds the `code`, its `scope` and `expires_at` (Unix seconds). Without a body, the code has `fleet` scope. An older server ignores the requested scope and grants `fleet` without saying so in the response, which is why the example prints the code only when the response confirms `"scope": "self"`, as `sk1ll fleet invite` and the GUI do.
+The response includes the `code`, its `scope` and `expires_at` in Unix seconds. An empty request body creates a `fleet` code.
 
 On a joined machine with a running daemon, run `sk1ll fleet invite` to create a single-use join code. It prints the code, a ready-to-paste join command for the new machine, when the code expires, and its scope. You can also create a code from the GUI's Fleet or Settings screen.
 
@@ -90,9 +90,7 @@ A join code decides what the machine that joins with it may manage ([ADR 0005](a
 
 Every machine can read the fleet view, the log and every assignment. The admin token can do everything. A `self` machine that tries more gets `403` with the reason, and since it can't create join codes, it can't create a `fleet` code either. Scopes cover fleet administration only: a `self` machine can still push content to the baseline.
 
-A push drops toggles only for the skills and rules it removed from the baseline, and keeps each machine's toggles for items in its draft or unpushed commits. A push by a `fleet` machine or the admin drops them on every machine; a push by a `self` machine drops only its own, and the other machines keep theirs. Toggles for items no longer in the baseline do nothing, and apply again if an item with the same kind and name comes back from any machine's push. Later pushes that don't remove the item leave them alone; a `fleet` machine or the admin can clear them by changing the assignment. Every write also checks the caller's token and scope again as it is stored, so a request sent just before its machine was removed, or joined again with a `self` code, fails. Removing a machine waits for a push in progress, and a push queued behind the removal of its machine is refused with `401`. The server accepts pushes only to the baseline branch, the one the repo's HEAD names when the server starts: pushes to tags, other branches, refs under the branch's name or `refs/replace/` are refused, and its own reads ignore replacement objects. The server writes `hooks/pre-receive` in the repo over on every start to enforce this, so put your own checks elsewhere. If HEAD is detached or names something outside `refs/heads/`, the server refuses to start; point it at the branch with `git -C <data>/repo.git symbolic-ref HEAD refs/heads/<branch>`. Changing HEAD while the server runs isn't supported: restart it afterwards. If it can't list the tree before or after a push, that push drops no toggles. If it can't read the baseline when a draft is discarded, it drops nothing and closes the daemon's session with code 1013; the daemon reconnects, backing off, and sends the discard again. `sk1ll fleet` marks `self` machines with *manages only itself*, and the GUI's Fleet screen shows each machine's scope.
-
-Machines that joined before scopes existed have `fleet` scope. A machine removed and joined again gets the scope of its new code.
+Every write checks the caller's token and scope again inside its transaction. Removing a machine waits for a push in progress. A push queued behind a removal is refused with `401`. The server takes pushes only to the Baseline branch, selected from HEAD at startup, and ignores replacement objects. A push is refused unless every item in its new tree (personal skill, Rule, Import) has an Item ID of its own and no file goes through a git filter driver: the refusal names each item without one, each group sharing one, any unreadable Item ID metadata and the files with a `filter=` attribute. Run `sk1ll repair-ids` (it gives every item without an Item ID of its own a fresh one), commit the repaired items and push again. `sk1ll commit` checks its tree the same way and refuses what the server would refuse. A push the server refuses anyway (a commit made with plain git) isn't retried: the command fails, and `sk1ll status`, `sk1ll fleet` and the app show *push refused* with the server's reason until a fix is committed on top. If HEAD is detached, point it to the branch with `git -C <data>/repo.git symbolic-ref HEAD refs/heads/<branch>` and restart the server. `sk1ll fleet` marks `self` Machines as *manages only itself*. A Machine removed and joined again gets the scope of its new code.
 
 On the new machine:
 
@@ -115,9 +113,19 @@ If either Assignment changes or either Machine rejoins after preview, preview ag
 
 Run `sk1ll fleet` to find the machine id. Run `sk1ll fleet remove <machine>` and type that id at the confirmation prompt. In a script, pass `--yes` to confirm removal. For an id that starts with `-`, put `--` before it: `sk1ll fleet remove --yes -- -lab`. The daemon must be running. Removal revokes the machine's credential.
 
-Use `sk1ll assign <harness> --all on|off` to change both defaults and every Baseline item, even if this Machine has yet to pull it. The operation also includes this Machine’s reported drafts and unpushed items. Older Servers use the local item list and warn that unpulled items may stay on.
+Use `sk1ll assign <harness> --all on|off` to set both defaults and every explicit toggle for a Harness, including its toggles for items the Machine has yet to pull.
 
 Use `sk1ll fleet log` to see recent Assignment changes, newest first. Filter with `--machine`, `--harness`, `--author`, or `--item`. Use `--limit` to set the page size and `--before <entry-id>` to page back. To undo a change, run `sk1ll fleet undo <entry-id>`.
+
+## Orphan toggles
+
+Assignment uses Item IDs. Renames keep their toggles on every Machine. A push or Restore changes only the repo content. Toggles for absent IDs are inert.
+
+Run `sk1ll fleet orphans` to list toggles whose Item ID appears in neither the Baseline nor any Machine's last report. `sk1ll fleet prune-orphans` clears the listed orphans in your scope and records each removal in the Assignment log. A `self` Machine can clear only its own toggles. A `fleet` Machine or the admin can clear across the Fleet, or pass `--machine <id>` to select one Machine.
+
+The Server refuses to list or clear orphans while the Baseline or any reported inventory is incomplete. Pushes keep the Baseline's Item IDs complete, so only a Baseline written on the server by hand can be. A Machine reports an incomplete inventory while its Item ID metadata is unreadable, an item has no Item ID yet, two items share one, or a Pull is pending. Changing a Machine's defaults is refused then too, since it records each existing item's value by Item ID. Fix the affected metadata (`sk1ll repair-ids` for duplicates) or let the Pull finish, and let the Machine report again. The Server also refuses pruning while git push state is degraded.
+
+The server exposes `GET /api/assignment/orphans` and `POST /api/assignment/orphans/prune`. The optional prune body is `{"machine":"workstation"}`.
 
 ## Run the daemon
 
@@ -152,7 +160,7 @@ tail -n 50 ~/Library/Logs/sk1ll/daemon.log
 
 The LaunchAgent has its own `PATH`. When setup or the app creates the plist, it looks up `git` on its current `PATH` and prepends Git's directory if the agent's default list lacks it. To change the agent's search path, edit `EnvironmentVariables` → `PATH` in the plist. Run `launchctl bootout "gui/$(id -u)/app.v1p3r.sk1ll.daemon"` if the agent is loaded, then run the start commands above to load the change.
 
-While it runs, the daemon holds the repo's engine lock. CLI commands that change the repo go through the daemon, and the daemon refuses to start while another sk1ll process holds the lock. Running `sk1ll join` again after the machine was removed also goes through the daemon, which then restarts itself with the new credentials.
+While it runs, the daemon holds the repo's engine lock. CLI commands that change the repo go through the daemon, and the daemon refuses to start while another sk1ll process holds the lock. A slow or unreachable server holds up only the request waiting for it: the daemon fetches, pushes, clones and waits for the server to confirm an Assignment change without blocking its other work, so status, reads, syncs and local edits keep answering. Running `sk1ll join` again after the machine was removed also goes through the daemon, which then restarts itself with the new credentials.
 
 On Linux, the local API socket is `$XDG_RUNTIME_DIR/sk1ll/daemon.sock`, with a fallback to `~/.config/sk1ll/run/daemon.sock` when there is no runtime directory. On macOS it is `~/Library/Application Support/sk1ll/run/daemon.sock`. The socket has mode 0600 and its directory must belong to the user and have mode 0700. On macOS the socket path can be at most 103 bytes. If it is too long, set `SK1LL_DAEMON_SOCKET` to a shorter path in a private directory for the daemon and its clients.
 
@@ -160,15 +168,18 @@ The table lists Linux paths. On macOS, config and data use `~/Library/Applicatio
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SK1LL_DAEMON_STATE` | Platform config directory’s `sk1ll/daemon.json` | Machine id, server URL, token and repo path |
+| `SK1LL_DAEMON_STATE` | Platform config directory’s `sk1ll/daemon.json` | Machine id, server URL, token and repo path, and the server's last known baseline and whether the machine is Blocked on it |
 | `SK1LL_DAEMON_SOCKET` | `$XDG_RUNTIME_DIR/sk1ll/daemon.sock` | Local API socket |
 | `SK1LL_MACHINE_CONFIG` | `~/.config/sk1ll/machine.toml` | Harness configuration |
 | `SK1LL_ASSIGNMENT` | `~/.cache/sk1ll/assignment.json` | Local assignment in standalone; server mirror when joined |
+| `SK1LL_STATE_DIR` | `~/.local/state/sk1ll` (`$XDG_STATE_HOME/sk1ll`; on macOS the data directory's `sk1ll`) | The machine lock's files (`locks/`) and a pending Harness rename (`harness-rename/`), each named by a hash of the real path of the file it is about, and the recovery area's index (`displaced/`) |
+| `SK1LL_CACHE_DIR` | `~/.cache/sk1ll` (`$XDG_CACHE_HOME/sk1ll`) | Import sources fetched into `git/` |
 | `SK1LL_REPO` | nearest skills repo, else `~/.local/share/sk1ll/repo` | Standalone repo path; joined machines use `daemon.json` |
 | `SK1LL_PULL_INTERVAL` | `5m` | Fallback pull interval while connected |
 | `SK1LL_DEBOUNCE` | `300ms` | Quiet time before reacting to file changes |
 | `SK1LL_DEBOUNCE_MAX` | `2s` | Longest a stream of file changes can postpone a sync |
-| `SK1LL_RECONCILE_INTERVAL` | `60s` | Local re-sync of the harnesses, even while offline |
+| `SK1LL_RECONCILE_INTERVAL` | `60s` | Periodic reconcile of the harnesses, even while offline; it costs only a metadata check when nothing changed |
+| `SK1LL_FULL_RECONCILE_INTERVAL` | `10m` | Longest time between two full reconciles, which plan and rehash everything whatever the metadata says; one also runs at startup |
 | `SK1LL_AUTH_WARN_AFTER` | `24h` | After the server rejects the token this long, status reports the machine as probably removed |
 | `SK1LL_NOTIFICATIONS` | unset | Set to `0` to disable [desktop notifications](configuration.md#desktop-notifications) |
 | `SK1LL_RECONNECT_MAX` | `60s` | Longest reconnect backoff |
@@ -186,7 +197,7 @@ The table lists Linux paths. On macOS, config and data use `~/Library/Applicatio
 | Drafting | The machine has a draft. |
 | In sync | Latest baseline, no draft, no conflicts. |
 
-To clear Blocked, commit or restore the clashing items, then run `sk1ll pull`.
+To clear Blocked, restore the clashing items (`sk1ll restore <items>` keeps your version in recovery and prints each entry's id), run `sk1ll pull`, then `sk1ll recover adopt <id>` to bring your version back as Draft on the new baseline and commit it again. Committing a clashing item doesn't clear Blocked: the next pull turns an unpushed commit that conflicts with the new baseline back into Draft changes, keeping every file as it is. The daemon remembers Blocked and the server's baseline across restarts (a standalone daemon, which has no `daemon.json`, keeps them in `standalone-state.json` in the same directory), so it reports them before it can reach the server again. A Pull that stopped half-way (it crashed, or hit an error) is finished by the next Pull or by the daemon's next reconcile, without fetching again.
 
 Join codes expire after `SK1LL_SERVER_JOIN_CODE_TTL` (default `24h`), using the server duration syntax. `sk1ll fleet invite` and the GUI show the exact time.
 

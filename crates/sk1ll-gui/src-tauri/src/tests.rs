@@ -63,7 +63,7 @@ async fn commands_use_the_unix_client_and_preserve_payloads_and_errors() {
     let requests = Recorded::default();
     let fleet = json!({"baseline":"abc", "machines":[]});
     let items = json!([{"item":"skill:pdf", "in_baseline":true, "draft":null, "unpushed":false,
-        "description":"Read PDF files"}]);
+        "description":"Read PDF files", "id":null}]);
     let assignment = json!({"revision":7, "harnesses": {"claude": {"new_skills_default":false,
         "new_rules_default":true, "skills":{"pdf":true}, "rules":{}}}});
     let committed = json!({"sha":"abc", "items":["skill:pdf"], "message":"Ship PDF", "pushed":false,
@@ -82,7 +82,7 @@ async fn commands_use_the_unix_client_and_preserve_payloads_and_errors() {
         ("POST /restore", json!({"discarded":["skill:pdf"]})),
         ("POST /pull", json!({"state":"blocked","baseline":"abc","items":["skill:pdf"]})),
         ("GET /log?before=42&limit=10", json!([])),
-        ("POST /join-codes", json!({"code":"ONCE"})),
+        ("POST /join-codes", json!({"code":"ONCE","scope":"fleet","expires_at":100})),
         (
             "POST /join",
             json!({"machine_id":"alpha","repo":"/tmp/skills","setup":"adopted","harnesses":[],"revision":7}),
@@ -93,15 +93,15 @@ async fn commands_use_the_unix_client_and_preserve_payloads_and_errors() {
     for path in [
         "POST /conflicts/adopt",
         "POST /conflicts/overwrite",
-        "POST /conflicts/displaced/a%2Fb/adopt",
         "POST /conflicts/displaced/a%2Fb/discard",
         "DELETE /machines/a%2Fb",
     ] {
         replies.insert(path.into(), (StatusCode::NO_CONTENT, Value::Null));
     }
+    replies.insert("POST /conflicts/displaced/a%2Fb/adopt".into(), (StatusCode::OK, json!("/tmp/skills/personal/pdf")));
     replies.insert(
         "PUT /machines/alpha/assignment".into(),
-        (StatusCode::UNPROCESSABLE_ENTITY, json!({"error":"skill:local is not in the Baseline"})),
+        (StatusCode::CONFLICT, json!({"error":"the Assignment changed since revision 7"})),
     );
     let daemon = FakeDaemon::start(Router::new().fallback(respond).with_state((requests.clone(), replies))).await;
     let bridge = Bridge::new(daemon.client.clone());
@@ -117,9 +117,6 @@ async fn commands_use_the_unix_client_and_preserve_payloads_and_errors() {
     assert!(matches!(bridge.pull().await.unwrap(), PullResult::Blocked { .. }));
     assert!(bridge.log(LogQuery { before: Some(42), limit: Some(10), ..Default::default() }).await.unwrap().is_empty());
     assert_eq!(bridge.join_code(Scope::Fleet).await.unwrap().code, "ONCE");
-    // That reply has no scope, like an older Server's: it can't grant `self`.
-    let old = bridge.join_code(Scope::SelfOnly).await.unwrap_err();
-    assert!(old.message.contains("too old"), "{}", old.message);
     let joined = bridge
         .join(JoinApiRequest {
             server_url: "http://server".into(),
@@ -138,11 +135,11 @@ async fn commands_use_the_unix_client_and_preserve_payloads_and_errors() {
     bridge.discard_displaced("a/b".into()).await.unwrap();
     bridge.remove_machine("a/b".into()).await.unwrap();
     let changes: AssignmentChanges = serde_json::from_value(json!({"changes":[{
-        "harness":"claude","kind":"skill","name":"local","enabled":true}]}))
+        "harness":"claude","kind":"skill","item_id":"local-id","name":"local","enabled":true}],"expected":{"revision":7}}))
     .unwrap();
     let error = bridge.set_assignment("alpha".into(), changes).await.unwrap_err();
-    assert_eq!(error.status, Some(422));
-    assert_eq!(error.message, "skill:local is not in the Baseline");
+    assert_eq!(error.status, Some(409));
+    assert_eq!(error.message, "the Assignment changed since revision 7");
     assert!(!error.unreachable);
     {
         let requests = requests.lock().unwrap();
@@ -159,7 +156,12 @@ async fn commands_use_the_unix_client_and_preserve_payloads_and_errors() {
         .invoke_handler(tauri::generate_handler![crate::commands::fleet])
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
         .unwrap();
-    let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
+    // Its data directory in a temporary one, not under HOME.
+    let data = tempfile::tempdir().unwrap();
+    let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+        .data_directory(data.path().to_path_buf())
+        .build()
+        .unwrap();
     let response = tauri::test::get_ipc_response(
         &webview,
         tauri::webview::InvokeRequest {
@@ -480,7 +482,7 @@ fn editor_bundle_detection_and_json_contract() {
 async fn skill_commands_preserve_queries_payloads_and_errors() {
     let requests = Recorded::default();
     let inventory = json!([{"name":"pdf", "item":null, "type":"unmanaged", "description":"PDF",
-        "draft":null, "in_baseline":false, "path":null, "enabled_harnesses":[], "clashes_with_repo":false,
+        "draft":null, "id":null, "in_baseline":false, "path":null, "enabled_harnesses":[], "clashes_with_repo":false,
         "variants":[{"hash":"sha256:one", "description":"PDF", "locations":[{"harness":"claude", "path":"/tmp/pdf"}],
         "resumable":false}]}]);
     let tree = json!([{"path":"SKILL.md", "kind":"file", "size":12}]);
@@ -701,10 +703,7 @@ async fn new_commands_forward_typed_payloads() {
     for path in ["POST /items/create", "POST /imports/remove", "POST /items/delete"] {
         replies.insert(path.into(), (StatusCode::NO_CONTENT, Value::Null));
     }
-    replies.insert(
-        "POST /items/rename".into(),
-        (StatusCode::OK, json!({"item":"skill:docs","migrated":["claude"],"assignment_error":null})),
-    );
+    replies.insert("POST /items/rename".into(), (StatusCode::OK, json!({"item":"skill:docs"})));
     replies.insert(
         "GET /log?machine=a%20b&harness=claude&author=dev&item=skill%3Apdf&before=9&limit=50".into(),
         (StatusCode::OK, json!([])),
@@ -743,15 +742,10 @@ async fn new_commands_forward_typed_payloads() {
     );
     bridge.delete_item(DeleteItemRequest { kind: "rule".into(), name: "style".into() }).await.unwrap();
     let renamed = bridge
-        .rename_item(RenameItemRequest {
-            kind: "skill".into(),
-            name: "pdf".into(),
-            to: "docs".into(),
-            copy_assignment: false,
-        })
+        .rename_item(RenameItemRequest { kind: "skill".into(), name: "pdf".into(), to: "docs".into() })
         .await
         .unwrap();
-    assert_eq!((renamed.item.to_string(), renamed.migrated), ("skill:docs".to_string(), vec!["claude".to_string()]));
+    assert_eq!(renamed.item.to_string(), "skill:docs");
     let query = LogQuery {
         machine: Some("a b".into()),
         harness: Some("claude".into()),
@@ -767,7 +761,7 @@ async fn new_commands_forward_typed_payloads() {
     assert_eq!(requests[2].2, json!({"name":"pdf"}));
     assert_eq!(requests[4].2["id"], "recovered");
     assert_eq!(requests[5].2, json!({"kind":"rule","name":"style"}));
-    assert_eq!(requests[6].2, json!({"kind":"skill","name":"pdf","to":"docs","copy_assignment":false}));
+    assert_eq!(requests[6].2, json!({"kind":"skill","name":"pdf","to":"docs"}));
 }
 
 #[test]
@@ -824,19 +818,13 @@ async fn harness_commands_forward_changes_and_open_only_the_daemons_machine_conf
     assert!(crate::editors::config_target(directory.path()).is_err(), "a directory is not a config file");
 }
 
-/// A daemon started before an upgrade has no harness routes: it answers 404
-/// without a body, which the app reports as a daemon to restart.
 #[tokio::test]
-async fn a_daemon_without_a_route_is_reported_as_too_old() {
+async fn the_bridge_preserves_a_missing_route_status() {
     let daemon = FakeDaemon::start(Router::new()).await;
     let bridge = Bridge::new(daemon.client.clone());
     let error = bridge.harness_settings().await.unwrap_err();
     assert_eq!(error.status, Some(404));
-    assert!(error.message.contains("older than this client") && error.message.contains("restart"), "{}", error.message);
-    // Any other route missing is no sign of an old daemon.
-    let error = bridge.harnesses().await.unwrap_err();
-    assert_eq!(error.status, Some(404));
-    assert!(!error.message.contains("older than this client"), "{}", error.message);
+    assert_eq!(error.message, "404 Not Found");
 }
 
 #[tokio::test]

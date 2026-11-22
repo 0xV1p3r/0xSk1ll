@@ -28,8 +28,10 @@ impl Fixture {
             .arg("--daemon-socket")
             .arg(root.join("absent.sock"))
             .env("HOME", root.join("home"))
+            .env_remove("SK1LL_STATE_DIR")
             .env("XDG_CONFIG_HOME", root.join("config"))
             .env("XDG_STATE_HOME", root.join("state"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .args(args);
@@ -67,9 +69,22 @@ fn unmanaged_list_and_adopt_preserve_differing_variants_and_assignment() {
     let root = fixture.0.path();
     assert_eq!(std::fs::read_to_string(root.join("repo/personal/pdf/SKILL.md")).unwrap(), "same");
     let assignment = sk1ll_core::Assignment::load(&root.join("assignment.json")).unwrap();
-    assert!(assignment.skill_enabled("a", "pdf") && assignment.skill_enabled("b", "pdf"));
-    assert!(!assignment.skill_enabled("c", "pdf"));
-    assert!(root.join("a/pdf/.sk1ll-managed").is_file() && root.join("b/pdf/.sk1ll-managed").is_file());
+    let pdf = sk1ll_core::Repo::open(root.join("repo")).unwrap().skills().unwrap()[0].id.clone().unwrap();
+    assert!(assignment.skill_enabled("a", &pdf) && assignment.skill_enabled("b", &pdf));
+    assert!(!assignment.skill_enabled("c", &pdf));
+    for harness in ["a", "b"] {
+        let dir = root.join(harness);
+        let bytes = std::fs::read(dir.join(sk1ll_core::sync::INDEX_PATH)).unwrap();
+        let index: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let copy = dir.join("pdf");
+        let token = std::fs::read_to_string(copy.join(sk1ll_core::sync::PLACEMENT_MARKER)).unwrap();
+        let entry = &index["entries"]["pdf"];
+        assert_eq!(entry["kind"], "copy");
+        assert_eq!(entry["hash"], sk1ll_core::sync::deploy_hash(&root.join("repo/personal/pdf")).unwrap());
+        assert_eq!(entry["token"], token);
+        assert!(entry["payload"].as_str().is_some_and(|hash| hash.starts_with("sha256:")));
+        assert_eq!(index["pending"], serde_json::json!({}));
+    }
     assert_eq!(std::fs::read_to_string(root.join("c/pdf/SKILL.md")).unwrap(), "different");
     assert!(error(fixture.command(&["adopt", "c", "pdf"]).output().unwrap()).contains("already exists"));
     assert!(root.join("a/.sk1ll-tmp/displaced").is_dir());
@@ -116,6 +131,7 @@ fn direct_adoption_rejects_a_repo_other_than_the_joined_repo() {
         server_url: "http://unused".into(),
         repo: joined.root().to_path_buf(),
         revoked: false,
+        record: Default::default(),
     }
     .save(&root.join("absent.json"))
     .unwrap();
@@ -125,12 +141,13 @@ fn direct_adoption_rejects_a_repo_other_than_the_joined_repo() {
     assert!(message.contains("selected repo") && message.contains("joined repo"), "{message}");
     assert!(!joined.personal_dir().join("second").exists());
     assert!(!root.join("repo/personal/second").exists());
-    assert!(!root.join("daemon-outbox.json").exists());
     assert_eq!(std::fs::read_to_string(root.join("a/second/SKILL.md")).unwrap(), "unmanaged user content");
 }
 
+/// Without a daemon, the engine in this process connects to the server for
+/// the Assignment write before it publishes anything.
 #[test]
-fn joined_adoption_requires_a_running_connected_daemon() {
+fn joined_adoption_requires_a_reachable_server() {
     let fixture = Fixture::new();
     let root = fixture.0.path();
     sk1ll_daemon::DaemonState {
@@ -139,23 +156,20 @@ fn joined_adoption_requires_a_running_connected_daemon() {
         server_url: "http://unused".into(),
         repo: root.join("repo"),
         revoked: false,
+        record: Default::default(),
     }
     .save(&root.join("absent.json"))
     .unwrap();
     fixture.write("a/pdf/SKILL.md", "unmanaged user content");
     let message = error(fixture.command(&["adopt", "a", "pdf"]).output().unwrap());
-    assert!(
-        message.contains("Adopt needs a connection to the Server") && message.contains("sk1ll daemon"),
-        "{message}"
-    );
+    assert!(message.contains("Adopt needs a connection to the Server"), "{message}");
     assert!(!root.join("repo/personal/pdf").exists());
     assert!(!root.join("assignment.json").exists());
-    assert!(!root.join("daemon-outbox.json").exists());
     assert_eq!(std::fs::read_to_string(root.join("a/pdf/SKILL.md")).unwrap(), "unmanaged user content");
 }
 
 #[test]
-fn daemonless_assign_all_pins_and_reports_skipped_names() {
+fn daemonless_assign_all_reaches_items_with_spaces() {
     let fixture = Fixture::new();
     fixture.write("repo/personal/old name/SKILL.md", "Legacy");
     fixture.write("repo/personal/pdf/SKILL.md", "PDF");
@@ -163,12 +177,183 @@ fn daemonless_assign_all_pins_and_reports_skipped_names() {
     let out = fixture.command(&["assign", "a", "--all", "off"]).output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stderr}");
-    assert!(stderr.contains("old name"));
-    assert!(stderr.contains("old rule"));
     let assignment = sk1ll_core::Assignment::load(&fixture.0.path().join("assignment.json")).unwrap();
-    assert!(assignment.skill_enabled("a", "old name"));
-    assert!(assignment.rule_enabled("a", "old rule"));
-    assert!(!assignment.skill_enabled("a", "pdf"));
-    assert!(!assignment.skill_enabled("a", "future"));
-    assert!(!assignment.rule_enabled("a", "future"));
+    // The command wrote each hand-made item an Item ID first.
+    let ids = sk1ll_core::Repo::open(fixture.0.path().join("repo")).unwrap().item_ids().unwrap();
+    assert_eq!(ids.len(), 3, "{ids:?}");
+    for (item, id) in ids {
+        let id = id.expect("an Item ID");
+        match item {
+            sk1ll_core::ItemRef::Skill(_) => assert!(!assignment.skill_enabled("a", &id), "{item}"),
+            _ => assert!(!assignment.rule_enabled("a", &id), "{item}"),
+        }
+    }
+    // Items that appear later are off too.
+    let a = assignment.harness("a");
+    assert!(!a.new_skills_default && !a.new_rules_default);
+}
+
+#[test]
+fn harness_rename_moves_toggles_and_a_recreated_item_starts_from_the_default() {
+    let fixture = Fixture::new();
+    let root = fixture.0.path();
+    fixture.write("repo/personal/pdf/SKILL.md", "PDF");
+    fixture.run(&["assign", "a", "skill", "pdf", "off"]);
+    let skill_id = || sk1ll_core::Repo::open(root.join("repo")).unwrap().skills().unwrap()[0].id.clone();
+    let old = skill_id().expect("assign wrote an Item ID");
+    std::fs::remove_dir_all(root.join("repo/personal/pdf")).unwrap();
+    fixture.write("repo/personal/pdf/SKILL.md", "Recreated PDF");
+    fixture.run(&["harnesses", "rename", "a", "new-a"]);
+    let assignment = sk1ll_core::Assignment::load(&root.join("assignment.json")).unwrap();
+    assert!(!assignment.harnesses.contains_key("a"));
+    assert!(!assignment.skill_enabled("new-a", &old));
+    let machine = sk1ll_core::MachineConfig::load(&root.join("machine.toml")).unwrap();
+    assert!(machine.harnesses().contains_key("new-a"));
+    fixture.run(&["sync"]);
+    // Re-created by hand, it got a new Item ID, which has no toggle: IDs are
+    // never derived from names, so the old one's toggle doesn't apply.
+    let new = skill_id().expect("sync wrote an Item ID");
+    assert_ne!(new, old);
+    let assignment = sk1ll_core::Assignment::load(&root.join("assignment.json")).unwrap();
+    assert!(assignment.skill_enabled("new-a", &new));
+    // The renamed harness keeps its directory.
+    assert_eq!(std::fs::read_to_string(root.join("a/pdf/SKILL.md")).unwrap(), "Recreated PDF");
+
+    let out = fixture.command(&["assign", "new-a", "skill", "absent", "on"]).output().unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("warning: no skill named `absent` in the repo"));
+}
+
+#[test]
+fn rename_requires_readable_membership_and_protects_destination_assignment() {
+    let fixture = Fixture::new();
+    let root = fixture.0.path();
+    let config = std::fs::read(root.join("machine.toml")).unwrap();
+    fixture.write("absent.json", "{broken");
+    let failed = error(fixture.command(&["harnesses", "rename", "a", "new-a"]).output().unwrap());
+    assert!(failed.contains("parsing") && failed.contains("absent.json"), "{failed}");
+    assert_eq!(std::fs::read(root.join("machine.toml")).unwrap(), config);
+    assert!(!root.join("assignment.json").exists());
+
+    std::fs::remove_file(root.join("absent.json")).unwrap();
+    let mut assignment = sk1ll_core::Assignment::default();
+    assignment.set_harness("a", true);
+    assignment.set_harness("new-a", false);
+    assignment.save(&root.join("assignment.json")).unwrap();
+    fixture.write("repo/instructions/routed.md", "---\nid: rule-id\nharnesses: [a]\n---\nrule");
+    let rejected = error(fixture.command(&["harnesses", "rename", "a", "new-a"]).output().unwrap());
+    assert!(rejected.contains("still has an Assignment") && rejected.contains("--replace"), "{rejected}");
+    assert_eq!(std::fs::read(root.join("machine.toml")).unwrap(), config);
+    // Onto a harness this Machine has, --replace can't help, so it isn't suggested.
+    for args in [&["harnesses", "rename", "a", "c"][..], &["harnesses", "rename", "a", "c", "--replace"]] {
+        let taken = error(fixture.command(args).output().unwrap());
+        assert!(taken.contains("already exists on this Machine") && !taken.contains("use --replace"), "{taken}");
+    }
+    let renamed = fixture.command(&["harnesses", "rename", "a", "new-a", "--replace"]).output().unwrap();
+    assert!(renamed.status.success(), "{renamed:?}");
+    assert!(String::from_utf8_lossy(&renamed.stderr).contains("Rules still routed to a"));
+    assert!(String::from_utf8_lossy(&renamed.stderr).contains("routed"));
+    let assignment = sk1ll_core::Assignment::load(&root.join("assignment.json")).unwrap();
+    assert!(!assignment.harnesses.contains_key("a"));
+    assert!(assignment.harness("new-a").new_skills_default);
+}
+
+#[test]
+fn standalone_sync_recovers_a_harness_rename_after_config_was_saved() {
+    use sk1ll_core::harness_rename::{RenameIntent, RenameRequest};
+    let fixture = Fixture::new();
+    let root = fixture.0.path();
+    let mut assignment = sk1ll_core::Assignment::default();
+    assignment.set_harness("a", false);
+    assignment.save(&root.join("assignment.json")).unwrap();
+    let config = root.join("machine.toml");
+    // sk1ll's state directory, as the CLI finds it from `XDG_STATE_HOME`.
+    let state = root.join("state/sk1ll");
+    let pending = RenameIntent::prepare(
+        &state,
+        &config,
+        &root.join("repo"),
+        RenameRequest { from: "a".into(), to: "new-a".into(), replace: false },
+        &assignment,
+        None,
+    )
+    .unwrap();
+    pending.apply_config(&config).unwrap();
+
+    fixture.run(&["sync"]);
+    assert!(!RenameIntent::exists(&state, &config).unwrap());
+    let saved = sk1ll_core::Assignment::load(&root.join("assignment.json")).unwrap();
+    assert!(!saved.harnesses.contains_key("a"));
+    assert!(!saved.harness("new-a").new_skills_default);
+}
+
+/// Every file and directory under `root`: its kind, mode and contents.
+fn tree(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, (String, u32, Vec<u8>)> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut found = std::collections::BTreeMap::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            let mode = meta.permissions().mode();
+            let rel = path.strip_prefix(root).unwrap().to_path_buf();
+            let value = if meta.is_symlink() {
+                ("link".into(), mode, std::fs::read_link(&path).unwrap().into_os_string().into_encoded_bytes())
+            } else if meta.is_dir() {
+                pending.push(path);
+                ("dir".into(), mode, Vec::new())
+            } else {
+                ("file".into(), mode, std::fs::read(&path).unwrap())
+            };
+            found.insert(rel, value);
+        }
+    }
+    found
+}
+
+/// Previews only read: with a Harness rename stopped half-way, a disabled
+/// Harness and a skill without an Item ID (all of which a reconcile would
+/// change), `status`, `render` and `sync --dry-run` leave every file as it
+/// was. They plan as the next reconcile would, with the rename finished.
+#[test]
+fn previews_leave_a_pending_rename_and_the_harnesses_byte_identical() {
+    use sk1ll_core::harness_rename::{RenameIntent, RenameRequest};
+    let fixture = Fixture::new();
+    let root = fixture.0.path();
+    fixture.write("repo/personal/pdf/SKILL.md", "PDFs.");
+    fixture.write("repo/instructions/git.md", "Git.");
+    let mut assignment = sk1ll_core::Assignment::default();
+    assignment.set_harness("b", false);
+    assignment.save(&root.join("assignment.json")).unwrap();
+    let config = root.join("machine.toml");
+    // sk1ll's state directory, as the CLI finds it from `XDG_STATE_HOME`.
+    let state = root.join("state/sk1ll");
+    let pending = RenameIntent::prepare(
+        &state,
+        &config,
+        &root.join("repo"),
+        RenameRequest { from: "a".into(), to: "new-a".into(), replace: false },
+        &assignment,
+        None,
+    )
+    .unwrap();
+    pending.apply_config(&config).unwrap();
+    let before = tree(root);
+
+    let status = fixture.run(&["status"]);
+    assert!(status.contains("+ ") && status.contains("pdf"), "{status}");
+    let plan = fixture.run(&["sync", "--dry-run"]);
+    assert_eq!(plan, status, "status shows the dry run's plan");
+    let harnesses: Vec<_> = plan.lines().filter_map(|line| line.split_whitespace().nth(1)).collect();
+    assert_eq!(harnesses, ["c", "new-a"], "the renamed Harness, not the disabled one: {plan}");
+    fixture.run(&["render", "new-a"]);
+
+    assert_eq!(tree(root), before, "a preview changed the filesystem");
+    assert!(RenameIntent::exists(&state, &config).unwrap());
+    // A sync, which changes things, finishes the rename.
+    fixture.run(&["sync"]);
+    assert!(!RenameIntent::exists(&state, &config).unwrap());
+    // `new-a` keeps `a`'s skills directory.
+    assert!(root.join("a/pdf/SKILL.md").is_file() && !root.join("b/pdf").exists());
 }

@@ -3,16 +3,85 @@
 //! the token is never written anywhere else (git gets it from the
 //! environment, see [`crate::auth`]).
 //!
+//! It also keeps what a restart must not forget about the server's Baseline
+//! ([`PullRecord`]): the Baseline last known and whether the Machine is
+//! Blocked on it. A standalone daemon has no state file and keeps that record
+//! in [`standalone_record_path`].
+//!
 //! Next to it, also private: the last assignment snapshot the server sent
-//! (revision and content together, so they can't disagree) and the outbox
-//! of `draft_discarded` messages not yet delivered.
+//! (revision and content together, so they can't disagree), tagged with the
+//! registration it belongs to ([`DaemonState::registration_key`]): a
+//! snapshot of another registration (one a rejoin replaced, half-written
+//! when the process stopped) is never loaded as this one's.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use sk1ll_proto::AssignmentSnapshot;
+use sk1ll_proto::{AssignmentSnapshot, ItemRef};
+
+/// Where the Machine stands against the server's Baseline: what the last pull
+/// (or reconcile) found.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PullState {
+    /// On the Baseline, or not knowingly behind it.
+    #[default]
+    Clear,
+    /// `baseline` clashes with these Draft items, so the Machine stays on its
+    /// old Baseline (Blocked).
+    Blocked { baseline: String, items: Vec<ItemRef> },
+    /// A pull stopped half-way and has yet to finish, so the working tree is
+    /// partial. `baseline`: the remote commit its journal moves onto (empty
+    /// if the journal could not be read); a restart decides from it, not
+    /// from whatever was fetched since, whether the pull finished. `items`:
+    /// the Draft items in its way, if that is what stopped it.
+    Pending { baseline: String, items: Vec<ItemRef> },
+}
+
+/// What the daemon remembers about the server's Baseline across restarts.
+///
+/// Only a hint: a field that can't be read (written by another version, say)
+/// is dropped with a warning rather than keep the daemon from starting. The
+/// reconcile at startup derives where the Machine stands from the pull's
+/// journal and `HEAD` (see `Daemon::pull_after_reconcile`), and the next
+/// pull finds a block again.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRecord {
+    /// The server's Baseline as last announced, fetched or pushed.
+    #[serde(default, deserialize_with = "or_default")]
+    pub server_baseline: Option<String>,
+    #[serde(default, deserialize_with = "or_default")]
+    pub pull: PullState,
+    /// The server refused to take `commit` for good, until `HEAD` moves on.
+    #[serde(default, deserialize_with = "or_default", skip_serializing_if = "Option::is_none")]
+    pub push_refused: Option<PushRefusal>,
+}
+
+/// A push the server refused for good (see [`PullRecord::push_refused`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushRefusal {
+    /// The commit it refused.
+    pub commit: String,
+    /// What it said.
+    pub reason: String,
+}
+
+/// `T`, or its default (with a warning) for a value that isn't one.
+fn or_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_else(|e| {
+        tracing::warn!(
+            "dropping an unreadable part of the remembered pull state ({e}); the journal and HEAD decide it instead"
+        );
+        T::default()
+    }))
+}
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonState {
@@ -26,6 +95,10 @@ pub struct DaemonState {
     /// The machine was removed from the fleet; the daemon no longer manages it.
     #[serde(default)]
     pub revoked: bool,
+    /// As of the last time the daemon wrote it; the running daemon's
+    /// lifecycle owns it.
+    #[serde(default, flatten)]
+    pub record: PullRecord,
 }
 
 impl std::fmt::Debug for DaemonState {
@@ -36,16 +109,30 @@ impl std::fmt::Debug for DaemonState {
             .field("token", &"<redacted>")
             .field("repo", &self.repo)
             .field("revoked", &self.revoked)
+            .field("record", &self.record)
             .finish()
     }
 }
 
 impl DaemonState {
+    /// A new registration: not revoked, nothing known about the Baseline yet.
+    pub fn new(machine_id: String, server_url: String, token: String, repo: PathBuf) -> Self {
+        Self { machine_id, server_url, token, repo, revoked: false, record: PullRecord::default() }
+    }
+
+    /// Identifies this registration locally: each join gets a new token.
+    pub fn registration_key(&self) -> String {
+        sk1ll_core::hash::hash_str(&format!("{}\0{}\0{}", self.server_url, self.machine_id, self.token))
+    }
+
     /// `None` if the machine hasn't joined.
     pub fn load(path: &Path) -> anyhow::Result<Option<Self>> {
         match fs::read_to_string(path) {
             Ok(text) => Ok(Some(serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match fs::symlink_metadata(path) {
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                _ => Err(e).with_context(|| format!("reading {}", path.display())),
+            },
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
     }
@@ -74,11 +161,93 @@ impl DaemonState {
     }
 }
 
-/// The persisted assignment snapshot. `Ok(None)` if there is none; an
-/// unreadable one is an error, which the daemon treats like none.
-pub fn load_snapshot(path: &Path) -> anyhow::Result<Option<AssignmentSnapshot>> {
-    match fs::read_to_string(path) {
-        Ok(text) => Ok(Some(serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?)),
+/// Where a standalone daemon keeps its [`PullRecord`]: it has no state file,
+/// whose presence means joined.
+pub fn standalone_record_path(state: &Path) -> PathBuf {
+    state.with_file_name("standalone-state.json")
+}
+
+/// Which repo a standalone [`PullRecord`] is about: its canonical path and
+/// git directory, and the git directory's inode, so a record never follows
+/// another repo to the same path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoIdentity {
+    pub root: PathBuf,
+    pub git_dir: PathBuf,
+    pub dev: u64,
+    pub ino: u64,
+}
+
+impl RepoIdentity {
+    /// `None` while `root` is no git repo (yet).
+    pub fn of(root: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let root = root.canonicalize().ok()?;
+        let git_dir = sk1ll_core::git::plumbing::absolute_git_dir(&root)?;
+        let meta = fs::metadata(&git_dir).ok()?;
+        Some(Self { root, git_dir, dev: meta.dev(), ino: meta.ino() })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct StandaloneRecord {
+    #[serde(default)]
+    repo: Option<RepoIdentity>,
+    #[serde(flatten)]
+    record: PullRecord,
+}
+
+/// A standalone daemon's [`PullRecord`] for the repo at `root`; the default
+/// if there is none, or if it is about another repo (or none).
+pub fn load_record(path: &Path, root: &Path) -> anyhow::Result<PullRecord> {
+    let stored: StandaloneRecord = match fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(PullRecord::default()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let here = RepoIdentity::of(root);
+    if stored.repo.is_none() || stored.repo != here {
+        if stored.record != PullRecord::default() {
+            tracing::info!("{} is about another repo; starting without a remembered Baseline", path.display());
+        }
+        return Ok(PullRecord::default());
+    }
+    Ok(stored.record)
+}
+
+pub fn save_record(path: &Path, root: &Path, record: &PullRecord) -> anyhow::Result<()> {
+    let stored = StandaloneRecord { repo: RepoIdentity::of(root), record: record.clone() };
+    let body = serde_json::to_string_pretty(&stored)?;
+    write_private(path, format!("{body}\n").as_bytes())
+}
+
+/// A stored snapshot and the registration it belongs to (`None`: standalone).
+#[derive(Serialize, Deserialize)]
+pub(crate) struct StoredSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
+    #[serde(flatten)]
+    snapshot: AssignmentSnapshot,
+}
+
+impl StoredSnapshot {
+    pub(crate) fn new(snapshot: &AssignmentSnapshot, owner: Option<&str>) -> Self {
+        Self { owner: owner.map(str::to_string), snapshot: snapshot.clone() }
+    }
+}
+
+/// The persisted assignment snapshot. `Ok(None)` if there is none, or if
+/// `owner` is given and the snapshot belongs to another registration (or to
+/// none); an unreadable one is an error, which the daemon treats like none.
+pub fn load_snapshot(path: &Path, owner: Option<&str>) -> anyhow::Result<Option<AssignmentSnapshot>> {
+    parse_snapshot(path, read_snapshot(path)?.as_deref(), owner)
+}
+
+/// The stored snapshot's exact bytes, `None` if there is none: what a
+/// compare-and-swap of it compares against.
+pub(crate) fn read_snapshot(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
         // A symlink to nowhere is a broken snapshot, not a missing one.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && fs::symlink_metadata(path).is_ok() => {
             Err(e).with_context(|| format!("reading {}: a symlink to a missing file", path.display()))
@@ -88,65 +257,27 @@ pub fn load_snapshot(path: &Path) -> anyhow::Result<Option<AssignmentSnapshot>> 
     }
 }
 
-/// Writes the snapshot (revision and assignment in one file) atomically.
-pub fn save_snapshot(path: &Path, snap: &AssignmentSnapshot) -> anyhow::Result<()> {
-    let body = serde_json::to_string_pretty(snap)?;
+/// [`load_snapshot`] of `bytes` read from `path`.
+pub(crate) fn parse_snapshot(
+    path: &Path,
+    bytes: Option<&[u8]>,
+    owner: Option<&str>,
+) -> anyhow::Result<Option<AssignmentSnapshot>> {
+    let Some(bytes) = bytes else { return Ok(None) };
+    let stored: StoredSnapshot =
+        serde_json::from_slice(bytes).with_context(|| format!("parsing {}", path.display()))?;
+    if owner.is_some() && stored.owner.as_deref() != owner {
+        tracing::warn!("{} belongs to another registration of this Machine; ignoring it", path.display());
+        return Ok(None);
+    }
+    Ok(Some(stored.snapshot))
+}
+
+/// Writes the snapshot (revision and assignment in one file) atomically,
+/// tagged with `owner`, the registration it belongs to.
+pub fn save_snapshot(path: &Path, snap: &AssignmentSnapshot, owner: Option<&str>) -> anyhow::Result<()> {
+    let body = serde_json::to_string_pretty(&StoredSnapshot::new(snap, owner))?;
     write_private(path, format!("{body}\n").as_bytes())
-}
-
-/// Assignment for direct commands. Joined machines require the authoritative
-/// snapshot; an absent mirror must never turn their disabled items back on.
-pub fn load_assignment(cfg: &crate::Config) -> anyhow::Result<sk1ll_proto::Assignment> {
-    if DaemonState::load(&cfg.state)?.is_some_and(|s| !s.revoked) {
-        return load_snapshot(&cfg.snapshot_path())?.map(|s| s.assignment).context(
-            "no authoritative assignment is stored; start the daemon and connect to the server \
-                      before changing harnesses",
-        );
-    }
-    Ok(sk1ll_proto::Assignment::load(&cfg.assignment)?)
-}
-
-/// Like [`load_assignment`], except that a joined machine with no
-/// authoritative snapshot yet (still waiting for the server's) is `None`.
-/// Every other failure (an unreadable state, a corrupt snapshot) is an error.
-pub fn load_assignment_if_present(cfg: &crate::Config) -> anyhow::Result<Option<sk1ll_proto::Assignment>> {
-    if DaemonState::load(&cfg.state)?.is_some_and(|s| !s.revoked) {
-        return Ok(load_snapshot(&cfg.snapshot_path())?.map(|s| s.assignment));
-    }
-    Ok(Some(sk1ll_proto::Assignment::load(&cfg.assignment)?))
-}
-
-/// Persists direct-mode restore notifications for the daemon's next connection.
-/// The caller must hold the joined repo's engine lock while restoring and
-/// appending, so the daemon cannot load the outbox between those operations.
-pub fn queue_discards(
-    cfg: &crate::Config,
-    _lock: &sk1ll_core::EngineLock,
-    items: Vec<sk1ll_proto::ItemRef>,
-) -> anyhow::Result<()> {
-    if items.is_empty() {
-        return Ok(());
-    }
-    let state = DaemonState::load(&cfg.state)?.context("not joined to a fleet")?;
-    crate::outbox::Outbox::load(cfg.outbox_path(), &state).push(items)
-}
-
-/// `url` without `user:password@`, for comparing remotes.
-pub(crate) fn without_credentials(url: &str) -> String {
-    match url.split_once("://") {
-        Some((scheme, rest)) => {
-            let (host, path) = rest.split_once('/').map_or((rest, ""), |(h, p)| (h, p));
-            let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
-            let path = path.trim_end_matches('/');
-            if path.is_empty() { format!("{scheme}://{host}") } else { format!("{scheme}://{host}/{path}") }
-        }
-        None => url.trim_end_matches('/').to_string(),
-    }
-}
-
-/// Whether `url` carries `user[:password]@`.
-pub(crate) fn has_credentials(url: &str) -> bool {
-    url.split_once("://").is_some_and(|(_, rest)| rest.split('/').next().is_some_and(|host| host.contains('@')))
 }
 
 /// Writes `path` atomically with mode 0600, creating its directory (0700).
@@ -185,14 +316,46 @@ mod tests {
         assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
     }
 
+    /// A record another version wrote (a pending pull without its
+    /// Baseline) loads without it, the rest of the state intact.
+    #[test]
+    fn an_unreadable_pull_record_is_dropped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.json");
+        let mut json = serde_json::to_value(state()).unwrap();
+        json["pull"] = serde_json::json!({ "state": "pending", "items": ["skill:pdf"] });
+        json["server_baseline"] = serde_json::json!(["not", "a", "commit"]);
+        fs::write(&path, json.to_string()).unwrap();
+        let loaded = DaemonState::load(&path).unwrap().unwrap();
+        assert_eq!(loaded.record, PullRecord::default());
+        assert_eq!(loaded, state());
+
+        json["pull"] = serde_json::json!({ "state": "blocked", "baseline": "abc", "items": ["skill:pdf"] });
+        json["server_baseline"] = serde_json::json!("abc");
+        fs::write(&path, json.to_string()).unwrap();
+        let loaded = DaemonState::load(&path).unwrap().unwrap();
+        let items = vec!["skill:pdf".parse().unwrap()];
+        assert_eq!(loaded.record.pull, PullState::Blocked { baseline: "abc".into(), items });
+        assert_eq!(loaded.record.server_baseline.as_deref(), Some("abc"));
+
+        // A standalone daemon's record the same way.
+        let repo = dir.path().join("repo");
+        sk1ll_core::Repo::init(&repo).unwrap();
+        let record = dir.path().join("standalone-state.json");
+        save_record(&record, &repo, &PullRecord::default()).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+        json["pull"] = serde_json::json!({ "state": "pending", "items": [] });
+        json["server_baseline"] = serde_json::json!("abc");
+        fs::write(&record, json.to_string()).unwrap();
+        let loaded = load_record(&record, &repo).unwrap();
+        assert_eq!(
+            loaded,
+            PullRecord { server_baseline: Some("abc".into()), pull: PullState::Clear, push_refused: None }
+        );
+    }
+
     fn state() -> DaemonState {
-        DaemonState {
-            machine_id: "ws".into(),
-            server_url: "https://server.example:8443".into(),
-            token: "t0k".into(),
-            repo: "/r".into(),
-            revoked: false,
-        }
+        DaemonState::new("ws".into(), "https://server.example:8443".into(), "t0k".into(), "/r".into())
     }
 
     #[test]
@@ -200,10 +363,10 @@ mod tests {
         let s = state();
         assert_eq!(s.repo_url(), "https://server.example:8443/git/repo.git");
         assert_eq!(s.ws_url(), "wss://server.example:8443/api/ws");
-        assert_eq!(without_credentials("https://ws:t0k@server.example:8443/git/repo.git"), s.repo_url());
-        assert_eq!(without_credentials("http://h/git/repo.git/"), "http://h/git/repo.git");
-        assert!(has_credentials("https://ws:t0k@server.example/git/repo.git"));
-        assert!(!has_credentials("https://server.example/git/a@b"));
+        assert_eq!(
+            sk1ll_core::git::plumbing::without_credentials("https://ws:t0k@server.example:8443/git/repo.git"),
+            s.repo_url()
+        );
     }
 
     #[cfg(unix)]
@@ -211,9 +374,9 @@ mod tests {
     fn a_dangling_snapshot_link_is_an_error_not_a_missing_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("snapshot.json");
-        assert!(load_snapshot(&path).unwrap().is_none());
+        assert!(load_snapshot(&path, None).unwrap().is_none());
         std::os::unix::fs::symlink(dir.path().join("gone.json"), &path).unwrap();
-        let err = load_snapshot(&path).unwrap_err();
+        let err = load_snapshot(&path, None).unwrap_err();
         assert!(format!("{err:#}").contains("symlink to a missing file"), "{err:#}");
     }
 
@@ -239,15 +402,71 @@ mod tests {
     }
 
     #[test]
+    fn the_baseline_record_survives_a_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sk1ll/daemon.json");
+        let record = PullRecord {
+            server_baseline: Some("abc".into()),
+            pull: PullState::Blocked { baseline: "abc".into(), items: vec!["skill:pdf".parse().unwrap()] },
+            push_refused: None,
+        };
+        let s = DaemonState { record: record.clone(), ..state() };
+        s.save(&path).unwrap();
+        assert_eq!(DaemonState::load(&path).unwrap().unwrap().record, record);
+        // A state file without one knows nothing about the Baseline.
+        fs::write(&path, r#"{"machine_id":"m","server_url":"http://h","token":"t","repo":"/r"}"#).unwrap();
+        assert_eq!(DaemonState::load(&path).unwrap().unwrap().record, PullRecord::default());
+
+        let standalone = standalone_record_path(&path);
+        let repo = dir.path().join("repo");
+        sk1ll_core::Repo::init(&repo).unwrap();
+        assert_eq!(load_record(&standalone, &repo).unwrap(), PullRecord::default());
+        save_record(&standalone, &repo, &record).unwrap();
+        assert_eq!(load_record(&standalone, &repo).unwrap(), record);
+    }
+
+    /// A standalone record is about one repo: another repo, at another path
+    /// or re-created at the same one, starts without it.
+    #[test]
+    fn a_standalone_record_is_not_restored_for_another_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = standalone_record_path(&dir.path().join("sk1ll/daemon.json"));
+        let record = PullRecord {
+            server_baseline: Some("abc".into()),
+            pull: PullState::Blocked { baseline: "abc".into(), items: vec!["skill:pdf".parse().unwrap()] },
+            push_refused: None,
+        };
+        let (one, other) = (dir.path().join("one"), dir.path().join("other"));
+        sk1ll_core::Repo::init(&one).unwrap();
+        sk1ll_core::Repo::init(&other).unwrap();
+        save_record(&path, &one, &record).unwrap();
+        assert_eq!(load_record(&path, &other).unwrap(), PullRecord::default());
+        assert_eq!(load_record(&path, &one).unwrap(), record);
+        fs::remove_dir_all(&one).unwrap();
+        assert_eq!(load_record(&path, &one).unwrap(), PullRecord::default(), "no repo there");
+        fs::rename(&other, &one).unwrap();
+        assert_eq!(load_record(&path, &one).unwrap(), PullRecord::default(), "another repo at the same path");
+        // A record without a repo (an older one) is about none.
+        fs::write(&path, r#"{"server_baseline":"abc","pull":{"state":"clear"}}"#).unwrap();
+        assert_eq!(load_record(&path, &one).unwrap(), PullRecord::default());
+    }
+
+    #[test]
     fn snapshots_keep_revision_and_content_together() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sk1ll/daemon-assignment.json");
-        assert_eq!(load_snapshot(&path).unwrap(), None);
+        assert_eq!(load_snapshot(&path, None).unwrap(), None);
         let mut snap = AssignmentSnapshot { revision: 7, ..Default::default() };
-        snap.assignment.set_skill("h", "x", false);
-        save_snapshot(&path, &snap).unwrap();
-        assert_eq!(load_snapshot(&path).unwrap(), Some(snap));
+        snap.assignment.set_skill("h", &"x".parse().unwrap(), false);
+        save_snapshot(&path, &snap, None).unwrap();
+        assert_eq!(load_snapshot(&path, None).unwrap(), Some(snap.clone()));
+        // Joined, a snapshot belongs to one registration.
+        save_snapshot(&path, &snap, Some("old")).unwrap();
+        assert_eq!(load_snapshot(&path, Some("old")).unwrap(), Some(snap.clone()));
+        assert_eq!(load_snapshot(&path, Some("new")).unwrap(), None, "another registration's");
+        save_snapshot(&path, &snap, None).unwrap();
+        assert_eq!(load_snapshot(&path, Some("new")).unwrap(), None, "an untagged one");
         fs::write(&path, "{broken").unwrap();
-        assert!(load_snapshot(&path).is_err());
+        assert!(load_snapshot(&path, None).is_err());
     }
 }

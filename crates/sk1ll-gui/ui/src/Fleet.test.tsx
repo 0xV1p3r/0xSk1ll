@@ -41,7 +41,7 @@ it('filters Machines by attention and connection, then clears the filter', async
   expect(filters.getByRole('button', { name: 'Filter: All' }).getAttribute('aria-pressed')).toBe('true');
   expect(within(screen.getByRole('table', { name: 'Machines' })).getAllByRole('row')).toHaveLength(7);
 });
-const machineReport = (overrides: Partial<MachineReport> = {}): MachineReport => ({ baseline: 'abcdef123456', drafts: [], unpushed: [], conflicts: [], harnesses: ['codex'], blocked: false, clashes: [], behind: false, ...overrides });
+const machineReport = (overrides: Partial<MachineReport> = {}): MachineReport => ({ seq: 1, items: [], baseline: 'abcdef123456', drafts: [], unpushed: [], conflicts: [], harnesses: ['codex'], blocked: false, clashes: [], behind: false, ...overrides });
 const machineRow = (overrides: Partial<MachineRow> = {}): MachineRow => ({ id: 'local', status: 'in_sync', connected: true, joined_at: 1, last_seen: 2, report: machineReport(), ...overrides });
 function renderFleet(props: Partial<Parameters<typeof Fleet>[0]> = {}) {
   return render(<TooltipProvider><Fleet revision={0} machineId="local" navigate={vi.fn()} changed={vi.fn()} live {...props} /></TooltipProvider>);
@@ -106,7 +106,7 @@ it('preserves Machine details, local actions, timestamps, and removal confirmati
   expect(screen.getByText(/This removes THIS Machine/)).toBeTruthy();
 });
 it('creates an Add Machine join code through the existing flow', async () => {
-  vi.mocked(api.fleet).mockResolvedValue({ baseline: null, machines: [] }); vi.mocked(api.joinCode).mockResolvedValue({ code: 'fleet-join-code', expires_at: null, scope: null });
+  vi.mocked(api.fleet).mockResolvedValue({ baseline: null, machines: [] }); vi.mocked(api.joinCode).mockResolvedValue({ code: 'fleet-join-code', expires_at: 1_800_000_000, scope: 'fleet' });
   renderFleet(); fireEvent.click(await screen.findByRole('button', { name: 'Add Machine' }));
   expect(await screen.findByRole('dialog', { name: 'Join code' })).toBeTruthy(); expect(screen.getByText('fleet-join-code')).toBeTruthy();
 });
@@ -248,7 +248,7 @@ it('counts queue entries, adopts in Library, and hides Push without unpushed ite
 });
 it('renders local assignments, toggles a cell and opens the matrix', async () => {
   vi.mocked(api.fleet).mockResolvedValue({ baseline: null, machines: [machineRow({ registration: 'local-reg' })] });
-  vi.mocked(api.items).mockResolvedValue([{ item: 'skill:review', in_baseline: true, draft: null, unpushed: false, description: null }]);
+  vi.mocked(api.items).mockResolvedValue([{ item: 'skill:review', id: 'review', in_baseline: true, draft: null, unpushed: false, description: null }]);
   const snapshot = { assignment: { harnesses: { codex: { new_skills_default: true, new_rules_default: true, skills: {}, rules: {} } } }, revision: 1, registration: 'local-reg' };
   const updated = { assignment: { harnesses: { codex: { new_skills_default: true, new_rules_default: true, skills: { review: false }, rules: {} } } }, revision: 2 };
   vi.mocked(api.assignment).mockClear().mockResolvedValueOnce(snapshot).mockResolvedValue(updated); vi.mocked(api.setAssignment).mockResolvedValue({ ...updated, entries: [] });
@@ -256,14 +256,14 @@ it('renders local assignments, toggles a cell and opens the matrix', async () =>
   const cell = await screen.findByRole('checkbox', { name: 'skill:review in local / codex, Inherited' });
   expect(cell.getAttribute('aria-checked')).toBe('true'); fireEvent.click(cell);
   expect(screen.getByRole('checkbox', { name: 'skill:review in local / codex, Explicit' }).getAttribute('aria-checked')).toBe('false');
-  await waitFor(() => expect(api.setAssignment).toHaveBeenCalledWith('local', { changes: [{ harness: 'codex', kind: 'skill', name: 'review', enabled: false }], expected: { revision: 1, registration: 'local-reg' } }));
+  await waitFor(() => expect(api.setAssignment).toHaveBeenCalledWith('local', { changes: [{ harness: 'codex', kind: 'skill', item_id: 'review', name: 'review', enabled: false }], expected: { revision: 1, registration: 'local-reg' } }));
   await waitFor(() => expect(api.assignment).toHaveBeenCalledTimes(2));
   expect(screen.getByRole('checkbox', { name: 'skill:review in local / codex, Explicit' }).getAttribute('aria-checked')).toBe('false');
   fireEvent.click(screen.getByRole('button', { name: 'Open matrix' })); expect(navigate).toHaveBeenCalledWith('Assignment matrix');
 });
 
 const harness = (skills: Record<string, boolean> = {}) => ({ assignment: { harnesses: { codex: { new_skills_default: true, new_rules_default: true, skills, rules: {} } } }, revision: 1 });
-const item = (name: string) => ({ item: `skill:${name}`, in_baseline: true, draft: null, unpushed: false, description: null });
+const item = (name: string) => ({ item: `skill:${name}`, id: name, in_baseline: true, draft: null, unpushed: false, description: null });
 it('rolls a failed local assignment toggle back and shows the error', async () => {
   vi.mocked(api.items).mockResolvedValue([item('review')]); vi.mocked(api.assignment).mockResolvedValue(harness());
   vi.mocked(api.setAssignment).mockRejectedValue(new Error('Server refused'));

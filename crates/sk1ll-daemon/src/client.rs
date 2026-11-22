@@ -1,11 +1,14 @@
 //! The daemon's local API: request and response types, and a small async
 //! client for it. The CLI and the GUI use this to talk to the daemon over
-//! its Unix domain socket (HTTP/1.1 + JSON).
+//! its Unix domain socket (HTTP/1.1 + JSON), or the CLI to an engine in its
+//! own process when no daemon runs ([`crate::local`]), with the same requests.
 //!
 //! | Method | Path | Body → Response |
 //! |---|---|---|
 //! | GET | `/status` | → [`StatusView`] |
 //! | GET | `/items` | → `Vec<`[`ItemView`]`>` |
+//! | GET | `/repo` | → [`RepoContent`]: the repo's skills, rules and imports as `sk1ll list` and `status` show them |
+//! | GET | `/items/editable?item=` | → the file an editor opens for a personal Skill or Rule |
 //! | GET | `/skills` | → `Vec<ContentEntry>` |
 //! | GET | `/skills/tree?item=skill:pdf` | → `Vec<FileEntry>` |
 //! | GET | `/skills/file?item=skill:pdf&path=SKILL.md` | → `FileContent` |
@@ -13,6 +16,7 @@
 //! | POST | `/skills/adopt` | `ConflictTarget` → 204; unmanaged Adopt needs a Server connection when joined |
 //! | POST | `/items/create` | [`CreateItemRequest`] → 204 |
 //! | POST | `/items/delete` | [`DeleteItemRequest`] → 204 (a Draft deletion) |
+//! | POST | `/items/repair-ids` | → number of items given a fresh Item ID in the Draft (shared or missing) |
 //! | POST | `/items/rename` | [`RenameItemRequest`] → [`RenameItemResponse`] |
 //! | GET | `/draft` | → `Vec<`[`DraftEntry`]`>` |
 //! | GET | `/draft/diff?item=` | → [`DiffView`] |
@@ -22,7 +26,8 @@
 //! | POST | `/pull` | → [`PullResult`] |
 //! | GET | `/conflicts` | → `Vec<`[`ConflictView`]`>` |
 //! | GET | `/conflicts/displaced` | → all recovered entries |
-//! | POST | `/conflicts/displaced/{id}/adopt`, `/conflicts/displaced/{id}/discard` | → 204 |
+//! | POST | `/conflicts/displaced/{id}/adopt` | → destination path |
+//! | POST | `/conflicts/displaced/{id}/discard` | → 204 |
 //! | POST | `/conflicts/adopt`, `/conflicts/overwrite` | [`ConflictTarget`] → 204 |
 //! | GET | `/harnesses` | → `Vec<`[`HarnessView`]`>` |
 //! | GET | `/setup/harnesses` | → `Vec<`[`HarnessChoice`]`>` |
@@ -59,17 +64,15 @@
 //! `GET /imports`, `POST /join-codes`. Bodies are the server's (`sk1ll-proto`).
 //!
 //! Every request carries [`API_HEADER`]; a daemon of another [`API_VERSION`]
-//! answers 426 and says to restart it. A daemon older than the
-//! `/harnesses/config|preview|apply` routes answers them 404 without a body;
-//! the client reports that as a daemon to restart too.
+//! answers 426 and says to restart it.
 //!
 //! Errors are [`ErrorBody`] with a 4xx/5xx status.
 
 use std::path::{Path, PathBuf};
 
+use axum::body::Body;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
 use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::de::DeserializeOwned;
@@ -82,47 +85,24 @@ pub use sk1ll_core::{HarnessChange, HarnessChoice};
 pub use sk1ll_proto::{
     Assignment, AssignmentChanges, AssignmentCopyPreview, AssignmentSnapshot, AssignmentUpdate, ErrorBody, FleetView,
     ImportSkipped, ImportUpdate, ItemRef, JoinCode, JoinCodeRequest, LogEntry, LogFacets, LogQuery,
-    MachineAssignmentCopy, MachineReport, MachineStatus, Scope,
+    MachineAssignmentCopy, MachineReport, MachineStatus, OrphansPruned, OrphansView, PruneOrphans, Scope,
 };
 use tokio::net::UnixStream;
 
 /// The version of this local API. Bump it on any change an older daemon or
 /// client would misread; additive fields with serde defaults don't need one.
-pub const API_VERSION: u32 = 1;
+pub const API_VERSION: u32 = 2;
 
 /// Request header carrying the client's [`API_VERSION`]. A daemon refuses a
 /// request that names another version (426); one without it is accepted.
 pub const API_HEADER: &str = "sk1ll-api";
 
-/// Routes added after the first release with this [`API_VERSION`]: a
-/// daemon started before them answers them 404 without a body.
-const NEWER_ROUTES: [&str; 3] = ["/harnesses/config", "/harnesses/preview", "/harnesses/apply"];
-
-/// What a failed response says: its error, or why there is none.
-fn failure_message(status: StatusCode, bytes: &[u8], method: &Method, path: &str) -> String {
-    if status == StatusCode::NOT_FOUND
-        && path.starts_with("/imports/")
-        && path.ends_with("/update-reviewed")
-        && serde_json::from_slice::<serde_json::Value>(bytes).is_err()
-    {
-        return "the running daemon is older than this app; restart it".into();
-    }
+/// The server's error, its response text, or the HTTP status.
+fn failure_message(status: StatusCode, bytes: &[u8]) -> String {
     let message = serde_json::from_slice::<ErrorBody>(bytes)
         .map(|e| e.error)
         .unwrap_or_else(|_| String::from_utf8_lossy(bytes).trim().to_string());
-    match message.is_empty() {
-        true if status == StatusCode::NOT_FOUND
-            && bytes.is_empty()
-            && (NEWER_ROUTES.contains(&path) || path.starts_with("/assignment/harness/")) =>
-        {
-            format!(
-                "the running daemon doesn't know {method} {path}: it is older than this client; restart it so it \
-             runs the installed sk1ll (systemctl --user restart sk1ll-daemon)"
-            )
-        }
-        true => status.to_string(),
-        false => message,
-    }
+    if message.is_empty() { status.to_string() } else { message }
 }
 
 // ---------------------------------------------------------------------------
@@ -178,9 +158,6 @@ pub struct StatusView {
     /// Since when (Unix seconds) the server has been rejecting the token.
     #[serde(default)]
     pub auth_rejected_since: Option<i64>,
-    /// `draft_discarded` messages waiting to be delivered to the server.
-    #[serde(default)]
-    pub pending_discards: usize,
     /// What the daemon reports to the server.
     pub report: MachineReport,
     /// The daemon's build ([`sk1ll_core::VERSION`]).
@@ -201,11 +178,23 @@ pub enum ChangeKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ItemView {
     pub item: ItemRef,
+    pub id: Option<sk1ll_core::ItemId>,
     pub in_baseline: bool,
     pub draft: Option<ChangeKind>,
     pub unpushed: bool,
     /// A cheap, single-line SKILL.md frontmatter description, when available.
     pub description: Option<String>,
+}
+
+/// `GET /repo`: the repo's content as `sk1ll list` and `sk1ll status` show
+/// it, read from the working tree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoContent {
+    pub skills: Vec<sk1ll_core::Skill>,
+    pub rules: Vec<sk1ll_core::Rule>,
+    pub imports: Vec<sk1ll_core::ImportStatus>,
+    /// A pull stopped half-way and has to finish first.
+    pub pull_pending: bool,
 }
 
 /// One draft item (`GET /draft`).
@@ -220,6 +209,8 @@ pub struct DraftEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffView {
     pub item: ItemRef,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<PathBuf>,
     pub diff: String,
 }
 
@@ -250,6 +241,13 @@ pub struct CommitResponse {
     /// Pushed to the server; otherwise queued until the daemon reconnects.
     pub pushed: bool,
     pub push_error: Option<String>,
+    /// The server refused the push for good: pushing again won't help.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub push_refused: bool,
+    /// The pull before the push turned the commit back into Draft changes:
+    /// it conflicts with the new Baseline (nothing is lost).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub uncommitted: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,8 +261,12 @@ pub struct RestoreRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestoreResponse {
-    /// Items that left the draft (reported to the server as `draft_discarded`).
+    /// Items that left the Draft after Restore.
     pub discarded: Vec<ItemRef>,
+    /// Recovery entries that keep the restored version of items a pull is
+    /// Blocked on, to adopt (`sk1ll recover adopt`) once the pull is done.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kept: Vec<String>,
 }
 
 /// `POST /pull`.
@@ -278,10 +280,29 @@ pub enum PullResult {
         to: String,
     },
     /// The new baseline clashes with `items`; the machine stays on its old one.
+    /// `uncommitted`: unpushed commits (short id and subject) that conflicted
+    /// with it and were turned back into Draft changes, nothing lost.
     Blocked {
         baseline: String,
         items: Vec<ItemRef>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pending: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        uncommitted: Vec<String>,
     },
+}
+
+/// What clears a pull Blocked on `items`, as every message about it says:
+/// restore them (each version is kept in recovery), pull, then adopt the
+/// kept versions back as Draft on the new Baseline.
+pub fn blocked_hint(items: &[ItemRef]) -> String {
+    let names: Vec<String> = items.iter().map(ToString::to_string).collect();
+    let names = names.join(" ");
+    format!(
+        "the new baseline also changes {names}, which this machine changed too. Run `sk1ll restore {names}` (your \
+         version is kept in recovery), then `sk1ll pull`, then `sk1ll recover adopt <id>` for each id the restore \
+         printed, to bring your version back as Draft on the new baseline"
+    )
 }
 
 /// `GET /conflicts`: harness content sk1ll won't overwrite on its own.
@@ -309,6 +330,9 @@ pub struct ConflictView {
     pub reason: Option<String>,
     /// Only copied skills and rule files can be adopted, not `block` instructions.
     pub adoptable: bool,
+    /// A recovered entry written to while sk1ll replaced it: a conflict.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub changed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -368,7 +392,6 @@ pub struct PlacementView {
 /// `POST /harnesses/preview`: what a harness change would do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarnessPreview {
-    #[serde(default)]
     pub fingerprint: String,
     pub path: PathBuf,
     pub name: String,
@@ -650,35 +673,24 @@ pub struct DeleteItemRequest {
     pub kind: String,
     pub name: String,
 }
-/// Before renaming, the Assignment authority (the Server, or the daemon when
-/// standalone) copies this machine's explicit toggles for the old name to the
-/// new one. When that copy fails, nothing is renamed and the request fails
-/// with HTTP 409, unless `copy_assignment` is false: then the item is
-/// renamed without its toggles, and the new name follows each Harness's default.
+pub use sk1ll_core::harness_rename::RenameRequest as HarnessRenameRequest;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessRenameResult {
+    pub update: AssignmentUpdate,
+    pub routed_rules: Vec<String>,
+}
+
+/// Renames an item in the Draft while keeping its Item ID.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenameItemRequest {
     pub kind: String,
     pub name: String,
     pub to: String,
-    #[serde(default = "yes")]
-    pub copy_assignment: bool,
 }
-fn yes() -> bool {
-    true
-}
-/// This machine's toggles were copied to the new name in `migrated`
-/// harnesses; in `kept` harnesses the new name already had its own explicit
-/// toggle, which was kept. Other machines' toggles are not copied: once the
-/// rename is pushed, the old name's are dropped (`item_removed`) and the new
-/// name follows their defaults. `assignment_error` is always null: a copy
-/// that fails refuses the rename instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RenameItemResponse {
     pub item: ItemRef,
-    pub migrated: Vec<String>,
-    #[serde(default)]
-    pub kept: Vec<String>,
-    pub assignment_error: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConflictDiffRequest {
@@ -714,28 +726,39 @@ impl ClientError {
     }
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct HarnessAssignmentUpdate {
-    pub update: AssignmentUpdate,
-    pub warning: Option<String>,
-    #[serde(default)]
-    pub skipped: Vec<ItemRef>,
-}
-
-pub const LEGACY_HARNESS_ASSIGNMENT_WARNING: &str =
-    "This Server only accepted items in the local repo. Unpulled items may stay on.";
-
 pub type Result<T> = std::result::Result<T, ClientError>;
 
-/// Talks to a daemon's local API; one connection per request.
-#[derive(Debug, Clone)]
+/// Talks to a daemon's local API: over its socket, one connection per
+/// request, or to an engine in this process ([`crate::local`]).
+#[derive(Clone)]
 pub struct Client {
-    socket: PathBuf,
+    transport: Transport,
+}
+
+#[derive(Clone)]
+enum Transport {
+    Socket(PathBuf),
+    /// The local API of an engine in this process, called directly.
+    InProcess(axum::Router),
+}
+
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.transport {
+            Transport::Socket(socket) => f.debug_tuple("Client").field(socket).finish(),
+            Transport::InProcess(_) => f.write_str("Client(in process)"),
+        }
+    }
 }
 
 impl Client {
     pub fn new(socket: impl Into<PathBuf>) -> Self {
-        Self { socket: socket.into() }
+        Self { transport: Transport::Socket(socket.into()) }
+    }
+
+    /// A client of the engine whose local API `router` serves, in this process.
+    pub(crate) fn in_process(router: axum::Router) -> Self {
+        Self { transport: Transport::InProcess(router) }
     }
 
     /// A client for the default socket (see [`crate::Config::default_socket`]).
@@ -743,21 +766,15 @@ impl Client {
         Ok(Self::new(crate::Config::default_socket()?))
     }
 
+    /// The daemon's socket; empty for an engine in this process.
     pub fn socket(&self) -> &Path {
-        &self.socket
+        match &self.transport {
+            Transport::Socket(socket) => socket,
+            Transport::InProcess(_) => Path::new(""),
+        }
     }
 
-    async fn send(&self, method: Method, path: &str, body: Option<Vec<u8>>) -> Result<hyper::Response<Incoming>> {
-        let stream = UnixStream::connect(&self.socket).await.map_err(|e| {
-            let not_running = matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused);
-            let message = format!("cannot reach the daemon at {}: {e}", self.socket.display());
-            ClientError { status: None, message, not_running }
-        })?;
-        let (mut sender, conn) =
-            hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.map_err(ClientError::transport)?;
-        tokio::spawn(async move {
-            let _ = conn.await;
-        });
+    async fn send(&self, method: Method, path: &str, body: Option<Vec<u8>>) -> Result<hyper::Response<Body>> {
         let mut req = Request::builder()
             .method(method)
             .uri(path)
@@ -767,7 +784,26 @@ impl Client {
             req = req.header(hyper::header::CONTENT_TYPE, "application/json");
         }
         let req = req.body(Full::new(Bytes::from(body.unwrap_or_default()))).map_err(ClientError::transport)?;
-        sender.send_request(req).await.map_err(ClientError::transport)
+        let socket = match &self.transport {
+            Transport::InProcess(router) => {
+                use tower::ServiceExt;
+                let response = router.clone().oneshot(req.map(Body::new)).await;
+                return Ok(response.unwrap_or_else(|never| match never {}));
+            }
+            Transport::Socket(socket) => socket,
+        };
+        let stream = UnixStream::connect(socket).await.map_err(|e| {
+            let not_running = matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused);
+            let message = format!("cannot reach the daemon at {}: {e}", socket.display());
+            ClientError { status: None, message, not_running }
+        })?;
+        let (mut sender, conn) =
+            hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.map_err(ClientError::transport)?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let response = sender.send_request(req).await.map_err(ClientError::transport)?;
+        Ok(response.map(Body::new))
     }
 
     /// Sends a request and returns the response body of a 2xx response.
@@ -778,7 +814,7 @@ impl Client {
         if status.is_success() {
             return Ok(bytes);
         }
-        let message = failure_message(status, &bytes, &method, path);
+        let message = failure_message(status, &bytes);
         Err(ClientError { status: Some(status.as_u16()), message, not_running: false })
     }
 
@@ -828,6 +864,20 @@ impl Client {
         self.get("/items").await
     }
 
+    /// [`Client::items`] as of now: waits for a running engine operation.
+    /// `fresh`: as of now, with missing Item IDs written (see [`Client::items_fresh`]).
+    pub async fn repo(&self, fresh: bool) -> Result<RepoContent> {
+        self.get(if fresh { "/repo?fresh=true" } else { "/repo" }).await
+    }
+
+    pub async fn editable(&self, item: &str) -> Result<PathBuf> {
+        self.get(&format!("/items/editable?item={}", encode(item))).await
+    }
+
+    pub async fn items_fresh(&self) -> Result<Vec<ItemView>> {
+        self.get("/items?fresh=true").await
+    }
+
     pub async fn skills(&self) -> Result<Vec<ContentEntry>> {
         self.get("/skills").await
     }
@@ -848,8 +898,16 @@ impl Client {
         self.post_empty("/skills/adopt", target).await
     }
 
+    /// The Draft from the daemon's last Snapshot: never waits, so it may
+    /// lag behind an edit made a moment ago while an engine operation runs.
     pub async fn draft(&self) -> Result<Vec<DraftEntry>> {
         self.get("/draft").await
+    }
+
+    /// The Draft as of now, for acting on what it lists: waits for a running
+    /// engine operation and reconciles first.
+    pub async fn draft_fresh(&self) -> Result<Vec<DraftEntry>> {
+        self.get("/draft?fresh=true").await
     }
 
     pub async fn diff(&self, item: &str) -> Result<DiffView> {
@@ -864,6 +922,10 @@ impl Client {
         self.post("/commit", req).await
     }
 
+    pub async fn repair_ids(&self) -> Result<usize> {
+        self.post("/items/repair-ids", &()).await
+    }
+
     pub async fn restore(&self, req: &RestoreRequest) -> Result<RestoreResponse> {
         self.post("/restore", req).await
     }
@@ -876,8 +938,13 @@ impl Client {
         self.get("/conflicts/displaced").await
     }
 
-    pub async fn adopt_displaced(&self, id: &str) -> Result<()> {
-        self.post_empty(&format!("/conflicts/displaced/{}/adopt", encode(id)), &()).await
+    /// [`Client::recovered`] as of now: waits for a running engine operation.
+    pub async fn recovered_fresh(&self) -> Result<Vec<ConflictView>> {
+        self.get("/conflicts/displaced?fresh=true").await
+    }
+
+    pub async fn adopt_displaced(&self, id: &str) -> Result<PathBuf> {
+        self.post(&format!("/conflicts/displaced/{}/adopt", encode(id)), &()).await
     }
 
     pub async fn discard_displaced(&self, id: &str) -> Result<()> {
@@ -886,6 +953,11 @@ impl Client {
 
     pub async fn conflicts(&self) -> Result<Vec<ConflictView>> {
         self.get("/conflicts").await
+    }
+
+    /// [`Client::conflicts`] as of now: waits for a running engine operation.
+    pub async fn conflicts_fresh(&self) -> Result<Vec<ConflictView>> {
+        self.get("/conflicts?fresh=true").await
     }
 
     pub async fn adopt(&self, target: &ConflictTarget) -> Result<()> {
@@ -925,18 +997,12 @@ impl Client {
     }
 
     pub async fn preview_harness(&self, req: &HarnessChangeRequest) -> Result<HarnessPreview> {
-        let preview: HarnessPreview = self.post("/harnesses/preview", req).await?;
-        if preview.fingerprint.is_empty() {
-            return Err(ClientError::transport(
-                "the running daemon is older than this app; restart or upgrade the daemon",
-            ));
-        }
-        Ok(preview)
+        self.post("/harnesses/preview", req).await
     }
 
     pub async fn apply_harness(&self, req: &HarnessChangeRequest) -> Result<HarnessApplied> {
         if req.fingerprint.as_deref().is_none_or(str::is_empty) {
-            return Err(ClientError::transport("a reviewed preview is required; restart or upgrade the daemon"));
+            return Err(ClientError::transport("a reviewed preview is required"));
         }
         self.post("/harnesses/apply", req).await
     }
@@ -1033,11 +1099,7 @@ impl Client {
         {
             return Ok(result);
         }
-        Err(ClientError {
-            status: Some(status.as_u16()),
-            message: failure_message(status, &bytes, &Method::POST, path),
-            not_running: false,
-        })
+        Err(ClientError { status: Some(status.as_u16()), message: failure_message(status, &bytes), not_running: false })
     }
 
     pub async fn push(&self) -> Result<PushResult> {
@@ -1079,7 +1141,7 @@ impl Client {
         self.call(Method::PUT, &format!("/machines/{}/assignment", encode(machine)), Some(changes)).await
     }
 
-    pub async fn set_harness_assignment(&self, harness: &str, enabled: bool) -> Result<HarnessAssignmentUpdate> {
+    pub async fn set_harness_assignment(&self, harness: &str, enabled: bool) -> Result<AssignmentUpdate> {
         self.post(&format!("/assignment/harness/{}", encode(harness)), &sk1ll_proto::SetHarnessAssignment { enabled })
             .await
     }
@@ -1120,19 +1182,20 @@ impl Client {
         self.get("/imports").await
     }
 
-    /// A join code granting `scope`. Fails (501) if the server granted
-    /// another scope: an older server ignores the request's and grants `fleet`.
     pub async fn join_code(&self, scope: Scope) -> Result<JoinCode> {
-        let code: JoinCode = self.post("/join-codes", &JoinCodeRequest { scope }).await?;
-        if code.scope.unwrap_or_default() != scope {
-            let message = format!(
-                "the Server is too old to create {} join codes; upgrade it (the code it created instead was not \
-                 shown and expires unused)",
-                scope.as_str()
-            );
-            return Err(ClientError { status: Some(501), message, not_running: false });
-        }
-        Ok(code)
+        self.post("/join-codes", &JoinCodeRequest { scope }).await
+    }
+
+    pub async fn rename_harness(&self, rename: &HarnessRenameRequest) -> Result<HarnessRenameResult> {
+        self.post("/assignment/rename-harness", rename).await
+    }
+
+    pub async fn orphans(&self) -> Result<sk1ll_proto::OrphansView> {
+        self.get("/assignment/orphans").await
+    }
+
+    pub async fn prune_orphans(&self, request: &sk1ll_proto::PruneOrphans) -> Result<sk1ll_proto::OrphansPruned> {
+        self.post("/assignment/orphans/prune", request).await
     }
 
     /// Subscribes to `GET /events`.
@@ -1148,7 +1211,7 @@ impl Client {
 
 /// Server-sent events from `GET /events`.
 pub struct EventStream {
-    body: Incoming,
+    body: Body,
     buf: String,
 }
 
@@ -1204,62 +1267,6 @@ pub(crate) fn encode(s: &str) -> String {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn reviewed_writes_are_refused_by_a_legacy_daemon() {
-        use axum::{Json, Router, routing::post};
-        use std::sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        };
-
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("legacy.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-        let writes = Arc::new(AtomicUsize::new(0));
-        let count = writes.clone();
-        let app = Router::new()
-            .route(
-                "/imports/{name}/update",
-                post(move || async move {
-                    count.fetch_add(1, Ordering::Relaxed);
-                    StatusCode::OK
-                }),
-            )
-            .route(
-                "/harnesses/preview",
-                post(|| async {
-                    Json(serde_json::json!({
-                        "path": "/machine.toml", "name": "codex", "before": null, "after": null,
-                        "placed": [], "sync": [], "awaiting_assignment": false
-                    }))
-                }),
-            )
-            .route(
-                "/harnesses/apply",
-                post({
-                    let count = writes.clone();
-                    move || async move {
-                        count.fetch_add(1, Ordering::Relaxed);
-                        StatusCode::OK
-                    }
-                }),
-            );
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let client = Client::new(socket);
-        for force in [false, true] {
-            let error = client.update_reviewed_import("pdf", force, Some("reviewed")).await.unwrap_err();
-            assert_eq!(error.status, Some(404));
-            assert!(error.message.contains("older than this app; restart it"));
-        }
-        let req = HarnessChangeRequest { fingerprint: None, change: HarnessChange::Disable { name: "codex".into() } };
-        let error = client.preview_harness(&req).await.unwrap_err();
-        assert!(error.message.contains("restart or upgrade the daemon"), "{error}");
-        let error = client.apply_harness(&req).await.unwrap_err();
-        assert!(error.message.contains("restart or upgrade the daemon"));
-        assert_eq!(writes.load(Ordering::Relaxed), 0);
-        server.abort();
-    }
-
     #[test]
     fn encodes_query_values() {
         assert_eq!(encode("skill:pdf"), "skill%3Apdf");
@@ -1272,7 +1279,12 @@ mod tests {
         let e = Event::Assignment { revision: 3 };
         assert_eq!(serde_json::to_value(&e).unwrap(), serde_json::json!({"type": "assignment", "revision": 3}));
         assert_eq!(e.name(), "assignment");
-        let p = PullResult::Blocked { baseline: "b".into(), items: vec![ItemRef::Skill("x".into())] };
+        let p = PullResult::Blocked {
+            baseline: "b".into(),
+            items: vec![ItemRef::Skill("x".into())],
+            pending: false,
+            uncommitted: Vec::new(),
+        };
         let v = serde_json::to_value(&p).unwrap();
         assert_eq!(v["state"], "blocked");
         assert_eq!(serde_json::from_value::<PullResult>(v).unwrap(), p);
@@ -1306,16 +1318,9 @@ mod tests {
     }
 
     #[test]
-    fn only_a_missing_harness_route_reads_as_an_old_daemon() {
-        let msg = |status, body: &[u8], path| failure_message(status, body, &Method::GET, path);
-        assert!(msg(StatusCode::NOT_FOUND, b"", "/harnesses/config").contains("older than this client"));
-        assert_eq!(msg(StatusCode::NOT_FOUND, b"", "/imports/x/update"), "404 Not Found");
-        assert_eq!(msg(StatusCode::NOT_FOUND, b"  ", "/harnesses/apply"), "404 Not Found", "a body, if blank");
-        assert_eq!(
-            msg(StatusCode::NOT_FOUND, br#"{"error":"no harness `x`"}"#, "/harnesses/preview"),
-            "no harness `x`"
-        );
-        assert_eq!(msg(StatusCode::BAD_GATEWAY, b"", "/harnesses/config"), "502 Bad Gateway");
+    fn response_errors_keep_the_message_or_status() {
+        assert_eq!(failure_message(StatusCode::NOT_FOUND, b""), "404 Not Found");
+        assert_eq!(failure_message(StatusCode::NOT_FOUND, br#"{"error":"no harness `x`"}"#), "no harness `x`");
     }
 
     /// The GUI's contract for harness changes.

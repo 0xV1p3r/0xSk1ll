@@ -1,23 +1,27 @@
 // Daemon serde contract: sk1ll-daemon/src/client.rs and sk1ll-proto/src/lib.rs.
 // ItemRef and PathBuf serialize as strings; timestamps are Unix seconds.
 export type ItemRef = string;
+export type ItemId = string;
 export type MachineStatus = 'offline' | 'blocked' | 'conflict' | 'behind' | 'drafting' | 'in_sync';
 export type Connection = 'connecting' | 'connected' | 'offline' | 'auth_rejected' | 'revoked' | 'standalone';
 export interface MachineReport {
+  seq: number; items: { item: ItemRef; id: ItemId }[];
+  inventory_complete?: boolean; inventory_error?: string;
   baseline: string | null; drafts: ItemRef[]; unpushed: ItemRef[];
   conflicts: { item: ItemRef; harness: string }[]; harnesses: string[];
   blocked: boolean; clashes: ItemRef[]; behind: boolean;
+  push_refused?: string;
 }
 export interface StatusView {
   mode: 'joined' | 'standalone'; has_origin: boolean; repo_ready: boolean;
   machine_id: string; server_url: string | null; repo: string; headline: MachineStatus; connection: Connection;
   last_error: string | null; revoked: boolean; server_baseline: string | null; assignment_revision: number;
-  awaiting_assignment: boolean; auth_rejected_since: number | null; pending_discards: number; report: MachineReport;
+  awaiting_assignment: boolean; auth_rejected_since: number | null; report: MachineReport;
   version?: string;
 }
-// What a Machine may manage, from its join code: the whole Fleet, or only itself. Absent means `fleet`.
+// What a Machine may manage, from its join code.
 export type Scope = 'fleet' | 'self';
-// `registration`: random and new for every join (two joins can share a `joined_at` second); absent from a 0.1.0 Server.
+// `registration`: random and new for every join (two joins can share a `joined_at` second).
 export interface MachineRow {
   id: string; status: MachineStatus; connected: boolean; joined_at: number; last_seen: number | null;
   report: MachineReport | null; scope?: Scope; registration?: string | null;
@@ -29,7 +33,7 @@ export interface HarnessAssignment {
 }
 export interface Assignment { harnesses: Record<string, HarnessAssignment> }
 export type ToggleKind = 'skill' | 'rule' | 'new_skills_default' | 'new_rules_default';
-export interface ToggleChange { harness: string; kind: ToggleKind; name?: string; enabled: boolean | null }
+export interface ToggleChange { harness: string; kind: ToggleKind; item_id?: ItemId; name?: string; enabled: boolean | null }
 // `expected`: apply only to this revision (and registration, when given), else HTTP 409 and nothing changes.
 export interface Expected { revision: number; registration?: string | null }
 export interface AssignmentChanges { changes: ToggleChange[]; expected?: Expected | null }
@@ -38,27 +42,30 @@ export interface AssignmentSnapshot extends Assignment { revision: number; regis
 // `registration`: which registration of the Machine it was read for (see `registrationOf`).
 export interface CachedAssignmentSnapshot { assignment: Assignment; revision: number; registration?: string | null }
 export interface AssignmentUpdate extends Omit<CachedAssignmentSnapshot, 'registration'> { entries: LogEntry[]; errors?: string[] }
-export type LogCause = { type: 'change' | 'item_removed' | 'default_materialized' | 'machine_removed' | 'harness_added' }
-  | { type: 'undo'; entry: number };
+export type LogCause = { type: 'change' | 'orphan_pruned' | 'default_materialized' | 'machine_removed' | 'harness_added' }
+  | { type: 'undo'; entry: number } | { type: 'harness_renamed'; from: string; to: string };
 export interface LogEntry {
   id: number; at: number; author: string; machine: string; harness: string; kind: ToggleKind;
-  name: string | null; before: boolean | null; after: boolean | null; cause: LogCause;
+  item_id: ItemId | null; name: string | null; before: boolean | null; after: boolean | null; cause: LogCause;
 }
 // Filters run on the Server before `limit`, so the last id of a page is the next `before`.
 // `item` matches a substring of `<kind>:<name>` ignoring ASCII case; empty strings match everything.
+export interface Orphan { machine: string; harness: string; kind: 'skill' | 'rule'; item_id: ItemId; name: string | null }
+export interface OrphansView { orphans: Orphan[] }
+export interface OrphansPruned { entries: LogEntry[] }
 export interface LogQuery { machine?: string; harness?: string; author?: string; item?: string; before?: number; limit?: number }
 // Distinct values over the whole Assignment log, sorted.
 export interface LogFacets { machines: string[]; harnesses: string[]; authors: string[] }
 // The GUI bridge adds a byte fingerprint to the Daemon's Draft entry.
 export interface DraftEntry { item: ItemRef; change: 'added' | 'modified' | 'deleted'; paths: string[]; fingerprint: string }
-export interface DiffView { item: ItemRef; diff: string }
+export interface DiffView { item: ItemRef; diff: string; target?: string }
 export interface CommitMessage { items: ItemRef[]; message: string }
 export interface CommitRequest { items: string[]; message?: string; author?: string }
 export interface CommitResponse { sha: string; items: ItemRef[]; message: string; pushed: boolean; push_error: string | null }
 export interface RestoreRequest { items: string[]; all: boolean }
-export interface RestoreResponse { discarded: ItemRef[] }
+export interface RestoreResponse { discarded: ItemRef[]; kept?: string[] }
 export type PullResult = { state: 'up_to_date' } | { state: 'updated'; from: string | null; to: string }
-  | { state: 'blocked'; baseline: string; items: ItemRef[] };
+  | { state: 'blocked'; baseline: string; items: ItemRef[]; pending?: boolean; uncommitted?: string[] };
 export interface ConflictView {
   kind?: string; id?: string; item?: ItemRef; path?: string; displaced_at?: number;
   // Harness conflicts only: newest mtime of the Harness content (when it was last edited), not a first-seen time.
@@ -105,15 +112,14 @@ export interface ImportsView { imports?: ImportEntry[]; checked_at: number | nul
 export interface ImportUpdated { name: string; old_commit: string | null; new_commit: string; changed: boolean }
 // `admin_token` replaces `code` for the first Machine of a new Fleet.
 export interface JoinApiRequest { server_url: string; code: string; admin_token?: string; machine_id?: string; copy_from?: string; repo?: string }
-export interface Joined { machine_id: string; repo: string; setup: 'cloned' | 'initialized' | 'adopted'; harnesses: string[]; revision: number }
-// `expires_at` and `scope` are null from an older Server.
-export interface JoinCode { code: string; expires_at: number | null; scope: Scope | null }
+export interface Joined { machine_id: string; repo: string; setup: 'cloned' | 'adopted'; harnesses: string[]; revision: number }
+export interface JoinCode { code: string; expires_at: number; scope: Scope }
 export interface CommandError { message: string; status: number | null; unreachable: boolean }
 export interface DaemonConnection { reachable: boolean; message: string | null; retry_in_ms: number }
 export type DaemonEvent = { type: 'status' | 'draft' | 'fleet' } | { type: 'assignment'; revision: number }
   | { type: 'imports'; updates: ImportUpdate[] };
 
-export interface ItemView {
+export interface ItemView { id: ItemId | null;
   item: ItemRef; in_baseline: boolean; draft: DraftEntry['change'] | null; unpushed: boolean; description: string | null;
 }
 
@@ -147,14 +153,8 @@ export interface PushResult { pushed: boolean }
 export interface CreateItemRequest { kind: 'skill' | 'rule'; name: string; description?: string }
 // Personal Skills and Rules only; Imports use removeImport. Both are Draft changes.
 export interface DeleteItemRequest { kind: 'skill' | 'rule'; name: string }
-// The Assignment authority (the Server, or the Daemon when standalone) first copies this Machine's explicit toggles for
-// the old name to the new one. When it can't (offline, a Server without the copy, an unknown outcome) the rename is
-// refused with HTTP 409, unless `copy_assignment` is false: then it renames and the new name follows the defaults.
-export interface RenameItemRequest { kind: 'skill' | 'rule'; name: string; to: string; copy_assignment?: boolean }
-// `migrated`: Harnesses whose toggle was copied; `kept`: Harnesses where the new name already had its own explicit
-// toggle. `assignment_error` is always null now. Other Machines are not migrated: after the push, the old name's
-// toggles are dropped and the new name follows their defaults.
-export interface RenameItemResponse { item: ItemRef; migrated: string[]; kept?: string[]; assignment_error: string | null }
+export interface RenameItemRequest { kind: 'skill' | 'rule'; name: string; to: string }
+export interface RenameItemResponse { item: ItemRef }
 export type ConflictDiffRequest = { harness: string; name: string; id?: never } | { id: string; harness?: never; name?: never };
 export interface ImportEntry { name: string; source: string; ref: string; path: string; locked: string | null }
 

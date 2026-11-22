@@ -9,11 +9,11 @@
 //! reader and its writer, even a writer stuck in a send. A status report is
 //! accepted only while the session is current and its token still valid.
 //!
-//! Discards with an id are acknowledged only after a successful commit, including
-//! no-ops. Invalid or stale sessions receive no acknowledgement. If the
-//! baseline's items can't be read, the session is closed with code 1013 (try
-//! again later), so the daemon reconnects, backing off, and sends its
-//! unacknowledged discards again; later discards on that session aren't read.
+//! Frames are handled one at a time, in the order they came, so a machine's
+//! own assignment write (`set_assignment`) is applied after the status it
+//! sent before it: a draft item it reports can be enabled right away. Each
+//! write is answered with `assignment_result`, which also echoes the last
+//! report stored from this session.
 //!
 //! Outbound state is bounded: the assignment is coalesced in a `watch` (only
 //! the newest revision is kept), and other messages go through a small queue.
@@ -21,14 +21,16 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRequestParts, State};
 use axum::http::request::Parts;
 use axum::response::Response;
 use futures_util::stream::SplitStream;
 use futures_util::{Sink, SinkExt, StreamExt};
 use serde_json::Value;
-use sk1ll_proto::{AssignmentSnapshot, DaemonMessage, ItemRef, MachineReport, ServerMessage};
+use sk1ll_proto::{
+    AssignmentOutcome, AssignmentSnapshot, AssignmentWrite, DaemonMessage, ItemRef, MachineReport, Scope, ServerMessage,
+};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -125,9 +127,7 @@ async fn session(server: Arc<Server>, machine: String, token_hash: String, socke
         queue: qtx.clone(),
     };
 
-    let retry = Arc::new(AtomicBool::new(false));
-    let ends = Ending { revoked, retry: retry.clone() };
-    let writer = tokio::spawn(write_loop(sink, qrx, arx, cancel.clone(), ends, server.config.clone()));
+    let writer = tokio::spawn(write_loop(sink, qrx, arx, cancel.clone(), revoked, server.config.clone()));
     match register(&server, &machine, handle).await {
         Ok(Some(snapshot)) => {
             tracing::info!("{machine} connected (session {id})");
@@ -147,7 +147,7 @@ async fn session(server: Arc<Server>, machine: String, token_hash: String, socke
     }
     drop((atx, qtx));
 
-    read_loop(&server, &machine, id, &token_hash, stream, &cancel, &retry).await;
+    read_loop(&server, &machine, id, &token_hash, stream, &cancel).await;
     cancel.cancel();
     let _ = writer.await;
     server.disconnect(&machine, id);
@@ -180,11 +180,12 @@ async fn read_loop(
     token_hash: &str,
     mut stream: SplitStream<WebSocket>,
     cancel: &CancellationToken,
-    retry: &AtomicBool,
 ) {
     let idle = server.config.idle_limit();
     let touch_every = std::time::Duration::from_secs(10).min(server.config.offline_after / 4);
     let mut last_touch: Option<tokio::time::Instant> = None;
+    // The `seq` of the last report stored from this session.
+    let mut stored = 0;
     loop {
         let next = tokio::select! {
             biased;
@@ -208,33 +209,31 @@ async fn read_loop(
                     }
                     Ok(DaemonMessage::Hello { .. }) => {}
                     Ok(DaemonMessage::Status(report)) => {
-                        // A later discard must not sweep against an older report,
-                        // so drop the session; reconnecting sends a fresh one first.
-                        if let Err(e) = on_status(server, machine, id, token_hash, report, cancel).await {
-                            return tracing::error!("{machine}: storing status: {e}; closing");
+                        let seq = report.seq;
+                        if seq <= stored {
+                            tracing::warn!("{machine}: ignoring status {seq} after status {stored}");
+                            continue;
+                        }
+                        match on_report(server, machine, id, token_hash, report, cancel).await {
+                            Ok(true) => stored = seq,
+                            Ok(false) => {}
+                            Err(e) => return tracing::error!("{machine}: storing status: {e}; closing"),
                         }
                     }
-                    Ok(DaemonMessage::DraftDiscarded { id: discard_id, items }) => {
-                        match on_draft_discarded(server, machine, id, token_hash, items, cancel).await {
-                            Ok(Discard::Applied) => {
-                                if let Some(discard_id) = discard_id
-                                    && let Some(h) = crate::lock(&server.conns)
-                                        .get(machine)
-                                        .filter(|h| h.id == id && !cancel.is_cancelled())
-                                {
-                                    h.send(machine, ServerMessage::DraftDiscardApplied { id: discard_id });
-                                }
-                            }
-                            Ok(Discard::Stale) => {}
-                            Ok(Discard::Unknown) => {
-                                retry.store(true, Ordering::SeqCst);
-                                return tracing::warn!(
-                                    "{machine}: keeping toggles for discarded drafts: the baseline's items are \
-                                     unknown; closing so the daemon sends them again later"
-                                );
-                            }
-                            // The daemon only replays unacknowledged discards on reconnect.
-                            Err(e) => return tracing::error!("{machine}: discarding draft toggles: {e}; closing"),
+                    Ok(DaemonMessage::SetAssignment { req, write }) => {
+                        let result = if stored == 0 && !matches!(write, AssignmentWrite::RenameHarness(_)) {
+                            Some(AssignmentOutcome::Refused {
+                                status: 400,
+                                error: "send status before changing Assignment".into(),
+                            })
+                        } else {
+                            on_set_assignment(server, machine, id, token_hash, write, cancel).await
+                        };
+                        if let Some(result) = result
+                            && let Some(h) =
+                                crate::lock(&server.conns).get(machine).filter(|h| h.id == id && !cancel.is_cancelled())
+                        {
+                            h.send(machine, ServerMessage::AssignmentResult { req, seq: stored, result });
                         }
                     }
                     Err(e) => tracing::warn!("{machine}: bad message: {e}"),
@@ -246,26 +245,17 @@ async fn read_loop(
     }
 }
 
-/// Why a session is ending, when the daemon must be told.
-#[derive(Default)]
-struct Ending {
-    /// The machine was removed: send `Revoked` last.
-    revoked: Arc<AtomicBool>,
-    /// The daemon should come back later: close with code 1013.
-    retry: Arc<AtomicBool>,
-}
-
 /// Sends queued messages, the latest assignment and pings until cancelled.
-/// Every frame has a deadline; a stuck send ends with the session.
+/// Every frame has a deadline; a stuck send ends with the session. A
+/// `revoked` session (its machine was removed) sends `Revoked` last.
 async fn write_loop<S: Sink<Message> + Unpin>(
     mut sink: S,
     mut queue: mpsc::Receiver<ServerMessage>,
     mut assignment: watch::Receiver<Option<AssignmentSnapshot>>,
     cancel: CancellationToken,
-    ends: Ending,
+    revoked: Arc<AtomicBool>,
     config: crate::Config,
 ) {
-    let Ending { revoked, retry } = ends;
     let deadline = config.send_timeout;
     let mut ping = tokio::time::interval(config.ping_every);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -289,11 +279,10 @@ async fn write_loop<S: Sink<Message> + Unpin>(
         };
         tokio::select! {
             biased;
-            // A removal still needs its final Revoked frame, and a retry
-            // its close code. Other cancellations drop a stalled socket
-            // immediately.
+            // A removal still needs its final Revoked frame. Other
+            // cancellations drop a stalled socket immediately.
             () = cancel.cancelled() => {
-                if revoked.load(Ordering::SeqCst) || retry.load(Ordering::SeqCst) {
+                if revoked.load(Ordering::SeqCst) {
                     break 'frames;
                 }
                 return;
@@ -311,10 +300,7 @@ async fn write_loop<S: Sink<Message> + Unpin>(
     if revoked.load(Ordering::SeqCst) {
         let _ = tokio::time::timeout(deadline, sink.send(text(&ServerMessage::Revoked))).await;
     }
-    let close = retry
-        .load(Ordering::SeqCst)
-        .then(|| CloseFrame { code: close_code::AGAIN, reason: "the baseline can't be read; try again later".into() });
-    let _ = tokio::time::timeout(deadline, sink.send(Message::Close(close))).await;
+    let _ = tokio::time::timeout(deadline, sink.send(Message::Close(None))).await;
 }
 
 fn text(msg: &ServerMessage) -> Message {
@@ -325,39 +311,46 @@ fn text(msg: &ServerMessage) -> Message {
 /// parse (an item ref from a newer daemon, say) are skipped and logged
 /// rather than dropping the whole report.
 fn parse(mut v: Value) -> std::result::Result<DaemonMessage, String> {
-    if v.get("type").and_then(Value::as_str) == Some("status") {
-        for field in ["drafts", "unpushed", "clashes", "conflicts"] {
-            let Some(Value::Array(entries)) = v.get_mut(field) else {
-                continue;
+    let fields: &[&str] = match v.get("type").and_then(Value::as_str) {
+        Some("status") => &["drafts", "unpushed", "clashes", "conflicts", "items"],
+        _ => &[],
+    };
+    for &field in fields {
+        let Some(Value::Array(entries)) = v.get_mut(field) else { continue };
+        let before = entries.len();
+        entries.retain(|e| {
+            let ok = match field {
+                "conflicts" => serde_json::from_value::<sk1ll_proto::ConflictRef>(e.clone()).is_ok(),
+                "items" => serde_json::from_value::<sk1ll_proto::ReportedItem>(e.clone())
+                    .is_ok_and(|r| matches!(r.item, ItemRef::Skill(_) | ItemRef::Rule(_))),
+                _ => serde_json::from_value::<ItemRef>(e.clone()).is_ok(),
             };
-            entries.retain(|e| {
-                let ok = if field == "conflicts" {
-                    serde_json::from_value::<sk1ll_proto::ConflictRef>(e.clone()).is_ok()
-                } else {
-                    serde_json::from_value::<ItemRef>(e.clone()).is_ok()
-                };
-                if !ok {
-                    tracing::warn!("status: skipping malformed `{field}` entry {e}");
-                }
-                ok
-            });
+            if !ok {
+                tracing::warn!("status: skipping malformed `{field}` entry {e}");
+            }
+            ok
+        });
+        if field == "items" && entries.len() != before {
+            v["inventory_complete"] = Value::Bool(false);
+            v["inventory_error"] = Value::String("malformed Item IDs in report".into());
         }
     }
     serde_json::from_value(v).map_err(|e| e.to_string())
 }
 
 /// Stores the report if the session is still current and its token still
-/// valid; adds harnesses the machine has no assignment for (all off).
-async fn on_status(
+/// valid (`false` if not); adds harnesses the machine has no assignment for
+/// (all off).
+async fn on_report(
     server: &Arc<Server>,
     machine: &str,
     id: u64,
     token_hash: &str,
     report: MachineReport,
     cancel: &CancellationToken,
-) -> Result<()> {
+) -> Result<bool> {
     if cancel.is_cancelled() {
-        return Ok(());
+        return Ok(false);
     }
     let (h, m, t, now) = (server.clone(), machine.to_string(), token_hash.to_string(), now());
     let updated = server
@@ -370,72 +363,43 @@ async fn on_status(
                 return Ok(None);
             }
             let tx = conn.transaction()?;
+            let Some(record) = db::machine(&tx, &m)? else { return Ok(None) };
             db::save_report(&tx, &m, &report, now)?;
-            let Some(a) = db::assignment(&tx, &m)? else {
-                return Ok(None);
-            };
-            let added = assign::new_harness_changes(&a, &report.harnesses);
+            let added = assign::new_harness_changes(&record.assignment, &report.harnesses);
             let mut latest = None;
             if !added.is_empty() {
-                latest = Some(assign::apply(&tx, &m, assign::SERVER_AUTHOR, added, now, None)?.snapshot());
+                latest = Some(assign::apply(&tx, &m, assign::SERVER_AUTHOR, added, now, &[], false)?.snapshot());
             }
             tx.commit()?;
-            Ok(latest)
+            Ok(Some(latest))
         })
         .await?;
+    let Some(updated) = updated else { return Ok(false) };
     if let Some(snapshot) = updated {
         server.publish_assignment(machine, snapshot);
     }
-    Ok(())
+    Ok(true)
 }
 
-/// What became of a draft discard.
-#[derive(Debug, PartialEq, Eq)]
-enum Discard {
-    /// Committed (maybe as a no-op): acknowledge it.
-    Applied,
-    /// The session is no longer current, or its token valid: ignore it.
-    Stale,
-    /// The baseline's items couldn't be read, so nothing was dropped.
-    Unknown,
-}
-
-/// An explicit Restore, scoped to this machine and the named items. A status
-/// snapshot alone never proves that an absent draft item was discarded.
-async fn on_draft_discarded(
+/// A write to the machine's own assignment, if the session is still current;
+/// `None` (no answer) for a stale one.
+async fn on_set_assignment(
     server: &Arc<Server>,
     machine: &str,
     id: u64,
     token_hash: &str,
-    discarded: Vec<ItemRef>,
+    write: AssignmentWrite,
     cancel: &CancellationToken,
-) -> Result<Discard> {
-    if cancel.is_cancelled() {
-        return Ok(Discard::Stale);
+) -> Option<AssignmentOutcome> {
+    if cancel.is_cancelled() || !server.is_current(machine, id) {
+        return None;
     }
-    // Serialize with pushes so a Restore can't sweep against an old baseline,
-    // and read HEAD itself: the cached one lags a push whose read of it failed.
-    let _push = server.push_lock.lock().await;
-    let Some(items) = server.live_items().await else { return Ok(Discard::Unknown) };
-    let (h, m, t, now) = (server.clone(), machine.to_string(), token_hash.to_string(), now());
-    let updated = server
-        .db(move |conn| {
-            if !h.is_current(&m, id)
-                || db::machine_for_token(conn, &t)?.map(|(id, _)| id).as_deref() != Some(m.as_str())
-            {
-                return Ok(None);
-            }
-            let tx = conn.transaction()?;
-            let updated = assign::sweep(&tx, &m, &items, &discarded, now)?.map(|a| a.snapshot());
-            tx.commit()?;
-            Ok(Some(updated))
-        })
-        .await?;
-    let Some(updated) = updated else { return Ok(Discard::Stale) };
-    if let Some(snapshot) = updated {
-        server.publish_assignment(machine, snapshot);
-    }
-    Ok(Discard::Applied)
+    // The scope is read again from the token as the write commits.
+    let caller = Caller::Machine { id: machine.into(), scope: Scope::SelfOnly, token_hash: token_hash.into() };
+    Some(match crate::api::write_assignment(server, caller, machine.into(), write, Some(id)).await {
+        Ok(update) => AssignmentOutcome::Applied(update),
+        Err(e) => AssignmentOutcome::Refused { status: e.status().as_u16(), error: e.message() },
+    })
 }
 
 #[cfg(test)]
@@ -551,8 +515,7 @@ mod tests {
         let (queue_tx, queue_rx) = mpsc::channel(1);
         let (_assignment_tx, assignment_rx) = watch::channel(None);
         queue_tx.send(ServerMessage::Nudge { baseline: "abc".into() }).await.unwrap();
-        let ends = Ending { revoked, ..Ending::default() };
-        write_loop(sink, queue_rx, assignment_rx, cancel, ends, crate::Config::new("/unused")).await;
+        write_loop(sink, queue_rx, assignment_rx, cancel, revoked, crate::Config::new("/unused")).await;
         let frames = frames.lock().unwrap();
         assert!(
             frames.iter().any(|frame| matches!(frame, Message::Text(text)
@@ -613,105 +576,179 @@ mod tests {
         assert!(!server.is_connected("m"));
     }
 
-    /// Review finding: after a push whose read of the new HEAD failed, a
-    /// discard must not sweep against the old cached HEAD (which lacks the
-    /// item the push added). While HEAD can't be read it drops nothing and
-    /// closes with 1013 instead of acknowledging; once HEAD reads again, the
-    /// resent discard is checked against the live baseline.
+    /// A machine's own write is applied after the status sent before it,
+    /// on the same session, and answered with that status's `seq`.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_discard_after_a_failed_head_read_uses_the_live_baseline() {
+    async fn session_writes_follow_the_status_before_them() {
         use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest};
 
         let dir = tempfile::tempdir().unwrap();
         let server = Server::open(crate::Config::new(dir.path().join("data"))).await.unwrap();
-        let mut a = sk1ll_proto::Assignment::default();
-        a.set_skill("claude", "pdf", true);
-        let scope = sk1ll_proto::Scope::Fleet;
+        let (a, scope) = (sk1ll_proto::Assignment::default(), Scope::SelfOnly);
         server.db(move |conn| db::insert_machine(conn, "m", &crate::hash("t"), 0, &a, scope)).await.unwrap();
-        let has_pdf = || {
-            let server = server.clone();
-            async move {
-                server
-                    .db(|conn| Ok(db::assignment(conn, "m")?.unwrap().harness("claude").skills.contains_key("pdf")))
-                    .await
-                    .unwrap()
-            }
-        };
-
-        // A push adds pdf, and reading HEAD after it fails.
-        let git = |dir: &std::path::Path, args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .arg("-C")
-                .arg(dir)
-                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
-                .args(args)
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .output()
-                .unwrap();
-            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-        };
-        let work = dir.path().join("work");
-        git(dir.path(), &["clone", "--quiet", &server.config.repo_dir().to_string_lossy(), &work.to_string_lossy()]);
-        std::fs::create_dir_all(work.join("personal/pdf")).unwrap();
-        std::fs::write(work.join("personal/pdf/SKILL.md"), "x\n").unwrap();
-        git(&work, &["add", "--all"]);
-        git(&work, &["commit", "--quiet", "-m", "pdf"]);
-        let before = server.read_head().await.unwrap();
-        git(&work, &["push", "--quiet", "origin", "HEAD:main"]);
-        server.fail_head.store(true, Ordering::SeqCst);
-        server.after_push(before, crate::git::Budget::default(), &Caller::Admin).await;
-        assert_eq!(server.head(), None, "the cached HEAD is no longer trusted");
-
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let router = server.router();
         let serve = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let connect = || async move {
+        let mut req = format!("ws://{address}/api/ws").into_client_request().unwrap();
+        req.headers_mut().insert("authorization", "Bearer t".parse().unwrap());
+        let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+        let send = |msg: DaemonMessage| tungstenite::Message::text(serde_json::to_string(&msg).unwrap());
+
+        let id: sk1ll_proto::ItemId = "drafted".parse().unwrap();
+        let item = sk1ll_proto::ReportedItem { item: ItemRef::Skill("new".into()), id: id.clone() };
+        let report = MachineReport {
+            seq: 1,
+            items: vec![item],
+            inventory_complete: true,
+            harnesses: vec!["claude".into()],
+            ..Default::default()
+        };
+        ws.send(send(DaemonMessage::Status(report))).await.unwrap();
+        // Turning the default off right after materializes the reported item.
+        let change = |kind, enabled| sk1ll_proto::ToggleChange {
+            harness: "claude".into(),
+            kind,
+            item_id: None,
+            name: None,
+            enabled: Some(enabled),
+        };
+        let write = AssignmentWrite::Changes(sk1ll_proto::AssignmentChanges {
+            changes: vec![change(sk1ll_proto::ToggleKind::NewSkillsDefault, true)],
+            expected: None,
+        });
+        ws.send(send(DaemonMessage::SetAssignment { req: 9, write })).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(Ok(tungstenite::Message::Text(text))) = ws.next().await
+                    && let Ok(ServerMessage::AssignmentResult { req, seq, result }) = serde_json::from_str(&text)
+                {
+                    break (req, seq, result);
+                }
+            }
+        })
+        .await
+        .expect("the write must be answered");
+        let (req, seq, AssignmentOutcome::Applied(update)) = result else { panic!("{result:?}") };
+        assert_eq!((req, seq), (9, 1));
+        let h = update.assignment.harness("claude");
+        assert!(h.new_skills_default);
+        assert_eq!(h.skills.get(&id), Some(&false), "the reported draft item kept its value");
+        let materialized = update.entries.iter().find(|e| e.cause == sk1ll_proto::LogCause::DefaultMaterialized);
+        assert_eq!(materialized.and_then(|e| e.name.as_deref()), Some("new"));
+        serve.abort();
+    }
+
+    #[tokio::test]
+    async fn replayed_rename_and_replaced_session_cannot_overwrite_assignment() {
+        use sk1ll_proto::{AssignmentChanges, HarnessRename, ToggleChange, ToggleKind};
+        use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest};
+
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::open(crate::Config::new(dir.path().join("data"))).await.unwrap();
+        let skill: sk1ll_proto::ItemId = "skill-id".parse().unwrap();
+        let mut initial = sk1ll_proto::Assignment::default();
+        initial.set_skill("old", &skill, true);
+        initial.set_harness("existing", false);
+        server
+            .db(move |conn| db::insert_machine(conn, "m", &crate::hash("t"), 0, &initial, Scope::SelfOnly))
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = server.router();
+        let serve = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let connect = || async {
             let mut req = format!("ws://{address}/api/ws").into_client_request().unwrap();
             req.headers_mut().insert("authorization", "Bearer t".parse().unwrap());
             let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
-            let discard = DaemonMessage::DraftDiscarded { id: Some(7), items: vec![ItemRef::Skill("pdf".into())] };
-            let text = serde_json::to_string(&discard).unwrap();
-            ws.send(tungstenite::Message::text(text)).await.unwrap();
+            assert!(ws.next().await.is_some());
             ws
         };
-        let mut ws = connect().await;
-        let close = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match ws.next().await {
-                    Some(Ok(tungstenite::Message::Text(text))) => {
-                        let msg: ServerMessage = serde_json::from_str(&text).unwrap();
-                        assert!(!matches!(msg, ServerMessage::DraftDiscardApplied { .. }), "acknowledged");
-                    }
-                    Some(Ok(tungstenite::Message::Close(frame))) => break frame,
-                    Some(Ok(_)) => {}
-                    other => panic!("connection ended without a close frame: {other:?}"),
-                }
+        let send = |msg: DaemonMessage| tungstenite::Message::text(serde_json::to_string(&msg).unwrap());
+        let mut first = connect().await;
+        let denied =
+            HarnessRename { from: "old".into(), to: "existing".into(), operation_id: "deny".into(), replace: false };
+        first
+            .send(send(DaemonMessage::SetAssignment { req: 9, write: AssignmentWrite::RenameHarness(denied) }))
+            .await
+            .unwrap();
+        loop {
+            let tungstenite::Message::Text(text) = first.next().await.unwrap().unwrap() else { continue };
+            if let Ok(ServerMessage::AssignmentResult { req: 9, result, .. }) = serde_json::from_str(&text) {
+                assert!(matches!(result, AssignmentOutcome::Refused { status: 409, .. }));
+                break;
+            }
+        }
+        let rename =
+            HarnessRename { from: "old".into(), to: "existing".into(), operation_id: "move".into(), replace: true };
+        first
+            .send(send(DaemonMessage::SetAssignment { req: 10, write: AssignmentWrite::RenameHarness(rename.clone()) }))
+            .await
+            .unwrap();
+        // Treat the response as lost after the server commits.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while server
+                .db(|conn| db::harness_rename(conn, &db::machine(conn, "m")?.unwrap().registration, "move"))
+                .await
+                .unwrap()
+                .is_none()
+            {
+                tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("the session must close");
-        let frame = close.expect("a close code");
-        assert_eq!(u16::from(frame.code), close_code::AGAIN);
-        assert!(has_pdf().await, "an unknown baseline drops nothing");
+        .unwrap();
 
-        // HEAD reads again: the resent discard sees pdf in the live baseline.
-        server.fail_head.store(false, Ordering::SeqCst);
-        let mut ws = connect().await;
-        let applied = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Some(Ok(tungstenite::Message::Text(text))) = ws.next().await
-                    && let Ok(ServerMessage::DraftDiscardApplied { id }) = serde_json::from_str(&text)
-                {
-                    break id;
-                }
+        let (generation, cancel) = {
+            let conns = crate::lock(&server.conns);
+            (conns["m"].id, conns["m"].cancel.clone())
+        };
+        let push = server.push_lock.lock().await;
+        let token_hash = crate::hash("t");
+        let mut stale = Box::pin(on_set_assignment(
+            &server,
+            "m",
+            generation,
+            &token_hash,
+            AssignmentWrite::Changes(AssignmentChanges {
+                expected: None,
+                changes: vec![ToggleChange {
+                    harness: "existing".into(),
+                    kind: ToggleKind::NewRulesDefault,
+                    name: None,
+                    item_id: None,
+                    enabled: Some(false),
+                }],
+            }),
+            &cancel,
+        ));
+        // The first session passed the early generation check and is waiting to materialize defaults.
+        assert!(futures_util::poll!(&mut stale).is_pending());
+        let mut next = connect().await;
+        drop(push);
+        assert!(matches!(stale.await, Some(AssignmentOutcome::Refused { status: 409, .. })));
+
+        // Even if a later report had recreated the source with all-off defaults,
+        // replay of the completed operation leaves the populated destination alone.
+        let status =
+            MachineReport { seq: 1, inventory_complete: true, harnesses: vec!["old".into()], ..Default::default() };
+        next.send(send(DaemonMessage::Status(status))).await.unwrap();
+        next.send(send(DaemonMessage::SetAssignment { req: 11, write: AssignmentWrite::RenameHarness(rename) }))
+            .await
+            .unwrap();
+        loop {
+            let tungstenite::Message::Text(text) = next.next().await.unwrap().unwrap() else { continue };
+            if let Ok(ServerMessage::AssignmentResult { req: 11, seq, result }) = serde_json::from_str(&text) {
+                let AssignmentOutcome::Applied(update) = result else { panic!("{result:?}") };
+                assert_eq!(seq, 1);
+                assert!(update.entries.is_empty());
+                assert!(update.assignment.skill_enabled("existing", &skill));
+                assert!(update.assignment.harness("existing").new_rules_default);
+                assert!(!update.assignment.harness("old").new_rules_default);
+                break;
             }
-        })
-        .await
-        .expect("the resent discard must be acknowledged");
-        assert_eq!(applied, 7);
-        assert!(has_pdf().await, "pdf is in the baseline, so its toggle stays");
+        }
         serve.abort();
     }
 
