@@ -20,7 +20,7 @@ impl Daemon {
         } else {
             sync::displaced::discard_from(&Repo::open_git_only(self.repo_root())?, id).map(|()| None)
         };
-        self.refresh(eng)?;
+        self.reconcile(eng)?;
         self.event(Event::Status);
         if adopt {
             self.event(Event::Draft);
@@ -63,7 +63,7 @@ impl Daemon {
             let (repo, actions) = self.plan(false)?;
             sync::adopt(&repo, Self::find_conflict(&actions, &t)?)?;
             tracing::info!("adopted {} from {} into the draft", t.name, t.harness);
-            self.refresh(eng)?;
+            self.reconcile(eng)?;
             return Ok(None);
         }
         if !self.is_standalone() && !self.is_connected() {
@@ -99,7 +99,7 @@ impl Daemon {
         // Publish the draft before enabling it. On a lost reply it stays
         // available to retry with the same ID. Original copies stay until
         // the Assignment has been confirmed.
-        self.refresh(eng)?;
+        self.reconcile(eng)?;
         Ok(Some(PendingAdoption { adoption, created, id, changes }))
     }
 
@@ -130,12 +130,12 @@ impl Daemon {
             if created && matches!(error, Error::Upstream(_, _)) {
                 sync::unmanaged::rollback(&repo, &adoption)?;
             }
-            self.refresh(eng)?;
+            self.reconcile(eng)?;
             self.event(Event::Draft);
             return Err(error);
         }
         if Self::adopted_id(&repo, &adoption).ok().flatten().as_ref() != Some(&id) {
-            self.refresh(eng)?;
+            self.reconcile(eng)?;
             return Err(Error::Conflict(format!(
                 "skill:{} changed while its Assignment was being written; its copies in the harnesses are kept, \
                  adopt it again",
@@ -146,7 +146,7 @@ impl Daemon {
         let snapshot = self.snapshot();
         adoption.locations.retain(|l| snapshot.as_ref().is_some_and(|s| s.assignment.skill_enabled(&l.harness, &id)));
         sync::unmanaged::complete(&repo, &harnesses, &adoption)?;
-        self.refresh(eng)?;
+        self.reconcile(eng)?;
         self.event(Event::Draft);
         self.event(Event::Fleet);
         Ok(())
@@ -173,7 +173,7 @@ impl Daemon {
             sync::apply(&repo, a)?;
         }
         tracing::info!("overwrote {} in {}", t.name, t.harness);
-        self.refresh(eng)
+        self.reconcile(eng).map(drop)
     }
 }
 

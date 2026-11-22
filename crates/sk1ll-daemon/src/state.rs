@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use sk1ll_proto::{AssignmentSnapshot, ItemRef};
 
 /// Where the Machine stands against the server's Baseline: what the last pull
-/// (or refresh) found.
+/// (or reconcile) found.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum PullState {

@@ -1,9 +1,28 @@
+//! The reconcile loop. Desired state is a function of the Inputs: the repo
+//! (working tree, `HEAD` and refs, a pull's journal), `machine.toml` and a
+//! pending Harness rename, the applied Assignment, the pull state the
+//! lifecycle remembers, each Harness's placements (see
+//! [`sync::harness_fingerprint`]) and the recovery area. [`Inputs::gather`]
+//! fingerprints them from `lstat` alone, without reading a file or running
+//! git, and [`Daemon::reconcile`] plans and applies only when that
+//! fingerprint differs from the one it last reconciled successfully.
+//!
+//! Every trigger goes through it: file events and the periodic tick wake the
+//! background task ([`Daemon::wake`], [`run`]); the server session's
+//! Assignment snapshots and nudges, and API mutations, call it under the
+//! engine mutex they hold, so their reply reflects the reconciled state.
+//! A reconcile that failed, reported errors, or saw an input change within
+//! the racy window (see [`HashCache`]) records no fingerprint, so the next
+//! wake reconciles again.
+
 use super::*;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use sk1ll_core::harness_rename::RenameIntent;
+use sk1ll_core::hash::{HashCache, Stamp};
 use sk1ll_core::sync::{self, ActionKind, PlanOptions};
 use sk1ll_core::{MachineConfig, PullOutcome, Repo};
 use sk1ll_proto::{ConflictRef, MachineReport};
@@ -14,39 +33,156 @@ use crate::gitx;
 use crate::state::PullState;
 use crate::watch::WatchRoot;
 
+/// How long an input must have been left alone before its stamp proves it
+/// unchanged; tests write their trees just before reconciling.
+const RACY_WINDOW: std::time::Duration = if cfg!(test) { std::time::Duration::ZERO } else { HashCache::RACY_WINDOW };
+
+/// What a reconcile reads, each part as a cheap fingerprint: equal Inputs
+/// plan and apply the same.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Inputs {
+    /// The working tree, without `.git` and imports being staged.
+    repo: String,
+    /// `HEAD`, the refs, the index, the config and a pull's journal.
+    git: String,
+    /// `machine.toml` and a pending Harness rename's intent.
+    machine: String,
+    /// The applied Assignment's revision, and standalone its file.
+    assignment: (Option<u64>, Option<String>),
+    pull: PullState,
+    harnesses: Vec<(String, String)>,
+    displaced: String,
+}
+
+impl Inputs {
+    /// The Inputs as they are now, and the paths among them changed within
+    /// the racy window: only Inputs without any may be recorded.
+    pub(super) fn gather(d: &Daemon) -> sk1ll_core::Result<(Self, Vec<PathBuf>)> {
+        let at = SystemTime::now();
+        let mut racy = Vec::new();
+        let mut stamp = |path: &Path, exclude: Option<sync::Exclusion>| -> sk1ll_core::Result<String> {
+            let stamp = Stamp::of(path, exclude, false)?;
+            if !stamp.settled(at, RACY_WINDOW) {
+                racy.push(path.to_path_buf());
+            }
+            Ok(stamp.digest().to_string())
+        };
+        let root = d.repo_root();
+        let config = &d.cfg.machine_config;
+        let intent = config.with_extension("harness-rename.json");
+        let inputs = Self {
+            repo: stamp(root, Some(outside_git))?,
+            git: stamp(&root.join(".git"), Some(git_bookkeeping))?,
+            machine: format!("{}\n{}", stamp(config, None)?, stamp(&intent, None)?),
+            assignment: (
+                d.snapshot().map(|s| s.revision),
+                d.is_standalone().then(|| stamp(&d.cfg.assignment, None)).transpose()?,
+            ),
+            pull: d.lifecycle().pull().clone(),
+            harnesses: MachineConfig::load(config)?
+                .harnesses()
+                .iter()
+                .map(|(name, harness)| Ok((name.clone(), sync::harness_fingerprint(harness)?)))
+                .collect::<sk1ll_core::Result<_>>()?,
+            // Unit tests share one recovery area, which they write at any time.
+            displaced: if cfg!(test) { String::new() } else { stamp(&sync::displaced::root()?, None)? },
+        };
+        Ok((inputs, racy))
+    }
+
+    /// Which of them differ from `before`, for the log.
+    fn changed_since(&self, before: &Self) -> Vec<&'static str> {
+        let mut changed = Vec::new();
+        let mut check = |differs: bool, name| {
+            if differs {
+                changed.push(name);
+            }
+        };
+        check(self.repo != before.repo, "working tree");
+        check(self.git != before.git, "git");
+        check(self.machine != before.machine, "machine config");
+        check(self.assignment != before.assignment, "assignment");
+        check(self.pull != before.pull, "pull state");
+        check(self.harnesses != before.harnesses, "harnesses");
+        check(self.displaced != before.displaced, "recovery area");
+        changed
+    }
+}
+
+/// The working tree: everything but `.git` and imports being staged.
+fn outside_git(depth: usize, name: &std::ffi::OsStr) -> bool {
+    (depth == 1 && name == ".git") || name.to_string_lossy().starts_with(sk1ll_core::source::STAGE_PREFIX)
+}
+
+/// What git writes for itself: objects, logs, fetch results, lock files.
+fn git_bookkeeping(depth: usize, name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    name.ends_with(".lock")
+        || (depth == 1 && matches!(&*name, "objects" | "logs" | "lfs" | "FETCH_HEAD" | "ORIG_HEAD" | "COMMIT_EDITMSG"))
+}
+
 impl Daemon {
-    /// Plans and applies the sync, then recomputes the report. Conflicts are
-    /// reported, never applied. Without an assignment, harnesses are left alone.
-    ///
-    /// This is the expensive operation (a full plan and a dozen git
-    /// processes), so callers that know nothing it reads has changed since
-    /// the last one skip it: see [`Daemon::pull_refreshed`], [`Daemon::nudge`]
-    /// uses this to decide when it must recompute a report.
-    pub(crate) fn refresh(&self, eng: &mut Engine) -> Result<()> {
-        self.refresh_reporting(eng).map(drop)
+    /// Wakes the background reconcile ([`run`]): something may have changed.
+    pub(crate) fn wake(&self) {
+        self.wakeups.notify_one();
     }
 
-    /// [`Daemon::refresh`], returning what the sync failed to place (also
-    /// published as the last error).
-    pub(super) fn refresh_reporting(&self, eng: &mut Engine) -> Result<Vec<String>> {
-        let result = self.refresh_with_plan(eng, None).map(|outcome| outcome.errors);
-        eng.assignment_placement_failed = result.as_ref().map_or(true, |errors| !errors.is_empty());
-        result
+    /// Reconciles unless no Input changed since the last successful
+    /// reconcile: finishes a stopped pull, recovers, writes missing Item IDs,
+    /// plans and applies the sync, then publishes the report. Conflicts are
+    /// reported, never applied. Without an assignment, harnesses are left
+    /// alone. Returns what the sync failed to place (also published as the
+    /// last error).
+    pub(crate) fn reconcile(&self, eng: &mut Engine) -> Result<Vec<String>> {
+        self.reconcile_with(eng, None).map(|outcome| outcome.errors)
     }
 
-    pub(super) fn refresh_with_plan(&self, eng: &mut Engine, reviewed: Option<ReviewedSync>) -> Result<RefreshOutcome> {
+    /// [`Daemon::reconcile`]; a `reviewed` plan is applied instead of a new
+    /// one, always, and leaves the rest to the next reconcile.
+    pub(super) fn reconcile_with(&self, eng: &mut Engine, reviewed: Option<ReviewedSync>) -> Result<ReconcileOutcome> {
         if self.idle() {
-            return Ok(RefreshOutcome::default());
+            return Ok(ReconcileOutcome::default());
         }
+        // An edit of the Assignment file is a new revision, an Input.
         if self.is_standalone() {
             self.reload_local_assignment()?;
-        } else if let Ok(state) = self.ident.joined()
+        }
+        let gathered = Inputs::gather(self);
+        let why = match (&gathered, &eng.reconciled) {
+            _ if reviewed.is_some() => "a reviewed sync".to_string(),
+            (Err(e), _) => format!("the inputs could not be read ({e})"),
+            (Ok(_), None) => "no reconcile succeeded since the last change".to_string(),
+            (Ok((now, _)), Some(before)) if now == before => {
+                tracing::trace!("nothing changed since the last reconcile");
+                return Ok(ReconcileOutcome::default());
+            }
+            (Ok((now, _)), Some(before)) => format!("changed: {}", now.changed_since(before).join(", ")),
+        };
+        tracing::debug!("reconciling: {why}");
+        eng.reconciled = None;
+        let reviewed_plan = reviewed.is_some();
+        let outcome = self.apply_inputs(eng, reviewed);
+        self.hashes.sweep();
+        let outcome = outcome?;
+        match gathered {
+            Ok((inputs, racy)) if racy.is_empty() && !reviewed_plan && outcome.errors.is_empty() => {
+                eng.reconciled = Some(inputs);
+            }
+            Ok((_, racy)) if !racy.is_empty() => {
+                tracing::debug!("changed within the racy window, so reconciled again next time: {racy:?}");
+            }
+            _ => {}
+        }
+        Ok(outcome)
+    }
+
+    /// Plans and applies, in the order the Item ID and pull guards need.
+    fn apply_inputs(&self, eng: &mut Engine, reviewed: Option<ReviewedSync>) -> Result<ReconcileOutcome> {
+        if let Ok(state) = self.ident.joined()
             && RenameIntent::load(&self.cfg.machine_config, Some(&state.rename_authority()))?.is_some()
         {
             return Err(Error::Unavailable("waiting for the pending Harness rename to finish".into()));
         }
-        tracing::debug!("refreshing the local state");
-        eng.stale = true;
         let root = self.repo_root().to_path_buf();
         if self.is_standalone() && !root.join(".git").exists() {
             self.update(|v| {
@@ -56,7 +192,7 @@ impl Daemon {
             });
             self.roots
                 .send_replace(vec![WatchRoot::new(root, true), WatchRoot::new(self.cfg.assignment.clone(), false)]);
-            return Ok(RefreshOutcome::default());
+            return Ok(ReconcileOutcome::default());
         }
         if !root.join(".git").exists() {
             return Err(Error::Conflict(format!("{} is not set up yet (the server was unreachable)", root.display())));
@@ -65,7 +201,7 @@ impl Daemon {
         let machine = MachineConfig::load(&self.cfg.machine_config)?;
         let harnesses = machine.harnesses();
         let lock = eng.lock.as_ref().ok_or_else(|| Error::Conflict(format!("{} is not locked", root.display())))?;
-        let mut outcome = RefreshOutcome::default();
+        let mut outcome = ReconcileOutcome::default();
         let repo = Repo::open_git_only(&root)?;
         let finish = repo.finish_pull(lock);
         let pending = repo.pull_pending()?;
@@ -85,7 +221,7 @@ impl Daemon {
             }
             Ok(Some(_)) => None,
         };
-        let pull = self.pull_after_refresh(&root, finished, pending);
+        let pull = self.pull_after_reconcile(&root, finished, pending);
         // Sync waits for every item to have an Item ID; the report doesn't.
         let mut ids_ready = true;
         if !pending && reviewed.is_none() {
@@ -106,9 +242,13 @@ impl Daemon {
             && ids_ready
             && let Some(snap) = &snapshot
         {
+            let plan = |repo: &Repo| {
+                self.plans.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                sync::plan_cached(repo, &harnesses, &snap.assignment, PlanOptions::default(), &self.hashes)
+            };
             let planned = reviewed.map(Ok).unwrap_or_else(|| {
                 Repo::open(&root).and_then(|repo| {
-                    let actions = sync::plan(&repo, &harnesses, &snap.assignment, PlanOptions::default())?;
+                    let actions = plan(&repo)?;
                     Ok((repo, actions.into_iter().map(|action| (action, None)).collect()))
                 })
             });
@@ -130,7 +270,7 @@ impl Daemon {
                     }
 
                     let remaining = if outcome.changed.is_some() {
-                        sync::plan(&repo, &harnesses, &snap.assignment, PlanOptions::default())?
+                        plan(&repo)?
                     } else {
                         actions.into_iter().map(|(action, _)| action).collect()
                     };
@@ -204,16 +344,15 @@ impl Daemon {
             *r = roots;
             changed
         });
-        eng.stale = false;
         Ok(outcome)
     }
 
-    /// Where a refresh leaves the pull: what finishing a stopped pull
+    /// Where a reconcile leaves the pull: what finishing a stopped pull
     /// (`finished`) found, else what was known, checked against the repo. The
     /// journal decides whether a pull is pending. A remembered block whose
     /// Baseline `HEAD` has reached since (a pull while the daemon was
     /// stopped) is over.
-    pub(super) fn pull_after_refresh(&self, root: &Path, finished: Option<PullState>, pending: bool) -> PullState {
+    pub(super) fn pull_after_reconcile(&self, root: &Path, finished: Option<PullState>, pending: bool) -> PullState {
         if let Some(pull) = finished {
             return pull;
         }
@@ -237,9 +376,9 @@ impl Daemon {
         }
     }
 
-    /// After file changes (or the periodic reconciliation): refresh, and if
-    /// Blocked and the draft changed, try the pull again.
-    pub(crate) async fn on_files_changed(self: &Arc<Self>) -> Result<()> {
+    /// A background reconcile, after file changes or the periodic tick: and
+    /// if the Draft changed, a stopped pull is tried again.
+    async fn reconcile_in_background(self: &Arc<Self>) -> Result<()> {
         let drafted = self
             .blocking(|d, eng| {
                 if d.idle() {
@@ -247,7 +386,7 @@ impl Daemon {
                 }
                 sync::displaced::prune()?;
                 let before = d.view.borrow().report.drafts.clone();
-                d.refresh(eng)?;
+                d.reconcile(eng)?;
                 Ok(d.view.borrow().report.drafts != before)
             })
             .await?;
@@ -258,10 +397,24 @@ impl Daemon {
     }
 }
 
+/// Reconciles whenever woken ([`Daemon::wake`]); wakes while one runs make
+/// one more.
+pub(crate) async fn run(d: Arc<Daemon>) {
+    loop {
+        d.wakeups.notified().await;
+        if d.is_revoked() {
+            return;
+        }
+        if let Err(e) = d.reconcile_in_background().await {
+            d.set_error(format!("sync after file change: {e}"));
+        }
+    }
+}
+
 /// The working tree's items, by Item ID. Incomplete, so the server neither
 /// materializes defaults nor prunes orphans by it, while metadata is
 /// unreadable, a pull is pending (the tree is partial), an item has no
-/// Item ID yet (a refresh writes one; none is ever derived), or two items
+/// Item ID yet (a reconcile writes one; none is ever derived), or two items
 /// share one (until `repair-ids`).
 pub(crate) fn repo_inventory(root: &Path, harnesses: Vec<String>) -> sk1ll_proto::InventoryReport {
     let inventory = sk1ll_core::item_id::working_inventory(root);
@@ -314,7 +467,7 @@ pub(super) fn repo_report(root: &Path, harnesses: Vec<String>) -> Result<Machine
 }
 
 #[derive(Default)]
-pub(super) struct RefreshOutcome {
+pub(super) struct ReconcileOutcome {
     pub(super) errors: Vec<String>,
     pub(super) completed: Vec<PlacementView>,
     pub(super) changed: Option<PlacementView>,

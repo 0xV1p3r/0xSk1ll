@@ -78,7 +78,7 @@ impl Daemon {
             .ok_or_else(|| Error::BadRequest("this client is older than the daemon; update it".into()))?;
         let plan = harness_change::apply(lock, &repo, &self.cfg.machine_config, &req.change, fingerprint)?;
         tracing::info!("harness change {:?}: {} placed item(s) left in place", req.change, plan.placed.len());
-        let errors = match self.refresh_reporting(eng) {
+        let errors = match self.reconcile(eng) {
             Ok(failed) => failed,
             Err(e) => vec![format!("sync: {e}")],
         };

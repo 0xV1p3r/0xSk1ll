@@ -9,59 +9,31 @@ use crate::gitx;
 use crate::state::PullState;
 
 impl Daemon {
-    /// What a pull or push can change among the things the report is made
-    /// from: where `HEAD` and origin's branch are (the baseline, the unpushed
-    /// items and the working tree a pull moves all follow from them) and
-    /// where the pull stands.
-    pub(super) fn pull_inputs(&self) -> Result<PullInputs> {
-        let root = self.repo_root();
-        Ok(PullInputs {
-            head: gitx::rev(root, "HEAD")?,
-            remote: gitx::remote_head(root)?,
-            pull: self.lifecycle().pull().clone(),
-            pending: Repo::open_git_only(root)?.pull_pending()?,
-        })
-    }
-
     /// After a Draft change, which may have cleared what stopped the last
     /// pull: a Blocked Machine pulls again.
     pub(super) async fn retry_stopped_pull(self: &Arc<Self>) {
         if self.lifecycle().pull_stopped() && (self.is_connected() || self.is_standalone()) {
-            let _ = self.pull_refreshed().await;
+            let _ = self.pull().await;
         }
     }
 
     /// Fetches the server's baseline and moves onto it (draft carried along),
-    /// pushes queued commits, and syncs.
+    /// pushes queued commits, and reconciles. The fetch (or the first clone)
+    /// and the push run without the engine mutex; moving onto what was
+    /// fetched and the reconcile hold it. Each step under the mutex checks
+    /// again that the daemon still manages the repo, and moves onto whatever
+    /// was fetched last, whoever fetched it. A pull that moved nothing
+    /// changed no Input, so its reconcile has nothing to do.
     pub(crate) async fn pull(self: &Arc<Self>) -> Result<PullResult> {
-        self.pull_with(false).await
-    }
-
-    /// A pull where the local state was refreshed just before (by the caller,
-    /// or by the session on connecting): the sync after it is skipped if the
-    /// pull moved nothing, since it would recompute the same report from the
-    /// same inputs. Standalone always syncs.
-    pub(super) async fn pull_refreshed(self: &Arc<Self>) -> Result<PullResult> {
-        self.pull_with(!self.is_standalone()).await
-    }
-
-    /// The fetch (or the first clone) and the push run without the engine
-    /// mutex; moving onto what was fetched and the sync hold it. Each step
-    /// under the mutex checks again that the daemon still manages the repo,
-    /// and moves onto whatever was fetched last, whoever fetched it.
-    pub(super) async fn pull_with(self: &Arc<Self>, refreshed: bool) -> Result<PullResult> {
         let standalone = self.is_standalone();
-        // `None`: refresh whatever happens.
-        let before = self
-            .blocking(move |d, eng| {
-                d.ensure_managed()?;
-                if standalone {
-                    d.require_origin()?;
-                }
-                d.lock_repo(eng)?;
-                Ok(if refreshed && !eng.stale { d.pull_inputs().ok() } else { None })
-            })
-            .await?;
+        self.blocking(move |d, eng| {
+            d.ensure_managed()?;
+            if standalone {
+                d.require_origin()?;
+            }
+            d.lock_repo(eng)
+        })
+        .await?;
         let result = match self.network(|d| d.fetch_baseline()).await {
             Ok(()) => {
                 self.blocking(|d, eng| {
@@ -81,11 +53,7 @@ impl Daemon {
             if d.idle() {
                 return result;
             }
-            // A failed pull may have stopped half-way: that always refreshes.
-            // So does one that another operation ran beside.
-            if !(result.is_ok() && before.is_some() && !eng.stale && before == d.pull_inputs().ok()) {
-                d.refresh(eng)?;
-            }
+            d.reconcile(eng)?;
             match &result {
                 Ok(r) => {
                     if let PullResult::Updated { to, .. } = r {
@@ -247,7 +215,7 @@ impl Daemon {
         })
         .await?;
         let result = self.push_pending().await;
-        self.blocking(|d, eng| d.refresh(eng)).await?;
+        self.blocking(|d, eng| d.reconcile(eng)).await?;
         match result {
             Ok(pushed) => Ok(PushResult { pushed }),
             Err(Error::Internal(e)) => {
@@ -262,12 +230,11 @@ impl Daemon {
         if self.idle() {
             return Ok(());
         }
-        // The session refreshed before its first status, moments ago.
-        self.pull_refreshed().await.map(drop)
+        self.pull().await.map(drop)
     }
 
     /// Commits under the engine mutex; a joined daemon then pushes, and the
-    /// state is refreshed once the push is done.
+    /// state is reconciled once the push is done.
     pub(crate) async fn commit(self: &Arc<Self>, req: CommitRequest) -> Result<CommitResponse> {
         let mut response = self.blocking(move |d, eng| d.commit_locally(eng, req)).await?;
         if !self.is_standalone() {
@@ -282,7 +249,7 @@ impl Daemon {
         }
         let push_error = response.push_error.clone();
         self.blocking(move |d, eng| {
-            d.refresh(eng)?;
+            d.reconcile(eng)?;
             if let Some(e) = &push_error {
                 d.set_error(format!("push: {e}"));
             }
@@ -317,7 +284,7 @@ impl Daemon {
 
     /// The server's baseline is now `baseline`: pull unless already on it. A
     /// nudge for the baseline the machine is on (the server sends one on every
-    /// connect) says nothing about the local state, so it costs no refresh.
+    /// connect) changes no Input, so its reconcile has nothing to do.
     pub(crate) async fn nudge(self: &Arc<Self>, baseline: String) -> Result<()> {
         let pull = self
             .blocking(move |d, eng| {
@@ -330,13 +297,10 @@ impl Daemon {
                 if current.as_deref() != Some(baseline.as_str()) || d.lifecycle().pull_stopped() {
                     return Ok(true);
                 }
-                if eng.stale {
-                    d.refresh(eng)?;
-                }
+                d.reconcile(eng)?;
                 Ok(false)
             })
             .await?;
-        // Not `pull_refreshed`: the last refresh may be long ago.
         if pull {
             self.pull().await?;
         }
@@ -350,13 +314,4 @@ pub(super) fn is_rejected_push(e: &sk1ll_core::Error) -> bool {
     let text = e.to_string();
     ["[rejected]", "non-fast-forward", "fetch first", "failed to push some refs"].iter().any(|m| text.contains(m))
         && !text.contains("unable to access")
-}
-
-/// See [`Daemon::pull_inputs`].
-#[derive(PartialEq)]
-pub(super) struct PullInputs {
-    pub(super) head: Option<String>,
-    pub(super) remote: Option<String>,
-    pub(super) pull: PullState,
-    pub(super) pending: bool,
 }

@@ -155,17 +155,17 @@ async fn send(ws: &mut Sink, msg: &DaemonMessage) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn refresh_report(d: &Arc<Daemon>) -> anyhow::Result<MachineReport> {
+async fn reconciled_report(d: &Arc<Daemon>) -> anyhow::Result<MachineReport> {
     match d
         .blocking(|d, eng| {
-            d.refresh(eng)?;
+            d.reconcile(eng)?;
             Ok(d.view().report)
         })
         .await
     {
         Ok(report) => Ok(report),
         Err(e) => {
-            d.set_error(format!("refreshing before reporting to the Server: {e}"));
+            d.set_error(format!("reconciling before reporting to the Server: {e}"));
             Err(e.into())
         }
     }
@@ -183,7 +183,7 @@ async fn session(d: &Arc<Daemon>, ws: Ws, inbox: &mpsc::UnboundedSender<ServerMe
     }
     let mut sent = None;
     let mut seq = 0;
-    send_report(&mut sink, refresh_report(d).await?, &mut sent, &mut seq).await?;
+    send_report(&mut sink, reconciled_report(d).await?, &mut sent, &mut seq).await?;
     let (sender, mut writes) = mpsc::channel::<SessionWrite>(16);
     d.assignment_session.send_replace(Some(sender));
     d.set_link(Link::Connected);
@@ -233,7 +233,7 @@ async fn session(d: &Arc<Daemon>, ws: Ws, inbox: &mpsc::UnboundedSender<ServerMe
                 if changed.is_err() {
                     return Ok(());
                 }
-                // Reports are published only at the end of a local refresh.
+                // Reports are published only at the end of a reconcile.
                 // Reading them here must not wait for a pull's engine mutex.
                 let report = view.borrow_and_update().report.clone();
                 send_report(&mut sink, report, &mut sent, &mut seq).await?;

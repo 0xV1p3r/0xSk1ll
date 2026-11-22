@@ -28,7 +28,7 @@
 //!   environment turns off git's opportunistic index refresh, see
 //!   [`crate::prepare_process`]), and it does not finish an interrupted
 //!   import ([`Daemon::recover_imports`] needs the engine mutex and the
-//!   [`EngineLock`]). Until the next refresh has put such an import back, a
+//!   [`EngineLock`]). Until the next reconcile has put such an import back, a
 //!   reader shows the repo as it is, with that import missing;
 //! - may see the repo in the middle of a concurrent operation (a pull moving
 //!   the working tree). What it returns is then momentarily stale and the
@@ -70,7 +70,7 @@ mod read;
 mod reconcile;
 mod views;
 
-pub(crate) use reconcile::repo_inventory;
+pub(crate) use reconcile::{repo_inventory, run as reconcile_loop};
 use {placement::*, reconcile::*, views::*};
 
 /// Name a `block` instructions conflict goes by (one block per harness).
@@ -136,16 +136,22 @@ pub(crate) struct Daemon {
     pub(crate) restart_assignment_session: Notify,
     pub(crate) roots: watch::Sender<Vec<WatchRoot>>,
     pub(crate) http: reqwest::Client,
+    /// Wakes the background reconcile ([`reconcile::run`]).
+    wakeups: Notify,
+    /// The hashes of trees planning found unchanged (see [`HashCache`]).
+    hashes: sk1ll_core::hash::HashCache,
+    /// How many reconciles planned a sync, for tests.
+    plans: std::sync::atomic::AtomicU64,
 }
 
 /// Mutable state, only touched with the engine mutex held.
 pub(crate) struct Engine {
     /// Core's engine lock on the repo, held from startup (or from the clone).
     lock: Option<EngineLock>,
-    /// The published report is not the result of a successful refresh: the
-    /// last one failed, or none ran yet. Nothing may be derived from it.
-    stale: bool,
-    assignment_placement_failed: bool,
+    /// The Inputs last reconciled successfully (see [`reconcile`]); `None`
+    /// when the last reconcile failed, reported errors, or none ran yet, so
+    /// the next one runs whatever the Inputs.
+    reconciled: Option<reconcile::Inputs>,
     #[cfg(test)]
     after_sync_review: Option<Box<dyn FnOnce() + Send>>,
 }
@@ -222,8 +228,7 @@ impl Daemon {
             assignment_writes: tokio::sync::Mutex::new(()),
             engine: Mutex::new(Engine {
                 lock: None,
-                stale: true,
-                assignment_placement_failed: true,
+                reconciled: None,
                 #[cfg(test)]
                 after_sync_review: None,
             }),
@@ -233,6 +238,14 @@ impl Daemon {
             restart_assignment_session: Notify::new(),
             roots: watch::channel(Vec::new()).0,
             http: crate::server::http_client().build().context("building the HTTP client")?,
+            wakeups: Notify::new(),
+            // Tests reconcile trees they wrote a moment ago.
+            hashes: if cfg!(test) {
+                sk1ll_core::hash::HashCache::with_racy_window(std::time::Duration::ZERO)
+            } else {
+                sk1ll_core::hash::HashCache::new()
+            },
+            plans: Default::default(),
         }))
     }
 
@@ -264,7 +277,7 @@ impl Daemon {
         }
         Repo::init_committed(root)?;
         self.lock_repo(eng)?;
-        self.refresh(eng)
+        self.reconcile(eng).map(drop)
     }
 
     /// Runs `f` with the engine on a blocking thread. The engine mutex is
@@ -548,7 +561,7 @@ impl Daemon {
             {
                 tracing::warn!("writing the assignment cache {}: {e}", d.cfg.assignment.display());
             }
-            d.refresh(eng)
+            d.reconcile(eng).map(drop)
         })
         .await
     }

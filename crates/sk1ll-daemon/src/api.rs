@@ -527,7 +527,7 @@ async fn assignment(
         // Read through the engine so an external CLI file edit is visible.
         let snap = d
             .blocking(|d, eng| {
-                d.refresh(eng)?;
+                d.reconcile(eng)?;
                 Ok(d.snapshot().expect("local assignment").as_ref().clone())
             })
             .await?;

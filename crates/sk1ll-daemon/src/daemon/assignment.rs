@@ -123,17 +123,16 @@ impl Daemon {
     /// Publishes and applies a just saved local Assignment. The save is the
     /// write: a failure from here on shows in the status, never as a failed write.
     pub(super) fn saved_local_assignment(&self, eng: &mut Engine) -> Vec<String> {
-        let result = self.reload_local_assignment().and_then(|()| self.refresh_reporting(eng));
-        self.assignment_placement_outcome(eng, result)
+        let result = self.reload_local_assignment().and_then(|()| self.reconcile(eng));
+        self.assignment_placement_outcome(result)
     }
 
-    pub(super) fn assignment_placement_outcome(&self, eng: &mut Engine, result: Result<Vec<String>>) -> Vec<String> {
+    pub(super) fn assignment_placement_outcome(&self, result: Result<Vec<String>>) -> Vec<String> {
         let errors = result.unwrap_or_else(|e| {
             let message = crate::auth::redact(&format!("applying the saved Assignment: {e}"));
             self.set_error(message.clone());
             vec![message]
         });
-        eng.assignment_placement_failed = !errors.is_empty();
         errors.into_iter().map(|error| crate::auth::redact(&error)).collect()
     }
 
@@ -237,9 +236,11 @@ impl Daemon {
             if snap.revision < have.revision {
                 tracing::info!("ignoring stale assignment revision {} (have {})", snap.revision, have.revision);
             }
-            if snap.revision == have.revision && eng.assignment_placement_failed {
-                let result = self.refresh_reporting(eng);
-                return Ok(self.assignment_placement_outcome(eng, result));
+            // A placement that failed for it is tried again, if anything
+            // changed since or it failed: the reconcile knows.
+            if snap.revision == have.revision {
+                let result = self.reconcile(eng);
+                return Ok(self.assignment_placement_outcome(result));
             }
             return Ok(Vec::new());
         }
@@ -255,8 +256,8 @@ impl Daemon {
             v.awaiting_assignment = false;
         });
         self.event(Event::Assignment { revision });
-        let result = self.refresh_reporting(eng);
-        Ok(self.assignment_placement_outcome(eng, result))
+        let result = self.reconcile(eng);
+        Ok(self.assignment_placement_outcome(result))
     }
 }
 

@@ -105,7 +105,7 @@ impl Daemon {
         let snapshot =
             AssignmentSnapshot { revision: update.revision, assignment: update.assignment.clone(), registration: None };
         if self.snapshot().is_some_and(|current| current.revision >= snapshot.revision) {
-            update.errors = self.refresh_reporting(eng)?;
+            update.errors = self.reconcile(eng)?;
         } else {
             update.errors = self.apply_assignment(eng, snapshot)?;
         }

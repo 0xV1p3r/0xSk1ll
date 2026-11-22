@@ -1,5 +1,5 @@
 //! Watches the repo's working tree and every harness's skills and
-//! instructions paths, and re-syncs once changes settle.
+//! instructions paths, and wakes the reconcile once changes settle.
 //!
 //! Inside `.git` only `HEAD`, `packed-refs` and `refs/heads/` count, so
 //! commits, restores and checkouts are noticed but git's own bookkeeping (and
@@ -7,10 +7,12 @@
 //! doesn't trigger another one; one that does write converges after one
 //! more pass.
 //!
-//! Events only set a coalesced dirty flag. A sync runs after a quiet period
-//! (`debounce`), but a steady stream of events postpones it at most
-//! `debounce_max`. Independently of events and of the server connection, a
-//! periodic reconciliation (`reconcile_every`) re-syncs too.
+//! Events only set a coalesced dirty flag. The reconcile is woken after a
+//! quiet period (`debounce`), but a steady stream of events postpones it at
+//! most `debounce_max`. Independently of events and of the server
+//! connection, the periodic tick (`reconcile_every`) wakes it too. A wake
+//! costs only the Inputs' fingerprint when nothing changed (see
+//! [`crate::daemon::Daemon::reconcile`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -177,8 +179,8 @@ async fn settle(dirty: &Dirty, d: &Daemon) {
 }
 
 /// Keeps the watcher in line with the roots the daemon publishes (and with
-/// directories appearing), and runs [`Daemon::on_files_changed`] once changes
-/// settle or the reconciliation interval passes. Registers the initial watches
+/// directories appearing), and wakes the reconcile ([`Daemon::wake`]) once
+/// changes settle or the reconciliation interval passes. Registers the initial watches
 /// before returning the future, so the local API cannot acknowledge readiness
 /// while file changes can still be missed.
 pub(crate) fn run(d: Arc<Daemon>) -> impl Future<Output = ()> {
@@ -190,7 +192,7 @@ pub(crate) fn run(d: Arc<Daemon>) -> impl Future<Output = ()> {
     let mut roots = roots_rx.borrow_and_update().clone();
     let mut current = watched_targets(&roots);
     let mut _watcher = build(&current, &roots, git_dir.clone(), dirty.clone());
-    // Changes between startup's refresh and installing the watches have no
+    // Changes between startup's reconcile and installing the watches have no
     // event to replay. Reconcile once with the watches already installed.
     dirty.mark();
     async move {
@@ -220,10 +222,8 @@ pub(crate) fn run(d: Arc<Daemon>) -> impl Future<Output = ()> {
                 // Whatever appeared hasn't been seen yet.
                 dirty.flag.store(true, Ordering::SeqCst);
             }
-            if dirty.take()
-                && let Err(e) = d.on_files_changed().await
-            {
-                d.set_error(format!("sync after file change: {e}"));
+            if dirty.take() {
+                d.wake();
             }
         }
     }

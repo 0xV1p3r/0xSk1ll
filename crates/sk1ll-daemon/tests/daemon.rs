@@ -1044,11 +1044,11 @@ async fn reconnecting_does_not_send_status_until_refresh_succeeds() {
     assert!(report.items.iter().any(|item| item.id == skill_id("w")));
 }
 
-/// Connecting costs one refresh (the one before the first status) when
-/// nothing changed: no extra refresh for a catch-up pull
-/// that moved nothing, or for the server's nudge for the baseline in use.
+/// Connecting costs no reconcile when nothing changed since the one at
+/// startup: not the one before the first status, not the catch-up pull that
+/// moved nothing, not the server's nudge for the baseline in use.
 #[tokio::test(flavor = "multi_thread")]
-async fn connecting_refreshes_once_when_nothing_changed() {
+async fn connecting_costs_no_reconcile_when_nothing_changed() {
     let server = FakeServer::new().await;
     // Neither the watcher nor the reconciliation refreshes during the test.
     let mut m = solo("solo", &server.url(), Some(snapshot(1, &[])))
@@ -1057,7 +1057,9 @@ async fn connecting_refreshes_once_when_nothing_changed() {
         .with_env("SK1LL_RECONCILE_INTERVAL", "1h")
         .with_env("RUST_LOG", "info,sk1ll_daemon=debug");
     let baseline = git(&m.repo(), &["rev-parse", "HEAD"]);
-    let refreshes = |m: &Machine| m.log().matches("refreshing the local state").count();
+    let refreshes = |m: &Machine| m.log().matches("reconciling: ").count();
+    // Inputs written moments ago are reconciled every time (the racy window).
+    tokio::time::sleep(sk1ll_core::hash::HashCache::RACY_WINDOW).await;
     m.start().await;
     for connection in 0..2 {
         let (mut ws, _) = server.accept().await;
@@ -1078,11 +1080,7 @@ async fn connecting_refreshes_once_when_nothing_changed() {
         assert_eq!(m.status().await.headline, MachineStatus::InSync);
         drop(ws);
         eventually(|| async { (m.status().await.connection == Connection::Offline).then_some(()) }).await;
-        if connection == 0 {
-            assert_eq!(refreshes(&m), 2, "one at startup, one on connecting");
-        } else {
-            assert_eq!(refreshes(&m), 3, "one more for the second connection");
-        }
+        assert_eq!(refreshes(&m), 1, "connection {connection}: only the one at startup");
     }
 }
 

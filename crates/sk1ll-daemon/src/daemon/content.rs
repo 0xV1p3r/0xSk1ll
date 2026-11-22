@@ -8,16 +8,16 @@ use crate::client::{RestoreRequest, RestoreResponse};
 use crate::error::{Error, Result};
 
 impl Daemon {
-    /// Gives each item whose Item ID is a duplicate a new one, then refreshes.
+    /// Gives each item whose Item ID is a duplicate a new one, then reconciles.
     pub(crate) fn repair_ids(&self, eng: &mut Engine) -> Result<usize> {
         self.ensure_managed()?;
         self.lock_repo(eng)?;
         let count = Repo::open(self.repo_root())?.repair_ids()?;
-        self.refresh(eng)?;
+        self.reconcile(eng)?;
         Ok(count)
     }
 
-    /// Restores draft items and refreshes the local state.
+    /// Restores draft items and reconciles.
     pub(crate) async fn restore(self: &Arc<Self>, req: RestoreRequest) -> Result<RestoreResponse> {
         let response = self.blocking(move |d, eng| d.restore_locally(eng, req)).await?;
         self.retry_stopped_pull().await;
@@ -45,7 +45,7 @@ impl Daemon {
         }
         let after: BTreeSet<ItemRef> = repo.draft()?.into_iter().map(|d| d.item).collect();
         let discarded: Vec<ItemRef> = before.difference(&after).cloned().collect();
-        self.refresh(eng)?;
+        self.reconcile(eng)?;
         Ok(RestoreResponse { discarded })
     }
 
@@ -55,7 +55,7 @@ impl Daemon {
         if !sk1ll_core::content::write_file(&Repo::open(self.repo_root())?, req)? {
             return Err(Error::Conflict("File changed on disk".into()));
         }
-        self.refresh(eng)
+        self.reconcile(eng).map(drop)
     }
 
     pub(crate) fn create_item(&self, eng: &mut Engine, req: crate::client::CreateItemRequest) -> Result<()> {
@@ -67,7 +67,7 @@ impl Daemon {
             (Some(_), _) => return Err(Error::BadRequest("only skills are bundled".into())),
             (None, _) => repo.create_item(&req.kind, &req.name, req.description.as_deref().unwrap_or(""))?,
         }
-        self.refresh(eng)?;
+        self.reconcile(eng)?;
         Ok(())
     }
     /// Restore brings the same Item ID and its toggles back.
@@ -75,7 +75,7 @@ impl Daemon {
         self.ensure_managed()?;
         self.lock_repo(eng)?;
         let deleted = Repo::open(self.repo_root())?.delete_item(&req.kind, &req.name);
-        self.refresh(eng)?;
+        self.reconcile(eng)?;
         Ok(deleted?)
     }
     pub(crate) fn rename_item(
@@ -93,13 +93,13 @@ impl Daemon {
         let item = if req.kind == "skill" { ItemRef::Skill(req.to.clone()) } else { ItemRef::Rule(req.to.clone()) };
         match repo.rename_item(&req.kind, &req.name, &req.to) {
             Ok(()) => {
-                if let Err(e) = self.refresh(eng) {
-                    self.set_error(format!("refreshing after renaming {} to {item}: {e}", req.name));
+                if let Err(e) = self.reconcile(eng) {
+                    self.set_error(format!("reconciling after renaming {} to {item}: {e}", req.name));
                 }
                 Ok(crate::client::RenameItemResponse { item })
             }
             Err(RenameError::Moved(e)) => {
-                let _ = self.refresh(eng);
+                let _ = self.reconcile(eng);
                 Err(Error::Internal(anyhow::anyhow!(
                     "`{}` was renamed to `{}`, but updating its metadata failed: {e}",
                     req.name,

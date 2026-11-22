@@ -97,6 +97,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             Err(e) => d.set_error(format!("startup: {e}")),
             Ok(()) => {}
         }
+        tokio::spawn(daemon::reconcile_loop(d.clone()));
         tokio::spawn(watch::run(d.clone()));
         if !d.is_standalone() {
             tokio::spawn(server::run(d.clone()));

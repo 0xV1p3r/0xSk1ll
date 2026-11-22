@@ -203,7 +203,7 @@ impl Daemon {
     /// The plan for the repo as it is, changing nothing: what a reader may
     /// run. An import that an interrupted update left set aside is not put
     /// back here (that needs the engine mutex and the repo's engine lock), so
-    /// until the next refresh has done it this plan sees it as missing.
+    /// until the next reconcile has done it this plan sees it as missing.
     pub(super) fn plan_as_is(&self, snap: &AssignmentSnapshot, force: bool) -> Result<(Repo, Vec<Action>)> {
         let repo = Repo::open(self.repo_root())?;
         Self::require_sync_ready(&repo)?;

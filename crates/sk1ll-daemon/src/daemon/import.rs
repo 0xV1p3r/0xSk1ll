@@ -37,7 +37,7 @@ impl Daemon {
             d.ensure_managed()?;
             d.lock_repo(eng)?;
             let reports = Repo::open(d.repo_root())?.apply_updates(fetched, force);
-            d.refresh(eng)?;
+            d.reconcile(eng)?;
             Ok(reports?.into_iter().map(import_updated).collect())
         })
         .await
@@ -114,7 +114,7 @@ impl Daemon {
             d.ensure_managed()?;
             d.lock_repo(eng)?;
             let added = Repo::open(d.repo_root())?.add_fetched(given(&name), fetched);
-            d.refresh(eng)?;
+            d.reconcile(eng)?;
             Ok(import_updated(added?))
         })
         .await
@@ -131,7 +131,7 @@ impl Daemon {
         self.ensure_managed()?;
         self.lock_repo(eng)?;
         let removed = Repo::open(self.repo_root())?.remove_import(name);
-        self.refresh(eng)?;
+        self.reconcile(eng)?;
         Ok(removed?)
     }
 
@@ -140,7 +140,7 @@ impl Daemon {
         self.ensure_managed()?;
         self.lock_repo(eng)?;
         let forked = Repo::open(self.repo_root())?.fork(name);
-        self.refresh(eng)?;
+        self.reconcile(eng)?;
         Ok(forked?)
     }
 

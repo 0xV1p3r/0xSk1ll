@@ -251,7 +251,7 @@ async fn reviewed_sync_reports_partial_progress_and_stops_on_digest_mismatch() {
     assert_eq!(returned.errors.len(), 1);
     assert!(returned.errors[0].contains("b-io-error"));
     assert_eq!(daemon.view().last_error.as_ref(), returned.errors.first());
-    assert!(!lock(&daemon.engine).stale);
+    assert!(lock(&daemon.engine).reconciled.is_none(), "a reviewed sync leaves the rest to the next reconcile");
     assert!(matches!(events.try_recv().unwrap(), Event::Status));
     assert!(skills.join("a-success/SKILL.md").is_file());
     assert!(!skills.join("z-later").exists());
@@ -431,7 +431,7 @@ fn confirmed(revision: u64, enabled: bool) -> Result<AssignmentUpdate> {
 async fn a_slow_assignment_confirmation_blocks_no_other_call() {
     let dir = tempfile::tempdir().unwrap();
     let (d, mut session, _) = joined_daemon(dir.path(), PullRecord::default());
-    d.blocking(|d, eng| d.refresh(eng)).await.unwrap();
+    d.blocking(|d, eng| d.reconcile(eng).map(drop)).await.unwrap();
     let writer = d.clone();
     let write = tokio::spawn(async move { writer.write_assignment(harness_toggle(false)).await });
     let request = session.recv().await.expect("the write reached the session");
@@ -439,7 +439,7 @@ async fn a_slow_assignment_confirmation_blocks_no_other_call() {
     let quick = std::time::Duration::from_secs(5);
     let started = std::time::Instant::now();
     tokio::time::timeout(quick, d.reading(|d| d.draft())).await.expect("a reader waited").unwrap();
-    tokio::time::timeout(quick, d.blocking(|d, eng| d.refresh(eng)))
+    tokio::time::timeout(quick, d.blocking(|d, eng| d.reconcile(eng).map(drop)))
         .await
         .expect("the engine mutex was held during the request")
         .unwrap();
@@ -492,7 +492,7 @@ async fn a_confirmation_overtaken_by_a_newer_revision_is_not_applied() {
 async fn a_restart_remembers_the_block_and_the_server_baseline() {
     let dir = tempfile::tempdir().unwrap();
     let (d, _session, state) = joined_daemon(dir.path(), PullRecord::default());
-    d.blocking(|d, eng| d.refresh(eng)).await.unwrap();
+    d.blocking(|d, eng| d.reconcile(eng).map(drop)).await.unwrap();
     let head = gitx::rev(d.repo_root(), "HEAD").unwrap();
     let clash = ItemRef::Skill("pdf".into());
     let blocked = PullState::Blocked { baseline: "f00d".repeat(10), items: vec![clash.clone()] };
@@ -514,15 +514,15 @@ async fn a_restart_remembers_the_block_and_the_server_baseline() {
     assert_eq!(view.server_baseline, Some("f00d".repeat(10)));
     assert_eq!(view.connection, Connection::Connecting);
     assert_eq!(restarted.lifecycle().pull(), &blocked);
-    // A refresh keeps it: HEAD is still not on the blocking Baseline.
-    restarted.blocking(|d, eng| d.refresh(eng)).await.unwrap();
+    // A reconcile keeps it: HEAD is still not on the blocking Baseline.
+    restarted.blocking(|d, eng| d.reconcile(eng).map(drop)).await.unwrap();
     assert!(restarted.view().report.blocked);
 
     // Once HEAD contains that Baseline (a pull while the daemon was
     // stopped), the block is over.
     let head = head.expect("an initialized repo has a commit");
     restarted.note(|lc| lc.set_pull(PullState::Blocked { baseline: head, items: Vec::new() }));
-    restarted.blocking(|d, eng| d.refresh(eng)).await.unwrap();
+    restarted.blocking(|d, eng| d.reconcile(eng).map(drop)).await.unwrap();
     assert_eq!(restarted.lifecycle().pull(), &PullState::Clear);
     assert!(!restarted.view().report.blocked);
     assert_eq!(DaemonState::load(&cfg.state).unwrap().unwrap().record.pull, PullState::Clear);
@@ -548,4 +548,89 @@ async fn a_halted_daemon_leaves_the_state_file_alone() {
     d.blocking(|d, eng| d.revoke(eng, "the old registration was removed")).await.unwrap();
     assert_eq!(DaemonState::load(&d.cfg.state).unwrap(), Some(next));
     assert!(d.ensure_managed().is_err());
+}
+
+/// A reconcile plans only when an Input changed, and each kind of change
+/// costs one; trees that did not change are not hashed again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reconcile_runs_once_per_input_change_and_rehashes_only_changed_trees() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = tempfile::tempdir().unwrap();
+    let (d, _session, _) = joined_daemon(dir.path(), PullRecord::default());
+    let root = d.repo_root().to_path_buf();
+    std::fs::create_dir_all(root.join("personal/pdf")).unwrap();
+    std::fs::write(root.join("personal/pdf/SKILL.md"), "PDFs.\n").unwrap();
+    Repo::open(&root).unwrap().assign_missing_ids().unwrap();
+    let reconcile = || {
+        let d = d.clone();
+        async move { d.blocking(|d, eng| d.reconcile(eng)).await.unwrap() }
+    };
+    // Placing the skill changes the harness: one more pass settles it.
+    assert!(reconcile().await.is_empty());
+    assert!(reconcile().await.is_empty());
+    let placed = dir.path().join("h/pdf/SKILL.md");
+    assert_eq!(std::fs::read_to_string(&placed).unwrap(), "PDFs.\n");
+    let counts = || (d.plans.load(Relaxed), d.hashes.hashed());
+    let settled = counts();
+    reconcile().await;
+    assert_eq!(counts(), settled, "nothing changed: no plan, nothing hashed");
+
+    let git = |args: &[&str]| sk1ll_core::git::Git::new(&root).args(args).run().unwrap();
+    type Change<'a> = Box<dyn Fn() + 'a>;
+    let changes: [(&str, Change, u64); 6] = [
+        ("working tree", Box::new(|| std::fs::write(root.join("README.md"), "notes\n").unwrap()), 0),
+        ("git", Box::new(|| drop(git(&["branch", "other"]))), 0),
+        (
+            "machine config",
+            Box::new(|| {
+                let text = std::fs::read_to_string(&d.cfg.machine_config).unwrap();
+                std::fs::write(&d.cfg.machine_config, format!("{text}\n# edited\n")).unwrap();
+            }),
+            0,
+        ),
+        (
+            "assignment",
+            Box::new(|| {
+                let next = AssignmentSnapshot { revision: 2, ..d.snapshot().unwrap().as_ref().clone() };
+                *d.snapshot.write().unwrap() = Some(Arc::new(next));
+            }),
+            0,
+        ),
+        (
+            "pull state",
+            Box::new(|| {
+                let pull = PullState::Blocked { baseline: "f00d".repeat(10), items: Vec::new() };
+                d.note(|lc| lc.set_pull(pull));
+            }),
+            0,
+        ),
+        // The placement is read again: edited, it is a conflict.
+        ("harness", Box::new(|| std::fs::write(&placed, "Edited in the harness.\n").unwrap()), 1),
+    ];
+    for (input, change, rehashed) in changes {
+        let (plans, hashed) = counts();
+        // A change within one tick of the clock could keep every timestamp.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        change();
+        reconcile().await;
+        assert_eq!(counts(), (plans + 1, hashed + rehashed), "{input}: one plan");
+        reconcile().await;
+        assert_eq!(counts(), (plans + 1, hashed + rehashed), "{input}: settled");
+    }
+    assert_eq!(std::fs::read_to_string(&placed).unwrap(), "Edited in the harness.\n");
+    assert_eq!(d.view().report.conflicts.len(), 1);
+}
+
+/// A reconcile that failed records nothing: the next one runs again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_reconcile_is_tried_again() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = tempfile::tempdir().unwrap();
+    let (d, _session, _) = joined_daemon(dir.path(), PullRecord::default());
+    std::fs::write(&d.cfg.machine_config, "not toml [").unwrap();
+    for _ in 0..2 {
+        assert!(d.blocking(|d, eng| d.reconcile(eng)).await.is_err());
+    }
+    assert!(lock(&d.engine).reconciled.is_none());
+    assert_eq!(d.plans.load(Relaxed), 0);
 }

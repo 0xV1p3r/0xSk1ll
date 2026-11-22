@@ -158,7 +158,7 @@ impl Daemon {
                 sync::apply(&repo, a)?;
             }
         }
-        let RefreshOutcome { errors, completed, changed } = self.refresh_with_plan(eng, reviewed)?;
+        let ReconcileOutcome { errors, completed, changed } = self.reconcile_with(eng, reviewed)?;
         self.event(Event::Status);
         if changed.is_some() {
             let mut preview = self.preview_sync(force)?;
