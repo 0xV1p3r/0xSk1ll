@@ -391,8 +391,26 @@ pub enum CopyMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssignmentCopyPreview {
     pub count: usize,
+    /// What the copy would change on the target, one entry per change.
+    #[serde(default)]
+    pub changes: Vec<CopyChange>,
     pub target: Expected,
     pub source: Expected,
+}
+
+/// One change an Assignment copy would make. For item toggles `None` means
+/// "no explicit toggle" (the item follows the default).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CopyChange {
+    pub harness: String,
+    pub kind: ToggleKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<ItemId>,
+    /// The item's name, where the server knows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub before: Option<bool>,
+    pub after: Option<bool>,
 }
 
 /// `PUT /api/machines/{id}/assignment` response.

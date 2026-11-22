@@ -103,7 +103,7 @@ A new machine starts with everything off unless you pass `--copy-from`. `--id` s
 
 ## Copy an Assignment after joining
 
-Run `sk1ll fleet copy-assignment laptop workstation` to preview the changes and confirm them. Use `--yes` in scripts. The command needs a running, joined daemon. A Machine with `self` scope can copy to its own Assignment.
+Run `sk1ll fleet copy-assignment laptop workstation` to list the changes (harness, item or default, before -> after) and confirm them. If workstation already matches, it says so and asks nothing. Use `--yes` in scripts. The command needs a running, joined daemon. A Machine with `self` scope can copy to its own Assignment.
 
 Matching Harness names are paired by default. To choose the pairs explicitly, repeat `--map SOURCE=TARGET` for each pair to copy. Replace copies the source defaults and explicit toggles, clearing target-only toggles in those Harnesses. Use `--merge` to keep the target defaults and fill only unset item toggles. As at join time, explicit toggles carry over even if the target has yet to see the item.
 

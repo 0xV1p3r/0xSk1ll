@@ -452,8 +452,13 @@ fn fleet_copy_assignment_confirms_with_preview_preconditions() {
         let target = json!({"revision": 2, "registration": "target"});
         let source = json!({"revision": 4, "registration": "source"});
         let path = "/machines/work/assignment/copy-from";
+        let changes = json!([
+            {"harness":"codex","kind":"skill","item_id":"pdf-id","name":"pdf","before":null,"after":true},
+            {"harness":"codex","kind":"new_rules_default","before":true,"after":false},
+        ]);
+        let preview = json!({"count":2,"changes":changes,"target":target,"source":source});
         for (path, expected, source_expected, response) in [
-            (format!("{path}/preview"), Value::Null, Value::Null, json!({"count":1,"target":target,"source":source})),
+            (format!("{path}/preview"), Value::Null, Value::Null, preview),
             (path.into(), target, source, json!({"revision":5,"assignment":{"harnesses":{}},"entries":[]})),
         ] {
             let (line, body) = answer(&listener, "200 OK", &response.to_string());
@@ -467,9 +472,33 @@ fn fleet_copy_assignment_confirms_with_preview_preconditions() {
             );
         }
     });
-    repo.run_on(&socket, &["fleet", "copy-assignment", "home", "work", "--merge", "--map", "claude=codex", "--yes"])
+    let out = repo
+        .run_on(&socket, &["fleet", "copy-assignment", "home", "work", "--merge", "--map", "claude=codex", "--yes"])
         .unwrap();
     daemon.join().unwrap();
+    assert!(out.contains("2 Assignment changes on work:"), "{out}");
+    assert!(out.contains("skill pdf") && out.contains("default -> on"), "{out}");
+    assert!(out.contains("rules default") && out.contains("on -> off"), "{out}");
+}
+
+/// A copy that changes nothing says the target matches, and asks nothing.
+#[test]
+fn fleet_copy_assignment_with_nothing_to_change_asks_nothing() {
+    let repo = TestRepo::new();
+    let socket = repo.root.join("copy.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let daemon = std::thread::spawn(move || {
+        assert_eq!(answer(&listener, "200 OK", STATUS).0, "GET /status HTTP/1.1");
+        let state = r#"{"revision":2,"registration":"r"}"#;
+        let preview = format!(r#"{{"count":0,"changes":[],"target":{state},"source":{state}}}"#);
+        assert_eq!(
+            answer(&listener, "200 OK", &preview).0,
+            "POST /machines/work/assignment/copy-from/preview HTTP/1.1"
+        );
+    });
+    let out = repo.run_on(&socket, &["fleet", "copy-assignment", "home", "work"]).unwrap();
+    daemon.join().unwrap();
+    assert_eq!(out, "work already matches home's Assignment; nothing to copy\n");
 }
 
 /// Only "no socket" and "connection refused" mean no daemon runs; any

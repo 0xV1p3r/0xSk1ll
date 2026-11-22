@@ -1838,6 +1838,22 @@ async fn copy_machine_assignment_previews_merges_replaces_and_logs() {
     assert_eq!(copied.assignment.harness("codex"), src.assignment.harness("claude"));
     assert_eq!(copied.assignment.harness("claude"), update.assignment.harness("claude"));
     assert_eq!(copied.entries.len(), 4);
+    // The preview lists the very changes the copy logged, before and after.
+    let previewed: Vec<sk1ll_proto::CopyChange> = serde_json::from_value(preview["changes"].clone()).unwrap();
+    let logged: Vec<_> = copied
+        .entries
+        .iter()
+        .map(|e| sk1ll_proto::CopyChange {
+            harness: e.harness.clone(),
+            kind: e.kind,
+            item_id: e.item_id.clone(),
+            name: e.name.clone(),
+            before: e.before,
+            after: e.after,
+        })
+        .collect();
+    assert_eq!(previewed, logged);
+    assert!(previewed.iter().any(|c| c.name.as_deref() == Some("private")), "{previewed:?}");
     assert_eq!(post(&target, path, replace).await.unwrap().status(), StatusCode::CONFLICT);
     for entry in copied.entries.iter().rev() {
         let restored: AssignmentUpdate = post(&target, &format!("/log/{}/undo", entry.id), json!(null))
