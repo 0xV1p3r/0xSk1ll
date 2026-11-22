@@ -22,17 +22,31 @@ An operation that talks to the server checks and takes what it sends under
 the engine mutex, releases it for the network, then takes it again to apply
 the result against the state as it is now:
 
+- What the result is applied in is checked again as one token, the World
+  taken under the mutex before releasing it: still managing, and the same
+  registration (a removal or a halt for a rejoin advances the lifecycle's
+  epoch), and, for what changes the harnesses, no Pull pending. A result
+  from another World is not applied and saves nothing.
 - Assignment writes wait for the server's confirmation unlocked, one at a
   time. A confirmation overtaken by a newer applied revision is not applied,
-  and a daemon that stopped managing meanwhile applies nothing. Adopt
-  removes the copies an enablement came from only while the skill still has
-  the enabled Item ID.
+  and a daemon that stopped managing meanwhile applies nothing; neither does
+  a Harness rename's confirmation. Adopt removes the copies an enablement
+  came from only while the skill still has the enabled Item ID and no Pull
+  is pending; a refused Adopt takes back only an uncommitted addition that
+  still has the Item ID it gave it.
+- A rejoin registers unlocked, then stores the new registration only if the
+  old one is still replaceable (removed, or its token still refused); else
+  it asks the server to remove the new one again. Assignment snapshots are
+  tagged with their registration and written before the credentials, so a
+  stop in between never pairs new credentials with old toggles.
 - git's clone, fetch and push run unlocked, one at a time. A pull fetches,
   then moves onto the fetched Baseline under the mutex (finishing a stopped
   pull, recovery, missing Item IDs and the sync keep their order there). A
   push sends the exact commit it checked, so a pull that rebased it meanwhile
   makes the server refuse it as not fast-forward. A clone moves into place
-  only once complete.
+  only once complete. Filter drivers (git-lfs's smudge) run for the fetched
+  Baseline's blobs right after the fetch, unlocked; the pull writes those
+  conversions once cleaning them gives the blob back.
 
 ## One lifecycle
 
@@ -41,6 +55,9 @@ stands against the server's Baseline (Blocked, a pull pending, the Baseline
 last known) are one value with explicit transitions. The status the daemon
 publishes derives from it. The state file keeps its Blocked state and
 Baseline, so a restarted daemon starts Blocked and Behind before it can pull.
+A remembered pending pull whose journal is gone finished before the process
+could record it: it is Clear once `HEAD` contains the server's Baseline. A
+standalone daemon's record names its repo and is dropped for any other.
 
 ## One reconcile over fingerprinted Inputs
 
@@ -85,4 +102,5 @@ engine operation runs, a read answers from the last Snapshot, so an edit made
 outside sk1ll moments before may not show until the reconcile it wakes publishes
 the next one; the `draft` and `status` events follow. Reads about something in
 particular (a diff, a file, the skills browser, a preview) still read the repo
-as it is.
+as it is. A caller about to act on a list (`sk1ll restore --all`) asks for it
+with `?fresh=true`, which waits for the engine and reconciles first.

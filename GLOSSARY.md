@@ -51,7 +51,7 @@ _Avoid_: Hub, relay, coordinator
 A built-in Harness configuration that needs explicit enablement in `machine.toml` before sync uses it. Gemini’s skills directory is also opt-in.
 
 **Registration**:
-A Machine’s membership instance in the Fleet. Each join gets a new registration ID, even when the Machine ID is reused. Assignment writes can check that ID to guard against a concurrent rejoin.
+A Machine’s membership instance in the Fleet. Each join gets a new registration ID, even when the Machine ID is reused. Assignment writes can check that ID to guard against a concurrent rejoin. The daemon tags its stored Assignment snapshot with its registration and ignores one of another.
 
 ## State
 

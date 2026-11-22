@@ -14,8 +14,11 @@
 //! depends on: an Assignment revision applied meanwhile wins over an older
 //! confirmation, a pull moves onto whatever was fetched last, an Adopt whose
 //! item changed meanwhile is a conflict, and a daemon that stopped managing
-//! meanwhile applies nothing. Its lifecycle ([`Lifecycle`]) has a mutex of its
-//! own, so the session can mark it connected or offline at any time.
+//! meanwhile applies nothing. What every such step checks first is one token,
+//! the [`World`] it started in: still managing the same registration, and
+//! for what changes the harnesses, no Pull pending. Its lifecycle
+//! ([`Lifecycle`]) has a mutex of its own, so the session can mark it
+//! connected or offline at any time.
 //!
 //! Everything that brings the harnesses and the report in line with the repo
 //! is one reconcile over fingerprinted Inputs ([`reconcile`]): it plans and

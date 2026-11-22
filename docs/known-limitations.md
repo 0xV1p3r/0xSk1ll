@@ -104,6 +104,25 @@ loss is unsupported. Keep external Git commands that switch branches or
 write the index out of the repo during Pull. Pull checks the branch again
 before writing the index, and another Git command can still race that check.
 
+## Filter drivers and the engine lock
+
+Filter drivers that need the network (git-lfs's smudge) run right after a
+fetch, without the engine lock, for the blobs the fetched Baseline brings.
+The pull runs them under the lock where that left nothing: when it finishes
+a pull that stopped half-way, when a replayed local commit changes
+`.gitattributes`, or when the conversion no longer cleans to the blob.
+Clean filters still run under the lock, both for checking that a file still
+holds what the old Baseline has and for checking a conversion; a clean
+filter that waits on the network holds up the Daemon meanwhile.
+
+## A registration left over by a rejoin
+
+`POST /join` registers before it stores anything. If the Machine's old
+registration works again meanwhile (the server stops refusing its token),
+the new registration is not used: the Daemon asks the server to remove it
+again. If the server can't be reached then, it stays in the Fleet as a
+Machine that never connects, until it is removed from the Fleet.
+
 ## Extended attributes and alternate data streams
 
 The fingerprint that decides whether placed content is unchanged includes
