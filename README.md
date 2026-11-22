@@ -137,7 +137,7 @@ If Pull stops partway through, the next `sk1ll pull` or Daemon reconcile resumes
 | `fleet log`, `fleet undo <entry-id>` | Filter the Assignment log by Machine, Harness, author or item, or undo one entry |
 | `completions <shell>` | Generate shell completions |
 
-`sk1ll <command> --help` lists every flag.
+`sk1ll <command> --help` lists every flag. `sync` exits non-zero while it leaves a conflict alone, and `sync --force` prints the recovery id it kept each overwritten edit under. `SK1LL_*` variables set to an empty value count as unset.
 
 ## Documentation
 

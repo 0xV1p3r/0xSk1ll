@@ -504,7 +504,7 @@ fn list_and_status_report_duplicate_item_id_paths() {
     fs::copy(repo.repo.join("personal/docs/.sk1ll-id"), repo.repo.join("personal/pdf/.sk1ll-id")).unwrap();
     for command in ["list", "status"] {
         let err = repo.run(&[command]).unwrap_err();
-        for expected in ["duplicate Item ID", "personal/docs/.sk1ll-id", "personal/pdf/.sk1ll-id"] {
+        for expected in ["duplicate Item ID", "personal/docs/.sk1ll-id", "personal/pdf/.sk1ll-id", "sk1ll repair-ids"] {
             assert!(err.contains(expected), "{command}: {err}");
         }
     }
@@ -659,6 +659,8 @@ fn a_blocked_machine_that_committed_the_clash_follows_the_hint_out() {
     let blocked = b.run(&["pull"]).unwrap_err();
     assert!(blocked.contains("Run `sk1ll restore skill:pdf`"), "{blocked}");
     assert!(!blocked.contains("commit or restore"), "{blocked}");
+    let status = b.run(&["status"]).unwrap();
+    assert!(status.contains("blocked: the pull of baseline") && status.contains("sk1ll restore skill:pdf"), "{status}");
     // What the docs used to suggest: commit the clashing item.
     b.run(&["commit", "pdf"]).unwrap();
     let blocked = b.run(&["pull"]).unwrap_err();
@@ -795,4 +797,86 @@ fn a_manifest_broken_in_head_can_be_fixed_with_a_commit() {
     fs::write(repo.repo.join("sk1ll.toml"), &manifest).unwrap();
     repo.run(&["commit", "manifest", "-m", "fix the manifest"]).unwrap();
     assert_eq!(repo.run(&["draft"]).unwrap(), "no draft: on the baseline\n");
+}
+
+/// `sync` fails while harness conflicts are left alone, and `sync --force`
+/// says where the edit it overwrote went.
+#[test]
+fn sync_fails_on_conflicts_and_force_says_where_the_edit_went() {
+    let repo = TestRepo::new().with_skill();
+    repo.run(&["sync"]).unwrap();
+    fs::write(repo.root.join("h/pdf/SKILL.md"), "edited in the harness").unwrap();
+    let error = repo.run(&["sync"]).unwrap_err();
+    assert!(error.contains("! h") && error.contains("1 conflict(s) left alone"), "{error}");
+    let forced = repo.run(&["sync", "--force"]).unwrap();
+    assert!(forced.contains("kept in recovery as ") && forced.contains("h/pdf"), "{forced}");
+    let id = forced.split("kept in recovery as ").nth(1).unwrap().split(':').next().unwrap();
+    assert!(repo.run(&["recover", "list"]).unwrap().contains(id));
+}
+
+/// An empty `SK1LL_*` variable counts as unset, and a `--repo` that isn't
+/// there is said to be missing, in those words.
+#[test]
+fn empty_variables_are_unset_and_a_missing_repo_is_named() {
+    let repo = TestRepo::new().with_skill();
+    let mut cmd = repo.command_on(&repo.root.join("no-daemon.sock"), &["list"]);
+    cmd.env("SK1LL_ADMIN_UNUSED", "").env("SK1LL_SERVER_ADMIN_TOKEN", "");
+    outcome(cmd.output().unwrap()).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sk1ll"));
+    cmd.arg("list")
+        .env("SK1LL_REPO", &repo.repo)
+        .env("SK1LL_MACHINE_CONFIG", repo.root.join("machine.toml"))
+        .env("SK1LL_ASSIGNMENT", "")
+        .env("SK1LL_DAEMON_STATE", "")
+        .env("SK1LL_DAEMON_SOCKET", "")
+        .env("HOME", repo.root.join("home"))
+        .env("XDG_CONFIG_HOME", repo.root.join("home/.config"))
+        .env("XDG_CACHE_HOME", repo.root.join("home/.cache"))
+        .env("XDG_STATE_HOME", repo.root.join("home/.local/state"))
+        .env("XDG_DATA_HOME", repo.root.join("home/.local/share"))
+        .env("XDG_RUNTIME_DIR", repo.root.join("run"))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    let listed = outcome(cmd.output().unwrap()).unwrap();
+    assert!(listed.contains("pdf"), "{listed}");
+
+    let missing = repo.root.join("nowhere");
+    let error = repo.command_for(&missing, &repo.root.join("no-daemon.sock"), &["draft"]).output().unwrap();
+    let error = outcome(error).unwrap_err();
+    assert!(error.contains("no such directory") && error.contains("nowhere"), "{error}");
+    assert!(!error.contains("POST") && !error.contains("/init"), "{error}");
+}
+
+#[test]
+fn recover_subcommands_explain_themselves_and_their_id() {
+    let repo = TestRepo::new();
+    let help = repo.run(&["recover", "adopt", "--help"]).unwrap();
+    assert!(help.contains("<ID>") && help.contains("sk1ll recover list"), "{help}");
+    assert!(repo.run(&["recover", "--help"]).unwrap().contains("Delete an entry"));
+}
+
+/// `sk1ll init` of another path while a daemon manages a repo says so,
+/// rather than that another process holds a lock.
+#[test]
+fn init_beside_a_daemon_for_another_repo_names_it() {
+    let repo = TestRepo::new();
+    let socket = repo.root.join("daemon.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let status = STATUS.replace(r#""mode":"joined""#, r#""mode":"standalone""#);
+    let daemon = std::thread::spawn(move || {
+        assert_eq!(answer(&listener, "200 OK", &status).0, "GET /status HTTP/1.1");
+    });
+    let target = repo.root.join("new-repo");
+    let error = repo.run_on(&socket, &["init", target.to_str().unwrap()]).unwrap_err();
+    assert!(error.contains("the sk1ll daemon manages /elsewhere") && error.contains("new-repo"), "{error}");
+    assert!(!target.exists());
+    daemon.join().unwrap();
+}
+
+/// A standalone commit without an `origin` has nowhere to push to, and says nothing of it.
+#[test]
+fn a_commit_without_an_origin_says_nothing_of_pushing() {
+    let repo = TestRepo::new().with_skill();
+    let out = repo.run(&["commit", "pdf"]).unwrap();
+    assert!(out.starts_with("committed skill:pdf") && !out.contains("push") && !out.contains("fleet"), "{out}");
 }

@@ -220,16 +220,16 @@ fn fleet(cli: &Cli, command: Option<&FleetCmd>) -> Result<()> {
                     None => "unset",
                 };
                 println!(
-                    "{}  {}  {} / {}  {}  {} -> {}  by {} ({:?})",
+                    "{}  {}  {} / {}  {}  {} -> {}  by {}{}",
                     entry.id,
-                    entry.at,
+                    utc(entry.at),
                     entry.machine,
                     entry.harness,
                     item,
                     state(entry.before),
                     state(entry.after),
                     entry.author,
-                    entry.cause
+                    cause(&entry.cause)
                 );
             }
         }
@@ -244,6 +244,21 @@ fn fleet(cli: &Cli, command: Option<&FleetCmd>) -> Result<()> {
         None => print_fleet(s.block(client.fleet())?),
     }
     Ok(())
+}
+
+/// Why an Assignment log entry was written, for `fleet log`: nothing for
+/// an ordinary change.
+fn cause(cause: &sk1ll_proto::LogCause) -> String {
+    use sk1ll_proto::LogCause as C;
+    match cause {
+        C::Change => String::new(),
+        C::Undo { entry } => format!(" (undoing entry {entry})"),
+        C::DefaultMaterialized => " (kept as the old default when the default changed)".into(),
+        C::MachineRemoved => " (machine removed from the fleet)".into(),
+        C::HarnessAdded => " (new harness, starts all off)".into(),
+        C::HarnessRenamed { from, to } => format!(" (harness renamed from {from} to {to})"),
+        C::OrphanPruned => " (orphan toggle pruned)".into(),
+    }
 }
 
 fn shell_arg(arg: &str) -> String {
@@ -380,6 +395,15 @@ impl Session {
                 repo.display()
             );
         }
+        // A repo asked for by name has to be there (only `init` makes one).
+        if cli.repo.is_some() && !repo.is_dir() && !matches!(cli.cmd, Cmd::Fleet { .. } | Cmd::Setup | Cmd::Join { .. })
+        {
+            bail!(
+                "no such directory: {} (from --repo or SK1LL_REPO); create a skills repo there with `sk1ll init {}`",
+                repo.display(),
+                repo.display()
+            );
+        }
         let cfg = Config { repo: Some(repo.to_path_buf()), ..daemon_config(cli)? };
         let state_path = cfg.state.clone();
         let engine = {
@@ -426,6 +450,11 @@ impl Session {
         }))
     }
 
+    /// The repo the running daemon manages, if one runs.
+    pub(crate) fn daemon_repo(cli: &Cli) -> Result<Option<std::path::PathBuf>> {
+        Ok(Self::daemon(cli)?.1.map(|(_, status)| status.repo))
+    }
+
     fn daemon(cli: &Cli) -> Result<(tokio::runtime::Runtime, Option<(Client, StatusView)>)> {
         let rt = runtime()?;
         let client = client(cli)?;
@@ -450,7 +479,7 @@ impl Session {
     }
 }
 
-fn same_path(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
     let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     canon(a) == canon(b)
 }
@@ -458,6 +487,16 @@ fn same_path(a: &Path, b: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::utc;
+
+    #[test]
+    fn log_causes_read_as_text() {
+        use sk1ll_proto::LogCause as C;
+        assert_eq!(super::cause(&C::Change), "");
+        assert_eq!(super::cause(&C::Undo { entry: 7 }), " (undoing entry 7)");
+        let renamed = super::cause(&C::HarnessRenamed { from: "a".into(), to: "b".into() });
+        assert_eq!(renamed, " (harness renamed from a to b)");
+        assert!(!super::cause(&C::OrphanPruned).contains('{'));
+    }
 
     #[test]
     fn utc_dates() {

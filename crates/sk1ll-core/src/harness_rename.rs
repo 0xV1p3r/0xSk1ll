@@ -84,14 +84,16 @@ impl RenameIntent {
                 intent.request.from, intent.request.to
             )));
         }
-        if authoritative.harnesses.contains_key(&request.to) && !request.replace {
-            return Err(Error::Changed(format!(
-                "harness `{}` already has an Assignment; use --replace to overwrite it",
-                request.to
-            )));
-        }
+        // A harness of that name is refused first: --replace can't help there.
         let before = Snapshot::take(config)?;
         let edit = MachineConfig::rename_harness(&before, &request.from, &request.to)?;
+        if authoritative.harnesses.contains_key(&request.to) && !request.replace {
+            return Err(Error::Changed(format!(
+                "harness `{}` is gone from this Machine but still has an Assignment; use --replace to overwrite it \
+                 with `{}`'s",
+                request.to, request.from
+            )));
+        }
         let routed_rules = crate::instructions::discover(repo)?
             .into_iter()
             .filter(|rule| rule.harnesses.is_some() && rule.applies_to(&request.from) && !rule.applies_to(&request.to))

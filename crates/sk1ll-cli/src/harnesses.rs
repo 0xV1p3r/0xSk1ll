@@ -20,9 +20,12 @@ pub(crate) enum HarnessCmd {
     Rename {
         old: String,
         new: String,
-        /// Replace an Assignment already stored for the new name
+        /// Replace an Assignment still stored for the new name (of a harness that is gone)
         #[arg(long)]
         replace: bool,
+        /// Accepted as for the other changes; a rename asks no confirmation
+        #[arg(long, short)]
+        yes: bool,
     },
     /// Sync into a harness again
     Enable {
@@ -126,7 +129,7 @@ pub(crate) fn run(s: &Session, all: bool, command: Option<HarnessCmd>) -> Result
             Listing { machine: &s.status.machine_id, config: &settings.path, effective, choices: settings.harnesses };
         return list(&listing, all, &mut std::io::stdout());
     };
-    if let HarnessCmd::Rename { old, new, replace } = command {
+    if let HarnessCmd::Rename { old, new, replace, .. } = command {
         let request = sk1ll_core::harness_rename::RenameRequest { from: old, to: new, replace };
         let (from, to) = (request.from.clone(), request.to.clone());
         let renamed = s.block(s.client.rename_harness(&request))?;

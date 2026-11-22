@@ -5483,7 +5483,7 @@ mod tests {
         assert!(root.join("personal/pdf/extra.md").is_file() && !root.join("personal/pdf").join(INDEX_DIR).exists());
         assert_eq!(
             fs::read_to_string(root.join("instructions/git.md")).unwrap(),
-            "---\nharnesses: [h, b]\nid: git-rule\ndescription: Git\n---\n\nUse CC always.\n"
+            "---\nharnesses: [h, b]\nid: git-rule\ndescription: Git\n---\nUse CC always.\n"
         );
         let draft: Vec<(ItemRef, Change)> = repo.draft().unwrap().into_iter().map(|d| (d.item, d.change)).collect();
         assert_eq!(

@@ -130,6 +130,19 @@ break compatibility.
 
 ### Fixed
 
+- CLI messages: `sk1ll status` says when the Machine is Blocked (and how
+  to clear it), behind, or had a push refused; `sync` exits non-zero while
+  it leaves conflicts alone and `sync --force` says which recovery entry
+  kept each edit; status and sync print rules the same way
+  (`rule git -> <path>`); every duplicate Item ID error suggests
+  `sk1ll repair-ids`; renaming a harness onto one that exists no longer
+  suggests `--replace`, which can't help there, and `harnesses rename`
+  accepts `--yes`; empty `SK1LL_*` variables count as unset; a `--repo`
+  that isn't there is named as missing; `sk1ll init` beside a daemon for
+  another repo says so; `fleet log` prints dates and readable causes; the
+  `recover` subcommands and their `<ID>` have help; a standalone commit
+  without `origin` no longer tells you to push to a fleet; adopting a rule
+  no longer adds a blank line after its frontmatter.
 - The recovery area's index and the import cache follow `SK1LL_STATE_DIR`
   and the new `SK1LL_CACHE_DIR` (and the daemon's configuration) instead of
   always the platform's directories. The test suite no longer writes under

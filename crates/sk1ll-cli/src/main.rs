@@ -281,9 +281,20 @@ enum FleetCmd {
 
 #[derive(Subcommand)]
 enum RecoverCmd {
+    /// List recovery entries: their id, harness, item, where the content was and where it is kept
     List,
-    Adopt { id: String },
-    Discard { id: String },
+    /// Put an entry's content back (into the repo as a Draft change, or a block file into its harness)
+    Adopt {
+        /// The entry's id, as `sk1ll recover list` or `sk1ll conflicts` prints it
+        #[arg(value_name = "ID")]
+        id: String,
+    },
+    /// Delete an entry and its content for good
+    Discard {
+        /// The entry's id, as `sk1ll recover list` or `sk1ll conflicts` prints it
+        #[arg(value_name = "ID")]
+        id: String,
+    },
 }
 
 impl Cmd {
@@ -343,6 +354,14 @@ impl Switch {
 }
 
 fn main() -> Result<()> {
+    // An empty variable counts as unset, as it does for the daemon: clap
+    // would take it as an empty value. Single-threaded here.
+    for (key, value) in std::env::vars_os() {
+        if value.is_empty() && key.to_str().is_some_and(|k| k.starts_with("SK1LL_")) {
+            // SAFETY: no other thread runs yet.
+            unsafe { std::env::remove_var(&key) };
+        }
+    }
     let mut cli = Cli::parse();
     if let Cmd::Completions { shell } = cli.cmd {
         clap_complete::generate(shell, &mut Cli::command(), "sk1ll", &mut std::io::stdout());
@@ -364,7 +383,17 @@ fn main() -> Result<()> {
     let cfg = fleet::daemon_config(&cli)?;
     // SAFETY: no other thread runs yet.
     unsafe { sk1ll_daemon::prepare_process(&cfg)? };
-    run(cli)
+    run(cli).map_err(repair_hint)
+}
+
+/// A duplicate Item ID is repaired with `sk1ll repair-ids`: every error
+/// that names one says so.
+fn repair_hint(e: anyhow::Error) -> anyhow::Error {
+    let msg = format!("{e:#}");
+    if msg.contains("duplicate Item ID") && !msg.contains("repair-ids") {
+        return anyhow::anyhow!("{msg}\nRun `sk1ll repair-ids`, then commit the repaired items");
+    }
+    e
 }
 
 fn run(cli: Cli) -> Result<()> {
@@ -390,10 +419,25 @@ fn run(cli: Cli) -> Result<()> {
 /// repo the path is in (if it is in one).
 fn init(cli: &Cli, root: &Path) -> Result<()> {
     sk1ll_core::git::require_git(sk1ll_core::git::MIN_VERSION)?;
+    if let Some(repo) = Session::daemon_repo(cli)?
+        && !fleet::same_path(&repo, root)
+    {
+        bail!(
+            "the sk1ll daemon manages {} on this Machine, and one engine manages a Machine at a time; stop the \
+             daemon to create a repo at {}, or select {} to work there",
+            repo.display(),
+            root.display(),
+            repo.display()
+        );
+    }
     if let Some(session) = Session::daemon_for(cli, root)?
         && !session.status.repo_ready
     {
         session.block(session.client.init())?;
+    } else if let Some(session) = Session::daemon_for(cli, root)? {
+        // The daemon manages this repo, which exists already.
+        drop(session);
+        bail!("{} is already a skills repo", root.display());
     } else {
         let cfg = fleet::daemon_config(cli)?;
         let _machine = sk1ll_daemon::MachineLock::acquire(&cfg)?;
@@ -570,18 +614,40 @@ fn command(s: &Session, cmd: Cmd) -> Result<()> {
         }
         Cmd::Sync { dry_run: false, force } => {
             let result = s.block(c.sync(&SyncRequest { force, ..Default::default() }))?;
-            if result.conflicts.is_empty() && result.errors.is_empty() {
+            let (kept, conflicts): (Vec<_>, Vec<_>) =
+                result.conflicts.iter().partition(|x| x.kind.as_deref() == Some("displaced"));
+            if conflicts.is_empty() && result.errors.is_empty() {
                 println!("harnesses in sync");
             }
-            for x in &result.conflicts {
+            for x in &conflicts {
                 let reason = x.reason.as_deref().map(|r| format!("  ({r})")).unwrap_or_default();
-                println!("! {:<10} {}{reason}", x.harness, x.name);
+                let kind = match (x.items.first(), x.adoptable) {
+                    (_, false) if x.name == "instructions" => "instructions",
+                    (Some(sk1ll_core::ItemRef::Rule(_)), _) => "rule",
+                    _ => "skill",
+                };
+                let name = if kind == "instructions" { names_only(&x.items) } else { x.name.clone() };
+                println!("! {:<10} {}{reason}", x.harness, placement_what(kind, &name, &x.dest));
+            }
+            for x in &kept {
+                println!(
+                    "kept in recovery as {}: the edit to {} (`sk1ll recover adopt` or `sk1ll recover discard` it)",
+                    x.id.as_deref().unwrap_or_default(),
+                    x.dest.display()
+                );
             }
             for error in &result.errors {
                 eprintln!("error: {error}");
             }
             if !result.errors.is_empty() {
                 bail!("{} action(s) failed", result.errors.len());
+            }
+            if !conflicts.is_empty() {
+                bail!(
+                    "{} conflict(s) left alone: `sk1ll adopt <harness> <name>` an edit into the repo, or `sk1ll sync \
+                     --force` to overwrite it (it is kept in recovery)",
+                    conflicts.len()
+                );
             }
         }
         Cmd::Render { harness } => {
@@ -952,13 +1018,23 @@ fn print_plan(actions: &[PlacementView]) {
             _ => "!",
         };
         let reason = a.reason.as_deref().map(|r| format!("  ({r})")).unwrap_or_default();
-        let what = match a.item.as_str() {
-            "skill" => a.name.clone(),
-            "rule" => format!("rule -> {}", a.dest.display()),
-            _ => format!("instructions [{}] -> {}", a.name, a.dest.display()),
-        };
-        println!("{sym} {:<10} {what}{reason}", a.harness);
+        println!("{sym} {:<10} {}{reason}", a.harness, placement_what(&a.item, &a.name, &a.dest));
     }
+}
+
+/// What a placement is, as `status`, `sync --dry-run` and `sync` print it:
+/// a skill by name, a rule or a block of rules with where it goes.
+fn placement_what(kind: &str, name: &str, dest: &Path) -> String {
+    match kind {
+        "skill" => name.to_string(),
+        "rule" => format!("rule {} -> {}", name.strip_suffix(".md").unwrap_or(name), dest.display()),
+        _ => format!("instructions [{name}] -> {}", dest.display()),
+    }
+}
+
+/// The names of `items`, comma-separated: `git, style`.
+fn names_only(items: &[sk1ll_core::ItemRef]) -> String {
+    items.iter().map(sk1ll_core::ItemRef::name).collect::<Vec<_>>().join(", ")
 }
 
 /// `sk1ll add` of a link to a skill bundled with sk1ll whose fetch failed:

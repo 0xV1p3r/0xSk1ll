@@ -362,6 +362,12 @@ pub(crate) fn restore_metadata(
     parse_harnesses(text, path)?;
     explicit_id(text, path)?;
     let (frontmatter, body) = split_frontmatter(text);
+    // A harness's rule file has the blank line `render_rule` puts after
+    // its frontmatter; the repo's rule doesn't.
+    let body = match frontmatter {
+        Some(_) => body.strip_prefix("\r\n").or_else(|| body.strip_prefix('\n')).unwrap_or(body),
+        None => body,
+    };
     let source = frontmatter.unwrap_or_default();
     let mut mapping = frontmatter_mapping(source, path)?;
     let had_routing = FRONTMATTER_KEYS.iter().any(|key| mapping.contains_key(*key));
@@ -807,13 +813,17 @@ mod tests {
         let edited = "---\npaths: [x]\n---\n\nDo X better.\n";
         assert_eq!(
             restore_metadata(Some(&f), edited, &f.path, None).unwrap(),
-            "---\nharnesses:\n  - claude\npaths: [x]\n---\n\nDo X better.\n"
+            "---\nharnesses:\n  - claude\npaths: [x]\n---\nDo X better.\n",
+            "the blank line the harness file has after its frontmatter is not adopted"
         );
         assert_eq!(
             restore_metadata(Some(&f), "Plain.\n", &f.path, None).unwrap(),
             "---\nharnesses:\n  - claude\n---\nPlain.\n"
         );
-        assert_eq!(restore_metadata(Some(&frag("Plain.")), edited, Path::new("r.md"), None).unwrap(), edited);
+        assert_eq!(
+            restore_metadata(Some(&frag("Plain.")), edited, Path::new("r.md"), None).unwrap(),
+            "---\npaths: [x]\n---\nDo X better.\n"
+        );
     }
 
     #[test]

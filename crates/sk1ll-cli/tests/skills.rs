@@ -242,8 +242,13 @@ fn rename_requires_readable_membership_and_protects_destination_assignment() {
     assignment.save(&root.join("assignment.json")).unwrap();
     fixture.write("repo/instructions/routed.md", "---\nid: rule-id\nharnesses: [a]\n---\nrule");
     let rejected = error(fixture.command(&["harnesses", "rename", "a", "new-a"]).output().unwrap());
-    assert!(rejected.contains("already has an Assignment"), "{rejected}");
+    assert!(rejected.contains("still has an Assignment") && rejected.contains("--replace"), "{rejected}");
     assert_eq!(std::fs::read(root.join("machine.toml")).unwrap(), config);
+    // Onto a harness this Machine has, --replace can't help, so it isn't suggested.
+    for args in [&["harnesses", "rename", "a", "c"][..], &["harnesses", "rename", "a", "c", "--replace"]] {
+        let taken = error(fixture.command(args).output().unwrap());
+        assert!(taken.contains("already exists on this Machine") && !taken.contains("use --replace"), "{taken}");
+    }
     let renamed = fixture.command(&["harnesses", "rename", "a", "new-a", "--replace"]).output().unwrap();
     assert!(renamed.status.success(), "{renamed:?}");
     assert!(String::from_utf8_lossy(&renamed.stderr).contains("Rules still routed to a"));

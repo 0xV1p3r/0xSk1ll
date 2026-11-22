@@ -186,7 +186,7 @@ fn fleet_log_forwards_filters_and_prints_entries() {
         "--before",
         "42",
     ]));
-    assert_eq!(output, "41  1700000000  box / claude  skill:pdf  off -> on  by admin (Change)\n");
+    assert_eq!(output, "41  2023-11-14 22:13:20 UTC  box / claude  skill:pdf  off -> on  by admin\n");
     daemon.assert_requests(&[
         ("GET", "/status", &[], ""),
         (

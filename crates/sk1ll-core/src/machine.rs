@@ -555,7 +555,10 @@ impl MachineConfig {
         check_name(to)?;
         let before = Self::from_snapshot(snapshot)?;
         if before.harnesses.contains_key(to) || preset(to).is_some() {
-            return Err(Error::Invalid(format!("harness `{to}` already exists")));
+            return Err(Error::Invalid(format!(
+                "harness `{to}` already exists on this Machine; rename to a name no harness has (or remove `{to}` \
+                 first with `sk1ll harnesses remove {to}`)"
+            )));
         }
         let mut doc = ConfigDoc::parse(&snapshot.text()?, snapshot.path())?;
         if let Some(preset) = preset(from).filter(|_| !before.custom(from)) {
