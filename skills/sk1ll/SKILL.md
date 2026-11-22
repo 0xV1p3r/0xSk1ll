@@ -43,5 +43,6 @@ sk1ll update <name>       # re-fetch an import from its source into the Draft
 
 - Only use a link or `owner/repo` the user gave you. Never search the web
   for skills to install.
-- Never run `commit`, `push`, `restore`, `remove`, `fork` or `sync --force`.
-  Those are the user's decisions; tell them the command if they want it.
+- Never run `commit`, `push`, `restore`, `remove`, `delete`, `rename`, `fork`
+  or `sync --force`. Those are the user's decisions; tell them the command if
+  they want it.
