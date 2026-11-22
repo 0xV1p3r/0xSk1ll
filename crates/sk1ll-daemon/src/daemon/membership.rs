@@ -131,6 +131,28 @@ impl Daemon {
         result.map(drop)
     }
 
+    /// Checks that the registration `world` allowed a join to replace still
+    /// is replaceable, runs `store` and halts the daemon, all in one critical
+    /// section of the lifecycle mutex: the session can't connect the old
+    /// registration in between, and once halted its connection is ignored.
+    /// The outer `Err` is `store`'s (it halts too); the inner one says why
+    /// nothing was stored.
+    fn halt_for_rejoin(
+        &self,
+        world: World,
+        store: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<std::result::Result<(), &'static str>> {
+        let mut lc = lock(&self.lifecycle);
+        if let Err(why) = lc.check_rejoin(world.epoch) {
+            return Ok(Err(why));
+        }
+        let stored = store();
+        lc.halt();
+        drop(lc);
+        self.update(|_| {});
+        stored.map(Ok)
+    }
+
     /// Second half of a joined `POST /join`: stores the new credentials and
     /// snapshot and halts the daemon until the restart ([`Daemon::restart`])
     /// that brings them into effect, then sets up the repo with them, without
@@ -145,16 +167,25 @@ impl Daemon {
     /// again, as far as the server can be reached.
     pub(crate) async fn rejoin(self: &Arc<Self>, reg: Registered, world: World) -> Result<Result<Joined>> {
         let stored = self
-            .blocking(move |d, _| {
-                if d.lifecycle().halted() {
-                    return Ok(Err((reg, "already joined again; the daemon is restarting")));
-                }
-                if d.can_rejoin() != Some(world) {
-                    return Ok(Err((reg, "this Machine's registration works again; there is nothing to join")));
-                }
-                d.halt_with(|| reg.persist(&d.cfg).map(|()| true))?;
-                tracing::info!("joined again as `{}`", reg.state().machine_id);
-                Ok(Ok(reg))
+            .blocking(move |d, eng| {
+                #[cfg(test)]
+                let hook = eng.before_rejoin_persist.take();
+                #[cfg(not(test))]
+                let _ = eng;
+                let checked = d.halt_for_rejoin(world, || {
+                    #[cfg(test)]
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                    reg.persist(&d.cfg)
+                })?;
+                Ok(match checked {
+                    Ok(()) => {
+                        tracing::info!("joined again as `{}`", reg.state().machine_id);
+                        Ok(reg)
+                    }
+                    Err(why) => Err((reg, why)),
+                })
             })
             .await?;
         let reg = match stored {

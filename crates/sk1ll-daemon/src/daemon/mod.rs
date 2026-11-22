@@ -187,6 +187,10 @@ pub(crate) struct Engine {
     racy: std::time::Duration,
     #[cfg(test)]
     after_sync_review: Option<Box<dyn FnOnce() + Send>>,
+    /// Runs in [`Daemon::rejoin`] once the old registration was found
+    /// replaceable, before the new one is stored.
+    #[cfg(test)]
+    before_rejoin_persist: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl Daemon {
@@ -270,6 +274,8 @@ impl Daemon {
                 racy: reconcile::RACY_WINDOW,
                 #[cfg(test)]
                 after_sync_review: None,
+                #[cfg(test)]
+                before_rejoin_persist: None,
             }),
             view: watch::channel(view).0,
             events: broadcast::channel(256).0,
@@ -559,8 +565,9 @@ impl Daemon {
     }
 
     /// The server session's connection changed.
-    pub(crate) fn set_link(&self, link: Link) {
-        self.note(|lc| lc.set_link(link));
+    /// `false`: the daemon has no connection any more (halted or removed).
+    pub(crate) fn set_link(&self, link: Link) -> bool {
+        self.note(|lc| lc.set_link(link))
     }
 
     /// The server answered 401 to the token. That can be a proxy or a server

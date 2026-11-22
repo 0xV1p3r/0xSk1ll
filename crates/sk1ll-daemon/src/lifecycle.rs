@@ -77,14 +77,29 @@ impl Lifecycle {
     // Transitions
 
     /// The session's connection changed. Only a joined, managing daemon has
-    /// one; connecting clears an auth rejection.
-    pub(crate) fn set_link(&mut self, next: Link) {
-        if let Fleet::Joined { link, rejected_since } = &mut self.fleet {
-            *link = next;
-            if next == Link::Connected {
-                *rejected_since = None;
-            }
+    /// one; connecting clears an auth rejection. `false`: there is none (a
+    /// halted daemon's session belongs to the registration it replaces).
+    pub(crate) fn set_link(&mut self, next: Link) -> bool {
+        let Fleet::Joined { link, rejected_since } = &mut self.fleet else { return false };
+        *link = next;
+        if next == Link::Connected {
+            *rejected_since = None;
         }
+        true
+    }
+
+    /// The first step of storing a rejoin's registration, taken in the same
+    /// critical section as storing it and [`Lifecycle::halt`]: `Err` says why
+    /// the registration a join was allowed to replace at `epoch` is no longer
+    /// replaceable (it connected again, or something else changed it).
+    pub(crate) fn check_rejoin(&self, epoch: u64) -> Result<(), &'static str> {
+        if self.halted() {
+            return Err("already joined again; the daemon is restarting");
+        }
+        if !self.can_rejoin() || self.epoch != epoch {
+            return Err("this Machine's registration works again; there is nothing to join");
+        }
+        Ok(())
     }
 
     /// The server rejected the token at `now`. Returns since when it has, or

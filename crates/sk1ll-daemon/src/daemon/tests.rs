@@ -905,6 +905,38 @@ async fn a_rejoin_does_not_replace_a_registration_that_recovered_meanwhile() {
     assert!(d.ensure_managed().is_ok(), "still managing, not halted");
 }
 
+/// The session's connection can't slip in between the check that the old
+/// registration is replaceable and the halt that replaces it: either it
+/// connects first (and the join stores nothing) or the halt comes first (and
+/// the connection is ignored).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejoin_checks_and_halts_in_one_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let (d, _session, state) = joined_daemon(dir.path(), PullRecord::default());
+    d.set_auth_rejected();
+    let world = d.can_rejoin().expect("an auth-rejected Machine may join again");
+    let next = DaemonState::new("b".into(), "http://127.0.0.1:1".into(), "new".into(), state.repo.clone());
+    let reg = crate::join::Registered::for_test(next, AssignmentSnapshot { revision: 9, ..Default::default() });
+    let session = d.clone();
+    let (tx, connected) = std::sync::mpsc::channel();
+    lock(&d.engine).before_rejoin_persist = Some(Box::new(move || {
+        std::thread::spawn(move || {
+            session.set_link(Link::Connected);
+            let _ = tx.send(());
+        });
+        // Gives the session every chance to connect inside the window.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }));
+    d.rejoin(reg, world).await.unwrap().ok();
+    connected.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    assert!(d.lifecycle().halted());
+    assert_eq!(
+        d.view().connection,
+        crate::client::Connection::AuthRejected,
+        "the replaced registration never showed as connected"
+    );
+}
+
 /// Settles `d`, makes `change`, and returns how many plans the reconciles
 /// after it ran: one when the change is an Input the fingerprint sees.
 async fn plans_after(d: &Arc<Daemon>, change: impl FnOnce()) -> u64 {

@@ -186,7 +186,12 @@ async fn session(d: &Arc<Daemon>, ws: Ws, inbox: &mpsc::UnboundedSender<ServerMe
     send_report(&mut sink, reconciled_report(d).await?, &mut sent, &mut seq).await?;
     let (sender, mut writes) = mpsc::channel::<SessionWrite>(16);
     d.assignment_session.send_replace(Some(sender));
-    d.set_link(Link::Connected);
+    if !d.set_link(Link::Connected) {
+        // Halted for a rejoin meanwhile: this session's registration is
+        // being replaced.
+        d.assignment_session.send_replace(None);
+        return Ok(());
+    }
     let mut next_request = 1;
     let mut pending: BTreeMap<u64, (u64, oneshot::Sender<Result<AssignmentUpdate>>)> = BTreeMap::new();
     let catch_up = d.clone();
