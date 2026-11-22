@@ -59,8 +59,9 @@
 //! other users are refused.
 //!
 //! Server pass-throughs (the daemon adds its machine token; 503 while the server
-//! is unreachable): `GET /fleet`, `GET|PUT /machines/{id}/assignment`,
-//! `DELETE /machines/{id}`, `GET /log`, `GET /log/facets`, `POST /log/{id}/undo`,
+//! is unreachable): `GET /fleet`, `GET|PUT /machines/{id}/assignment` and
+//! `POST /machines/{id}/assignment/harness/{harness}` of another Machine (this
+//! one's are its own), `DELETE /machines/{id}`, `GET /log`, `GET /log/facets`, `POST /log/{id}/undo`,
 //! `GET /imports`, `POST /join-codes`. Bodies are the server's (`sk1ll-proto`).
 //!
 //! Every request carries [`API_HEADER`]; a daemon of another [`API_VERSION`]
@@ -1144,6 +1145,17 @@ impl Client {
     pub async fn set_harness_assignment(&self, harness: &str, enabled: bool) -> Result<AssignmentUpdate> {
         self.post(&format!("/assignment/harness/{}", encode(harness)), &sk1ll_proto::SetHarnessAssignment { enabled })
             .await
+    }
+
+    /// [`Self::set_harness_assignment`] of any Machine: another's goes to the server.
+    pub async fn set_machine_harness_assignment(
+        &self,
+        machine: &str,
+        harness: &str,
+        enabled: bool,
+    ) -> Result<AssignmentUpdate> {
+        let path = format!("/machines/{}/assignment/harness/{}", encode(machine), encode(harness));
+        self.post(&path, &sk1ll_proto::SetHarnessAssignment { enabled }).await
     }
 
     pub async fn remove_machine(&self, machine: &str) -> Result<()> {

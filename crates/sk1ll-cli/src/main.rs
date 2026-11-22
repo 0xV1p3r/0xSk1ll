@@ -216,6 +216,9 @@ enum Cmd {
         /// Every skill and rule in the repo, and both defaults
         #[arg(long, value_name = "on|off", conflicts_with_all = ["kind", "default_skills", "default_rules"])]
         all: Option<Switch>,
+        /// Another fleet Machine's Assignment (needs `fleet` scope; default: this Machine)
+        #[arg(long, value_name = "ID")]
+        machine: Option<String>,
     },
     /// Set up this machine step by step: a standalone repo, joining a fleet or starting one
     Setup,
@@ -915,8 +918,8 @@ fn command(s: &Session, cmd: Cmd) -> Result<()> {
             s.block(c.adopt(&ConflictTarget { harness: harness.clone(), name: name.clone() }))?;
             println!("adopted {name} from {harness} into the draft; review with `sk1ll diff {name}`");
         }
-        Cmd::Assign { harness, kind, name, state, default_skills, default_rules, all } => {
-            assign(s, &harness, kind, name, state, default_skills, default_rules, all)?;
+        Cmd::Assign { harness, kind, name, state, default_skills, default_rules, all, machine } => {
+            assign(s, machine, &harness, kind, name, state, default_skills, default_rules, all)?;
         }
         Cmd::Init { .. }
         | Cmd::Harnesses { .. }
@@ -975,6 +978,7 @@ fn require_harness(s: &Session, harness: &str) -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 fn assign(
     s: &Session,
+    machine: Option<String>,
     harness: &str,
     kind: Option<Kind>,
     name: Option<String>,
@@ -983,7 +987,19 @@ fn assign(
     default_rules: Option<Switch>,
     all: Option<Switch>,
 ) -> Result<()> {
-    require_harness(s, harness)?;
+    let own = s.status.machine_id.clone();
+    let machine = match machine {
+        Some(_) if s.status.mode == DaemonMode::Standalone => bail!(
+            "this machine is standalone, so it has only its own Assignment; `--machine` needs a fleet (`sk1ll join`)"
+        ),
+        Some(machine) if machine != own => machine,
+        _ => own.clone(),
+    };
+    if machine == own {
+        require_harness(s, harness)?;
+    } else {
+        require_machine_harness(s, &machine, harness)?;
+    }
     let target = assign_target(kind, name, state, default_skills, default_rules, all)?;
     let write = if let Some(state) = all {
         AssignmentWrite::Harness { harness: harness.into(), enabled: state.on() }
@@ -1013,16 +1029,21 @@ fn assign(
         }
         AssignmentWrite::Changes(AssignmentChanges { changes, expected: None })
     };
-    let machine = s.status.machine_id.clone();
     let requested = match &write {
         AssignmentWrite::Changes(changes) => changes.changes.clone(),
         _ => Vec::new(),
     };
     let update = match write {
-        AssignmentWrite::Harness { harness, enabled } => s.block(s.client.set_harness_assignment(&harness, enabled))?,
-        AssignmentWrite::Changes(changes) => s.block(s.client.set_assignment(&machine, &changes))?,
+        AssignmentWrite::Harness { harness, enabled } if machine == own => {
+            s.block(s.client.set_harness_assignment(&harness, enabled))
+        }
+        AssignmentWrite::Harness { harness, enabled } => {
+            s.block(s.client.set_machine_harness_assignment(&machine, &harness, enabled))
+        }
+        AssignmentWrite::Changes(changes) => s.block(s.client.set_assignment(&machine, &changes)),
         AssignmentWrite::RenameHarness(_) => unreachable!(),
-    };
+    }
+    .map_err(|e| scope_hint(e, &machine))?;
     if !update.errors.is_empty() {
         println!("Assignment of {machine} was saved at revision {}.", update.revision);
         for error in &update.errors {
@@ -1039,7 +1060,10 @@ fn assign(
     }
     // A machine-local write logs nothing, and a fleet one logs only what changed:
     // the toggles asked for are echoed either way.
-    let unchanged = update.revision == s.status.assignment_revision;
+    let unchanged = match machine == own {
+        true => update.revision == s.status.assignment_revision,
+        false => update.entries.is_empty(),
+    };
     if update.entries.is_empty() {
         for c in &requested {
             let already = if unchanged { " (already)" } else { "" };
@@ -1068,6 +1092,32 @@ fn toggle_text(kind: ToggleKind, name: Option<&str>, value: Option<bool>) -> Str
         None => "default",
     };
     format!("{what} {value}")
+}
+
+/// Another Machine's harness, as its last report names them: the server
+/// refuses a harness the Machine doesn't have.
+fn require_machine_harness(s: &Session, machine: &str, harness: &str) -> Result<()> {
+    let fleet = s.block(s.client.fleet())?;
+    let Some(row) = fleet.machines.iter().find(|m| m.id == machine) else {
+        bail!("no machine `{machine}` in the fleet (see `sk1ll fleet`)");
+    };
+    if let Some(report) = &row.report
+        && !report.harnesses.is_empty()
+        && !report.harnesses.iter().any(|h| h == harness)
+    {
+        bail!("{machine} has no harness `{harness}`; it has {}", report.harnesses.join(", "));
+    }
+    Ok(())
+}
+
+/// The server refuses a `self`-scope Machine another's Assignment: say what that means.
+fn scope_hint(e: anyhow::Error, machine: &str) -> anyhow::Error {
+    match e.downcast_ref::<sk1ll_daemon::client::ClientError>() {
+        Some(client) if client.status == Some(403) => anyhow::anyhow!(
+            "{client}; change {machine}'s Assignment on {machine} itself, or from a machine that joined with `fleet` scope"
+        ),
+        _ => e,
+    }
 }
 
 /// What `assign` toggles: an item (`None` when only defaults, or `--all`, change).

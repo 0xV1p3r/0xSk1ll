@@ -549,6 +549,21 @@ async fn harness_assignment_passes_through_to_the_fleet_and_reaches_sync() {
     eventually(|| async { b.harness_skill("x").is_none().then_some(()) }).await;
 }
 
+/// The per-Machine harness route: this Machine's own is written here (and
+/// syncs), another's at the server.
+#[tokio::test(flavor = "multi_thread")]
+async fn machine_harness_assignment_writes_this_or_another_machine() {
+    let server = Server::start().await;
+    let (a, b, _) = fleet_of_two(&server).await;
+    let other = a.client.set_machine_harness_assignment("beta", HARNESS, true).await.unwrap();
+    assert!(other.assignment.skill_enabled(HARNESS, &skill_id("x")));
+    assert!(other.entries.iter().all(|entry| entry.machine == "beta" && entry.author == "alpha"));
+    eventually(|| async { b.harness_skill("x").is_some().then_some(()) }).await;
+    let own = b.client.set_machine_harness_assignment("beta", HARNESS, false).await.unwrap();
+    assert!(own.entries.iter().all(|entry| entry.machine == "beta" && entry.author == "beta"));
+    eventually(|| async { b.harness_skill("x").is_none().then_some(()) }).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn standalone_harness_assignment_reaches_items_with_spaces() {
     let mut m = Machine::new("solo");

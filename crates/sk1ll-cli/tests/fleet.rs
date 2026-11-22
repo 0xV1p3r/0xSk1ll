@@ -106,8 +106,19 @@ async fn respond(State((requests, mode)): State<FakeState>, request: Request) ->
         }),
         ("GET", "/fleet") => json!({
             "baseline": "0123456789abcdef",
-            "machines": [{"id": "box", "status": "offline", "connected": false, "joined_at": 1700000000, "scope": "fleet", "registration": "box-reg"}]
+            "machines": [
+                {"id": "box", "status": "offline", "connected": false, "joined_at": 1700000000, "scope": "fleet", "registration": "box-reg"},
+                {"id": "work", "status": "in_sync", "connected": true, "joined_at": 1700000000, "scope": "fleet", "registration": "work-reg", "report": {"harnesses": ["codex"]}},
+                {"id": "locked", "status": "in_sync", "connected": true, "joined_at": 1700000000, "scope": "fleet", "registration": "locked-reg"}
+            ]
         }),
+        ("POST", "/machines/work/assignment/harness/codex") => json!({
+            "assignment": {"harnesses": {}}, "revision": 3, "entries": []
+        }),
+        ("POST", "/machines/locked/assignment/harness/codex") => {
+            let refusal = json!({"error": "machine `box` joined with a self-only join code and may only manage itself, not `locked`"});
+            return (StatusCode::FORBIDDEN, Json(refusal)).into_response();
+        }
         ("GET", "/status") => json!({
             "machine_id": "box", "server_url": "https://fleet.example", "mode": mode,
             "has_origin": true, "repo_ready": true, "repo": "/repo", "headline": "offline",
@@ -144,6 +155,8 @@ fn fleet_lists_machines_and_baseline() {
     let mut lines = output.lines();
     assert_eq!(lines.next(), Some("baseline 0123456789"));
     assert_eq!(lines.next().unwrap().split_whitespace().collect::<Vec<_>>(), ["box", "offline", "seen", "never"]);
+    assert_eq!(lines.next().unwrap().split_whitespace().collect::<Vec<_>>(), ["work", "in", "sync", "seen", "never"]);
+    assert!(lines.next().unwrap().starts_with("locked "));
     assert_eq!(lines.next(), None);
     daemon.assert_requests(&[("GET", "/status", &[], ""), ("GET", "/fleet", &[], "")]);
 }
@@ -303,4 +316,32 @@ fn fleet_lists_and_prunes_orphans_with_an_optional_machine() {
         ("GET", "/status", &[], ""),
         ("POST", "/assignment/orphans/prune", &[], r#"{"machine":"box"}"#),
     ]);
+}
+
+/// `assign --machine` writes another Machine's Assignment through the
+/// server, checks its harness by its report, and explains a `self` scope's
+/// refusal; a standalone Machine has no other Assignment to write.
+#[test]
+fn assign_another_machine_goes_to_its_assignment() {
+    let daemon = FakeDaemon::start();
+    let out = stdout(daemon.run_cli(&["--repo", "/repo", "assign", "codex", "--all", "off", "--machine", "work"]));
+    assert!(out.contains("codex: skills and rules off") && out.contains("fleet assignment of work"), "{out}");
+    daemon.assert_requests(&[
+        ("GET", "/status", &[], ""),
+        ("GET", "/fleet", &[], ""),
+        ("POST", "/machines/work/assignment/harness/codex", &[], r#"{"enabled":false}"#),
+    ]);
+    let unknown = daemon.run_cli(&["--repo", "/repo", "assign", "claude", "--all", "off", "--machine", "work"]);
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("work has no harness `claude`; it has codex"));
+    let missing = daemon.run_cli(&["--repo", "/repo", "assign", "codex", "--all", "off", "--machine", "gone"]);
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("no machine `gone` in the fleet"));
+    let refused = daemon.run_cli(&["--repo", "/repo", "assign", "codex", "--all", "off", "--machine", "locked"]);
+    let refused = String::from_utf8_lossy(&refused.stderr);
+    assert!(refused.contains("self-only join code") && refused.contains("on locked itself"), "{refused}");
+
+    let standalone = FakeDaemon::start_in_mode(sk1ll_daemon::client::DaemonMode::Standalone);
+    let out = standalone.run_cli(&["--repo", "/repo", "assign", "claude", "--all", "off", "--machine", "work"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("standalone"), "{}", String::from_utf8_lossy(&out.stderr));
+    standalone.assert_requests(&[("GET", "/status", &[], "")]);
 }

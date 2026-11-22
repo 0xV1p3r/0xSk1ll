@@ -127,6 +127,7 @@ If Pull stops partway through, the next `sk1ll pull` or Daemon reconcile resumes
 | `assign <harness> skill\|rule <name> on\|off` | Toggle a local repo item for one harness |
 | `assign <harness> --default-skills on\|off` | Set the default for skills added later (`--default-rules` for rules) |
 | `assign <harness> --all on\|off` | Set every Skill and Rule and both defaults. With a Fleet, this includes Baseline items the Machine has yet to pull |
+| `assign ... --machine <id>` | Change another fleet Machine's Assignment instead, as the desktop app's matrix does. Needs `fleet` scope |
 | `conflicts` | List harness and recovery conflicts |
 | `adopt <harness> <name>` | Copy a hand edit or an unmanaged skill into the draft. A hand edit goes into the item it was placed from, found by its Item ID even if it was renamed since |
 | `recover list\|adopt\|discard` | Inspect content that sync or pull moved aside: each entry's id, item, harness (or `pull`), age and whether it changed. `--paths` adds where it was and where it is kept |
