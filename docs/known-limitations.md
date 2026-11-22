@@ -221,6 +221,23 @@ without a push, such as a fetch run on the server by hand, aren't checked
 either: the server then refuses to list or prune orphans and to change
 defaults until a checked push replaces that Baseline.
 
+## Changes metadata cannot see
+
+The Daemon decides whether anything changed from file metadata (inode, size,
+timestamps, mode), and remembers the hashes of trees whose metadata stayed the
+same. A few changes leave all of it as it was: a write through a shared
+writable memory mapping after the file's timestamps settled, a change to a
+directory's extended attributes or ACL alone, a write that restores every
+timestamp. The Daemon notices those within ten minutes, plus one periodic
+reconcile (`SK1LL_FULL_RECONCILE_INTERVAL`, `SK1LL_RECONCILE_INTERVAL`), when
+a full reconcile plans everything and reads every tree again. One also runs at
+startup. Sync never relies on the remembered hashes when it replaces or
+removes content.
+
+A linked worktree's or a separate git directory's changes are seen by the
+periodic reconcile, not by the file watcher, which watches `.git` in the
+working tree only: they can take up to one `SK1LL_RECONCILE_INTERVAL` to show.
+
 ## Reviewed sync and concurrent changes
 
 A reviewed Sync can apply several placements. When a staged copy's digest

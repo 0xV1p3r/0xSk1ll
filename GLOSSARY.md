@@ -66,6 +66,10 @@ _Avoid_: System state, local state, working copy
 **Snapshot**:
 The daemon's published view of reconciled state, used to answer reads.
 
+**Full reconcile**:
+A reconcile that plans and reads every tree again, whatever the fingerprint of its inputs and the hash cache say: at startup, then at most every ten minutes. It bounds how long a change file metadata cannot show goes unnoticed.
+_Avoid_: Resync, rescan
+
 **Commit**:
 To record selected draft items as a new commit on the fleet branch. It reaches the fleet once it is pushed.
 _Avoid_: Promote, publish

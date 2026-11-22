@@ -75,11 +75,36 @@ again.
 Metadata can miss a change made within one tick of the filesystem's clock (a
 second on some filesystems): a file written twice in that tick may keep its
 size, inode and timestamps. So Inputs changed less than two seconds before they
-were read are never recorded, and the next wake reconciles again. A Harness's
-fingerprint covers the entries of its skills directory, the whole tree of each
-placement its ownership index records, the index and sk1ll's scratch area, and
-its instructions; it does not look inside unmanaged skills, which the plan does
-not read either.
+were read are never recorded, a Harness's included, and the next wake
+reconciles again. A Harness's fingerprint covers its settings (paths, mode and
+instructions format), the entries of its skills directory, the whole tree of
+each placement its ownership index records, the index and sk1ll's scratch
+area, its instructions, and the scratch and recovery area beside a block
+instructions file; it does not look inside unmanaged skills, which the plan
+does not read either. The recovery area's fingerprint covers the payload of
+every entry its index records, wherever it is.
+
+What is read through a symlink is stamped through it: the link and what it
+resolves to, so a skills directory, an instructions file or `machine.toml`
+linked into a dotfiles repo changes the fingerprint when its target does. When
+`.git` is a pointer file (a linked worktree, `--separate-git-dir`), the git
+directory it names and that one's common directory are stamped instead of the
+pointer alone. The working tree leaves out only the staging directories sk1ll
+creates for imports and renames, directly in `personal/`, `imported/` and
+`instructions/`; a skill's own file of that name is content.
+
+Metadata still misses a few changes: a write through a shared writable mapping
+after its stamps settled, a change to a directory's extended attributes or ACL
+alone, a write that leaves every timestamp as it was. So a full reconcile runs
+at startup and then at most every ten minutes (`SK1LL_FULL_RECONCILE_INTERVAL`)
+on the next wake: it plans and applies whatever the fingerprint says and
+empties the hash cache first, so every tree is read again. A change only that
+pass sees is reconciled within the interval plus one periodic tick.
+
+A standalone daemon whose repo disappears (moved or removed) publishes a
+Snapshot without it: every reader of the Draft, the inventory, the conflicts
+and the recovery area gets the same "no skills repo" error as any other request
+about the repo, and the report is emptied.
 
 Planning takes the hashes of skill trees (repo sources, Harness placements) from
 a cache keyed by that same metadata, with the same two-second rule. The cache
@@ -89,7 +114,7 @@ which applying it then refuses; it never makes sync overwrite or delete content
 the uncached check would have kept. Directory timestamps are left out of both
 fingerprints (lock files coming and going change them constantly), so a change
 to a directory's extended attributes alone is not seen until something else in
-the tree changes.
+the tree changes, or the next full reconcile.
 
 ## Readers use the Snapshot
 
