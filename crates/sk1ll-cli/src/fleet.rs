@@ -261,7 +261,7 @@ fn cause(cause: &sk1ll_proto::LogCause) -> String {
     }
 }
 
-fn shell_arg(arg: &str) -> String {
+pub(crate) fn shell_arg(arg: &str) -> String {
     if !arg.is_empty() && arg.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~:/%+=@".contains(&b)) {
         arg.into()
     } else {

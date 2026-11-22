@@ -799,15 +799,20 @@ fn a_manifest_broken_in_head_can_be_fixed_with_a_commit() {
     assert_eq!(repo.run(&["draft"]).unwrap(), "no draft: on the baseline\n");
 }
 
-/// `sync` fails while harness conflicts are left alone, and `sync --force`
-/// says where the edit it overwrote went.
+/// `sync` fails while harness conflicts are left alone, naming the exact
+/// command that adopts the edit, and `sync --force` says where the edit it
+/// overwrote went.
 #[test]
 fn sync_fails_on_conflicts_and_force_says_where_the_edit_went() {
     let repo = TestRepo::new().with_skill();
     repo.run(&["sync"]).unwrap();
     fs::write(repo.root.join("h/pdf/SKILL.md"), "edited in the harness").unwrap();
     let error = repo.run(&["sync"]).unwrap_err();
-    assert!(error.contains("! h") && error.contains("1 conflict(s) left alone"), "{error}");
+    assert!(error.contains("! h") && error.contains("1 conflict left alone: `sk1ll adopt h pdf`"), "{error}");
+    for command in ["status", "conflicts"] {
+        let out = repo.run(&[command]).unwrap();
+        assert!(out.contains("edited by hand in the harness; `sk1ll adopt h pdf` it into the repo"), "{out}");
+    }
     let forced = repo.run(&["sync", "--force"]).unwrap();
     assert!(forced.contains("kept in recovery as ") && forced.contains("h/pdf"), "{forced}");
     let id = forced.split("kept in recovery as ").nth(1).unwrap().split(':').next().unwrap();
