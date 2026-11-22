@@ -10,7 +10,7 @@ use sk1ll_daemon::service::Manager;
 use sk1ll_daemon::{Config, DaemonState};
 use sk1ll_proto::{LogQuery, Scope, ToggleKind};
 
-use crate::{Cli, Cmd, FleetCmd, InviteScope, confirm, names, short};
+use crate::{Cli, Cmd, FleetCmd, InviteScope, confirm, names, plural, short};
 
 pub(crate) fn runtime() -> Result<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Builder::new_current_thread().enable_all().build()?)
@@ -171,7 +171,7 @@ fn fleet(cli: &Cli, command: Option<&FleetCmd>) -> Result<()> {
                 println!("{target} already matches {source}'s Assignment; nothing to copy");
                 return Ok(());
             }
-            let count = crate::plural(preview.count, "Assignment change", "Assignment changes");
+            let count = plural(preview.count, "Assignment change", "Assignment changes");
             println!("{count} on {target}:");
             for change in &preview.changes {
                 let item = match (change.kind, &change.name, &change.item_id) {
@@ -209,11 +209,11 @@ fn fleet(cli: &Cli, command: Option<&FleetCmd>) -> Result<()> {
                 let name = orphan.name.as_deref().unwrap_or("-");
                 println!("{} / {}  {:?} {} ({name})", orphan.machine, orphan.harness, orphan.kind, orphan.item_id);
             }
-            println!("{} orphan toggle(s)", view.orphans.len());
+            println!("{}", plural(view.orphans.len(), "orphan toggle", "orphan toggles"));
         }
         Some(FleetCmd::PruneOrphans { machine }) => {
             let result = s.block(client.prune_orphans(&sk1ll_proto::PruneOrphans { machine: machine.clone() }))?;
-            println!("cleared {} orphan toggle(s)", result.entries.len());
+            println!("cleared {}", plural(result.entries.len(), "orphan toggle", "orphan toggles"));
         }
         Some(FleetCmd::Log { machine, harness, author, item, before, limit }) => {
             let query = LogQuery {
@@ -317,10 +317,10 @@ fn print_fleet(fleet: sk1ll_proto::FleetView) {
                 notes.push(format!("clashes: {}", names(&r.clashes)));
             }
             if !r.conflicts.is_empty() {
-                notes.push(format!("{} conflict(s)", r.conflicts.len()));
+                notes.push(plural(r.conflicts.len(), "conflict", "conflicts"));
             }
             if !r.drafts.is_empty() {
-                notes.push(format!("{} draft item(s)", r.drafts.len()));
+                notes.push(plural(r.drafts.len(), "draft item", "draft items"));
             }
             if !r.unpushed.is_empty() {
                 notes.push(format!("{} unpushed", r.unpushed.len()));

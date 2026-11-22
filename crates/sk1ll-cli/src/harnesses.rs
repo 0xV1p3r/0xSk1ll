@@ -173,7 +173,7 @@ pub(crate) fn run(s: &Session, all: bool, command: Option<HarnessCmd>) -> Result
         eprintln!("error: {e}");
     }
     if !applied.errors.is_empty() {
-        bail!("machine.toml changed, but {} step(s) failed", applied.errors.len());
+        bail!("machine.toml changed, but {} failed", crate::plural(applied.errors.len(), "step", "steps"));
     }
     println!("harnesses in sync");
     Ok(())
