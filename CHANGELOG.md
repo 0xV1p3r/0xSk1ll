@@ -130,6 +130,11 @@ break compatibility.
 
 ### Fixed
 
+- `sk1ll adopt` of a hand edit finds its target by the Item ID the
+  placement recorded, as recovery's Adopt does: an edit to the harness copy
+  of a skill or rule renamed since goes into the renamed item instead of
+  recreating the old name. An ID that leads to no item, or to several, is
+  refused with what was found.
 - `sk1ll commit` refuses a tree the server would refuse for good (items
   without an Item ID of their own, files through a filter driver), with the
   server's own check and message. A push the server refuses anyway is no

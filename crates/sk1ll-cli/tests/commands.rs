@@ -770,3 +770,16 @@ fn git_out(root: &Path, args: &[&str]) -> String {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
+
+/// `sk1ll adopt` of a harness copy placed before its skill was renamed
+/// updates the renamed skill: the placement's Item ID finds it.
+#[test]
+fn adopt_updates_a_renamed_skill_instead_of_recreating_the_old_name() {
+    let repo = TestRepo::new().with_skill();
+    repo.run(&["sync"]).unwrap();
+    fs::rename(repo.repo.join("personal/pdf"), repo.repo.join("personal/docs")).unwrap();
+    fs::write(repo.root.join("h/pdf/SKILL.md"), "Edited in the harness.").unwrap();
+    repo.run(&["adopt", "h", "pdf"]).unwrap();
+    assert_eq!(fs::read_to_string(repo.repo.join("personal/docs/SKILL.md")).unwrap(), "Edited in the harness.");
+    assert!(!repo.repo.join("personal/pdf").exists(), "the old name is not recreated");
+}

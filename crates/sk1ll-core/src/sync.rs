@@ -1639,7 +1639,7 @@ fn adopt_skill(repo: &Repo, harness: &str, src: &Path, name: &str) -> Result<()>
         }
     };
     let ownership = Ownership::new(&lock, src, name, recorded.as_ref());
-    let target = adopt_target(repo, displaced::Kind::Skill, Path::new(name), None)?;
+    let target = placed_target(repo, displaced::Kind::Skill, src, name)?;
     let placed_origin = displaced::skill_placement_origin(src)?.or(target.origin);
     let (hash, payload, displaced) = copy_into_repo(repo, src, &target, None, placed_origin)?;
     // Only what was copied is owned: content the copy left out (`.git`),
@@ -1716,6 +1716,63 @@ fn adopt_target(repo: &Repo, kind: displaced::Kind, dest: &Path, item_id: Option
     };
     crate::imports::validate_name(&name.to_string_lossy())?;
     Ok(target)
+}
+
+/// Where Adopt copies the harness content at `src` (a skill or rule file,
+/// `leaf` named there): the repo item sync placed it from, found by the
+/// Item ID it recorded for the placement, whatever the item is called now
+/// (it may have been renamed). Refused, naming what it found, when that ID
+/// leads to no item now (deleted, or given a new ID) or to more than one.
+/// Only a placement recorded without an Item ID is found by its name.
+fn placed_target(repo: &Repo, kind: displaced::Kind, src: &Path, leaf: &str) -> Result<AdoptTarget> {
+    let what = if kind == displaced::Kind::Rule { "rule" } else { "skill" };
+    let name = if kind == displaced::Kind::Rule { leaf.strip_suffix(".md").unwrap_or(leaf) } else { leaf };
+    let Some(Some(id)) = displaced::placed_id(kind, src)? else {
+        return adopt_target(repo, kind, Path::new(leaf), None);
+    };
+    let (skills, rules) = match repo.content() {
+        Err(Error::DuplicateItemId { id: shared, first, second }) => {
+            return Err(Error::Invalid(format!(
+                "can't tell where to adopt `{name}`: Item ID `{shared}` is claimed by both {} and {}. Run `sk1ll \
+                 repair-ids` first",
+                first.display(),
+                second.display()
+            )));
+        }
+        content => content?,
+    };
+    let holders: Vec<(String, PathBuf)> = match kind {
+        displaced::Kind::Rule => {
+            rules.iter().filter(|r| r.id.as_ref() == Some(&id)).map(|r| (r.name.clone(), r.path.clone())).collect()
+        }
+        _ => skills.iter().filter(|s| s.id.as_ref() == Some(&id)).map(|s| (s.name.clone(), s.path.clone())).collect(),
+    };
+    match holders.as_slice() {
+        [_] => adopt_target(repo, kind, Path::new(leaf), Some(&id)),
+        [] => {
+            let same_name = match kind {
+                displaced::Kind::Rule => rules.iter().any(|r| r.name == name),
+                _ => skills.iter().any(|s| s.name == name),
+            };
+            let hint = match same_name {
+                true => format!(
+                    " The repo's {what} `{name}` has another Item ID, so it is another item; adopting would \
+                     overwrite it."
+                ),
+                false => String::new(),
+            };
+            Err(Error::Invalid(format!(
+                "can't adopt `{name}`: sync placed it as Item ID `{id}`, which no {what} in the repo has now (deleted, \
+                 or given a new Item ID).{hint} Restore that {what} (`sk1ll restore`), or move {} out of the harness \
+                 and add it again as a new {what}",
+                src.display()
+            )))
+        }
+        many => Err(Error::Invalid(format!(
+            "can't tell where to adopt `{name}`: Item ID `{id}` belongs to {}. Run `sk1ll repair-ids` first",
+            many.iter().map(|(name, path)| format!("`{name}` ({})", path.display())).collect::<Vec<_>>().join(", ")
+        ))),
+    }
 }
 
 fn recovery_target_changed(id: Option<&ItemId>) -> Error {
@@ -1902,7 +1959,7 @@ fn adopt_rule(repo: &Repo, harness: &str, src: &Path, file: &str) -> Result<()> 
     };
     let recorded = index_entry(src)?;
     let ownership = Ownership::new(&lock, src, file, recorded.as_ref());
-    let target = adopt_target(repo, displaced::Kind::Rule, Path::new(file), None)?;
+    let target = placed_target(repo, displaced::Kind::Rule, src, file)?;
     let displaced = rule_into_repo(repo, &target, &text, None)?;
     // The file read, whichever it is: from now on sync manages it.
     let next = IndexEntry::Rule { file: id, hash: hash_str(&text), payload };
@@ -2385,6 +2442,13 @@ pub mod displaced {
                 || record.provenance.repo != root
                 || record.provenance.source.as_deref() != Some(source)
         }))
+    }
+
+    /// The Item ID sync recorded for what it placed at `dest`: `None` if it
+    /// recorded nothing there (placed before Item IDs, say), `Some(None)` if
+    /// the item had no Item ID then.
+    pub(super) fn placed_id(kind: Kind, dest: &Path) -> Result<Option<Option<ItemId>>> {
+        Ok(placed(kind, dest)?.map(|record| record.id))
     }
 
     pub fn skill_placement_origin(dest: &Path) -> Result<Option<Origin>> {
@@ -6191,6 +6255,44 @@ mod tests {
         let actions = plan(repo, harnesses, &assignment, PlanOptions::default()).unwrap();
         assert_eq!(actions[0].kind, ActionKind::Conflict);
         (dest, actions.into_iter().next().unwrap())
+    }
+
+    /// Adopt follows the Item ID a placement was recorded with: an edit to
+    /// the harness copy of a skill renamed since goes into the renamed
+    /// skill, never into a new one of the old name. An ID that leads to no
+    /// item, or to two, is refused, naming what it found.
+    #[test]
+    fn adopt_finds_a_renamed_target_by_its_item_id() {
+        let (tmp, repo, harnesses) = skill_setup(LinkMode::Copy);
+        let _root = displaced::test_root(&tmp.path().join("recovery"));
+        let assignment = Assignment::default();
+        apply(&repo, &plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap()[0]).unwrap();
+        let personal = repo.personal_dir();
+        fs::rename(personal.join("pdf"), personal.join("docs")).unwrap();
+        write(&tmp.path().join("skills/pdf/SKILL.md"), "Edited in the harness.\n");
+        let conflict = || {
+            let actions = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
+            actions.into_iter().find(|a| a.kind == ActionKind::Conflict && a.dest.ends_with("pdf")).unwrap()
+        };
+        let pending = conflict();
+
+        // Another item of the old name, and later a copy that shares the ID.
+        write(&personal.join("pdf/SKILL.md"), "Another pdf.\n");
+        repo.assign_missing_ids().unwrap();
+        fs::rename(personal.join("docs"), tmp.path().join("docs-aside")).unwrap();
+        let error = adopt(&repo, &pending).unwrap_err().to_string();
+        assert!(error.contains("no skill in the repo has now") && error.contains("another Item ID"), "{error}");
+        fs::rename(tmp.path().join("docs-aside"), personal.join("docs")).unwrap();
+        fs::create_dir(personal.join("copy")).unwrap();
+        fs::copy(personal.join("docs/SKILL.md"), personal.join("copy/SKILL.md")).unwrap();
+        fs::copy(personal.join("docs/.sk1ll-id"), personal.join("copy/.sk1ll-id")).unwrap();
+        let error = adopt(&repo, &pending).unwrap_err().to_string();
+        assert!(error.contains("personal/copy") && error.contains("personal/docs"), "{error}");
+        fs::remove_dir_all(personal.join("copy")).unwrap();
+
+        adopt(&repo, &conflict()).unwrap();
+        assert_eq!(fs::read_to_string(personal.join("docs/SKILL.md")).unwrap(), "Edited in the harness.\n");
+        assert_eq!(fs::read_to_string(personal.join("pdf/SKILL.md")).unwrap(), "Another pdf.\n");
     }
 
     /// Adopting replaces the repo version through sync's swap: an edit to

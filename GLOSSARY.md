@@ -89,7 +89,7 @@ Content in a harness that differs from what the machine's draft says it should b
 _Avoid_: Drift
 
 **Adopt**:
-To copy content from a harness into the machine's draft: either a hand edit made to managed content in the harness, or an unmanaged skill, which becomes a personal skill.
+To copy content from a harness into the machine's draft: either a hand edit made to managed content in the harness, which goes into the item it was placed from (found by the Item ID the placement recorded, whatever the item is called now), or an unmanaged skill, which becomes a personal skill.
 _Avoid_: Import (reserved for external git sources), take in
 
 **Daemon**:
