@@ -219,7 +219,25 @@ enum Blob {
     Rule(PathBuf),
 }
 
+/// [`claims_at`] that never reads what it leaves out: the claims of the
+/// items `include` takes (and the manifest's Imports only with `manifest`),
+/// read without the metadata of the others, which may be unreadable.
+pub(crate) fn claims_at_only(
+    root: &Path,
+    rev: &str,
+    include: impl Fn(&Path) -> bool,
+    manifest: bool,
+) -> Result<Claims> {
+    let repo = RepoGit::with_env(root, &[("GIT_OPTIONAL_LOCKS".into(), "0".into())])?;
+    let tree = repo.git().args(["rev-parse", "--verify", &format!("{rev}^{{tree}}")]).text()?;
+    read_claims_of(root, &tree, &include, manifest)
+}
+
 fn read_claims(root: &Path, tree: &str) -> Result<Claims> {
+    read_claims_of(root, tree, &|_| true, true)
+}
+
+fn read_claims_of(root: &Path, tree: &str, include: &dyn Fn(&Path) -> bool, manifest: bool) -> Result<Claims> {
     let repo = RepoGit::with_env(root, &[("GIT_OPTIONAL_LOCKS".into(), "0".into())])?;
     let git = || repo.git();
     let tree = git().args(["ls-tree", "-r", "-t", "-z", tree]).run()?;
@@ -234,7 +252,7 @@ fn read_claims(root: &Path, tree: &str) -> Result<Claims> {
 
     let mut claims = Claims::new();
     let mut jobs = Vec::new();
-    if let Some(&(mode, oid)) = entries.get(Path::new(MANIFEST_FILE)) {
+    if let Some(&(mode, oid)) = entries.get(Path::new(MANIFEST_FILE)).filter(|_| manifest) {
         if !regular(mode) {
             return Err(Error::Invalid(format!("{MANIFEST_FILE} is not a regular file")));
         }
@@ -246,6 +264,9 @@ fn read_claims(root: &Path, tree: &str) -> Result<Claims> {
             && matches!(parent.parent(), Some(dir) if dir == Path::new(PERSONAL_DIR) || dir == Path::new(IMPORTED_DIR))
         {
             if mode == "040000" || crate::source::is_staging_path(parent) {
+                continue;
+            }
+            if parent.starts_with(PERSONAL_DIR) && !include(parent) {
                 continue;
             }
             claims.insert(parent.into(), None);
@@ -260,6 +281,7 @@ fn read_claims(root: &Path, tree: &str) -> Result<Claims> {
         } else if parent == Path::new(INSTRUCTIONS_DIR)
             && path.extension().is_some_and(|ext| ext == "md")
             && !crate::source::is_staging_path(path)
+            && include(path)
         {
             if regular(mode) {
                 jobs.push((oid, Blob::Rule(path.clone())));

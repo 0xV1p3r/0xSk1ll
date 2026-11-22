@@ -783,3 +783,16 @@ fn adopt_updates_a_renamed_skill_instead_of_recreating_the_old_name() {
     assert_eq!(fs::read_to_string(repo.repo.join("personal/docs/SKILL.md")).unwrap(), "Edited in the harness.");
     assert!(!repo.repo.join("personal/pdf").exists(), "the old name is not recreated");
 }
+
+/// A manifest committed broken (invalid TOML in HEAD) can be repaired with
+/// `sk1ll commit manifest`.
+#[test]
+fn a_manifest_broken_in_head_can_be_fixed_with_a_commit() {
+    let repo = TestRepo::new();
+    let manifest = fs::read_to_string(repo.repo.join("sk1ll.toml")).unwrap();
+    fs::write(repo.repo.join("sk1ll.toml"), "[import.web\n").unwrap();
+    git(&repo.repo, &["commit", "-qam", "broken by hand"]);
+    fs::write(repo.repo.join("sk1ll.toml"), &manifest).unwrap();
+    repo.run(&["commit", "manifest", "-m", "fix the manifest"]).unwrap();
+    assert_eq!(repo.run(&["draft"]).unwrap(), "no draft: on the baseline\n");
+}

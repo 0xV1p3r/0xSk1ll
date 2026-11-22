@@ -130,6 +130,9 @@ break compatibility.
 
 ### Fixed
 
+- A commit can repair Item ID metadata the Baseline can't read (a manifest
+  committed as invalid TOML, a rule with broken frontmatter): it is checked
+  against the rest of `HEAD`, and the tree it makes is checked strictly.
 - `sk1ll adopt` of a hand edit finds its target by the Item ID the
   placement recorded, as recovery's Adopt does: an edit to the harness copy
   of a skill or rule renamed since goes into the renamed item instead of

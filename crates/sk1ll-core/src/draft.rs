@@ -513,11 +513,26 @@ impl Repo {
     }
 
     fn check_id_transitions(&self, head: Option<&str>, selected: &[ItemRef], operation: &str) -> Result<()> {
-        use crate::item_id::{claim_path, claims_at, claims_on_disk, manifest_on_disk};
+        use crate::item_id::{claim_path, claims_at, claims_at_only, claims_on_disk, manifest_on_disk};
         let Some(head) = head else { return Ok(()) };
-        let committed = claims_at(self.root(), head, |_| true, true)?;
         // Restore still has to work when the selected metadata itself is broken.
         let restoring = operation == "restore";
+        let committed = match claims_at(self.root(), head, |_| true, true) {
+            Ok(claims) => claims,
+            // A commit may replace what HEAD can't read: the rest of HEAD
+            // constrains the moves, and the tree it makes is checked strictly.
+            Err(Error::Parse { .. } | Error::Invalid(_)) if !restoring => {
+                let replaced = |path: &Path| selected.contains(&claim_item(path));
+                let manifest = !selected.contains(&ItemRef::Manifest);
+                claims_at_only(self.root(), head, |path| !replaced(path), manifest).map_err(|e| {
+                    Error::Invalid(format!(
+                        "can't {operation}: the baseline has Item ID metadata that can't be read ({e}). Fix it and \
+                         {operation} it together with these items"
+                    ))
+                })?
+            }
+            Err(e) => return Err(e),
+        };
         let manifest = match manifest_on_disk(self.root()) {
             Err(Error::Parse { .. }) if restoring && selected.contains(&ItemRef::Manifest) => {
                 crate::Manifest::default()
@@ -1898,6 +1913,44 @@ mod tests {
         write(&root.join("instructions/x.md"), "x\n");
         assert!(invalid(r.restore(&[ItemRef::Manifest, item("rule:x")])).contains("commit it first"));
         assert!(root.join("instructions/x.md").is_file());
+    }
+
+    /// Metadata HEAD can't read doesn't block its own repair: a commit that
+    /// replaces it (a corrected manifest, a rule with its frontmatter fixed)
+    /// goes through, its tree checked strictly; one that leaves it is
+    /// refused, and so is a commit whose own metadata is unreadable.
+    #[test]
+    fn a_commit_can_replace_metadata_head_cannot_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let repo = Repo::init_committed(&root).unwrap();
+        git(&root, &["config", "user.name", "T"]);
+        git(&root, &["config", "user.email", "t@example.invalid"]);
+        repo.create_item("rule", "style", "Style").unwrap();
+        repo.commit(&[item("rule:style")], "style", None).unwrap();
+        let manifest = read(&root.join("sk1ll.toml"));
+        let rule = read(&root.join("instructions/style.md"));
+        write(&root.join("sk1ll.toml"), "[import.web\n");
+        write(&root.join("instructions/style.md"), &rule.replacen("id:", "id: [", 1));
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-qm", "broken by hand"]);
+
+        // The tree it makes is checked strictly: fixing only the manifest
+        // leaves the rule HEAD can't read in it.
+        write(&root.join("sk1ll.toml"), &manifest);
+        write(&root.join("instructions/style.md"), &rule);
+        let error = repo.commit(&[item("manifest")], "fix the manifest", None).unwrap_err().to_string();
+        assert!(error.contains("instructions/style.md"), "{error}");
+        repo.create_item("rule", "git", "Git").unwrap();
+        let error = repo.commit(&[item("rule:git")], "git", None).unwrap_err().to_string();
+        assert!(error.contains("sk1ll.toml"), "{error}");
+        repo.commit(&[item("manifest"), item("rule:style"), item("rule:git")], "fix both", None).unwrap();
+        assert!(repo.draft().unwrap().is_empty());
+        assert!(crate::item_id::claims_at(repo.root(), "HEAD", |_| true, true).is_ok());
+
+        // What it commits must be readable.
+        write(&root.join("sk1ll.toml"), "[import.web\n");
+        assert!(repo.commit(&[item("manifest")], "broken again", None).is_err());
     }
 
     #[test]
