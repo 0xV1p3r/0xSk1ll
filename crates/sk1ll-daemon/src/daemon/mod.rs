@@ -457,11 +457,14 @@ impl Daemon {
 
     pub(crate) fn require_repo(&self) -> Result<()> {
         if self.is_standalone() && !self.repo_root().join(".git").exists() {
-            return Err(Error::Conflict(
-                "this machine has no skills repo yet; initialize it with `sk1ll init` or POST /init".into(),
-            ));
+            return Err(Self::no_repo());
         }
         Ok(())
+    }
+
+    /// Why a standalone daemon without its repo answers nothing about it.
+    pub(super) fn no_repo() -> Error {
+        Error::Conflict("this machine has no skills repo yet; initialize it with `sk1ll init` or POST /init".into())
     }
 
     /// The current lifecycle.

@@ -242,10 +242,14 @@ impl Daemon {
         }
         let root = self.repo_root().to_path_buf();
         if self.is_standalone() && !root.join(".git").exists() {
+            // Moved or removed: what readers had of it is gone with it.
+            let generation = self.snapshot().generation + 1;
+            self.snapshot.send_replace(Snapshot::without_repo(generation, Self::no_repo));
             self.update(|v| {
                 v.repo_ready = false;
                 v.has_origin = false;
                 v.last_error = None;
+                v.report = MachineReport::default();
             });
             self.roots
                 .send_replace(vec![WatchRoot::new(root, true), WatchRoot::new(self.cfg.assignment.clone(), false)]);

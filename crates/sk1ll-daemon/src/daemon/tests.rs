@@ -1027,3 +1027,37 @@ fn a_git_pointer_is_followed_to_the_git_and_common_dirs() {
         assert_ne!(reconcile::git_dirs(root).unwrap(), before, "{what}");
     }
 }
+
+/// A standalone daemon whose repo was moved away publishes a Snapshot
+/// without it: readers stop answering with the vanished repo's items.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_missing_standalone_repo_replaces_the_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    Repo::init_committed(&root).unwrap();
+    pdf_skill(&root);
+    let cfg = Config {
+        repo: Some(root.clone()),
+        state: dir.path().join("state/daemon.json"),
+        assignment: dir.path().join("assignment.json"),
+        machine_config: dir.path().join("machine.toml"),
+        socket: dir.path().join("daemon.sock"),
+        ..Config::new().unwrap()
+    };
+    let presets =
+        sk1ll_core::machine::presets().map(|name| format!("[harnesses.{name}]\nenabled = false\n")).collect::<String>();
+    std::fs::write(&cfg.machine_config, format!("id = \"m\"\n{presets}")).unwrap();
+    let d = Daemon::standalone(cfg).unwrap();
+    d.blocking(|d, eng| d.reconcile(eng)).await.unwrap();
+    assert!(d.snapshot().items().unwrap().iter().any(|i| i.item.to_string() == "skill:pdf"));
+    assert!(!d.view().report.items.is_empty());
+    std::fs::rename(&root, dir.path().join("moved")).unwrap();
+    d.blocking(|d, eng| d.reconcile(eng)).await.unwrap();
+    let snapshot = d.snapshot();
+    assert!(matches!(snapshot.items(), Err(Error::Conflict(_))));
+    assert!(matches!(snapshot.draft(), Err(Error::Conflict(_))));
+    assert!(matches!(snapshot.conflicts(), Err(Error::Conflict(_))));
+    assert!(matches!(snapshot.recovered(), Err(Error::Conflict(_))));
+    assert!(!d.view().repo_ready);
+    assert!(d.view().report.items.is_empty());
+}
