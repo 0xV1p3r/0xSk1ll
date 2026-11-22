@@ -453,18 +453,17 @@ fn solo(id: &str, server_url: &str, snap: Option<AssignmentSnapshot>) -> Machine
     git(m.home.path(), &["init", "--quiet", "--bare", origin.to_str().unwrap()]);
     git(&repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
     git(&repo, &["push", "--quiet", "-u", "origin", "main"]);
-    DaemonState {
+    let state = DaemonState {
         machine_id: id.into(),
         server_url: server_url.into(),
         token: "tok".into(),
         repo,
         revoked: false,
         record: Default::default(),
-    }
-    .save(&m.state_path())
-    .unwrap();
+    };
+    state.save(&m.state_path()).unwrap();
     if let Some(snap) = snap {
-        write(m.snapshot_path().parent().unwrap(), "daemon-assignment.json", &serde_json::to_string(&snap).unwrap());
+        sk1ll_daemon::state::save_snapshot(&m.snapshot_path(), &snap, Some(&state.registration_key())).unwrap();
     }
     m
 }

@@ -55,18 +55,22 @@ pub(crate) enum Fleet {
 pub(crate) struct Lifecycle {
     fleet: Fleet,
     record: PullRecord,
+    /// Grows whenever what the daemon manages changes (removed, halted), so
+    /// an operation can tell that it is still in the world it started in
+    /// (see [`crate::daemon::World`]).
+    epoch: u64,
 }
 
 impl Lifecycle {
     pub(crate) fn standalone(record: PullRecord) -> Self {
-        Self { fleet: Fleet::Standalone, record }
+        Self { fleet: Fleet::Standalone, record, epoch: 0 }
     }
 
     /// A joined daemon at startup: connecting, unless it was removed.
     pub(crate) fn joined(revoked: bool, record: PullRecord) -> Self {
         let fleet =
             if revoked { Fleet::Revoked } else { Fleet::Joined { link: Link::Connecting, rejected_since: None } };
-        Self { fleet, record }
+        Self { fleet, record, epoch: 0 }
     }
 
     // -------------------------------------------------------------------
@@ -96,6 +100,7 @@ impl Lifecycle {
     pub(crate) fn revoke(&mut self) {
         if matches!(self.fleet, Fleet::Joined { .. }) {
             self.fleet = Fleet::Revoked;
+            self.epoch += 1;
         }
     }
 
@@ -106,6 +111,7 @@ impl Lifecycle {
             _ => None,
         };
         self.fleet = Fleet::Halted { was: self.connection(), rejected_since };
+        self.epoch += 1;
     }
 
     pub(crate) fn set_pull(&mut self, pull: PullState) {
@@ -126,6 +132,10 @@ impl Lifecycle {
             Fleet::Revoked => Err("this machine was removed from the fleet; the daemon no longer manages it"),
             Fleet::Halted { .. } => Err("the daemon is restarting after joining again; try again"),
         }
+    }
+
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     pub(crate) fn idle(&self) -> bool {

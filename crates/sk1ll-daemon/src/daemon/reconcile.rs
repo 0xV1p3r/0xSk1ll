@@ -373,27 +373,28 @@ impl Daemon {
     /// (`finished`) found, else what was known, checked against the repo. The
     /// journal decides whether a pull is pending. A remembered block whose
     /// Baseline `HEAD` has reached since (a pull while the daemon was
-    /// stopped) is over.
+    /// stopped) is over. So is a remembered pending pull whose journal is
+    /// gone and whose Baseline `HEAD` contains: it finished, and the process
+    /// stopped before it could record that.
     pub(super) fn pull_after_reconcile(&self, root: &Path, finished: Option<PullState>, pending: bool) -> PullState {
         if let Some(pull) = finished {
             return pull;
         }
+        let reached = |baseline: &str| {
+            gitx::rev(root, "HEAD")
+                .ok()
+                .flatten()
+                .is_some_and(|head| gitx::is_ancestor(root, baseline, &head).unwrap_or(false))
+        };
         match self.lifecycle().pull().clone() {
             PullState::Pending { items } if pending => PullState::Pending { items },
             _ if pending => PullState::Pending { items: Vec::new() },
             PullState::Pending { items } if items.is_empty() => PullState::Clear,
             PullState::Pending { items } => match gitx::remote_head(root) {
-                Ok(Some(baseline)) => PullState::Blocked { baseline, items },
+                Ok(Some(baseline)) if !reached(&baseline) => PullState::Blocked { baseline, items },
                 _ => PullState::Clear,
             },
-            PullState::Blocked { baseline, .. }
-                if gitx::rev(root, "HEAD")
-                    .ok()
-                    .flatten()
-                    .is_some_and(|head| gitx::is_ancestor(root, &baseline, &head).unwrap_or(false)) =>
-            {
-                PullState::Clear
-            }
+            PullState::Blocked { baseline, .. } if reached(&baseline) => PullState::Clear,
             pull => pull,
         }
     }

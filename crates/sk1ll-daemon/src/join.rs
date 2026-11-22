@@ -245,11 +245,22 @@ async fn register_inner(
 }
 
 #[cfg(test)]
+type PersistHook = Box<dyn FnOnce() -> anyhow::Result<()>>;
+
+#[cfg(test)]
 thread_local! {
     static BEFORE_CREDENTIALS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
+    /// Runs in [`Registered::persist`] between the snapshot and the
+    /// credentials: an error stands for the process stopping there.
+    static AFTER_SNAPSHOT: std::cell::RefCell<Option<PersistHook>> = Default::default();
 }
 
 impl Registered {
+    #[cfg(test)]
+    pub(crate) fn for_test(state: DaemonState, snapshot: AssignmentSnapshot) -> Self {
+        Self { state, snapshot, harnesses: Vec::new() }
+    }
+
     pub(crate) fn state(&self) -> &DaemonState {
         &self.state
     }
@@ -270,16 +281,38 @@ impl Registered {
         Ok(path)
     }
 
-    /// Stores the token and the assignment snapshot. The token is shown only
-    /// once, so this comes before anything else that can fail.
+    /// Stores the assignment snapshot, then the token. The token is shown
+    /// only once, so this comes before anything else that can fail. The
+    /// snapshot is tagged with the new registration and written first: a
+    /// stop in between leaves the old credentials, which ignore it, never the
+    /// new credentials with the old registration's snapshot.
     pub(crate) fn persist(&self, cfg: &Config) -> anyhow::Result<()> {
+        state::save_snapshot(&cfg.snapshot_path(), &self.snapshot, Some(&self.state.registration_key()))?;
+        #[cfg(test)]
+        AFTER_SNAPSHOT.with_borrow_mut(|hook| hook.take().map_or(Ok(()), |hook| hook()))?;
         self.state.save(&cfg.state)?;
-        state::save_snapshot(&cfg.snapshot_path(), &self.snapshot)?;
         // The CLI's read-only commands read the cache; it is only a mirror.
         if let Err(e) = self.snapshot.assignment.save(&cfg.assignment) {
             tracing::warn!("writing the assignment cache {}: {e}", cfg.assignment.display());
         }
         Ok(())
+    }
+
+    /// A registration that is not used after all: best effort, asks the
+    /// server to remove it again with its own token. If the server can't be
+    /// reached, it stays in the Fleet as a Machine that never connects,
+    /// for an admin to remove.
+    pub(crate) async fn discard(&self, http: &reqwest::Client) {
+        let url = format!("{}/api/machines/{}", self.state.server_url, self.state.machine_id);
+        let sent = http.delete(url).bearer_auth(&self.state.token).timeout(std::time::Duration::from_secs(10)).send();
+        match sent.await.map(|r| r.error_for_status()) {
+            Ok(Ok(_)) => tracing::info!("removed the unused registration `{}` again", self.state.machine_id),
+            Ok(Err(e)) | Err(e) => tracing::warn!(
+                "the unused registration `{}` stays in the Fleet until it is removed: {}",
+                self.state.machine_id,
+                crate::auth::redact(&e.to_string())
+            ),
+        }
     }
 
     /// Build the replacement privately and lock it before it can become live.
@@ -317,7 +350,11 @@ impl Registered {
     /// snapshot and mirror succeed, restoring every earlier file on failure.
     pub(crate) fn persist_standalone(&self, cfg: &Config) -> anyhow::Result<()> {
         let mut files = [
-            ActivationFile::stage(cfg.snapshot_path(), &self.snapshot, true)?,
+            ActivationFile::stage(
+                cfg.snapshot_path(),
+                &state::StoredSnapshot::new(&self.snapshot, Some(&self.state.registration_key())),
+                true,
+            )?,
             ActivationFile::stage(cfg.assignment.clone(), &self.snapshot.assignment, true)?,
             ActivationFile::stage(cfg.state.clone(), &self.state, false)?,
         ];
@@ -585,6 +622,40 @@ mod tests {
         assert_eq!(std::fs::read(cfg.snapshot_path()).unwrap(), b"original snapshot");
         assert_eq!(std::fs::read(&cfg.assignment).unwrap(), b"original local assignment");
         assert_eq!(std::fs::read(cfg.state.join("notes")).unwrap(), b"private");
+    }
+
+    /// A stop between the rejoin's two writes never leaves the new
+    /// credentials with the old registration's snapshot: the snapshot comes
+    /// first and belongs to the new registration, which the old credentials
+    /// don't load.
+    #[test]
+    fn a_rejoin_stopped_half_way_never_pairs_new_credentials_with_the_old_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = Config::new().unwrap();
+        cfg.state = tmp.path().join("daemon.json");
+        cfg.assignment = tmp.path().join("assignment.json");
+        let old = DaemonState::new("a".into(), "http://h".into(), "old".into(), tmp.path().join("repo"));
+        old.save(&cfg.state).unwrap();
+        let mut toggles = AssignmentSnapshot { revision: 50, ..Default::default() };
+        toggles.assignment.set_harness("h", true);
+        state::save_snapshot(&cfg.snapshot_path(), &toggles, Some(&old.registration_key())).unwrap();
+
+        let mut reg = registration(tmp.path());
+        reg.state.token = "new".into();
+        reg.snapshot = AssignmentSnapshot { revision: 7, ..Default::default() };
+        AFTER_SNAPSHOT.with_borrow_mut(|hook| *hook = Some(Box::new(|| anyhow::bail!("the process stopped"))));
+        assert!(reg.persist(&cfg).is_err());
+        let stored = DaemonState::load(&cfg.state).unwrap().unwrap();
+        assert_eq!(stored.token, "old", "the old credentials are still there");
+        let snapshot = state::load_snapshot(&cfg.snapshot_path(), Some(&stored.registration_key())).unwrap();
+        assert_eq!(snapshot, None, "the old registration doesn't take up the new one's snapshot");
+
+        reg.persist(&cfg).unwrap();
+        let stored = DaemonState::load(&cfg.state).unwrap().unwrap();
+        assert_eq!(stored.token, "new");
+        let snapshot = state::load_snapshot(&cfg.snapshot_path(), Some(&stored.registration_key())).unwrap();
+        assert_eq!(snapshot.unwrap().revision, 7, "a higher old revision never masks the new snapshot");
+        assert_eq!(state::load_snapshot(&cfg.snapshot_path(), Some(&old.registration_key())).unwrap(), None);
     }
 
     #[tokio::test]

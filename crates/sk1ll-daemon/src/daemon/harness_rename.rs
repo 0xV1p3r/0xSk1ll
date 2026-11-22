@@ -34,18 +34,18 @@ impl Daemon {
             Some(_) => return Err(Error::Conflict("finish the pending Harness rename first".into())),
             None => Some(crate::server::fetch_machine_assignment(&state, &self.http).await?.assignment),
         };
-        let intent = self
+        let (intent, world) = self
             .blocking(move |d, eng| {
-                d.ensure_managed()?;
+                let world = d.world()?;
                 d.lock_repo(eng)?;
                 let intent = crate::server::prepare_rename(&d.cfg, &state, request, authoritative.as_ref())?;
                 intent.apply_config(&d.cfg.machine_config)?;
-                Ok(intent)
+                Ok((intent, world))
             })
             .await?;
         let result = crate::server::write_assignment(self, crate::server::rename_write(&intent)).await;
         let routed_rules = intent.routed_rules.clone();
-        match self.blocking(move |d, eng| d.finish_harness_rename(eng, intent, result)).await {
+        match self.blocking(move |d, eng| d.finish_harness_rename(eng, world, intent, result)).await {
             Ok(update) => Ok(crate::client::HarnessRenameResult { update, routed_rules }),
             Err(error) => {
                 self.restart_assignment_session.notify_one();
@@ -78,28 +78,34 @@ impl Daemon {
         })
     }
 
-    pub(crate) fn pending_harness_rename(&self, eng: &mut Engine) -> Result<Option<RenameIntent>> {
+    pub(crate) fn pending_harness_rename(&self, eng: &mut Engine) -> Result<Option<(RenameIntent, World)>> {
         let authority = self.ident.joined()?.rename_authority();
         let config = &self.cfg.machine_config;
         let Some(intent) = RenameIntent::load(config, Some(&authority))? else { return Ok(None) };
-        self.ensure_managed()?;
+        let world = self.world()?;
         self.lock_repo(eng)?;
         intent.apply_config(config)?;
-        Ok(Some(intent))
+        Ok(Some((intent, world)))
     }
 
+    /// Applies the server's answer to a rename sent from `world`. A daemon
+    /// that was removed, or halted for a rejoin, since applies nothing and
+    /// saves no snapshot: the state files may already be the next
+    /// registration's.
     pub(crate) fn finish_harness_rename(
         &self,
         eng: &mut Engine,
+        world: World,
         intent: RenameIntent,
         result: Result<AssignmentUpdate>,
     ) -> Result<AssignmentUpdate> {
+        self.same_world(world)?;
         // If the process stops after clearing the intent, startup must
         // already have the Assignment for the new config.
         if let Ok(update) = &result
             && self.applied().is_none_or(|current| current.revision < update.revision)
         {
-            crate::server::save_assignment_snapshot(&self.cfg, update)?;
+            crate::server::save_assignment_snapshot(&self.cfg, self.ident.joined()?, update)?;
         }
         let mut update = crate::server::resolve_rename(&self.cfg.machine_config, &intent, result)?;
         let snapshot =

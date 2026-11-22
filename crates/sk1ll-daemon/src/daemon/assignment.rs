@@ -23,7 +23,7 @@ impl Daemon {
         }
         let revision = previous.as_ref().map_or(1, |s| s.revision + 1);
         let snap = AssignmentSnapshot { revision, assignment, registration: None };
-        state::save_snapshot(&self.cfg.state.with_file_name("standalone-assignment.json"), &snap)?;
+        state::save_snapshot(&self.cfg.state.with_file_name("standalone-assignment.json"), &snap, None)?;
         *self.applied.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(snap));
         self.update(|v| {
             v.assignment_revision = revision;
@@ -145,15 +145,16 @@ impl Daemon {
             return self.blocking(move |d, eng| d.write_local_assignment(eng, write)).await;
         }
         let _writes = self.assignment_writes.lock().await;
-        self.blocking(|d, _| {
-            if RenameIntent::exists(&d.cfg.machine_config)? {
-                return Err(Error::Unavailable("waiting for the pending Harness rename to finish".into()));
-            }
-            Ok(())
-        })
-        .await?;
+        let world = self
+            .blocking(|d, _| {
+                if RenameIntent::exists(&d.cfg.machine_config)? {
+                    return Err(Error::Unavailable("waiting for the pending Harness rename to finish".into()));
+                }
+                d.world()
+            })
+            .await?;
         let update = crate::server::write_assignment(self, write).await?;
-        self.blocking(move |d, eng| Ok(d.apply_confirmed(eng, update))).await
+        self.blocking(move |d, eng| Ok(d.apply_confirmed(eng, world, update))).await
     }
 
     pub(super) fn write_local_assignment(&self, eng: &mut Engine, write: AssignmentWrite) -> Result<AssignmentUpdate> {
@@ -187,9 +188,14 @@ impl Daemon {
     /// nothing; a newer revision applied meanwhile (its snapshot overtook the
     /// confirmation) stands, and since the server numbers revisions in order
     /// it already includes this write: the reply then carries that one.
-    pub(super) fn apply_confirmed(&self, eng: &mut Engine, mut update: AssignmentUpdate) -> AssignmentUpdate {
-        if self.idle() {
-            tracing::info!("not applying Assignment revision {}: no longer managing", update.revision);
+    pub(super) fn apply_confirmed(
+        &self,
+        eng: &mut Engine,
+        world: World,
+        mut update: AssignmentUpdate,
+    ) -> AssignmentUpdate {
+        if let Err(why) = self.same_world(world) {
+            tracing::info!("not applying Assignment revision {}: {why}", update.revision);
             return update;
         }
         let snapshot =
@@ -244,7 +250,7 @@ impl Daemon {
             }
             return Ok(Vec::new());
         }
-        state::save_snapshot(&self.cfg.snapshot_path(), &snap)?;
+        state::save_snapshot(&self.cfg.snapshot_path(), &snap, self.snapshot_owner().as_deref())?;
         if let Err(e) = snap.assignment.save(&self.cfg.assignment) {
             tracing::warn!("writing the assignment cache {}: {e}", self.cfg.assignment.display());
         }

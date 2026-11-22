@@ -175,11 +175,11 @@ async fn session(d: &Arc<Daemon>, ws: Ws, inbox: &mpsc::UnboundedSender<ServerMe
     let (mut sink, mut stream) = ws.split();
     let mut view = d.subscribe_view();
     send(&mut sink, &DaemonMessage::Hello { machine_id: d.ident.machine_id().to_string() }).await?;
-    if let Some(intent) = d.blocking(|d, eng| d.pending_harness_rename(eng)).await? {
+    if let Some((intent, world)) = d.blocking(|d, eng| d.pending_harness_rename(eng)).await? {
         let result = exchange(&mut sink, &mut stream, 1, 0, rename_write(&intent)).await;
         // Reconnect after a refusal too. The exchange consumed the
         // unsolicited initial Assignment while waiting for this reply.
-        d.blocking(move |d, eng| d.finish_harness_rename(eng, intent, result)).await?;
+        d.blocking(move |d, eng| d.finish_harness_rename(eng, world, intent, result)).await?;
     }
     let mut sent = None;
     let mut seq = 0;
@@ -459,7 +459,7 @@ pub async fn rename_harness_direct(
     let result = exchange(&mut sink, &mut stream, 1, 0, rename_write(&intent)).await;
     // Persist the new authoritative Assignment before clearing the intent.
     if let Ok(update) = &result {
-        save_assignment_snapshot(cfg, update)?;
+        save_assignment_snapshot(cfg, state, update)?;
     }
     let update = resolve_rename(&cfg.machine_config, &intent, result)?;
     Ok(crate::client::HarnessRenameResult { update, routed_rules: intent.routed_rules })
@@ -476,11 +476,15 @@ async fn direct_session(state: &DaemonState) -> anyhow::Result<(Sink, futures_ut
     Ok((sink, stream))
 }
 
-pub(crate) fn save_assignment_snapshot(cfg: &Config, update: &AssignmentUpdate) -> anyhow::Result<()> {
+pub(crate) fn save_assignment_snapshot(
+    cfg: &Config,
+    state: &DaemonState,
+    update: &AssignmentUpdate,
+) -> anyhow::Result<()> {
     use anyhow::Context;
     let snap =
         AssignmentSnapshot { revision: update.revision, assignment: update.assignment.clone(), registration: None };
-    crate::state::save_snapshot(&cfg.snapshot_path(), &snap)
+    crate::state::save_snapshot(&cfg.snapshot_path(), &snap, Some(&state.registration_key()))
         .context("Server accepted the Assignment, but saving its snapshot failed")
 }
 
@@ -498,7 +502,7 @@ pub async fn write_assignment_direct(
         intent.apply_config(&cfg.machine_config)?;
         let result = exchange(&mut sink, &mut stream, 1, 0, rename_write(&intent)).await;
         if let Ok(update) = &result {
-            save_assignment_snapshot(cfg, update)?;
+            save_assignment_snapshot(cfg, &state, update)?;
         }
         resolve_rename(&cfg.machine_config, &intent, result)?;
     }
@@ -506,6 +510,6 @@ pub async fn write_assignment_direct(
     let inventory = crate::daemon::repo_inventory(&state.repo, harnesses);
     send(&mut sink, &DaemonMessage::Inventory(InventoryReport { seq: 1, ..inventory })).await?;
     let update = exchange(&mut sink, &mut stream, 2, 1, write).await?;
-    save_assignment_snapshot(cfg, &update)?;
+    save_assignment_snapshot(cfg, &state, &update)?;
     Ok(update)
 }

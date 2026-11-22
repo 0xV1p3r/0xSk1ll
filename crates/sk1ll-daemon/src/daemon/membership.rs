@@ -27,9 +27,11 @@ impl Daemon {
     }
 
     /// Whether `POST /join` may join again: the machine is standalone, was
-    /// removed, or the server rejects its token.
-    pub(crate) fn can_rejoin(&self) -> bool {
-        lock(&self.lifecycle).can_rejoin()
+    /// removed, or the server rejects its token. `Some`: the world it may
+    /// replace, which [`Daemon::rejoin`] checks again.
+    pub(crate) fn can_rejoin(&self) -> Option<World> {
+        let lc = lock(&self.lifecycle);
+        lc.can_rejoin().then(|| World { epoch: lc.epoch() })
     }
 
     /// Validate before registration and again under the engine lock afterwards.
@@ -135,20 +137,35 @@ impl Daemon {
     /// the engine mutex (a halted daemon changes nothing). The outer error
     /// means nothing was stored; the inner one that the repo setup failed (the
     /// restarted daemon retries it).
-    pub(crate) async fn rejoin(self: &Arc<Self>, reg: Registered) -> Result<Result<Joined>> {
-        let reg = self
+    ///
+    /// `world`: what the join was allowed to replace. The registration
+    /// request ran without the engine mutex; if the old registration
+    /// recovered meanwhile (the session connected again, so the token works
+    /// after all), the new one is not stored: it is removed from the Fleet
+    /// again, as far as the server can be reached.
+    pub(crate) async fn rejoin(self: &Arc<Self>, reg: Registered, world: World) -> Result<Result<Joined>> {
+        let stored = self
             .blocking(move |d, _| {
                 if d.lifecycle().halted() {
-                    return Err(Error::Conflict("already joined again; the daemon is restarting".into()));
+                    return Ok(Err((reg, "already joined again; the daemon is restarting")));
+                }
+                if d.can_rejoin() != Some(world) {
+                    return Ok(Err((reg, "this Machine's registration works again; there is nothing to join")));
                 }
                 d.halt_with(|| reg.persist(&d.cfg).map(|()| true))?;
                 tracing::info!("joined again as `{}`", reg.state().machine_id);
-                Ok(reg)
+                Ok(Ok(reg))
             })
             .await?;
+        let reg = match stored {
+            Ok(reg) => reg,
+            Err((reg, why)) => {
+                reg.discard(&self.http).await;
+                return Err(Error::Conflict(why.into()));
+            }
+        };
         self.network(move |_| Ok(reg.set_up_repo().map_err(Error::Internal))).await
     }
-
     /// Replaces this process with a fresh copy of itself (same PID, same
     /// arguments) once the engine is idle. Git's credentials live in the
     /// process environment, set before any thread starts, so new credentials

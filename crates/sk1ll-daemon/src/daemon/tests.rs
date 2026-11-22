@@ -316,19 +316,9 @@ async fn refused_adoption_rolls_back_only_its_own_unchanged_copy_and_can_retry()
         .unwrap();
         let mut snap = AssignmentSnapshot { revision: 1, ..Default::default() };
         snap.assignment.set_new_skills_default("h", false);
-        state::save_snapshot(&cfg.snapshot_path(), &snap).unwrap();
-        let d = Daemon::new(
-            cfg,
-            DaemonState {
-                machine_id: "a".into(),
-                token: "t".into(),
-                server_url: "http://127.0.0.1:1".into(),
-                repo: root,
-                revoked: false,
-                record: Default::default(),
-            },
-        )
-        .unwrap();
+        let state = DaemonState::new("a".into(), "http://127.0.0.1:1".into(), "t".into(), root);
+        state::save_snapshot(&cfg.snapshot_path(), &snap, Some(&state.registration_key())).unwrap();
+        let d = Daemon::new(cfg, state).unwrap();
         let (tx, mut rx) = mpsc::channel::<crate::server::SessionWrite>(1);
         d.assignment_session.send_replace(Some(tx));
         let server = tokio::spawn({
@@ -405,8 +395,9 @@ fn joined_daemon(
         ),
     )
     .unwrap();
-    state::save_snapshot(&cfg.snapshot_path(), &AssignmentSnapshot { revision: 1, ..Default::default() }).unwrap();
     let state = DaemonState { record, ..DaemonState::new("a".into(), "http://127.0.0.1:1".into(), "t".into(), root) };
+    let snapshot = AssignmentSnapshot { revision: 1, ..Default::default() };
+    state::save_snapshot(&cfg.snapshot_path(), &snapshot, Some(&state.registration_key())).unwrap();
     state.save(&cfg.state).unwrap();
     let d = Daemon::new(cfg, state.clone()).unwrap();
     let (tx, rx) = mpsc::channel::<crate::server::SessionWrite>(1);
@@ -475,7 +466,8 @@ async fn a_confirmation_overtaken_by_a_newer_revision_is_not_applied() {
     assert_eq!(update.revision, 3, "the reply carries the revision that stands");
     assert_eq!(update.assignment, newer.assignment);
     assert_eq!(d.applied().unwrap().revision, 3);
-    assert_eq!(state::load_snapshot(&d.cfg.snapshot_path()).unwrap().unwrap().revision, 3);
+    let owner = d.snapshot_owner();
+    assert_eq!(state::load_snapshot(&d.cfg.snapshot_path(), owner.as_deref()).unwrap().unwrap().revision, 3);
 
     let writer = d.clone();
     let write = tokio::spawn(async move { writer.write_assignment(harness_toggle(true)).await });
@@ -708,4 +700,198 @@ async fn readers_answer_from_the_last_snapshot_while_the_engine_is_busy() {
     d.blocking(|d, eng| d.reconcile(eng)).await.unwrap();
     assert!(Arc::ptr_eq(&d.snapshot(), &settled));
     server.abort();
+}
+
+/// An unmanaged skill `pdf` in the harness `h` of a [`joined_daemon`].
+fn unmanaged_pdf(dir: &Path) -> std::path::PathBuf {
+    let source = dir.join("h/pdf");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("SKILL.md"), "original").unwrap();
+    source
+}
+
+fn pdf() -> ConflictTarget {
+    ConflictTarget { harness: "h".into(), name: "pdf".into() }
+}
+
+/// Answers the next Assignment write with `answer`, after running `meanwhile`.
+fn answer_once(
+    mut session: mpsc::Receiver<crate::server::SessionWrite>,
+    meanwhile: impl FnOnce(&AssignmentWrite) + Send + 'static,
+    answer: impl FnOnce(&AssignmentWrite) -> Result<AssignmentUpdate> + Send + 'static,
+) -> tokio::task::JoinHandle<mpsc::Receiver<crate::server::SessionWrite>> {
+    tokio::spawn(async move {
+        let request = session.recv().await.unwrap();
+        meanwhile(&request.write);
+        request.result.send(answer(&request.write)).unwrap();
+        session
+    })
+}
+
+fn refused(_: &AssignmentWrite) -> Result<AssignmentUpdate> {
+    Err(Error::Upstream(axum::http::StatusCode::UNPROCESSABLE_ENTITY, "Server refused".into()))
+}
+
+/// A refused Adopt takes back only the skill it published, as it published
+/// it: not once it was committed meanwhile, nor once it has another Item ID.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_adoption_keeps_a_skill_committed_or_reidentified_meanwhile() {
+    for scenario in ["committed", "new id"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, session, _) = joined_daemon(dir.path(), PullRecord::default());
+        let source = unmanaged_pdf(dir.path());
+        let root = d.repo_root().to_path_buf();
+        let published = root.join("personal/pdf");
+        let server = answer_once(
+            session,
+            {
+                let root = root.clone();
+                move |_| {
+                    let repo = Repo::open(&root).unwrap();
+                    if scenario == "committed" {
+                        let author = sk1ll_core::machine_author("a");
+                        repo.commit(&[ItemRef::Skill("pdf".into())], "Add pdf", Some(&author)).unwrap();
+                    } else {
+                        std::fs::write(root.join("personal/pdf/.sk1ll-id"), "01HZZZZZZZZZZZZZZZZZZZZZZZ\n").unwrap();
+                    }
+                }
+            },
+            refused,
+        );
+        let error = d.adopt(pdf()).await.unwrap_err().to_string();
+        server.await.unwrap();
+        assert!(error.contains("Server refused") && error.contains("stays in the Draft"), "{scenario}: {error}");
+        assert_eq!(std::fs::read_to_string(published.join("SKILL.md")).unwrap(), "original", "{scenario}");
+        assert_eq!(std::fs::read_to_string(source.join("SKILL.md")).unwrap(), "original", "{scenario}");
+        let draft = Repo::open(&root).unwrap().draft().unwrap();
+        assert!(
+            !draft.iter().any(|c| c.item == ItemRef::Skill("pdf".into()) && c.change == sk1ll_core::Change::Deleted),
+            "{scenario}: no Draft deletion"
+        );
+        assert!(sync::displaced::list().unwrap().iter().all(|e| !e.path.starts_with(dir.path())), "{scenario}");
+    }
+}
+
+/// A pull that became pending while Adopt's Assignment write was in flight
+/// pauses sync: the unmanaged copies stay where they are.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_adoption_confirmed_during_a_pending_pull_leaves_the_harness_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (d, session, _) = joined_daemon(dir.path(), PullRecord::default());
+    let source = unmanaged_pdf(dir.path());
+    let journal = d.repo_root().join(".git/sk1ll-pull.json");
+    let server = answer_once(
+        session,
+        {
+            let journal = journal.clone();
+            move |_| std::fs::write(&journal, "{}").unwrap()
+        },
+        |write| {
+            let AssignmentWrite::Changes(body) = write else { panic!("expected toggles") };
+            let mut assignment = sk1ll_proto::Assignment::default();
+            assignment.set_skill("h", body.changes[0].item_id.as_ref().unwrap(), true);
+            Ok(AssignmentUpdate { assignment, revision: 2, entries: vec![], errors: vec![] })
+        },
+    );
+    let error = d.adopt(pdf()).await.unwrap_err().to_string();
+    server.await.unwrap();
+    assert!(error.contains("pull") && error.contains("kept"), "{error}");
+    assert!(!dir.path().join("h").join(sync::INDEX_PATH).exists(), "the harness was not changed");
+    assert!(!source.join(sync::PLACEMENT_MARKER).exists());
+    assert_eq!(std::fs::read_to_string(source.join("SKILL.md")).unwrap(), "original");
+    // Core refuses it too, whoever calls it.
+    let repo = Repo::open(d.repo_root()).unwrap();
+    let adoption = sync::unmanaged::Adoption {
+        name: "pdf".into(),
+        hash: sk1ll_core::hash::hash_dir(&source).unwrap(),
+        locations: vec![sync::unmanaged::Location { harness: "h".into(), path: source.clone() }],
+    };
+    let harnesses = MachineConfig::load(&d.cfg.machine_config).unwrap().harnesses();
+    assert!(matches!(sync::unmanaged::complete(&repo, &harnesses, &adoption), Err(sk1ll_core::Error::PullPending)));
+    std::fs::remove_file(journal).unwrap();
+}
+
+/// A Harness rename's confirmation that arrives after the Machine was
+/// removed and joined again belongs to the old registration: it must not
+/// overwrite the new registration's Assignment snapshot.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_rename_confirmation_leaves_the_next_registrations_snapshot_alone() {
+    use sk1ll_core::harness_rename::{RenameIntent, RenameRequest};
+    let dir = tempfile::tempdir().unwrap();
+    let (d, _session, state) = joined_daemon(dir.path(), PullRecord::default());
+    let request = RenameRequest { from: "h".into(), to: "g".into(), replace: false };
+    let intent = RenameIntent::prepare(
+        &d.cfg.machine_config,
+        &state.repo,
+        request,
+        &sk1ll_proto::Assignment::default(),
+        Some(&state.rename_authority()),
+    )
+    .unwrap();
+    let world = d.blocking(|d, _| d.world()).await.unwrap();
+    // Removed, then joined again: the next registration's files are stored.
+    d.blocking(|d, eng| d.revoke(eng, "removed")).await.unwrap();
+    let next = DaemonState::new("a".into(), "http://127.0.0.1:1".into(), "new".into(), state.repo.clone());
+    let fresh = AssignmentSnapshot { revision: 5, ..Default::default() };
+    let (cfg, saved) = (d.cfg.clone(), fresh.clone());
+    let key = next.registration_key();
+    d.halt_with(|| {
+        state::save_snapshot(&cfg.snapshot_path(), &saved, Some(&key))?;
+        next.save(&cfg.state).map(|()| true)
+    })
+    .unwrap();
+    let stale = confirmed(9, true).unwrap();
+    let finished = d.blocking(move |d, eng| d.finish_harness_rename(eng, world, intent, Ok(stale))).await;
+    assert!(finished.is_err());
+    assert_eq!(state::load_snapshot(&d.cfg.snapshot_path(), Some(&next.registration_key())).unwrap(), Some(fresh));
+    assert_eq!(d.applied().unwrap().revision, 1);
+}
+
+/// A pull finished (the journal gone) but the process stopped before it
+/// recorded that: once `HEAD` contains the server's Baseline, the
+/// remembered pending pull is over, not Blocked.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_finished_pull_recorded_as_pending_is_clear_after_a_restart() {
+    let pending =
+        PullRecord { server_baseline: None, pull: PullState::Pending { items: vec![ItemRef::Skill("pdf".into())] } };
+    let dir = tempfile::tempdir().unwrap();
+    let (d, _session, _) = joined_daemon(dir.path(), pending.clone());
+    let root = d.repo_root().to_path_buf();
+    let git = |args: &[&str]| sk1ll_core::git::Git::new(&root).args(args).text().unwrap();
+    let head = git(&["rev-parse", "HEAD"]);
+    git(&["update-ref", "refs/remotes/origin/main", &head]);
+    d.blocking(|d, eng| d.reconcile(eng).map(drop)).await.unwrap();
+    assert_eq!(d.lifecycle().pull(), &PullState::Clear);
+    assert_eq!(DaemonState::load(&d.cfg.state).unwrap().unwrap().record.pull, PullState::Clear);
+
+    // A Baseline HEAD does not contain is still in the way.
+    let dir = tempfile::tempdir().unwrap();
+    let (d, _session, _) = joined_daemon(dir.path(), pending);
+    let root = d.repo_root().to_path_buf();
+    let git = |args: &[&str]| sk1ll_core::git::Git::new(&root).args(args).text().unwrap();
+    let tree = git(&["rev-parse", "HEAD^{tree}"]);
+    let other = git(&["-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit-tree", &tree, "-m", "x"]);
+    git(&["update-ref", "refs/remotes/origin/main", &other]);
+    d.blocking(|d, eng| d.reconcile(eng).map(drop)).await.unwrap();
+    assert!(matches!(d.lifecycle().pull(), PullState::Blocked { baseline, .. } if *baseline == other));
+}
+
+/// A join that registered while the old registration recovered (its token
+/// works again) stores nothing: the daemon keeps its registration.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejoin_does_not_replace_a_registration_that_recovered_meanwhile() {
+    let dir = tempfile::tempdir().unwrap();
+    let (d, _session, state) = joined_daemon(dir.path(), PullRecord::default());
+    d.set_auth_rejected();
+    let world = d.can_rejoin().expect("an auth-rejected Machine may join again");
+    // The registration request is in flight; meanwhile the session connects.
+    let next = DaemonState::new("b".into(), "http://127.0.0.1:1".into(), "new".into(), state.repo.clone());
+    let reg = crate::join::Registered::for_test(next, AssignmentSnapshot { revision: 9, ..Default::default() });
+    d.set_link(Link::Connected);
+    let error = d.rejoin(reg, world).await.unwrap_err();
+    assert!(error.to_string().contains("works again"), "{error}");
+    assert_eq!(DaemonState::load(&d.cfg.state).unwrap().unwrap().token, state.token);
+    let owner = d.snapshot_owner();
+    assert_eq!(state::load_snapshot(&d.cfg.snapshot_path(), owner.as_deref()).unwrap().unwrap().revision, 1);
+    assert!(d.ensure_managed().is_ok(), "still managing, not halted");
 }

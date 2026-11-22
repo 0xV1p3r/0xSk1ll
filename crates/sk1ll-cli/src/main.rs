@@ -1126,17 +1126,18 @@ mod tests {
         }
 
         #[cfg(unix)]
-        fn joined(&self, server_url: &str) {
-            sk1ll_daemon::DaemonState {
+        /// Returns the registration's key, which its Assignment snapshot is tagged with.
+        fn joined(&self, server_url: &str) -> String {
+            let state = sk1ll_daemon::DaemonState {
                 machine_id: "test".into(),
                 server_url: server_url.into(),
                 token: "tok".into(),
                 repo: self.0.clone(),
                 revoked: false,
                 record: Default::default(),
-            }
-            .save(&self.0.join(".git/daemon.json"))
-            .unwrap();
+            };
+            state.save(&self.0.join(".git/daemon.json")).unwrap();
+            state.registration_key()
         }
     }
 
@@ -1178,17 +1179,21 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
-        repo.joined(&url);
+        let owner = repo.joined(&url);
         sk1ll_daemon::state::save_snapshot(
             &repo.0.join(".git/daemon-assignment.json"),
             &sk1ll_proto::AssignmentSnapshot::default(),
+            Some(&owner),
         )
         .unwrap();
         let err = repo.run(&["assign", "h", "skill", "pdf", "on"]).expect_err("fleet assignment must reach the server");
         assert!(err.to_string().contains("server unreachable"), "{err}");
         assert!(!repo.0.join("assignment.json").exists(), "the mirror cannot record an unaccepted change");
         assert_eq!(
-            sk1ll_daemon::state::load_snapshot(&repo.0.join(".git/daemon-assignment.json")).unwrap().unwrap().revision,
+            sk1ll_daemon::state::load_snapshot(&repo.0.join(".git/daemon-assignment.json"), Some(&owner))
+                .unwrap()
+                .unwrap()
+                .revision,
             0
         );
     }
@@ -1203,21 +1208,13 @@ mod tests {
             format!("id = 'test'\n[harnesses.h]\nskills = '{}'\nmode = 'copy'\n{}", skills.display(), no_presets()),
         )
         .unwrap();
-        sk1ll_daemon::DaemonState {
-            machine_id: "test".into(),
-            server_url: "http://127.0.0.1:1".into(),
-            token: "tok".into(),
-            repo: repo.0.clone(),
-            revoked: false,
-            record: Default::default(),
-        }
-        .save(&repo.0.join(".git/daemon.json"))
-        .unwrap();
+        let owner = repo.joined("http://127.0.0.1:1");
         let mut assignment = Assignment::default();
         assignment.set_skill("h", &test_item_id(&repo.0, ItemRef::Skill("pdf".into())), false);
         sk1ll_daemon::state::save_snapshot(
             &repo.0.join(".git/daemon-assignment.json"),
             &sk1ll_proto::AssignmentSnapshot { revision: 7, assignment, registration: None },
+            Some(&owner),
         )
         .unwrap();
         repo.run(&["sync"]).unwrap();

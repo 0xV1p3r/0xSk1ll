@@ -467,12 +467,12 @@ async fn push(State(d): St) -> Result<Json<PushResult>> {
 /// Joins again (after a removal, or while the server rejects the token), then
 /// restarts the daemon in place so the new credentials take effect.
 async fn join(State(d): St, Json(req): Json<JoinApiRequest>) -> Result<Json<Joined>> {
-    if !d.can_rejoin() {
+    let Some(world) = d.can_rejoin() else {
         return Err(Error::Conflict(format!(
             "this machine is in the fleet as `{}`; there is nothing to join",
             d.ident.machine_id()
         )));
-    }
+    };
     let opts = JoinOptions {
         server_url: req.server_url,
         code: req.code,
@@ -496,7 +496,7 @@ async fn join(State(d): St, Json(req): Json<JoinApiRequest>) -> Result<Json<Join
     } else {
         let replace = !d.is_revoked();
         let reg = join::register(&d.cfg, &opts, replace).await.map_err(|e| Error::BadRequest(format!("{e:#}")))?;
-        d.rejoin(reg).await?
+        d.rejoin(reg, world).await?
     };
     let restart = d.clone();
     tokio::spawn(async move {

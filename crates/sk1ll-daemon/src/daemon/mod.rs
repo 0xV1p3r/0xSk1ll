@@ -88,6 +88,13 @@ use {placement::*, reconcile::*, views::*};
 /// Name a `block` instructions conflict goes by (one block per harness).
 const BLOCK_NAME: &str = "instructions";
 
+/// What an operation that releases the engine mutex for the network checks
+/// again once it holds it again ([`Daemon::world`], [`Daemon::same_world`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct World {
+    epoch: u64,
+}
+
 /// Process identity. Standalone has no server credentials or fleet state.
 #[derive(Clone)]
 pub(crate) enum Mode {
@@ -188,9 +195,9 @@ impl Daemon {
         let standalone = matches!(state, Mode::Standalone { .. });
         let lifecycle = match &state {
             Mode::Joined(s) => Lifecycle::joined(s.revoked, s.record.clone()),
-            Mode::Standalone { .. } => {
+            Mode::Standalone { repo, .. } => {
                 let path = state::standalone_record_path(&cfg.state);
-                Lifecycle::standalone(state::load_record(&path).unwrap_or_else(|e| {
+                Lifecycle::standalone(state::load_record(&path, repo).unwrap_or_else(|e| {
                     tracing::warn!("{e:#}; starting without a remembered Baseline");
                     PullRecord::default()
                 }))
@@ -198,11 +205,14 @@ impl Daemon {
         };
         let snapshot = if standalone {
             let assignment = sk1ll_core::Assignment::load(&cfg.assignment)?;
-            let previous = state::load_snapshot(&cfg.state.with_file_name("standalone-assignment.json"))?;
+            let previous = state::load_snapshot(&cfg.state.with_file_name("standalone-assignment.json"), None)?;
             let revision = previous.as_ref().map_or(1, |s| s.revision + u64::from(s.assignment != assignment));
             Some(AssignmentSnapshot { revision, assignment, registration: None })
         } else {
-            match state::load_snapshot(&cfg.snapshot_path()) {
+            match state::load_snapshot(
+                &cfg.snapshot_path(),
+                state.joined().ok().map(|s| s.registration_key()).as_deref(),
+            ) {
                 Ok(Some(s)) => Some(s),
                 Ok(None) => {
                     tracing::warn!("no stored assignment: leaving the harnesses alone until the server sends one");
@@ -215,7 +225,7 @@ impl Daemon {
             }
         };
         if standalone && let Some(snap) = &snapshot {
-            state::save_snapshot(&cfg.state.with_file_name("standalone-assignment.json"), snap)?;
+            state::save_snapshot(&cfg.state.with_file_name("standalone-assignment.json"), snap, None)?;
         }
         let mut view = StatusView {
             machine_id: state.machine_id().to_string(),
@@ -266,6 +276,12 @@ impl Daemon {
             plans: Default::default(),
             draft_moved: AtomicBool::new(false),
         }))
+    }
+
+    /// The registration this daemon's Assignment snapshots belong to
+    /// (`None`: standalone, whose snapshot is its own).
+    pub(crate) fn snapshot_owner(&self) -> Option<String> {
+        self.ident.joined().ok().map(DaemonState::registration_key)
     }
 
     fn require_origin(&self) -> Result<()> {
@@ -491,7 +507,9 @@ impl Daemon {
         let (revoked, record) = lc.persisted();
         match &self.ident {
             Mode::Joined(s) => DaemonState { revoked, record: record.clone(), ..s.clone() }.save(&self.cfg.state),
-            Mode::Standalone { .. } => state::save_record(&state::standalone_record_path(&self.cfg.state), record),
+            Mode::Standalone { repo, .. } => {
+                state::save_record(&state::standalone_record_path(&self.cfg.state), repo, record)
+            }
         }
     }
 
@@ -560,6 +578,34 @@ impl Daemon {
     fn ensure_managed(&self) -> Result<()> {
         lock(&self.lifecycle).managed().map_err(|why| Error::Conflict(why.into()))?;
         self.require_repo()
+    }
+
+    /// The world an operation that releases the engine mutex starts in,
+    /// taken with the mutex held: managing, and which registration.
+    pub(crate) fn world(&self) -> Result<World> {
+        self.ensure_managed()?;
+        Ok(World { epoch: lock(&self.lifecycle).epoch() })
+    }
+
+    /// With the engine mutex held again: whether the daemon still manages
+    /// the registration it managed when `world` was taken. A removal, a halt
+    /// for a rejoin or a restart since all fail it, so nothing that belonged
+    /// to the old registration is applied to (or saved over) the new one.
+    pub(crate) fn same_world(&self, world: World) -> Result<()> {
+        let lc = lock(&self.lifecycle);
+        lc.managed().map_err(|why| Error::Conflict(why.into()))?;
+        if lc.epoch() != world.epoch {
+            return Err(Error::Conflict("this Machine's registration changed meanwhile; nothing was applied".into()));
+        }
+        drop(lc);
+        self.require_repo()
+    }
+
+    /// [`Daemon::same_world`], and no Pull pending: what changes the
+    /// harnesses waits until the pull is finished (core refuses it too).
+    pub(crate) fn same_world_settled(&self, world: World) -> Result<()> {
+        self.same_world(world)?;
+        Ok(Repo::open_git_only(self.repo_root())?.require_no_pending_pull()?)
     }
 
     /// Nothing to manage: revoked, or about to restart.

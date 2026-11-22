@@ -237,19 +237,39 @@ pub fn publish(repo: &Repo, adoption: &Adoption) -> Result<()> {
     copied
 }
 
-/// Roll back only our new copy, while its bytes still match a harness source.
-/// Keep concurrent edits and any extra metadata that the content hash excludes.
-pub fn rollback(repo: &Repo, adoption: &Adoption) -> Result<bool> {
+/// What [`rollback`] did with the copy a refused Adopt published.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RolledBack {
+    /// Taken back out of the Draft.
+    Removed,
+    /// Not there any more.
+    Absent,
+    /// Kept where it is, for this reason.
+    Kept(&'static str),
+}
+
+/// Roll back only our new copy: while it is still an uncommitted addition
+/// with the Item ID `id` that Adopt gave it, and its bytes still match a
+/// harness source. Keep concurrent edits, a commit made meanwhile and any
+/// extra metadata that the content hash excludes; in doubt, keep it.
+pub fn rollback(repo: &Repo, adoption: &Adoption, id: &crate::ItemId) -> Result<RolledBack> {
     let dest = repo.personal_dir().join(&adoption.name);
     if !dest.symlink_metadata().is_ok_and(|m| m.is_dir()) {
-        return Ok(false);
+        return Ok(RolledBack::Absent);
+    }
+    let added = crate::ItemRef::Skill(adoption.name.clone());
+    if !repo.draft()?.iter().any(|d| d.item == added && d.change == crate::Change::Added) {
+        return Ok(RolledBack::Kept("it was committed meanwhile"));
+    }
+    if crate::ItemId::read_skill(&dest).ok().flatten().as_ref() != Some(id) {
+        return Ok(RolledBack::Kept("its Item ID changed meanwhile"));
     }
     if walkdir::WalkDir::new(&dest)
         .into_iter()
         .any(|entry| entry.map_or(true, |e| e.depth() > 0 && excluded_from_skill(e.depth(), e.file_name())))
         || hash_dir(&dest)? != adoption.hash
     {
-        return Ok(false);
+        return Ok(RolledBack::Kept("it changed meanwhile"));
     }
     let unchanged_source = adoption
         .locations
@@ -260,7 +280,7 @@ pub fn rollback(repo: &Repo, adoption: &Adoption) -> Result<bool> {
         // one through an open descriptor, remains recoverable after rollback.
         let expected = observe_skill(&dest)?.state;
         if hash_dir(&dest)? != adoption.hash {
-            return Ok(false);
+            return Ok(RolledBack::Kept("it changed meanwhile"));
         }
         let displace = Displace {
             repo,
@@ -273,8 +293,9 @@ pub fn rollback(repo: &Repo, adoption: &Adoption) -> Result<bool> {
         if let Some(error) = remove_displacing(&dest, displace)? {
             return Err(error);
         }
+        return Ok(RolledBack::Removed);
     }
-    Ok(unchanged_source)
+    Ok(RolledBack::Kept("the harness copy it came from changed meanwhile"))
 }
 
 pub(super) fn durable_tree(path: &Path) -> Result<()> {
@@ -296,7 +317,10 @@ pub fn prepare(repo: &Repo, harnesses: &BTreeMap<String, Harness>, harness: &str
 
 /// Replaces only the copies the user adopted, using sync's normal displacement
 /// mechanism. Changed variants remain unmanaged and become ordinary conflicts.
+/// Refuses ([`Error::PullPending`]) while a pull is pending, like every
+/// placement.
 pub fn complete(repo: &Repo, harnesses: &BTreeMap<String, Harness>, adoption: &Adoption) -> Result<()> {
+    repo.require_no_pending_pull()?;
     let source = repo.personal_dir().join(&adoption.name);
     if !source.join("SKILL.md").is_file() {
         return Ok(());

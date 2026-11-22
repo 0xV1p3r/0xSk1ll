@@ -69,6 +69,9 @@ impl Daemon {
         if !self.is_standalone() && !self.is_connected() {
             return Err(Error::Unavailable("Adopt needs a connection to the Server".into()));
         }
+        // A pending pull's tree is partial: nothing is published into it.
+        repo.require_no_pending_pull()?;
+        let world = self.world()?;
         let adoption = match adopted {
             Some(adoption) => adoption,
             None => sync::unmanaged::select(&repo, &harnesses, &t.harness, &t.name)?,
@@ -100,7 +103,7 @@ impl Daemon {
         // available to retry with the same ID. Original copies stay until
         // the Assignment has been confirmed.
         self.reconcile(eng)?;
-        Ok(Some(PendingAdoption { adoption, created, id, changes }))
+        Ok(Some(PendingAdoption { adoption, created, id, changes, world }))
     }
 
     /// The Item ID of an adopted skill as the repo has it now.
@@ -113,32 +116,54 @@ impl Daemon {
     }
 
     /// After the Assignment write: removes the copies an enabled adoption
-    /// came from, or rolls back a refused one. If the published skill no
-    /// longer has the Item ID that was enabled (changed while the write was
-    /// in flight), the copies stay where they are and it is a conflict.
+    /// came from, or rolls back a refused one, as of now. Nothing is done
+    /// once the daemon stopped managing the registration it wrote to. A
+    /// rollback keeps the skill if it was committed meanwhile or no longer
+    /// has its Item ID. If the published skill no longer has the Item ID that
+    /// was enabled, or a pull is pending (sync is paused), the copies stay
+    /// where they are: adopt it again (once the pull has finished).
     pub(super) fn finish_adoption(
         &self,
         eng: &mut Engine,
         pending: PendingAdoption,
         written: Result<AssignmentUpdate>,
     ) -> Result<()> {
-        let PendingAdoption { mut adoption, created, id, .. } = pending;
-        self.ensure_managed()?;
+        let PendingAdoption { mut adoption, created, id, world, .. } = pending;
+        self.same_world(world)?;
         self.lock_repo(eng)?;
         let repo = Repo::open(self.repo_root())?;
         if let Err(error) = written {
-            if created && matches!(error, Error::Upstream(_, _)) {
-                sync::unmanaged::rollback(&repo, &adoption)?;
-            }
+            let kept = if created && matches!(error, Error::Upstream(_, _)) {
+                match sync::unmanaged::rollback(&repo, &adoption, &id)? {
+                    sync::unmanaged::RolledBack::Kept(why) => Some(why),
+                    _ => None,
+                }
+            } else {
+                None
+            };
             self.reconcile(eng)?;
             self.event(Event::Draft);
-            return Err(error);
+            return Err(match (kept, error) {
+                (Some(why), Error::Upstream(status, message)) => {
+                    Error::Upstream(status, format!("{message}; skill:{} stays in the Draft: {why}", adoption.name))
+                }
+                (_, error) => error,
+            });
         }
         if Self::adopted_id(&repo, &adoption).ok().flatten().as_ref() != Some(&id) {
             self.reconcile(eng)?;
             return Err(Error::Conflict(format!(
                 "skill:{} changed while its Assignment was being written; its copies in the harnesses are kept, \
                  adopt it again",
+                adoption.name
+            )));
+        }
+        if let Err(why) = self.same_world_settled(world) {
+            self.reconcile(eng)?;
+            self.event(Event::Fleet);
+            return Err(Error::Conflict(format!(
+                "skill:{} is enabled, but its copies in the harnesses are kept ({why}); adopt it again once the \
+                 pull has finished",
                 adoption.name
             )));
         }
@@ -185,4 +210,6 @@ pub(super) struct PendingAdoption {
     pub(super) created: bool,
     pub(super) id: sk1ll_core::ItemId,
     pub(super) changes: sk1ll_proto::AssignmentChanges,
+    /// What the write's result is applied in (see [`Daemon::same_world`]).
+    pub(super) world: World,
 }
