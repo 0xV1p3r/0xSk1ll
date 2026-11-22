@@ -261,13 +261,7 @@ impl Repo {
         // A commit is only useful if it can be pushed, and that needs the fleet branch.
         self.on_fleet_branch()?;
         // It would move the branch a pull that stopped half-way still has to move.
-        if self.pull_pending()? {
-            return Err(Error::Invalid(
-                "a pull stopped half-way and has to finish first: restore what blocks it (copy edits you want to \
-                 keep aside first), then run `sk1ll pull`"
-                    .into(),
-            ));
-        }
+        self.require_no_pending_pull()?;
         let (_, st) = self.select(items, "committed")?;
         self.check_id_transitions(st.head.as_deref(), items, "commit")?;
         self.assign_item_ids(|path| {
@@ -351,6 +345,8 @@ impl Repo {
     /// Pushes [`FLEET_BRANCH`] to [`REMOTE`]; it must be checked out.
     pub fn push(&self) -> Result<()> {
         self.on_fleet_branch()?;
+        // Its branch has yet to move to the replayed commits.
+        self.require_no_pending_pull()?;
         if let Some(head) = rev(self.git(), "HEAD")? {
             let claims = crate::item_id::claims_at(self.root(), &head, |_| true, true)?;
             crate::item_id::check_claims(&claims).map_err(|e| repair_before(e, "push"))?;
@@ -549,6 +545,23 @@ impl Repo {
     /// Whether a [`pull`](Self::pull) stopped half-way and has yet to finish.
     pub fn pull_pending(&self) -> Result<bool> {
         pull::pending(self)
+    }
+
+    /// The Item ID claims of the Baseline (`HEAD`). An unborn or unreadable
+    /// Baseline has none.
+    pub(crate) fn baseline_claims(&self) -> Result<crate::item_id::Claims> {
+        Ok(match rev(self.git(), "HEAD")? {
+            Some(head) => crate::item_id::claims_at(self.root(), &head, |_| true, true).unwrap_or_default(),
+            None => crate::item_id::Claims::new(),
+        })
+    }
+
+    /// [`Error::PullPending`] if a [`pull`](Self::pull) stopped half-way.
+    /// Whatever writes Item IDs, syncs harnesses or pushes checks this: a
+    /// pending pull's tree is partial, and writing into it could block the
+    /// paths the pull still has to update.
+    pub fn require_no_pending_pull(&self) -> Result<()> {
+        if self.pull_pending()? { Err(Error::PullPending) } else { Ok(()) }
     }
 
     /// Finishes a [`pull`](Self::pull) that stopped half-way, without
@@ -2405,7 +2418,11 @@ mod tests {
         assert_eq!((head_ref(&f.b), git(&f.b, &["rev-parse", "HEAD"])), ("refs/heads/main".into(), old.clone()));
         // Still Blocked, and nothing else can move the branch meanwhile.
         assert_eq!(finish_now(&b).unwrap().unwrap(), outcome);
-        assert!(invalid(b.commit(&[item("skill:pdf")], "m", None)).contains("half-way"));
+        assert!(matches!(b.commit(&[item("skill:pdf")], "m", None), Err(Error::PullPending)));
+        // Nor does anything write Item IDs into its partial tree, or push.
+        assert!(matches!(b.push(), Err(Error::PullPending)));
+        assert!(matches!(b.repair_ids(), Err(Error::PullPending)));
+        assert!(matches!(b.assign_missing_ids(), Err(Error::PullPending)));
 
         b.restore(&[item("skill:pdf")]).unwrap();
         assert_eq!(pull_now(&b).unwrap(), PullOutcome::Updated { from: old, to: remote });

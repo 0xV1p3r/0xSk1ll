@@ -109,9 +109,13 @@ pub(super) fn journal_exists(git_dir: &Path) -> Result<bool> {
     }
 }
 
-/// Whether a pull stopped half-way and left its journal.
+/// Whether a pull stopped half-way and left its journal. Content that is
+/// not in a Git repository (yet) has nothing to pull.
 pub(super) fn pending(repo: &Repo) -> Result<bool> {
-    let git_dir = Git::new(repo.root()).args(["rev-parse", "--absolute-git-dir"]).run()?;
+    let git_dir = match Git::new(repo.root()).args(["rev-parse", "--absolute-git-dir"]).run() {
+        Err(Error::Git { stderr, .. }) if stderr.contains("not a git repository") => return Ok(false),
+        git_dir => git_dir?,
+    };
     let git_dir = path_from_bytes(git_dir.strip_suffix(b"\n").unwrap_or(&git_dir));
     journal_exists(&git_dir)
 }
@@ -121,7 +125,7 @@ pub(super) fn pending(repo: &Repo) -> Result<bool> {
 /// baseline (and goes to the recovery area in turn), so nothing is lost.
 pub(super) fn adopt(repo: &Repo, entry: &crate::sync::displaced::Entry) -> Result<()> {
     if pending(repo)? {
-        return Err(Error::Invalid("a pull stopped half-way; run `sk1ll pull` to finish it first".into()));
+        return Err(Error::PullPending);
     }
     with_pull(repo, |pull| {
         let root = pull.root.canonicalize().at(&pull.root)?;

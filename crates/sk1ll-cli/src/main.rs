@@ -1360,6 +1360,52 @@ mod tests {
         assert_eq!(fs::read_to_string(skills.join("pdf/SKILL.md")).unwrap(), "PDFs.");
     }
 
+    /// A copy of a committed skill shares its Item ID; `repair-ids` gives
+    /// the copy a new one, so the original keeps its toggles and placement.
+    #[test]
+    fn repair_ids_keeps_the_id_with_the_baselines_claimant() {
+        let repo = TestRepo::new();
+        let skills = repo.0.join(".git/harness/skills");
+        fs::write(
+            repo.0.join("machine.toml"),
+            format!("id = 'test'\n[harnesses.h]\nskills = '{}'\nmode = 'copy'\n{}", skills.display(), no_presets()),
+        )
+        .unwrap();
+        fs::create_dir(repo.0.join("personal/web")).unwrap();
+        fs::write(repo.0.join("personal/web/SKILL.md"), "Web.").unwrap();
+        repo.run(&["commit", "web"]).unwrap();
+        repo.run(&["assign", "h", "--all", "off"]).unwrap();
+        repo.run(&["assign", "h", "skill", "web", "on"]).unwrap();
+        repo.run(&["sync"]).unwrap();
+        assert!(skills.join("web/SKILL.md").is_file());
+        let web = test_item_id(&repo.0, ItemRef::Skill("web".into()));
+
+        // `cp -r personal/web personal/aweb`: `aweb` sorts first by path.
+        fs::create_dir(repo.0.join("personal/aweb")).unwrap();
+        for file in ["SKILL.md", ".sk1ll-id"] {
+            fs::copy(repo.0.join("personal/web").join(file), repo.0.join("personal/aweb").join(file)).unwrap();
+        }
+        repo.run(&["repair-ids"]).unwrap();
+        assert_eq!(test_item_id(&repo.0, ItemRef::Skill("web".into())), web);
+        assert_ne!(test_item_id(&repo.0, ItemRef::Skill("aweb".into())), web);
+        repo.run(&["sync"]).unwrap();
+        assert!(skills.join("web/SKILL.md").is_file(), "web keeps its placement");
+        assert!(!skills.join("aweb").exists(), "the copy is new, and new skills are off in h");
+    }
+
+    /// A pull that stopped half-way leaves a partial tree: nothing writes
+    /// Item IDs into it or pushes until it is finished.
+    #[test]
+    fn repair_ids_and_push_wait_for_a_pending_pull() {
+        let repo = TestRepo::new().with_skill();
+        fs::write(repo.0.join(".git/sk1ll-pull.json"), "{}").unwrap();
+        for args in [&["repair-ids"][..], &["push"]] {
+            let err = repo.run(args).expect_err("refused while a pull is pending");
+            assert!(err.to_string().contains("pull stopped half-way"), "{args:?}: {err}");
+        }
+        assert!(!repo.0.join("personal/pdf/.sk1ll-id").exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn fleet_copy_assignment_confirms_with_preview_preconditions() {

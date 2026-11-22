@@ -91,7 +91,7 @@ repaired items.
 
 Pull requires Git 2.40 or later, and 2.42 when the new Baseline changes a `.gitattributes` file. It updates only the working-tree paths the new Baseline changes, one at a time, and leaves the Draft where it is. Replayed commits get this Machine as their committer and lose their signatures. Pull drops commits that become empty and keeps commits that started empty. Pull refuses unpushed merge commits, submodules and sparse checkouts. File changes need atomic filesystem operations on Linux or macOS. Pull checks for support before it starts changing files.
 
-If Pull stops partway through, the next `sk1ll pull` or Daemon refresh resumes it. Edits to paths it already updated stay as Draft on the new Baseline. While Pull is pending, `git status` shows the partially updated tree, and `sk1ll commit` and `sk1ll sync` refuse to run. Copy aside any edit blocking a pending Pull before restoring the item. Pull recovery entries stay until you adopt or discard them.
+If Pull stops partway through, the next `sk1ll pull` or Daemon refresh resumes it. Edits to paths it already updated stay as Draft on the new Baseline. While Pull is pending, `git status` shows the partially updated tree, and `sk1ll commit`, `sk1ll sync`, `sk1ll push` and `sk1ll repair-ids` refuse to run. A harness change is saved but syncs once the Pull finishes. Copy aside any edit blocking a pending Pull before restoring the item. Pull recovery entries stay until you adopt or discard them.
 
 ## Commands
 
@@ -106,7 +106,7 @@ If Pull stops partway through, the next `sk1ll pull` or Daemon refresh resumes i
 | `fork <name>` | Turn an import into a personal skill you can edit |
 | `edit <name>` | Open a personal skill or rule in `$VISUAL` or `$EDITOR` |
 | `list` | List repo content. Use `--json` to include Item IDs or `--unmanaged` to list unmanaged skills |
-| `repair-ids` | Keep the first claim to each Item ID by path and give duplicates fresh IDs in the Draft |
+| `repair-ids` | Give duplicate Item IDs fresh IDs in the Draft; the item that holds the ID in the Baseline keeps it (else the first by path) |
 | `status` | Import drift and pending sync actions |
 | `sync [--dry-run] [--force]` | Write skills and instructions into harnesses |
 | `render <harness>` | Print the instruction files a harness would receive |

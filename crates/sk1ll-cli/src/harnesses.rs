@@ -158,6 +158,12 @@ pub(crate) fn run(mut cli: Cli, repo: &Path, machine_path: &Path, assignment_pat
     print_preview(machine_path, &change, &rows, assignment.is_none(), true);
     decide(&opts)?;
     harness_change::apply(&lock, &repo, machine_path, &change, &plan.fingerprint)?;
+    // The change is saved; a pending pull's tree is partial, so placing (and
+    // the Item IDs placements carry) waits until it is finished.
+    if repo.pull_pending()? {
+        println!("machine.toml changed; the harnesses sync once the pending pull finishes (run `sk1ll pull`)");
+        return Ok(());
+    }
     repo.assign_missing_ids()?;
     let mut failed = 0;
     match assignment {
@@ -475,6 +481,20 @@ mod tests {
         assert!(!fs::read_to_string(root.join("machine.toml")).unwrap().contains("[harnesses.h]"));
         assert!(sk1ll(root, &["harnesses", "remove", "h", "--yes"]).is_err());
         assert!(sk1ll(root, &["harnesses", "add", "x", "--skills", "relative", "--yes"]).is_err());
+    }
+
+    /// A pending pull's tree is partial: the change is saved, but nothing
+    /// is placed and no Item ID is written until the pull is finished.
+    #[test]
+    fn a_pending_pull_saves_the_change_and_defers_placement() {
+        let (_tmp, root) = direct_root();
+        fs::write(root.join("repo/.git/sk1ll-pull.json"), "{}").unwrap();
+        let skills = root.join("h/skills");
+        let add = ["harnesses", "add", "h", "--skills", skills.to_str().unwrap(), "--mode", "copy", "--yes"];
+        sk1ll(&root, &add).unwrap();
+        assert!(fs::read_to_string(root.join("machine.toml")).unwrap().contains("[harnesses.h]"));
+        assert!(!skills.join("pdf").exists(), "placement waits for the pull");
+        assert!(!root.join("repo/personal/pdf/.sk1ll-id").exists(), "and so do Item IDs");
     }
 
     fn direct_root() -> (tempfile::TempDir, PathBuf) {

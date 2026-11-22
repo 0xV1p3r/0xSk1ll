@@ -67,6 +67,14 @@ pub enum Error {
     StrandedRename { path: PathBuf },
     #[error("{0}")]
     Invalid(String),
+    /// A pull stopped half-way (its journal is still there): its tree is
+    /// partial, so nothing that writes Item IDs, syncs or pushes may run
+    /// until the pull is finished.
+    #[error(
+        "a pull stopped half-way and has to finish first: restore what blocks it (copy edits you want to keep aside \
+         first), then run `sk1ll pull`"
+    )]
+    PullPending,
     /// What an operation was planned from changed before it was made, so
     /// nothing was done: look again (re-read, preview again) and retry.
     #[error("{0}")]

@@ -157,6 +157,8 @@ impl Repo {
     /// The item to rename, its destination and the file whose frontmatter
     /// names it.
     fn rename_paths(&self, kind: &str, name: &str, to: &str) -> Result<(PathBuf, PathBuf, PathBuf)> {
+        // It moves the item and its Item ID: not inside a pending pull's partial tree.
+        self.require_no_pending_pull()?;
         let from = self.personal_item(kind, name)?;
         crate::imports::validate_name(to)?;
         if name == to {
@@ -388,14 +390,20 @@ impl Repo {
         self.assign_item_ids(|_| true)
     }
 
+    /// Every Item ID write goes through here or [`repair_ids`](Self::repair_ids):
+    /// neither writes into a pending pull's partial tree.
     pub(crate) fn assign_item_ids(&self, include: impl Fn(&Path) -> bool) -> Result<usize> {
-        crate::item_id::assign(&self.root, include, false)
+        self.require_no_pending_pull()?;
+        crate::item_id::assign(&self.root, include, crate::item_id::Mode::Missing)
     }
 
     /// Reassigns duplicate Item IDs as a Draft change while the caller holds
-    /// the EngineLock.
+    /// the EngineLock. Of the items sharing an ID, the one that has it at its
+    /// path in the Baseline keeps it (ADR 0006).
     pub fn repair_ids(&self) -> Result<usize> {
-        crate::item_id::assign(&self.root, |_| true, true)
+        self.require_no_pending_pull()?;
+        let baseline = self.baseline_claims()?;
+        crate::item_id::assign(&self.root, |_| true, crate::item_id::Mode::Repair { baseline: &baseline })
     }
 
     fn item_id_claims(&self) -> Result<crate::item_id::Claims> {

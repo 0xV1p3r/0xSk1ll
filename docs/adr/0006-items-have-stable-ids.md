@@ -26,9 +26,17 @@ uses the Item ID, so a rename is local to the repo and the ID moves with the ite
   unreadable, an item has no ID yet, two items share one, or a Pull is
   pending. The server refuses orphan pruning and default changes that
   record existing items' values while an inventory it needs is incomplete.
-- Item ID claims must be unique across the repo. `sk1ll repair-ids` keeps the
-  first claim by path and assigns fresh IDs to the others, then gives every
-  item without an ID a fresh one.
+- Item ID claims must be unique across the repo. Of the items sharing an ID,
+  `sk1ll repair-ids` keeps it with the one that has it at its path in the
+  Baseline, so a copy gets the fresh ID and the original keeps its
+  Assignment toggles and placements. Only when no claimant (a copy of a
+  renamed or uncommitted item) or several (a Baseline that already shares
+  it) has it there does the first of them by path keep it. The others get
+  fresh IDs, then every item without an ID gets one. A renamed item is its
+  ID's only claimant, so it keeps it.
+- Nothing writes Item IDs, syncs Harnesses, renames items or pushes while a
+  Pull is pending: core refuses it, so no caller can forget. A Harness change
+  is still saved then; its placements wait until the Pull is finished.
 - The Baseline always gives every item an Item ID of its own. The server's
   pre-receive hook refuses a push whose new tree has an item without one, two
   items sharing one, or unreadable Item ID metadata, naming each item. It

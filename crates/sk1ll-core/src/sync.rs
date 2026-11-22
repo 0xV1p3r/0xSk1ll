@@ -298,7 +298,11 @@ pub fn apply(repo: &Repo, action: &Action) -> Result<()> {
     apply_reviewed(repo, action, None)
 }
 
+/// Like [`apply`], only while the content it places is still as reviewed.
+/// Refuses ([`Error::PullPending`]) while a pull is pending: its tree is
+/// partial, so placements wait until it is finished.
 pub fn apply_reviewed(repo: &Repo, action: &Action, reviewed_digest: Option<&str>) -> Result<()> {
+    repo.require_no_pending_pull()?;
     match &action.item {
         Item::Skill { .. } => apply_skill(repo, action, false, reviewed_digest),
         Item::Instructions { content, expected, .. } => {

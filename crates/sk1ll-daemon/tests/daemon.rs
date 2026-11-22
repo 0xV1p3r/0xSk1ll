@@ -1955,7 +1955,7 @@ async fn standalone_commits_locally_and_pushes_and_pulls_its_own_origin() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refresh_finishes_a_pull_that_stopped_half_way() {
-    use sk1ll_daemon::client::{PullResult, SyncRequest};
+    use sk1ll_daemon::client::{PullResult, RenameItemRequest, SyncRequest};
     use std::os::unix::fs::PermissionsExt;
     let mut m = Machine::new("solo");
     sk1ll_core::Repo::init(&m.repo()).unwrap();
@@ -1992,6 +1992,13 @@ async fn a_refresh_finishes_a_pull_that_stopped_half_way() {
     assert_eq!(m.harness_skill("pdf").as_deref(), Some("initial"));
     let error = m.client.sync(&SyncRequest { force: true, ..Default::default() }).await.unwrap_err();
     assert!(error.to_string().contains("pull pending"), "{error}");
+    // Nor does anything write Item IDs into the partial tree meanwhile.
+    let error = m.client.repair_ids().await.unwrap_err();
+    assert!(error.to_string().contains("pull stopped half-way"), "{error}");
+    let rename = RenameItemRequest { kind: "skill".into(), name: "pdf".into(), to: "new-pdf".into() };
+    let error = m.client.rename_item(&rename).await.unwrap_err();
+    assert!(error.to_string().contains("pull stopped half-way"), "{error}");
+    assert!(pdf.join("SKILL.md").is_file() && !m.repo().join("personal/new-pdf").exists());
 
     // An editor can still write to a file in the read-only directory.
     m.write("personal/pdf/SKILL.md", "saved while pull was pending");

@@ -365,20 +365,57 @@ pub(crate) fn check_claims(claims: &Claims) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn assign(root: &Path, include: impl Fn(&Path) -> bool, repair: bool) -> Result<usize> {
+/// What [`assign`] writes.
+pub(crate) enum Mode<'a> {
+    /// An Item ID for each included item without one; duplicates are refused.
+    Missing,
+    /// A new Item ID for each item that shares one, but the keeper: the
+    /// claimant that holds it at its path in `baseline`. Only when none or
+    /// several do, the first of them by claim path keeps it.
+    Repair { baseline: &'a Claims },
+}
+
+/// Of the items sharing an Item ID, those [`Mode::Repair`] gives a new one.
+fn repaired<'a>(claims: &'a Claims, baseline: &Claims) -> BTreeSet<&'a Path> {
+    let mut by_id = BTreeMap::<&ItemId, Vec<&Path>>::new();
+    for (path, id) in claims {
+        if let Some(id) = id {
+            by_id.entry(id).or_default().push(path);
+        }
+    }
+    let mut replaced = BTreeSet::new();
+    for (id, mut paths) in by_id {
+        if paths.len() < 2 {
+            continue;
+        }
+        paths.sort_by_key(|path| claim_path(path));
+        let in_baseline: Vec<_> =
+            paths.iter().copied().filter(|path| baseline.get(*path).is_some_and(|b| b.as_ref() == Some(id))).collect();
+        let keeper = in_baseline.first().copied().unwrap_or(paths[0]);
+        replaced.extend(paths.into_iter().filter(|path| *path != keeper));
+    }
+    replaced
+}
+
+pub(crate) fn assign(root: &Path, include: impl Fn(&Path) -> bool, mode: Mode) -> Result<usize> {
     let manifest = manifest_on_disk(root)?;
     let claims = claims_on_disk(root, &manifest, |_| true)?;
-    if !repair {
-        check_claims(&claims)?;
-    }
+    let replaced = match mode {
+        Mode::Missing => {
+            check_claims(&claims)?;
+            None
+        }
+        Mode::Repair { baseline } => Some(repaired(&claims, baseline)),
+    };
     let mut used: BTreeSet<_> = claims.values().flatten().cloned().collect();
-    let mut seen = BTreeSet::new();
     let mut ordered: Vec<_> = claims.iter().collect();
     ordered.sort_by_key(|(path, _)| claim_path(path));
     let mut changed = 0;
     for (path, id) in ordered {
-        let replace =
-            if repair { id.as_ref().is_some_and(|id| !seen.insert(id)) } else { id.is_none() && include(path) };
+        let replace = match &replaced {
+            Some(replaced) => replaced.contains(path.as_path()),
+            None => id.is_none() && include(path),
+        };
         if !replace {
             continue;
         }
