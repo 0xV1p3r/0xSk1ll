@@ -295,10 +295,10 @@ impl Daemon {
         let pending = repo.pull_pending()?;
         let finished = match finish {
             Ok(None) => None,
-            Ok(Some(PullOutcome::Blocked { baseline, items })) if !pending => {
+            Ok(Some(PullOutcome::Blocked { baseline, items, .. })) if !pending => {
                 Some(PullState::Blocked { baseline, items })
             }
-            Ok(Some(PullOutcome::Blocked { baseline, items })) => Some(PullState::Pending { baseline, items }),
+            Ok(Some(PullOutcome::Blocked { baseline, items, .. })) => Some(PullState::Pending { baseline, items }),
             Ok(Some(_)) | Err(sk1ll_core::Error::Displaced { .. }) if !pending => {
                 tracing::info!("finished a pull that had stopped half-way");
                 Some(PullState::Clear)

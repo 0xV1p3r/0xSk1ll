@@ -104,9 +104,11 @@ pub(super) fn finish(repo: &Repo, hook: Hook) -> Result<Option<PullOutcome>> {
     with_pull(repo, |pull| {
         let Some(mut journal) = Journal::load(pull)? else { return Ok(None) };
         match pull.finish(&Worktree::open(&pull.root, &pull.git_dir)?, &mut journal, false, hook)? {
-            Finished::Blocked(items) => {
-                Ok(Some(PullOutcome::Blocked { baseline: journal.baseline, items: items.into_iter().collect() }))
-            }
+            Finished::Blocked(items) => Ok(Some(PullOutcome::Blocked {
+                baseline: journal.baseline,
+                items: items.into_iter().collect(),
+                uncommitted: Vec::new(),
+            })),
             Finished::Updated { displaced: Some(displaced), .. } => Err(displaced),
             Finished::Updated { from, to, displaced: None } => Ok(Some(PullOutcome::Updated { from, to })),
         }
@@ -288,7 +290,11 @@ impl Pull<'_> {
                 let baseline = journal.baseline.clone();
                 match self.finish(&Worktree::open(&self.root, &self.git_dir)?, &mut journal, false, hook)? {
                     Finished::Blocked(items) => {
-                        return Ok(PullOutcome::Blocked { baseline, items: items.into_iter().collect() });
+                        return Ok(PullOutcome::Blocked {
+                            baseline,
+                            items: items.into_iter().collect(),
+                            uncommitted: Vec::new(),
+                        });
                     }
                     Finished::Updated { from, displaced, .. } => Some((from, displaced)),
                 }
@@ -353,7 +359,14 @@ impl Pull<'_> {
         self.refuse_gitlinks(&base, &head, &remote)?;
         self.refuse_sparse_checkout()?;
         let blocked = |items: BTreeSet<ItemRef>| {
-            Ok((PullOutcome::Blocked { baseline: remote.clone(), items: items.into_iter().collect() }, None))
+            Ok((
+                PullOutcome::Blocked {
+                    baseline: remote.clone(),
+                    items: items.into_iter().collect(),
+                    uncommitted: Vec::new(),
+                },
+                None,
+            ))
         };
 
         let upstream = self.changes(&base, &remote)?;
@@ -366,7 +379,7 @@ impl Pull<'_> {
         } else {
             let target = match self.replay(&head, &base, &remote)? {
                 Ok(tip) => tip,
-                Err(items) => return blocked(items),
+                Err(clash) => return self.uncommit(&branch, &head, clash, hook),
             };
             let (ours, changes) = (self.changes(&base, &target)?, self.changes(&head, &target)?);
             (target, ours, changes)
@@ -414,6 +427,33 @@ impl Pull<'_> {
             Finished::Updated { to, displaced, .. } => Ok((PullOutcome::Updated { from: head, to }, displaced)),
             Finished::Blocked(items) => blocked(items),
         }
+    }
+
+    /// An unpushed commit conflicts with the new Baseline: turns it and the
+    /// commits after it back into Draft changes, then pulls as for a Draft
+    /// clash. Only the branch moves, back to the commit before the first
+    /// conflicting one; the index and the working tree keep their bytes, so
+    /// nothing is lost and `git status` shows those commits' changes (staged)
+    /// with the Draft that was on top of them. The commits before it are
+    /// replayed as usual.
+    fn uncommit(&self, branch: &str, head: &str, clash: Clash, hook: Hook) -> Result<(PullOutcome, Option<Error>)> {
+        let range = format!("{}..{head}", clash.parent);
+        let log = self.git().args(["log", "--reverse", "--no-show-signature", "--format=%h %s", &range]).text()?;
+        let commits: Vec<String> = log.lines().map(str::to_string).collect();
+        let reference = format!("refs/heads/{branch}");
+        let message = "sk1ll: pull turns unpushed commits that conflict with the new baseline back into Draft";
+        self.git().args(["update-ref", "--no-deref", "-m", message, &reference, &clash.parent, head]).run()?;
+        let (outcome, displaced) = self.update(false, hook)?;
+        let outcome = match outcome {
+            PullOutcome::Blocked { baseline, mut items, uncommitted } => {
+                items.extend(clash.items.iter().filter(|item| !items.contains(item)).cloned().collect::<Vec<_>>());
+                items.sort();
+                PullOutcome::Blocked { baseline, items, uncommitted: commits.into_iter().chain(uncommitted).collect() }
+            }
+            // The Draft they became matches the new Baseline after all.
+            outcome => outcome,
+        };
+        Ok((outcome, displaced))
     }
 
     /// Takes the working tree, the index and then the branch from the
@@ -972,9 +1012,9 @@ impl Pull<'_> {
     }
 
     /// Replays the unpushed commits `base..head` onto `remote`, like `git
-    /// rebase` would, in the object store only. `Err(items)`: a commit
+    /// rebase` would, in the object store only. `Err(clash)`: a commit
     /// conflicts there, in these items.
-    fn replay(&self, head: &str, base: &str, remote: &str) -> Result<std::result::Result<String, BTreeSet<ItemRef>>> {
+    fn replay(&self, head: &str, base: &str, remote: &str) -> Result<std::result::Result<String, Clash>> {
         let commits = self.git().args(["rev-list", "--parents", "--reverse", &format!("{base}..{head}")]).text()?;
         if commits.lines().any(|line| line.split_whitespace().count() != 2) {
             return Err(Error::Invalid("can't pull with merge commits among the unpushed commits".into()));
@@ -1016,7 +1056,7 @@ impl Pull<'_> {
                     if items.is_empty() {
                         return Err(Error::Invalid(format!("replaying {commit} conflicts, but git names no path")));
                     }
-                    return Ok(Err(items));
+                    return Ok(Err(Clash { items, parent: parent.to_string() }));
                 }
                 Some(129) => {
                     return Err(Error::Invalid(
@@ -1038,6 +1078,15 @@ impl Pull<'_> {
         }
         Ok(Ok(tip))
     }
+}
+
+/// An unpushed commit that conflicts with the new Baseline when replayed.
+struct Clash {
+    /// The items it conflicts in.
+    items: BTreeSet<ItemRef>,
+    /// Its parent: the last commit that replays cleanly (or the Baseline it
+    /// started from).
+    parent: String,
 }
 
 /// Which side of a journal a check is about.

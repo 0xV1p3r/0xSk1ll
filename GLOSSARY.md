@@ -120,7 +120,7 @@ A machine has one headline status: the most severe that applies, in the order Of
 The server can't reach the machine; it shows a last-seen time.
 
 **Blocked**:
-A new baseline clashes with the machine's draft, so the machine stays on its old baseline. A pull also stops as Blocked when the new baseline writes a file through a git filter driver (Git LFS), which the skills repo doesn't support.
+A new baseline clashes with the machine's draft, so the machine stays on its old baseline. Unpushed commits that conflict with it are turned back into Draft first, so they block the same way. Restoring the clashing items keeps their version in recovery, to adopt after the pull. A pull also stops as Blocked when the new baseline writes a file through a git filter driver (Git LFS), which the skills repo doesn't support.
 
 **Behind**:
 The machine hasn't picked up the latest baseline yet.

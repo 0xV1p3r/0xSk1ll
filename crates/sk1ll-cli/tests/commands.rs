@@ -618,3 +618,64 @@ fn harness_changes_stop_on_an_unreadable_assignment_and_report_failed_placements
     assert!(err.contains("machine.toml changed, but"), "{err}");
     assert!(fs::read_to_string(&config).unwrap().contains("[harnesses.h]"), "the change itself was made");
 }
+
+/// Two Machines sharing a bare `origin`: `a` (its repo pushed there first)
+/// and `b`, a clone of it.
+fn two_machines() -> (TestRepo, TestRepo, tempfile::TempDir) {
+    let origin = tempfile::tempdir().unwrap();
+    let bare = origin.path().join("origin.git");
+    let a = TestRepo::new().with_skill();
+    git(origin.path(), &["init", "-q", "--bare", "-b", "main", bare.to_str().unwrap()]);
+    git(&a.repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    a.run(&["sync"]).unwrap();
+    a.run(&["commit", "pdf", "--push"]).unwrap();
+    let b = TestRepo::new();
+    fs::remove_dir_all(&b.repo).unwrap();
+    git(origin.path(), &["clone", "-q", bare.to_str().unwrap(), b.repo.to_str().unwrap()]);
+    git(&b.repo, &["config", "user.name", "Test"]);
+    git(&b.repo, &["config", "user.email", "test@example.com"]);
+    (a, b, origin)
+}
+
+/// The route the Blocked message gives works, also after committing the
+/// clashing item: the pull turns the conflicting unpushed commit back into
+/// Draft (nothing lost), restore keeps that version in recovery, the pull
+/// goes through, and adopting the entry brings the version back as Draft
+/// on the new Baseline, ready to commit again.
+#[test]
+fn a_blocked_machine_that_committed_the_clash_follows_the_hint_out() {
+    let (a, b, _origin) = two_machines();
+    let skill = |repo: &Path| fs::read_to_string(repo.join("personal/pdf/SKILL.md")).unwrap();
+    fs::write(b.repo.join("personal/pdf/SKILL.md"), "b's edit\n").unwrap();
+    fs::write(a.repo.join("personal/pdf/SKILL.md"), "a's edit\n").unwrap();
+    a.run(&["commit", "pdf", "--push"]).unwrap();
+
+    let blocked = b.run(&["pull"]).unwrap_err();
+    assert!(blocked.contains("Run `sk1ll restore skill:pdf`"), "{blocked}");
+    assert!(!blocked.contains("commit or restore"), "{blocked}");
+    // What the docs used to suggest: commit the clashing item.
+    b.run(&["commit", "pdf"]).unwrap();
+    let blocked = b.run(&["pull"]).unwrap_err();
+    assert!(blocked.contains("turned 1 unpushed commit(s) back into Draft"), "{blocked}");
+    assert!(blocked.contains("Run `sk1ll restore skill:pdf`"), "{blocked}");
+    assert_eq!(skill(&b.repo), "b's edit\n", "nothing lost");
+    assert!(b.run(&["draft"]).unwrap().contains("M skill:pdf"));
+    // Pushing says the same.
+    let push = b.run(&["push"]).unwrap_or_else(|e| e);
+    assert!(!push.contains("commit or restore"), "{push}");
+
+    let restored = b.run(&["restore", "pdf"]).unwrap();
+    let id = restored
+        .lines()
+        .find_map(|line| line.strip_prefix("kept your version of what the pull is blocked on in recovery: "))
+        .unwrap_or_else(|| panic!("{restored}"))
+        .to_string();
+    b.run(&["pull"]).unwrap();
+    assert_eq!(skill(&b.repo), "a's edit\n");
+    assert!(b.run(&["recover", "list"]).unwrap().contains(&id));
+    b.run(&["recover", "adopt", &id]).unwrap();
+    assert_eq!(skill(&b.repo), "b's edit\n");
+    b.run(&["commit", "pdf", "--push"]).unwrap();
+    a.run(&["pull"]).unwrap();
+    assert_eq!(skill(&a.repo), "b's edit\n");
+}

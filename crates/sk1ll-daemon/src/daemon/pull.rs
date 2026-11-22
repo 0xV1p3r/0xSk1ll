@@ -102,7 +102,12 @@ impl Daemon {
                 plumbing::FirstBaseline::Adopted(to) => (PullResult::Updated { from: None, to }, PullState::Clear),
                 plumbing::FirstBaseline::Empty => (PullResult::UpToDate, PullState::Clear),
                 plumbing::FirstBaseline::Blocked { baseline, items } => (
-                    PullResult::Blocked { baseline: baseline.clone(), items: items.clone(), pending: false },
+                    PullResult::Blocked {
+                        baseline: baseline.clone(),
+                        items: items.clone(),
+                        pending: false,
+                        uncommitted: Vec::new(),
+                    },
                     PullState::Blocked { baseline, items },
                 ),
             }
@@ -114,7 +119,7 @@ impl Daemon {
                 Ok(PullOutcome::Updated { from, to }) => {
                     (PullResult::Updated { from: Some(from), to }, PullState::Clear)
                 }
-                Ok(PullOutcome::Blocked { baseline, items }) => {
+                Ok(PullOutcome::Blocked { baseline, items, uncommitted }) => {
                     tracing::warn!("blocked: baseline {baseline} clashes with the draft");
                     let pending = repo.pull_pending()?;
                     let pull = if pending {
@@ -122,7 +127,7 @@ impl Daemon {
                     } else {
                         PullState::Blocked { baseline: baseline.clone(), items: items.clone() }
                     };
-                    (PullResult::Blocked { baseline, items, pending }, pull)
+                    (PullResult::Blocked { baseline, items, pending, uncommitted }, pull)
                 }
                 // The pull went through; a save made to a file it replaced
                 // is in the recovery area, which the report lists as a conflict.
@@ -200,11 +205,7 @@ impl Daemon {
                     self.network(|d| d.fetch_baseline()).await?;
                     let pulled = self.pull_fetched().await?;
                     if let PullResult::Blocked { items, .. } = pulled {
-                        let names: Vec<String> = items.iter().map(ToString::to_string).collect();
-                        return Err(Error::Conflict(format!(
-                            "can't push: the server's baseline clashes with {}; commit or restore them",
-                            names.join(", ")
-                        )));
+                        return Err(Error::Conflict(format!("can't push: {}", crate::client::blocked_hint(&items))));
                     }
                 }
                 Err(e) => return Err(e.into()),

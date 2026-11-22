@@ -85,7 +85,7 @@ export function Draft({ revision, status, changed }: { revision: number; status:
   const unpushed = [...new Set([...status.report.unpushed, ...(!result?.pushed ? result?.items ?? [] : [])])];
   return <>
     {blocked && <Notice title="Blocked" tone="destructive">
-      The new Baseline clashes with this Draft. Commit or Restore the clashing items, then Pull.
+      The new Baseline also changes these items. Restore them (your version is kept in Recovery), Pull, then adopt your version back from Recovery as Draft.
       <p className="text-xs">{(pull?.state === 'blocked' ? pull.items : status.report.clashes).join(', ')}</p>{pullAction}</Notice>}
     <Panel label="Draft"><PanelToolbar>
       {standalone && <><Button variant="outline" disabled={noOrigin || push.pending} onClick={pushNow}>Push</Button>{pullAction}{noOrigin && <span className="text-xs text-muted-foreground">Push and Pull require an origin git remote.</span>}</>}

@@ -648,22 +648,37 @@ fn command(s: &Session, cmd: Cmd) -> Result<()> {
             } else {
                 println!("restored {}", names(&resp.discarded));
             }
+            if !resp.kept.is_empty() {
+                println!("kept your version of what the pull is blocked on in recovery: {}", resp.kept.join(" "));
+                println!("after `sk1ll pull`, bring it back as Draft with `sk1ll recover adopt <id>`");
+            }
         }
         Cmd::Pull => match s.block(c.pull())? {
             PullResult::UpToDate => println!("already on the latest baseline"),
             PullResult::Updated { from, to } => {
                 println!("baseline {} -> {}", from.as_deref().map_or("(none)", short), short(&to));
             }
-            PullResult::Blocked { baseline, items, pending: true } => bail!(
-                "pull pending at {}. Move aside any edits you want to keep, then restore or clear {} and pull again",
+            PullResult::Blocked { baseline, items, pending: true, .. } => bail!(
+                "pull pending at {}: {} changed while it was updating them. Run `sk1ll restore {}` (your version is \
+                 kept in recovery), then `sk1ll pull` to finish, then `sk1ll recover adopt <id>` for each id the \
+                 restore printed",
                 short(&baseline),
-                names(&items)
+                names(&items),
+                spaced(&items)
             ),
-            PullResult::Blocked { baseline, items, pending: false } => bail!(
-                "blocked: baseline {} clashes with {}; commit or restore them, then pull again",
-                short(&baseline),
-                names(&items)
-            ),
+            PullResult::Blocked { baseline, items, pending: false, uncommitted } => {
+                if !uncommitted.is_empty() {
+                    eprintln!(
+                        "turned {} unpushed commit(s) back into Draft, nothing lost: they conflict with baseline {}",
+                        uncommitted.len(),
+                        short(&baseline)
+                    );
+                    for commit in &uncommitted {
+                        eprintln!("  {commit}");
+                    }
+                }
+                bail!("blocked: {}", sk1ll_daemon::client::blocked_hint(&items))
+            }
         },
         Cmd::Adopt { harness, name } => {
             require_harness(s, &harness)?;
@@ -870,6 +885,11 @@ fn change_sym(change: ChangeKind) -> &'static str {
         ChangeKind::Modified => "M",
         ChangeKind::Deleted => "D",
     }
+}
+
+/// `items` as command arguments.
+fn spaced(items: &[sk1ll_core::ItemRef]) -> String {
+    items.iter().map(ToString::to_string).collect::<Vec<_>>().join(" ")
 }
 
 fn names(items: &[sk1ll_core::ItemRef]) -> String {

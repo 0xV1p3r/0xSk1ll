@@ -256,6 +256,10 @@ pub struct RestoreRequest {
 pub struct RestoreResponse {
     /// Items that left the Draft after Restore.
     pub discarded: Vec<ItemRef>,
+    /// Recovery entries that keep the restored version of items a pull is
+    /// Blocked on, to adopt (`sk1ll recover adopt`) once the pull is done.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kept: Vec<String>,
 }
 
 /// `POST /pull`.
@@ -269,12 +273,29 @@ pub enum PullResult {
         to: String,
     },
     /// The new baseline clashes with `items`; the machine stays on its old one.
+    /// `uncommitted`: unpushed commits (short id and subject) that conflicted
+    /// with it and were turned back into Draft changes, nothing lost.
     Blocked {
         baseline: String,
         items: Vec<ItemRef>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         pending: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        uncommitted: Vec<String>,
     },
+}
+
+/// What clears a pull Blocked on `items`, as every message about it says:
+/// restore them (each version is kept in recovery), pull, then adopt the
+/// kept versions back as Draft on the new Baseline.
+pub fn blocked_hint(items: &[ItemRef]) -> String {
+    let names: Vec<String> = items.iter().map(ToString::to_string).collect();
+    let names = names.join(" ");
+    format!(
+        "the new baseline also changes {names}, which this machine changed too. Run `sk1ll restore {names}` (your \
+         version is kept in recovery), then `sk1ll pull`, then `sk1ll recover adopt <id>` for each id the restore \
+         printed, to bring your version back as Draft on the new baseline"
+    )
 }
 
 /// `GET /conflicts`: harness content sk1ll won't overwrite on its own.
@@ -1251,7 +1272,12 @@ mod tests {
         let e = Event::Assignment { revision: 3 };
         assert_eq!(serde_json::to_value(&e).unwrap(), serde_json::json!({"type": "assignment", "revision": 3}));
         assert_eq!(e.name(), "assignment");
-        let p = PullResult::Blocked { baseline: "b".into(), items: vec![ItemRef::Skill("x".into())], pending: false };
+        let p = PullResult::Blocked {
+            baseline: "b".into(),
+            items: vec![ItemRef::Skill("x".into())],
+            pending: false,
+            uncommitted: Vec::new(),
+        };
         let v = serde_json::to_value(&p).unwrap();
         assert_eq!(v["state"], "blocked");
         assert_eq!(serde_json::from_value::<PullResult>(v).unwrap(), p);

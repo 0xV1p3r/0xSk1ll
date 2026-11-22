@@ -30,11 +30,18 @@ impl Daemon {
         let repo = Repo::open_git_only(self.repo_root())?;
         let draft = repo.draft()?;
         let before: BTreeSet<ItemRef> = draft.iter().map(|d| d.item.clone()).collect();
-        match (req.all, req.items.is_empty()) {
-            (true, true) => repo.restore_all()?,
+        // What a pull is Blocked on is kept in recovery, to adopt once it is done.
+        let blocked: BTreeSet<ItemRef> = match self.lifecycle().pull() {
+            crate::state::PullState::Blocked { items, .. } | crate::state::PullState::Pending { items, .. } => {
+                items.iter().cloned().collect()
+            }
+            crate::state::PullState::Clear => BTreeSet::new(),
+        };
+        let kept = match (req.all, req.items.is_empty()) {
+            (true, true) => repo.restore_all_keeping(&blocked)?,
             (false, false) => {
                 let items = req.items.iter().map(|i| ItemRef::resolve(i, &draft)).collect::<Result<Vec<_>, _>>()?;
-                repo.restore(&items)?;
+                repo.restore_keeping(&items, &blocked)?
             }
             (true, false) => {
                 return Err(Error::BadRequest("pass either items or all, not both".into()));
@@ -42,11 +49,11 @@ impl Daemon {
             (false, true) => {
                 return Err(Error::BadRequest("name the draft items to restore, or pass all".into()));
             }
-        }
+        };
         let after: BTreeSet<ItemRef> = repo.draft()?.into_iter().map(|d| d.item).collect();
         let discarded: Vec<ItemRef> = before.difference(&after).cloned().collect();
         self.reconcile(eng)?;
-        Ok(RestoreResponse { discarded })
+        Ok(RestoreResponse { discarded, kept })
     }
 
     pub(crate) fn write_skill_file(&self, eng: &mut Engine, req: &crate::client::WriteFileRequest) -> Result<()> {

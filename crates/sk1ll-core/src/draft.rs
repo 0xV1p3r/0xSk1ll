@@ -171,12 +171,17 @@ pub enum PullOutcome {
         from: String,
         to: String,
     },
-    /// The new baseline clashes with the draft (or with committed, unpushed
-    /// commits, or with local files the draft leaves out, such as ignored
-    /// ones). Nothing was changed; `baseline` is the remote commit.
+    /// The new baseline clashes with the draft (or with local files the
+    /// draft leaves out, such as ignored ones). Nothing else was changed;
+    /// `baseline` is the remote commit. Unpushed commits that conflict with
+    /// it were turned back into Draft changes first (`uncommitted`: each
+    /// one's short id and subject), keeping every byte of the working tree
+    /// and the index, so they block the pull as Draft does.
     Blocked {
         baseline: String,
         items: Vec<ItemRef>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        uncommitted: Vec<String>,
     },
 }
 
@@ -384,6 +389,17 @@ impl Repo {
     /// be restored while the baseline has none, since that would delete it, and
     /// nothing is restored that would delete or replace an ignored file.
     pub fn restore(&self, items: &[ItemRef]) -> Result<()> {
+        self.restore_keeping(items, &BTreeSet::new()).map(drop)
+    }
+
+    /// [`restore`](Self::restore), first moving what the working tree has
+    /// for the items in `keep` into the recovery area, file by file, as
+    /// pull's recovery entries ([`crate::sync::displaced::Kind::Draft`]):
+    /// they stay until adopted (`sk1ll recover adopt`, which puts a file
+    /// back as a Draft change over a path that has none) or discarded.
+    /// That is how the version of an item a pull is Blocked on survives the
+    /// restore that clears the way. Returns the entries' ids.
+    pub fn restore_keeping(&self, items: &[ItemRef], keep: &BTreeSet<ItemRef>) -> Result<Vec<String>> {
         let (selected, st) = self.select(items, "restored")?;
         if selected.iter().any(|d| d.item == ItemRef::Manifest) && !st.head_paths.contains(Path::new(MANIFEST_FILE)) {
             return Err(Error::Invalid(format!(
@@ -422,6 +438,7 @@ impl Repo {
                 )));
             }
         }
+        let kept = self.keep_in_recovery(selected.iter().filter(|d| keep.contains(&d.item)).flat_map(|d| &d.paths))?;
         let (in_head, new): (Vec<&PathBuf>, Vec<&PathBuf>) =
             selected.iter().flat_map(|d| &d.paths).partition(|p| st.head_paths.contains(*p));
         // New paths go first: one may be in the way of a baseline file (a file
@@ -442,7 +459,45 @@ impl Repo {
         if let (Some(head), false) = (&st.head, in_head.is_empty()) {
             self.git()?.literal().args(["checkout", "--quiet", head, "--"]).args(&in_head).run()?;
         }
-        Ok(())
+        Ok(kept)
+    }
+
+    /// Moves each file or symlink at `paths` (repo-relative) into a recovery
+    /// entry of its own in the git directory's recovery area, as pull does
+    /// for what it displaces; a path with nothing there (a deletion) is
+    /// skipped. Returns the entries' ids.
+    #[cfg(unix)]
+    fn keep_in_recovery<'a>(&self, paths: impl Iterator<Item = &'a PathBuf>) -> Result<Vec<String>> {
+        use crate::sync::displaced::{Displacing, Kind, PULL};
+        let paths: Vec<&PathBuf> = paths.collect();
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let git_dir = PathBuf::from(self.git()?.args(["rev-parse", "--absolute-git-dir"]).text()?);
+        let mut kept = Vec::new();
+        for rel in paths {
+            let path = self.root().join(rel);
+            match fs::symlink_metadata(&path) {
+                Ok(meta) if !meta.is_dir() => {}
+                _ => continue,
+            }
+            let mut held = Displacing::begin(Some(self), Kind::Draft, PULL, &path, None, None, &git_dir)?;
+            if let Err(e) = held.take(&path) {
+                held.abandon();
+                return Err(e);
+            }
+            kept.push(held.id().to_string());
+            held.finish(false)?;
+        }
+        Ok(kept)
+    }
+
+    #[cfg(not(unix))]
+    fn keep_in_recovery<'a>(&self, paths: impl Iterator<Item = &'a PathBuf>) -> Result<Vec<String>> {
+        match paths.count() {
+            0 => Ok(Vec::new()),
+            _ => Err(Error::Invalid("keeping a restored version in recovery needs Unix".into())),
+        }
     }
 
     fn check_id_transitions(&self, head: Option<&str>, selected: &[ItemRef], operation: &str) -> Result<()> {
@@ -506,11 +561,17 @@ impl Repo {
     /// Restores the whole draft, including `other:` items, except a manifest
     /// the baseline doesn't have yet (see [`restore`](Self::restore)).
     pub fn restore_all(&self) -> Result<()> {
+        self.restore_all_keeping(&BTreeSet::new()).map(drop)
+    }
+
+    /// [`restore_all`](Self::restore_all), keeping the items in `keep` in
+    /// recovery as [`restore_keeping`](Self::restore_keeping) does.
+    pub fn restore_all_keeping(&self, keep: &BTreeSet<ItemRef>) -> Result<Vec<String>> {
         let (draft, st) = self.draft_with_status()?;
         let keep_manifest = !st.head_paths.contains(Path::new(MANIFEST_FILE));
         let items: Vec<ItemRef> =
             draft.into_iter().map(|d| d.item).filter(|i| !(keep_manifest && *i == ItemRef::Manifest)).collect();
-        if items.is_empty() { Ok(()) } else { self.restore(&items) }
+        if items.is_empty() { Ok(Vec::new()) } else { self.restore_keeping(&items, keep) }
     }
 
     /// Fetches [`REMOTE`] and moves to its baseline, carrying the draft on
@@ -1521,7 +1582,10 @@ mod tests {
 
         let before = snapshot(&f.b);
         let outcome = pull_now(&b).unwrap();
-        assert_eq!(outcome, PullOutcome::Blocked { baseline: remote.clone(), items: vec![item("skill:pdf")] });
+        assert_eq!(
+            outcome,
+            PullOutcome::Blocked { baseline: remote.clone(), items: vec![item("skill:pdf")], uncommitted: Vec::new() }
+        );
         assert_eq!(snapshot(&f.b), before);
 
         // An unpushed commit that conflicts with the new baseline backs out too.
@@ -1534,12 +1598,21 @@ mod tests {
         assert!(matches!(pull_now(&b).unwrap(), PullOutcome::Blocked { .. }));
         assert_eq!(snapshot(&f.b), before);
 
+        // Without the draft on top, the conflicting commit turns back into
+        // Draft: only the branch moves, every file stays as it was.
         b.restore(&[item("skill:pdf")]).unwrap();
-        let before = snapshot(&f.b);
+        let (files, _, _, _) = snapshot(&f.b);
         let outcome = pull_now(&b).unwrap();
-        assert_eq!(outcome, PullOutcome::Blocked { baseline: remote, items: vec![item("skill:pdf")] });
-        assert_eq!(snapshot(&f.b), before);
+        let PullOutcome::Blocked { baseline, items, uncommitted } = outcome else { panic!("{outcome:?}") };
+        assert_eq!((baseline, items), (remote, vec![item("skill:pdf")]));
+        assert!(uncommitted.len() == 1 && uncommitted[0].ends_with(" b"), "{uncommitted:?}");
+        assert_eq!(snapshot(&f.b).0, files);
         assert!(f.b.join("personal/new/SKILL.md").is_file());
+        assert!(items_of(&b).contains(&item("skill:pdf")));
+    }
+
+    fn items_of(repo: &Repo) -> Vec<ItemRef> {
+        repo.draft().unwrap().into_iter().map(|d| d.item).collect()
     }
 
     fn pending(repo: &Repo) -> bool {
@@ -1612,6 +1685,7 @@ mod tests {
         let blocked = PullOutcome::Blocked {
             baseline: remote.clone(),
             items: vec![item("other:build/out.txt"), item("other:secret.txt")],
+            uncommitted: Vec::new(),
         };
         assert_eq!(pull_now(&b).unwrap(), blocked);
         assert_eq!(snapshot(&f.b), before);
@@ -1637,7 +1711,8 @@ mod tests {
         let remote = a.commit(&[item("other:private.txt")], "private", None).unwrap();
         a.push().unwrap();
         let path = f.b.join("private.txt");
-        let blocked = PullOutcome::Blocked { baseline: remote, items: vec![item("other:private.txt")] };
+        let blocked =
+            PullOutcome::Blocked { baseline: remote, items: vec![item("other:private.txt")], uncommitted: Vec::new() };
         for rebase in [false, true] {
             if rebase {
                 write(&f.b.join("instructions/style.md"), "b committed\n");
@@ -1664,7 +1739,8 @@ mod tests {
         let remote = a.commit(&[item("skill:pdf")], "pdf", None).unwrap();
         a.push().unwrap();
         let (skill, sibling) = (f.b.join("personal/pdf/SKILL.md"), f.b.join("personal/pdf/ref.md"));
-        let blocked = PullOutcome::Blocked { baseline: remote, items: vec![item("skill:pdf")] };
+        let blocked =
+            PullOutcome::Blocked { baseline: remote, items: vec![item("skill:pdf")], uncommitted: Vec::new() };
         for rebase in [false, true] {
             if rebase {
                 write(&f.b.join("instructions/style.md"), "b committed\n");
@@ -1709,15 +1785,51 @@ mod tests {
             .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000))
             .unwrap();
 
-        let before = snapshot(&f.b);
+        let (files, ..) = snapshot(&f.b);
         let index = fs::read(f.b.join(".git/index")).unwrap();
-        assert_eq!(
-            b.pull_at(Before::Checks, || panic!("conflicting replay reached the tree switch")).unwrap(),
-            PullOutcome::Blocked { baseline: remote, items: vec![item("skill:web")] }
-        );
-        assert_eq!(snapshot(&f.b), before);
-        assert_eq!(git(&f.b, &["rev-parse", "refs/heads/main"]), head);
+        let style = git(&f.b, &["rev-parse", &format!("{head}^")]);
+        let outcome = b.pull_at(Before::Checks, || panic!("conflicting replay reached the tree switch")).unwrap();
+        let PullOutcome::Blocked { baseline, items, uncommitted } = outcome else { panic!("{outcome:?}") };
+        assert_eq!((baseline, items), (remote, vec![item("skill:web")]));
+        assert!(uncommitted.len() == 1 && uncommitted[0].ends_with(" web from b"), "{uncommitted:?}");
+        // The branch is back on the commit that replays cleanly; the
+        // conflicting one is Draft again, staged, and no byte of the
+        // working tree or the index changed.
+        assert_eq!(snapshot(&f.b).0, files);
+        assert_eq!(git(&f.b, &["rev-parse", "refs/heads/main"]), style);
         assert_eq!(fs::read(f.b.join(".git/index")).unwrap(), index);
+        assert!(items_of(&b).contains(&item("skill:web")));
+        assert_eq!(fs::read_to_string(f.b.join("imported/web/SKILL.md")).unwrap(), "b committed\n");
+    }
+
+    /// The whole way out of a clash with a committed item: the commit turns
+    /// back into Draft, a restore that keeps it in recovery clears the way,
+    /// and adopting the entry brings it back on the new Baseline.
+    #[test]
+    fn a_conflicting_unpushed_commit_turns_back_into_draft_and_comes_back_after_the_pull() {
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        write(&f.b.join("personal/pdf/SKILL.md"), "b's edit\n");
+        write(&f.a.join("personal/pdf/SKILL.md"), "a's edit\n");
+        let remote = a.commit(&[item("skill:pdf")], "a", None).unwrap();
+        a.push().unwrap();
+        let base = git(&f.b, &["rev-parse", "HEAD"]);
+        b.commit(&[item("skill:pdf")], "b", None).unwrap();
+
+        let outcome = pull_now(&b).unwrap();
+        assert!(matches!(&outcome, PullOutcome::Blocked { uncommitted, .. } if uncommitted.len() == 1), "{outcome:?}");
+        assert_eq!(git(&f.b, &["rev-parse", "HEAD"]), base);
+        assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "b's edit\n");
+
+        let kept = b.restore_keeping(&[item("skill:pdf")], &[item("skill:pdf")].into()).unwrap();
+        let entries: Vec<_> = kept.iter().map(|id| crate::sync::displaced::get(id).unwrap()).collect();
+        let skill = entries.iter().find(|e| e.dest.ends_with("personal/pdf/SKILL.md")).expect("SKILL.md is kept");
+        assert_eq!(pull_now(&b).unwrap(), PullOutcome::Updated { from: base, to: remote });
+        assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "a's edit\n");
+        let _lock = crate::EngineLock::acquire(b.root()).unwrap();
+        crate::sync::displaced::adopt(&b, &skill.id, &_lock).unwrap();
+        assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "b's edit\n");
+        assert!(items_of(&b).contains(&item("skill:pdf")));
     }
 
     #[cfg(unix)]
@@ -2212,6 +2324,7 @@ mod tests {
         let blocked = |items: &[&str]| PullOutcome::Blocked {
             baseline: git(&a, &["rev-parse", "HEAD"]),
             items: items.iter().map(|i| item(i)).collect(),
+            uncommitted: Vec::new(),
         };
         assert_eq!(pull_now(&r).unwrap(), blocked(&["other:../notes.txt"]));
         // Also with an unpushed commit, so that pull rebases.
@@ -2311,7 +2424,7 @@ mod tests {
     }
 
     /// The conflict is named even when the unpushed commits end up where
-    /// they started (an edit, then its revert).
+    /// they started (an edit, then its revert), and both turn back into Draft.
     #[test]
     fn pull_names_the_items_a_replayed_commit_conflicts_in() {
         let f = Fleet::new();
@@ -2323,9 +2436,17 @@ mod tests {
         write(&f.a.join("instructions/style.md"), "a's style\n");
         let remote = a.commit(&[item("rule:style")], "style", None).unwrap();
         a.push().unwrap();
-        let before = snapshot(&f.b);
-        assert_eq!(pull_now(&b).unwrap(), PullOutcome::Blocked { baseline: remote, items: vec![item("rule:style")] });
-        assert_eq!(snapshot(&f.b), before);
+        // Both commits turn back into Draft: the first conflicts, and the
+        // second is built on it. What they leave (the rule's new Item ID)
+        // is in the way as Draft.
+        let base = git(&f.b, &["rev-parse", "HEAD~2"]);
+        let (files, ..) = snapshot(&f.b);
+        let outcome = pull_now(&b).unwrap();
+        let PullOutcome::Blocked { baseline, items, uncommitted } = outcome else { panic!("{outcome:?}") };
+        assert_eq!((baseline, items), (remote, vec![item("rule:style")]));
+        assert_eq!(uncommitted.len(), 2, "{uncommitted:?}");
+        assert_eq!(git(&f.b, &["rev-parse", "HEAD"]), base);
+        assert_eq!(snapshot(&f.b).0, files);
     }
 
     /// A replayed commit is the original object with a new tree, parent and
@@ -2526,7 +2647,10 @@ mod tests {
         let old = git(&f.b, &["rev-parse", "HEAD"]);
         let pdf = f.b.join("personal/pdf/SKILL.md");
         let outcome = b.pull_at(Before::File(1), || write(&pdf, "draft edit\n")).unwrap();
-        assert_eq!(outcome, PullOutcome::Blocked { baseline: remote.clone(), items: vec![item("skill:pdf")] });
+        assert_eq!(
+            outcome,
+            PullOutcome::Blocked { baseline: remote.clone(), items: vec![item("skill:pdf")], uncommitted: Vec::new() }
+        );
         assert_eq!(read(&pdf), "draft edit\n");
         assert_eq!(read(&f.b.join("imported/web/SKILL.md")), "web v2\n");
         assert!(pending(&b));

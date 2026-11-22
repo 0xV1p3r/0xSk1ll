@@ -62,9 +62,9 @@ export interface CommitMessage { items: ItemRef[]; message: string }
 export interface CommitRequest { items: string[]; message?: string; author?: string }
 export interface CommitResponse { sha: string; items: ItemRef[]; message: string; pushed: boolean; push_error: string | null }
 export interface RestoreRequest { items: string[]; all: boolean }
-export interface RestoreResponse { discarded: ItemRef[] }
+export interface RestoreResponse { discarded: ItemRef[]; kept?: string[] }
 export type PullResult = { state: 'up_to_date' } | { state: 'updated'; from: string | null; to: string }
-  | { state: 'blocked'; baseline: string; items: ItemRef[] };
+  | { state: 'blocked'; baseline: string; items: ItemRef[]; pending?: boolean; uncommitted?: string[] };
 export interface ConflictView {
   kind?: string; id?: string; item?: ItemRef; path?: string; displaced_at?: number;
   // Harness conflicts only: newest mtime of the Harness content (when it was last edited), not a first-seen time.

@@ -196,7 +196,7 @@ The table lists Linux paths. On macOS, config and data use `~/Library/Applicatio
 | Drafting | The machine has a draft. |
 | In sync | Latest baseline, no draft, no conflicts. |
 
-To clear Blocked, commit or restore the clashing items, then run `sk1ll pull`. The daemon remembers Blocked and the server's baseline across restarts (a standalone daemon, which has no `daemon.json`, keeps them in `standalone-state.json` in the same directory), so it reports them before it can reach the server again. A Pull that stopped half-way (it crashed, or hit an error) is finished by the next Pull or by the daemon's next reconcile, without fetching again.
+To clear Blocked, restore the clashing items (`sk1ll restore <items>` keeps your version in recovery and prints each entry's id), run `sk1ll pull`, then `sk1ll recover adopt <id>` to bring your version back as Draft on the new baseline and commit it again. Committing a clashing item doesn't clear Blocked: the next pull turns an unpushed commit that conflicts with the new baseline back into Draft changes, keeping every file as it is. The daemon remembers Blocked and the server's baseline across restarts (a standalone daemon, which has no `daemon.json`, keeps them in `standalone-state.json` in the same directory), so it reports them before it can reach the server again. A Pull that stopped half-way (it crashed, or hit an error) is finished by the next Pull or by the daemon's next reconcile, without fetching again.
 
 Join codes expire after `SK1LL_SERVER_JOIN_CODE_TTL` (default `24h`), using the server duration syntax. `sk1ll fleet invite` and the GUI show the exact time.
 

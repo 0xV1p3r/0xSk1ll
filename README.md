@@ -81,7 +81,14 @@ sk1ll restore pdf                    # discard one item's draft
 sk1ll pull                           # fetch the new baseline, keep the draft on top
 ```
 
-Commands take a bare skill or rule name, or `skill:<name>`, `rule:<name>`, `manifest` and `other:<path>`. `pull` never merges. If the new baseline changes an item that is also in your draft, `pull` changes nothing and marks the machine Blocked until you commit or restore that item.
+Commands take a bare skill or rule name, or `skill:<name>`, `rule:<name>`, `manifest` and `other:<path>`. `pull` never merges. If the new baseline changes an item that is also in your draft, `pull` changes nothing and marks the machine Blocked. An unpushed commit that conflicts with the new baseline is turned back into draft changes first (only the branch moves; no file changes), so it blocks the pull the same way. To get past it:
+
+```sh
+sk1ll restore pdf          # your version goes to recovery; prints its entry ids
+sk1ll pull
+sk1ll recover adopt <id>   # your version comes back as draft on the new baseline
+sk1ll diff pdf             # merge by hand if needed, then commit
+```
 
 The daemon and mutating commands write a new Item ID for hand-made Skills, Rules,
 and Import entries that lack one. These writes are part of the Draft and get
@@ -91,7 +98,7 @@ repaired items.
 
 Pull requires Git 2.40 or later, and 2.42 when the new Baseline changes a `.gitattributes` file. It updates only the working-tree paths the new Baseline changes, one at a time, and leaves the Draft where it is. Replayed commits get this Machine as their committer and lose their signatures. Pull drops commits that become empty and keeps commits that started empty. Pull refuses unpushed merge commits, submodules and sparse checkouts. File changes need atomic filesystem operations on Linux or macOS. Pull checks for support before it starts changing files.
 
-If Pull stops partway through, the next `sk1ll pull` or Daemon reconcile resumes it. Edits to paths it already updated stay as Draft on the new Baseline. While Pull is pending, `git status` shows the partially updated tree, and `sk1ll commit`, `sk1ll sync`, `sk1ll push` and `sk1ll repair-ids` refuse to run. A harness change is saved but syncs once the Pull finishes. Copy aside any edit blocking a pending Pull before restoring the item. Pull recovery entries stay until you adopt or discard them.
+If Pull stops partway through, the next `sk1ll pull` or Daemon reconcile resumes it. Edits to paths it already updated stay as Draft on the new Baseline. While Pull is pending, `git status` shows the partially updated tree, and `sk1ll commit`, `sk1ll sync`, `sk1ll push` and `sk1ll repair-ids` refuse to run. A harness change is saved but syncs once the Pull finishes. Restoring an item a Pull is Blocked on, or that blocks a pending Pull, keeps your version in recovery. Pull recovery entries stay until you adopt or discard them.
 
 ## Commands
 

@@ -130,6 +130,15 @@ break compatibility.
 
 ### Fixed
 
+- A Blocked Machine that committed the clashing item could only get out
+  with `git reset`: pull refused it with a hint to commit or restore, and
+  restore found nothing in the Draft. Pull now turns an unpushed commit
+  that conflicts with the new Baseline (and the commits after it) back into
+  Draft changes, moving only the branch, and is Blocked on them as on any
+  Draft clash. Restoring an item a pull is Blocked on keeps your version in
+  recovery, to bring back with `sk1ll recover adopt` after the pull. Every
+  Blocked message in the CLI, the push error and the app now gives that
+  route.
 - The daemon starts when its state file holds a pull record it can't read
   (a pending pull another version recorded without its Baseline): it drops
   that record with a warning and derives the pull's state from its journal

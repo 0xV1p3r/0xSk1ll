@@ -141,8 +141,9 @@ subsequent writes through that open file. These operations need atomic
 exchange and no-replace rename on the filesystems where they are used.
 
 Pull checks for clashes item by item before it changes anything. After that,
-a Draft edit to a path it has yet to update can block it. Move any edits you
-want to keep aside, restore or clear the obstruction, then pull again. A
+a Draft edit to a path it has yet to update can block it. Restore the item
+(`sk1ll restore` keeps your version in recovery) or clear the obstruction,
+then pull again. A
 save to a path Pull already updated stays as Draft. While Pull is pending,
 the Daemon keeps the last complete Draft report and inventory, reports the
 inventory as incomplete, writes no Item IDs and pauses sync. A Harness
