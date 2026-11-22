@@ -28,7 +28,8 @@ with one code path over them (ADR 0001, 0002, 0004).
   line first, and changes sync after themselves.
 - Previews only read: `status`, `render`, `sync --dry-run`, `list`, `diff`,
   `edit` and `harnesses` run a read-only engine that holds no lock, never
-  reconciles and writes nothing. They plan in memory with the Inputs the
+  reconciles and writes nothing. Sent to a running daemon, what they ask
+  for never reconciles either. They plan in memory with the Inputs the
   next reconcile would have: a machine-local Harness rename that stopped
   half-way is finished in the plan only, and a hand edit of the
   machine-local Assignment is read, not applied. Only an engine holding the
@@ -42,9 +43,13 @@ with one code path over them (ADR 0001, 0002, 0004).
   rename, the Assignment (the machine-local file and its revision, or a
   joined Machine's snapshot and its mirror), the state file and the harness
   directories with their ownership indexes. So an engine takes the machine
-  lock (OS locks beside the state file, `machine.toml` and the Assignment
-  file) before it reads any of that, and holds it for its life: the daemon
-  until it exits, a command's engine for the command. A daemon starting
+  lock before it reads any of that, and holds it for its life: the daemon
+  until it exits, a command's engine for the command. It is one OS lock per
+  file an engine writes there (the state file, `machine.toml`, the
+  Assignment file, and the files kept beside the state file and beside
+  `machine.toml`), each keyed on the file's real path, every symlink
+  resolved: two names for one file are one lock, so engines that share any
+  of these files exclude each other however they are configured. A daemon starting
   while a command's engine runs waits for it (up to 30 seconds), so it
   loads what that command saved. `join` and `init` hold it too.
 - A command that changes something while another engine manages the
@@ -61,7 +66,11 @@ with one code path over them (ADR 0001, 0002, 0004).
   mutex. The save compares the file and its revision with what the write
   was made from; a hand edit that landed meanwhile is taken up as a
   revision of its own and the write made again on top, so a toggle that
-  reports success is saved and never overwrites the edit.
+  reports success is saved and never overwrites the edit. What an engine
+  just loaded is never written back unless something changed: taking up a
+  hand edit (at startup, or before a toggle or a reconcile) records only
+  its revision, by the same compare-and-swap against the exact bytes it
+  read, so a second edit landing in between is read again, not replaced.
 - A joined Machine's commands work on the repo it joined; another selected
   repo is refused.
 - `sk1ll init` creates a repo itself unless a daemon waits for one there: it

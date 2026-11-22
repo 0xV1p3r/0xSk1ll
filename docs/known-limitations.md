@@ -54,19 +54,32 @@ set them.
 ## A hand edit of assignment.json at the moment a toggle is saved
 
 A machine-local toggle is saved by comparing `assignment.json` and its
-revision with what the toggle was made from, then replacing the file
-atomically. A hand edit that lands before that comparison becomes a revision
-of its own and the toggle is made again on top of it. One that lands in the
-gap between the comparison and the rename is replaced and lost, as described
-above for block instructions files. A save into that gap needs exceptional
-timing; the next toggle or reconcile does not bring it back.
+revision with the exact bytes the toggle was made from, then replacing the
+file atomically. A hand edit that lands before that comparison becomes a
+revision of its own and the toggle is made again on top of it. One that lands
+in the gap between the comparison and the rename is replaced and lost, as
+described above for block instructions files. A save into that gap needs
+exceptional timing; the next toggle or reconcile does not bring it back.
+Taking up a hand edit (at startup, before a toggle, in a reconcile) writes
+only its revision, never the file, and a machine-local Harness rename writes
+the file only if it still holds what the rename read; a later edit fails the
+rename, which stays pending, rather than being replaced.
 
 ## One engine per Machine, and what keys it
 
-The machine lock is a set of OS file locks beside the state file,
-`machine.toml` and `assignment.json` (`*.engine-lock`). Two engines that
-share any of those files are one Machine and exclude each other. Two config
-dirs that share none of them are two Machines, even if their `machine.toml`
+The machine lock is a set of OS file locks, one for each file an engine
+writes outside the repo and the harness directories: the state file,
+`machine.toml`, `assignment.json`, the files kept beside the state file
+(`daemon-assignment.json`, `standalone-assignment.json`,
+`standalone-state.json`, the notifications shown) and a pending Harness
+rename beside `machine.toml`. Each lock file sits beside the file's real
+path (`<file>.engine-lock`, with every symlink resolved, the file's own
+included), so it may land in a dotfiles directory a symlinked `machine.toml`
+points into. Two engines that share any of those files, by whatever names,
+are one Machine and exclude each other: two state files in one directory
+share `standalone-assignment.json` and `standalone-state.json`, so they are
+one Machine. A symlink retargeted while an engine runs is not followed by
+its lock. Two config dirs that share none of them are two Machines, even if their `machine.toml`
 files name the same harness directories: only each harness directory's own
 lock keeps their syncs apart then, and their Assignments are separate. Like
 the directory lock, the machine lock needs a filesystem with working locks
@@ -145,14 +158,18 @@ everywhere. `git check-attr` prints `set` both for `filter` set without a
 value and for a driver called `set` (likewise `unset` and `unspecified`), so
 those names count as a driver only where one of that name is configured.
 
-Every git command a pull runs (and the clone and the first Baseline) has each
-filter driver git's configuration names turned off, so no driver process
-runs even for a pull that started before an attribute named one; that pull
-finishes with the content unconverted. The drivers are read from git's
-configuration as the pull starts: one added to the configuration while a
-pull runs, and named by an attribute that also appears meanwhile, can still
-run. Restore, status and the other commands outside a pull use your git as
-it is, drivers included. Imports keep their own handling of LFS sources.
+Every git command on the skills repo (a pull's, the clone's, the first
+Baseline's, and status, diff, restore and commit outside a pull) has each
+filter driver git's configuration for that repo names turned off,
+conditional includes included, so no driver process runs even for a pull
+that started before an attribute named one; that pull finishes with the
+content unconverted. The clone is made without a checkout, its drivers read
+in the clone, and a Baseline that writes a file through one is refused
+there too. The drivers are read from git's configuration as each command,
+or a pull, starts: one added to the configuration in between, and named by
+an attribute that also appears meanwhile, can still run. Your own git
+commands in the repo use your configuration as it is, drivers included.
+Imports keep their own handling of LFS sources.
 
 ## A registration left over by a rejoin
 

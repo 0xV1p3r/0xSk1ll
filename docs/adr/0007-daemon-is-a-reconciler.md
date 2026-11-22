@@ -63,10 +63,15 @@ the result against the state as it is now:
   Baseline that writes a file through one (its `filter` attribute, read where
   the pull reads `.gitattributes`, names a driver) stops before changing
   anything and stays Blocked, saying why; the server refuses to take such a
-  push. Every git command of a pull, the clone and the first Baseline runs
-  with each configured driver turned off, so finishing a pull that started
-  before an attribute named one runs none either. Other conversions (line
-  endings, `ident`, encodings) still apply.
+  push, and the clone refuses such a Baseline. Every git command on the
+  skills repo (a pull's, the clone's, the first Baseline's, and the Draft's
+  `status`, a diff, a restore's checkout, a commit's `add`) is built one
+  way, with each driver git's configuration for that repo names turned off,
+  conditional includes (`includeIf.gitdir`) included, so finishing a pull
+  that started before an attribute named one runs none either, and neither
+  does a reconcile under the engine mutex. The clone is made without a
+  checkout, so its drivers are read in the clone itself, then checked out.
+  Other conversions (line endings, `ident`, encodings) still apply.
 
 ## One lifecycle
 
@@ -150,8 +155,12 @@ the tree changes, or the next full reconcile.
 Each reconcile publishes a Snapshot (the Draft, the inventory, the conflicts and
 the recovery area) as one immutable value, before the events that send clients
 to it; the applied Assignment is published the same way. Readers never wait for
-the engine mutex. When it is free, a read first reconciles (which returns at
-once when no Input changed), so a read right after an edit sees it. While an
+the engine mutex. When it is free, a read of the Draft, the inventory, the
+conflicts or the recovery area first reconciles (which returns at once when no
+Input changed), so a read right after an edit sees it. What a CLI preview asks
+for (`/repo` for `status` and `list`, the sync preview, a render, a diff, the
+harnesses) never reconciles, through the daemon as in a read-only engine
+([ADR 0008](0008-cli-is-a-client-of-the-engine.md)); `?fresh=true` does. While an
 engine operation runs, a read answers from the last Snapshot, so an edit made
 outside sk1ll moments before may not show until the reconcile it wakes publishes
 the next one; the `draft` and `status` events follow. Reads about something in
