@@ -70,6 +70,16 @@ pub fn diff_text(before: Option<&str>, after: &str) -> anyhow::Result<String> {
     Ok(String::from_utf8(out.stdout)?)
 }
 
+/// `git diff --no-index` of two paths outside any repo, without external
+/// diff drivers or textconv: exit status 1 means they differ.
+pub fn diff_no_index(left: &Path, right: &Path) -> std::io::Result<Output> {
+    std::process::Command::new("git")
+        .args(["diff", "--no-index", "--no-ext-diff", "--no-textconv", "--"])
+        .arg(left)
+        .arg(right)
+        .output()
+}
+
 /// Runs git; non-zero is an error. Returns trimmed stdout.
 pub fn run(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
     run_env(dir, args, &[])

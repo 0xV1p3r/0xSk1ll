@@ -324,12 +324,7 @@ impl Daemon {
                 std::fs::write(&right, "").map_err(anyhow::Error::from)?;
             }
         }
-        let output = std::process::Command::new("git")
-            .args(["diff", "--no-index", "--no-ext-diff", "--no-textconv", "--"])
-            .arg(&left)
-            .arg(&right)
-            .output()
-            .map_err(anyhow::Error::from)?;
+        let output = plumbing::diff_no_index(&left, &right).map_err(anyhow::Error::from)?;
         if !matches!(output.status.code(), Some(0 | 1)) {
             return Err(Error::BadRequest(String::from_utf8_lossy(&output.stderr).into_owned()));
         }
@@ -348,12 +343,7 @@ impl Daemon {
             std::fs::write(&empty, "").map_err(anyhow::Error::from)?;
             empty
         };
-        let output = std::process::Command::new("git")
-            .args(["diff", "--no-index", "--no-ext-diff", "--no-textconv", "--"])
-            .arg(&entry.path)
-            .arg(&right)
-            .output()
-            .map_err(anyhow::Error::from)?;
+        let output = plumbing::diff_no_index(&entry.path, &right).map_err(anyhow::Error::from)?;
         if !matches!(output.status.code(), Some(0 | 1)) {
             return Err(Error::BadRequest(String::from_utf8_lossy(&output.stderr).into_owned()));
         }
