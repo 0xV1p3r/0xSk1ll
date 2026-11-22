@@ -84,8 +84,8 @@ mod reconcile;
 mod snapshot;
 mod views;
 
-pub(crate) use harness_rename::{prepare_rename, rename_write, resolve_rename};
-pub(crate) use reconcile::{repo_inventory, run as reconcile_loop};
+pub(crate) use harness_rename::rename_write;
+pub(crate) use reconcile::run as reconcile_loop;
 pub(crate) use snapshot::Snapshot;
 use {placement::*, reconcile::*, views::*};
 

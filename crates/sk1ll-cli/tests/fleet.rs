@@ -145,7 +145,7 @@ fn fleet_lists_machines_and_baseline() {
     assert_eq!(lines.next(), Some("baseline 0123456789"));
     assert_eq!(lines.next().unwrap().split_whitespace().collect::<Vec<_>>(), ["box", "offline", "seen", "never"]);
     assert_eq!(lines.next(), None);
-    daemon.assert_requests(&[("GET", "/fleet", &[], "")]);
+    daemon.assert_requests(&[("GET", "/status", &[], ""), ("GET", "/fleet", &[], "")]);
 }
 
 #[test]
@@ -187,12 +187,15 @@ fn fleet_log_forwards_filters_and_prints_entries() {
         "42",
     ]));
     assert_eq!(output, "41  1700000000  box / claude  skill:pdf  off -> on  by admin (Change)\n");
-    daemon.assert_requests(&[(
-        "GET",
-        "/log",
-        &["author=admin", "before=42", "harness=claude", "item=skill%3Apdf", "limit=10", "machine=box"],
-        "",
-    )]);
+    daemon.assert_requests(&[
+        ("GET", "/status", &[], ""),
+        (
+            "GET",
+            "/log",
+            &["author=admin", "before=42", "harness=claude", "item=skill%3Apdf", "limit=10", "machine=box"],
+            "",
+        ),
+    ]);
 }
 
 #[test]
@@ -202,14 +205,14 @@ fn fleet_undo_targets_entry_and_reports_no_change() {
         stdout(daemon.run(&["undo", "42"])),
         "Assignment log entry 42's previous value is already set; nothing changed\n"
     );
-    daemon.assert_requests(&[("POST", "/log/42/undo", &[], "null")]);
+    daemon.assert_requests(&[("GET", "/status", &[], ""), ("POST", "/log/42/undo", &[], "null")]);
 }
 
 #[test]
 fn fleet_remove_with_yes_deletes_machine() {
     let daemon = FakeDaemon::start();
     assert_eq!(stdout(daemon.run(&["remove", "box", "--yes"])), "removed box from the fleet\n");
-    daemon.assert_requests(&[("DELETE", "/machines/box", &[], "")]);
+    daemon.assert_requests(&[("GET", "/status", &[], ""), ("DELETE", "/machines/box", &[], "")]);
 }
 
 #[test]
@@ -222,15 +225,23 @@ fn fleet_remove_without_yes_or_terminal_sends_no_request() {
     daemon.assert_requests(&[]);
 }
 
+/// Without a daemon, the engine in this process asks the server; a
+/// standalone Machine has none to ask.
 #[test]
 fn removal_requires_yes_without_a_terminal() {
     let dir = tempfile::tempdir().unwrap();
-    for (flag, expected) in
-        [(None, "requires terminal confirmation or `--yes`"), (Some("--yes"), "the sk1ll daemon isn't running")]
-    {
+    for (flag, expected) in [(None, "requires terminal confirmation or `--yes`"), (Some("--yes"), "join a Fleet")] {
         let out = Command::new(env!("CARGO_BIN_EXE_sk1ll"))
             .arg("--daemon-socket")
             .arg(dir.path().join("absent.sock"))
+            .arg("--daemon-state")
+            .arg(dir.path().join("absent.json"))
+            .arg("--repo")
+            .arg(dir.path().join("repo"))
+            .env("HOME", dir.path())
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .env("XDG_CACHE_HOME", dir.path().join("cache"))
+            .env("XDG_STATE_HOME", dir.path().join("state"))
             .args(["fleet", "remove", "box"])
             .args(flag)
             .stdin(Stdio::null())
@@ -286,7 +297,9 @@ fn fleet_lists_and_prunes_orphans_with_an_optional_machine() {
     assert!(listed.contains("stale-id") && listed.contains("old"), "{listed}");
     assert!(stdout(daemon.run(&["prune-orphans", "--machine", "box"])).contains("cleared 0 orphan toggle"));
     daemon.assert_requests(&[
+        ("GET", "/status", &[], ""),
         ("GET", "/assignment/orphans", &[], ""),
+        ("GET", "/status", &[], ""),
         ("POST", "/assignment/orphans/prune", &[], r#"{"machine":"box"}"#),
     ]);
 }

@@ -1,29 +1,22 @@
 //! `sk1ll setup`: first-run setup on the command line, the same steps as the
-//! GUI's setup wizard. It goes through a running daemon when there is one.
+//! GUI's setup wizard, through the running daemon or an engine in this process.
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use sk1ll_core::{HarnessChoice, MachineConfig, Repo};
-use sk1ll_daemon::client::{Client, Connection, DaemonMode};
+use sk1ll_core::{HarnessChoice, ItemRef, MachineConfig};
+use sk1ll_daemon::client::{Connection, DaemonMode};
 use sk1ll_daemon::service::{self, Manager, Started};
 use sk1ll_daemon::{DaemonState, JoinOptions};
 use sk1ll_proto::{AssignmentChanges, ToggleChange, ToggleKind};
 
 use crate::Cli;
-use crate::fleet::{client, daemon_config, runtime};
+use crate::fleet::{Session, daemon_config, runtime};
 
 pub(crate) fn run(cli: &Cli) -> Result<()> {
     let cfg = daemon_config(cli)?;
-    let rt = runtime()?;
-    let client = client(cli)?;
-    let daemon = match rt.block_on(client.status()) {
-        Ok(status) => Some(status),
-        Err(e) if e.is_not_running() => None,
-        Err(e) => bail!("a daemon may be running but can't be reached ({e}); stop it or try again"),
-    };
     if let Some(state) = DaemonState::load(&cfg.state)? {
         if state.revoked {
             bail!("this machine was removed from its fleet; join again with `sk1ll join <server-url> <code>`");
@@ -31,10 +24,10 @@ pub(crate) fn run(cli: &Cli) -> Result<()> {
         println!("this machine already joined {} as `{}`; nothing to set up", state.server_url, state.machine_id);
         return Ok(());
     }
-    let repo = match &daemon {
-        Some(status) => status.repo.clone(),
-        None => sk1ll_daemon::locate_repo(cli.repo.as_deref(), false)?,
-    };
+    // The running daemon, else an engine in this process for the located repo.
+    let session = Session::any(cli)?;
+    let daemon = !session.in_process();
+    let repo = session.status.repo.clone();
     if repo.join(".git").exists() {
         println!("this machine already has a skills repo at {}; nothing to set up", repo.display());
         return Ok(());
@@ -56,25 +49,17 @@ pub(crate) fn run(cli: &Cli) -> Result<()> {
     };
 
     println!();
-    choose_harnesses(&mut input, &cfg.machine_config, &repo, daemon.is_some().then_some(&client), &rt)?;
+    choose_harnesses(&mut input, &cfg.machine_config, &session)?;
     println!();
 
     let joined = if path == 1 {
-        match &daemon {
-            Some(_) => rt.block_on(client.init())?,
-            None => {
-                let _lock = crate::lock_direct(&repo)?;
-                std::fs::create_dir_all(&repo)?;
-                for warning in MachineConfig::adopt_detected_presets(&cfg.machine_config, &repo)? {
-                    eprintln!("{warning}");
-                }
-                Repo::init_committed(&repo)?;
-            }
-        }
+        session.block(session.client.init())?;
         println!("created the skills repo at {}", repo.display());
         None
     } else {
-        Some(join(&mut input, &cfg, path == 3, &repo, &rt)?)
+        // The join sets the repo up; this process's engine has no part in it.
+        drop(session);
+        Some(join(&mut input, &cfg, path == 3, &repo)?)
     };
 
     if let Some((machine_id, copied, via_daemon)) = &joined
@@ -83,14 +68,14 @@ pub(crate) fn run(cli: &Cli) -> Result<()> {
         println!();
         println!("{machine_id} starts with every skill and rule off.");
         if input.yes("Turn on everything, including skills and rules added later?", true)? {
-            turn_everything_on(&cfg, &client, machine_id, *via_daemon, &rt)?;
+            turn_everything_on(cli, machine_id, *via_daemon)?;
             println!("turned on everything for {machine_id}");
         } else {
             println!("assign items with `sk1ll assign` or in the GUI's Assignment matrix");
         }
     }
 
-    if daemon.is_none() {
+    if !daemon {
         println!();
         if !start_daemon(&mut input, cli)? {
             let overrides = path_overrides(cli, &repo);
@@ -131,18 +116,9 @@ fn shell_quote(path: &Path) -> String {
     }
 }
 
-fn choose_harnesses(
-    input: &mut Input,
-    machine_config: &Path,
-    repo: &Path,
-    client: Option<&Client>,
-    rt: &tokio::runtime::Runtime,
-) -> Result<()> {
-    let choices: Vec<HarnessChoice> = match client {
-        Some(client) => rt.block_on(client.setup_harnesses())?,
-        // The opt-in presets found here read as on: setup enables them as it ends.
-        None => MachineConfig::setup_choices(machine_config, repo)?,
-    };
+fn choose_harnesses(input: &mut Input, machine_config: &Path, session: &Session) -> Result<()> {
+    // The opt-in presets found here read as on: setup enables them as it ends.
+    let choices: Vec<HarnessChoice> = session.block(session.client.setup_harnesses())?;
     let (shown, missing): (Vec<_>, Vec<_>) = choices.into_iter().partition(|c| c.installed || c.enabled);
     if shown.is_empty() {
         println!("No harnesses found. Install an agent tool or add one to {}.", machine_config.display());
@@ -160,10 +136,7 @@ fn choose_harnesses(
         let paths = paths.into_iter().flatten().collect::<Vec<_>>().join(", ");
         let enabled = input.yes(&format!("  Sync {} ({paths})?", choice.name), choice.enabled)?;
         if enabled != choice.enabled {
-            match client {
-                Some(client) => drop(rt.block_on(client.set_setup_harness(&choice.name, enabled))?),
-                None => MachineConfig::set_enabled(machine_config, &choice.name, enabled)?,
-            }
+            session.block(session.client.set_setup_harness(&choice.name, enabled))?;
         }
     }
     if !missing.is_empty() {
@@ -174,13 +147,7 @@ fn choose_harnesses(
 }
 
 /// Returns the machine id, whether the assignment was copied, and whether the daemon joined.
-fn join(
-    input: &mut Input,
-    cfg: &sk1ll_daemon::Config,
-    create: bool,
-    repo: &Path,
-    rt: &tokio::runtime::Runtime,
-) -> Result<(String, bool, bool)> {
+fn join(input: &mut Input, cfg: &sk1ll_daemon::Config, create: bool, repo: &Path) -> Result<(String, bool, bool)> {
     if create {
         println!("Deploy the server first. See the deployment section in docs/fleet.md.");
     }
@@ -214,41 +181,49 @@ fn join(
     };
     let copied = copy_from.is_some();
     let opts = JoinOptions { server_url, code, admin_token, machine_id, copy_from, repo: repo.to_path_buf() };
-    let (joined, via_daemon) = rt.block_on(sk1ll_daemon::join_or_rejoin(cfg, opts))?;
+    let (joined, via_daemon) = runtime()?.block_on(sk1ll_daemon::join_or_rejoin(cfg, opts))?;
     println!("joined the fleet as {} with the repo at {}", joined.machine_id, joined.repo.display());
     Ok((joined.machine_id, copied, via_daemon))
 }
 
-fn turn_everything_on(
-    cfg: &sk1ll_daemon::Config,
-    client: &Client,
-    machine_id: &str,
-    via_daemon: bool,
-    rt: &tokio::runtime::Runtime,
-) -> Result<()> {
-    let state = DaemonState::load(&cfg.state)?.context("the join didn't store this machine's credentials")?;
-    let repo = Repo::open(&state.repo)?;
-    let harnesses: Vec<String> = MachineConfig::load(&cfg.machine_config)?.harnesses().into_keys().collect();
-    let changes = AssignmentChanges { changes: everything_on(&harnesses, &repo.item_ids()?), expected: None };
-    if !via_daemon {
-        let lock = crate::lock_direct(&state.repo)?.context("the joined repo is not a git repo")?;
-        rt.block_on(sk1ll_daemon::write_assignment_direct(cfg, &lock, sk1ll_proto::AssignmentWrite::Changes(changes)))?;
-        return Ok(());
-    }
-    // The daemon restarts itself with the new credentials first.
-    rt.block_on(async {
-        for _ in 0..60 {
-            if client
-                .status()
-                .await
-                .is_ok_and(|s| s.mode == DaemonMode::Joined && s.connection == Connection::Connected)
-            {
-                return Ok(client.set_assignment(machine_id, &changes).await.map(drop)?);
+/// Through the daemon that joined (once it restarted with the new
+/// credentials and reconnected), else an engine in this process.
+fn turn_everything_on(cli: &Cli, machine_id: &str, via_daemon: bool) -> Result<()> {
+    let session = if via_daemon {
+        let rt = runtime()?;
+        let client = crate::fleet::client(cli)?;
+        let connected = rt.block_on(async {
+            for _ in 0..60 {
+                if client
+                    .status()
+                    .await
+                    .is_ok_and(|s| s.mode == DaemonMode::Joined && s.connection == Connection::Connected)
+                {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            false
+        });
+        if !connected {
+            bail!("the daemon didn't reconnect to the server in time; turn items on with `sk1ll assign` later");
         }
-        bail!("the daemon didn't reconnect to the server in time; turn items on with `sk1ll assign` later")
-    })
+        drop(rt);
+        Session::any(cli)?
+    } else {
+        Session::any(cli)?
+    };
+    let harnesses: Vec<String> = session.block(session.client.harnesses())?.into_iter().map(|h| h.name).collect();
+    let repo = session.block(session.client.repo(true))?;
+    let items: Vec<_> = repo
+        .skills
+        .into_iter()
+        .map(|s| (ItemRef::Skill(s.name), s.id))
+        .chain(repo.rules.into_iter().map(|r| (ItemRef::Rule(r.name), r.id)))
+        .collect();
+    let changes = AssignmentChanges { changes: everything_on(&harnesses, &items), expected: None };
+    session.block(session.client.set_assignment(machine_id, &changes))?;
+    Ok(())
 }
 
 /// Defaults first: changing a default records each existing item's value as

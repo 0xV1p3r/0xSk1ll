@@ -15,20 +15,17 @@ use axum::response::Response;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use sk1ll_proto::{
-    AssignmentOutcome, AssignmentSnapshot, AssignmentUpdate, AssignmentWrite, DaemonMessage, ErrorBody,
-    InventoryReport, MachineReport, PROTOCOL_HEADER, PROTOCOL_VERSION, ServerMessage,
+    AssignmentOutcome, AssignmentSnapshot, AssignmentUpdate, AssignmentWrite, DaemonMessage, ErrorBody, MachineReport,
+    PROTOCOL_HEADER, PROTOCOL_VERSION, ServerMessage,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::{self, Message, client::IntoClientRequest};
 
+use crate::DaemonState;
 use crate::auth::redact;
-use crate::client::Event;
-use sk1ll_core::harness_rename::{RenameIntent, RenameRequest};
-
-use crate::client::Connection;
+use crate::client::{Connection, Event};
 use crate::daemon::{Daemon, Link, rename_write};
 use crate::error::{Error, Result};
-use crate::{Config, DaemonState};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -428,78 +425,4 @@ async fn exchange(
     })
     .await
     .map_err(|_| Error::Unavailable("the Server did not confirm the Assignment in time".into()))?
-}
-
-pub async fn rename_harness_direct(
-    cfg: &Config,
-    state: &DaemonState,
-    _lock: &sk1ll_core::EngineLock,
-    request_body: RenameRequest,
-) -> anyhow::Result<crate::client::HarnessRenameResult> {
-    let http = http_client().build()?;
-    let authority = state.registration_key();
-    let authoritative = match RenameIntent::load(&cfg.machine_config, Some(&authority))? {
-        Some(_) => None,
-        None => Some(fetch_machine_assignment(state, &http).await?.assignment),
-    };
-    let intent =
-        crate::daemon::prepare_rename(&cfg.machine_config, &state.repo, Some(&authority), request_body, authoritative)?;
-    intent.apply_config(&cfg.machine_config)?;
-    let (mut sink, mut stream) = direct_session(state).await?;
-    let result = exchange(&mut sink, &mut stream, 1, 0, rename_write(&intent)).await;
-    // Persist the new authoritative Assignment before clearing the intent.
-    if let Ok(update) = &result {
-        save_assignment_snapshot(cfg, state, update)?;
-    }
-    let update = crate::daemon::resolve_rename(&cfg.machine_config, &intent, result)?;
-    Ok(crate::client::HarnessRenameResult { update, routed_rules: intent.routed_rules })
-}
-
-async fn direct_session(state: &DaemonState) -> anyhow::Result<(Sink, futures_util::stream::SplitStream<Ws>)> {
-    anyhow::ensure!(!state.revoked, "this machine was removed from the fleet");
-    let ws = connect(state).await.map_err(|error| match error {
-        ConnectError::Unauthorized => anyhow::anyhow!("the Server refused this Machine's token"),
-        ConnectError::Other(message) => anyhow::anyhow!(message),
-    })?;
-    let (mut sink, stream) = ws.split();
-    send(&mut sink, &DaemonMessage::Hello { machine_id: state.machine_id.clone() }).await?;
-    Ok((sink, stream))
-}
-
-pub(crate) fn save_assignment_snapshot(
-    cfg: &Config,
-    state: &DaemonState,
-    update: &AssignmentUpdate,
-) -> anyhow::Result<()> {
-    use anyhow::Context;
-    let snap =
-        AssignmentSnapshot { revision: update.revision, assignment: update.assignment.clone(), registration: None };
-    crate::state::save_snapshot(&cfg.snapshot_path(), &snap, Some(&state.registration_key()))
-        .context("Server accepted the Assignment, but saving its snapshot failed")
-}
-
-/// Open a short-lived session when the daemon is stopped.
-pub async fn write_assignment_direct(
-    cfg: &Config,
-    _lock: &sk1ll_core::EngineLock,
-    write: AssignmentWrite,
-) -> anyhow::Result<AssignmentUpdate> {
-    use anyhow::Context;
-    let state = DaemonState::load(&cfg.state)?.context("this machine hasn't joined a fleet")?;
-    let (mut sink, mut stream) = direct_session(&state).await?;
-    let authority = state.registration_key();
-    if let Some(intent) = RenameIntent::load(&cfg.machine_config, Some(&authority))? {
-        intent.apply_config(&cfg.machine_config)?;
-        let result = exchange(&mut sink, &mut stream, 1, 0, rename_write(&intent)).await;
-        if let Ok(update) = &result {
-            save_assignment_snapshot(cfg, &state, update)?;
-        }
-        crate::daemon::resolve_rename(&cfg.machine_config, &intent, result)?;
-    }
-    let harnesses = sk1ll_core::MachineConfig::load(&cfg.machine_config)?.harnesses().into_keys().collect();
-    let inventory = crate::daemon::repo_inventory(&state.repo, harnesses);
-    send(&mut sink, &DaemonMessage::Inventory(InventoryReport { seq: 1, ..inventory })).await?;
-    let update = exchange(&mut sink, &mut stream, 2, 1, write).await?;
-    save_assignment_snapshot(cfg, &state, &update)?;
-    Ok(update)
 }

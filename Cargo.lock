@@ -3517,7 +3517,6 @@ dependencies = [
  "axum",
  "clap",
  "clap_complete",
- "dirs 6.0.0",
  "serde_json",
  "sk1ll-core",
  "sk1ll-daemon",

@@ -2900,54 +2900,6 @@ async fn unknown_id_is_inert_and_harness_rename_moves_explicit_toggles() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn direct_fleet_assignment_sends_status_and_caches_the_result() {
-    let server = Server::start().await;
-    let (mut a, _b, _) = fleet_of_two(&server).await;
-    a.stop();
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-    let state = a.state();
-    let mut request = state.ws_url().into_client_request().unwrap();
-    request.headers_mut().insert("authorization", format!("Bearer {}", state.token).parse().unwrap());
-    let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
-    let item = ItemRef::Skill("x".into());
-    let saved = sk1ll_proto::MachineReport {
-        seq: 9,
-        baseline: Some("blocked-baseline".into()),
-        blocked: true,
-        behind: true,
-        clashes: vec![item.clone()],
-        drafts: vec![item.clone()],
-        harnesses: vec![HARNESS.into()],
-        conflicts: vec![sk1ll_proto::ConflictRef { item, harness: HARNESS.into() }],
-        inventory_complete: true,
-        ..Default::default()
-    };
-    ws.send(Message::text(serde_json::to_string(&DaemonMessage::Status(saved.clone())).unwrap())).await.unwrap();
-    eventually(|| async { (server.row("alpha").await?.report? == saved).then_some(()) }).await;
-    drop(ws);
-
-    let cfg = sk1ll_daemon::Config {
-        state: a.state_path(),
-        machine_config: Machine::machine_config(a.home.path()),
-        ..sk1ll_daemon::Config::new().unwrap()
-    };
-    let lock = sk1ll_core::EngineLock::acquire(&a.repo()).unwrap();
-    let update = sk1ll_daemon::write_assignment_direct(
-        &cfg,
-        &lock,
-        sk1ll_proto::AssignmentWrite::Changes(AssignmentChanges { changes: vec![toggle("x", true)], expected: None }),
-    )
-    .await
-    .unwrap();
-    let report = server.row("alpha").await.unwrap().report.unwrap();
-    assert!(report.items.iter().any(|item| item.id == skill_id("x")));
-    assert_eq!(sk1ll_proto::MachineReport { items: vec![], ..report }, saved);
-    let snapshot = a.snapshot().unwrap();
-    assert_eq!(snapshot.revision, update.revision);
-    assert!(snapshot.assignment.skill_enabled(HARNESS, &skill_id("x")));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recreated_personal_skill_gets_a_new_assignment_identity() {
     use sk1ll_daemon::client::{CreateItemRequest, DeleteItemRequest};
     let mut m = Machine::new("solo");
@@ -3061,51 +3013,4 @@ async fn malformed_rule_reports_partial_inventory_and_still_pulls() {
     })
     .await;
     assert_eq!(std::fs::read_to_string(a.repo().join("notes")).unwrap(), "a change to pull");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn direct_rename_protects_destination_even_with_an_old_cache() {
-    use sk1ll_core::harness_rename::RenameIntent;
-    use sk1ll_daemon::client::HarnessRenameRequest;
-
-    let server = Server::start().await;
-    let (mut a, _b, _) = fleet_of_two(&server).await;
-    a.stop();
-    assert!(!a.snapshot().unwrap().assignment.harnesses.contains_key("already-stored"));
-    let saved = server
-        .http
-        .put(format!("{}/api/machines/alpha/assignment", server.url()))
-        .bearer_auth(ADMIN)
-        .json(&serde_json::json!({"changes":[{
-            "harness":"already-stored","kind":"skill","item_id":"absent","enabled":true
-        }]}))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json::<sk1ll_proto::AssignmentUpdate>()
-        .await
-        .unwrap();
-    let cfg = sk1ll_daemon::Config {
-        state: a.state_path(),
-        machine_config: Machine::machine_config(a.home.path()),
-        ..sk1ll_daemon::Config::new().unwrap()
-    };
-    let before = std::fs::read(&cfg.machine_config).unwrap();
-    let lock = sk1ll_core::EngineLock::acquire(&a.repo()).unwrap();
-    let error = sk1ll_daemon::rename_harness_direct(
-        &cfg,
-        &a.state(),
-        &lock,
-        HarnessRenameRequest { from: HARNESS.into(), to: "already-stored".into(), replace: false },
-    )
-    .await
-    .unwrap_err();
-    assert!(error.to_string().contains("already has an Assignment"), "{error:#}");
-    assert_eq!(std::fs::read(&cfg.machine_config).unwrap(), before);
-    assert!(!RenameIntent::exists(&cfg.machine_config).unwrap());
-    let snapshot: AssignmentSnapshot = server.get("/machines/alpha/assignment").await;
-    assert_eq!(snapshot.revision, saved.revision);
-    assert_eq!(snapshot.assignment, saved.assignment);
 }

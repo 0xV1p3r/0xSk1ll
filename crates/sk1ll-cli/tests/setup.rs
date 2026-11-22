@@ -93,6 +93,8 @@ fn init_adopts_opt_in_presets_only_without_a_machine_toml() {
         let out = Command::new(env!("CARGO_BIN_EXE_sk1ll"))
             .arg("--machine-config")
             .arg(root.join(config))
+            .arg("--daemon-socket")
+            .arg(root.join("absent.sock"))
             .args(["init"])
             .arg(root.join(repo))
             .env("HOME", root.join("home"))

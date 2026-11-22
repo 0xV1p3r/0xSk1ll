@@ -1,110 +1,19 @@
-//! Everything that needs the daemon (Unix only): `join`, `daemon`, `fleet`,
-//! and routing mutating commands through a running daemon.
+//! `join`, `daemon` and `fleet`, and where every other command's requests
+//! go ([`Session`]): the running daemon, or an engine in this process.
 
 use std::io::{IsTerminal, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use sk1ll_daemon::client::{
-    AddImportRequest, ChangeKind, Client, CommitRequest, ConflictTarget, CreateItemRequest, DaemonMode, PullResult,
-    RestoreRequest, StatusView, SyncRequest, UpdateImportsRequest,
-};
+use sk1ll_daemon::client::{Client, StatusView};
 use sk1ll_daemon::service::Manager;
 use sk1ll_daemon::{Config, DaemonState};
-use sk1ll_proto::{AssignmentChanges, AssignmentWrite, LogQuery, Scope, ToggleChange, ToggleKind};
+use sk1ll_proto::{LogQuery, Scope, ToggleKind};
 
-use crate::{
-    Cli, Cmd, FleetCmd, InviteScope, Kind, assign_target, bundled_fallback, confirm, fetch_hint, names, print_bundled,
-    print_import_changes, print_update, resolve_assignment_item, short,
-};
-
-/// Sets up this process's environment, before any thread starts: the
-/// daemon's (`sk1ll daemon`), or for direct mode the machine's git
-/// credentials (which live only in the daemon's state file), so a direct
-/// push or pull to the server authenticates.
-pub(crate) fn prepare(cli: &Cli) -> Result<()> {
-    if matches!(cli.cmd, Cmd::Daemon) {
-        let cfg = daemon_config(cli)?;
-        // SAFETY: called from `main` before any runtime or thread starts.
-        return unsafe { sk1ll_daemon::prepare_process(&cfg) };
-    }
-    if matches!(cli.cmd, Cmd::Join { .. } | Cmd::Setup) {
-        // SAFETY: as above. Git must fail instead of prompting.
-        unsafe { std::env::set_var("GIT_TERMINAL_PROMPT", "0") };
-    }
-    if let Some(state) = joined_state(cli) {
-        for (k, v) in sk1ll_daemon::auth::git_credentials_env(&state) {
-            // SAFETY: as above.
-            unsafe { std::env::set_var(k, v) };
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn joined_state(cli: &Cli) -> Option<DaemonState> {
-    let cfg = daemon_config(cli).ok()?;
-    DaemonState::load(&cfg.state).ok().flatten()
-}
-
-/// Whether this machine joined a fleet.
-pub(crate) fn is_joined(cli: &Cli) -> bool {
-    joined_state(cli).is_some()
-}
+use crate::{Cli, Cmd, FleetCmd, InviteScope, confirm, names, short};
 
 pub(crate) fn runtime() -> Result<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Builder::new_current_thread().enable_all().build()?)
-}
-
-/// A joined machine always changes assignments at the Server, even without a daemon.
-pub(crate) fn assign_direct(cli: &Cli, repo: &Path, lock: Option<&sk1ll_core::EngineLock>) -> Result<bool> {
-    let cfg = daemon_config(cli)?;
-    let Some(state) = DaemonState::load(&cfg.state)?.filter(|s| !s.revoked) else { return Ok(false) };
-    let Cmd::Assign { harness, kind, name, state: enabled, default_skills, default_rules, all } = &cli.cmd else {
-        return Ok(false);
-    };
-    if !sk1ll_core::MachineConfig::load(&cfg.machine_config)?.harnesses().contains_key(harness) {
-        bail!("unknown harness `{harness}` on this machine (see `sk1ll harnesses`)");
-    }
-    check_joined_repo(repo, &state)?;
-    let target = assign_target(*kind, name.clone(), *enabled, *default_skills, *default_rules, *all)?;
-    let write = assignment_write(repo, harness, target, *default_skills, *default_rules, *all)?;
-    let Some(write) = write else { return Ok(true) };
-    let lock = lock.context("a fleet assignment change requires the engine lock")?;
-    let update = runtime()?.block_on(sk1ll_daemon::write_assignment_direct(&cfg, lock, write))?;
-    println!("fleet assignment of {} is now revision {}; run `sk1ll sync` to apply", state.machine_id, update.revision);
-    Ok(true)
-}
-
-fn assignment_write(
-    repo: &Path,
-    harness: &str,
-    target: Option<(Kind, String, crate::Switch)>,
-    default_skills: Option<crate::Switch>,
-    default_rules: Option<crate::Switch>,
-    all: Option<crate::Switch>,
-) -> Result<Option<AssignmentWrite>> {
-    if let Some(state) = all {
-        return Ok(Some(AssignmentWrite::Harness { harness: harness.into(), enabled: state.on() }));
-    }
-    let mut changes = Vec::new();
-    let toggle =
-        |kind, item_id, name, on| ToggleChange { harness: harness.into(), kind, item_id, name, enabled: Some(on) };
-    if let Some((kind, name, state)) = target
-        && let Some(id) = resolve_assignment_item(&sk1ll_core::Repo::open(repo)?, kind, &name, state)?
-    {
-        let kind = match kind {
-            Kind::Skill => ToggleKind::Skill,
-            Kind::Rule => ToggleKind::Rule,
-        };
-        changes.push(toggle(kind, Some(id), Some(name), state.on()));
-    }
-    if let Some(state) = default_skills {
-        changes.push(toggle(ToggleKind::NewSkillsDefault, None, None, state.on()));
-    }
-    if let Some(state) = default_rules {
-        changes.push(toggle(ToggleKind::NewRulesDefault, None, None, state.on()));
-    }
-    Ok((!changes.is_empty()).then_some(AssignmentWrite::Changes(AssignmentChanges { changes, expected: None })))
 }
 
 /// The daemon's config, with the CLI's `--machine-config` / `--assignment`.
@@ -126,47 +35,15 @@ pub(crate) fn daemon_config(cli: &Cli) -> Result<Config> {
     Ok(cfg)
 }
 
-pub(crate) fn assignment(state: Option<&Path>, cache: &Path) -> Result<sk1ll_core::Assignment> {
-    let mut cfg = Config::from_env()?;
-    if let Some(p) = state {
-        cfg.state = p.to_path_buf();
-    }
-    cfg.assignment = cache.to_path_buf();
-    sk1ll_daemon::state::load_assignment(&cfg)
-}
-
-/// [`assignment`], with a joined machine still waiting for its own as `None`.
-pub(crate) fn assignment_if_present(state: Option<&Path>, cache: &Path) -> Result<Option<sk1ll_core::Assignment>> {
-    let mut cfg = Config::from_env()?;
-    if let Some(p) = state {
-        cfg.state = p.to_path_buf();
-    }
-    cfg.assignment = cache.to_path_buf();
-    sk1ll_daemon::state::load_assignment_if_present(&cfg)
-}
-
-pub(crate) fn check_joined_repo(repo: &Path, state: &DaemonState) -> Result<()> {
-    let joined = state.repo.canonicalize()?;
+/// The repo a joined Machine's engine manages is the one it joined with.
+fn check_joined_repo(repo: &Path, state: &DaemonState) -> Result<()> {
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     anyhow::ensure!(
-        repo.canonicalize()? == joined,
-        "selected repo {} differs from the joined repo {}; select the joined repo to change fleet content",
+        canon(repo) == canon(&state.repo),
+        "selected repo {} differs from the joined repo {}; select the joined repo (--repo or SK1LL_REPO)",
         repo.display(),
-        joined.display()
+        state.repo.display()
     );
-    Ok(())
-}
-
-pub(crate) fn require_standalone_adoption(state: Option<&Path>, repo: &sk1ll_core::Repo) -> Result<()> {
-    let mut cfg = Config::from_env()?;
-    if let Some(p) = state {
-        cfg.state = p.to_path_buf();
-    }
-    if let Some(state) = DaemonState::load(&cfg.state)?.filter(|s| !s.revoked) {
-        check_joined_repo(repo.root(), &state)?;
-        bail!(
-            "Adopt needs a connection to the Server; start the daemon with `sk1ll daemon` and wait for it to connect"
-        );
-    }
     Ok(())
 }
 
@@ -231,18 +108,33 @@ fn join(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+/// Fleet administration: the server's API, through the engine (which adds
+/// the machine token).
 fn fleet(cli: &Cli, command: Option<&FleetCmd>) -> Result<()> {
-    let client = client(cli)?;
-    let rt = runtime()?;
+    // Confirmed before anything is asked of the engine.
+    if let Some(FleetCmd::Remove { machine, yes: false }) = command {
+        let stdin = std::io::stdin();
+        if !stdin.is_terminal() {
+            bail!("removing a machine requires terminal confirmation or `--yes`");
+        }
+        eprint!("Type the machine id `{machine}` to confirm removal: ");
+        std::io::stderr().flush()?;
+        let mut answer = String::new();
+        stdin.read_line(&mut answer)?;
+        if answer.trim_end_matches(['\r', '\n']) != machine {
+            bail!("machine id did not match; removal aborted");
+        }
+    }
+    let s = Session::any(cli)?;
+    let client = &s.client;
     match command {
         Some(FleetCmd::Invite { scope }) => {
-            let status = rt.block_on(client.status()).map_err(fleet_error)?;
-            let url = status.server_url.context("this machine hasn't joined a fleet")?;
+            let url = s.status.server_url.clone().context("this machine hasn't joined a fleet")?;
             let scope = match scope {
                 InviteScope::Fleet => Scope::Fleet,
                 InviteScope::SelfOnly => Scope::SelfOnly,
             };
-            let code = rt.block_on(client.join_code(scope)).map_err(fleet_error)?;
+            let code = s.block(client.join_code(scope))?;
             println!("{}", code.code);
             println!("sk1ll join {} {}", shell_arg(&url), shell_arg(&code.code));
             println!("expires {}", utc(code.expires_at));
@@ -251,21 +143,8 @@ fn fleet(cli: &Cli, command: Option<&FleetCmd>) -> Result<()> {
                 Scope::SelfOnly => println!("scope self: the Machine may manage only itself"),
             }
         }
-        Some(FleetCmd::Remove { machine, yes }) => {
-            if !yes {
-                let stdin = std::io::stdin();
-                if !stdin.is_terminal() {
-                    bail!("removing a machine requires terminal confirmation or `--yes`");
-                }
-                eprint!("Type the machine id `{machine}` to confirm removal: ");
-                std::io::stderr().flush()?;
-                let mut answer = String::new();
-                stdin.read_line(&mut answer)?;
-                if answer.trim_end_matches(['\r', '\n']) != machine {
-                    bail!("machine id did not match; removal aborted");
-                }
-            }
-            rt.block_on(client.remove_machine(machine)).map_err(fleet_error)?;
+        Some(FleetCmd::Remove { machine, .. }) => {
+            s.block(client.remove_machine(machine))?;
             println!("removed {machine} from the fleet");
         }
         Some(FleetCmd::CopyAssignment { source, target, merge, maps, yes }) => {
@@ -287,7 +166,7 @@ fn fleet(cli: &Cli, command: Option<&FleetCmd>) -> Result<()> {
                 expected: None,
                 source_expected: None,
             };
-            let preview = rt.block_on(client.preview_assignment_copy(target, &copy)).map_err(fleet_error)?;
+            let preview = s.block(client.preview_assignment_copy(target, &copy))?;
             println!("{} Assignment changes on {target} (item toggles and defaults)", preview.count);
             if preview.count == 0 {
                 return Ok(());
@@ -302,11 +181,11 @@ fn fleet(cli: &Cli, command: Option<&FleetCmd>) -> Result<()> {
             }
             copy.expected = Some(preview.target);
             copy.source_expected = Some(preview.source);
-            let update = rt.block_on(client.copy_machine_assignment(target, &copy)).map_err(fleet_error)?;
+            let update = s.block(client.copy_machine_assignment(target, &copy))?;
             println!("copied Assignment to {target} at revision {}", update.revision);
         }
         Some(FleetCmd::Orphans) => {
-            let view = rt.block_on(client.orphans()).map_err(fleet_error)?;
+            let view = s.block(client.orphans())?;
             for orphan in &view.orphans {
                 let name = orphan.name.as_deref().unwrap_or("-");
                 println!("{} / {}  {:?} {} ({name})", orphan.machine, orphan.harness, orphan.kind, orphan.item_id);
@@ -314,9 +193,7 @@ fn fleet(cli: &Cli, command: Option<&FleetCmd>) -> Result<()> {
             println!("{} orphan toggle(s)", view.orphans.len());
         }
         Some(FleetCmd::PruneOrphans { machine }) => {
-            let result = rt
-                .block_on(client.prune_orphans(&sk1ll_proto::PruneOrphans { machine: machine.clone() }))
-                .map_err(fleet_error)?;
+            let result = s.block(client.prune_orphans(&sk1ll_proto::PruneOrphans { machine: machine.clone() }))?;
             println!("cleared {} orphan toggle(s)", result.entries.len());
         }
         Some(FleetCmd::Log { machine, harness, author, item, before, limit }) => {
@@ -328,7 +205,7 @@ fn fleet(cli: &Cli, command: Option<&FleetCmd>) -> Result<()> {
                 before: *before,
                 limit: *limit,
             };
-            let entries = rt.block_on(client.log(&query)).map_err(fleet_error)?;
+            let entries = s.block(client.log(&query))?;
             for entry in entries {
                 let kind = match entry.kind {
                     ToggleKind::Skill => "skill",
@@ -357,24 +234,16 @@ fn fleet(cli: &Cli, command: Option<&FleetCmd>) -> Result<()> {
             }
         }
         Some(FleetCmd::Undo { entry_id }) => {
-            let update = rt.block_on(client.undo(*entry_id)).map_err(fleet_error)?;
+            let update = s.block(client.undo(*entry_id))?;
             if update.entries.is_empty() {
                 println!("Assignment log entry {entry_id}'s previous value is already set; nothing changed");
             } else {
                 println!("undid Assignment log entry {entry_id} at revision {}", update.revision);
             }
         }
-        None => print_fleet(rt.block_on(client.fleet()).map_err(fleet_error)?),
+        None => print_fleet(s.block(client.fleet())?),
     }
     Ok(())
-}
-
-fn fleet_error(e: sk1ll_daemon::client::ClientError) -> anyhow::Error {
-    if e.is_not_running() {
-        anyhow::anyhow!("the sk1ll daemon isn't running (start it with `sk1ll daemon`)")
-    } else {
-        e.into()
-    }
 }
 
 fn shell_arg(arg: &str) -> String {
@@ -455,256 +324,103 @@ fn ago(secs: i64) -> String {
     }
 }
 
-/// The running daemon, when it manages the repo a command is about.
-pub(crate) struct Daemon {
-    rt: tokio::runtime::Runtime,
+/// Where a command's requests go: the running daemon when it manages the
+/// repo, else an engine started in this process for the command (see
+/// [`sk1ll_daemon::local`]). Either way, the same local API.
+pub(crate) struct Session {
+    /// The engine in this process, if no daemon serves the command.
+    engine: Option<sk1ll_daemon::local::Engine>,
     pub(crate) client: Client,
-    status: StatusView,
+    pub(crate) status: StatusView,
+    rt: tokio::runtime::Runtime,
 }
 
-/// The daemon managing `repo`, if one runs. `None` means work directly
-/// (after taking the engine lock): certainly no daemon runs (no socket, or
-/// connection refused), or it manages another repo. Any other failure to
-/// talk to it is an error, since a daemon may well be running.
-pub(crate) fn connect(cli: &Cli, repo: &Path) -> Result<Option<Daemon>> {
-    let client = client(cli)?;
-    let rt = runtime()?;
-    let status = match rt.block_on(client.status()) {
-        Ok(s) => s,
-        Err(e) if e.is_not_running() => {
-            if is_joined(cli) {
-                eprintln!("note: the sk1ll daemon isn't running; working on the repo directly");
+impl Session {
+    /// The session for a command about `repo`. A daemon that isn't
+    /// running (no socket, or connection refused) or manages another repo
+    /// means an engine in this process; any other failure to talk to the
+    /// daemon is an error, since one may well be running.
+    pub(crate) fn open(cli: &Cli, repo: &Path) -> Result<Self> {
+        let cfg = daemon_config(cli)?;
+        let state = DaemonState::load(&cfg.state)?;
+        let (rt, daemon) = Self::daemon(cli)?;
+        if let Some((client, status)) = daemon {
+            if same_path(&status.repo, repo) {
+                return Ok(Self { engine: None, client, status, rt });
             }
-            return Ok(None);
+            eprintln!(
+                "note: the sk1ll daemon manages {}, not {}; running this command in this process",
+                status.repo.display(),
+                repo.display()
+            );
         }
-        Err(e) => bail!(
-            "cannot talk to the sk1ll daemon ({e}); not working on the repo directly while it may be running \
-             (check `systemctl --user status sk1ll-daemon`)"
-        ),
-    };
-    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    if canon(&status.repo) != canon(repo) {
-        eprintln!("note: the sk1ll daemon manages {}, not this repo; working on it directly", status.repo.display());
-        return Ok(None);
-    }
-    Ok(Some(Daemon { rt, client, status }))
-}
-
-impl Daemon {
-    pub(crate) fn into_parts(self) -> (tokio::runtime::Runtime, Client) {
-        (self.rt, self.client)
+        if let Some(state) = state.as_ref().filter(|s| !s.revoked) {
+            check_joined_repo(repo, state)?;
+        }
+        let engine = {
+            let _runtime = rt.enter();
+            sk1ll_daemon::local::Engine::start(Config { repo: Some(repo.to_path_buf()), ..cfg })?
+        };
+        let client = engine.client().clone();
+        let status = rt.block_on(client.status())?;
+        Ok(Self { engine: Some(engine), client, status, rt })
     }
 
-    fn block<T>(&self, f: impl Future<Output = sk1ll_daemon::client::Result<T>>) -> Result<T> {
+    /// For a command about the Machine rather than a repo: the running
+    /// daemon whatever it manages, else an engine for the joined repo (or,
+    /// standalone, the selected one).
+    pub(crate) fn any(cli: &Cli) -> Result<Self> {
+        let cfg = daemon_config(cli)?;
+        let (rt, daemon) = Self::daemon(cli)?;
+        if let Some((client, status)) = daemon {
+            return Ok(Self { engine: None, client, status, rt });
+        }
+        drop(rt);
+        let repo = match DaemonState::load(&cfg.state)? {
+            Some(state) => state.repo,
+            None => sk1ll_daemon::locate_repo(cli.repo.as_deref(), false)?,
+        };
+        Self::open(cli, &repo)
+    }
+
+    /// The running daemon, if it manages `repo`.
+    pub(crate) fn daemon_for(cli: &Cli, repo: &Path) -> Result<Option<Self>> {
+        let (rt, daemon) = Self::daemon(cli)?;
+        Ok(daemon.filter(|(_, status)| same_path(&status.repo, repo)).map(|(client, status)| Self {
+            engine: None,
+            client,
+            status,
+            rt,
+        }))
+    }
+
+    fn daemon(cli: &Cli) -> Result<(tokio::runtime::Runtime, Option<(Client, StatusView)>)> {
+        let rt = runtime()?;
+        let client = client(cli)?;
+        let daemon = match rt.block_on(client.status()) {
+            Ok(status) => Some((client, status)),
+            Err(e) if e.is_not_running() => None,
+            Err(e) => bail!(
+                "cannot talk to the sk1ll daemon ({e}); not running this command without it while it may be \
+                 running (check `systemctl --user status sk1ll-daemon`)"
+            ),
+        };
+        Ok((rt, daemon))
+    }
+
+    /// Whether the engine runs in this process rather than in a daemon.
+    pub(crate) fn in_process(&self) -> bool {
+        self.engine.is_some()
+    }
+
+    pub(crate) fn block<T>(&self, f: impl Future<Output = sk1ll_daemon::client::Result<T>>) -> Result<T> {
         Ok(self.rt.block_on(f)?)
     }
+}
 
-    /// Runs a mutating command through the daemon. `repo` is only read
-    /// (to check names).
-    pub(crate) fn run(self, cmd: Cmd, repo: &Path) -> Result<()> {
-        let c = &self.client;
-        match cmd {
-            Cmd::Conflicts | Cmd::Recover { command: crate::RecoverCmd::List } => {
-                let entries =
-                    // Their ids and names are what the next command acts on.
-                    if matches!(cmd, Cmd::Conflicts) {
-                        self.block(c.conflicts_fresh())?
-                    } else {
-                        self.block(c.recovered_fresh())?
-                    };
-                for e in entries {
-                    if e.kind.as_deref() == Some("displaced") {
-                        println!(
-                            "{} {} {} {}",
-                            e.id.unwrap_or_default(),
-                            e.harness,
-                            e.name,
-                            e.path.unwrap_or_default().display()
-                        );
-                    } else if matches!(cmd, Cmd::Conflicts) {
-                        println!("! {} {} {}", e.harness, e.name, e.dest.display());
-                    }
-                }
-            }
-            Cmd::Recover { command: crate::RecoverCmd::Adopt { id } } => {
-                println!("adopted into {}", self.block(c.adopt_displaced(&id))?.display());
-            }
-            Cmd::Recover { command: crate::RecoverCmd::Discard { id } } => self.block(c.discard_displaced(&id))?,
-            Cmd::Commit { items, message, author, push } => {
-                let resp = self.block(c.commit(&CommitRequest { items, message, author }))?;
-                println!("committed {} as {}", names(&resp.items), short(&resp.sha));
-                if self.status.mode == DaemonMode::Standalone {
-                    if push {
-                        self.block(c.push())?;
-                        println!("pushed to origin");
-                    }
-                    return Ok(());
-                }
-                match (resp.pushed, resp.push_error) {
-                    (true, _) => println!("pushed to the server"),
-                    (false, Some(e)) => println!("not pushed yet ({e}); the daemon pushes it when it can"),
-                    (false, None) => println!("not pushed yet; the daemon pushes it when it can"),
-                }
-            }
-            Cmd::RepairIds => {
-                println!("reassigned {} duplicate Item ID(s) in the Draft", self.block(c.repair_ids())?);
-            }
-            Cmd::Push => match self.block(c.push())?.pushed {
-                true => println!(
-                    "pushed to {}",
-                    if self.status.mode == DaemonMode::Standalone { "origin" } else { "the server" }
-                ),
-                false => println!("nothing to push"),
-            },
-            Cmd::Restore { items, all, yes } => {
-                if all {
-                    // What is confirmed is what gets restored: as of now.
-                    let draft = self.block(c.draft_fresh())?;
-                    if draft.is_empty() {
-                        println!("no draft to restore");
-                        return Ok(());
-                    }
-                    for d in &draft {
-                        let sym = match d.change {
-                            ChangeKind::Added => "A",
-                            ChangeKind::Modified => "M",
-                            ChangeKind::Deleted => "D",
-                        };
-                        println!("{sym} {}", d.item);
-                    }
-                    if !yes && !confirm(&format!("discard all {} draft item(s)?", draft.len()))? {
-                        bail!("aborted");
-                    }
-                }
-                let resp = self.block(c.restore(&RestoreRequest { items, all }))?;
-                if resp.discarded.is_empty() {
-                    println!("nothing was restored");
-                } else {
-                    println!("restored {}", names(&resp.discarded));
-                }
-            }
-            Cmd::Pull => match self.block(c.pull())? {
-                PullResult::UpToDate => println!("already on the latest baseline"),
-                PullResult::Updated { from, to } => {
-                    println!("baseline {} -> {}", from.as_deref().map_or("(none)", short), short(&to));
-                }
-                PullResult::Blocked { baseline, items, pending: true } => bail!(
-                    "pull pending at {}. Move aside any edits you want to keep, then restore or clear {} and pull again",
-                    short(&baseline),
-                    names(&items)
-                ),
-                PullResult::Blocked { baseline, items, pending: false } => bail!(
-                    "blocked: baseline {} clashes with {}; commit or restore them (the daemon pulls again then)",
-                    short(&baseline),
-                    names(&items)
-                ),
-            },
-            Cmd::Sync { dry_run: _, force } => {
-                let result = self.block(c.sync(&SyncRequest { force, ..Default::default() }))?;
-                if result.conflicts.is_empty() {
-                    println!("harnesses in sync");
-                }
-                for x in result.conflicts {
-                    let reason = x.reason.map(|r| format!("  ({r})")).unwrap_or_default();
-                    println!("! {:<10} {}{reason}", x.harness, x.name);
-                }
-            }
-            Cmd::Adopt { harness, name } => {
-                self.block(c.adopt(&ConflictTarget { harness: harness.clone(), name: name.clone() }))?;
-                println!("adopted {name} from {harness} into the draft; review with `sk1ll diff {name}`");
-            }
-            Cmd::Add { source, path, git_ref, name, list: false } => {
-                // An empty name is the skill's default name, decided by the daemon.
-                let narrowed = path.is_some() || git_ref.is_some();
-                let req =
-                    AddImportRequest { name: name.clone().unwrap_or_default(), source, path, git_ref, commit: None };
-                match self.block(c.add_import(&req)).map_err(fetch_hint) {
-                    Ok(r) => println!("added {} @ {}", r.name, short(&r.new_commit)),
-                    Err(e) => {
-                        let (bundled, e) = bundled_fallback(&req.source, narrowed, e)?;
-                        let name = name.unwrap_or_else(|| bundled.to_string());
-                        let create = CreateItemRequest {
-                            kind: "skill".into(),
-                            name: name.clone(),
-                            description: None,
-                            bundled: Some(bundled.into()),
-                        };
-                        self.block(c.create_item(&create))?;
-                        print_bundled(&e, &name);
-                    }
-                }
-            }
-            Cmd::Update { name: Some(name), dry_run: true, .. } => {
-                print_import_changes(&name, self.block(c.import_changes(&name, None))?);
-            }
-            Cmd::Update { name, force, .. } => {
-                for r in self.block(c.update_imports(&UpdateImportsRequest { name, force, expected: None }))? {
-                    print_update(&r.name, r.old_commit.as_deref(), &r.new_commit, r.changed);
-                }
-                println!("review with `sk1ll diff`, then commit");
-            }
-            Cmd::Remove { name } => {
-                self.block(c.remove_import(&name))?;
-                println!("removed {name}");
-            }
-            Cmd::Fork { name } => {
-                self.block(c.fork(&name))?;
-                println!("moved {name} to personal/");
-            }
-            Cmd::Assign { harness, kind, name, state, default_skills, default_rules, all } => {
-                // Assignment is server state: change it there, for this machine.
-                if !self.block(c.harnesses())?.iter().any(|h| h.name == harness) {
-                    bail!("unknown harness `{harness}` on this machine (see `sk1ll harnesses`)");
-                }
-                let target = assign_target(kind, name, state, default_skills, default_rules, all)?;
-                let Some(write) = assignment_write(repo, &harness, target, default_skills, default_rules, all)? else {
-                    return Ok(());
-                };
-                let machine = self.status.machine_id.clone();
-                let update = match write {
-                    AssignmentWrite::Harness { harness, enabled } => {
-                        self.block(c.set_harness_assignment(&harness, enabled))?
-                    }
-                    AssignmentWrite::Changes(changes) => self.block(c.set_assignment(&machine, &changes))?,
-                    AssignmentWrite::RenameHarness(_) => unreachable!(),
-                };
-                if all.is_some() && !update.errors.is_empty() {
-                    println!("Assignment of {machine} was saved at revision {}.", update.revision);
-                    for error in &update.errors {
-                        eprintln!("{error}");
-                    }
-                    bail!("Could not apply all placements");
-                }
-                if self.status.mode == DaemonMode::Standalone {
-                    println!(
-                        "local assignment of {machine} is now revision {}; the daemon applies it",
-                        update.revision
-                    );
-                    return Ok(());
-                }
-                if update.entries.is_empty() {
-                    println!("{harness}: already so on {machine}");
-                }
-                for e in &update.entries {
-                    let what = match (&e.kind, &e.name) {
-                        (ToggleKind::NewSkillsDefault, _) => "skills default".to_string(),
-                        (ToggleKind::NewRulesDefault, _) => "rules default".to_string(),
-                        (k, Some(n)) => format!("{} {n}", if *k == ToggleKind::Skill { "skill" } else { "rule" }),
-                        (_, None) => "?".to_string(),
-                    };
-                    let after = match e.after {
-                        Some(true) => "on",
-                        Some(false) => "off",
-                        None => "default",
-                    };
-                    println!("{}: {what} {after}", e.harness);
-                }
-                println!("fleet assignment of {machine} is now revision {}; the daemon applies it", update.revision);
-            }
-            _ => unreachable!("not a mutating command"),
-        }
-        Ok(())
-    }
+fn same_path(a: &Path, b: &Path) -> bool {
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    canon(a) == canon(b)
 }
 
 #[cfg(test)]

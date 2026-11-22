@@ -580,7 +580,7 @@ pub(crate) async fn run(d: Arc<Daemon>) {
 /// unreadable, a pull is pending (the tree is partial), an item has no
 /// Item ID yet (a reconcile writes one; none is ever derived), or two items
 /// share one (until `repair-ids`).
-pub(crate) fn repo_inventory(root: &Path, harnesses: Vec<String>) -> sk1ll_proto::InventoryReport {
+fn repo_inventory(root: &Path, harnesses: Vec<String>) -> sk1ll_proto::InventoryReport {
     let inventory = sk1ll_core::item_id::working_inventory(root);
     let mut errors = inventory.errors;
     match Repo::open_git_only(root).and_then(|repo| repo.pull_pending()) {

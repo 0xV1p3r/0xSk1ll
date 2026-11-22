@@ -30,6 +30,7 @@ impl Fixture {
             .env("HOME", root.join("home"))
             .env("XDG_CONFIG_HOME", root.join("config"))
             .env("XDG_STATE_HOME", root.join("state"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .args(args);
@@ -142,8 +143,10 @@ fn direct_adoption_rejects_a_repo_other_than_the_joined_repo() {
     assert_eq!(std::fs::read_to_string(root.join("a/second/SKILL.md")).unwrap(), "unmanaged user content");
 }
 
+/// Without a daemon, the engine in this process connects to the server for
+/// the Assignment write before it publishes anything.
 #[test]
-fn joined_adoption_requires_a_running_connected_daemon() {
+fn joined_adoption_requires_a_reachable_server() {
     let fixture = Fixture::new();
     let root = fixture.0.path();
     sk1ll_daemon::DaemonState {
@@ -158,10 +161,7 @@ fn joined_adoption_requires_a_running_connected_daemon() {
     .unwrap();
     fixture.write("a/pdf/SKILL.md", "unmanaged user content");
     let message = error(fixture.command(&["adopt", "a", "pdf"]).output().unwrap());
-    assert!(
-        message.contains("Adopt needs a connection to the Server") && message.contains("sk1ll daemon"),
-        "{message}"
-    );
+    assert!(message.contains("Adopt needs a connection to the Server"), "{message}");
     assert!(!root.join("repo/personal/pdf").exists());
     assert!(!root.join("assignment.json").exists());
     assert_eq!(std::fs::read_to_string(root.join("a/pdf/SKILL.md")).unwrap(), "unmanaged user content");

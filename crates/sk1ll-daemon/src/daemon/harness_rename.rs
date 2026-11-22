@@ -110,7 +110,7 @@ impl Daemon {
 /// The rename intent for `request`: the pending one if it is for the same
 /// request, else a new one from `authoritative` (the Assignment where it
 /// lives). Only local files: callers fetch first.
-pub(crate) fn prepare_rename(
+fn prepare_rename(
     config: &Path,
     repo: &Path,
     authority: Option<&str>,
@@ -143,11 +143,7 @@ fn definitive_refusal(error: &Error) -> bool {
         StatusCode::BAD_REQUEST | StatusCode::CONFLICT | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND))
 }
 
-pub(crate) fn resolve_rename(
-    config: &Path,
-    intent: &RenameIntent,
-    result: Result<AssignmentUpdate>,
-) -> Result<AssignmentUpdate> {
+fn resolve_rename(config: &Path, intent: &RenameIntent, result: Result<AssignmentUpdate>) -> Result<AssignmentUpdate> {
     match result {
         Ok(update) => {
             intent.apply_config(config)?;

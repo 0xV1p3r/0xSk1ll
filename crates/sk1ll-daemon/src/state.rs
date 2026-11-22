@@ -230,28 +230,6 @@ pub fn save_snapshot(path: &Path, snap: &AssignmentSnapshot, owner: Option<&str>
     write_private(path, format!("{body}\n").as_bytes())
 }
 
-/// Assignment for direct commands. Joined machines require the authoritative
-/// snapshot; an absent mirror must never turn their disabled items back on.
-pub fn load_assignment(cfg: &crate::Config) -> anyhow::Result<sk1ll_proto::Assignment> {
-    if let Some(s) = DaemonState::load(&cfg.state)?.filter(|s| !s.revoked) {
-        return load_snapshot(&cfg.snapshot_path(), Some(&s.registration_key()))?.map(|s| s.assignment).context(
-            "no authoritative assignment is stored; start the daemon and connect to the server \
-                      before changing harnesses",
-        );
-    }
-    Ok(sk1ll_proto::Assignment::load(&cfg.assignment)?)
-}
-
-/// Like [`load_assignment`], except that a joined machine with no
-/// authoritative snapshot yet (still waiting for the server's) is `None`.
-/// Every other failure (an unreadable state, a corrupt snapshot) is an error.
-pub fn load_assignment_if_present(cfg: &crate::Config) -> anyhow::Result<Option<sk1ll_proto::Assignment>> {
-    if let Some(s) = DaemonState::load(&cfg.state)?.filter(|s| !s.revoked) {
-        return Ok(load_snapshot(&cfg.snapshot_path(), Some(&s.registration_key()))?.map(|s| s.assignment));
-    }
-    Ok(Some(sk1ll_proto::Assignment::load(&cfg.assignment)?))
-}
-
 /// Writes `path` atomically with mode 0600, creating its directory (0700).
 pub(crate) fn write_private(path: &Path, body: &[u8]) -> anyhow::Result<()> {
     use std::os::unix::fs::DirBuilderExt;

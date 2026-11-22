@@ -54,6 +54,21 @@ impl EngineLock {
         })
     }
 
+    /// For creating a repo at `root`: the lock of the repo its nearest
+    /// existing ancestor is in, `None` when that is in none. Fails while
+    /// another process holds it.
+    pub fn for_new_repo(root: &Path) -> Result<Option<Self>> {
+        let absolute = std::path::absolute(root).at(root)?;
+        let existing = absolute
+            .ancestors()
+            .find(|p| p.is_dir())
+            .ok_or_else(|| Error::Invalid(format!("{} has no existing ancestor", root.display())))?;
+        if !Git::new(existing).args(["rev-parse", "--show-toplevel"]).output()?.status.success() {
+            return Ok(None);
+        }
+        Self::acquire(existing).map(Some)
+    }
+
     pub(crate) fn check_for(&self, root: &Path) -> Result<()> {
         if self.path == lock_path(root)? {
             return Ok(());
