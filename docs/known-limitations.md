@@ -104,28 +104,27 @@ loss is unsupported. Keep external Git commands that switch branches or
 write the index out of the repo during Pull. Pull checks the branch again
 before writing the index, and another Git command can still race that check.
 
-## Filter drivers and the engine lock
+## Filter drivers in the skills repo
 
-Filter drivers that need the network (git-lfs's smudge) never run under the
-engine lock. They run right after a fetch, and again whenever a pull needs
-them, for every file the next pull writes through one: the rest of a pull that
-stopped half-way, else what moving onto the fetched Baseline writes, with
-unpushed commits replayed and `.gitattributes` read as the pull will read
-them. The pull uses each conversion only for the same blob, path, resolved
-attributes and driver configuration. When one is missing it stops before
-changing anything, the drivers run again without the lock, and the pull goes
-on. After three tries the Machine stays Blocked, or the pull pending, and the
-error says why. That happens only when `.gitattributes` or the `filter.*`
-settings keep changing while it pulls.
+The skills repo doesn't support git filter drivers (Git LFS and the like):
+the server is plain git over HTTP and has no LFS endpoint. A pull onto a
+Baseline that writes a file through one stops before it changes anything
+and the Machine stays Blocked until `filter=` is gone from `.gitattributes`
+(the repo's or the Machine's own `.git/info/attributes`). The server refuses
+a push whose tree gives a file one. A driver needn't be configured on the
+Machine for its attribute to count, since the Baseline is the same
+everywhere. `git check-attr` prints `set` both for `filter` set without a
+value and for a driver called `set` (likewise `unset` and `unspecified`), so
+those names count as a driver only where one of that name is configured.
 
-Clean filters still run under the lock, both for checking that a file still
-holds what the old Baseline has and when the pull starts. A clean filter that
-waits on the network holds up the Daemon meanwhile. Conversions without a
-filter driver (line endings, `ident`, encodings) also run under the lock.
-They read the working tree's `.gitattributes` there, so a
-`.gitattributes` edit that adds a filter driver in the moment between the
-pull's attribute check and its conversion of that file runs that driver's
-smudge under the lock.
+Every git command a pull runs (and the clone and the first Baseline) has each
+filter driver git's configuration names turned off, so no driver process
+runs even for a pull that started before an attribute named one; that pull
+finishes with the content unconverted. The drivers are read from git's
+configuration as the pull starts: one added to the configuration while a
+pull runs, and named by an attribute that also appears meanwhile, can still
+run. Restore, status and the other commands outside a pull use your git as
+it is, drivers included. Imports keep their own handling of LFS sources.
 
 ## A registration left over by a rejoin
 

@@ -83,6 +83,11 @@ break compatibility.
   or later.
 - A Daemon sends its Machine's Assignment writes over the same WebSocket
   as status, so Adopt reports its Draft before enabling it.
+- The skills repo no longer supports git filter drivers (Git LFS): the
+  server has no LFS endpoint. A pull onto a Baseline that writes a file
+  through one stays Blocked and says to remove `filter=` from
+  `.gitattributes`, and the server refuses such a push. Pull, the clone and
+  the first Baseline run no filter driver. Imports keep their LFS handling.
 
 - Add Import and `sk1ll add --list` show file sizes and warn about scripts,
   executable files, binaries and files over 1 MiB.
@@ -115,6 +120,8 @@ break compatibility.
 
 ### Removed
 
+- The pull's filter-driver conversion cache (`.git/sk1ll-pull-filtered/`)
+  and its retries.
 - Push-time toggle sweeping and the Restore notification outbox.
 - Assignment copying during item rename and its offline override.
 - Compatibility fallbacks for older Assignment and join-code formats.

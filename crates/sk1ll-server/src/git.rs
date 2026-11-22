@@ -138,12 +138,51 @@ fn pre_receive_hook(branch: &str, check: Option<&Path>) -> String {
 /// item in its tree (personal skill, Rule, Import) has an Item ID of its own,
 /// so the baseline's Item IDs are always complete (ADR 0006). The error names
 /// each item and how to repair it.
+///
+/// It also refuses a tree whose `.gitattributes` give a file a git filter
+/// driver (`filter=lfs`): the skills repo supports none, and Machines
+/// refuse to pull such a Baseline.
 pub async fn check_push(repo: &Path, commit: &str) -> anyhow::Result<()> {
     let inventory = item_ids_at(repo, commit).await.with_context(|| format!("cannot read the Item IDs of {commit}"))?;
-    match inventory.id_problems() {
-        Some(problems) => bail!("refusing {commit}: {problems}"),
-        None => Ok(()),
+    if let Some(problems) = inventory.id_problems() {
+        bail!("refusing {commit}: {problems}");
     }
+    let filtered =
+        filter_driver_paths(repo, commit).await.with_context(|| format!("cannot read the attributes of {commit}"))?;
+    if !filtered.is_empty() {
+        let mut named = filtered.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+        if filtered.len() > 5 {
+            named.push_str(&format!(" and {} more", filtered.len() - 5));
+        }
+        bail!(
+            "refusing {commit}: the skills repo uses a git filter driver (e.g. Git LFS) on {named}; sk1ll doesn't \
+             support filter drivers in the skills repo — remove `filter=` from .gitattributes"
+        );
+    }
+    Ok(())
+}
+
+/// The files of `commit` whose `filter` attribute, read from its own
+/// `.gitattributes`, names a driver. `set`, `unset` and `unspecified` are
+/// no driver to `git check-attr` (it prints them for `filter`, `-filter` and
+/// none too), and the server configures none of that name.
+async fn filter_driver_paths(repo: &Path, commit: &str) -> anyhow::Result<Vec<String>> {
+    let args = ["ls-tree", "-r", "-z", "--name-only", "--full-tree", commit];
+    let Some(paths) = git_bytes(repo, &args, None).await? else { bail!("cannot list tree of {commit}") };
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let source = format!("--source={commit}");
+    let args = ["check-attr", &source, "-z", "--stdin", "filter"];
+    let Some(out) = git_bytes(repo, &args, Some(paths)).await? else {
+        bail!("cannot check the attributes of {commit}")
+    };
+    let fields: Vec<&[u8]> = out.split(|b| *b == 0).collect();
+    Ok(fields
+        .chunks(3)
+        .filter(|f| f.len() == 3 && !matches!(f[2], b"set" | b"unset" | b"unspecified"))
+        .map(|f| String::from_utf8_lossy(f[0]).into_owned())
+        .collect())
 }
 
 /// Bootstrap commands must not inherit identity, signing, hooks or templates
@@ -1224,6 +1263,15 @@ while ! test -f '{}'; do sleep 0.01; done
         write("personal/bare/.sk1ll-id", "two\nlines\n");
         let error = check_push(work, &commit("an unreadable one")).await.unwrap_err().to_string();
         assert!(error.contains("unreadable Item ID: personal/bare/.sk1ll-id"), "{error}");
+        write("personal/bare/.sk1ll-id", "bare\n");
+        assert!(check_push(work, &commit("repaired")).await.is_ok());
+
+        // No filter driver: `filter` set without a value or unset is none.
+        write(".gitattributes", "*.md filter\n*.txt -filter\n");
+        assert!(check_push(work, &commit("no driver")).await.is_ok());
+        write("personal/pdf/.gitattributes", "*.md filter=lfs\n");
+        let error = check_push(work, &commit("lfs")).await.unwrap_err().to_string();
+        assert!(error.contains("filter driver") && error.contains("on personal/pdf/SKILL.md;"), "{error}");
     }
 
     #[test]

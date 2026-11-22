@@ -20,9 +20,13 @@
 //! worktree's top level.
 //!
 //! Every git command runs with [`Git::for_pull`]: no hooks, no autostash,
-//! no submodule recursion. Config that only changes how content is
-//! converted or merged (`core.autocrlf`, filters, merge drivers, rename
-//! detection) is the user's and applies as it would to their own git.
+//! no submodule recursion, and no filter driver (the skills repo supports
+//! none, see [`crate::git::driver_paths`]): pull refuses a Baseline that
+//! writes a file through one before it changes anything, and finishing a
+//! pull that started anyway runs none. Other config that changes how
+//! content is converted or merged (`core.autocrlf`, `text`/`eol`
+//! attributes, merge drivers, rename detection) is the user's and applies
+//! as it would to their own git.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -89,12 +93,6 @@ pub(super) fn run(repo: &Repo, fetch: bool, hook: Hook) -> Result<PullOutcome> {
 /// neither `HEAD`, the index nor the working tree, so it needs no engine lock.
 pub(super) fn fetch(repo: &Repo) -> Result<()> {
     with_pull(repo, |pull| pull.fetch())
-}
-
-/// [`Pull::prefilter`]: converts what the next pull writes through a filter
-/// driver. Needs no engine lock.
-pub(super) fn prefilter(repo: &Repo) -> Result<()> {
-    with_pull(repo, |pull| pull.prefilter())
 }
 
 /// Finishes a pull that stopped half-way, if there is one, without fetching.
@@ -181,12 +179,14 @@ pub(super) fn adopt(repo: &Repo, entry: &crate::sync::displaced::Entry) -> Resul
 
 fn with_pull<T>(repo: &Repo, f: impl FnOnce(&Pull) -> Result<T>) -> Result<T> {
     let hooks = NoHooks::new()?;
-    let git = || Git::for_pull(repo.root(), &hooks.0);
+    let none = BTreeSet::new();
+    let git = || Git::for_pull(repo.root(), &hooks.0, &none);
     let line = |out: Vec<u8>| path_from_bytes(out.strip_suffix(b"\n").unwrap_or(&out));
     let root = line(git().args(["rev-parse", "--show-toplevel"]).run()?);
     let prefix = line(git().args(["rev-parse", "--show-prefix"]).run()?);
     let git_dir = line(git().args(["rev-parse", "--absolute-git-dir"]).run()?);
-    f(&Pull { repo: repo.root(), root, prefix, git_dir, hooks: &hooks.0 })
+    let drivers = crate::git::configured_drivers(Git::for_pull(&root, &hooks.0, &none))?;
+    f(&Pull { repo: repo.root(), root, prefix, git_dir, hooks: &hooks.0, drivers })
 }
 
 /// An empty directory for `core.hooksPath`, removed again when dropped.
@@ -265,96 +265,20 @@ struct Pull<'a> {
     /// entries of what pull replaces are.
     git_dir: PathBuf,
     hooks: &'a Path,
+    /// The filter drivers git's configuration has here, as the pull
+    /// started; every git command runs with them turned off.
+    drivers: BTreeSet<String>,
 }
 
 impl Pull<'_> {
     fn git(&self) -> Git {
-        Git::for_pull(&self.root, self.hooks)
+        Git::for_pull(&self.root, self.hooks, &self.drivers)
     }
 
     fn fetch(&self) -> Result<()> {
         let all = format!("+refs/heads/*:refs/remotes/{REMOTE}/*");
         self.git().args(["fetch", "--quiet", "--prune", "--no-recurse-submodules", REMOTE, &all]).run()?;
-        // Best effort: what isn't there is converted when it is written.
-        let _ = self.prefilter();
         Ok(())
-    }
-
-    /// Where [`Pull::prefilter`] keeps what checking out a blob writes.
-    fn prefiltered_dir(&self) -> PathBuf {
-        self.git_dir.join(PREFILTERED)
-    }
-
-    /// Runs the `filter` drivers (git-lfs's smudge, say, which downloads)
-    /// for every file the next pull writes through one, so that the pull,
-    /// which holds the caller's engine lock, never runs a smudge filter: it
-    /// uses what this wrote, by a key of the blob, the path, the path's
-    /// resolved conversion attributes and the driver's configuration (see
-    /// [`Filters`]), and stops with [`Error::FiltersPending`] on a miss.
-    ///
-    /// What the next pull writes: the rest of a pull that stopped half-way
-    /// (its journal), else the paths that differ between `HEAD` and what
-    /// moving onto the fetched Baseline makes of it, unpushed commits
-    /// replayed (in the object store only, as the pull will). Their
-    /// attributes are read as the pull will read them: from that target
-    /// commit if the pull changes any `.gitattributes` (deletions included),
-    /// else from the working tree. Needs no lock: it writes only to its own
-    /// directory in the git directory, and objects.
-    fn prefilter(&self) -> Result<()> {
-        let dir = self.prefiltered_dir();
-        match fs::remove_dir_all(&dir) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e).at(&dir),
-            _ => {}
-        }
-        let (target, changes) = match Journal::load(self)? {
-            Some(journal) => (journal.target, journal.changes),
-            None => {
-                let Some(head) = rev(self.git(), "HEAD")? else { return Ok(()) };
-                let remote = format!("refs/remotes/{REMOTE}/{FLEET_BRANCH}");
-                let Some(remote) = rev(self.git(), &remote)? else { return Ok(()) };
-                let base = self.git().args(["merge-base", &head, &remote]).text()?;
-                if base == remote {
-                    return Ok(());
-                }
-                let target = if base == head {
-                    remote
-                } else {
-                    match self.replay(&head, &base, &remote)? {
-                        Ok(tip) => tip,
-                        // Blocked: there is nothing to write.
-                        Err(_) => return Ok(()),
-                    }
-                };
-                let changes = self.changes(&head, &target)?;
-                (target, changes)
-            }
-        };
-        let source = changes_attributes(&changes).then_some(target);
-        let filters = Filters::new(self, source.as_deref(), &changes)?;
-        let git = || match &source {
-            Some(commit) => self.git().arg(format!("--attr-source={commit}")),
-            None => self.git(),
-        };
-        for change in &changes {
-            let (Some(entry), Some(key)) = (&change.new, filters.key(&change.path)) else { continue };
-            let bytes = git().args(["cat-file", "--filters"]).arg(path_option(&change.path)).arg(&entry.oid).run()?;
-            fs::create_dir_all(&dir).at(&dir)?;
-            let file = dir.join(key);
-            let staged = file.with_extension("tmp");
-            fs::write(&staged, bytes).at(&staged)?;
-            fs::rename(&staged, &file).at(&file)?;
-        }
-        Ok(())
-    }
-
-    /// Where [`Pull::prefilter`] wrote the conversion it keyed `key`.
-    fn prefiltered(&self, key: &str) -> PathBuf {
-        self.prefiltered_dir().join(key)
-    }
-
-    /// The pull is done: what was converted for it is not needed any more.
-    fn forget_prefiltered(&self) {
-        let _ = fs::remove_dir_all(self.prefiltered_dir());
     }
 
     /// Finishes a pull that stopped half-way first, then pulls.
@@ -462,6 +386,7 @@ impl Pull<'_> {
 
         // Whatever stops a pull from starting has to stop it here, before
         // anything changes.
+        self.refuse_filter_drivers(&target, &remote, &changes)?;
         let tree = Worktree::open(&self.root, &self.git_dir)?;
         tree.preflight(&changes)?;
         if self.index()?.values().flatten().any(|(_, _, stage)| stage != "0") {
@@ -513,7 +438,6 @@ impl Pull<'_> {
                 }
                 journal.remove(self)?;
                 tree.clear();
-                self.forget_prefiltered();
                 let to = rev(self.git(), "HEAD")?.ok_or_else(|| Error::Invalid("HEAD is missing".into()))?;
                 return Ok(Finished::Updated { from: journal.old.clone(), to, displaced });
             }
@@ -521,28 +445,6 @@ impl Pull<'_> {
             at => return Err(self.branch_moved(journal, at.as_deref())),
         }
         let convert = Convert::new(self, journal)?;
-        // A smudge filter never runs here: what it has to write must have
-        // been converted ahead (see `Pull::prefilter`), before anything
-        // changes.
-        let missing: Vec<&Change> = journal
-            .changes
-            .iter()
-            .enumerate()
-            .filter(|(i, change)| !journal.operations.contains_key(i) && convert.unconverted(change))
-            .map(|(_, change)| change)
-            .collect();
-        if !missing.is_empty() {
-            let paths: Vec<PathBuf> = missing.iter().map(|change| change.path.clone()).collect();
-            let items: BTreeSet<ItemRef> = missing.iter().map(|change| self.item(&change.path)).collect();
-            if fresh && journal.operations.is_empty() {
-                journal.remove(self)?;
-            }
-            return Err(Error::FiltersPending {
-                baseline: journal.baseline.clone(),
-                paths,
-                items: items.into_iter().collect(),
-            });
-        }
         let (mut wrote, mut displaced) = (false, None);
         let blocked = |items: BTreeSet<ItemRef>, wrote: bool, journal: &Journal| {
             if fresh && !wrote && journal.operations.is_empty() {
@@ -606,7 +508,6 @@ impl Pull<'_> {
         hook(Before::Done)?;
         journal.remove(self)?;
         tree.clear();
-        self.forget_prefiltered();
         let to = rev(self.git(), "HEAD")?.ok_or_else(|| Error::Invalid("HEAD is missing".into()))?;
         Ok(Finished::Updated { from: journal.old.clone(), to, displaced })
     }
@@ -746,6 +647,25 @@ impl Pull<'_> {
             error.push_str(&format!("; another Git command moved {branch} to {actual}"));
         }
         Err(Error::Git { args: args.join(" "), stderr: error })
+    }
+
+    /// The skills repo supports no filter driver (see
+    /// [`crate::git::driver_paths`]): a pull onto `target` that writes a
+    /// file through one stops here, before anything changes. Its attributes
+    /// are read where the pull reads them (see [`Convert`]).
+    fn refuse_filter_drivers(&self, target: &str, baseline: &str, changes: &[Change]) -> Result<()> {
+        let files: Vec<&Path> = changes
+            .iter()
+            .filter(|c| c.new.as_ref().is_some_and(|e| matches!(e.mode.as_str(), "100644" | "100755")))
+            .map(|c| c.path.as_path())
+            .collect();
+        let source = changes_attributes(changes).then_some(target);
+        let paths = crate::git::driver_paths(self.git(), source, &files, &self.drivers)?;
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let items: BTreeSet<ItemRef> = paths.iter().map(|path| self.item(path)).collect();
+        Err(Error::FilterDriver { baseline: baseline.to_string(), paths, items: items.into_iter().collect() })
     }
 
     /// Checks that git can read `.gitattributes` from `tree` if the journal
@@ -1141,35 +1061,16 @@ struct Convert<'a> {
     /// `core.symlinks`: whether a symlink is checked out as one, or as a
     /// file that holds its target.
     symlinks: bool,
-    /// Which target files go through a filter driver, and the key of what
-    /// [`Pull::prefilter`] converted for each.
-    filters: Filters,
 }
 
 impl<'a> Convert<'a> {
     fn new(pull: &'a Pull<'a>, journal: &Journal) -> Result<Self> {
         let attributes = journal.changes_attributes().then(|| (journal.old.clone(), journal.target.clone()));
-        let source = attributes.as_ref().map(|(_, target)| target.as_str());
-        let filters = Filters::new(pull, source, &journal.changes)?;
-        Ok(Self { filters, ..Self::with_attributes(pull, attributes)? })
+        Self::with_attributes(pull, attributes)
     }
 
-    /// Without [`Convert::content`]: no target is written.
     fn with_attributes(pull: &'a Pull<'a>, attributes: Option<(String, String)>) -> Result<Self> {
-        Ok(Self {
-            pull,
-            attributes,
-            file_mode: pull.flag("core.fileMode")?,
-            symlinks: pull.flag("core.symlinks")?,
-            filters: Filters::default(),
-        })
-    }
-
-    /// Whether `change` writes a file through a filter driver whose
-    /// conversion [`Pull::prefilter`] has not written (for these
-    /// attributes and this driver configuration).
-    fn unconverted(&self, change: &Change) -> bool {
-        change.new.is_some() && self.filters.key(&change.path).is_some_and(|key| !self.pull.prefiltered(key).is_file())
+        Ok(Self { pull, attributes, file_mode: pull.flag("core.fileMode")?, symlinks: pull.flag("core.symlinks")? })
     }
 
     fn git(&self, side: Side) -> Git {
@@ -1182,7 +1083,7 @@ impl<'a> Convert<'a> {
     }
 
     /// Whether `node` is what checking out `entry` at `path` gives, as git
-    /// itself decides (filters and line endings included). With no entry,
+    /// itself decides (line endings included, filter drivers off). With no entry,
     /// that is nothing, or a directory.
     fn holds(&self, node: &Node, entry: Option<&Entry>, path: &Path) -> Result<bool> {
         let Some(entry) = entry else { return Ok(matches!(node, Node::Missing | Node::Directory)) };
@@ -1212,128 +1113,9 @@ impl<'a> Convert<'a> {
             });
         }
         let executable = entry.mode == "100755";
-        // Through a filter driver: only ever what was converted before the
-        // engine lock was taken, for these attributes and this driver.
-        if let Some(key) = self.filters.key(path) {
-            let file = self.pull.prefiltered(key);
-            return match fs::read(&file) {
-                Ok(bytes) => Ok(Content::File { bytes, executable }),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::FiltersPending {
-                    baseline: String::new(),
-                    paths: vec![path.to_path_buf()],
-                    items: vec![self.pull.item(path)],
-                }),
-                Err(e) => Err(e).at(file),
-            };
-        }
         let filters = self.git(Side::Target).args(["cat-file", "--filters"]).arg(path_option(path)).arg(&entry.oid);
         Ok(Content::File { bytes: filters.run()?, executable })
     }
-}
-
-/// Where [`Pull::prefilter`] keeps its conversions, in the git directory.
-const PREFILTERED: &str = "sk1ll-pull-filtered";
-
-/// The paths of a pull that git writes through a filter driver, each with
-/// the key of its conversion in [`PREFILTERED`]: the blob, the path, the
-/// conversion attributes it resolves to (where the pull reads them), and
-/// the configuration of `core.autocrlf`, `core.eol` and its driver
-/// (`filter.<driver>.smudge`, `.clean`, `.process`, `.required`). The same
-/// key means the same conversion, so a conversion is used without checking
-/// it again; anything that could change it changes the key.
-#[derive(Default)]
-struct Filters(BTreeMap<PathBuf, String>);
-
-/// The attributes that decide how git converts a blob it checks out.
-const CONVERSION_ATTRIBUTES: [&str; 6] = ["filter", "text", "eol", "crlf", "ident", "working-tree-encoding"];
-
-impl Filters {
-    /// For the files `changes` write, with `.gitattributes` from `source`
-    /// (`None`: the working tree).
-    fn new(pull: &Pull, source: Option<&str>, changes: &[Change]) -> Result<Self> {
-        let files: Vec<(&Path, &Entry)> = changes
-            .iter()
-            .filter_map(|c| {
-                c.new.as_ref().filter(|e| matches!(e.mode.as_str(), "100644" | "100755")).map(|e| (c.path.as_path(), e))
-            })
-            .collect();
-        if files.is_empty() {
-            return Ok(Self::default());
-        }
-        let mut paths = Vec::new();
-        for (path, _) in &files {
-            paths.extend_from_slice(&crate::git::path_bytes(path));
-            paths.push(0);
-        }
-        let mut git = pull.git().arg("check-attr");
-        if let Some(source) = source {
-            git = git.arg(format!("--source={source}"));
-        }
-        let out = git.args(["-z", "--stdin"]).args(CONVERSION_ATTRIBUTES).stdin(paths).run()?;
-        // `<path>\0<attribute>\0<value>\0`, per path and attribute.
-        let mut attributes = BTreeMap::<PathBuf, Vec<(String, String)>>::new();
-        let fields: Vec<&[u8]> = out.split(|b| *b == 0).collect();
-        for f in fields.chunks(3).filter(|f| f.len() == 3) {
-            let (name, value) =
-                (String::from_utf8_lossy(f[1]).into_owned(), String::from_utf8_lossy(f[2]).into_owned());
-            attributes.entry(path_from_bytes(f[0])).or_default().push((name, value));
-        }
-        let driver = |attrs: &[(String, String)]| {
-            attrs
-                .iter()
-                .find(|(name, _)| name == "filter")
-                .map(|(_, value)| value.clone())
-                .filter(|value| !matches!(value.as_str(), "unspecified" | "unset" | "set"))
-        };
-        if !attributes.values().any(|attrs| driver(attrs).is_some()) {
-            return Ok(Self::default());
-        }
-        let config = conversion_config(pull)?;
-        let settings = |key: &str| config.get(key).map(Vec::as_slice).unwrap_or_default().join("\n");
-        let mut keys = BTreeMap::new();
-        for (path, entry) in files {
-            let Some(attrs) = attributes.get(path) else { continue };
-            let Some(driver) = driver(attrs) else { continue };
-            let mut material = format!("{}\0{}", entry.oid, String::from_utf8_lossy(&crate::git::path_bytes(path)));
-            for (name, value) in attrs {
-                material.push_str(&format!("\0{name}={value}"));
-            }
-            for key in ["core.autocrlf", "core.eol"] {
-                material.push_str(&format!("\0{key}={}", settings(key)));
-            }
-            for key in ["smudge", "clean", "process", "required"] {
-                material.push_str(&format!("\0{key}={}", settings(&format!("filter.{driver}.{key}"))));
-            }
-            keys.insert(path.to_path_buf(), crate::hash::hash_str(&material));
-        }
-        Ok(Self(keys))
-    }
-
-    /// The key of `path`'s conversion; `None` if no filter driver writes it.
-    fn key(&self, path: &Path) -> Option<&str> {
-        self.0.get(path).map(String::as_str)
-    }
-}
-
-/// The effective configuration of `core.autocrlf`, `core.eol` and every
-/// filter driver, by key (section and name in lower case, as git spells
-/// them; a driver's name as given), all values of each.
-fn conversion_config(pull: &Pull) -> Result<BTreeMap<String, Vec<String>>> {
-    let pattern = r"^(core\.(autocrlf|eol)|filter\..*\.(smudge|clean|process|required))$";
-    let out = pull.git().args(["config", "-z", "--get-regexp", pattern]).output()?;
-    match out.status.code() {
-        Some(0) => {}
-        Some(1) => return Ok(BTreeMap::new()),
-        _ => return Err(git_error("config --get-regexp", &out.stderr)),
-    }
-    let mut config = BTreeMap::<String, Vec<String>>::new();
-    // `<key>\n<value>\0`, or `<key>\0` without a value.
-    for entry in out.stdout.split(|b| *b == 0).filter(|e| !e.is_empty()) {
-        let entry = String::from_utf8_lossy(entry);
-        let (key, value) = entry.split_once('\n').unwrap_or((&entry, ""));
-        config.entry(key.to_string()).or_default().push(value.to_string());
-    }
-    Ok(config)
 }
 
 /// Whether `changes` change any `.gitattributes` file, removals included.

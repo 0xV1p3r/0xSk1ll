@@ -93,6 +93,22 @@ fn run_env(dir: &Path, args: &[&str], env: Env) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// [`run_env`] with every filter driver git's configuration has in `dir`
+/// turned off: the skills repo supports none (see [`crate::git::driver_paths`]),
+/// so its clone and first Baseline run none either.
+fn run_without_filter_drivers(dir: &Path, args: &[&str], env: Env) -> anyhow::Result<String> {
+    let drivers = crate::git::configured_drivers(command(dir, &[], env)).map_err(redacted)?;
+    let mut git = Git::new(dir).env("GIT_TERMINAL_PROMPT", "0").without_filter_drivers(&drivers).args(args);
+    for (k, v) in env {
+        git = git.env(k, v);
+    }
+    let out = git.output().map_err(redacted)?;
+    if !out.status.success() {
+        return Err(failed(args, &out));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 /// Runs git; `None` on a non-zero exit.
 fn try_run(dir: &Path, args: &[&str]) -> anyhow::Result<Option<String>> {
     let out = output(dir, args, &[])?;
@@ -286,7 +302,7 @@ pub fn adopt_first_baseline(dir: &Path) -> anyhow::Result<FirstBaseline> {
     }
     // Git only writes metadata, after every working-tree publication succeeds.
     run(dir, &["symbolic-ref", "HEAD", &format!("refs/heads/{FLEET_BRANCH}")])?;
-    run(dir, &["reset", "--quiet", "--mixed", &remote])?;
+    run_without_filter_drivers(dir, &["reset", "--quiet", "--mixed", &remote], &[])?;
     Ok(FirstBaseline::Adopted(remote))
 }
 
@@ -433,7 +449,8 @@ pub fn ensure_clone(dir: &Path, remote: &str, env: &[(String, String)]) -> anyho
             .tempdir_in(&parent)
             .with_context(|| format!("creating a directory in {}", parent.display()))?;
         let target = stage.path().join("repo");
-        run_env(stage.path(), &["clone", "--quiet", "--origin", REMOTE, &remote, &target.to_string_lossy()], env)?;
+        let clone = ["clone", "--quiet", "--origin", REMOTE, &remote, &target.to_string_lossy()];
+        run_without_filter_drivers(stage.path(), &clone, env)?;
         std::fs::rename(&target, dir).with_context(|| format!("moving the clone to {}", dir.display()))?;
         Setup::Cloned
     };

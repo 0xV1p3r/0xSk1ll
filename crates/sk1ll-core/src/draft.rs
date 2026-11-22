@@ -180,11 +180,6 @@ pub enum PullOutcome {
     },
 }
 
-/// How often [`Repo::pull`] prefilters again for a pull that stopped with
-/// [`Error::FiltersPending`]; a caller that drops its engine lock to
-/// prefilter should stop after as many.
-pub const PREFILTER_TRIES: usize = 3;
-
 /// `"<id> <sk1ll@<id>>"`: the commit identity for a machine without a git identity.
 pub fn machine_author(machine_id: &str) -> String {
     let slug: String =
@@ -540,33 +535,13 @@ impl Repo {
     /// it has no branches at all (an empty server, which only older servers start
     /// as): then there is nothing to pull yet, and the first push creates it.
     ///
-    /// A pull never runs a smudge filter itself (see
-    /// [`prefilter_pull`](Self::prefilter_pull)); this one, which holds the
-    /// lock throughout anyway, prefilters and goes on when it needs to, a
-    /// few times at most.
+    /// A Baseline that writes a file through a git filter driver (Git LFS)
+    /// is an [`Error::FilterDriver`], before anything changes: the skills
+    /// repo supports none. No pull, nor finishing one, runs a filter driver.
     pub fn pull(&self, lock: &crate::EngineLock) -> Result<PullOutcome> {
         lock.check_for(self.root())?;
-        let mut pulled = pull::run(self, true, &mut |_| Ok(()));
-        for _ in 0..PREFILTER_TRIES {
-            if !matches!(pulled, Err(Error::FiltersPending { .. })) {
-                break;
-            }
-            pull::prefilter(self)?;
-            pulled = pull::run(self, false, &mut |_| Ok(()));
-        }
+        let pulled = pull::run(self, true, &mut |_| Ok(()));
         self.check_pulled_ids(pulled)
-    }
-
-    /// Runs the filter drivers (git-lfs's smudge, say, which downloads) for
-    /// what the next pull writes through one: the rest of a pull that
-    /// stopped half-way, else what moving onto the Baseline fetched last
-    /// writes. A pull under the engine lock never runs a smudge filter: it
-    /// uses what this converted, and stops with [`Error::FiltersPending`]
-    /// before changing anything when that is missing or was converted for
-    /// other attributes or another driver configuration. [`fetch`](Self::fetch)
-    /// runs it too. It needs no engine lock.
-    pub fn prefilter_pull(&self) -> Result<()> {
-        pull::prefilter(self)
     }
 
     /// Fetches [`REMOTE`]'s branches, the network half of a [`pull`](Self::pull).
@@ -2614,137 +2589,111 @@ mod tests {
         assert_eq!(git(&f.b, &["status", "--porcelain"]), "");
     }
 
-    /// `*.md` goes through the driver `up`, whose smudge upper-cases `v2` and
-    /// notes in the returned log file each time it runs.
+    /// Configures the filter driver `name` in `b`, whose smudge upper-cases
+    /// `v2` and whose clean lower-cases it again, each noting in the
+    /// returned log file that it ran.
     #[cfg(unix)]
-    fn smudge_logged(b: &Path, attributes: &Path) -> PathBuf {
-        let log = b.join(".git/smudged");
-        write(attributes, "*.md filter=up\n");
-        git(b, &["config", "filter.up.clean", "sed s/V2/v2/"]);
-        git(b, &["config", "filter.up.smudge", &format!("echo >>{}; sed s/v2/V2/", log.display())]);
+    fn logged_driver(b: &Path, name: &str) -> PathBuf {
+        let log = b.join(".git/driver-ran");
+        git(b, &["config", &format!("filter.{name}.clean"), &format!("echo >>{}; sed s/V2/v2/", log.display())]);
+        git(b, &["config", &format!("filter.{name}.smudge"), &format!("echo >>{}; sed s/v2/V2/", log.display())]);
+        git(b, &["config", &format!("filter.{name}.required"), "true"]);
         log
     }
 
-    /// How often the smudge filter ran since the last call, and forgets it.
-    #[cfg(unix)]
-    fn smudged(log: &Path) -> usize {
-        let runs = fs::read_to_string(log).map_or(0, |text| text.lines().count());
-        let _ = fs::remove_file(log);
-        runs
-    }
-
-    /// A filter driver (git-lfs's smudge downloads) runs when the Baseline is
-    /// fetched, without the engine lock; the pull, under it, writes what it
-    /// converted then and never runs the smudge filter itself.
+    /// A Baseline that writes a file through a filter driver (Git LFS, say:
+    /// the server has no LFS endpoint) is refused before the pull changes
+    /// anything, wherever the attribute comes from, and no driver runs.
     #[cfg(unix)]
     #[test]
-    fn filter_drivers_run_at_fetch_not_under_the_engine_lock() {
+    fn a_pull_through_a_filter_driver_is_refused_and_runs_no_driver() {
+        let refused = |pulled: Result<PullOutcome>, want: &[&str]| match pulled {
+            Err(Error::FilterDriver { paths, items, .. }) => {
+                assert_eq!(paths, want.iter().map(PathBuf::from).collect::<Vec<_>>());
+                assert!(items.contains(&item("skill:pdf")), "{items:?}");
+            }
+            other => panic!("not refused: {other:?}"),
+        };
+        // From the Baseline's own `.gitattributes`.
         let f = Fleet::new();
         let (a, b) = (repo(&f.a), repo(&f.b));
-        let log = smudge_logged(&f.b, &f.b.join(".git/info/attributes"));
+        let log = logged_driver(&f.b, "up");
+        write(&f.a.join(".gitattributes"), "*.md filter=up\n");
         write(&f.a.join("personal/pdf/SKILL.md"), "pdf v2\n");
-        write(&f.a.join("instructions/git.md"), "git v2\n");
-        commit_all(&f.a, "two files");
+        commit_all(&f.a, "filtered");
         a.push().unwrap();
-        b.fetch().unwrap();
-        assert_eq!(smudged(&log), 2, "converted at fetch");
-        let dir = f.b.join(".git/sk1ll-pull-filtered");
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
-        let lock = crate::EngineLock::acquire(&f.b).unwrap();
-        assert!(matches!(b.pull_fetched(&lock).unwrap(), PullOutcome::Updated { .. }));
-        assert_eq!(smudged(&log), 0, "not under the lock");
-        assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "pdf V2\n");
-        assert_eq!(read(&f.b.join("instructions/git.md")), "git V2\n");
-        assert!(!dir.exists(), "forgotten once the pull is done");
-    }
+        let before = git(&f.b, &["rev-parse", "HEAD"]);
+        let pulled = pull_now(&b);
+        let message = pulled.as_ref().map(|_| String::new()).unwrap_or_else(|e| e.to_string());
+        assert!(message.contains("remove `filter=` from .gitattributes"), "{message}");
+        refused(pulled, &["personal/pdf/SKILL.md"]);
+        assert!(!log.exists(), "a filter driver ran");
+        assert!(!b.pull_pending().unwrap(), "not started");
+        assert_eq!(git(&f.b, &["rev-parse", "HEAD"]), before);
+        assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "---\nname: pdf\n---\nPDFs.\n");
+        assert!(!f.b.join(".gitattributes").exists());
 
-    /// A conversion is never checked by cleaning it again (an LFS pointer
-    /// cleans to itself, and a clean filter can map two renderings to one
-    /// blob): it is used only for the same blob, path, attributes and driver
-    /// configuration. Anything else stops the pull before it changes a
-    /// file, without running the smudge filter, until it is prefiltered.
-    #[cfg(unix)]
-    #[test]
-    fn a_conversion_for_another_driver_configuration_is_not_used() {
+        // From the Machine's own attributes, for a driver it doesn't even
+        // have: the Baseline is the same everywhere, the drivers are not.
         let f = Fleet::new();
         let (a, b) = (repo(&f.a), repo(&f.b));
-        let log = smudge_logged(&f.b, &f.b.join(".git/info/attributes"));
+        write(&f.b.join(".git/info/attributes"), "*.md filter=lfs\n");
         write(&f.a.join("personal/pdf/SKILL.md"), "pdf v2\n");
         commit_all(&f.a, "v2");
         a.push().unwrap();
-        b.fetch().unwrap();
-        assert_eq!(smudged(&log), 1);
-        // "pdf V2" still cleans to the blob, but the smudge filter is another.
-        git(&f.b, &["config", "filter.up.smudge", &format!("echo >>{}; sed s/^/NEW/", log.display())]);
-        let lock = crate::EngineLock::acquire(&f.b).unwrap();
-        let pending = b.pull_fetched(&lock).unwrap_err();
-        assert!(
-            matches!(&pending, Error::FiltersPending { paths, items, .. }
-                if *paths == [PathBuf::from("personal/pdf/SKILL.md")] && *items == [item("skill:pdf")]),
-            "{pending}"
-        );
-        assert_eq!(smudged(&log), 0, "not under the lock");
-        assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "---\nname: pdf\n---\nPDFs.\n");
-        assert!(!b.pull_pending().unwrap(), "not started");
-        b.prefilter_pull().unwrap();
-        assert_eq!(smudged(&log), 1);
-        assert!(matches!(b.pull_fetched(&lock).unwrap(), PullOutcome::Updated { .. }));
-        assert_eq!(smudged(&log), 0);
-        assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "NEWpdf v2\n");
+        refused(pull_now(&b), &["personal/pdf/SKILL.md"]);
+        fs::remove_file(f.b.join(".git/info/attributes")).unwrap();
+        assert!(matches!(pull_now(&b).unwrap(), PullOutcome::Updated { .. }));
     }
 
-    /// Prefiltering reads attributes as the pull will: a pull that removes a
-    /// nested `.gitattributes` (which turned the driver off) reads the
-    /// target's, so what it writes through the driver was converted ahead.
+    /// `git check-attr` prints `set` for `filter` set without a value (no
+    /// driver) and for `filter=set`, a driver of that name. One configured
+    /// under that name counts, and never runs.
     #[cfg(unix)]
     #[test]
-    fn prefiltering_reads_the_attributes_the_pull_moves_onto() {
+    fn a_filter_driver_named_set_is_a_driver() {
         let f = Fleet::new();
         let (a, b) = (repo(&f.a), repo(&f.b));
-        write(&f.a.join("personal/pdf/.gitattributes"), "* -filter\n");
-        commit_all(&f.a, "no filter for pdf");
+        let log = logged_driver(&f.b, "set");
+        write(&f.a.join(".gitattributes"), "*.md filter=set\n");
+        write(&f.a.join("personal/pdf/SKILL.md"), "pdf v2\n");
+        commit_all(&f.a, "filtered");
+        a.push().unwrap();
+        assert!(matches!(pull_now(&b), Err(Error::FilterDriver { .. })));
+        assert!(!log.exists(), "a filter driver ran");
+        assert!(!b.pull_pending().unwrap());
+
+        // Set without a value, with no driver called `set`: no driver.
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        write(&f.a.join(".gitattributes"), "*.md filter\n");
+        write(&f.a.join("personal/pdf/SKILL.md"), "pdf v2\n");
+        commit_all(&f.a, "filter set");
         a.push().unwrap();
         assert!(matches!(pull_now(&b).unwrap(), PullOutcome::Updated { .. }));
-        let log = smudge_logged(&f.b, &f.b.join(".git/info/attributes"));
-        fs::remove_file(f.a.join("personal/pdf/.gitattributes")).unwrap();
-        write(&f.a.join("personal/pdf/SKILL.md"), "pdf v2\n");
-        commit_all(&f.a, "filter pdf");
-        a.push().unwrap();
-        b.fetch().unwrap();
-        assert_eq!(smudged(&log), 1, "converted at fetch");
-        let lock = crate::EngineLock::acquire(&f.b).unwrap();
-        assert!(matches!(b.pull_fetched(&lock).unwrap(), PullOutcome::Updated { .. }));
-        assert_eq!(smudged(&log), 0, "not under the lock");
-        assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "pdf V2\n");
+        assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "pdf v2\n");
     }
 
-    /// The rest of a pull that stopped half-way is prefiltered from its
-    /// journal; finishing it never runs the smudge filter, and stops before
-    /// changing anything while a conversion it needs is missing.
+    /// A pull that started before attributes named a driver finishes, with
+    /// every driver off: no driver runs, and the other conversions (line
+    /// endings here) still apply.
     #[cfg(unix)]
     #[test]
-    fn a_stopped_pull_is_prefiltered_from_its_journal() {
+    fn a_resumed_pull_finishes_with_filter_drivers_off() {
         let f = Fleet::new();
         let (a, b) = (repo(&f.a), repo(&f.b));
-        let log = smudge_logged(&f.b, &f.b.join(".git/info/attributes"));
         write(&f.a.join("instructions/git.md"), "git v2\n");
         write(&f.a.join("personal/pdf/SKILL.md"), "pdf v2\n");
         commit_all(&f.a, "two files");
         a.push().unwrap();
         b.pull_crashing_at(Before::File(1)).unwrap_err();
-        assert_eq!(read(&f.b.join("instructions/git.md")), "git V2\n");
-        fs::remove_dir_all(f.b.join(".git/sk1ll-pull-filtered")).unwrap();
-        smudged(&log);
-        assert!(matches!(finish_now(&b), Err(Error::FiltersPending { .. })));
-        assert_eq!(smudged(&log), 0, "not under the lock");
-        assert!(b.pull_pending().unwrap(), "still pending");
-        assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "---\nname: pdf\n---\nPDFs.\n");
-        b.prefilter_pull().unwrap();
-        assert_eq!(smudged(&log), 2, "from the journal");
+        assert!(b.pull_pending().unwrap());
+        let log = logged_driver(&f.b, "up");
+        write(&f.b.join(".git/info/attributes"), "*.md filter=up text eol=crlf\n");
         assert!(matches!(finish_now(&b).unwrap(), Some(PullOutcome::Updated { .. })));
-        assert_eq!(smudged(&log), 0, "not under the lock");
-        assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "pdf V2\n");
-        assert_eq!(git(&f.b, &["status", "--porcelain"]), "");
+        assert!(!log.exists(), "a filter driver ran");
+        assert!(!b.pull_pending().unwrap());
+        assert_eq!(fs::read(f.b.join("personal/pdf/SKILL.md")).unwrap(), b"pdf v2\r\n");
     }
 
     #[cfg(unix)]

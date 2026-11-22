@@ -1982,51 +1982,43 @@ async fn standalone_commits_locally_and_pushes_and_pulls_its_own_origin() {
     assert_eq!(std::fs::read_to_string(m.repo().join("personal/pdf/SKILL.md")).unwrap(), "local draft");
 }
 
-/// A stopped pull whose filter-driver conversions are gone is not finished
-/// under the engine mutex by running the smudge filter there: the refresh
-/// stops before changing anything, runs the drivers without the mutex, and
-/// then finishes it.
+/// A Baseline that writes a file through a filter driver (Git LFS) leaves
+/// the Machine Blocked on it, changes nothing and runs no driver, and the
+/// error says why.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_refresh_prefilters_a_stopped_pull_before_finishing_it() {
-    use std::os::unix::fs::PermissionsExt;
+async fn a_pull_through_a_filter_driver_stays_blocked_and_says_why() {
     let mut m = Machine::new("solo");
     sk1ll_core::Repo::init(&m.repo()).unwrap();
     let bare = m.home.path().join("origin.git");
     git(m.home.path(), &["init", "--quiet", "--bare", "-b", "main", bare.to_str().unwrap()]);
     git(&m.repo(), &["remote", "add", "origin", bare.to_str().unwrap()]);
-    write(&m.repo().join(".git/info"), "attributes", "*.md filter=up\n");
-    git(&m.repo(), &["config", "filter.up.clean", "sed s/V2/v2/"]);
-    git(&m.repo(), &["config", "filter.up.smudge", "sed s/v2/V2/"]);
+    let ran = m.home.path().join("driver-ran");
+    for key in ["clean", "smudge"] {
+        git(&m.repo(), &["config", &format!("filter.lfs.{key}"), &format!("touch {}; cat", ran.display())]);
+    }
     m.write("personal/pdf/SKILL.md", "initial");
     m.start().await;
     m.commit_all().await;
     assert!(m.client.push().await.unwrap().pushed);
     let peer = m.home.path().join("peer");
     git(m.home.path(), &["clone", "--quiet", bare.to_str().unwrap(), peer.to_str().unwrap()]);
-    write(&peer.join("instructions"), "git.md", "rule v2");
+    write(&peer, ".gitattributes", "*.md filter=lfs\n");
     write(&peer.join("personal/pdf"), "SKILL.md", "pdf v2");
-    git(&peer, &["add", "-A"]);
+    git(&peer, &["-c", "filter.lfs.clean=cat", "add", "-A"]);
     git(&peer, &["commit", "--quiet", "-m", "v2"]);
     git(&peer, &["push", "--quiet", "origin", "main"]);
-    let remote = git(&peer, &["rev-parse", "HEAD"]);
+    let before = m.head();
 
-    let pdf = m.repo().join("personal/pdf");
-    let mode = |mode| std::fs::set_permissions(&pdf, std::fs::Permissions::from_mode(mode)).unwrap();
-    mode(0o555);
-    if std::fs::write(pdf.join("probe"), "").is_ok() {
-        return; // root writes into read-only directories
-    }
-    m.client.pull().await.unwrap_err();
-    let journal = m.repo().join(".git/sk1ll-pull.json");
-    assert!(journal.exists());
-    assert_eq!(std::fs::read_to_string(m.repo().join("instructions/git.md")).unwrap(), "rule V2");
-    std::fs::remove_dir_all(m.repo().join(".git/sk1ll-pull-filtered")).unwrap();
-    mode(0o755);
-
-    m.write("notes.txt", "a draft");
-    eventually(|| async { (m.head() == remote && !journal.exists()).then_some(()) }).await;
-    assert_eq!(std::fs::read_to_string(pdf.join("SKILL.md")).unwrap(), "pdf V2");
+    let error = m.client.pull().await.unwrap_err().to_string();
+    assert!(error.contains("filter driver") && error.contains("personal/pdf/SKILL.md"), "{error}");
+    let status = m.status().await;
+    assert_eq!(status.headline, MachineStatus::Blocked);
+    assert!(status.last_error.as_deref().unwrap_or_default().contains("filter="), "{status:?}");
+    assert_eq!(m.head(), before);
+    assert!(!m.repo().join(".git/sk1ll-pull.json").exists());
+    assert_eq!(std::fs::read_to_string(m.repo().join("personal/pdf/SKILL.md")).unwrap(), "initial");
+    assert!(!ran.exists(), "a filter driver ran");
 }
 
 /// A pull that stopped half-way (here: at a directory it can't write to)

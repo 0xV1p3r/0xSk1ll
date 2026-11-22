@@ -26,6 +26,8 @@ use std::time::{Duration, Instant};
 use crate::{Error, Result};
 
 pub mod config_env;
+mod filters;
+pub(crate) use filters::{configured_drivers, driver_paths};
 /// Unix only, like the daemon and the fleet that use it.
 #[cfg(unix)]
 pub mod plumbing;
@@ -91,8 +93,11 @@ impl Git {
     /// `git -C <dir>` for pull, which checks and undoes its own steps: no
     /// hooks (`no_hooks` is an empty directory), no autostash, no submodule
     /// recursion, submodule changes never hidden, and no fsmonitor daemon
-    /// standing in for the file system.
-    pub(crate) fn for_pull(dir: &Path, no_hooks: &Path) -> Self {
+    /// standing in for the file system, and no filter driver.
+    ///
+    /// `drivers`: the filter drivers git's configuration has, which are
+    /// turned off (see [`Git::without_filter_drivers`]).
+    pub(crate) fn for_pull(dir: &Path, no_hooks: &Path, drivers: &std::collections::BTreeSet<String>) -> Self {
         let mut hooks = OsString::from("core.hooksPath=");
         hooks.push(no_hooks);
         let config = [
@@ -104,7 +109,7 @@ impl Git {
             "core.ignoreStat=false",
             "core.quotePath=true",
         ];
-        Self::new(dir).args(config.iter().flat_map(|c| ["-c", c])).arg("-c").arg(hooks)
+        Self::new(dir).args(config.iter().flat_map(|c| ["-c", c])).arg("-c").arg(hooks).without_filter_drivers(drivers)
     }
 
     /// Takes pathspecs literally, so file names are never globs. Only for

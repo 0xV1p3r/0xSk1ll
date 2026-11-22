@@ -54,16 +54,16 @@ the result against the state as it is now:
   pull, recovery, missing Item IDs and the sync keep their order there). A
   push sends the exact commit it checked, so a pull that rebased it meanwhile
   makes the server refuse it as not fast-forward. A clone moves into place
-  only once complete. Filter drivers (git-lfs's smudge) never run under the
-  mutex. They run unlocked right after the fetch for every file the next pull
-  writes through one: the rest of a stopped pull from its journal, else the
-  move onto the fetched Baseline, with unpushed commits replayed and
-  `.gitattributes` read where the pull reads them. Each conversion is keyed
-  by blob, path, resolved attributes and the driver's configuration, and used
-  without being checked again. A pull that misses one stops before changing
-  anything. The daemon then runs the drivers unlocked and tries again, three
-  times at most, then stays Blocked (or pending) and says why. The background
-  reconcile does the same for a stopped pull it finishes.
+  only once complete. No filter driver (git-lfs's smudge, which downloads)
+  runs, under the mutex or not: the skills repo supports none, since the
+  server is plain git over HTTP without an LFS endpoint. A pull onto a
+  Baseline that writes a file through one (its `filter` attribute, read where
+  the pull reads `.gitattributes`, names a driver) stops before changing
+  anything and stays Blocked, saying why; the server refuses to take such a
+  push. Every git command of a pull, the clone and the first Baseline runs
+  with each configured driver turned off, so finishing a pull that started
+  before an attribute named one runs none either. Other conversions (line
+  endings, `ident`, encodings) still apply.
 
 ## One lifecycle
 
