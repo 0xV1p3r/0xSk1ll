@@ -92,7 +92,9 @@ sk1ll diff pdf             # merge by hand if needed, then commit
 
 The daemon and mutating commands write a new Item ID for hand-made Skills, Rules,
 and Import entries that lack one. These writes are part of the Draft and get
-committed with the item. Read-only commands show unassigned IDs until then.
+committed with the item. Until then an item has no toggle and follows the
+defaults; `sk1ll list --json` shows its `id` as null, and `sk1ll list` says so only
+while a pending Pull holds the IDs up.
 If copying an item duplicates its ID, run `sk1ll repair-ids` and commit the
 repaired items.
 
