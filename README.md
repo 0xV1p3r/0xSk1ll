@@ -139,7 +139,7 @@ If Pull stops partway through, the next `sk1ll pull` or Daemon reconcile resumes
 | `harnesses rename <old> <new> [--replace]` | Rename a Harness and move its Assignment |
 | `fleet orphans` | List orphan Assignment toggles |
 | `fleet prune-orphans [--machine <id>]` | Clear orphan toggles within your scope |
-| `fleet copy-assignment <source> <target>` | Preview and copy a joined Machine's Assignment. Use `--merge`, repeat `--map from=to`, or pass `--yes` in scripts |
+| `fleet copy-assignment <source> <target>` | List each change (harness, item or default, before -> after), confirm, and copy a joined Machine's Assignment; a target that already matches is left alone. Use `--merge`, repeat `--map from=to`, or pass `--yes` in scripts |
 | `fleet log`, `fleet undo <entry-id>` | Filter the Assignment log by Machine, Harness, author or item, or undo one entry |
 | `completions <shell>` | Generate shell completions |
 

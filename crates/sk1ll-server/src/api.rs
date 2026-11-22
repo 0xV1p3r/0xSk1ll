@@ -20,9 +20,9 @@ use axum::{Json, Router};
 use rusqlite::Connection;
 use sk1ll_proto::{
     Assignment, AssignmentChanges, AssignmentCopyPreview, AssignmentSnapshot, AssignmentUpdate, AssignmentWrite,
-    Expected, FleetView, HarnessAssignment, HarnessRename, ImportsView, ItemId, JoinCode, JoinCodeRequest, JoinRequest,
-    JoinResponse, LogCause, LogEntry, LogFacets, LogQuery, MachineAssignmentCopy, MachineRow, Orphan, OrphansPruned,
-    OrphansView, PruneOrphans, REPO_PATH, SetHarnessAssignment, headline,
+    CopyChange, Expected, FleetView, HarnessAssignment, HarnessRename, ImportsView, ItemId, JoinCode, JoinCodeRequest,
+    JoinRequest, JoinResponse, LogCause, LogEntry, LogFacets, LogQuery, MachineAssignmentCopy, MachineRow, Orphan,
+    OrphansPruned, OrphansView, PruneOrphans, REPO_PATH, SetHarnessAssignment, headline,
 };
 
 use crate::assign::{self, Change};
@@ -304,25 +304,51 @@ async fn rename_harness(
     Ok(Json(write_assignment(&server, caller, machine, AssignmentWrite::RenameHarness(body), None).await?))
 }
 
+/// The changes copying `body.source`'s Assignment to `target` makes, and
+/// their preview: each with its value before and after, and the item's name
+/// from `baseline`, the two Machines' reports or the log.
 fn plan_copy(
     tx: &Connection,
     caller: &Caller,
     target: &str,
     body: &MachineAssignmentCopy,
+    baseline: &assign::Items,
 ) -> Result<(Vec<Change>, AssignmentCopyPreview)> {
     authorize_assignment(tx, caller, target)?;
-    let load = |id: &str, expected: Option<&Expected>| -> Result<_> {
+    let mut reported = Vec::new();
+    let mut load = |id: &str, expected: Option<&Expected>| -> Result<_> {
         let m = db::machine(tx, id)?.ok_or_else(|| ApiError::NotFound(format!("no machine `{id}`")))?;
         if let Some(expected) = expected {
             assign::check_expected(tx, &m, expected)?;
         }
         let snap = db::snapshot(tx, id)?.expect("registered machine has assignment");
+        reported.extend(m.report.into_iter().flat_map(|r| r.items).map(|r| (r.item, r.id)));
         Ok((m.assignment, Expected { revision: snap.revision, registration: Some(m.registration) }))
     };
     let (destination, target_state) = load(target, body.expected.as_ref())?;
     let (source, source_state) = load(&body.source, body.source_expected.as_ref())?;
     let changes = assign::machine_copy_changes(&source, &destination, body)?;
-    let preview = AssignmentCopyPreview { count: changes.len(), target: target_state, source: source_state };
+    let name = |id: &ItemId| -> Result<Option<String>> {
+        match baseline.iter().chain(&reported).find(|(_, known)| known == id) {
+            Some((item, _)) => Ok(Some(item.name().to_string())),
+            None => db::last_name(tx, id),
+        }
+    };
+    let described = changes
+        .iter()
+        .map(|c| {
+            Ok(CopyChange {
+                harness: c.harness.clone(),
+                kind: c.kind,
+                item_id: c.item_id.clone(),
+                name: c.item_id.as_ref().map(name).transpose()?.flatten(),
+                before: assign::get(&destination, &c.harness, c.kind, c.item_id.as_ref()),
+                after: c.after,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let preview =
+        AssignmentCopyPreview { count: changes.len(), changes: described, target: target_state, source: source_state };
     Ok((changes, preview))
 }
 
@@ -333,10 +359,11 @@ async fn preview_copy_from(
     Json(body): Json<MachineAssignmentCopy>,
 ) -> Result<Json<AssignmentCopyPreview>> {
     caller.require_machine(&id)?;
+    let baseline = server.baseline_items();
     server
         .db(move |conn| {
             let tx = conn.transaction()?;
-            let (_, preview) = plan_copy(&tx, &caller, &id, &body)?;
+            let (_, preview) = plan_copy(&tx, &caller, &id, &body, &baseline)?;
             Ok(Json(preview))
         })
         .await
@@ -353,7 +380,7 @@ async fn copy_from(
     let applied = server
         .db(move |conn| {
             let tx = conn.transaction()?;
-            let (changes, preview) = plan_copy(&tx, &caller, &machine, &body)?;
+            let (changes, preview) = plan_copy(&tx, &caller, &machine, &body, &baseline)?;
             let registration = preview.target.registration.expect("registered Machine");
             let applied = assign::apply(&tx, &machine, caller.author(), changes, now(), &baseline, false)?;
             for entry in &applied.entries {

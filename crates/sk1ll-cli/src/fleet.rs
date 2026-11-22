@@ -167,9 +167,28 @@ fn fleet(cli: &Cli, command: Option<&FleetCmd>) -> Result<()> {
                 source_expected: None,
             };
             let preview = s.block(client.preview_assignment_copy(target, &copy))?;
-            println!("{} Assignment changes on {target} (item toggles and defaults)", preview.count);
             if preview.count == 0 {
+                println!("{target} already matches {source}'s Assignment; nothing to copy");
                 return Ok(());
+            }
+            let count = crate::plural(preview.count, "Assignment change", "Assignment changes");
+            println!("{count} on {target}:");
+            for change in &preview.changes {
+                let item = match (change.kind, &change.name, &change.item_id) {
+                    (ToggleKind::NewSkillsDefault, ..) => "skills default".to_string(),
+                    (ToggleKind::NewRulesDefault, ..) => "rules default".to_string(),
+                    (kind, name, id) => {
+                        let kind = if kind == ToggleKind::Skill { "skill" } else { "rule" };
+                        let name = name.clone().or_else(|| id.as_ref().map(|id| format!("[{id}]")));
+                        format!("{kind} {}", name.unwrap_or_default())
+                    }
+                };
+                let state = |value| match value {
+                    Some(true) => "on",
+                    Some(false) => "off",
+                    None => "default",
+                };
+                println!("  {:<10} {item:<32} {} -> {}", change.harness, state(change.before), state(change.after));
             }
             if !yes {
                 if !std::io::stdin().is_terminal() {
