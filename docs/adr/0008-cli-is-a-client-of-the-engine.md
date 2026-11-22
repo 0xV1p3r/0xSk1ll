@@ -77,8 +77,9 @@ with one code path over them (ADR 0001, 0002, 0004).
   hand edit (at startup, or before a toggle or a reconcile) records only
   its revision, by the same compare-and-swap against the exact bytes it
   read, so a second edit landing in between is read again, not replaced.
-- A joined Machine's commands work on the repo it joined; another selected
-  repo is refused.
+- A joined Machine's commands that change something work on the repo it
+  joined; another selected repo is refused. A preview of another repo
+  reads it as a standalone one.
 - `sk1ll init` creates a repo itself unless a daemon waits for one there: it
   makes what an engine then manages. `join` and `setup` keep their own steps.
 - Fleet commands work without a daemon, through an engine for the joined repo.

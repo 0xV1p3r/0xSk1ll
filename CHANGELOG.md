@@ -174,7 +174,11 @@ break compatibility.
   without a daemon they no longer write missing Item IDs or sync the
   harnesses, they answer beside another engine (a daemon for another repo
   included), and their Draft, conflicts and recovery entries are planned in
-  memory.
+  memory. On a joined Machine they read another selected repo as a
+  standalone one.
+- `sk1ll commit` of an item the pull is Blocked on no longer says the daemon
+  pushes it when it can: the pull before the push turns such a commit back
+  into Draft, and the command fails saying so and how to go on.
 - A Blocked Machine that committed the clashing item could only get out
   with `git reset`: pull refused it with a hint to commit or restore, and
   restore found nothing in the Draft. Pull now turns an unpushed commit

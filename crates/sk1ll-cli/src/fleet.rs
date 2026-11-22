@@ -376,10 +376,27 @@ impl Session {
     /// one that changes something is refused.
     pub(crate) fn open(cli: &Cli, repo: &Path, access: Access) -> Result<Self> {
         let (rt, daemon) = Self::daemon(cli)?;
+        // A repo asked for by name has to be there (only `init` makes one),
+        // unless the daemon serves it.
+        let missing = || {
+            if cli.repo.is_some()
+                && !repo.is_dir()
+                && !matches!(cli.cmd, Cmd::Fleet { .. } | Cmd::Setup | Cmd::Join { .. })
+            {
+                bail!(
+                    "no such directory: {} (from --repo or SK1LL_REPO); create a skills repo there with `sk1ll init \
+                     {}`",
+                    repo.display(),
+                    repo.display()
+                );
+            }
+            Ok(())
+        };
         if let Some((client, status)) = daemon {
             if same_path(&status.repo, repo) {
                 return Ok(Self { engine: None, client, status, rt });
             }
+            missing()?;
             if access == Access::Write {
                 bail!(
                     "the sk1ll daemon manages {} on this Machine, so it alone changes its harnesses and \
@@ -395,15 +412,7 @@ impl Session {
                 repo.display()
             );
         }
-        // A repo asked for by name has to be there (only `init` makes one).
-        if cli.repo.is_some() && !repo.is_dir() && !matches!(cli.cmd, Cmd::Fleet { .. } | Cmd::Setup | Cmd::Join { .. })
-        {
-            bail!(
-                "no such directory: {} (from --repo or SK1LL_REPO); create a skills repo there with `sk1ll init {}`",
-                repo.display(),
-                repo.display()
-            );
-        }
+        missing()?;
         let cfg = Config { repo: Some(repo.to_path_buf()), ..daemon_config(cli)? };
         let state_path = cfg.state.clone();
         let engine = {
@@ -414,7 +423,10 @@ impl Session {
                 Access::Read => sk1ll_daemon::local::Engine::read_only(cfg)?,
             }
         };
-        if let Some(state) = DaemonState::load(&state_path)?.filter(|s| !s.revoked) {
+        // Reading another repo than the joined one is reading a standalone one.
+        if access == Access::Write
+            && let Some(state) = DaemonState::load(&state_path)?.filter(|s| !s.revoked)
+        {
             check_joined_repo(repo, &state)?;
         }
         let client = engine.client().clone();

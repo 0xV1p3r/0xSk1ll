@@ -687,6 +687,11 @@ fn command(s: &Session, cmd: Cmd) -> Result<()> {
             };
             match (resp.pushed, resp.push_error) {
                 (true, _) => println!("pushed to the server"),
+                (false, Some(_)) if resp.uncommitted => bail!(
+                    "the server's baseline conflicts with this commit, so the pull before the push turned it back into \
+                     Draft changes (nothing is lost): {}",
+                    sk1ll_daemon::client::blocked_hint(&resp.items)
+                ),
                 (false, Some(e)) if resp.push_refused => bail!("not pushed: {e}"),
                 (false, Some(e)) if push => bail!("not pushed yet ({e}); {later}"),
                 (false, Some(e)) => println!("not pushed yet ({e}); {later}"),

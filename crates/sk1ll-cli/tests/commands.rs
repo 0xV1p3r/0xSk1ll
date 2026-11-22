@@ -880,3 +880,18 @@ fn a_commit_without_an_origin_says_nothing_of_pushing() {
     let out = repo.run(&["commit", "pdf"]).unwrap();
     assert!(out.starts_with("committed skill:pdf") && !out.contains("push") && !out.contains("fleet"), "{out}");
 }
+
+/// A joined Machine reads another repo as a standalone one (`draft`), and
+/// still refuses to change it.
+#[test]
+fn a_joined_machine_reads_another_repo_but_changes_only_its_own() {
+    let repo = TestRepo::new().with_skill();
+    repo.joined("http://127.0.0.1:1");
+    let other = repo.other_repo();
+    fs::write(other.join("personal/web/SKILL.md"), "Edited.").unwrap();
+    let socket = repo.root.join("no-daemon.sock");
+    let draft = outcome(repo.command_for(&other, &socket, &["draft"]).output().unwrap()).unwrap();
+    assert!(draft.contains("M skill:web"), "{draft}");
+    let error = outcome(repo.command_for(&other, &socket, &["sync"]).output().unwrap()).unwrap_err();
+    assert!(error.contains("differs from the joined repo"), "{error}");
+}

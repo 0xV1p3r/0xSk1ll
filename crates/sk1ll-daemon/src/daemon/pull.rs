@@ -268,6 +268,8 @@ impl Daemon {
                     Err(e) => {
                         response.push_refused =
                             self.lifecycle().push_refused().is_some_and(|r| r.commit == response.sha);
+                        let root = self.repo_root();
+                        response.uncommitted = !plumbing::is_ancestor(root, &response.sha, "HEAD").unwrap_or(true);
                         response.push_error = Some(crate::auth::redact(&e.to_string()));
                     }
                 }
@@ -307,7 +309,15 @@ impl Daemon {
         };
         let sha = repo.commit(&items, &message, author.as_deref())?;
         tracing::info!("committed {} as {sha}", items.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "));
-        Ok(CommitResponse { sha, items, message, pushed: false, push_error: None, push_refused: false })
+        Ok(CommitResponse {
+            sha,
+            items,
+            message,
+            pushed: false,
+            push_error: None,
+            push_refused: false,
+            uncommitted: false,
+        })
     }
 
     /// The server's baseline is now `baseline`: pull unless already on it. A

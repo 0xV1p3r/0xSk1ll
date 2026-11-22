@@ -54,7 +54,15 @@ impl Engine {
         sk1ll_core::git::require_git(sk1ll_core::git::MIN_VERSION)?;
         // Before anything of the Machine is read.
         let access = if writer { Access::OnDemand(MachineLock::acquire(&cfg)?) } else { Access::ReadOnly };
-        let state = DaemonState::load(&cfg.state)?;
+        let mut state = DaemonState::load(&cfg.state)?;
+        // A read of another repo than the joined one reads it as a
+        // standalone repo: it is not the Fleet's.
+        let same = |a: &std::path::Path, b: &std::path::Path| {
+            a.canonicalize().unwrap_or_else(|_| a.to_path_buf()) == b.canonicalize().unwrap_or_else(|_| b.to_path_buf())
+        };
+        if !writer && state.as_ref().is_some_and(|s| cfg.repo.as_deref().is_some_and(|repo| !same(repo, &s.repo))) {
+            state = None;
+        }
         let daemon = Daemon::for_machine(cfg, state, access)?;
         let client = Client::in_process(api::router(daemon.clone()));
         Ok(Self { daemon, client })

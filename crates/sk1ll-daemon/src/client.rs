@@ -244,6 +244,10 @@ pub struct CommitResponse {
     /// The server refused the push for good: pushing again won't help.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub push_refused: bool,
+    /// The pull before the push turned the commit back into Draft changes:
+    /// it conflicts with the new Baseline (nothing is lost).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub uncommitted: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
