@@ -12,7 +12,7 @@
 3. **Choose harnesses.** The wizard lists the detected harnesses and saves the ones you turn off as `enabled = false` in `machine.toml`. It offers the opt-in presets it finds as on, and enables the ones you keep when setup ends (see [Opt-in presets](configuration.md#opt-in-presets)). Later, change them in Settings, which previews what each change leaves in the harness (see [Changing harnesses](configuration.md#changing-harnesses)).
 4. **Pick a starting assignment.** A machine that joins without copying another machine's assignment starts with everything off. The app then offers to turn on everything, including the defaults for items added later, or to open the assignment matrix.
 
-`sk1ll setup` asks the same questions on the command line. It goes through the daemon if one is running, otherwise it works directly, and at the end it offers to install and start the service. Answers come from standard input, so it can be scripted.
+`sk1ll setup` asks the same questions on the command line. It goes through the daemon if one is running, otherwise through the engine it runs itself, and at the end it offers to install and start the service. Answers come from standard input, so it can be scripted.
 
 After the wizard, the Library shows a getting-started checklist: add a skill or rule, adopt unmanaged skills, commit the draft and, on a fleet, add another machine. It goes away when every step is done or you dismiss it. Choose **Show getting started** in the command palette to bring it back, including on Machines set up before the checklist existed.
 

@@ -4,9 +4,9 @@ A fleet is every machine that shares one skills repo. It has three parts:
 
 - The **server** is a Docker container. It hosts the canonical bare repo, stores assignment and machine status, and tells machines to pull after each push. It is the only git remote ([ADR 0002](adr/0002-server-is-the-git-remote.md)).
 - The **daemon** runs on each machine. It watches the repo and the harnesses, applies the draft and assignment, and is the only process that talks to the server. When the server is unreachable, it keeps working from the last assignment it received.
-- The **CLI and GUI** talk to the local daemon over a Unix socket.
+- The **CLI and GUI** talk to the local daemon over a Unix socket. Without a running daemon, a CLI command runs the same engine in its own process, which connects to the server only when the command needs it ([ADR 0008](adr/0008-cli-is-a-client-of-the-engine.md)).
 
-The daemon and fleet commands need Unix.
+The daemon and the CLI need Unix.
 
 ## Deploy the server
 

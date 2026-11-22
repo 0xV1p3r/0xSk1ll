@@ -66,6 +66,11 @@ break compatibility.
 
 ### Changed
 
+- Every `sk1ll` command goes through the daemon's engine: the running
+  daemon's, else one the command runs in its own process (ADR 0008). Without
+  a daemon, commands now sync the harnesses as the daemon would, `fleet`
+  commands work, and a joined Machine connects to the server only for
+  Assignment writes, renames and unmanaged Adopt. The CLI needs Unix.
 - Assignment toggles use Item IDs. Renaming a Skill or Rule preserves its
   Assignment on every Machine. Item IDs are always explicit: the daemon and
   mutating commands write a fresh ID to any item that lacks one, so an item
@@ -116,6 +121,8 @@ break compatibility.
 
 ### Fixed
 
+- A conflict's diff requested while the daemon was busy no longer answers
+  that the conflict is gone.
 - Daemon state writes use exclusive private staging files. Failed desktop
   notifications keep their retry schedule across Daemon restarts.
 - The Library keeps unsaved text through a Daemon disconnect and restores

@@ -96,6 +96,10 @@ _Avoid_: Import (reserved for external git sources), take in
 The background process on each machine that keeps its harnesses matching its draft and assignment, and talks to the server for it.
 _Avoid_: Agent (reserved for the AI tools that harnesses run)
 
+**Engine**:
+What carries out every change to the repo, the harnesses and the assignment, and reconciles them: inside the daemon, or inside a single `sk1ll` command when no daemon runs.
+_Avoid_: Direct mode
+
 **Join code**:
 A single-use code that lets a new machine enter the fleet and receive its own credential.
 _Avoid_: Invite, fleet token

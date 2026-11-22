@@ -160,8 +160,8 @@ the same body and also supports unmanaged Skills.
 Unmanaged Adopt requires a running Daemon connected to the Server. Otherwise it
 returns HTTP 503 with `"Adopt needs a connection to the Server"`, without changing
 the repo or Harnesses. The GUI disables Adopt and Adopt to edit while disconnected.
-On a joined repo, the CLI also requires the connected Daemon and suggests
-`sk1ll daemon` when it is stopped. Standalone repos use local Assignment.
+Without a running Daemon, the CLI's own engine connects to the Server first
+and refuses the same way when it can't. Standalone repos use local Assignment.
 
 Adopt selects the chosen variant and its identical copies across Harnesses.
 It refuses an existing repo Skill with different content or an Import with the
@@ -228,8 +228,6 @@ The status carries `inventory_complete` and an optional `inventory_error`.
 An inventory is incomplete while Item ID metadata is unreadable, an item has
 no Item ID yet, two items share one, or a Pull is pending (the Daemon then
 keeps reporting its last inventory).
-A daemonless CLI session sends an `inventory` frame. The server merges its
-Item IDs into the last report and preserves its Git and Harness status.
 When an item is replaced with a different ID under the same name, `GET /items`
 returns separate Baseline and Draft rows.
 

@@ -2,7 +2,8 @@
 
 Status: accepted and implemented: one reconcile over fingerprinted Inputs,
 readers answer from a published Snapshot, and network I/O runs outside the
-engine mutex.
+engine mutex. The CLI runs the same engine when no daemon does
+([ADR 0008](0008-cli-is-a-client-of-the-engine.md)).
 
 The daemon is level-triggered. Desired state is a pure function of its Inputs:
 the repo (working tree, HEAD and refs, a Pull's journal), `machine.toml` and a
@@ -17,6 +18,12 @@ skips the reconcile when their fingerprint is unchanged.
   then publishes the Snapshot. Network I/O runs outside the mutex.
 
 ## Network outside the engine mutex
+
+Where the Assignment lives and what the repo fetches from are an
+`AssignmentStore` and a `Remote`, picked once by whether the Machine joined,
+so the steps below are one code path for both. A standalone write reaches
+the machine-local file under an engine step of its own and is applied like a
+server's confirmation.
 
 An operation that talks to the server checks and takes what it sends under
 the engine mutex, releases it for the network, then takes it again to apply

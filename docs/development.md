@@ -4,9 +4,9 @@
 
 | Crate | Role |
 |---|---|
-| `sk1ll-core` | All repo, import, draft and sync logic. It prints nothing, and its public types are `Serialize`. |
-| `sk1ll-cli` | The `sk1ll` binary, a thin `clap` front end |
-| `sk1ll-daemon` | The per-machine daemon, its local API and the client the CLI and GUI use |
+| `sk1ll-core` | All repo, import, draft and sync logic, and the one git layer (`git`, its `plumbing`). It prints nothing, and its public types are `Serialize`. |
+| `sk1ll-cli` | The `sk1ll` binary, a `clap` client of the local API: of the running daemon, else of an engine it starts in its own process ([ADR 0008](adr/0008-cli-is-a-client-of-the-engine.md)) |
+| `sk1ll-daemon` | The per-machine daemon: its engine (over an `AssignmentStore` and a `Remote`), local API, in-process engine (`local`) and the client the CLI and GUI use |
 | `sk1ll-server` | The fleet server: git remote, assignment, machine status |
 | `sk1ll-proto` | Wire types shared by the server, daemon, CLI and GUI, with no I/O |
 | `sk1ll-gui/src-tauri` | The desktop app, see [Desktop GUI](gui.md) |
@@ -46,6 +46,8 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 python3 crates/sk1ll-gui/tests/test_dev_fleet.py
 ```
+
+The CLI's command tests run the `sk1ll` binary, each with its own `HOME` and XDG directories: every command runs the engine, which reconciles, and would otherwise find your own harnesses through the presets.
 
 The automated tests don't drive the desktop app. Test interactive GUI flows by hand against the dev fleet.
 
