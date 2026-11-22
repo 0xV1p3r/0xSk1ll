@@ -90,6 +90,7 @@ pub(crate) fn router(d: Arc<Daemon>) -> Router {
         .route("/fleet", get(pass))
         .route("/machines/{id}", delete(pass))
         .route("/machines/{id}/assignment", get(assignment).put(assignment))
+        .route("/machines/{id}/assignment/harness/{harness}", post(machine_harness_assignment))
         .route("/assignment/harness/{harness}", post(set_harness_assignment))
         .route("/assignment/rename-harness", post(rename_harness))
         .route("/assignment/orphans", get(pass))
@@ -571,6 +572,24 @@ async fn assignment(
     let changes = serde_json::from_slice(&body).map_err(|e| Error::BadRequest(e.to_string()))?;
     let update = d.write_assignment(sk1ll_proto::AssignmentWrite::Changes(changes)).await?;
     Ok(Json(update).into_response())
+}
+
+/// `/assignment/harness/{harness}` of any Machine: this one's is written
+/// here, another's at the server.
+async fn machine_harness_assignment(
+    State(d): St,
+    UrlPath((machine, harness)): UrlPath<(String, String)>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    body: Bytes,
+) -> Result<Response> {
+    if machine != d.ident.machine_id() {
+        return pass(State(d), method, OriginalUri(uri), body).await;
+    }
+    let body: sk1ll_proto::SetHarnessAssignment =
+        serde_json::from_slice(&body).map_err(|e| Error::BadRequest(e.to_string()))?;
+    let write = sk1ll_proto::AssignmentWrite::Harness { harness, enabled: body.enabled };
+    Ok(Json(d.write_assignment(write).await?).into_response())
 }
 
 async fn set_harness_assignment(

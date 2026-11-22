@@ -113,7 +113,7 @@ If either Assignment changes or either Machine rejoins after preview, preview ag
 
 Run `sk1ll fleet` to find the machine id. Run `sk1ll fleet remove <machine>` and type that id at the confirmation prompt. In a script, pass `--yes` to confirm removal. For an id that starts with `-`, put `--` before it: `sk1ll fleet remove --yes -- -lab`. The daemon must be running. Removal revokes the machine's credential.
 
-Use `sk1ll assign <harness> --all on|off` to set both defaults and every explicit toggle for a Harness, including its toggles for items the Machine has yet to pull.
+Use `sk1ll assign <harness> --all on|off` to set both defaults and every explicit toggle for a Harness, including its toggles for items the Machine has yet to pull. Add `--machine <id>` to any `sk1ll assign` to change another Machine's Assignment; the server refuses that to a Machine with `self` scope.
 
 Use `sk1ll fleet log` to see recent Assignment changes, newest first. Filter with `--machine`, `--harness`, `--author`, or `--item`. Use `--limit` to set the page size and `--before <entry-id>` to page back. To undo a change, run `sk1ll fleet undo <entry-id>`.
 
