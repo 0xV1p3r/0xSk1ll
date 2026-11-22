@@ -110,7 +110,7 @@ fn enabled(d: &Daemon) -> bool {
 pub(crate) async fn run(d: Arc<Daemon>) {
     let (imports, mut failures) = watch::channel(None);
     tokio::join!(poll_imports(&d, imports), async {
-        let path = d.cfg.state.with_extension("notifications.json");
+        let path = d.cfg.notifications_path();
         let mut history = load(&path);
         let mut status = d.subscribe_view();
         let mut rejected_since = None;

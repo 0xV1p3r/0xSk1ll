@@ -73,7 +73,7 @@ impl Inputs {
         };
         let root = d.repo_root();
         let config = &d.cfg.machine_config;
-        let intent = config.with_extension("harness-rename.json");
+        let intent = sk1ll_core::harness_rename::RenameIntent::path(config);
         let assignment = match d.store.file() {
             Some(file) => Some(settled(&file.display(), Stamp::through(file, None)?)),
             None => None,

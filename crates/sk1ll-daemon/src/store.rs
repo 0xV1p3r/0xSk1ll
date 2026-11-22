@@ -106,7 +106,7 @@ pub(crate) fn for_machine(cfg: &Config, joined: Option<&DaemonState>) -> Box<dyn
         }),
         None => Box::new(LocalAssignment {
             file: cfg.assignment.clone(),
-            revisions: cfg.state.with_file_name("standalone-assignment.json"),
+            revisions: cfg.standalone_assignment_path(),
             machine_config: cfg.machine_config.clone(),
             #[cfg(test)]
             before_swap: std::sync::Mutex::new(BEFORE_FIRST_SWAP.take()),

@@ -112,6 +112,32 @@ impl Config {
         self.state.with_file_name("daemon-assignment.json")
     }
 
+    /// A standalone Machine's Assignment revision, next to the state file.
+    pub fn standalone_assignment_path(&self) -> PathBuf {
+        self.state.with_file_name("standalone-assignment.json")
+    }
+
+    /// The notifications already shown, next to the state file.
+    pub fn notifications_path(&self) -> PathBuf {
+        self.state.with_extension("notifications.json")
+    }
+
+    /// Every file an engine for this Machine may write, outside the repo and
+    /// the harness directories (which have locks of their own): what the
+    /// machine lock covers ([`crate::MachineLock`]).
+    pub fn machine_files(&self) -> Vec<PathBuf> {
+        vec![
+            self.state.clone(),
+            self.machine_config.clone(),
+            self.assignment.clone(),
+            self.snapshot_path(),
+            self.standalone_assignment_path(),
+            crate::state::standalone_record_path(&self.state),
+            self.notifications_path(),
+            sk1ll_core::harness_rename::RenameIntent::path(&self.machine_config),
+        ]
+    }
+
     /// `SK1LL_DAEMON_SOCKET`, else `$XDG_RUNTIME_DIR/sk1ll/daemon.sock`, else
     /// `run/daemon.sock` in the config dir (a directory of its own, since the
     /// socket's directory must be private). macOS has no runtime dir, so it is
