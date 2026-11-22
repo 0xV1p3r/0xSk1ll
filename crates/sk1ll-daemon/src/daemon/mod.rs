@@ -169,6 +169,14 @@ pub(crate) struct Daemon {
     /// The Draft changed since a stopped pull was last tried again (see
     /// [`Daemon::retry_stopped_pull`]).
     draft_moved: AtomicBool,
+    /// A reconcile could not finish a stopped pull until the filter drivers
+    /// ran for it (see [`sk1ll_core::Repo::prefilter_pull`]): the
+    /// background reconcile runs them without the engine mutex and goes on.
+    wants_prefilter: AtomicBool,
+    /// How often in a row the background reconcile ran them for that, up to
+    /// [`sk1ll_core::PREFILTER_TRIES`]; reset once a stopped pull finishes
+    /// or none is left, by a full reconcile and by a pull.
+    prefilter_tries: std::sync::atomic::AtomicUsize,
 }
 
 /// Mutable state, only touched with the engine mutex held.
@@ -292,6 +300,8 @@ impl Daemon {
             },
             plans: Default::default(),
             draft_moved: AtomicBool::new(false),
+            wants_prefilter: AtomicBool::new(false),
+            prefilter_tries: Default::default(),
         }))
     }
 

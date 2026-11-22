@@ -50,7 +50,8 @@ impl From<sk1ll_core::Error> for Error {
             sk1ll_core::Error::Invalid(m) => Self::BadRequest(m),
             sk1ll_core::Error::DuplicateItemId { .. }
             | sk1ll_core::Error::StrandedRename { .. }
-            | sk1ll_core::Error::PullPending => Self::Conflict(e.to_string()),
+            | sk1ll_core::Error::PullPending
+            | sk1ll_core::Error::FiltersPending { .. } => Self::Conflict(e.to_string()),
             sk1ll_core::Error::Changed(m) => Self::Conflict(m),
             e => Self::Internal(e.into()),
         }

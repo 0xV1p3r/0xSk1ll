@@ -32,7 +32,9 @@ use std::path::{Path, PathBuf};
 pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("SK1LL_COMMIT"), ")");
 
 pub use assignment::{Assignment, HarnessAssignment};
-pub use draft::{Change, DraftItem, FLEET_BRANCH, ItemRef, PullOutcome, default_commit_message, machine_author};
+pub use draft::{
+    Change, DraftItem, FLEET_BRANCH, ItemRef, PREFILTER_TRIES, PullOutcome, default_commit_message, machine_author,
+};
 pub use engine::EngineLock;
 pub use imports::{
     FetchedLink, FetchedUpdates, ImportState, ImportStatus, ResolvedSource, SkillCandidate, UpdateReport, UpdateTargets,
@@ -75,6 +77,18 @@ pub enum Error {
          first), then run `sk1ll pull`"
     )]
     PullPending,
+    /// A pull would write `paths` through a filter driver (git-lfs's smudge,
+    /// say, which downloads), and what [`Repo::prefilter_pull`] converted
+    /// for them ahead of it is missing or was converted for other attributes
+    /// or another driver configuration. A pull holding the engine lock never
+    /// runs a smudge filter, so it stopped before changing anything:
+    /// prefilter (without the lock), then pull again. `baseline`: the remote
+    /// commit the pull moves onto; `items`: those `paths` belong to.
+    #[error(
+        "the filter drivers for {} have to run before the pull writes them; pull again",
+        paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+    )]
+    FiltersPending { baseline: String, paths: Vec<PathBuf>, items: Vec<ItemRef> },
     /// What an operation was planned from changed before it was made, so
     /// nothing was done: look again (re-read, preview again) and retry.
     #[error("{0}")]

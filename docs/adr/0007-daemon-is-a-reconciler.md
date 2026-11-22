@@ -44,9 +44,16 @@ the result against the state as it is now:
   pull, recovery, missing Item IDs and the sync keep their order there). A
   push sends the exact commit it checked, so a pull that rebased it meanwhile
   makes the server refuse it as not fast-forward. A clone moves into place
-  only once complete. Filter drivers (git-lfs's smudge) run for the fetched
-  Baseline's blobs right after the fetch, unlocked; the pull writes those
-  conversions once cleaning them gives the blob back.
+  only once complete. Filter drivers (git-lfs's smudge) never run under the
+  mutex. They run unlocked right after the fetch for every file the next pull
+  writes through one: the rest of a stopped pull from its journal, else the
+  move onto the fetched Baseline, with unpushed commits replayed and
+  `.gitattributes` read where the pull reads them. Each conversion is keyed
+  by blob, path, resolved attributes and the driver's configuration, and used
+  without being checked again. A pull that misses one stops before changing
+  anything. The daemon then runs the drivers unlocked and tries again, three
+  times at most, then stays Blocked (or pending) and says why. The background
+  reconcile does the same for a stopped pull it finishes.
 
 ## One lifecycle
 

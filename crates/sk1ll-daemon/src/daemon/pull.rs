@@ -37,15 +37,9 @@ impl Daemon {
             d.lock_repo(eng)
         })
         .await?;
+        self.prefilter_tries.store(0, std::sync::atomic::Ordering::SeqCst);
         let result = match self.network(|d| d.fetch_baseline()).await {
-            Ok(()) => {
-                self.blocking(|d, eng| {
-                    d.ensure_managed()?;
-                    d.lock_repo(eng)?;
-                    d.pull_inner(eng)
-                })
-                .await
-            }
+            Ok(()) => self.pull_prefiltered().await,
             Err(e) => Err(e),
         };
         let result = match result {
@@ -85,8 +79,70 @@ impl Daemon {
         Ok(Repo::open_git_only(root)?.fetch()?)
     }
 
+    /// Without the engine mutex: runs the filter drivers for what the next
+    /// pull writes through one (see [`Repo::prefilter_pull`]).
+    pub(super) fn prefilter(&self) -> Result<()> {
+        Ok(Repo::open_git_only(self.repo_root())?.prefilter_pull()?)
+    }
+
+    /// The local half of a pull ([`Daemon::pull_inner`]) under the engine
+    /// mutex. A pull there never runs a smudge filter: when it stops before
+    /// changing anything because what it writes through a filter driver was
+    /// not converted ahead, the drivers run without the mutex and the pull
+    /// goes on, [`sk1ll_core::PREFILTER_TRIES`] times at most. Then the
+    /// Machine stays Blocked (or the pull pending), and the error says why.
+    async fn pull_prefiltered(self: &Arc<Self>) -> Result<PullResult> {
+        let mut tries = 0;
+        loop {
+            let give_up = tries == sk1ll_core::PREFILTER_TRIES;
+            let step = self
+                .blocking(move |d, eng| {
+                    d.ensure_managed()?;
+                    d.lock_repo(eng)?;
+                    match d.pull_inner(eng)? {
+                        Ok(result) => Ok(Some(Ok(result))),
+                        Err(pending) if give_up => Ok(Some(Err(d.filters_still_pending(pending)?))),
+                        Err(_) => Ok(None),
+                    }
+                })
+                .await?;
+            match step {
+                Some(result) => return result,
+                None => {
+                    tries += 1;
+                    self.network(|d| d.prefilter()).await?;
+                }
+            }
+        }
+    }
+
+    /// The pull still found conversions missing after prefiltering as often
+    /// as it may: Blocked on what it needs them for, or still pending.
+    fn filters_still_pending(&self, pending: sk1ll_core::Error) -> Result<Error> {
+        let sk1ll_core::Error::FiltersPending { baseline, items, .. } = &pending else {
+            return Ok(pending.into());
+        };
+        let root = self.repo_root();
+        let baseline = match baseline.is_empty() {
+            true => gitx::remote_head(root)?.unwrap_or_default(),
+            false => baseline.clone(),
+        };
+        let pull = match Repo::open_git_only(root)?.pull_pending()? {
+            true => PullState::Pending { baseline, items: items.clone() },
+            false => PullState::Blocked { baseline, items: items.clone() },
+        };
+        self.note(|lc| lc.set_pull(pull));
+        Ok(Error::Conflict(format!(
+            "can't pull: {pending}. The filter drivers ran {} times without the engine lock, and each time the \
+             pull found what they converted missing, or converted for other attributes or another driver \
+             configuration; check that `.gitattributes` and the `filter.*` settings stay put, then pull again",
+            sk1ll_core::PREFILTER_TRIES
+        )))
+    }
+
     /// The local half of a pull: moves onto the baseline fetched last.
-    pub(super) fn pull_inner(&self, eng: &mut Engine) -> Result<PullResult> {
+    /// `Ok(Err)`: [`sk1ll_core::Error::FiltersPending`], nothing changed.
+    pub(super) fn pull_inner(&self, eng: &mut Engine) -> Result<std::result::Result<PullResult, sk1ll_core::Error>> {
         let root = self.repo_root().to_path_buf();
         let repo = Repo::open_git_only(&root)?;
         let first = if repo.pull_pending()? {
@@ -134,6 +190,7 @@ impl Daemon {
                     };
                     (result, PullState::Clear)
                 }
+                Err(e @ sk1ll_core::Error::FiltersPending { .. }) => return Ok(Err(e)),
                 Err(e) => return Err(e.into()),
             }
         };
@@ -144,7 +201,7 @@ impl Daemon {
                 lc.set_server_baseline(remote);
             }
         });
-        Ok(result)
+        Ok(Ok(result))
     }
 
     /// Pushes committed commits the server doesn't have. What to push is
@@ -187,12 +244,7 @@ impl Daemon {
                     tracing::info!("push rejected ({first}); pulling first");
                     retried = true;
                     self.network(|d| d.fetch_baseline()).await?;
-                    let pulled = self
-                        .blocking(|d, eng| {
-                            d.ensure_managed()?;
-                            d.pull_inner(eng)
-                        })
-                        .await?;
+                    let pulled = self.pull_prefiltered().await?;
                     if let PullResult::Blocked { items, .. } = pulled {
                         let names: Vec<String> = items.iter().map(ToString::to_string).collect();
                         return Err(Error::Conflict(format!(

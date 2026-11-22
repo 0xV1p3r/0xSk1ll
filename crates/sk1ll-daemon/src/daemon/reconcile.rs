@@ -235,6 +235,9 @@ impl Daemon {
         tracing::debug!("reconciling: {why}");
         eng.reconciled = None;
         let reviewed_plan = reviewed.is_some();
+        if full {
+            self.prefilter_tries.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
         if full && !reviewed_plan {
             // Metadata can't see everything (a write through a shared
             // mapping, a directory's extended attributes): read every tree.
@@ -292,6 +295,9 @@ impl Daemon {
         let lock = eng.lock.as_ref().ok_or_else(|| Error::Conflict(format!("{} is not locked", root.display())))?;
         let mut outcome = ReconcileOutcome::default();
         let finish = repo.finish_pull(lock);
+        if !matches!(finish, Err(sk1ll_core::Error::FiltersPending { .. })) {
+            self.prefilter_tries.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
         let pending = repo.pull_pending()?;
         let finished = match finish {
             Ok(None) => None,
@@ -302,6 +308,16 @@ impl Daemon {
             Ok(Some(_)) | Err(sk1ll_core::Error::Displaced { .. }) if !pending => {
                 tracing::info!("finished a pull that had stopped half-way");
                 Some(PullState::Clear)
+            }
+            Err(e @ sk1ll_core::Error::FiltersPending { .. }) => {
+                // The background reconcile runs the filter drivers without
+                // the engine mutex, then comes back to finish it.
+                self.wants_prefilter.store(true, std::sync::atomic::Ordering::SeqCst);
+                if self.prefilter_tries.load(std::sync::atomic::Ordering::SeqCst) < sk1ll_core::PREFILTER_TRIES {
+                    self.wake();
+                }
+                outcome.errors.push(format!("pull: {e}"));
+                None
             }
             Err(e) => {
                 outcome.errors.push(format!("pull: {e}"));
@@ -515,16 +531,35 @@ impl Daemon {
     }
 
     /// A background reconcile, after file changes or the periodic tick: and
-    /// if the Draft changed, a stopped pull is tried again.
+    /// if the Draft changed, a stopped pull is tried again. A stopped pull
+    /// the reconcile could not finish until the filter drivers ran for it
+    /// gets them run here, without the engine mutex, and the reconcile
+    /// again, [`sk1ll_core::PREFILTER_TRIES`] times in a row at most.
     async fn reconcile_in_background(self: &Arc<Self>) -> Result<()> {
-        self.blocking(|d, eng| {
-            if d.idle() {
-                return Ok(());
+        use std::sync::atomic::Ordering::SeqCst;
+        loop {
+            self.blocking(|d, eng| {
+                if d.idle() {
+                    return Ok(());
+                }
+                sync::displaced::prune()?;
+                d.reconcile(eng).map(drop)
+            })
+            .await?;
+            if !self.wants_prefilter.swap(false, SeqCst) {
+                break;
             }
-            sync::displaced::prune()?;
-            d.reconcile(eng).map(drop)
-        })
-        .await?;
+            if self.prefilter_tries.fetch_add(1, SeqCst) >= sk1ll_core::PREFILTER_TRIES {
+                self.set_error(format!(
+                    "pull: the stopped pull still finds the conversions of its filter drivers missing after running \
+                     them {} times without the engine lock; check that `.gitattributes` and the `filter.*` \
+                     settings stay put, then pull again",
+                    sk1ll_core::PREFILTER_TRIES
+                ));
+                break;
+            }
+            self.network(|d| d.prefilter()).await?;
+        }
         self.retry_stopped_pull().await;
         Ok(())
     }

@@ -112,7 +112,7 @@ A machine has one headline status: the most severe that applies, in the order Of
 The server can't reach the machine; it shows a last-seen time.
 
 **Blocked**:
-A new baseline clashes with the machine's draft, so the machine stays on its old baseline.
+A new baseline clashes with the machine's draft, so the machine stays on its old baseline. A pull also stops as Blocked when the files it writes through a filter driver (git-lfs) could not be converted ahead of it after a few tries.
 
 **Behind**:
 The machine hasn't picked up the latest baseline yet.

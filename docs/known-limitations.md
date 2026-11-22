@@ -106,14 +106,26 @@ before writing the index, and another Git command can still race that check.
 
 ## Filter drivers and the engine lock
 
-Filter drivers that need the network (git-lfs's smudge) run right after a
-fetch, without the engine lock, for the blobs the fetched Baseline brings.
-The pull runs them under the lock where that left nothing: when it finishes
-a pull that stopped half-way, when a replayed local commit changes
-`.gitattributes`, or when the conversion no longer cleans to the blob.
+Filter drivers that need the network (git-lfs's smudge) never run under the
+engine lock. They run right after a fetch, and again whenever a pull needs
+them, for every file the next pull writes through one: the rest of a pull that
+stopped half-way, else what moving onto the fetched Baseline writes, with
+unpushed commits replayed and `.gitattributes` read as the pull will read
+them. The pull uses each conversion only for the same blob, path, resolved
+attributes and driver configuration. When one is missing it stops before
+changing anything, the drivers run again without the lock, and the pull goes
+on. After three tries the Machine stays Blocked, or the pull pending, and the
+error says why. That happens only when `.gitattributes` or the `filter.*`
+settings keep changing while it pulls.
+
 Clean filters still run under the lock, both for checking that a file still
-holds what the old Baseline has and for checking a conversion; a clean
-filter that waits on the network holds up the Daemon meanwhile.
+holds what the old Baseline has and when the pull starts. A clean filter that
+waits on the network holds up the Daemon meanwhile. Conversions without a
+filter driver (line endings, `ident`, encodings) also run under the lock.
+They read the working tree's `.gitattributes` there, so a
+`.gitattributes` edit that adds a filter driver in the moment between the
+pull's attribute check and its conversion of that file runs that driver's
+smudge under the lock.
 
 ## A registration left over by a rejoin
 

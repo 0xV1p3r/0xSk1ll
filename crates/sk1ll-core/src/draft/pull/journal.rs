@@ -176,7 +176,7 @@ impl Journal {
 
     /// Whether the pull changes any `.gitattributes` file.
     pub(super) fn changes_attributes(&self) -> bool {
-        self.changes.iter().any(|c| c.path.file_name().is_some_and(|name| name == ".gitattributes"))
+        super::changes_attributes(&self.changes)
     }
 }
 
