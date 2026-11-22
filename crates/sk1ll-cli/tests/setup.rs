@@ -64,9 +64,17 @@ fn setup_creates_a_standalone_repo_with_the_chosen_harnesses() {
     assert_eq!(machine.harnesses["b"].enabled, Some(false));
     assert_eq!(machine.harnesses["a"].enabled, None);
 
-    let again = fixture.setup("");
-    assert!(again.status.success());
-    assert!(String::from_utf8_lossy(&again.stdout).contains("already has a skills repo"));
+    // With the repo there (as after `sk1ll init`), setup still offers the harnesses and the daemon.
+    std::fs::create_dir_all(fixture.0.path().join("repo/personal/pdf")).unwrap();
+    std::fs::write(fixture.0.path().join("repo/personal/pdf/SKILL.md"), "PDFs.").unwrap();
+    let again = fixture.setup("\ny\n");
+    let stdout = String::from_utf8_lossy(&again.stdout);
+    assert!(again.status.success(), "{stdout}{}", String::from_utf8_lossy(&again.stderr));
+    assert!(stdout.contains("Using the skills repo at") && !stdout.contains("How will this machine"), "{stdout}");
+    assert!(stdout.contains("Sync b (") && stdout.contains("custom daemon socket"), "{stdout}");
+    let machine = sk1ll_core::MachineConfig::load(&fixture.0.path().join("machine.toml")).unwrap();
+    assert_ne!(machine.harnesses["b"].enabled, Some(false));
+    assert!(fixture.0.path().join("b/pdf/SKILL.md").is_file(), "enabling a harness syncs it");
 }
 
 /// First-run setup offers the opt-in presets it finds as on, and enables

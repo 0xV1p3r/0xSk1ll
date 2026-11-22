@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use sk1ll_core::{HarnessChoice, ItemRef, MachineConfig};
-use sk1ll_daemon::client::{Connection, DaemonMode};
+use sk1ll_core::{HarnessChange, HarnessChoice, ItemRef, MachineConfig};
+use sk1ll_daemon::client::{Connection, DaemonMode, HarnessChangeRequest};
 use sk1ll_daemon::service::{self, Manager, Started};
 use sk1ll_daemon::{DaemonState, JoinOptions};
 use sk1ll_proto::{AssignmentChanges, ToggleChange, ToggleKind};
@@ -28,31 +28,37 @@ pub(crate) fn run(cli: &Cli) -> Result<()> {
     let session = Session::any(cli)?;
     let daemon = !session.in_process();
     let repo = session.status.repo.clone();
-    if repo.join(".git").exists() {
-        println!("this machine already has a skills repo at {}; nothing to set up", repo.display());
-        return Ok(());
-    }
+    // A standalone repo made with `sk1ll init`: how the machine is used is
+    // decided, the harnesses and the daemon are still to set up.
+    let existing = repo.join(".git").exists();
     sk1ll_core::git::require_git(sk1ll_core::git::MIN_VERSION)?;
     let mut input = Input::stdin();
 
-    println!("How will this machine use 0xSk1ll?");
-    println!("  1) Only this machine: a local skills repo; you can join a fleet later");
-    println!("  2) Join a fleet: you have a join code from another machine");
-    println!("  3) Join as the first machine: you have the deployed server's admin token");
-    let path = loop {
-        match input.line("Choose [1]: ")?.as_str() {
-            "" | "1" => break 1,
-            "2" => break 2,
-            "3" => break 3,
-            _ => println!("enter 1, 2 or 3"),
+    let path = if existing {
+        println!("Using the skills repo at {} (join a fleet later with `sk1ll join`).", repo.display());
+        0
+    } else {
+        println!("How will this machine use 0xSk1ll?");
+        println!("  1) Only this machine: a local skills repo; you can join a fleet later");
+        println!("  2) Join a fleet: you have a join code from another machine");
+        println!("  3) Join as the first machine: you have the deployed server's admin token");
+        loop {
+            match input.line("Choose [1]: ")?.as_str() {
+                "" | "1" => break 1,
+                "2" => break 2,
+                "3" => break 3,
+                _ => println!("enter 1, 2 or 3"),
+            }
         }
     };
 
     println!();
-    choose_harnesses(&mut input, &cfg.machine_config, &session)?;
+    choose_harnesses(&mut input, &cfg.machine_config, &session, existing)?;
     println!();
 
-    let joined = if path == 1 {
+    let joined = if existing {
+        None
+    } else if path == 1 {
         session.block(session.client.init())?;
         println!("created the skills repo at {}", repo.display());
         None
@@ -116,7 +122,9 @@ fn shell_quote(path: &Path) -> String {
     }
 }
 
-fn choose_harnesses(input: &mut Input, machine_config: &Path, session: &Session) -> Result<()> {
+/// `existing`: the repo is there already, so a change is made as `sk1ll
+/// harnesses enable|disable` makes it, and syncs.
+fn choose_harnesses(input: &mut Input, machine_config: &Path, session: &Session, existing: bool) -> Result<()> {
     // The opt-in presets found here read as on: setup enables them as it ends.
     let choices: Vec<HarnessChoice> = session.block(session.client.setup_harnesses())?;
     let (shown, missing): (Vec<_>, Vec<_>) = choices.into_iter().partition(|c| c.installed || c.enabled);
@@ -135,8 +143,31 @@ fn choose_harnesses(input: &mut Input, machine_config: &Path, session: &Session)
         let paths = [choice.harness.skills.as_deref(), choice.harness.instructions.as_deref()];
         let paths = paths.into_iter().flatten().collect::<Vec<_>>().join(", ");
         let enabled = input.yes(&format!("  Sync {} ({paths})?", choice.name), choice.enabled)?;
-        if enabled != choice.enabled {
+        if enabled == choice.enabled {
+            continue;
+        }
+        if !existing {
             session.block(session.client.set_setup_harness(&choice.name, enabled))?;
+            continue;
+        }
+        let name = choice.name.clone();
+        let change = if enabled { HarnessChange::Enable { name } } else { HarnessChange::Disable { name } };
+        let mut request = HarnessChangeRequest { change, fingerprint: None };
+        let preview = session.block(session.client.preview_harness(&request))?;
+        for warning in &preview.warnings {
+            println!("  warning: {warning}");
+        }
+        request.fingerprint = Some(preview.fingerprint);
+        let applied = session.block(session.client.apply_harness(&request))?;
+        for error in &applied.errors {
+            println!("  error: {error}");
+        }
+        if !enabled && !preview.placed.is_empty() {
+            println!(
+                "  what sk1ll placed in {0} stays there, no longer managed; to take it out, enable {0} again, run \
+                 `sk1ll assign {0} --all off` and `sk1ll sync`, then disable it",
+                choice.name
+            );
         }
     }
     if !missing.is_empty() {

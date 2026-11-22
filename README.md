@@ -106,7 +106,7 @@ If Pull stops partway through, the next `sk1ll pull` or Daemon reconcile resumes
 
 | Command | What it does |
 |---|---|
-| `setup` | Set up this machine step by step: a standalone repo, joining a fleet or starting one, harnesses and the daemon service |
+| `setup` | Set up this machine step by step: a standalone repo, joining a fleet or starting one, harnesses and the daemon service. After `init` it skips to the harnesses |
 | `init [path]` | Create a skills repo |
 | `add <link>` | Import a skill (`--path`, `--name`). Use `--ref` to select a branch, tag or commit and `--list` to show candidates, sizes and warnings about scripts, executables, binaries and large files |
 | `update [name] [--force]` | Re-fetch imports. Local edits require `--force` |

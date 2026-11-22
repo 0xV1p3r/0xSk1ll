@@ -546,7 +546,7 @@ impl Daemon {
 
     /// Why a standalone daemon without its repo answers nothing about it.
     pub(super) fn no_repo() -> Error {
-        Error::Conflict("this machine has no skills repo yet; create one with `sk1ll init`".into())
+        Error::Conflict("this machine has no skills repo yet; set this machine up with `sk1ll setup`, or create one with `sk1ll init`".into())
     }
 
     /// The current lifecycle.
