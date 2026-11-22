@@ -235,6 +235,12 @@ impl axum::serve::Listener for PeerChecked {
 // conflicts and the recovery area come from the published Snapshot (brought
 // up to date first when the engine is free, see `Daemon::caught_up`), and
 // the rest is read from the repo as it is, through `Daemon::reading`.
+//
+// What the CLI's previews ask for (`status`, `list`, `render`, `sync
+// --dry-run`, `diff`, `edit`, `harnesses`: `/repo`, `/skills`, `/sync`,
+// `/harnesses...`, `/draft/diff`, `/items/editable`) only reads, through
+// `Daemon::reading`, and never reconciles, here as in a read-only engine: a
+// preview changes nothing, not even what a reconcile would bring in line.
 
 async fn status(State(d): St) -> Json<StatusView> {
     Json(d.view())
@@ -259,13 +265,14 @@ async fn items(State(d): St, Query(q): Query<ReadQuery>) -> Result<Json<Vec<Item
     Ok(Json(q.snapshot(&d).await?.items()?))
 }
 
-/// Read from the working tree, after catching up (`?fresh=true`: as of now,
-/// see [`ReadQuery`]), so new items have their Item IDs.
+/// Read from the working tree as it is: a preview (`sk1ll status`, `list`),
+/// so it never reconciles, and an item still without its Item ID shows
+/// without one. `?fresh=true` (see [`ReadQuery`]), for a caller about to
+/// act on it (`sk1ll assign`): it waits for the engine and reconciles
+/// first, so new items have their Item IDs.
 async fn repo_content(State(d): St, Query(q): Query<ReadQuery>) -> Result<Json<crate::client::RepoContent>> {
     if q.fresh {
         d.fresh().await?;
-    } else {
-        let _ = d.caught_up().await;
     }
     Ok(Json(d.reading(|d| d.repo_content()).await?))
 }

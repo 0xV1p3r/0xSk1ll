@@ -1495,3 +1495,38 @@ async fn reading_the_assignment_leaves_a_pending_rename_alone() {
     d.blocking(|d, eng| d.reconcile(eng).map(drop)).await.unwrap();
     assert!(!RenameIntent::exists(&config).unwrap(), "a reconcile finishes it");
 }
+
+/// What the CLI's previews ask a running daemon for (`status`, `list`,
+/// `render`, `sync --dry-run`, `diff`, `edit`, `harnesses`) only reads: it
+/// never reconciles, so a new skill keeps going without its Item ID until
+/// something that changes the repo runs. `?fresh=true` does catch up.
+#[tokio::test(flavor = "multi_thread")]
+async fn previews_through_the_daemon_never_reconcile() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = tempfile::tempdir().unwrap();
+    let d = standalone_with_pdf(dir.path());
+    add_harnesses(&d, &["h"]);
+    for _ in 0..2 {
+        d.blocking(|d, eng| d.reconcile(eng)).await.unwrap();
+    }
+    let new = d.repo_root().join("personal/new");
+    std::fs::create_dir_all(&new).unwrap();
+    std::fs::write(new.join("SKILL.md"), "New.\n").unwrap();
+    let id = new.join(sk1ll_core::skill::ID_FILE);
+    let client = crate::client::Client::in_process(crate::api::router(d.clone()));
+    let plans = d.plans.load(Relaxed);
+    let repo = client.repo(false).await.unwrap();
+    assert!(repo.skills.iter().any(|s| s.name == "new" && s.id.is_none()), "read as it is");
+    client.preview_sync().await.unwrap();
+    client.skills().await.unwrap();
+    client.harnesses().await.unwrap();
+    client.harness_settings().await.unwrap();
+    client.render_instructions("h").await.unwrap();
+    client.diff("skill:new").await.unwrap();
+    client.editable("new").await.unwrap();
+    assert_eq!(d.plans.load(Relaxed), plans, "a preview reconciled");
+    assert!(!id.exists(), "a preview wrote an Item ID");
+    let repo = client.repo(true).await.unwrap();
+    assert!(repo.skills.iter().any(|s| s.name == "new" && s.id.is_some()), "a fresh read catches up");
+    assert!(id.exists());
+}
