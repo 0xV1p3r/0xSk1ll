@@ -584,6 +584,12 @@ impl Repo {
         pull::pending(self)
     }
 
+    /// The remote Baseline a pull that stopped half-way is moving onto, as
+    /// its journal records it; `None` if no pull is pending.
+    pub fn pending_pull_baseline(&self) -> Result<Option<String>> {
+        pull::pending_baseline(self)
+    }
+
     /// The Item ID claims of the Baseline (`HEAD`). An unborn or unreadable
     /// Baseline has none.
     pub(crate) fn baseline_claims(&self) -> Result<crate::item_id::Claims> {

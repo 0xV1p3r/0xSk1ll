@@ -109,6 +109,15 @@ pub(super) fn finish(repo: &Repo, hook: Hook) -> Result<Option<PullOutcome>> {
     })
 }
 
+/// The Baseline a pull that stopped half-way is moving onto, from its
+/// journal; `None` if no pull is pending.
+pub(super) fn pending_baseline(repo: &Repo) -> Result<Option<String>> {
+    if !pending(repo)? {
+        return Ok(None);
+    }
+    with_pull(repo, |pull| Ok(Journal::load(pull)?.map(|journal| journal.baseline)))
+}
+
 pub(super) fn journal_exists(git_dir: &Path) -> Result<bool> {
     let path = journal::path(git_dir);
     match fs::symlink_metadata(&path) {

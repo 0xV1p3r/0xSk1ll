@@ -216,7 +216,7 @@ impl Lifecycle {
         let (blocked, pending): (Option<&Vec<ItemRef>>, Option<&Vec<ItemRef>>) = match &self.record.pull {
             PullState::Clear => (None, None),
             PullState::Blocked { items, .. } => (Some(items), None),
-            PullState::Pending { items } => (None, Some(items)),
+            PullState::Pending { items, .. } => (None, Some(items)),
         };
         r.blocked = blocked.is_some();
         r.clashes = blocked.cloned().unwrap_or_default();
@@ -302,7 +302,7 @@ mod tests {
         assert_eq!(v.headline, sk1ll_proto::MachineStatus::Blocked);
         assert_eq!(v.server_baseline.as_deref(), Some("new"));
 
-        lc.set_pull(PullState::Pending { items: Vec::new() });
+        lc.set_pull(PullState::Pending { baseline: String::new(), items: Vec::new() });
         lc.apply(&mut v);
         assert!(!v.report.blocked && v.report.clashes.is_empty());
         assert_eq!(v.report.pull_pending, Some(Vec::new()));

@@ -33,8 +33,11 @@ pub enum PullState {
     /// old Baseline (Blocked).
     Blocked { baseline: String, items: Vec<ItemRef> },
     /// A pull stopped half-way and has yet to finish, so the working tree is
-    /// partial. `items`: the Draft items in its way, if that is what stopped it.
-    Pending { items: Vec<ItemRef> },
+    /// partial. `baseline`: the remote commit its journal moves onto (empty
+    /// if the journal could not be read); a restart decides from it, not
+    /// from whatever was fetched since, whether the pull finished. `items`:
+    /// the Draft items in its way, if that is what stopped it.
+    Pending { baseline: String, items: Vec<ItemRef> },
 }
 
 /// What the daemon remembers about the server's Baseline across restarts.

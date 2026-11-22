@@ -285,7 +285,7 @@ impl Daemon {
             Ok(Some(PullOutcome::Blocked { baseline, items })) if !pending => {
                 Some(PullState::Blocked { baseline, items })
             }
-            Ok(Some(PullOutcome::Blocked { items, .. })) => Some(PullState::Pending { items }),
+            Ok(Some(PullOutcome::Blocked { baseline, items })) => Some(PullState::Pending { baseline, items }),
             Ok(Some(_)) | Err(sk1ll_core::Error::Displaced { .. }) if !pending => {
                 tracing::info!("finished a pull that had stopped half-way");
                 Some(PullState::Clear)
@@ -296,7 +296,9 @@ impl Daemon {
             }
             Ok(Some(_)) => None,
         };
-        let pull = self.pull_after_reconcile(&root, finished, pending);
+        let journal =
+            if pending { Some(repo.pending_pull_baseline().ok().flatten().unwrap_or_default()) } else { None };
+        let pull = self.pull_after_reconcile(&root, finished, journal);
         // Sync waits for every item to have an Item ID; the report doesn't.
         let mut ids_ready = true;
         if !pending && reviewed.is_none() {
@@ -445,13 +447,20 @@ impl Daemon {
     }
 
     /// Where a reconcile leaves the pull: what finishing a stopped pull
-    /// (`finished`) found, else what was known, checked against the repo. The
-    /// journal decides whether a pull is pending. A remembered block whose
+    /// (`finished`) found, else what was known, checked against the repo.
+    /// `journal`: the Baseline of the pull whose journal is there, if one is
+    /// (it decides whether a pull is pending). A remembered block whose
     /// Baseline `HEAD` has reached since (a pull while the daemon was
     /// stopped) is over. So is a remembered pending pull whose journal is
-    /// gone and whose Baseline `HEAD` contains: it finished, and the process
-    /// stopped before it could record that.
-    pub(super) fn pull_after_reconcile(&self, root: &Path, finished: Option<PullState>, pending: bool) -> PullState {
+    /// gone and whose own Baseline `HEAD` contains: it finished, and the
+    /// process stopped before it could record that. A Baseline fetched since
+    /// is left to the next pull.
+    pub(super) fn pull_after_reconcile(
+        &self,
+        root: &Path,
+        finished: Option<PullState>,
+        journal: Option<String>,
+    ) -> PullState {
         if let Some(pull) = finished {
             return pull;
         }
@@ -461,16 +470,20 @@ impl Daemon {
                 .flatten()
                 .is_some_and(|head| gitx::is_ancestor(root, baseline, &head).unwrap_or(false))
         };
-        match self.lifecycle().pull().clone() {
-            PullState::Pending { items } if pending => PullState::Pending { items },
-            _ if pending => PullState::Pending { items: Vec::new() },
-            PullState::Pending { items } if items.is_empty() => PullState::Clear,
-            PullState::Pending { items } => match gitx::remote_head(root) {
-                Ok(Some(baseline)) if !reached(&baseline) => PullState::Blocked { baseline, items },
-                _ => PullState::Clear,
-            },
-            PullState::Blocked { baseline, .. } if reached(&baseline) => PullState::Clear,
-            pull => pull,
+        match (self.lifecycle().pull().clone(), journal) {
+            (PullState::Pending { baseline, items }, Some(journal)) if baseline == journal => {
+                PullState::Pending { baseline, items }
+            }
+            (_, Some(baseline)) => PullState::Pending { baseline, items: Vec::new() },
+            (PullState::Pending { baseline, items }, None) => {
+                if items.is_empty() || baseline.is_empty() || reached(&baseline) {
+                    PullState::Clear
+                } else {
+                    PullState::Blocked { baseline, items }
+                }
+            }
+            (PullState::Blocked { baseline, .. }, None) if reached(&baseline) => PullState::Clear,
+            (pull, None) => pull,
         }
     }
 

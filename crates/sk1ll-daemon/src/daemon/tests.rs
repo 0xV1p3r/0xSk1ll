@@ -856,33 +856,46 @@ async fn a_stale_rename_confirmation_leaves_the_next_registrations_snapshot_alon
     assert_eq!(d.applied().unwrap().revision, 1);
 }
 
+/// The daemon for `dir`'s state again, as after a restart, with `record`.
+fn restarted(d: Arc<Daemon>, state: &DaemonState, record: PullRecord) -> Arc<Daemon> {
+    let state = DaemonState { record, ..state.clone() };
+    state.save(&d.cfg.state).unwrap();
+    let cfg = d.cfg.clone();
+    drop(d);
+    Daemon::new(cfg, state).unwrap()
+}
+
 /// A pull finished (the journal gone) but the process stopped before it
-/// recorded that: once `HEAD` contains the server's Baseline, the
-/// remembered pending pull is over, not Blocked.
+/// recorded that. A retry may have fetched a newer Baseline B meanwhile,
+/// while the reconcile finished the pull onto A. The restart decides from A,
+/// which `HEAD` contains: Clear, not Blocked on B with A's clash items; B is
+/// left to the next pull.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_finished_pull_recorded_as_pending_is_clear_after_a_restart() {
-    let pending =
-        PullRecord { server_baseline: None, pull: PullState::Pending { items: vec![ItemRef::Skill("pdf".into())] } };
     let dir = tempfile::tempdir().unwrap();
-    let (d, _session, _) = joined_daemon(dir.path(), pending.clone());
+    let (d, _session, state) = joined_daemon(dir.path(), PullRecord::default());
     let root = d.repo_root().to_path_buf();
     let git = |args: &[&str]| sk1ll_core::git::Git::new(&root).args(args).text().unwrap();
-    let head = git(&["rev-parse", "HEAD"]);
-    git(&["update-ref", "refs/remotes/origin/main", &head]);
+    let a = git(&["rev-parse", "HEAD"]);
+    let tree = git(&["rev-parse", "HEAD^{tree}"]);
+    let commit =
+        |m: &str| git(&["-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit-tree", &tree, "-m", m]);
+    let b = commit("b");
+    git(&["update-ref", "refs/remotes/origin/main", &b]);
+    let items = vec![ItemRef::Skill("pdf".into())];
+    let pending = |baseline: &str| PullState::Pending { baseline: baseline.into(), items: items.clone() };
+    let record = |pull| PullRecord { server_baseline: Some(b.clone()), pull };
+
+    let d = restarted(d, &state, record(pending(&a)));
     d.blocking(|d, eng| d.reconcile(eng).map(drop)).await.unwrap();
     assert_eq!(d.lifecycle().pull(), &PullState::Clear);
     assert_eq!(DaemonState::load(&d.cfg.state).unwrap().unwrap().record.pull, PullState::Clear);
+    assert!(d.view().report.behind, "B is still to pull");
 
-    // A Baseline HEAD does not contain is still in the way.
-    let dir = tempfile::tempdir().unwrap();
-    let (d, _session, _) = joined_daemon(dir.path(), pending);
-    let root = d.repo_root().to_path_buf();
-    let git = |args: &[&str]| sk1ll_core::git::Git::new(&root).args(args).text().unwrap();
-    let tree = git(&["rev-parse", "HEAD^{tree}"]);
-    let other = git(&["-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit-tree", &tree, "-m", "x"]);
-    git(&["update-ref", "refs/remotes/origin/main", &other]);
+    // A pull onto a Baseline HEAD does not contain is still in the way.
+    let d = restarted(d, &state, record(pending(&b)));
     d.blocking(|d, eng| d.reconcile(eng).map(drop)).await.unwrap();
-    assert!(matches!(d.lifecycle().pull(), PullState::Blocked { baseline, .. } if *baseline == other));
+    assert!(matches!(d.lifecycle().pull(), PullState::Blocked { baseline, .. } if *baseline == b));
 }
 
 /// A join that registered while the old registration recovered (its token

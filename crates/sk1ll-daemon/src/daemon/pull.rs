@@ -118,7 +118,7 @@ impl Daemon {
                     tracing::warn!("blocked: baseline {baseline} clashes with the draft");
                     let pending = repo.pull_pending()?;
                     let pull = if pending {
-                        PullState::Pending { items: items.clone() }
+                        PullState::Pending { baseline: baseline.clone(), items: items.clone() }
                     } else {
                         PullState::Blocked { baseline: baseline.clone(), items: items.clone() }
                     };
