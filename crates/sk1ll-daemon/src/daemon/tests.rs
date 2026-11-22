@@ -1405,7 +1405,7 @@ async fn an_on_demand_rename_protects_a_destination_only_the_server_has() {
     let before = std::fs::read(&d.cfg.machine_config).unwrap();
     let request = crate::client::HarnessRenameRequest { from: "h".into(), to: "already-stored".into(), replace: false };
     let error = d.rename_harness(request).await.unwrap_err();
-    assert!(error.to_string().contains("already has an Assignment"), "{error}");
+    assert!(error.to_string().contains("still has an Assignment"), "{error}");
     assert_eq!(std::fs::read(&d.cfg.machine_config).unwrap(), before);
     assert!(!RenameIntent::exists(&d.cfg.state_dir, &d.cfg.machine_config).unwrap());
     let snapshot: AssignmentSnapshot = fleet.get("/machines/a/assignment").await;

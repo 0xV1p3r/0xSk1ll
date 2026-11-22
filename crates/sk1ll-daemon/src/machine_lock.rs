@@ -86,9 +86,15 @@ impl MachineLock {
             let file = open(&path)?;
             match file.try_lock() {
                 Ok(()) => held.push((file, path)),
-                // What was taken is released with `held`.
-                Err(TryLockError::WouldBlock) => return Ok(None),
+                // What was taken is unlocked, not only closed: a child
+                // another thread forked meanwhile shares its descriptions
+                // until it execs, and would keep them locked.
+                Err(TryLockError::WouldBlock) => {
+                    drop(Self { held });
+                    return Ok(None);
+                }
                 Err(TryLockError::Error(e)) => {
+                    drop(Self { held });
                     return Err(e).with_context(|| format!("locking {}", path.display()));
                 }
             }

@@ -156,7 +156,12 @@ async fn commands_use_the_unix_client_and_preserve_payloads_and_errors() {
         .invoke_handler(tauri::generate_handler![crate::commands::fleet])
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
         .unwrap();
-    let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
+    // Its data directory in a temporary one, not under HOME.
+    let data = tempfile::tempdir().unwrap();
+    let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+        .data_directory(data.path().to_path_buf())
+        .build()
+        .unwrap();
     let response = tauri::test::get_ipc_response(
         &webview,
         tauri::webview::InvokeRequest {
