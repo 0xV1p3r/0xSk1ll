@@ -77,6 +77,7 @@ The pushed state of the Fleet repo is the **Baseline**. Local commits stay on th
 sk1ll draft                          # draft items: A(dded), M(odified), D(eleted)
 sk1ll diff pdf                       # one item against the baseline
 sk1ll commit pdf git-flow --push     # commit only these items, then push
+sk1ll commit --all -m "..."          # commit every draft item
 sk1ll restore pdf                    # discard one item's draft
 sk1ll pull                           # fetch the new baseline, keep the draft on top
 ```
