@@ -468,7 +468,8 @@ fn command(s: &Session, cmd: Cmd) -> Result<()> {
                 if e.kind.as_deref() == Some("displaced") {
                     print_recovered(&e);
                 } else {
-                    let reason = e.reason.as_deref().map(|r| format!("  ({r})")).unwrap_or_default();
+                    let kind = if e.adoptable { "item" } else { "instructions" };
+                    let reason = conflict_reason(&e.harness, kind, &e.name, e.reason.as_deref());
                     println!("! {:<10} {} {}{reason}", e.harness, e.name, e.dest.display());
                 }
             }
@@ -619,13 +620,15 @@ fn command(s: &Session, cmd: Cmd) -> Result<()> {
             if conflicts.is_empty() && result.errors.is_empty() {
                 println!("harnesses in sync");
             }
+            let mut adopts = Vec::new();
             for x in &conflicts {
-                let reason = x.reason.as_deref().map(|r| format!("  ({r})")).unwrap_or_default();
                 let kind = match (x.items.first(), x.adoptable) {
                     (_, false) if x.name == "instructions" => "instructions",
                     (Some(sk1ll_core::ItemRef::Rule(_)), _) => "rule",
                     _ => "skill",
                 };
+                let reason = conflict_reason(&x.harness, kind, &x.name, x.reason.as_deref());
+                adopts.extend(adopt_command(&x.harness, kind, &x.name, x.reason.as_deref()));
                 let name = if kind == "instructions" { names_only(&x.items) } else { x.name.clone() };
                 println!("! {:<10} {}{reason}", x.harness, placement_what(kind, &name, &x.dest));
             }
@@ -640,14 +643,19 @@ fn command(s: &Session, cmd: Cmd) -> Result<()> {
                 eprintln!("error: {error}");
             }
             if !result.errors.is_empty() {
-                bail!("{} action(s) failed", result.errors.len());
+                bail!("{} failed", plural(result.errors.len(), "action", "actions"));
             }
-            if !conflicts.is_empty() {
-                bail!(
-                    "{} conflict(s) left alone: `sk1ll adopt <harness> <name>` an edit into the repo, or `sk1ll sync \
-                     --force` to overwrite it (it is kept in recovery)",
-                    conflicts.len()
-                );
+            match (&conflicts[..], &adopts[..]) {
+                ([], _) => {}
+                ([_], [adopt]) => bail!(
+                    "1 conflict left alone: `{adopt}` the edit into the repo, or `sk1ll sync --force` to overwrite it \
+                     (it is kept in recovery)"
+                ),
+                (conflicts, _) => bail!(
+                    "{} left alone: resolve each as its line above says, or `sk1ll sync --force` to overwrite the \
+                     edits (each is kept in recovery)",
+                    plural(conflicts.len(), "conflict", "conflicts")
+                ),
             }
         }
         Cmd::Render { harness } => {
@@ -1022,9 +1030,40 @@ fn print_plan(actions: &[PlacementView]) {
             "remove" => "-",
             _ => "!",
         };
-        let reason = a.reason.as_deref().map(|r| format!("  ({r})")).unwrap_or_default();
+        let reason = conflict_reason(&a.harness, &a.item, &a.name, a.reason.as_deref());
         println!("{sym} {:<10} {}{reason}", a.harness, placement_what(&a.item, &a.name, &a.dest));
     }
+}
+
+/// A conflict's reason as printed after it, `  (<reason>; <what to run>)`:
+/// an edit by hand to managed content names the exact command that takes
+/// it into the repo, or says where block edits go. `kind`: `skill`, `rule`
+/// (`name` with or without `.md`), `instructions`, or `item` for either of
+/// the first two.
+fn conflict_reason(harness: &str, kind: &str, name: &str, reason: Option<&str>) -> String {
+    let Some(reason) = reason else { return String::new() };
+    let hint = match adopt_command(harness, kind, name, Some(reason)) {
+        Some(adopt) => format!("; `{adopt}` it into the repo, or overwrite it with `sk1ll sync --force`"),
+        None if kind == "instructions" && reason.ends_with(sk1ll_core::sync::EDITED) => {
+            "; move the edits into instructions/, or overwrite them with `sk1ll sync --force`".into()
+        }
+        None => String::new(),
+    };
+    format!("  ({reason}{hint})")
+}
+
+/// `sk1ll adopt <harness> <name>` for a skill or rule edited by hand in a harness.
+fn adopt_command(harness: &str, kind: &str, name: &str, reason: Option<&str>) -> Option<String> {
+    if kind == "instructions" || !reason?.ends_with(sk1ll_core::sync::EDITED) {
+        return None;
+    }
+    let name = if kind == "skill" { name } else { name.strip_suffix(".md").unwrap_or(name) };
+    Some(format!("sk1ll adopt {} {}", fleet::shell_arg(harness), fleet::shell_arg(name)))
+}
+
+/// `n` and the noun for it: `1 conflict`, `2 conflicts`.
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
 }
 
 /// What a placement is, as `status`, `sync --dry-run` and `sync` print it:
@@ -1099,6 +1138,28 @@ mod tests {
         assert!(bundled_fallback(link, true, fetch()).is_err(), "--path or --ref asks for that exact source");
         assert!(bundled_fallback(link, false, anyhow::anyhow!("import `sk1ll` already exists")).is_err());
         assert!(bundled_fallback("https://github.com/o/r", false, fetch()).is_err());
+    }
+
+    #[test]
+    fn conflict_reasons_name_the_command_for_an_edit_by_hand() {
+        let edited = format!("rule {}", sk1ll_core::sync::EDITED);
+        assert_eq!(
+            conflict_reason("codex", "rule", "git.md", Some(&edited)),
+            format!(
+                "  ({edited}; `sk1ll adopt codex git` it into the repo, or overwrite it with `sk1ll sync --force`)"
+            )
+        );
+        let reason = conflict_reason("h", "skill", "my skill", Some(sk1ll_core::sync::EDITED));
+        assert!(reason.contains("`sk1ll adopt h 'my skill'`"), "{reason}");
+        let block = conflict_reason("codex", "instructions", "git", Some(sk1ll_core::sync::EDITED));
+        assert!(block.contains("move the edits into instructions/") && !block.contains("adopt"), "{block}");
+        let unmanaged = "existing rule file not managed by sk1ll";
+        assert_eq!(conflict_reason("h", "rule", "git.md", Some(unmanaged)), format!("  ({unmanaged})"));
+        assert_eq!(conflict_reason("h", "skill", "pdf", None), "");
+        assert_eq!(
+            (plural(1, "conflict", "conflicts"), plural(2, "entry", "entries")),
+            ("1 conflict".into(), "2 entries".into())
+        );
     }
 
     #[test]

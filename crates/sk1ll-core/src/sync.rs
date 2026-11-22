@@ -62,9 +62,11 @@ pub fn deploy_hash(source: &Path) -> Result<String> {
     if import_source(source) { copy_hash(source) } else { hash_dir(source) }
 }
 
-const EDITED: &str = "edited by hand in the harness; `sk1ll adopt` it into the repo or use --force";
-const BLOCK_EDITED: &str =
-    "managed block edited by hand in the harness; move the edits into instructions/ or use --force";
+/// How every conflict over managed content edited by hand in a harness
+/// ends its reason. What to run about it is the client's to say: the CLI
+/// names the command, the GUI has its buttons.
+pub const EDITED: &str = "edited by hand in the harness";
+const BLOCK_EDITED: &str = "managed block edited by hand in the harness";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
