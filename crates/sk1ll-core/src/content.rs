@@ -99,8 +99,10 @@ pub struct FileContent {
     pub size: u64,
 }
 
-fn git(root: &Path) -> Git {
-    Git::new(root).env("GIT_OPTIONAL_LOCKS", "0")
+/// A git command on the skills repo, its filter drivers turned off (see
+/// [`crate::git::RepoGit`]).
+fn git(root: &Path) -> Result<Git> {
+    Ok(crate::git::RepoGit::with_env(root, &[("GIT_OPTIONAL_LOCKS".into(), "0".into())])?.git())
 }
 
 /// Inventory identities for the working tree. Missing content can be looked
@@ -124,10 +126,10 @@ pub fn item_ids_at(root: &Path, revision: &str) -> Result<BTreeMap<ItemRef, Opti
 }
 
 fn tracked(root: &Path, revision: &str) -> Result<Vec<(String, String, String)>> {
-    if !git(root).args(["rev-parse", "--verify", "--quiet", revision]).succeeds()? {
+    if !git(root)?.args(["rev-parse", "--verify", "--quiet", revision]).succeeds()? {
         return Ok(Vec::new());
     }
-    let raw = git(root).args(["ls-tree", "-r", "-t", "-z", "--full-tree", revision]).run()?;
+    let raw = git(root)?.args(["ls-tree", "-r", "-t", "-z", "--full-tree", revision]).run()?;
     raw.split(|b| *b == 0)
         .filter(|b| !b.is_empty())
         .map(|row| {
@@ -212,11 +214,11 @@ pub fn list(
         } else {
             ContentType::Rule
         };
-        let content = git(repo.root()).args(["cat-file", "-s", oid]).text()?.parse::<u64>().unwrap_or(u64::MAX);
+        let content = git(repo.root())?.args(["cat-file", "-s", oid]).text()?.parse::<u64>().unwrap_or(u64::MAX);
         let description = if drafts.get(&item).is_some_and(|c| *c != Change::Deleted) {
             None
         } else if content <= MAX_FILE_BYTES {
-            let bytes = git(repo.root()).args(["cat-file", "blob", oid]).run()?;
+            let bytes = git(repo.root())?.args(["cat-file", "blob", oid]).run()?;
             std::str::from_utf8(&bytes).ok().and_then(|t| crate::skill::frontmatter_field(t, "description"))
         } else {
             None
@@ -436,7 +438,7 @@ pub fn tree(repo: &Repo, harnesses: &BTreeMap<String, Harness>, query: &ContentQ
                 let size = if mode == "040000" {
                     0
                 } else {
-                    git(repo.root()).args(["cat-file", "-s", &oid]).text()?.parse().unwrap_or(0)
+                    git(repo.root())?.args(["cat-file", "-s", &oid]).text()?.parse().unwrap_or(0)
                 };
                 files.push(FileEntry {
                     path: path.strip_prefix(base).unwrap().to_string_lossy().into_owned(),
@@ -536,10 +538,10 @@ pub fn file(repo: &Repo, harnesses: &BTreeMap<String, Harness>, query: &FileQuer
             if mode != "100644" && mode != "100755" {
                 return Err(Error::Invalid("path is not a regular file".into()));
             }
-            let size = git(repo.root()).args(["cat-file", "-s", oid]).text()?.parse().unwrap_or(u64::MAX);
+            let size = git(repo.root())?.args(["cat-file", "-s", oid]).text()?.parse().unwrap_or(u64::MAX);
             (
                 if size <= MAX_FILE_BYTES {
-                    git(repo.root()).args(["cat-file", "blob", oid]).run()?
+                    git(repo.root())?.args(["cat-file", "blob", oid]).run()?
                 } else {
                     Vec::new()
                 },

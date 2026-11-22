@@ -7,7 +7,7 @@ use std::{fmt, fs};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::git::{Git, path_from_bytes};
+use crate::git::{RepoGit, path_from_bytes};
 use crate::instructions::{self, INSTRUCTIONS_DIR};
 use crate::manifest::{MANIFEST_FILE, Manifest};
 use crate::skill::{ID_FILE, IMPORTED_DIR, PERSONAL_DIR};
@@ -194,7 +194,8 @@ fn cached_claims(root: &Path, revision: &str) -> Result<std::sync::Arc<Claims>> 
 
     const CAPACITY: usize = 32;
     static CACHE: Mutex<VecDeque<CachedClaims>> = Mutex::new(VecDeque::new());
-    let git = || Git::new(root).env("GIT_OPTIONAL_LOCKS", "0");
+    let repo = RepoGit::with_env(root, &[("GIT_OPTIONAL_LOCKS".into(), "0".into())])?;
+    let git = || repo.git();
     let tree = git().args(["rev-parse", "--verify", &format!("{revision}^{{tree}}")]).text()?;
     {
         let mut cache = CACHE.lock().unwrap();
@@ -219,7 +220,8 @@ enum Blob {
 }
 
 fn read_claims(root: &Path, tree: &str) -> Result<Claims> {
-    let git = || Git::new(root).env("GIT_OPTIONAL_LOCKS", "0");
+    let repo = RepoGit::with_env(root, &[("GIT_OPTIONAL_LOCKS".into(), "0".into())])?;
+    let git = || repo.git();
     let tree = git().args(["ls-tree", "-r", "-t", "-z", tree]).run()?;
     let entries: BTreeMap<_, _> = tree
         .split(|&b| b == 0)
@@ -771,9 +773,14 @@ pub fn committed_inventory(root: &Path, commit: &str, paths: &[String]) -> ItemI
 
 fn committed_claim(root: &Path, commit: &str, path: &str) -> std::io::Result<Vec<u8>> {
     use std::process::{Command, Stdio};
+    // Streamed, so not a `Git`; its filter drivers are off all the same.
+    let repo = RepoGit::open(root).map_err(std::io::Error::other)?;
+    let (neutralizing, env) = repo.neutralizing();
     let mut git = Command::new("git")
         .arg("-C")
         .arg(root)
+        .args(neutralizing)
+        .envs(env)
         .args(["cat-file", "blob", &format!("{commit}:{path}")])
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stdout(Stdio::piped())
@@ -867,7 +874,7 @@ mod tests {
         let cache = cached_claims(repo.root(), &head).unwrap();
         assert_eq!(cache[Path::new("instructions/rule.md")].as_ref().unwrap().to_string(), "rule-id");
         assert!(cache[Path::new("personal/pdf")].is_some());
-        Git::new(repo.root())
+        crate::git::Git::new(repo.root())
             .args([
                 "-c",
                 "user.name=Test",

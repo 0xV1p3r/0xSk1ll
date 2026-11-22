@@ -1,12 +1,16 @@
 //! The skills repo doesn't support git filter drivers (`filter.<driver>.smudge`,
 //! `.clean`, `.process`: Git LFS, say). The server is plain git over HTTP,
-//! with no LFS endpoint, so a driver has nothing to talk to. Pull refuses a
-//! Baseline that writes a file through one (see [`driver_paths`]), and every
-//! git command that pull (or the clone and first Baseline it starts from)
-//! runs has every configured driver turned off ([`Git::without_filter_drivers`]),
-//! so no driver process runs even for a pull that started before its
-//! attributes named one. Conversions without a driver (`text`, `eol`,
-//! `ident`, `working-tree-encoding`) still apply.
+//! with no LFS endpoint, so a driver has nothing to talk to. Pull and the
+//! clone refuse a Baseline that writes a file through one (see
+//! [`driver_paths`]), and every git command on the skills repo runs with
+//! every configured driver turned off ([`Git::without_filter_drivers`]): it
+//! is built by [`RepoGit`] (or, for pull, [`Git::for_pull`]), which reads the
+//! drivers from git's configuration for that repo, its conditional includes
+//! (`includeIf.gitdir`) and all. So no driver process runs, not under a pull
+//! that started before its attributes named one, and not under `git status`,
+//! a restore, a diff or a commit's `add`. Conversions without a driver
+//! (`text`, `eol`, `ident`, `working-tree-encoding`) still apply. Imports
+//! (third-party sources, in their own caches) keep their own handling.
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -53,7 +57,56 @@ pub(crate) fn configured_drivers(git: Git) -> Result<BTreeSet<String>> {
     Ok(drivers)
 }
 
+/// How every git command on the skills repo (its working tree, index or
+/// git directory) is built: `git -C <dir>` with each filter driver git's
+/// configuration for `dir` names turned off. The drivers are read when it
+/// is made, so make one for a series of commands, not for a long life.
+#[derive(Debug, Clone)]
+pub struct RepoGit {
+    dir: PathBuf,
+    env: Vec<(String, String)>,
+    drivers: BTreeSet<String>,
+}
+
+impl RepoGit {
+    /// For the repo at (or the directory) `dir`.
+    pub fn open(dir: &Path) -> Result<Self> {
+        Self::with_env(dir, &[])
+    }
+
+    /// With `env` set for every command, discovery included (git's
+    /// authentication, see [`super::config_env`]).
+    pub fn with_env(dir: &Path, env: &[(String, String)]) -> Result<Self> {
+        let env = env.to_vec();
+        let drivers = configured_drivers(Git::new(dir).envs(&env))?;
+        Ok(Self { dir: dir.to_path_buf(), env, drivers })
+    }
+
+    /// One command.
+    pub fn git(&self) -> Git {
+        Git::new(&self.dir).envs(&self.env).without_filter_drivers(&self.drivers)
+    }
+
+    /// The drivers it turns off.
+    pub(crate) fn drivers(&self) -> &BTreeSet<String> {
+        &self.drivers
+    }
+
+    /// The arguments and environment that turn the drivers off, for a
+    /// command that is not a [`Git`] (a streamed read): `git -C <dir>`, then
+    /// these, then its own arguments.
+    pub(crate) fn neutralizing(&self) -> (Vec<OsString>, Vec<(&'static str, &'static str)>) {
+        neutralizing(&self.drivers)
+    }
+}
+
 impl Git {
+    /// `git -C <dir>` for one command on the skills repo, with its filter
+    /// drivers turned off (see [`RepoGit`]).
+    pub fn repo(dir: &Path) -> Result<Self> {
+        Ok(RepoGit::open(dir)?.git())
+    }
+
     /// Turns each of `drivers` into a no-op for this command: its `smudge`,
     /// `clean` and `process` empty (git then converts nothing for it) and
     /// not `required` (so that is no error either). Set on the command line,
@@ -61,19 +114,23 @@ impl Git {
     /// so nothing overrides it; `--config-env` because a driver's name may
     /// hold `=` (git splits there at the last `=`).
     pub(crate) fn without_filter_drivers(self, drivers: &BTreeSet<String>) -> Self {
-        if drivers.is_empty() {
-            return self;
-        }
-        let mut args = Vec::<OsString>::new();
-        for name in drivers {
-            for (key, env) in
-                [("smudge", EMPTY_ENV), ("clean", EMPTY_ENV), ("process", EMPTY_ENV), ("required", FALSE_ENV)]
-            {
-                args.push(format!("--config-env=filter.{name}.{key}={env}").into());
-            }
-        }
-        self.env(EMPTY_ENV, "").env(FALSE_ENV, "false").args(args)
+        let (args, env) = neutralizing(drivers);
+        env.into_iter().fold(self, |git, (k, v)| git.env(k, v)).args(args)
     }
+}
+
+fn neutralizing(drivers: &BTreeSet<String>) -> (Vec<OsString>, Vec<(&'static str, &'static str)>) {
+    if drivers.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut args = Vec::<OsString>::new();
+    for name in drivers {
+        for (key, env) in [("smudge", EMPTY_ENV), ("clean", EMPTY_ENV), ("process", EMPTY_ENV), ("required", FALSE_ENV)]
+        {
+            args.push(format!("--config-env=filter.{name}.{key}={env}").into());
+        }
+    }
+    (args, vec![(EMPTY_ENV, ""), (FALSE_ENV, "false")])
 }
 
 /// Which of `paths` git would write through a filter driver: their `filter`

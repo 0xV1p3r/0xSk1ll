@@ -90,7 +90,7 @@ fn open(root: &Path) -> Result<(File, PathBuf)> {
 }
 
 fn lock_path(root: &Path) -> Result<PathBuf> {
-    let common = Git::new(root).args(["rev-parse", "--path-format=absolute", "--git-common-dir"]).run()?;
+    let common = Git::repo(root)?.args(["rev-parse", "--path-format=absolute", "--git-common-dir"]).run()?;
     let common = crate::git::path_from_bytes(common.strip_suffix(b"\n").unwrap_or(&common));
     Ok(common.canonicalize().at(&common)?.join(LOCK_FILE))
 }

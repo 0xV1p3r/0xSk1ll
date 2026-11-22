@@ -23,8 +23,9 @@ impl Daemon {
     /// A read-only inventory. GIT_OPTIONAL_LOCKS=0 prevents status from refreshing
     /// the index, and no engine mutex or EngineLock is acquired here.
     pub(crate) fn items(root: &Path) -> Result<Vec<ItemView>> {
-        use sk1ll_core::git::Git;
-        let read = |args: &[&str]| Git::new(root).env("GIT_OPTIONAL_LOCKS", "0").args(args).run();
+        // Every git command on the repo, its filter drivers turned off.
+        let git = sk1ll_core::git::RepoGit::with_env(root, &[("GIT_OPTIONAL_LOCKS".into(), "0".into())])?;
+        let read = |args: &[&str]| git.git().args(args).run();
         let paths = |revision: Option<&str>| -> Result<Vec<String>> {
             let Some(revision) = revision else { return Ok(Vec::new()) };
             let bytes = read(&["ls-tree", "-r", "-z", "--name-only", revision])?;
@@ -79,7 +80,7 @@ impl Daemon {
         let mut blobs = BTreeMap::new();
         let cat_file = |mode: &str, objects: &[String]| {
             let input = objects.iter().flat_map(|object| [object.as_str(), "\n"]).collect::<String>().into_bytes();
-            Git::new(root).env("GIT_OPTIONAL_LOCKS", "0").args(["cat-file", mode]).stdin(input).run()
+            git.git().args(["cat-file", mode]).stdin(input).run()
         };
         // Sizes first, so git never streams us a blob over the cap.
         if !wanted.is_empty() {

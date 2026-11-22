@@ -12,7 +12,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use walkdir::WalkDir;
 
-use crate::git::{Git, nul_list, path_bytes, path_from_bytes, split_paths};
+use crate::git::{Git, RepoGit, nul_list, path_bytes, path_from_bytes, split_paths};
 use crate::instructions::INSTRUCTIONS_DIR;
 use crate::lock::LOCK_FILE;
 use crate::manifest::MANIFEST_FILE;
@@ -231,12 +231,13 @@ impl Repo {
                 Some(h) => h.clone(),
                 None => self.empty_tree()?,
             };
-            let diff = self.git().literal().args(["diff", "--no-color", "--no-ext-diff", &base, "--"]);
+            let diff = self.git()?.literal().args(["diff", "--no-color", "--no-ext-diff", &base, "--"]);
             let diff = diff.args(&tracked).run()?;
             out.push_str(&String::from_utf8_lossy(&diff));
         }
         for path in untracked {
-            let o = self.git().args(["diff", "--no-color", "--no-ext-diff", "--no-index", "--", "/dev/null"]).arg(path);
+            let o =
+                self.git()?.args(["diff", "--no-color", "--no-ext-diff", "--no-index", "--", "/dev/null"]).arg(path);
             let o = o.output()?;
             if !matches!(o.status.code(), Some(0 | 1)) {
                 return Err(Error::Git {
@@ -270,9 +271,10 @@ impl Repo {
         let (selected, st) = self.select(items, "committed")?;
         let (case_removed, paths): (Vec<&PathBuf>, Vec<&PathBuf>) =
             selected.iter().flat_map(|d| &d.paths).partition(|path| st.case_removed.contains(*path));
+        let repo_git = self.repo_git()?;
         let update_index = |index: Option<&Path>| -> Result<()> {
             let git = || {
-                let git = self.git().args(["-c", "core.ignoreCase=false"]);
+                let git = repo_git.git().args(["-c", "core.ignoreCase=false"]);
                 match index {
                     Some(index) => git.env("GIT_INDEX_FILE", index),
                     None => git,
@@ -287,11 +289,11 @@ impl Repo {
 
         // Build the commit in a throwaway index so the real one is untouched.
         let index = PathBuf::from(
-            self.git().args(["rev-parse", "--path-format=absolute", "--git-path", "sk1ll-commit.index"]).text()?,
+            self.git()?.args(["rev-parse", "--path-format=absolute", "--git-path", "sk1ll-commit.index"]).text()?,
         );
         let _ = fs::remove_file(&index);
         let tree = (|| {
-            let g = || self.git().env("GIT_INDEX_FILE", &index);
+            let g = || repo_git.git().env("GIT_INDEX_FILE", &index);
             match &st.head {
                 Some(h) => g().args(["read-tree", h]).run()?,
                 None => g().args(["read-tree", "--empty"]).run()?,
@@ -322,17 +324,17 @@ impl Repo {
             }
         }
         if let Some(h) = &st.head
-            && self.git().args(["rev-parse", &format!("{h}^{{tree}}")]).text()? == tree
+            && self.git()?.args(["rev-parse", &format!("{h}^{{tree}}")]).text()? == tree
         {
             return Err(Error::Invalid("nothing to commit: those items already match the baseline".into()));
         }
 
-        let mut commit = self.git().args(["commit-tree", &tree]);
+        let mut commit = self.git()?.args(["commit-tree", &tree]);
         if let Some(h) = &st.head {
             commit = commit.args(["-p", h]);
         }
         let sha = commit.args(["-m", message]).envs(&self.identity_env(author)?).text()?;
-        let mut update = self.git().args(["update-ref", "-m", "sk1ll: commit", "HEAD", &sha]);
+        let mut update = self.git()?.args(["update-ref", "-m", "sk1ll: commit", "HEAD", &sha]);
         if let Some(h) = &st.head {
             update = update.arg(h);
         }
@@ -358,7 +360,7 @@ impl Repo {
         self.on_fleet_branch()?;
         // Its branch has yet to move to the replayed commits.
         self.require_no_pending_pull()?;
-        let Some(head) = rev(self.git(), "HEAD")? else { return Ok(None) };
+        let Some(head) = rev(self.git()?, "HEAD")? else { return Ok(None) };
         let claims = crate::item_id::claims_at(self.root(), &head, |_| true, true)?;
         crate::item_id::check_claims(&claims).map_err(|e| repair_before(e, "push"))?;
         Ok(Some(head))
@@ -371,9 +373,9 @@ impl Repo {
     /// had, so git refuses the push as not fast-forward.
     pub fn push_commit(&self, commit: &str) -> Result<()> {
         let refspec = format!("{commit}:refs/heads/{FLEET_BRANCH}");
-        self.git().args(["push", "--quiet", REMOTE, &refspec]).run()?;
+        self.git()?.args(["push", "--quiet", REMOTE, &refspec]).run()?;
         let tracking = format!("refs/remotes/{REMOTE}/{FLEET_BRANCH}");
-        self.git().args(["update-ref", "-m", "sk1ll: push", &tracking, commit]).run()?;
+        self.git()?.args(["update-ref", "-m", "sk1ll: push", &tracking, commit]).run()?;
         Ok(())
     }
 
@@ -425,7 +427,7 @@ impl Repo {
         // New paths go first: one may be in the way of a baseline file (a file
         // that became a directory) that the checkout below brings back.
         if !new.is_empty() {
-            self.git().args(["update-index", "--force-remove", "-z", "--stdin"]).stdin(nul_list(&new)).run()?;
+            self.git()?.args(["update-index", "--force-remove", "-z", "--stdin"]).stdin(nul_list(&new)).run()?;
             for rel in new {
                 let path = self.root().join(rel);
                 match fs::symlink_metadata(&path) {
@@ -438,7 +440,7 @@ impl Repo {
             }
         }
         if let (Some(head), false) = (&st.head, in_head.is_empty()) {
-            self.git().literal().args(["checkout", "--quiet", head, "--"]).args(&in_head).run()?;
+            self.git()?.literal().args(["checkout", "--quiet", head, "--"]).args(&in_head).run()?;
         }
         Ok(())
     }
@@ -570,7 +572,7 @@ impl Repo {
             Err(Error::Displaced { .. }) if !self.pull_pending()? => {}
             _ => return pulled,
         }
-        let to = rev(self.git(), "HEAD")?.unwrap_or_default();
+        let to = rev(self.git()?, "HEAD")?.unwrap_or_default();
         let claims = crate::item_id::claims_at(self.root(), &to, |_| true, true)?;
         crate::item_id::check_claims(&claims).map_err(|e| repair_before(e, "push the replayed commits"))?;
         // The pull went through: Draft metadata it can't read is reported by
@@ -597,7 +599,7 @@ impl Repo {
     /// The Item ID claims of the Baseline (`HEAD`). An unborn or unreadable
     /// Baseline has none.
     pub(crate) fn baseline_claims(&self) -> Result<crate::item_id::Claims> {
-        Ok(match rev(self.git(), "HEAD")? {
+        Ok(match rev(self.git()?, "HEAD")? {
             Some(head) => crate::item_id::claims_at(self.root(), &head, |_| true, true).unwrap_or_default(),
             None => crate::item_id::Claims::new(),
         })
@@ -651,27 +653,34 @@ impl Repo {
 
     /// Whether git has a configured `user.name` and `user.email`.
     pub fn has_git_identity(&self) -> Result<bool> {
-        has_git_identity(|| self.git())
+        let git = self.repo_git()?;
+        has_git_identity(|| git.git())
     }
 
     /// Ignored, untracked files under the repo root, relative to it.
     fn ignored_paths(&self) -> Result<Vec<PathBuf>> {
         let out =
-            self.git().args(["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--", "."]).run()?;
+            self.git()?.args(["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--", "."]).run()?;
         Ok(split_paths(&out).collect())
     }
 
-    fn git(&self) -> Git {
-        Git::new(self.root()).env("GIT_OPTIONAL_LOCKS", "0")
+    /// Every git command on the repo, built by [`RepoGit`]: with its filter
+    /// drivers turned off, so none runs (see [`crate::git::RepoGit`]).
+    fn repo_git(&self) -> Result<RepoGit> {
+        RepoGit::with_env(self.root(), &[("GIT_OPTIONAL_LOCKS".into(), "0".into())])
+    }
+
+    fn git(&self) -> Result<Git> {
+        Ok(self.repo_git()?.git())
     }
 
     /// [`FLEET_BRANCH`], if that is the branch checked out; else how to get there.
     fn on_fleet_branch(&self) -> Result<String> {
-        on_fleet_branch(self.git(), self.root())
+        on_fleet_branch(self.git()?, self.root())
     }
 
     fn empty_tree(&self) -> Result<String> {
-        self.git().args(["hash-object", "-t", "tree", "--stdin"]).stdin(Vec::new()).text()
+        self.git()?.args(["hash-object", "-t", "tree", "--stdin"]).stdin(Vec::new()).text()
     }
 
     /// Author/committer env for a commit: `author` overrides the author;
@@ -757,16 +766,16 @@ impl Repo {
                 crate::repo::check_rename_stage(&path)?;
             }
         }
-        let head = rev(self.git(), "HEAD")?;
+        let head = rev(self.git()?, "HEAD")?;
         let head_paths = match &head {
-            Some(h) => split_paths(&self.git().args(["ls-tree", "-r", "-z", "--name-only", h]).run()?).collect(),
+            Some(h) => split_paths(&self.git()?.args(["ls-tree", "-r", "-z", "--name-only", h]).run()?).collect(),
             None => BTreeSet::new(),
         };
         // Porcelain paths are relative to the top level; the repo may be a subdirectory.
-        let prefix = self.git().args(["rev-parse", "--show-prefix"]).run()?;
+        let prefix = self.git()?.args(["rev-parse", "--show-prefix"]).run()?;
         let prefix = prefix.strip_suffix(b"\n").unwrap_or(&prefix);
         let mut changed: BTreeMap<PathBuf, bool> =
-            status_paths(self.git().args(["-c", "core.ignoreCase=false", "-c", "core.fsmonitor=false"]), &["."])?
+            status_paths(self.git()?.args(["-c", "core.ignoreCase=false", "-c", "core.fsmonitor=false"]), &["."])?
                 .into_iter()
                 .filter_map(|(path, untracked)| {
                     let rel = path_from_bytes(path.strip_prefix(prefix).unwrap_or(&path));
@@ -1054,6 +1063,38 @@ mod tests {
 
     fn read(path: &Path) -> String {
         fs::read_to_string(path).unwrap()
+    }
+
+    /// No git command on the skills repo runs a filter driver: not the
+    /// Draft's `status`, a diff, a commit's `add` or a restore's checkout,
+    /// even for a driver a conditional include (`includeIf.gitdir`) names.
+    #[test]
+    fn draft_commands_run_no_filter_driver() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tmp.path().canonicalize().unwrap();
+        let root = tmp.join("repo");
+        let repo = Repo::init_committed(&root).unwrap();
+        let marker = tmp.join("ran");
+        let cmd = format!("touch '{}'; cat", marker.display());
+        let filter = tmp.join("filter.gitconfig");
+        write(&filter, &format!("[filter \"x\"]\n\tclean = {cmd}\n\tsmudge = {cmd}\n\trequired = true\n"));
+        git(&root, &["config", &format!("includeIf.gitdir:{}/.path", root.display()), filter.to_str().unwrap()]);
+        write(&root.join(".git/info/attributes"), "*.md filter=x\n");
+        repo.create_item("skill", "pdf", "PDF").unwrap();
+        let pdf = item("skill:pdf");
+        repo.commit(std::slice::from_ref(&pdf), "Add PDF", None).unwrap();
+        // Later than the index: status must look at the content.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write(&root.join("personal/pdf/SKILL.md"), "Edited.\n");
+        assert_eq!(items(&repo), [("skill:pdf".to_string(), Change::Modified)]);
+        assert!(repo.diff(&pdf).unwrap().contains("Edited."));
+        repo.restore(std::slice::from_ref(&pdf)).unwrap();
+        assert!(repo.draft().unwrap().is_empty());
+        assert!(!marker.exists(), "a filter driver ran");
+        // The include does name the driver where git runs.
+        write(&root.join("personal/pdf/SKILL.md"), "Edited again.\n");
+        let _ = Git::new(&root).args(["add", "--all"]).output();
+        assert!(marker.exists(), "the test's driver is not configured as git reads it");
     }
 
     #[test]

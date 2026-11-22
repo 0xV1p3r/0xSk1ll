@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
-use super::Git;
+use super::{Git, RepoGit};
 use crate::draft::{FLEET_BRANCH, REMOTE};
 use crate::redact::redact;
 use crate::{ItemRef, Repo};
@@ -23,12 +23,11 @@ use serde::{Deserialize, Serialize};
 
 type Env<'a> = &'a [(String, String)];
 
-fn command(dir: &Path, args: &[&str], env: Env) -> Git {
-    let mut git = Git::new(dir).env("GIT_TERMINAL_PROMPT", "0").args(args);
-    for (k, v) in env {
-        git = git.env(k, v);
-    }
-    git
+/// Every command here runs on the skills repo (or its clone being made),
+/// so it is built by [`RepoGit`]: with each filter driver git's
+/// configuration for `dir` names turned off.
+fn command(dir: &Path, args: &[&str], env: Env) -> anyhow::Result<Git> {
+    Ok(RepoGit::with_env(dir, env).map_err(redacted)?.git().env("GIT_TERMINAL_PROMPT", "0").args(args))
 }
 
 /// A core git error with the URL-ish parts redacted.
@@ -42,7 +41,7 @@ fn redacted(e: crate::Error) -> anyhow::Error {
 }
 
 fn output(dir: &Path, args: &[&str], env: Env) -> anyhow::Result<Output> {
-    command(dir, args, env).output().map_err(redacted)
+    command(dir, args, env)?.output().map_err(redacted)
 }
 
 fn failed(args: &[&str], out: &Output) -> anyhow::Error {
@@ -87,22 +86,6 @@ pub fn run(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
 
 fn run_env(dir: &Path, args: &[&str], env: Env) -> anyhow::Result<String> {
     let out = output(dir, args, env)?;
-    if !out.status.success() {
-        return Err(failed(args, &out));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-/// [`run_env`] with every filter driver git's configuration has in `dir`
-/// turned off: the skills repo supports none (see [`crate::git::driver_paths`]),
-/// so its clone and first Baseline run none either.
-fn run_without_filter_drivers(dir: &Path, args: &[&str], env: Env) -> anyhow::Result<String> {
-    let drivers = crate::git::configured_drivers(command(dir, &[], env)).map_err(redacted)?;
-    let mut git = Git::new(dir).env("GIT_TERMINAL_PROMPT", "0").without_filter_drivers(&drivers).args(args);
-    for (k, v) in env {
-        git = git.env(k, v);
-    }
-    let out = git.output().map_err(redacted)?;
     if !out.status.success() {
         return Err(failed(args, &out));
     }
@@ -302,7 +285,7 @@ pub fn adopt_first_baseline(dir: &Path) -> anyhow::Result<FirstBaseline> {
     }
     // Git only writes metadata, after every working-tree publication succeeds.
     run(dir, &["symbolic-ref", "HEAD", &format!("refs/heads/{FLEET_BRANCH}")])?;
-    run_without_filter_drivers(dir, &["reset", "--quiet", "--mixed", &remote], &[])?;
+    run_env(dir, &["reset", "--quiet", "--mixed", &remote], &[])?;
     Ok(FirstBaseline::Adopted(remote))
 }
 
@@ -449,13 +432,40 @@ pub fn ensure_clone(dir: &Path, remote: &str, env: &[(String, String)]) -> anyho
             .tempdir_in(&parent)
             .with_context(|| format!("creating a directory in {}", parent.display()))?;
         let target = stage.path().join("repo");
-        let clone = ["clone", "--quiet", "--origin", REMOTE, &remote, &target.to_string_lossy()];
-        run_without_filter_drivers(stage.path(), &clone, env)?;
+        let clone = ["clone", "--quiet", "--no-checkout", "--origin", REMOTE, &remote, &target.to_string_lossy()];
+        run_env(stage.path(), &clone, env)?;
+        check_out_clone(&target, env)?;
         std::fs::rename(&target, dir).with_context(|| format!("moving the clone to {}", dir.display()))?;
         Setup::Cloned
     };
     private_config(dir)?;
     Ok(setup)
+}
+
+/// Checks out a clone made with `--no-checkout`. Its filter drivers are
+/// read from the clone itself, where git's configuration (a conditional
+/// include on its `gitdir`, say) applies as it does for the checkout, and
+/// turned off for it; a Baseline that writes a file through one is refused,
+/// as a pull refuses it (see [`crate::git::driver_paths`]).
+fn check_out_clone(dir: &Path, env: Env) -> anyhow::Result<()> {
+    if rev(dir, "HEAD")?.is_none() {
+        return Ok(());
+    }
+    let repo = RepoGit::with_env(dir, env).map_err(redacted)?;
+    let listed = repo.git().args(["ls-tree", "-r", "-z", "--name-only", "HEAD"]).run().map_err(redacted)?;
+    let paths: Vec<PathBuf> = crate::git::split_paths(&listed).collect();
+    let paths: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+    let filtered = crate::git::driver_paths(repo.git(), Some("HEAD"), &paths, repo.drivers()).map_err(redacted)?;
+    if !filtered.is_empty() {
+        let names: Vec<String> = filtered.iter().map(|p| p.display().to_string()).collect();
+        bail!(
+            "the server's Baseline writes {} through a git filter driver (`filter` in .gitattributes), which the \
+             skills repo doesn't support; remove it from .gitattributes there",
+            names.join(", ")
+        );
+    }
+    repo.git().args(["reset", "--quiet", "--hard", "HEAD"]).run().map_err(redacted)?;
+    Ok(())
 }
 
 fn private_config(dir: &Path) -> anyhow::Result<()> {
@@ -571,11 +581,10 @@ pub fn has_credentials(url: &str) -> bool {
 /// The canonical git directory of the repo at `root`, `None` while it is no
 /// git repo (yet).
 pub fn absolute_git_dir(root: &Path) -> Option<PathBuf> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
+    let out = RepoGit::open(root)
+        .ok()?
+        .git()
         .args(["rev-parse", "--absolute-git-dir"])
-        .stderr(std::process::Stdio::null())
         .output()
         .ok()
         .filter(|o| o.status.success())?;
@@ -919,5 +928,59 @@ mod tests {
         git(tmp.path(), &["init", "--quiet", "--bare", "-b", "main", empty.to_str().unwrap()]);
         git(&own, &["remote", "set-url", REMOTE, empty.to_str().unwrap()]);
         assert!(check_shares_history(&own, &[]).unwrap_err().to_string().contains("no commits on `main`"));
+    }
+
+    /// A clone runs no filter driver, not even one git's configuration
+    /// names only for the clone's own git directory (`includeIf.gitdir`),
+    /// and a Baseline that writes a file through one is refused.
+    #[test]
+    fn a_clone_runs_no_filter_driver_a_conditional_include_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tmp.path().canonicalize().unwrap();
+        let seed = tmp.join("seed");
+        git(&tmp, &["init", "--quiet", "-b", "main", seed.to_str().unwrap()]);
+        std::fs::write(seed.join("sk1ll.toml"), "").unwrap();
+        std::fs::write(seed.join(".gitattributes"), "*.md filter=x\n").unwrap();
+        std::fs::write(seed.join("notes.md"), "notes\n").unwrap();
+        git(&seed, &["add", "-A"]);
+        git(&seed, &["commit", "--quiet", "-m", "baseline"]);
+        let remote = tmp.join("server.git");
+        git(&tmp, &["clone", "--quiet", "--bare", seed.to_str().unwrap(), remote.to_str().unwrap()]);
+        let marker = tmp.join("ran");
+        let filter = tmp.join("filter.gitconfig");
+        let cmd = format!("touch '{}'; cat", marker.display());
+        std::fs::write(&filter, format!("[filter \"x\"]\n\tsmudge = {cmd}\n\tclean = {cmd}\n")).unwrap();
+        // Applies to any git directory under `tmp`: the clone's, not the
+        // directory it is made from.
+        let global = tmp.join("global.gitconfig");
+        let include = format!("[includeIf \"gitdir:{}/**\"]\n\tpath = {}\n", tmp.display(), filter.display());
+        std::fs::write(&global, include).unwrap();
+        let env = [("GIT_CONFIG_GLOBAL".to_string(), global.to_string_lossy().into_owned())];
+        let dir = tmp.join("clone");
+        let error = ensure_clone(&dir, remote.to_str().unwrap(), &env).unwrap_err().to_string();
+        assert!(error.contains("notes.md") && error.contains("filter driver"), "{error}");
+        assert!(!marker.exists(), "a filter driver ran");
+        assert!(!dir.exists(), "a refused clone is not moved into place");
+        // The include does name the driver where git checks out.
+        let plain = tmp.join("plain");
+        let out = std::process::Command::new("git")
+            .args(["clone", "--quiet", remote.to_str().unwrap(), plain.to_str().unwrap()])
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(marker.exists(), "the test's driver is not configured as git reads it");
+    }
+
+    /// Without a filter attribute, the clone is checked out in full.
+    #[test]
+    fn a_clone_is_checked_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = server(tmp.path());
+        let dir = tmp.path().join("clone");
+        assert_eq!(ensure_clone(&dir, &remote, &[]).unwrap(), Setup::Cloned);
+        assert!(dir.join("sk1ll.toml").is_file());
+        assert_eq!(git(&dir, &["status", "--porcelain"]), "");
     }
 }

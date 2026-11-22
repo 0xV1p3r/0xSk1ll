@@ -2088,7 +2088,8 @@ pub mod displaced {
 
     impl Provenance {
         fn current(repo: &Repo, source: Option<&Path>) -> Result<Self> {
-            let git = || crate::git::Git::new(repo.root()).env("GIT_OPTIONAL_LOCKS", "0");
+            let repo_git = crate::git::RepoGit::with_env(repo.root(), &[("GIT_OPTIONAL_LOCKS".into(), "0".into())])?;
+            let git = || repo_git.git();
             let head = if git().args(["rev-parse", "--verify", "--quiet", "HEAD"]).succeeds()? {
                 Some(git().args(["rev-parse", "HEAD"]).text()?)
             } else {
@@ -2445,7 +2446,7 @@ pub mod displaced {
             // Pull's entries are in the git directory of the repo they came from.
             None if entry.kind == Kind::Draft => {
                 let holder = entry.path.ancestors().nth(4).unwrap_or(&entry.path);
-                let out = crate::git::Git::new(repo.root()).args(["rev-parse", "--absolute-git-dir"]).run()?;
+                let out = crate::git::Git::repo(repo.root())?.args(["rev-parse", "--absolute-git-dir"]).run()?;
                 let git_dir = crate::git::path_from_bytes(out.strip_suffix(b"\n").unwrap_or(&out));
                 let same = matches!((git_dir.canonicalize(), holder.canonicalize()), (Ok(a), Ok(b)) if a == b);
                 (!same).then(|| holder.to_path_buf())
@@ -2485,7 +2486,8 @@ pub mod displaced {
     fn history_connects(repo: &Repo, placed: &Provenance, id: &ItemId) -> Result<bool> {
         let Some(start) = placed.head.as_deref() else { return Ok(true) };
         let root = repo.root();
-        let git = || crate::git::Git::new(root).env("GIT_OPTIONAL_LOCKS", "0");
+        let repo_git = crate::git::RepoGit::with_env(root, &[("GIT_OPTIONAL_LOCKS".into(), "0".into())])?;
+        let git = || repo_git.git();
         if !git().args(["merge-base", "--is-ancestor", start, "HEAD"]).succeeds()? {
             return Ok(false);
         }

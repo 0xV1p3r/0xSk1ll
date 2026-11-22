@@ -27,6 +27,7 @@ use crate::{Error, Result};
 
 pub mod config_env;
 mod filters;
+pub use filters::RepoGit;
 pub(crate) use filters::{configured_drivers, driver_paths};
 /// Unix only, like the daemon and the fleet that use it.
 #[cfg(unix)]

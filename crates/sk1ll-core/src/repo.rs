@@ -279,7 +279,8 @@ impl Repo {
         if !dir.join(".git").exists() && !layout.contains(&true) {
             return false;
         }
-        let git = || crate::git::Git::new(dir);
+        let Ok(repo) = crate::git::RepoGit::open(dir) else { return false };
+        let git = || repo.git();
         // `HEAD:./path` is relative to `dir`, wherever the worktree's top is.
         if git().args(["cat-file", "-e", &format!("HEAD:./{MANIFEST_FILE}")]).succeeds().unwrap_or(false) {
             return true;

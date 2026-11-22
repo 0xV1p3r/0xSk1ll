@@ -365,7 +365,9 @@ pub(crate) fn unique(dir: &Path) -> PathBuf {
 /// (shared by its worktrees), once. Best effort: draft and discovery ignore
 /// staging paths themselves too.
 pub(crate) fn exclude_stages(root: &Path) {
-    let Ok(common) = Git::new(root).args(["rev-parse", "--path-format=absolute", "--git-common-dir"]).text() else {
+    let Ok(common) =
+        Git::repo(root).and_then(|git| git.args(["rev-parse", "--path-format=absolute", "--git-common-dir"]).text())
+    else {
         return;
     };
     let info = Path::new(&common).join("info");

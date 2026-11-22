@@ -134,7 +134,7 @@ pub(super) fn journal_exists(git_dir: &Path) -> Result<bool> {
 /// Whether a pull stopped half-way and left its journal. Content that is
 /// not in a Git repository (yet) has nothing to pull.
 pub(super) fn pending(repo: &Repo) -> Result<bool> {
-    let git_dir = match Git::new(repo.root()).args(["rev-parse", "--absolute-git-dir"]).run() {
+    let git_dir = match Git::repo(repo.root()).and_then(|git| git.args(["rev-parse", "--absolute-git-dir"]).run()) {
         Err(Error::Git { stderr, .. }) if stderr.contains("not a git repository") => return Ok(false),
         git_dir => git_dir?,
     };
