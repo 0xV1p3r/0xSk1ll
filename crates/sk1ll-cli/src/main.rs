@@ -593,10 +593,19 @@ fn command(s: &Session, cmd: Cmd) -> Result<()> {
             print_import_changes(&name, s.block(c.import_changes(&name, None))?);
         }
         Cmd::Update { name, force, .. } => {
-            for r in s.block(c.update_imports(&UpdateImportsRequest { name, force, expected: None }))? {
+            let updated = s.block(c.update_imports(&UpdateImportsRequest { name, force, expected: None }))?;
+            if updated.is_empty() {
+                println!("no imports to update; import a skill with `sk1ll add <link>`");
+            }
+            for r in &updated {
                 print_update(&r.name, r.old_commit.as_deref(), &r.new_commit, r.changed);
             }
-            println!("review with `sk1ll diff`, then commit");
+            let changed: Vec<_> = updated.iter().filter(|r| r.changed).map(|r| fleet::shell_arg(&r.name)).collect();
+            match &changed[..] {
+                [] => {}
+                [name] => println!("review with `sk1ll diff {name}`, then `sk1ll commit {name}`"),
+                names => println!("review each with `sk1ll diff <name>`, then `sk1ll commit {}`", names.join(" ")),
+            }
         }
         Cmd::Remove { name } => {
             s.block(c.remove_import(&name))?;

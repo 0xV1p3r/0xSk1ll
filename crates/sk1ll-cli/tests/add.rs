@@ -149,3 +149,21 @@ fn relative_sources_mean_the_cwd_on_the_command_line_and_the_repo_root_in_the_ma
     assert!(update.status.success(), "{}", text(&update));
     assert!(env.root.join("repo/imported/web/SKILL.md").is_file());
 }
+
+/// `update` says when there is nothing to update, and asks for a review
+/// only of the imports that changed.
+#[cfg(unix)]
+#[test]
+fn update_says_what_changed_and_asks_for_a_review_only_then() {
+    let env = Env::new("update");
+    let origin = env.origin();
+    let none = text(&env.sk1ll(&["update"]));
+    assert!(none.contains("no imports to update") && !none.contains("review"), "{none}");
+    assert!(env.sk1ll(&["add", &origin, "--path", "skills/pdf"]).status.success());
+    let unchanged = text(&env.sk1ll(&["update"]));
+    assert!(unchanged.contains("up to date") && !unchanged.contains("review"), "{unchanged}");
+    std::fs::write(env.root.join("origin/skills/pdf/SKILL.md"), "---\ndescription: PDFs, v2\n---\n").unwrap();
+    git(&env.root.join("origin"), &["-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-qam", "v2"]);
+    let changed = text(&env.sk1ll(&["update"]));
+    assert!(changed.contains("review with `sk1ll diff pdf`, then `sk1ll commit pdf`"), "{changed}");
+}
