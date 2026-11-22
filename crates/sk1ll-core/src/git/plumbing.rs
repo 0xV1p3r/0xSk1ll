@@ -17,8 +17,7 @@ use std::process::Output;
 use super::{Git, RepoGit};
 use crate::draft::{FLEET_BRANCH, REMOTE};
 use crate::redact::redact;
-use crate::{ItemRef, Repo};
-use anyhow::{Context, bail};
+use crate::{Error, IoExt, ItemRef, Repo, Result};
 use serde::{Deserialize, Serialize};
 
 type Env<'a> = &'a [(String, String)];
@@ -26,47 +25,58 @@ type Env<'a> = &'a [(String, String)];
 /// Every command here runs on the skills repo (or its clone being made),
 /// so it is built by [`RepoGit`]: with each filter driver git's
 /// configuration for `dir` names turned off.
-fn command(dir: &Path, args: &[&str], env: Env) -> anyhow::Result<Git> {
+fn command(dir: &Path, args: &[&str], env: Env) -> Result<Git> {
     Ok(RepoGit::with_env(dir, env).map_err(redacted)?.git().env("GIT_TERMINAL_PROMPT", "0").args(args))
 }
 
-/// A core git error with the URL-ish parts redacted.
-fn redacted(e: crate::Error) -> anyhow::Error {
+/// A core error with the URL-ish parts redacted: a git one's arguments and
+/// output, any other's message (kept as it is when there is nothing to
+/// redact in it).
+fn redacted(e: Error) -> Error {
     match e {
-        crate::Error::Git { args, stderr } => {
-            anyhow::anyhow!("`git {}` failed: {}", redact(&args), redact(&stderr))
+        Error::Git { args, stderr } => Error::Git { args: redact(&args), stderr: redact(&stderr) },
+        e => {
+            let message = e.to_string();
+            let clean = redact(&message);
+            if clean == message { e } else { Error::Invalid(clean) }
         }
-        e => anyhow::anyhow!("{}", redact(&e.to_string())),
     }
 }
 
-fn output(dir: &Path, args: &[&str], env: Env) -> anyhow::Result<Output> {
+fn output(dir: &Path, args: &[&str], env: Env) -> Result<Output> {
     command(dir, args, env)?.output().map_err(redacted)
 }
 
-fn failed(args: &[&str], out: &Output) -> anyhow::Error {
-    anyhow::anyhow!("`git {}` failed: {}", redact(&args.join(" ")), redact(String::from_utf8_lossy(&out.stderr).trim()))
+fn failed(args: &[&str], out: &Output) -> Error {
+    Error::Git { args: redact(&args.join(" ")), stderr: redact(String::from_utf8_lossy(&out.stderr).trim()) }
 }
 
 /// Diff two text snapshots using Git's unified diff, without touching the repo.
-pub fn diff_text(before: Option<&str>, after: &str) -> anyhow::Result<String> {
+pub fn diff_text(before: Option<&str>, after: &str) -> Result<String> {
     if before == Some(after) {
         return Ok(String::new());
     }
-    let scratch = tempfile::tempdir()?;
+    let scratch = temp_dir()?;
     let old = if let Some(before) = before {
-        std::fs::write(scratch.path().join("on-disk"), before)?;
+        let path = scratch.path().join("on-disk");
+        std::fs::write(&path, before).at(path)?;
         "on-disk"
     } else {
         "/dev/null"
     };
-    std::fs::write(scratch.path().join("next-sync"), after)?;
+    let next = scratch.path().join("next-sync");
+    std::fs::write(&next, after).at(next)?;
     let args = ["diff", "--no-index", "--no-color", "--no-ext-diff", "--no-textconv", "--text", "--", old, "next-sync"];
     let out = output(scratch.path(), &args, &[])?;
     if !matches!(out.status.code(), Some(0 | 1)) {
         return Err(failed(&args, &out));
     }
-    Ok(String::from_utf8(out.stdout)?)
+    String::from_utf8(out.stdout).map_err(|_| Error::Invalid("`git diff` printed text that is not UTF-8".into()))
+}
+
+/// A scratch directory in the system's temporary directory.
+fn temp_dir() -> Result<tempfile::TempDir> {
+    tempfile::tempdir().at(std::env::temp_dir())
 }
 
 /// `git diff --no-index` of two paths outside any repo, without external
@@ -80,11 +90,11 @@ pub fn diff_no_index(left: &Path, right: &Path) -> std::io::Result<Output> {
 }
 
 /// Runs git; non-zero is an error. Returns trimmed stdout.
-pub fn run(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
+pub fn run(dir: &Path, args: &[&str]) -> Result<String> {
     run_env(dir, args, &[])
 }
 
-fn run_env(dir: &Path, args: &[&str], env: Env) -> anyhow::Result<String> {
+fn run_env(dir: &Path, args: &[&str], env: Env) -> Result<String> {
     let out = output(dir, args, env)?;
     if !out.status.success() {
         return Err(failed(args, &out));
@@ -93,53 +103,53 @@ fn run_env(dir: &Path, args: &[&str], env: Env) -> anyhow::Result<String> {
 }
 
 /// Runs git; `None` on a non-zero exit.
-fn try_run(dir: &Path, args: &[&str]) -> anyhow::Result<Option<String>> {
+fn try_run(dir: &Path, args: &[&str]) -> Result<Option<String>> {
     let out = output(dir, args, &[])?;
     Ok(out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string()))
 }
 
-pub fn rev(dir: &Path, name: &str) -> anyhow::Result<Option<String>> {
+pub fn rev(dir: &Path, name: &str) -> Result<Option<String>> {
     try_run(dir, &["rev-parse", "--verify", "--quiet", &format!("{name}^{{commit}}")])
 }
 
-pub fn branch(dir: &Path) -> anyhow::Result<Option<String>> {
+pub fn branch(dir: &Path) -> Result<Option<String>> {
     try_run(dir, &["symbolic-ref", "--quiet", "--short", "HEAD"])
 }
 
 /// `refs/remotes/origin/main`: the server's baseline as last fetched or pushed.
-pub fn remote_head(dir: &Path) -> anyhow::Result<Option<String>> {
+pub fn remote_head(dir: &Path) -> Result<Option<String>> {
     rev(dir, &format!("refs/remotes/{REMOTE}/{FLEET_BRANCH}"))
 }
 
 /// Fetches every branch of origin (pruning the ones it no longer has), so
 /// `refs/remotes/origin/*` is exactly what the server has.
-fn fetch_all(dir: &Path, env: Env) -> anyhow::Result<()> {
+fn fetch_all(dir: &Path, env: Env) -> Result<()> {
     let refspec = format!("+refs/heads/*:refs/remotes/{REMOTE}/*");
     run_env(dir, &["fetch", "--quiet", "--prune", REMOTE, &refspec], env).map(drop)
 }
 
-fn no_fleet_branch(others: &[String]) -> anyhow::Error {
+fn no_fleet_branch(others: &[String]) -> Error {
     if others.is_empty() {
-        anyhow::anyhow!("the server has no commits on `{FLEET_BRANCH}`")
+        Error::Invalid(format!("the server has no commits on `{FLEET_BRANCH}`"))
     } else {
-        anyhow::anyhow!("the server has no `{FLEET_BRANCH}` branch (it has {})", others.join(", "))
+        Error::Invalid(format!("the server has no `{FLEET_BRANCH}` branch (it has {})", others.join(", ")))
     }
 }
 
 /// The branches origin had at the last [`fetch_all`].
-fn remote_branches(dir: &Path) -> anyhow::Result<Vec<String>> {
+fn remote_branches(dir: &Path) -> Result<Vec<String>> {
     let prefix = format!("refs/remotes/{REMOTE}/");
     let refs = run(dir, &["for-each-ref", "--format=%(refname)", &prefix])?;
     Ok(refs.lines().filter_map(|r| r.strip_prefix(&prefix)).filter(|b| *b != "HEAD").map(str::to_string).collect())
 }
 
-pub fn is_ancestor(dir: &Path, a: &str, b: &str) -> anyhow::Result<bool> {
+pub fn is_ancestor(dir: &Path, a: &str, b: &str) -> Result<bool> {
     Ok(output(dir, &["merge-base", "--is-ancestor", a, b], &[])?.status.success())
 }
 
 /// The server baseline the working tree is built on: origin's branch if `HEAD`
 /// contains it, else where `HEAD` forked from it (Blocked: the old baseline).
-pub fn baseline(dir: &Path) -> anyhow::Result<Option<String>> {
+pub fn baseline(dir: &Path) -> Result<Option<String>> {
     let (Some(remote), Some(head)) = (remote_head(dir)?, rev(dir, "HEAD")?) else {
         return Ok(None);
     };
@@ -150,7 +160,7 @@ pub fn baseline(dir: &Path) -> anyhow::Result<Option<String>> {
 }
 
 /// Whether `HEAD` has commits origin doesn't.
-pub fn has_unpushed(dir: &Path) -> anyhow::Result<bool> {
+pub fn has_unpushed(dir: &Path) -> Result<bool> {
     let Some(head) = rev(dir, "HEAD")? else {
         return Ok(false);
     };
@@ -161,7 +171,7 @@ pub fn has_unpushed(dir: &Path) -> anyhow::Result<bool> {
 }
 
 /// Items touched by commits in `HEAD` that origin doesn't have.
-pub fn unpushed_items(dir: &Path) -> anyhow::Result<Vec<ItemRef>> {
+pub fn unpushed_items(dir: &Path) -> Result<Vec<ItemRef>> {
     if !has_unpushed(dir)? {
         return Ok(Vec::new());
     }
@@ -200,7 +210,7 @@ thread_local! {
 /// as draft. Every checkout destination is checked before HEAD or the index
 /// moves. Ignored files and symlinks are checked directly on disk too.
 /// Talks to no server: the caller has fetched origin's branches.
-pub fn adopt_first_baseline(dir: &Path) -> anyhow::Result<FirstBaseline> {
+pub fn adopt_first_baseline(dir: &Path) -> Result<FirstBaseline> {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
@@ -218,13 +228,17 @@ pub fn adopt_first_baseline(dir: &Path) -> anyhow::Result<FirstBaseline> {
     }
     // An empty server clone and /init already contain core's starter files.
     // Keep those untouched; any other existing target belongs to the user.
-    let template = tempfile::tempdir()?;
+    let template = temp_dir()?;
     Repo::init(template.path())?;
     let mut missing = Vec::new();
     let mut blocked = BTreeSet::new();
     for entry in tree.stdout.split(|b| *b == 0).filter(|p| !p.is_empty()) {
-        let tab = entry.iter().position(|b| *b == b'\t').context("invalid ls-tree entry")?;
-        let fields = std::str::from_utf8(&entry[..tab])?.split_whitespace().collect::<Vec<_>>();
+        let tab =
+            entry.iter().position(|b| *b == b'\t').ok_or_else(|| Error::Invalid("invalid ls-tree entry".into()))?;
+        let fields = std::str::from_utf8(&entry[..tab])
+            .map_err(|_| Error::Invalid("invalid ls-tree entry".into()))?
+            .split_whitespace()
+            .collect::<Vec<_>>();
         let path = Path::new(OsStr::from_bytes(&entry[tab + 1..]));
         let mut destination = dir.to_path_buf();
         let mut obstructed = false;
@@ -239,13 +253,15 @@ pub fn adopt_first_baseline(dir: &Path) -> anyhow::Result<FirstBaseline> {
                 }
                 Ok(meta) => {
                     let starter = template.path().join(path);
-                    if !meta.is_file() || !starter.is_file() || std::fs::read(&destination)? != std::fs::read(starter)?
+                    if !meta.is_file()
+                        || !starter.is_file()
+                        || std::fs::read(&destination).at(&destination)? != std::fs::read(&starter).at(&starter)?
                     {
                         obstructed = true;
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e).with_context(|| format!("checking {}", destination.display())),
+                Err(e) => return Err(e).at(destination),
             }
         }
         if obstructed {
@@ -263,7 +279,7 @@ pub fn adopt_first_baseline(dir: &Path) -> anyhow::Result<FirstBaseline> {
             hook();
         }
     });
-    let directory = crate::placement::Directory::open(dir, false)?;
+    let directory = crate::placement::Directory::open(dir, false).at(dir)?;
     for (path, mode, oid) in missing {
         let blob = output(dir, &["cat-file", "blob", &oid], &[])?;
         if !blob.status.success() {
@@ -294,12 +310,12 @@ pub fn adopt_first_baseline(dir: &Path) -> anyhow::Result<FirstBaseline> {
 /// dropped, so the starter files are draft again, and the baseline adopted.
 /// Unless it is adopted, the commit is restored. `None` when this doesn't apply.
 /// Like [`adopt_first_baseline`], it reads what the caller fetched.
-pub fn adopt_first_baseline_over_init(dir: &Path) -> anyhow::Result<Option<FirstBaseline>> {
+pub fn adopt_first_baseline_over_init(dir: &Path) -> Result<Option<FirstBaseline>> {
     let Some(head) = rev(dir, "HEAD")? else { return Ok(None) };
     if branch(dir)?.as_deref() != Some(FLEET_BRANCH) || rev(dir, "HEAD^")?.is_some() {
         return Ok(None);
     }
-    let template = tempfile::tempdir()?;
+    let template = temp_dir()?;
     Repo::init(template.path())?;
     run(template.path(), &["add", "--all"])?;
     if run(template.path(), &["write-tree"])? != run(dir, &["rev-parse", "HEAD^{tree}"])? {
@@ -332,10 +348,10 @@ pub enum Setup {
 /// Whether `dir` can become the machine's clone of `remote`: missing, an
 /// empty directory, or a git repo whose origin is `remote` (credentials
 /// aside). Checked before joining, so a refusal costs no join code.
-pub fn check_repo_path(dir: &Path, remote: &str) -> anyhow::Result<()> {
+pub fn check_repo_path(dir: &Path, remote: &str) -> Result<()> {
     match std::fs::read_dir(dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+        Err(e) => return Err(e).at(dir),
         Ok(mut entries) => {
             if entries.next().is_none() {
                 return Ok(());
@@ -343,18 +359,23 @@ pub fn check_repo_path(dir: &Path, remote: &str) -> anyhow::Result<()> {
         }
     }
     if !dir.join(".git").exists() {
-        bail!("{} exists and is not empty or a clone of the server's repo; pick another --repo", dir.display());
+        return Err(Error::Invalid(format!(
+            "{} exists and is not empty or a clone of the server's repo; pick another --repo",
+            dir.display()
+        )));
     }
     let origin = try_run(dir, &["remote", "get-url", REMOTE])?;
     match origin {
         Some(url) if without_credentials(&url) == without_credentials(remote) => check_fleet_branch(dir),
-        Some(url) => bail!(
+        Some(url) => Err(Error::Invalid(format!(
             "{} is a clone of {}, not of the server ({}); pick another --repo",
             dir.display(),
             without_credentials(&url),
             without_credentials(remote)
-        ),
-        None => bail!("{} is a git repo without an `{REMOTE}`; pick another --repo", dir.display()),
+        ))),
+        None => {
+            Err(Error::Invalid(format!("{} is a git repo without an `{REMOTE}`; pick another --repo", dir.display())))
+        }
     }
 }
 
@@ -362,22 +383,22 @@ pub fn check_repo_path(dir: &Path, remote: &str) -> anyhow::Result<()> {
 /// `main`, and a clone on another branch would pull nothing and push a
 /// separate branch the fleet never sees. An unborn `HEAD` is fine (it is
 /// pointed at `main` before anything is committed).
-fn check_fleet_branch(dir: &Path) -> anyhow::Result<()> {
+fn check_fleet_branch(dir: &Path) -> Result<()> {
     if rev(dir, "HEAD")?.is_none() {
         return Ok(());
     }
     match branch(dir)? {
         Some(b) if b == FLEET_BRANCH => Ok(()),
-        Some(b) => bail!(
+        Some(b) => Err(Error::Invalid(format!(
             "{} is on branch `{b}`, but the fleet's baseline is `{FLEET_BRANCH}`; rename it (`git -C {} branch -m {b} \
              {FLEET_BRANCH}`) or check out `{FLEET_BRANCH}`, or pick another --repo",
             dir.display(),
             dir.display()
-        ),
-        None => bail!(
+        ))),
+        None => Err(Error::Invalid(format!(
             "{} has a detached HEAD; check out `{FLEET_BRANCH}` (the fleet's baseline) or pick another --repo",
             dir.display()
-        ),
+        ))),
     }
 }
 
@@ -386,7 +407,7 @@ fn check_fleet_branch(dir: &Path) -> anyhow::Result<()> {
 /// first pull or push can't go off on a history of its own. A clone without
 /// commits has no local history to check.
 /// `env` authenticates git, as for [`ensure_clone`].
-pub fn check_shares_history(dir: &Path, env: &[(String, String)]) -> anyhow::Result<()> {
+pub fn check_shares_history(dir: &Path, env: &[(String, String)]) -> Result<()> {
     check_fleet_branch(dir)?;
     fetch_all(dir, env)?;
     let Some(head) = rev(dir, "HEAD")? else {
@@ -399,19 +420,19 @@ pub fn check_shares_history(dir: &Path, env: &[(String, String)]) -> anyhow::Res
     if output(dir, &["merge-base", &head, &remote], &[])?.status.success() {
         return Ok(());
     }
-    bail!(
+    Err(Error::Invalid(format!(
         "{}'s `{FLEET_BRANCH}` shares no history with the server's `{FLEET_BRANCH}` (it was started on its own, not \
          cloned from the server), so its commits can't be pulled or pushed; move it aside and the daemon clones the server's \
          repo there, or pick another --repo",
         dir.display()
-    )
+    )))
 }
 
 /// Makes `dir` a clone of `remote` (see [`check_repo_path`]). `env` is how
 /// git authenticates (see [`super::config_env`]); origin
 /// never carries credentials, and an existing clone whose origin (or push
 /// URL) still has them from an older version is rewritten without them.
-pub fn ensure_clone(dir: &Path, remote: &str, env: &[(String, String)]) -> anyhow::Result<Setup> {
+pub fn ensure_clone(dir: &Path, remote: &str, env: &[(String, String)]) -> Result<Setup> {
     let remote = without_credentials(remote);
     check_repo_path(dir, &remote)?;
     let setup = if dir.join(".git").exists() {
@@ -426,16 +447,13 @@ pub fn ensure_clone(dir: &Path, remote: &str, env: &[(String, String)]) -> anyho
         // that runs meanwhile (the daemon clones outside its engine mutex)
         // takes a half-made clone for the repo. `dir` is missing or empty.
         let parent: PathBuf = dir.parent().map(Path::to_path_buf).unwrap_or_else(|| ".".into());
-        std::fs::create_dir_all(&parent).with_context(|| format!("creating {}", parent.display()))?;
-        let stage = tempfile::Builder::new()
-            .prefix(".sk1ll-clone-")
-            .tempdir_in(&parent)
-            .with_context(|| format!("creating a directory in {}", parent.display()))?;
+        std::fs::create_dir_all(&parent).at(&parent)?;
+        let stage = tempfile::Builder::new().prefix(".sk1ll-clone-").tempdir_in(&parent).at(&parent)?;
         let target = stage.path().join("repo");
         let clone = ["clone", "--quiet", "--no-checkout", "--origin", REMOTE, &remote, &target.to_string_lossy()];
         run_env(stage.path(), &clone, env)?;
         check_out_clone(&target, env)?;
-        std::fs::rename(&target, dir).with_context(|| format!("moving the clone to {}", dir.display()))?;
+        std::fs::rename(&target, dir).at(dir)?;
         Setup::Cloned
     };
     private_config(dir)?;
@@ -447,7 +465,7 @@ pub fn ensure_clone(dir: &Path, remote: &str, env: &[(String, String)]) -> anyho
 /// include on its `gitdir`, say) applies as it does for the checkout, and
 /// turned off for it; a Baseline that writes a file through one is refused,
 /// as a pull refuses it (see [`crate::git::driver_paths`]).
-fn check_out_clone(dir: &Path, env: Env) -> anyhow::Result<()> {
+fn check_out_clone(dir: &Path, env: Env) -> Result<()> {
     if rev(dir, "HEAD")?.is_none() {
         return Ok(());
     }
@@ -458,34 +476,33 @@ fn check_out_clone(dir: &Path, env: Env) -> anyhow::Result<()> {
     let filtered = crate::git::driver_paths(repo.git(), Some("HEAD"), &paths, repo.drivers()).map_err(redacted)?;
     if !filtered.is_empty() {
         let names: Vec<String> = filtered.iter().map(|p| p.display().to_string()).collect();
-        bail!(
+        return Err(Error::Invalid(format!(
             "the server's Baseline writes {} through a git filter driver (`filter` in .gitattributes), which the \
              skills repo doesn't support; remove it from .gitattributes there",
             names.join(", ")
-        );
+        )));
     }
     repo.git().args(["reset", "--quiet", "--hard", "HEAD"]).run().map_err(redacted)?;
     Ok(())
 }
 
-fn private_config(dir: &Path) -> anyhow::Result<()> {
+fn private_config(dir: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let path = dir.join(".git").join("config");
     if path.is_file() {
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("chmod {}", path.display()))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).at(&path)?;
     }
     Ok(())
 }
 
 /// Whether this repo defines its own origin remote.
-pub fn has_origin(dir: &Path) -> anyhow::Result<bool> {
+pub fn has_origin(dir: &Path) -> Result<bool> {
     Ok(try_run(dir, &["remote", "get-url", "origin"])?.is_some())
 }
 
 /// A standalone repo may join only when it is an untouched init, or an
 /// unchanged clone of this server without any local commits to preserve.
-pub fn check_standalone_join(dir: &Path, remote: &str) -> anyhow::Result<()> {
+pub fn check_standalone_join(dir: &Path, remote: &str) -> Result<()> {
     if is_pristine_init(dir)? {
         return Ok(());
     }
@@ -493,18 +510,20 @@ pub fn check_standalone_join(dir: &Path, remote: &str) -> anyhow::Result<()> {
     // complete pristine init may only be adopted when it has no worktree entries.
     if dir.join(".git").exists()
         && rev(dir, "HEAD")?.is_none()
-        && std::fs::read_dir(dir)?.any(|entry| entry.map_or(true, |e| e.file_name() != ".git"))
+        && std::fs::read_dir(dir).at(dir)?.any(|entry| entry.map_or(true, |e| e.file_name() != ".git"))
     {
-        bail!(
+        return Err(Error::Invalid(
             "the standalone repo has a draft or local commits, or other content outside a pristine init; move it aside before joining a Fleet"
-        );
+                .into(),
+        ));
     }
     if dir.join(".git").exists()
         && (!run(dir, &["status", "--porcelain", "--untracked-files=all"])?.is_empty() || has_unpushed(dir)?)
     {
-        bail!(
+        return Err(Error::Invalid(
             "the standalone repo has a draft or local commits; move it aside or choose another repo before joining a Fleet"
-        );
+                .into(),
+        ));
     }
     check_repo_path(dir, remote)?;
     Ok(())
@@ -515,7 +534,7 @@ pub fn check_standalone_join(dir: &Path, remote: &str) -> anyhow::Result<()> {
 /// The repo may be unborn, or hold only the commit of those files that
 /// `init_committed` makes: one root commit on the fleet branch, no other
 /// refs, nothing staged or changed.
-pub fn is_pristine_init(dir: &Path) -> anyhow::Result<bool> {
+pub fn is_pristine_init(dir: &Path) -> Result<bool> {
     if dir.symlink_metadata().is_ok_and(|m| m.is_symlink()) || !dir.join(".git").is_dir() {
         return Ok(false);
     }
@@ -526,18 +545,14 @@ pub fn is_pristine_init(dir: &Path) -> anyhow::Result<bool> {
     {
         return Ok(false);
     }
-    fn files(
-        root: &Path,
-        dir: &Path,
-        out: &mut std::collections::BTreeMap<PathBuf, Option<Vec<u8>>>,
-    ) -> anyhow::Result<bool> {
-        for entry in std::fs::read_dir(dir)? {
-            let path = entry?.path();
-            let rel = path.strip_prefix(root)?;
+    fn files(root: &Path, dir: &Path, out: &mut std::collections::BTreeMap<PathBuf, Option<Vec<u8>>>) -> Result<bool> {
+        for entry in std::fs::read_dir(dir).at(dir)? {
+            let path = entry.at(dir)?.path();
+            let rel = path.strip_prefix(root).expect("a directory's entry is inside its root");
             if rel == Path::new(".git") {
                 continue;
             }
-            let meta = path.symlink_metadata()?;
+            let meta = path.symlink_metadata().at(&path)?;
             if meta.is_symlink() {
                 return Ok(false);
             }
@@ -547,14 +562,14 @@ pub fn is_pristine_init(dir: &Path) -> anyhow::Result<bool> {
                     return Ok(false);
                 }
             } else if meta.is_file() {
-                out.insert(rel.to_path_buf(), Some(std::fs::read(path)?));
+                out.insert(rel.to_path_buf(), Some(std::fs::read(&path).at(&path)?));
             } else {
                 return Ok(false);
             }
         }
         Ok(true)
     }
-    let template = tempfile::tempdir()?;
+    let template = temp_dir()?;
     Repo::init(template.path())?;
     let (mut expected, mut actual) = (Default::default(), Default::default());
     Ok(files(template.path(), template.path(), &mut expected)? && files(dir, dir, &mut actual)? && expected == actual)
@@ -597,7 +612,7 @@ mod tests {
     use super::*;
 
     /// What the daemon does: fetch, then adopt from what was fetched.
-    fn fetched<T>(dir: &Path, adopt: fn(&Path) -> anyhow::Result<T>) -> anyhow::Result<T> {
+    fn fetched<T>(dir: &Path, adopt: fn(&Path) -> Result<T>) -> Result<T> {
         fetch_all(dir, &[])?;
         adopt(dir)
     }
