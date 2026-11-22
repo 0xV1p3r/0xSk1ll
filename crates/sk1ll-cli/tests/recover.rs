@@ -41,5 +41,6 @@ fn recover_list_shows_displaced_content() {
         .unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let text = String::from_utf8(output.stdout).unwrap();
-    assert!(text.contains("test-entry") && text.contains("agent") && text.contains("(changed)"), "{text}");
+    assert!(text.contains("test-entry") && text.contains("agent") && text.contains("changed: "), "{text}");
+    assert!(!text.contains("rule.md"), "paths only with --paths: {text}");
 }

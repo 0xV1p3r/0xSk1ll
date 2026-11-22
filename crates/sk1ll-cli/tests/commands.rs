@@ -661,6 +661,7 @@ fn a_blocked_machine_that_committed_the_clash_follows_the_hint_out() {
     assert!(!blocked.contains("commit or restore"), "{blocked}");
     let status = b.run(&["status"]).unwrap();
     assert!(status.contains("blocked: the pull of baseline") && status.contains("sk1ll restore skill:pdf"), "{status}");
+    assert!(status.contains("nothing to place") && !status.contains("in sync"), "{status}");
     // What the docs used to suggest: commit the clashing item.
     b.run(&["commit", "pdf"]).unwrap();
     let blocked = b.run(&["pull"]).unwrap_err();
@@ -680,9 +681,18 @@ fn a_blocked_machine_that_committed_the_clash_follows_the_hint_out() {
         .to_string();
     b.run(&["pull"]).unwrap();
     assert_eq!(skill(&b.repo), "a's edit\n");
-    assert!(b.run(&["recover", "list"]).unwrap().contains(&id));
+    // The pull keeps what it replaced too, unchanged: the restored entry is the one marked as b's version.
+    let listed = b.run(&["recover", "list"]).unwrap();
+    let line = listed.lines().find(|l| l.starts_with(&id)).unwrap_or_else(|| panic!("{listed}"));
+    assert!(line.contains("skill:pdf") && line.contains(" pull ") && line.contains("your version"), "{listed}");
+    assert!(!listed.contains(".sk1ll-tmp"), "paths only with --paths: {listed}");
+    assert!(b.run(&["recover", "list", "--paths"]).unwrap().contains(".sk1ll-tmp"));
+    let status = b.run(&["status"]).unwrap();
+    assert!(status.contains("1 changed entry") && status.contains("`sk1ll recover list`"), "{status}");
+    assert!(!status.contains("in sync"), "{status}");
     b.run(&["recover", "adopt", &id]).unwrap();
     assert_eq!(skill(&b.repo), "b's edit\n");
+    assert!(b.run(&["status"]).unwrap().contains("harnesses in sync"));
     b.run(&["commit", "pdf", "--push"]).unwrap();
     a.run(&["pull"]).unwrap();
     assert_eq!(skill(&a.repo), "b's edit\n");
