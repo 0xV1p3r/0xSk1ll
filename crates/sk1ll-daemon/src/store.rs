@@ -1,9 +1,11 @@
 //! Where this Machine's Assignment lives ([`AssignmentStore`]): at the
 //! server for a joined Machine ([ADR 0001]), in a machine-local file for a
-//! standalone one ([ADR 0004]). The daemon has one code path over it: it
-//! sends a write where the Assignment lives without the engine mutex, then
-//! applies the confirmed snapshot under the mutex, after checking that it is
-//! still in the [`World`](crate::daemon::World) it sent it from.
+//! standalone one ([ADR 0004]). A joined write is sent to the server without
+//! the engine mutex, then the confirmed snapshot is applied under the mutex,
+//! after checking that it is still in the [`World`](crate::daemon::World) it
+//! was sent from. A machine-local write has no network step: it is checked,
+//! saved and applied in one step under the engine mutex
+//! ([`LocalAssignment::write`]), so nothing can take its revision meanwhile.
 //!
 //! Loading and reading change nothing: a pending Harness rename is finished
 //! only under the engine mutex and the machine lock
@@ -20,7 +22,7 @@ use sk1ll_core::harness_rename::RenameIntent;
 use sk1ll_core::{Assignment, MachineConfig, Repo};
 use sk1ll_proto::{AssignmentChanges, AssignmentSnapshot, AssignmentUpdate, AssignmentWrite, ToggleKind};
 
-use crate::daemon::Daemon;
+use crate::daemon::{Daemon, Engine};
 use crate::error::{Error, Result};
 use crate::state::{self, DaemonState};
 use crate::{Config, server};
@@ -46,7 +48,8 @@ pub(crate) trait AssignmentStore: Send + Sync {
     /// Machine, whose session finishes its own.
     fn finish_interrupted_rename(&self) -> Result<()>;
 
-    /// The machine-local store.
+    /// The machine-local store, whose writes are made in one step under the
+    /// engine mutex instead of being sent ([`AssignmentStore::send`]).
     fn local(&self) -> Option<&LocalAssignment>;
 
     /// A file whose edits change the Assignment: an Input of the reconcile,
@@ -61,8 +64,9 @@ pub(crate) trait AssignmentStore: Send + Sync {
     /// A daemon that connects on demand connects here.
     fn ready<'a>(&'a self, d: &'a Arc<Daemon>) -> BoxFuture<'a, Result<()>>;
 
-    /// Sends `write` where the Assignment lives and returns what it
-    /// confirmed. Called without the engine mutex, one write at a time.
+    /// Sends `write` to the server and returns what it confirmed. Called
+    /// without the engine mutex, one write at a time. Only for a store
+    /// that isn't [`local`](AssignmentStore::local).
     fn send<'a>(&'a self, d: &'a Arc<Daemon>, write: AssignmentWrite) -> BoxFuture<'a, Result<AssignmentUpdate>>;
 
     /// This Machine's Assignment where it lives now (`GET`, and what a
@@ -82,6 +86,8 @@ pub(crate) fn for_machine(cfg: &Config, joined: Option<&DaemonState>) -> Box<dyn
             file: cfg.assignment.clone(),
             revisions: cfg.state.with_file_name("standalone-assignment.json"),
             machine_config: cfg.machine_config.clone(),
+            #[cfg(test)]
+            before_swap: Default::default(),
         }),
     }
 }
@@ -168,6 +174,9 @@ pub(crate) struct LocalAssignment {
     file: PathBuf,
     revisions: PathBuf,
     machine_config: PathBuf,
+    /// Runs in [`LocalAssignment::swap`] before it checks the file.
+    #[cfg(test)]
+    pub(crate) before_swap: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl AssignmentStore for LocalAssignment {
@@ -218,37 +227,10 @@ impl AssignmentStore for LocalAssignment {
         Box::pin(async { Ok(()) })
     }
 
-    /// The file is where the Assignment lives: the write is made to it under
-    /// the engine mutex, as the server would make it, and confirmed at once.
-    fn send<'a>(&'a self, d: &'a Arc<Daemon>, write: AssignmentWrite) -> BoxFuture<'a, Result<AssignmentUpdate>> {
-        let file = self.file.clone();
-        Box::pin(d.blocking(move |d, eng| {
-            d.lock_repo(eng)?;
-            d.refresh_assignment()?;
-            let applied = d.applied().expect("a standalone Machine always has its Assignment");
-            let mut assignment = Assignment::load(&file)?;
-            match write {
-                AssignmentWrite::Changes(changes) => {
-                    check_expected(&changes, &applied, d.ident.machine_id())?;
-                    apply_changes(&mut assignment, &changes, d)?;
-                }
-                AssignmentWrite::Harness { harness, enabled } => {
-                    known_harness(d, &harness)?;
-                    assignment.set_harness(&harness, enabled);
-                }
-                // A reconcile that ran since the intent was written finished
-                // the rename already: the file has it.
-                AssignmentWrite::RenameHarness(rename) => {
-                    if let Some(intent) = RenameIntent::load(&d.cfg.machine_config, None)?
-                        .filter(|intent| intent.operation_id == rename.operation_id)
-                    {
-                        assignment = intent.renamed_assignment(&file)?;
-                    }
-                }
-            }
-            let revision = applied.revision + u64::from(assignment != applied.assignment);
-            Ok(AssignmentUpdate { revision, assignment, entries: Vec::new(), errors: Vec::new() })
-        }))
+    fn send<'a>(&'a self, _: &'a Arc<Daemon>, _: AssignmentWrite) -> BoxFuture<'a, Result<AssignmentUpdate>> {
+        Box::pin(async {
+            Err(Error::Internal(anyhow::anyhow!("a machine-local Assignment write is made in one step, not sent")))
+        })
     }
 
     /// The applied snapshot, with a hand edit of the file not applied yet
@@ -261,6 +243,75 @@ impl AssignmentStore for LocalAssignment {
                 None => Ok(applied.expect("a standalone Machine always has its Assignment").as_ref().clone()),
             }
         })
+    }
+}
+
+/// How often a machine-local write starts over because the file was edited
+/// by hand while it was being made.
+const WRITE_ATTEMPTS: usize = 3;
+
+impl LocalAssignment {
+    /// Makes `write` to the file, under the engine mutex and the machine
+    /// lock, in one step: what it is made from (the applied revision, with a
+    /// hand edit taken up first), the next revision, saving both and
+    /// applying them to the harnesses. The save is a compare-and-swap: if
+    /// the file or its revision is no longer what the write was made from
+    /// (a hand edit landed meanwhile), nothing is written and the write is
+    /// made again from the new revision, so it is never lost and never
+    /// overwrites the edit.
+    pub(crate) fn write(&self, d: &Daemon, eng: &mut Engine, write: &AssignmentWrite) -> Result<AssignmentUpdate> {
+        d.ensure_managed()?;
+        d.lock_repo(eng)?;
+        for _ in 0..WRITE_ATTEMPTS {
+            d.refresh_assignment()?;
+            let base = d.applied().expect("a standalone Machine always has its Assignment");
+            let mut assignment = base.assignment.clone();
+            match write {
+                AssignmentWrite::Changes(changes) => {
+                    check_expected(changes, &base, d.ident.machine_id())?;
+                    apply_changes(&mut assignment, changes, d)?;
+                }
+                AssignmentWrite::Harness { harness, enabled } => {
+                    known_harness(d, harness)?;
+                    assignment.set_harness(harness, *enabled);
+                }
+                AssignmentWrite::RenameHarness(_) => {
+                    return Err(Error::Internal(anyhow::anyhow!("a machine-local Harness rename is made in one step")));
+                }
+            }
+            if assignment == base.assignment {
+                let errors = d.install_assignment(eng, None);
+                return Ok(AssignmentUpdate { revision: base.revision, assignment, entries: Vec::new(), errors });
+            }
+            let snap = AssignmentSnapshot { revision: base.revision + 1, assignment, registration: None };
+            if !self.swap(&base, &snap)? {
+                tracing::info!("the Assignment file changed while a write was made from it; making it again");
+                continue;
+            }
+            let (revision, assignment) = (snap.revision, snap.assignment.clone());
+            let errors = d.install_assignment(eng, Some(snap));
+            return Ok(AssignmentUpdate { revision, assignment, entries: Vec::new(), errors });
+        }
+        Err(Error::Conflict("the Assignment file kept changing while this write was made; try again".into()))
+    }
+
+    /// Saves `next` if the file and its revision are still `base`: `false`,
+    /// with nothing written, if not. The file is replaced atomically, its
+    /// revision after it, so a stop in between leaves a file that is newer
+    /// than its revision, which the next load counts as one more.
+    pub(crate) fn swap(&self, base: &AssignmentSnapshot, next: &AssignmentSnapshot) -> Result<bool> {
+        // A hand edit landing after the write was made from the file.
+        #[cfg(test)]
+        if let Some(edit) = self.before_swap.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            edit();
+        }
+        let stored = state::load_snapshot(&self.revisions, None)?;
+        if Assignment::load(&self.file)? != base.assignment || stored.is_some_and(|s| s.revision != base.revision) {
+            return Ok(false);
+        }
+        next.assignment.save(&self.file)?;
+        state::save_snapshot(&self.revisions, next, None)?;
+        Ok(true)
     }
 }
 

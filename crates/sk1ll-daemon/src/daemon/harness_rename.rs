@@ -12,12 +12,16 @@ use crate::error::{Error, Result};
 impl Daemon {
     /// Renames a Harness with its Assignment, in two writes a durable
     /// intent ties together: the machine config under the engine mutex, and
-    /// the Assignment where it lives ([`crate::store`]), without it.
+    /// the Assignment where it lives ([`crate::store`]): at the server
+    /// without the mutex, or the machine-local file in the same step.
     pub(crate) async fn rename_harness(
         self: &Arc<Self>,
         request: crate::client::HarnessRenameRequest,
     ) -> Result<crate::client::HarnessRenameResult> {
         let _writes = self.assignment_writes.lock().await;
+        if self.store.local().is_some() {
+            return self.blocking(move |d, eng| d.rename_harness_here(eng, request)).await;
+        }
         let authority = self.store.rename_authority();
         let pending = self
             .blocking({
@@ -55,6 +59,31 @@ impl Daemon {
                 Err(error)
             }
         }
+    }
+
+    /// A machine-local rename, in one step under the engine mutex: the
+    /// intent, both writes, the next revision and the sync. A rename that
+    /// stopped half-way is finished first (by the refresh), so a new one
+    /// starts from what it left.
+    fn rename_harness_here(
+        &self,
+        eng: &mut Engine,
+        request: crate::client::HarnessRenameRequest,
+    ) -> Result<crate::client::HarnessRenameResult> {
+        self.ensure_managed()?;
+        self.lock_repo(eng)?;
+        self.refresh_assignment()?;
+        let base = self.applied().expect("a standalone Machine always has its Assignment");
+        let (config, file) = (&self.cfg.machine_config, self.store.file().expect("a machine-local file"));
+        let intent = prepare_rename(config, self.repo_root(), None, request, Some(base.assignment.clone()))?;
+        intent.apply_standalone(config, file)?;
+        let assignment = sk1ll_core::Assignment::load(file)?;
+        let revision = base.revision + u64::from(assignment != base.assignment);
+        let snap = AssignmentSnapshot { revision, assignment: assignment.clone(), registration: None };
+        self.store.save(&snap)?;
+        let errors = self.install_assignment(eng, (revision > base.revision).then_some(snap));
+        let update = AssignmentUpdate { revision, assignment, entries: Vec::new(), errors };
+        Ok(crate::client::HarnessRenameResult { update, routed_rules: intent.routed_rules })
     }
 
     /// A rename the server session finds pending when it connects.

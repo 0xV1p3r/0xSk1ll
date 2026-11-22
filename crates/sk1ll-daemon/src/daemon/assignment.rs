@@ -42,11 +42,18 @@ impl Daemon {
         errors.into_iter().map(|error| crate::auth::redact(&error)).collect()
     }
 
-    /// Writes Assignment where it lives ([`crate::store`]). The engine mutex
-    /// is held only to check whether it may be sent and, once confirmed, to
-    /// apply it: the server may take up to its request timeout to confirm.
+    /// Writes Assignment where it lives ([`crate::store`]). A machine-local
+    /// write is made, saved and applied in one step under the engine mutex.
+    /// For the server's, the engine mutex is held only to check whether it
+    /// may be sent and, once confirmed, to apply it: the server may take up
+    /// to its request timeout to confirm.
     pub(crate) async fn write_assignment(self: &Arc<Self>, write: AssignmentWrite) -> Result<AssignmentUpdate> {
         let _writes = self.assignment_writes.lock().await;
+        if self.store.local().is_some() {
+            return self
+                .blocking(move |d, eng| d.store.local().expect("a machine-local store").write(d, eng, &write))
+                .await;
+        }
         let world = self
             .blocking(|d, _| {
                 d.refresh_assignment()?;
@@ -122,6 +129,20 @@ impl Daemon {
             return Ok((intent.renamed_config(config)?.harnesses(), intent.renamed_assignment(file)?));
         }
         Ok((sk1ll_core::MachineConfig::load(config)?.harnesses(), self.current_assignment()?))
+    }
+
+    /// Under the engine mutex: makes `snap`, already saved where the
+    /// Assignment lives, the applied one (`None`: the applied one stays) and
+    /// brings the harnesses in line with it. Returns what failed to place.
+    pub(crate) fn install_assignment(&self, eng: &mut Engine, snap: Option<AssignmentSnapshot>) -> Vec<String> {
+        if let Some(snap) = snap {
+            tracing::info!("applied assignment revision {}", snap.revision);
+            self.publish_assignment(snap);
+        }
+        let result = self.reconcile(eng);
+        let errors = self.assignment_placement_outcome(result);
+        self.event(Event::Fleet);
+        errors
     }
 
     /// Stores `snap` and syncs, unless it is older than what was applied. With

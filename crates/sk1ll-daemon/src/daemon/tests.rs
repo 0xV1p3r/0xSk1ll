@@ -1442,6 +1442,34 @@ async fn a_starting_daemon_waits_for_a_commands_toggle_and_starts_from_it() {
     );
 }
 
+/// A machine-local toggle and a hand edit of the file that lands while the
+/// toggle is made: the toggle is made again on top of the edit, so both
+/// are kept, each a revision of its own, and what it reports is saved.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_toggle_racing_a_hand_edit_keeps_both() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = standalone_with_pdf(dir.path());
+    add_harnesses(&d, &["h", "g"]);
+    let base = d.applied().unwrap().revision;
+    let file = d.cfg.assignment.clone();
+    let edit = file.clone();
+    *d.store.local().unwrap().before_swap.lock().unwrap() = Some(Box::new(move || {
+        let mut hand = sk1ll_core::Assignment::load(&edit).unwrap();
+        hand.set_harness("g", false);
+        hand.save(&edit).unwrap();
+    }));
+    let update = d.write_assignment(harness_toggle(false)).await.unwrap();
+    let saved = sk1ll_core::Assignment::load(&file).unwrap();
+    assert!(!saved.harness("h").new_skills_default, "the toggle is saved");
+    assert!(!saved.harness("g").new_skills_default, "and the hand edit kept");
+    assert_eq!(update.assignment, saved);
+    assert_eq!(update.revision, base + 2, "the edit is one revision, the toggle the next");
+    let stored =
+        state::load_snapshot(&d.cfg.state.with_file_name("standalone-assignment.json"), None).unwrap().unwrap();
+    assert_eq!((stored.revision, &stored.assignment), (update.revision, &saved));
+    assert_eq!(d.applied().unwrap().revision, update.revision);
+}
+
 /// Reading the Assignment never finishes a pending machine-local rename:
 /// only a reconcile, under the machine lock, does.
 #[tokio::test(flavor = "multi_thread")]
