@@ -7,7 +7,7 @@ use super::assignment::newer;
 use super::pull::is_rejected_push;
 use super::read::{DESCRIPTION_CAP, parse_batch, small_blob};
 use super::*;
-use crate::client::{ChangeKind, ConflictTarget};
+use crate::client::{ChangeKind, ConflictTarget, DraftEntry};
 use crate::state::PullState;
 use sk1ll_core::ItemRef;
 
@@ -451,8 +451,8 @@ async fn a_slow_assignment_confirmation_blocks_no_other_call() {
     request.result.send(confirmed(2, false)).unwrap();
     let update = write.await.unwrap().unwrap();
     assert_eq!(update.revision, 2);
-    assert_eq!(d.snapshot().unwrap().revision, 2);
-    assert_eq!(d.snapshot().unwrap().assignment, confirmed(2, false).unwrap().assignment);
+    assert_eq!(d.applied().unwrap().revision, 2);
+    assert_eq!(d.applied().unwrap().assignment, confirmed(2, false).unwrap().assignment);
 }
 
 /// What changes while a write is in flight decides what its confirmation
@@ -474,7 +474,7 @@ async fn a_confirmation_overtaken_by_a_newer_revision_is_not_applied() {
     let update = write.await.unwrap().unwrap();
     assert_eq!(update.revision, 3, "the reply carries the revision that stands");
     assert_eq!(update.assignment, newer.assignment);
-    assert_eq!(d.snapshot().unwrap().revision, 3);
+    assert_eq!(d.applied().unwrap().revision, 3);
     assert_eq!(state::load_snapshot(&d.cfg.snapshot_path()).unwrap().unwrap().revision, 3);
 
     let writer = d.clone();
@@ -483,7 +483,7 @@ async fn a_confirmation_overtaken_by_a_newer_revision_is_not_applied() {
     d.blocking(|d, eng| d.revoke(eng, "removed from the fleet")).await.unwrap();
     request.result.send(confirmed(4, true)).unwrap();
     assert_eq!(write.await.unwrap().unwrap().revision, 4);
-    assert_eq!(d.snapshot().unwrap().revision, 3, "a removed Machine applies nothing");
+    assert_eq!(d.applied().unwrap().revision, 3, "a removed Machine applies nothing");
 }
 
 /// The state file keeps the block and the server's Baseline, so a
@@ -591,8 +591,8 @@ async fn a_reconcile_runs_once_per_input_change_and_rehashes_only_changed_trees(
         (
             "assignment",
             Box::new(|| {
-                let next = AssignmentSnapshot { revision: 2, ..d.snapshot().unwrap().as_ref().clone() };
-                *d.snapshot.write().unwrap() = Some(Arc::new(next));
+                let next = AssignmentSnapshot { revision: 2, ..d.applied().unwrap().as_ref().clone() };
+                *d.applied.write().unwrap() = Some(Arc::new(next));
             }),
             0,
         ),
@@ -633,4 +633,79 @@ async fn a_failed_reconcile_is_tried_again() {
     }
     assert!(lock(&d.engine).reconciled.is_none());
     assert_eq!(d.plans.load(Relaxed), 0);
+}
+
+/// Readers answer from the Snapshot the last reconcile published, at once,
+/// even while a reconcile or a mutation holds the engine mutex; the next
+/// reconcile publishes a new one, and the old one stays as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn readers_answer_from_the_last_snapshot_while_the_engine_is_busy() {
+    use crate::client::Client;
+    let dir = tempfile::tempdir().unwrap();
+    let (d, _session, _) = joined_daemon(dir.path(), PullRecord::default());
+    let root = d.repo_root().to_path_buf();
+    let skill = |name: &str| {
+        std::fs::create_dir_all(root.join("personal").join(name)).unwrap();
+        std::fs::write(root.join("personal").join(name).join("SKILL.md"), "A skill.\n").unwrap();
+    };
+    skill("pdf");
+    let early = d.snapshot();
+    assert_eq!(early.generation, 0);
+    assert!(matches!(early.draft(), Err(Error::Unavailable(_))), "nothing reconciled yet");
+    d.blocking(|d, eng| d.reconcile(eng)).await.unwrap();
+    let first = d.snapshot();
+    let names = |draft: Vec<DraftEntry>| draft.into_iter().map(|e| e.item.to_string()).collect::<Vec<_>>();
+    assert_eq!(names(first.draft().unwrap()), ["skill:pdf"]);
+    assert!(first.items().unwrap().iter().any(|i| i.item.to_string() == "skill:pdf" && i.id.is_some()));
+
+    let socket = dir.path().join("daemon.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let served = d.clone();
+    let server = tokio::spawn(async move { axum::serve(listener, crate::api::router(served)).await.unwrap() });
+    let client = Client::new(&socket);
+
+    // A long engine operation: it holds the mutex until told to finish.
+    let (finish, finished) = std::sync::mpsc::channel::<()>();
+    let (started, running) = tokio::sync::oneshot::channel();
+    let engine = d.clone();
+    let busy = tokio::spawn(async move {
+        engine
+            .blocking(move |_, _| {
+                started.send(()).unwrap();
+                finished.recv().unwrap();
+                Ok(())
+            })
+            .await
+    });
+    running.await.unwrap();
+    skill("notes");
+    let quick = std::time::Duration::from_secs(5);
+    let read = async {
+        let draft = client.draft().await.unwrap();
+        let items = client.items().await.unwrap();
+        let conflicts = client.conflicts().await.unwrap();
+        let recovered = client.recovered().await.unwrap();
+        let status = client.status().await.unwrap();
+        (draft, items, conflicts, recovered, status)
+    };
+    let (draft, items, conflicts, _, status) = tokio::time::timeout(quick, read).await.expect("a reader waited");
+    assert_eq!(names(draft), ["skill:pdf"], "the Snapshot before the change");
+    assert!(!items.iter().any(|i| i.item.to_string() == "skill:notes"));
+    assert!(conflicts.is_empty());
+    assert_eq!(status.report.drafts.len(), 1);
+    finish.send(()).unwrap();
+    busy.await.unwrap().unwrap();
+
+    // The engine is free: a reader first brings the Snapshot up to date.
+    assert_eq!(names(client.draft().await.unwrap()), ["skill:notes", "skill:pdf"]);
+    let second = d.snapshot();
+    assert_eq!(second.generation, first.generation + 1);
+    assert_eq!(names(first.draft().unwrap()), ["skill:pdf"], "a published Snapshot never changes");
+    // Writing the new skill's Item ID changed the tree: one more pass, then
+    // nothing changes and no new Snapshot is published.
+    d.blocking(|d, eng| d.reconcile(eng)).await.unwrap();
+    let settled = d.snapshot();
+    d.blocking(|d, eng| d.reconcile(eng)).await.unwrap();
+    assert!(Arc::ptr_eq(&d.snapshot(), &settled));
+    server.abort();
 }

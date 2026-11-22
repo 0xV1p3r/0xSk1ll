@@ -143,7 +143,7 @@ impl Daemon {
             )));
         }
         let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
-        let snapshot = self.snapshot();
+        let snapshot = self.applied();
         adoption.locations.retain(|l| snapshot.as_ref().is_some_and(|s| s.assignment.skill_enabled(&l.harness, &id)));
         sync::unmanaged::complete(&repo, &harnesses, &adoption)?;
         self.reconcile(eng)?;

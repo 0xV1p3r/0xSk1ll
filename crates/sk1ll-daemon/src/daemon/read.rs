@@ -3,11 +3,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use sk1ll_core::imports;
-use sk1ll_core::sync::{self, Action, ActionKind, PlanOptions};
+use sk1ll_core::sync::{self};
 use sk1ll_core::{ItemRef, MachineConfig, Repo, default_commit_message};
-use sk1ll_proto::AssignmentSnapshot;
 
-use crate::client::{ChangeKind, CommitMessage, ConflictView, DiffView, DraftEntry, ItemView};
+use crate::client::{ChangeKind, CommitMessage, DiffView, DraftEntry, ItemView};
 use crate::error::{Error, Result};
 use crate::gitx;
 
@@ -200,48 +199,12 @@ impl Daemon {
         Ok(DiffView { item, diff, target: None })
     }
 
-    /// The plan for the repo as it is, changing nothing: what a reader may
-    /// run. An import that an interrupted update left set aside is not put
-    /// back here (that needs the engine mutex and the repo's engine lock), so
-    /// until the next reconcile has done it this plan sees it as missing.
-    pub(super) fn plan_as_is(&self, snap: &AssignmentSnapshot, force: bool) -> Result<(Repo, Vec<Action>)> {
-        let repo = Repo::open(self.repo_root())?;
-        Self::require_sync_ready(&repo)?;
-        let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
-        let actions = sync::plan(&repo, &harnesses, &snap.assignment, PlanOptions { force })?;
-        Ok((repo, actions))
-    }
-
-    /// A reader: no engine mutex.
-    pub(crate) fn recovered(&self) -> Result<Vec<ConflictView>> {
-        let root = self.repo_root();
-        Ok(sync::displaced::list()?.into_iter().map(|entry| displaced_view(entry, root)).collect())
-    }
-
-    /// A reader: no engine mutex, and so no recovery of interrupted imports
-    /// (see [`Daemon::plan_as_is`]).
-    pub(crate) fn conflicts(&self) -> Result<Vec<ConflictView>> {
-        let mut result: Vec<_> = if self.view.borrow().report.pull_pending.is_none()
-            && let Some(snap) = self.snapshot()
-        {
-            let (_, actions) = self.plan_as_is(&snap, false)?;
-            actions.iter().filter(|a| a.kind == ActionKind::Conflict).map(conflict_view).collect()
-        } else {
-            Vec::new()
-        };
-        let root = self.repo_root();
-        for entry in sync::displaced::changed()? {
-            result.push(displaced_view(entry, root));
-        }
-        Ok(result)
-    }
-
     /// A reader: no engine mutex.
     pub(crate) fn skills(&self) -> Result<Vec<sk1ll_core::content::ContentEntry>> {
         let repo = Repo::open(self.repo_root())?;
         let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
         let baseline = gitx::baseline(repo.root())?;
-        let snapshot = self.snapshot();
+        let snapshot = self.applied();
         let assignment = snapshot.as_ref().map(|s| s.assignment.clone()).unwrap_or_default();
         let mut entries = sk1ll_core::content::list(&repo, &harnesses, &assignment, baseline.as_deref())?;
         if snapshot.is_none() {
@@ -287,6 +250,7 @@ impl Daemon {
             (view, Some(target))
         } else {
             let view = self
+                .snapshot()
                 .conflicts()?
                 .into_iter()
                 .find(|v| Some(&v.harness) == req.harness.as_ref() && Some(&v.name) == req.name.as_ref())
@@ -300,7 +264,7 @@ impl Daemon {
             .unwrap_or(ItemRef::Other(view.name.clone()));
         let mut left_origin = Origin::Personal;
         let mut target = recovery.as_ref().map(|target| target.path.clone());
-        let snapshot = self.snapshot();
+        let snapshot = self.applied();
         let temp = tempfile::tempdir().map_err(anyhow::Error::from)?;
         let right = temp.path().join("Draft");
         match &item {

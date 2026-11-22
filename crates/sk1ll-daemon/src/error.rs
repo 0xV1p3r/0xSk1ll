@@ -25,6 +25,20 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+impl Error {
+    /// The same failure, to report it again (a published read keeps one).
+    pub(crate) fn duplicate(&self) -> Self {
+        match self {
+            Self::BadRequest(m) => Self::BadRequest(m.clone()),
+            Self::NotFound(m) => Self::NotFound(m.clone()),
+            Self::Conflict(m) => Self::Conflict(m.clone()),
+            Self::Unavailable(m) => Self::Unavailable(m.clone()),
+            Self::Upstream(status, m) => Self::Upstream(*status, m.clone()),
+            Self::Internal(e) => Self::Internal(anyhow::anyhow!("{e:#}")),
+        }
+    }
+}
+
 impl From<sk1ll_core::Error> for Error {
     fn from(e: sk1ll_core::Error) -> Self {
         match e {

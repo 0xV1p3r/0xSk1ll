@@ -10,9 +10,12 @@ use crate::state::PullState;
 
 impl Daemon {
     /// After a Draft change, which may have cleared what stopped the last
-    /// pull: a Blocked Machine pulls again.
+    /// pull: a Blocked Machine pulls again, once per change of the Draft.
     pub(super) async fn retry_stopped_pull(self: &Arc<Self>) {
-        if self.lifecycle().pull_stopped() && (self.is_connected() || self.is_standalone()) {
+        if self.draft_moved.swap(false, std::sync::atomic::Ordering::SeqCst)
+            && self.lifecycle().pull_stopped()
+            && (self.is_connected() || self.is_standalone())
+        {
             let _ = self.pull().await;
         }
     }

@@ -66,7 +66,7 @@ impl Daemon {
         let intent = RenameIntent::prepare(config, self.repo_root(), request, &authoritative, None)?;
         intent.apply_standalone(config, &self.cfg.assignment)?;
         let errors = self.saved_local_assignment(eng);
-        let snap = self.snapshot().expect("standalone always has assignment");
+        let snap = self.applied().expect("standalone always has assignment");
         Ok(crate::client::HarnessRenameResult {
             update: AssignmentUpdate {
                 revision: snap.revision,
@@ -97,14 +97,14 @@ impl Daemon {
         // If the process stops after clearing the intent, startup must
         // already have the Assignment for the new config.
         if let Ok(update) = &result
-            && self.snapshot().is_none_or(|current| current.revision < update.revision)
+            && self.applied().is_none_or(|current| current.revision < update.revision)
         {
             crate::server::save_assignment_snapshot(&self.cfg, update)?;
         }
         let mut update = crate::server::resolve_rename(&self.cfg.machine_config, &intent, result)?;
         let snapshot =
             AssignmentSnapshot { revision: update.revision, assignment: update.assignment.clone(), registration: None };
-        if self.snapshot().is_some_and(|current| current.revision >= snapshot.revision) {
+        if self.applied().is_some_and(|current| current.revision >= snapshot.revision) {
             update.errors = self.reconcile(eng)?;
         } else {
             update.errors = self.apply_assignment(eng, snapshot)?;

@@ -300,9 +300,12 @@ impl Machine {
         std::fs::read_to_string(self.skills().join(name).join("SKILL.md")).ok()
     }
 
-    /// Commits every draft item.
+    /// Commits every draft item, once the Draft shows an edit made just
+    /// before: while an engine operation runs, readers answer from the
+    /// Snapshot of the last reconcile.
     async fn commit_all(&self) -> CommitResponse {
-        let items = self.client.draft().await.unwrap().into_iter().map(|d| d.item.to_string()).collect();
+        let draft = eventually(|| async { Some(self.client.draft().await.unwrap()).filter(|d| !d.is_empty()) }).await;
+        let items = draft.into_iter().map(|d| d.item.to_string()).collect();
         self.client.commit(&CommitRequest { items, ..Default::default() }).await.unwrap()
     }
 

@@ -48,7 +48,7 @@ impl Daemon {
     /// A reader: plans the change without making it.
     pub(crate) fn preview_harness(&self, change: &HarnessChange) -> Result<HarnessPreview> {
         let repo = Repo::open(self.repo_root())?;
-        let snapshot = self.snapshot();
+        let snapshot = self.applied();
         let plan =
             harness_change::plan(&repo, &self.cfg.machine_config, change, snapshot.as_ref().map(|s| &s.assignment))?;
         Ok(HarnessPreview {

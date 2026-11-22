@@ -13,13 +13,17 @@ impl Daemon {
     /// The current plan; `force` plans as if overwriting. For engine
     /// operations: interrupted imports are put back first.
     pub(super) fn plan(&self, force: bool) -> Result<(Repo, Vec<Action>)> {
-        let Some(snap) = self.snapshot() else {
+        let Some(snap) = self.applied() else {
             return Err(Error::Conflict(
                 "waiting for the server's assignment; the harnesses are left alone until it arrives".into(),
             ));
         };
         Self::recover_imports(self.repo_root())?;
-        self.plan_as_is(&snap, force)
+        let repo = Repo::open(self.repo_root())?;
+        Self::require_sync_ready(&repo)?;
+        let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
+        let actions = sync::plan(&repo, &harnesses, &snap.assignment, PlanOptions { force })?;
+        Ok((repo, actions))
     }
 
     /// Puts back imports an interrupted (or failed, unrolled-back) update
@@ -127,7 +131,7 @@ impl Daemon {
                 self.reload_local_assignment()?;
             }
             let snapshot =
-                self.snapshot().ok_or_else(|| Error::Conflict("waiting for the server's assignment".into()))?;
+                self.applied().ok_or_else(|| Error::Conflict("waiting for the server's assignment".into()))?;
             let root = self.repo_root();
             let lock = eng.lock.as_ref().ok_or_else(|| Error::Conflict(format!("{} is not locked", root.display())))?;
             let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
@@ -169,7 +173,7 @@ impl Daemon {
         }
         Ok(SyncResult {
             fingerprint: None,
-            conflicts: self.conflicts()?,
+            conflicts: self.snapshot().conflicts()?,
             actions: None,
             errors,
             completed: Vec::new(),

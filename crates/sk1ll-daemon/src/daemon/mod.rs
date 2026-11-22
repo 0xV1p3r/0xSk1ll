@@ -17,24 +17,33 @@
 //! meanwhile applies nothing. Its lifecycle ([`Lifecycle`]) has a mutex of its
 //! own, so the session can mark it connected or offline at any time.
 //!
-//! Operations that only read (the draft, a diff, the skills browser, the
-//! conflicts, the inventory) run without the engine mutex
-//! ([`Daemon::reading`]), so the GUI keeps answering while a long engine
-//! operation (a sync of many skills) runs. They need the repo root, which is fixed
-//! for the process ([`Daemon::ident`]), and the applied assignment, which is
-//! published in [`Daemon::snapshot`]. A reader:
+//! Everything that brings the harnesses and the report in line with the repo
+//! is one reconcile over fingerprinted Inputs ([`reconcile`]): it plans and
+//! applies only when an Input changed since the last one that succeeded.
 //!
-//! - never writes: not the repo, not a harness, not git's index (the process
-//!   environment turns off git's opportunistic index refresh, see
-//!   [`crate::prepare_process`]), and it does not finish an interrupted
+//! Nothing that only reads takes the engine mutex, so the GUI keeps
+//! answering while a long engine operation (a sync of many skills) runs:
+//!
+//! - The Draft, the inventory, the conflicts and the recovery area come from
+//!   the [`Snapshot`] the last reconcile published ([`Daemon::snapshot`]),
+//!   the applied Assignment from [`Daemon::applied`]: both are immutable
+//!   values swapped whole, so a reader never waits and never sees half of an
+//!   update. The local API first brings the Snapshot up to date when the
+//!   engine is free ([`Daemon::caught_up`]), so a read right after an edit
+//!   sees it; while an engine operation runs, it answers from the last one.
+//! - What a request asks about in particular (a diff, a file, the skills
+//!   browser, a preview) is read from the repo as it is ([`Daemon::reading`]),
+//!   with the repo root, which is fixed for the process ([`Daemon::ident`]).
+//!   Such a reader never writes: not the repo, not a harness, not git's index
+//!   (the process environment turns off git's opportunistic index refresh,
+//!   see [`crate::prepare_process`]), and it does not finish an interrupted
 //!   import ([`Daemon::recover_imports`] needs the engine mutex and the
-//!   [`EngineLock`]). Until the next reconcile has put such an import back, a
-//!   reader shows the repo as it is, with that import missing;
-//! - may see the repo in the middle of a concurrent operation (a pull moving
-//!   the working tree). What it returns is then momentarily stale and the
-//!   event that follows the operation makes the client ask again; a read
-//!   that failed while an operation was running is retried before it is
-//!   reported as a failure.
+//!   [`EngineLock`]); until the next reconcile has put such an import back,
+//!   it shows the repo with that import missing. It may see the repo in the
+//!   middle of a concurrent operation (a pull moving the working tree): what
+//!   it returns is then momentarily stale and the event that follows the
+//!   operation makes the client ask again, and a read that failed while an
+//!   operation was running is retried before it is reported as a failure.
 //!
 //! What the outside sees ([`StatusView`]) lives in a `watch` channel: the server
 //! session sends a status whenever its report changes, and the local API and
@@ -42,6 +51,7 @@
 //! [`Lifecycle`] whenever it is published ([`Daemon::publish`]).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError};
 
 use anyhow::Context;
@@ -68,9 +78,11 @@ mod placement;
 mod pull;
 mod read;
 mod reconcile;
+mod snapshot;
 mod views;
 
 pub(crate) use reconcile::{repo_inventory, run as reconcile_loop};
+pub(crate) use snapshot::Snapshot;
 use {placement::*, reconcile::*, views::*};
 
 /// Name a `block` instructions conflict goes by (one block per harness).
@@ -129,7 +141,9 @@ pub(crate) struct Daemon {
     /// harnesses are left alone until the server sends one. Replaced only
     /// with the engine mutex held ([`Daemon::apply_assignment`]); read by
     /// anyone, readers without the engine mutex included.
-    snapshot: RwLock<Option<Arc<AssignmentSnapshot>>>,
+    applied: RwLock<Option<Arc<AssignmentSnapshot>>>,
+    /// The readers' view of the last reconcile (see [`snapshot`]).
+    snapshot: watch::Sender<Arc<Snapshot>>,
     view: watch::Sender<StatusView>,
     events: broadcast::Sender<Event>,
     pub(crate) assignment_session: watch::Sender<Option<mpsc::Sender<crate::server::SessionWrite>>>,
@@ -142,6 +156,9 @@ pub(crate) struct Daemon {
     hashes: sk1ll_core::hash::HashCache,
     /// How many reconciles planned a sync, for tests.
     plans: std::sync::atomic::AtomicU64,
+    /// The Draft changed since a stopped pull was last tried again (see
+    /// [`Daemon::retry_stopped_pull`]).
+    draft_moved: AtomicBool,
 }
 
 /// Mutable state, only touched with the engine mutex held.
@@ -222,7 +239,8 @@ impl Daemon {
         Ok(Arc::new(Self {
             cfg,
             ident: state,
-            snapshot: RwLock::new(snapshot.map(Arc::new)),
+            applied: RwLock::new(snapshot.map(Arc::new)),
+            snapshot: watch::channel(Snapshot::initial()).0,
             lifecycle: Mutex::new(lifecycle),
             net: tokio::sync::Mutex::new(()),
             assignment_writes: tokio::sync::Mutex::new(()),
@@ -246,6 +264,7 @@ impl Daemon {
                 sk1ll_core::hash::HashCache::new()
             },
             plans: Default::default(),
+            draft_moved: AtomicBool::new(false),
         }))
     }
 
@@ -345,9 +364,38 @@ impl Daemon {
         matches!(self.engine.try_lock(), Err(TryLockError::WouldBlock))
     }
 
+    /// What the last reconcile published for readers. Never waits.
+    pub(crate) fn snapshot(&self) -> Arc<Snapshot> {
+        self.snapshot.borrow().clone()
+    }
+
+    /// The Snapshot, brought up to date first if the engine is free, so a
+    /// read right after an edit sees it: the reconcile skips at once if no
+    /// Input changed. A reader never waits for an engine operation: while
+    /// one runs, it gets the Snapshot of the last reconcile.
+    pub(crate) async fn caught_up(self: &Arc<Self>) -> Arc<Snapshot> {
+        let d = self.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let mut eng = match d.engine.try_lock() {
+                Ok(eng) => eng,
+                Err(TryLockError::Poisoned(e)) => e.into_inner(),
+                Err(TryLockError::WouldBlock) => return,
+            };
+            if let Err(e) = d.reconcile(&mut eng) {
+                tracing::debug!("reading the last Snapshot: {e}");
+            }
+        })
+        .await;
+        // A stopped pull worth trying again is the background's to try.
+        if self.draft_moved.load(std::sync::atomic::Ordering::SeqCst) {
+            self.wake();
+        }
+        self.snapshot()
+    }
+
     /// The applied assignment, if there is one.
-    pub(crate) fn snapshot(&self) -> Option<Arc<AssignmentSnapshot>> {
-        self.snapshot.read().unwrap_or_else(|e| e.into_inner()).clone()
+    pub(crate) fn applied(&self) -> Option<Arc<AssignmentSnapshot>> {
+        self.applied.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// The repo, for readers: the same path as the engine's, which never
@@ -425,6 +473,7 @@ impl Daemon {
             self.event(Event::Status);
         }
         if draft_changed {
+            self.draft_moved.store(true, std::sync::atomic::Ordering::SeqCst);
             self.event(Event::Draft);
         }
         if fleet {
@@ -556,7 +605,7 @@ impl Daemon {
         self.blocking(|d, eng| {
             d.lock_repo(eng)?;
             if !d.is_standalone()
-                && let Some(s) = d.snapshot()
+                && let Some(s) = d.applied()
                 && let Err(e) = s.assignment.save(&d.cfg.assignment)
             {
                 tracing::warn!("writing the assignment cache {}: {e}", d.cfg.assignment.display());

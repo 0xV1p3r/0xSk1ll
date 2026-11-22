@@ -17,14 +17,14 @@ impl Daemon {
             intent.apply_standalone(&self.cfg.machine_config, &self.cfg.assignment)?;
         }
         let assignment = sk1ll_core::Assignment::load(&self.cfg.assignment)?;
-        let previous = self.snapshot();
+        let previous = self.applied();
         if previous.as_ref().is_some_and(|s| s.assignment == assignment) {
             return Ok(());
         }
         let revision = previous.as_ref().map_or(1, |s| s.revision + 1);
         let snap = AssignmentSnapshot { revision, assignment, registration: None };
         state::save_snapshot(&self.cfg.state.with_file_name("standalone-assignment.json"), &snap)?;
-        *self.snapshot.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(snap));
+        *self.applied.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(snap));
         self.update(|v| {
             v.assignment_revision = revision;
             v.awaiting_assignment = false;
@@ -56,7 +56,7 @@ impl Daemon {
         let (skills, rules): (Vec<_>, Vec<_>) =
             (skills.into_iter().flatten().collect(), rules.into_iter().flatten().collect());
         if let Some(expected) = &changes.expected {
-            let revision = self.snapshot().map_or(0, |s| s.revision);
+            let revision = self.applied().map_or(0, |s| s.revision);
             if expected.registration.is_some() {
                 return Err(Error::Conflict(
                     "this Machine is standalone now; reload its Assignment before changing it".into(),
@@ -111,7 +111,7 @@ impl Daemon {
         // Assignment::save replaces the file atomically, like the direct CLI.
         assignment.save(&self.cfg.assignment)?;
         let errors = self.saved_local_assignment(eng);
-        let snap = self.snapshot().expect("standalone always has assignment");
+        let snap = self.applied().expect("standalone always has assignment");
         Ok(sk1ll_proto::AssignmentUpdate {
             revision: snap.revision,
             assignment: snap.assignment.clone(),
@@ -170,7 +170,7 @@ impl Daemon {
                 assignment.set_harness(&harness, enabled);
                 assignment.save(&self.cfg.assignment)?;
                 let errors = self.saved_local_assignment(eng);
-                let snap = self.snapshot().expect("standalone always has assignment");
+                let snap = self.applied().expect("standalone always has assignment");
                 Ok(AssignmentUpdate {
                     revision: snap.revision,
                     assignment: snap.assignment.clone(),
@@ -198,7 +198,7 @@ impl Daemon {
             self.set_error(format!("applying the saved Assignment: {e}"));
             vec![crate::auth::redact(&e.to_string())]
         });
-        if let Some(current) = self.snapshot()
+        if let Some(current) = self.applied()
             && current.revision > update.revision
         {
             tracing::info!(
@@ -217,7 +217,7 @@ impl Daemon {
         if self.is_standalone() {
             return Ok(sk1ll_core::Assignment::load(&self.cfg.assignment)?);
         }
-        self.snapshot().map(|snap| snap.assignment.clone()).ok_or_else(|| {
+        self.applied().map(|snap| snap.assignment.clone()).ok_or_else(|| {
             Error::Conflict("waiting for the server's assignment; the harnesses are left alone until it arrives".into())
         })
     }
@@ -229,7 +229,7 @@ impl Daemon {
         if self.idle() {
             return Ok(Vec::new());
         }
-        if let Some(have) = self.snapshot()
+        if let Some(have) = self.applied()
             && !newer(have.revision, snap.revision)
         {
             // The same revision arrives on every connect; only an older one is news.
@@ -249,7 +249,7 @@ impl Daemon {
             tracing::warn!("writing the assignment cache {}: {e}", self.cfg.assignment.display());
         }
         let revision = snap.revision;
-        *self.snapshot.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(snap));
+        *self.applied.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(snap));
         tracing::info!("applied assignment revision {revision}");
         self.update(|v| {
             v.assignment_revision = revision;

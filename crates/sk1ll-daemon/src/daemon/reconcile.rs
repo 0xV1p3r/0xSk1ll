@@ -24,10 +24,10 @@ use std::time::SystemTime;
 use sk1ll_core::harness_rename::RenameIntent;
 use sk1ll_core::hash::{HashCache, Stamp};
 use sk1ll_core::sync::{self, ActionKind, PlanOptions};
-use sk1ll_core::{MachineConfig, PullOutcome, Repo};
+use sk1ll_core::{ItemRef, MachineConfig, PullOutcome, Repo};
 use sk1ll_proto::{ConflictRef, MachineReport};
 
-use crate::client::PlacementView;
+use crate::client::{ConflictView, PlacementView};
 use crate::error::{Error, Result};
 use crate::gitx;
 use crate::state::PullState;
@@ -75,7 +75,7 @@ impl Inputs {
             git: stamp(&root.join(".git"), Some(git_bookkeeping))?,
             machine: format!("{}\n{}", stamp(config, None)?, stamp(&intent, None)?),
             assignment: (
-                d.snapshot().map(|s| s.revision),
+                d.applied().map(|s| s.revision),
                 d.is_standalone().then(|| stamp(&d.cfg.assignment, None)).transpose()?,
             ),
             pull: d.lifecycle().pull().clone(),
@@ -237,7 +237,8 @@ impl Daemon {
         }
         let is_reviewed = reviewed.is_some();
         let mut conflicts: Vec<ConflictRef> = Vec::new();
-        let snapshot = self.snapshot();
+        let mut conflict_views: snapshot::Part<Vec<ConflictView>> = Ok(Vec::new());
+        let snapshot = self.applied();
         if !pending
             && ids_ready
             && let Some(snap) = &snapshot
@@ -275,6 +276,9 @@ impl Daemon {
                         actions.into_iter().map(|(action, _)| action).collect()
                     };
                     for action in remaining.iter().filter(|a| a.kind == ActionKind::Conflict) {
+                        if let Ok(views) = &mut conflict_views {
+                            views.push(conflict_view(action));
+                        }
                         for item in conflict_items(action) {
                             let conflict = ConflictRef { item, harness: action.harness.clone() };
                             if !conflicts.contains(&conflict) {
@@ -283,17 +287,26 @@ impl Daemon {
                         }
                     }
                 }
-                Err(e) => outcome.errors.push(format!("sync: {e}")),
+                Err(e) => {
+                    outcome.errors.push(format!("sync: {e}"));
+                    conflict_views = Err(e.into());
+                }
             }
         }
 
-        for entry in sync::displaced::changed()? {
-            let c = ConflictRef { item: displaced_item(&entry, &root), harness: entry.harness.clone() };
+        let displaced = sync::displaced::list()?;
+        for entry in displaced.iter().filter(|entry| entry.changed) {
+            let c = ConflictRef { item: displaced_item(entry, &root), harness: entry.harness.clone() };
             if !conflicts.contains(&c) {
                 conflicts.push(c);
             }
+            if let Ok(views) = &mut conflict_views {
+                views.push(displaced_view(entry.clone(), &root));
+            }
         }
-        let mut report = repo_report(&root, harnesses.keys().cloned().collect())?;
+        let draft = self.draft()?;
+        let drafts = draft.iter().map(|entry| entry.item.clone()).collect();
+        let mut report = repo_report(&root, harnesses.keys().cloned().collect(), drafts)?;
         if pending {
             // The partial checkout is not a Draft. Keep the last complete
             // inventory while the journal is active; `repo_report` already
@@ -305,6 +318,15 @@ impl Daemon {
         report.conflicts = conflicts;
         let awaiting = snapshot.is_none();
         let has_origin = !self.is_standalone() || gitx::has_origin(&root).unwrap_or(false);
+        // Readers see the new state before the events that send them to it.
+        let generation = self.snapshot().generation + 1;
+        self.snapshot.send_replace(Arc::new(Snapshot {
+            generation,
+            draft: Ok(draft),
+            items: Daemon::items(&root),
+            conflicts: conflict_views,
+            recovered: Ok(displaced.into_iter().map(|entry| displaced_view(entry, &root)).collect()),
+        }));
         // The lifecycle derives the report's Blocked, pending and behind.
         let ((), saved) = self.publish(
             |lc| lc.set_pull(pull),
@@ -379,20 +401,15 @@ impl Daemon {
     /// A background reconcile, after file changes or the periodic tick: and
     /// if the Draft changed, a stopped pull is tried again.
     async fn reconcile_in_background(self: &Arc<Self>) -> Result<()> {
-        let drafted = self
-            .blocking(|d, eng| {
-                if d.idle() {
-                    return Ok(false);
-                }
-                sync::displaced::prune()?;
-                let before = d.view.borrow().report.drafts.clone();
-                d.reconcile(eng)?;
-                Ok(d.view.borrow().report.drafts != before)
-            })
-            .await?;
-        if drafted {
-            self.retry_stopped_pull().await;
-        }
+        self.blocking(|d, eng| {
+            if d.idle() {
+                return Ok(());
+            }
+            sync::displaced::prune()?;
+            d.reconcile(eng).map(drop)
+        })
+        .await?;
+        self.retry_stopped_pull().await;
         Ok(())
     }
 }
@@ -451,12 +468,11 @@ pub(crate) fn repo_inventory(root: &Path, harnesses: Vec<String>) -> sk1ll_proto
     }
 }
 
-pub(super) fn repo_report(root: &Path, harnesses: Vec<String>) -> Result<MachineReport> {
-    let repo = Repo::open_git_only(root)?;
+pub(super) fn repo_report(root: &Path, harnesses: Vec<String>, drafts: Vec<ItemRef>) -> Result<MachineReport> {
     let inventory = repo_inventory(root, harnesses);
     Ok(MachineReport {
         baseline: gitx::baseline(root)?,
-        drafts: repo.draft()?.into_iter().map(|d| d.item).collect(),
+        drafts,
         unpushed: gitx::unpushed_items(root)?,
         harnesses: inventory.harnesses,
         items: inventory.items,

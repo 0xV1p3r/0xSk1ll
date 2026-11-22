@@ -229,24 +229,22 @@ impl axum::serve::Listener for PeerChecked {
     }
 }
 
-// Handlers that only read go through `Daemon::reading`, without the engine
-// mutex, so they answer while a pull or a push waits for the server.
+// Handlers that only read never wait for the engine mutex, so they answer
+// while a reconcile, a pull or a push runs: the Draft, the inventory, the
+// conflicts and the recovery area come from the published Snapshot (brought
+// up to date first when the engine is free, see `Daemon::caught_up`), and
+// the rest is read from the repo as it is, through `Daemon::reading`.
 
 async fn status(State(d): St) -> Json<StatusView> {
     Json(d.view())
 }
 
 async fn items(State(d): St) -> Result<Json<Vec<ItemView>>> {
-    // No mutable engine guard: inventory only reads git and the working tree.
-    let root = d.view().repo;
-    let inventory = tokio::task::spawn_blocking(move || Daemon::items(&root))
-        .await
-        .map_err(|e| Error::Internal(anyhow::anyhow!("inventory task failed: {e}")))??;
-    Ok(Json(inventory))
+    Ok(Json(d.caught_up().await.items()?))
 }
 
 async fn draft(State(d): St) -> Result<Json<Vec<DraftEntry>>> {
-    Ok(Json(d.reading(|d| d.draft()).await?))
+    Ok(Json(d.caught_up().await.draft()?))
 }
 
 async fn skills(State(d): St) -> Result<Json<Vec<sk1ll_core::content::ContentEntry>>> {
@@ -308,11 +306,11 @@ async fn pull(State(d): St) -> Result<Json<PullResult>> {
 }
 
 async fn recovered(State(d): St) -> Result<Json<Vec<ConflictView>>> {
-    Ok(Json(d.reading(|d| d.recovered()).await?))
+    Ok(Json(d.caught_up().await.recovered()?))
 }
 
 async fn conflicts(State(d): St) -> Result<Json<Vec<ConflictView>>> {
-    Ok(Json(d.reading(|d| d.conflicts()).await?))
+    Ok(Json(d.caught_up().await.conflicts()?))
 }
 
 async fn adopt_displaced(State(d): St, UrlPath(id): UrlPath<String>) -> Result<Json<PathBuf>> {
@@ -524,14 +522,10 @@ async fn assignment(
         return Err(Error::Conflict("This Machine is standalone; join a Fleet to use this".into()));
     }
     if method == Method::GET {
-        // Read through the engine so an external CLI file edit is visible.
-        let snap = d
-            .blocking(|d, eng| {
-                d.reconcile(eng)?;
-                Ok(d.snapshot().expect("local assignment").as_ref().clone())
-            })
-            .await?;
-        return Ok(Json(snap).into_response());
+        // The applied Assignment, published whole: a hand edit of the file
+        // is applied (and announced) by the reconcile it wakes.
+        let snap = d.applied().expect("standalone always has an assignment");
+        return Ok(Json(snap.as_ref()).into_response());
     }
     let changes = serde_json::from_slice(&body).map_err(|e| Error::BadRequest(e.to_string()))?;
     let update = d.write_assignment(sk1ll_proto::AssignmentWrite::Changes(changes)).await?;
@@ -594,6 +588,7 @@ async fn rename_item(
 }
 
 async fn conflict_diff(State(d): St, Json(req): Json<crate::client::ConflictDiffRequest>) -> Result<Json<DiffView>> {
+    d.caught_up().await;
     Ok(Json(d.reading(move |d| d.conflict_diff(&req)).await?))
 }
 
