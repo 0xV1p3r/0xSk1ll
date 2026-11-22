@@ -497,6 +497,22 @@ fn only_a_missing_or_refused_socket_means_no_daemon() {
     repo.run_on(&sock, &["assign", "h", "skill", "pdf", "on"]).unwrap();
 }
 
+/// `list` labels rules `rule`, leaves no trailing space for an item without
+/// a description, and speaks of Item IDs only when a pending pull holds them up.
+#[test]
+fn list_labels_rules_and_mentions_missing_ids_only_when_they_wait() {
+    let repo = TestRepo::new().with_skill();
+    fs::write(repo.repo.join("instructions/git.md"), "Use Conventional Commits.\n").unwrap();
+    let listed = repo.run(&["list"]).unwrap();
+    assert_eq!(listed, format!("{:<24} personal\n{:<24} rule\n", "pdf", "git"));
+    fs::write(repo.repo.join(".git/sk1ll-pull.json"), "{}").unwrap();
+    let listed = repo.run(&["list"]).unwrap();
+    assert!(
+        listed.contains("2 items have no Item ID until the pending pull finishes") && listed.contains("`sk1ll pull`"),
+        "{listed}"
+    );
+}
+
 #[test]
 fn list_and_status_report_duplicate_item_id_paths() {
     let repo = TestRepo::new().with_skill();

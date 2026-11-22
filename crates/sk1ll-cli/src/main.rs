@@ -506,19 +506,29 @@ fn command(s: &Session, cmd: Cmd) -> Result<()> {
         }
         Cmd::List { unmanaged: false, json: false } => {
             let repo = s.block(c.repo(false))?;
+            // A new item gets its Item ID from the next change the engine
+            // makes (the daemon's reconcile, a sync), except into a pending pull.
+            let unassigned = repo.skills.iter().filter(|s| s.id.is_none()).count()
+                + repo.rules.iter().filter(|r| r.id.is_none()).count();
             for skill in repo.skills {
                 let origin = match skill.origin {
                     Origin::Personal if skill.shadows_import => "personal*",
                     Origin::Personal => "personal",
                     Origin::Imported => "imported",
                 };
-                let id = if skill.id.is_none() { " [unassigned id]" } else { "" };
-                println!("{:<24} {:<10} {}{id}", skill.name, origin, skill.description.unwrap_or_default());
+                let line = format!("{:<24} {:<10} {}", skill.name, origin, skill.description.unwrap_or_default());
+                println!("{}", line.trim_end());
             }
             for rule in repo.rules {
                 let scope = rule.harnesses.map(|t| format!("[{}] ", t.join(", "))).unwrap_or_default();
-                let id = if rule.id.is_none() { " [unassigned id]" } else { "" };
-                println!("{:<24} {:<10} {scope}{}{id}", rule.name, "instr", rule.description.unwrap_or_default());
+                let line = format!("{:<24} {:<10} {scope}{}", rule.name, "rule", rule.description.unwrap_or_default());
+                println!("{}", line.trim_end());
+            }
+            if unassigned > 0 && repo.pull_pending {
+                println!(
+                    "{} no Item ID until the pending pull finishes, so no Assignment toggle; run `sk1ll pull`",
+                    plural(unassigned, "item has", "items have")
+                );
             }
         }
         Cmd::Edit { name } => {
