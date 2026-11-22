@@ -112,6 +112,13 @@ connected() {
 }
 wait_for connected "$alpha_socket"
 mkdir -p "$fleet_dir/alpha/skills/personal/"{git-review,release-notes} "$fleet_dir/alpha/skills/instructions"
+# Explicit Item IDs, which Assignment toggles are keyed by. Each is in place
+# before its item is, so the Daemon never writes a fresh one of its own.
+git_review_id=dev-skill-git-review
+release_notes_id=dev-skill-release-notes
+git_rule_id=dev-rule-git
+printf '%s\n' "$git_review_id" > "$fleet_dir/alpha/skills/personal/git-review/.sk1ll-id"
+printf '%s\n' "$release_notes_id" > "$fleet_dir/alpha/skills/personal/release-notes/.sk1ll-id"
 cat > "$fleet_dir/alpha/skills/personal/git-review/SKILL.md" <<'SKILL'
 ---
 name: git-review
@@ -126,7 +133,8 @@ description: Write concise release notes from a diff
 ---
 Describe changes that matter to people using the app.
 SKILL
-printf 'Use focused commits with clear messages.\n' > "$fleet_dir/alpha/skills/instructions/git.md"
+printf -- '---\nid: %s\n---\nUse focused commits with clear messages.\n' "$git_rule_id" > "$fleet_dir/git.md"
+mv "$fleet_dir/git.md" "$fleet_dir/alpha/skills/instructions/git.md"
 # Commit through the Daemon; it owns the repo lock and pushes on connection.
 curl --silent --show-error --fail-with-body --unix-socket "$alpha_socket" --request POST \
   --header 'Content-Type: application/json' \
@@ -136,7 +144,7 @@ curl --silent --show-error --fail-with-body --unix-socket "$alpha_socket" --requ
 for machine in alpha beta; do
   curl --silent --show-error --fail-with-body --unix-socket "$alpha_socket" --request PUT \
     --header 'Content-Type: application/json' \
-    --data '{"changes":[{"harness":"claude","kind":"skill","name":"git-review","enabled":true},{"harness":"codex","kind":"rule","name":"git","enabled":true}]}' \
+    --data '{"changes":[{"harness":"claude","kind":"skill","item_id":"'"$git_review_id"'","name":"git-review","enabled":true},{"harness":"codex","kind":"rule","item_id":"'"$git_rule_id"'","name":"git","enabled":true}]}' \
     "http://localhost/machines/$machine/assignment" > "$fleet_dir/assignment.json" || { cat "$fleet_dir/assignment.json" >&2; exit 1; }
 done
 printf '\nAdd a second pass for error handling.\n' >> "$fleet_dir/alpha/skills/personal/git-review/SKILL.md"
