@@ -1,4 +1,10 @@
 //! Durable intent for the two writes involved in renaming a Harness.
+//!
+//! The intent is kept in sk1ll's own state directory, not beside
+//! `machine.toml` (which may be in a dotfiles repo), and is keyed on
+//! `machine.toml`'s real path ([`crate::real_path`]): a rename that stopped
+//! half-way under one name for the file is found, and finished, through any
+//! other.
 
 use std::path::{Path, PathBuf};
 
@@ -17,6 +23,9 @@ pub struct RenameRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RenameIntent {
+    /// Where this intent is kept ([`RenameIntent::path`]).
+    #[serde(skip)]
+    file: PathBuf,
     pub request: RenameRequest,
     pub operation_id: String,
     pub routed_rules: Vec<String>,
@@ -27,13 +36,15 @@ pub struct RenameIntent {
 }
 
 impl RenameIntent {
-    /// Where the intent for the machine config at `config` is kept.
-    pub fn path(config: &Path) -> PathBuf {
-        config.with_extension("harness-rename.json")
+    /// Where the intent for the machine config at `config` is kept, in
+    /// sk1ll's state directory `state`: named by the hash of `config`'s real
+    /// path, so every name for one `machine.toml` finds the same intent.
+    pub fn path(state: &Path, config: &Path) -> Result<PathBuf> {
+        Ok(state.join("harness-rename").join(format!("{}.json", crate::real_path::key(config)?)))
     }
 
-    pub fn exists(config: &Path) -> Result<bool> {
-        let path = Self::path(config);
+    pub fn exists(state: &Path, config: &Path) -> Result<bool> {
+        let path = Self::path(state, config)?;
         match std::fs::symlink_metadata(&path) {
             Ok(_) => Ok(true),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -41,10 +52,12 @@ impl RenameIntent {
         }
     }
 
-    pub fn load(config: &Path, authority: Option<&str>) -> Result<Option<Self>> {
-        let path = Self::path(config);
+    pub fn load(state: &Path, config: &Path, authority: Option<&str>) -> Result<Option<Self>> {
+        let path = Self::path(state, config)?;
         let Some(text) = read_text(&path, false)? else { return Ok(None) };
-        let intent: Self = serde_json::from_str(&text).map_err(|e| Error::Parse { path, message: e.to_string() })?;
+        let mut intent: Self =
+            serde_json::from_str(&text).map_err(|e| Error::Parse { path: path.clone(), message: e.to_string() })?;
+        intent.file = path;
         if intent.authority.as_deref() != authority {
             return Err(Error::Changed(
                 "the pending Harness rename belongs to a different Assignment authority".into(),
@@ -55,13 +68,14 @@ impl RenameIntent {
 
     /// Record both possible file contents before either is changed.
     pub fn prepare(
+        state: &Path,
         config: &Path,
         repo: &Path,
         request: RenameRequest,
         authoritative: &Assignment,
         authority: Option<&str>,
     ) -> Result<Self> {
-        if let Some(intent) = Self::load(config, authority)? {
+        if let Some(intent) = Self::load(state, config, authority)? {
             if intent.request == request {
                 return Ok(intent);
             }
@@ -84,6 +98,7 @@ impl RenameIntent {
             .map(|rule| rule.name)
             .collect();
         let intent = Self {
+            file: Self::path(state, config)?,
             request,
             operation_id: ulid::Ulid::generate().to_string(),
             routed_rules,
@@ -93,11 +108,14 @@ impl RenameIntent {
             before_assignment: authority.is_none().then(|| authoritative.clone()),
         };
         let body = serde_json::to_vec(&intent).expect("serializing Harness rename intent");
-        let path = Self::path(config);
-        if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(dir).at(dir)?;
+        if let Some(dir) = intent.file.parent().filter(|p| !p.as_os_str().is_empty()) {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            builder.create(dir).at(dir)?;
         }
-        replace_private(&path, &body)?;
+        replace_private(&intent.file, &body)?;
         Ok(intent)
     }
 
@@ -107,7 +125,7 @@ impl RenameIntent {
 
     pub fn rollback_config(&self, config: &Path) -> Result<()> {
         self.set_config(config, &self.after_config, &self.before_config)?;
-        self.finish(config)
+        self.finish()
     }
 
     fn set_config(&self, config: &Path, from: &str, to: &str) -> Result<()> {
@@ -164,15 +182,14 @@ impl RenameIntent {
         if current != after && !after.swap(path, bytes.as_deref())? {
             return Err(Error::Changed(format!("{} changed during the pending Harness rename", path.display())));
         }
-        self.finish(config)
+        self.finish()
     }
 
-    pub fn finish(&self, config: &Path) -> Result<()> {
-        let path = Self::path(config);
-        match std::fs::remove_file(&path) {
+    pub fn finish(&self) -> Result<()> {
+        match std::fs::remove_file(&self.file) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e).at(path),
+            Err(e) => Err(e).at(&self.file),
         }
     }
 }

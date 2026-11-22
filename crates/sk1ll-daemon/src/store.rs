@@ -108,6 +108,7 @@ pub(crate) fn for_machine(cfg: &Config, joined: Option<&DaemonState>) -> Box<dyn
             file: cfg.assignment.clone(),
             revisions: cfg.standalone_assignment_path(),
             machine_config: cfg.machine_config.clone(),
+            state_dir: cfg.state_dir.clone(),
             #[cfg(test)]
             before_swap: std::sync::Mutex::new(BEFORE_FIRST_SWAP.take()),
         }),
@@ -207,6 +208,8 @@ pub(crate) struct LocalAssignment {
     file: PathBuf,
     revisions: PathBuf,
     machine_config: PathBuf,
+    /// sk1ll's state directory, where a pending Harness rename is kept.
+    state_dir: PathBuf,
     /// Runs in [`LocalAssignment::swap`] before it checks the file.
     #[cfg(test)]
     pub(crate) before_swap: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -234,7 +237,7 @@ impl AssignmentStore for LocalAssignment {
     }
 
     fn finish_interrupted_rename(&self) -> Result<()> {
-        if let Some(intent) = RenameIntent::load(&self.machine_config, None)? {
+        if let Some(intent) = RenameIntent::load(&self.state_dir, &self.machine_config, None)? {
             intent.apply_standalone(&self.machine_config, &self.file)?;
         }
         Ok(())

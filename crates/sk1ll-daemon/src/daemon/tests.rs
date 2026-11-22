@@ -217,6 +217,7 @@ async fn reviewed_sync_reports_partial_progress_and_stops_on_digest_mismatch() {
         state: dir.path().join("state/daemon.json"),
         assignment: dir.path().join("assignment.json"),
         machine_config: dir.path().join("machine.toml"),
+        state_dir: dir.path().join("sk1ll-state"),
         socket: dir.path().join("daemon.sock"),
         ..Config::new().unwrap()
     };
@@ -303,6 +304,7 @@ async fn refused_adoption_rolls_back_only_its_own_unchanged_copy_and_can_retry()
         cfg.state = dir.path().join("state/daemon.json");
         cfg.assignment = dir.path().join("assignment.json");
         cfg.machine_config = dir.path().join("machine.toml");
+        cfg.state_dir = dir.path().join("sk1ll-state");
         std::fs::write(
             &cfg.machine_config,
             // The presets would find the developer's real harnesses.
@@ -387,6 +389,7 @@ fn joined_daemon(
     cfg.state = dir.join("state/daemon.json");
     cfg.assignment = dir.join("assignment.json");
     cfg.machine_config = dir.join("machine.toml");
+    cfg.state_dir = dir.join("sk1ll-state");
     std::fs::write(
         &cfg.machine_config,
         format!(
@@ -832,6 +835,7 @@ async fn a_stale_rename_confirmation_leaves_the_next_registrations_snapshot_alon
     let (d, _session, state) = joined_daemon(dir.path(), PullRecord::default());
     let request = RenameRequest { from: "h".into(), to: "g".into(), replace: false };
     let intent = RenameIntent::prepare(
+        &d.cfg.state_dir,
         &d.cfg.machine_config,
         &state.repo,
         request,
@@ -1104,6 +1108,7 @@ fn standalone_with_pdf(dir: &Path) -> Arc<Daemon> {
         state: dir.join("state/daemon.json"),
         assignment: dir.join("assignment.json"),
         machine_config: dir.join("machine.toml"),
+        state_dir: dir.join("sk1ll-state"),
         socket: dir.join("daemon.sock"),
         ..Config::new().unwrap()
     };
@@ -1297,6 +1302,7 @@ impl OnDemand {
             state: dir.path().join("state/daemon.json"),
             assignment: dir.path().join("assignment.json"),
             machine_config: dir.path().join("machine.toml"),
+            state_dir: dir.path().join("sk1ll-state"),
             socket: dir.path().join("daemon.sock"),
             ..Config::new().unwrap()
         };
@@ -1401,7 +1407,7 @@ async fn an_on_demand_rename_protects_a_destination_only_the_server_has() {
     let error = d.rename_harness(request).await.unwrap_err();
     assert!(error.to_string().contains("already has an Assignment"), "{error}");
     assert_eq!(std::fs::read(&d.cfg.machine_config).unwrap(), before);
-    assert!(!RenameIntent::exists(&d.cfg.machine_config).unwrap());
+    assert!(!RenameIntent::exists(&d.cfg.state_dir, &d.cfg.machine_config).unwrap());
     let snapshot: AssignmentSnapshot = fleet.get("/machines/a/assignment").await;
     assert_eq!((snapshot.revision, snapshot.assignment), (saved.revision, saved.assignment));
 }
@@ -1483,17 +1489,66 @@ async fn reading_the_assignment_leaves_a_pending_rename_alone() {
     assignment.save(&d.cfg.assignment).unwrap();
     let config = d.cfg.machine_config.clone();
     let request = RenameRequest { from: "h".into(), to: "renamed".into(), replace: false };
-    RenameIntent::prepare(&config, d.repo_root(), request, &assignment, None).unwrap().apply_config(&config).unwrap();
+    RenameIntent::prepare(&d.cfg.state_dir, &config, d.repo_root(), request, &assignment, None)
+        .unwrap()
+        .apply_config(&config)
+        .unwrap();
     let (config_before, file_before) = (std::fs::read(&config).unwrap(), std::fs::read(&d.cfg.assignment).unwrap());
     let current = d.current_assignment().unwrap();
     let (harnesses, planned) = d.preview_inputs().unwrap();
     assert!(current.harnesses.contains_key("h"), "the file as it is");
     assert!(harnesses.contains_key("renamed") && !planned.harness("renamed").new_skills_default);
-    assert!(RenameIntent::exists(&config).unwrap());
+    assert!(RenameIntent::exists(&d.cfg.state_dir, &config).unwrap());
     assert_eq!(std::fs::read(&config).unwrap(), config_before);
     assert_eq!(std::fs::read(&d.cfg.assignment).unwrap(), file_before);
     d.blocking(|d, eng| d.reconcile(eng).map(drop)).await.unwrap();
-    assert!(!RenameIntent::exists(&config).unwrap(), "a reconcile finishes it");
+    assert!(!RenameIntent::exists(&d.cfg.state_dir, &config).unwrap(), "a reconcile finishes it");
+}
+
+/// A pending Harness rename is kept under `machine.toml`'s real path: one
+/// that stopped half-way under one name for the file (a symlink into a
+/// dotfiles directory) is finished by an engine that knows it by another.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rename_stopped_under_one_name_is_finished_through_another() {
+    use sk1ll_core::harness_rename::{RenameIntent, RenameRequest};
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let d = standalone_with_pdf(dir.path());
+    add_harnesses(&d, &["h"]);
+    let cfg = d.cfg.clone();
+    drop(d);
+    // `machine.toml` lives in a dotfiles directory, known by two names.
+    let dotfiles = dir.path().join("dotfiles");
+    std::fs::create_dir(&dotfiles).unwrap();
+    std::fs::rename(&cfg.machine_config, dotfiles.join("machine.toml")).unwrap();
+    let (a, b) = (dir.path().join("a.toml"), dir.path().join("b.toml"));
+    symlink(dotfiles.join("machine.toml"), &a).unwrap();
+    symlink("dotfiles", dir.path().join("dots")).unwrap();
+    symlink("dots/machine.toml", &b).unwrap();
+    let mut assignment = sk1ll_core::Assignment::default();
+    assignment.set_harness("h", false);
+    assignment.save(&cfg.assignment).unwrap();
+
+    // Started through `a`, stopped after `machine.toml`, before the Assignment.
+    let request = RenameRequest { from: "h".into(), to: "renamed".into(), replace: false };
+    let repo = cfg.repo.clone().unwrap();
+    RenameIntent::prepare(&cfg.state_dir, &a, &repo, request, &assignment, None).unwrap().apply_config(&a).unwrap();
+    assert!(MachineConfig::load(&b).unwrap().harnesses().contains_key("renamed"));
+    assert!(sk1ll_core::Assignment::load(&cfg.assignment).unwrap().harnesses.contains_key("h"));
+    assert!(RenameIntent::exists(&cfg.state_dir, &b).unwrap(), "seen through the other name");
+    assert_eq!(RenameIntent::path(&cfg.state_dir, &a).unwrap(), RenameIntent::path(&cfg.state_dir, &b).unwrap());
+    // Nothing of it is kept beside `machine.toml`.
+    assert_eq!(std::fs::read_dir(&dotfiles).unwrap().count(), 1);
+
+    // An engine knowing it as `b` finishes it.
+    let d = Daemon::standalone(Config { machine_config: b.clone(), ..cfg.clone() }).unwrap();
+    d.blocking(|d, eng| d.reconcile(eng).map(drop)).await.unwrap();
+    assert!(!RenameIntent::exists(&cfg.state_dir, &a).unwrap());
+    let saved = sk1ll_core::Assignment::load(&cfg.assignment).unwrap();
+    assert!(!saved.harnesses.contains_key("h"));
+    assert!(!saved.harness("renamed").new_skills_default, "the toggles moved with the name");
+    assert!(MachineConfig::load(&a).unwrap().harnesses().contains_key("renamed"));
+    assert_eq!(std::fs::read_dir(&dotfiles).unwrap().count(), 1);
 }
 
 /// What the CLI's previews ask a running daemon for (`status`, `list`,

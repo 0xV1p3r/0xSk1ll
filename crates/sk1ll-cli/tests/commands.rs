@@ -66,6 +66,7 @@ impl TestRepo {
             .arg(self.state())
             .args(args)
             .env("HOME", self.root.join("home"))
+            .env_remove("SK1LL_STATE_DIR")
             .env("XDG_CONFIG_HOME", self.root.join("home/.config"))
             .env("XDG_CACHE_HOME", self.root.join("home/.cache"))
             .env("XDG_STATE_HOME", self.root.join("home/.local/state"))
@@ -107,6 +108,8 @@ impl TestRepo {
             machine_config: self.root.join("machine.toml"),
             assignment: self.assignment(),
             socket: self.root.join("no-daemon.sock"),
+            // As the CLI finds it from `XDG_STATE_HOME`.
+            state_dir: self.root.join("home/.local/state/sk1ll"),
             ..sk1ll_daemon::Config::new().unwrap()
         }
     }

@@ -28,6 +28,7 @@ impl Fixture {
             .arg("--daemon-socket")
             .arg(root.join("absent.sock"))
             .env("HOME", root.join("home"))
+            .env_remove("SK1LL_STATE_DIR")
             .env("XDG_CONFIG_HOME", root.join("config"))
             .env("XDG_STATE_HOME", root.join("state"))
             .env("XDG_CACHE_HOME", root.join("cache"))
@@ -261,7 +262,10 @@ fn standalone_sync_recovers_a_harness_rename_after_config_was_saved() {
     assignment.set_harness("a", false);
     assignment.save(&root.join("assignment.json")).unwrap();
     let config = root.join("machine.toml");
+    // sk1ll's state directory, as the CLI finds it from `XDG_STATE_HOME`.
+    let state = root.join("state/sk1ll");
     let pending = RenameIntent::prepare(
+        &state,
         &config,
         &root.join("repo"),
         RenameRequest { from: "a".into(), to: "new-a".into(), replace: false },
@@ -272,7 +276,7 @@ fn standalone_sync_recovers_a_harness_rename_after_config_was_saved() {
     pending.apply_config(&config).unwrap();
 
     fixture.run(&["sync"]);
-    assert!(!RenameIntent::exists(&config).unwrap());
+    assert!(!RenameIntent::exists(&state, &config).unwrap());
     let saved = sk1ll_core::Assignment::load(&root.join("assignment.json")).unwrap();
     assert!(!saved.harnesses.contains_key("a"));
     assert!(!saved.harness("new-a").new_skills_default);
@@ -318,7 +322,10 @@ fn previews_leave_a_pending_rename_and_the_harnesses_byte_identical() {
     assignment.set_harness("b", false);
     assignment.save(&root.join("assignment.json")).unwrap();
     let config = root.join("machine.toml");
+    // sk1ll's state directory, as the CLI finds it from `XDG_STATE_HOME`.
+    let state = root.join("state/sk1ll");
     let pending = RenameIntent::prepare(
+        &state,
         &config,
         &root.join("repo"),
         RenameRequest { from: "a".into(), to: "new-a".into(), replace: false },
@@ -338,10 +345,10 @@ fn previews_leave_a_pending_rename_and_the_harnesses_byte_identical() {
     fixture.run(&["render", "new-a"]);
 
     assert_eq!(tree(root), before, "a preview changed the filesystem");
-    assert!(RenameIntent::exists(&config).unwrap());
+    assert!(RenameIntent::exists(&state, &config).unwrap());
     // A sync, which changes things, finishes the rename.
     fixture.run(&["sync"]);
-    assert!(!RenameIntent::exists(&config).unwrap());
+    assert!(!RenameIntent::exists(&state, &config).unwrap());
     // `new-a` keeps `a`'s skills directory.
     assert!(root.join("a/pdf/SKILL.md").is_file() && !root.join("b/pdf").exists());
 }

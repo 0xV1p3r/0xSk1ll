@@ -68,22 +68,32 @@ rename, which stays pending, rather than being replaced.
 ## One engine per Machine, and what keys it
 
 The machine lock is a set of OS file locks, one for each file an engine
-writes outside the repo and the harness directories: the state file,
-`machine.toml`, `assignment.json`, the files kept beside the state file
-(`daemon-assignment.json`, `standalone-assignment.json`,
-`standalone-state.json`, the notifications shown) and a pending Harness
-rename beside `machine.toml`. Each lock file sits beside the file's real
-path (`<file>.engine-lock`, with every symlink resolved, the file's own
-included), so it may land in a dotfiles directory a symlinked `machine.toml`
-points into. Two engines that share any of those files, by whatever names,
-are one Machine and exclude each other: two state files in one directory
-share `standalone-assignment.json` and `standalone-state.json`, so they are
-one Machine. A symlink retargeted while an engine runs is not followed by
-its lock. Two config dirs that share none of them are two Machines, even if their `machine.toml`
-files name the same harness directories: only each harness directory's own
-lock keeps their syncs apart then, and their Assignments are separate. Like
-the directory lock, the machine lock needs a filesystem with working locks
-between all writers.
+writes outside the repo, the harness directories and sk1ll's state
+directory: the state file, `machine.toml`, `assignment.json` and the files
+kept beside the state file (`daemon-assignment.json`,
+`standalone-assignment.json`, `standalone-state.json`, the notifications
+shown). Each lock is keyed on the file's real path (with every symlink
+resolved, the file's own included). The lock files are all kept in `locks/`
+in sk1ll's state directory (`SK1LL_STATE_DIR`, default
+`$XDG_STATE_HOME/sk1ll`), each named by a hash of the real path it stands
+for, never beside the file. A pending Harness rename is kept there too, in
+`harness-rename/`, under the hash of `machine.toml`'s real path, so an
+engine finds it whatever name it knows `machine.toml` by.
+
+Two engines that share any of those files, by whatever names, are one
+Machine and exclude each other, as long as they use the same state
+directory: two engines run with different `SK1LL_STATE_DIR` or
+`XDG_STATE_HOME` (or `HOME`) take different locks and don't see each
+other's pending rename. Two state files in one directory share
+`standalone-assignment.json` and `standalone-state.json`, so they are one
+Machine. A symlink retargeted while an engine runs is not followed by its
+lock, nor by its pending rename. Two config dirs that share none of them
+are two Machines, even if their `machine.toml` files name the same harness
+directories: only each harness directory's own lock keeps their syncs apart
+then, and their Assignments are separate. Lock files are never removed (one
+per file an engine has written, a few dozen bytes of directory entry each).
+Like the directory lock, the machine lock needs a filesystem with working
+locks between all writers.
 
 A daemon that starts while a command's engine runs waits up to 30 seconds for
 it, then fails to start; start it again once the command ends. A command that

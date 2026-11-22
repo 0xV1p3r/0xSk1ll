@@ -73,7 +73,7 @@ impl Inputs {
         };
         let root = d.repo_root();
         let config = &d.cfg.machine_config;
-        let intent = sk1ll_core::harness_rename::RenameIntent::path(config);
+        let intent = RenameIntent::path(&d.cfg.state_dir, config)?;
         let assignment = match d.store.file() {
             Some(file) => Some(settled(&file.display(), Stamp::through(file, None)?)),
             None => None,
@@ -259,7 +259,9 @@ impl Daemon {
     /// Plans and applies, in the order the Item ID and pull guards need.
     fn apply_inputs(&self, eng: &mut Engine, reviewed: Option<ReviewedSync>) -> Result<ReconcileOutcome> {
         // One the Assignment's own file holds was finished by the refresh.
-        if RenameIntent::load(&self.cfg.machine_config, self.store.rename_authority().as_deref())?.is_some() {
+        if RenameIntent::load(&self.cfg.state_dir, &self.cfg.machine_config, self.store.rename_authority().as_deref())?
+            .is_some()
+        {
             return Err(Error::Unavailable("waiting for the pending Harness rename to finish".into()));
         }
         let root = self.repo_root().to_path_buf();

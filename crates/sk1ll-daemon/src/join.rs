@@ -603,6 +603,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let reg = registration(tmp.path());
         let mut cfg = Config::new().unwrap();
+        cfg.state_dir = tmp.path().join("sk1ll-state");
         cfg.state = tmp.path().join("daemon.json");
         cfg.assignment = tmp.path().join("assignment.json");
         std::fs::write(cfg.snapshot_path(), "original snapshot").unwrap();
@@ -634,6 +635,7 @@ mod tests {
     fn a_rejoin_stopped_half_way_never_pairs_new_credentials_with_the_old_snapshot() {
         let tmp = tempfile::tempdir().unwrap();
         let mut cfg = Config::new().unwrap();
+        cfg.state_dir = tmp.path().join("sk1ll-state");
         cfg.state = tmp.path().join("daemon.json");
         cfg.assignment = tmp.path().join("assignment.json");
         let old = DaemonState::new("a".into(), "http://h".into(), "old".into(), tmp.path().join("repo"));
@@ -670,6 +672,7 @@ mod tests {
             std::future::pending::<()>().await;
         });
         let mut cfg = Config::new().unwrap();
+        cfg.state_dir = tmp.path().join("sk1ll-state");
         cfg.state = tmp.path().join("state");
         cfg.machine_config = tmp.path().join("machine.toml");
         let opts = JoinOptions {

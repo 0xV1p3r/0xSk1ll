@@ -20,6 +20,12 @@ pub struct Config {
     /// Assignment cache (`SK1LL_ASSIGNMENT`, default `~/.cache/sk1ll/assignment.json`).
     /// Authoritative in standalone; a mirror of the server snapshot when joined.
     pub assignment: PathBuf,
+    /// sk1ll's own state directory (`SK1LL_STATE_DIR`, default
+    /// `$XDG_STATE_HOME/sk1ll`, else the platform's data directory's
+    /// `sk1ll`): the machine lock's files (`locks/`) and a pending Harness
+    /// rename (`harness-rename/`), each named by the hash of the real path of
+    /// the file it is about, so none of them lands beside a user's file.
+    pub state_dir: PathBuf,
     /// Local API socket (`SK1LL_DAEMON_SOCKET`, default
     /// `$XDG_RUNTIME_DIR/sk1ll/daemon.sock`, else `run/daemon.sock` in the
     /// config dir, as on macOS). Its directory must be ours and mode 0700.
@@ -57,6 +63,7 @@ impl Config {
             state: config_dir()?.join("daemon.json"),
             machine_config: MachineConfig::default_path()?,
             assignment: Assignment::default_path()?,
+            state_dir: default_state_dir()?,
             socket: Self::default_socket()?,
             pull_every: Duration::from_secs(300),
             debounce: Duration::from_millis(300),
@@ -84,6 +91,9 @@ impl Config {
         }
         if let Some(v) = var("SK1LL_ASSIGNMENT") {
             cfg.assignment = v.into();
+        }
+        if let Some(v) = var("SK1LL_STATE_DIR") {
+            cfg.state_dir = v.into();
         }
         if let Some(v) = var("SK1LL_DAEMON_SOCKET") {
             cfg.socket = v.into();
@@ -122,9 +132,12 @@ impl Config {
         self.state.with_extension("notifications.json")
     }
 
-    /// Every file an engine for this Machine may write, outside the repo and
-    /// the harness directories (which have locks of their own): what the
-    /// machine lock covers ([`crate::MachineLock`]).
+    /// Every file an engine for this Machine may write, outside the repo,
+    /// the harness directories (which have locks of their own) and
+    /// [`Config::state_dir`]: what the machine lock covers
+    /// ([`crate::MachineLock`]). A pending Harness rename is kept in the
+    /// state directory under `machine.toml`'s real path, so `machine.toml`'s
+    /// lock covers it.
     pub fn machine_files(&self) -> Vec<PathBuf> {
         vec![
             self.state.clone(),
@@ -134,7 +147,6 @@ impl Config {
             self.standalone_assignment_path(),
             crate::state::standalone_record_path(&self.state),
             self.notifications_path(),
-            sk1ll_core::harness_rename::RenameIntent::path(&self.machine_config),
         ]
     }
 
@@ -151,6 +163,10 @@ impl Config {
             None => Ok(config_dir()?.join("run").join("daemon.sock")),
         }
     }
+}
+
+fn default_state_dir() -> anyhow::Result<PathBuf> {
+    dirs::state_dir().or_else(dirs::data_dir).map(|d| d.join("sk1ll")).context("cannot determine the state directory")
 }
 
 fn config_dir() -> anyhow::Result<PathBuf> {

@@ -63,7 +63,7 @@ impl Daemon {
         let world = self
             .blocking(|d, _| {
                 d.refresh_assignment()?;
-                if RenameIntent::exists(&d.cfg.machine_config)? {
+                if RenameIntent::exists(&d.cfg.state_dir, &d.cfg.machine_config)? {
                     return Err(Error::Unavailable("waiting for the pending Harness rename to finish".into()));
                 }
                 d.world()
@@ -130,7 +130,7 @@ impl Daemon {
     ) -> Result<(std::collections::BTreeMap<String, sk1ll_core::Harness>, sk1ll_core::Assignment)> {
         let config = &self.cfg.machine_config;
         if let Some(file) = self.store.local().and(self.store.file())
-            && let Some(intent) = RenameIntent::load(config, None)?
+            && let Some(intent) = RenameIntent::load(&self.cfg.state_dir, config, None)?
         {
             return Ok((intent.renamed_config(config)?.harnesses(), intent.renamed_assignment(file)?));
         }

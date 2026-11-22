@@ -30,7 +30,7 @@ impl Daemon {
                     d.ensure_managed()?;
                     d.lock_repo(eng)?;
                     d.refresh_assignment()?;
-                    Ok(RenameIntent::load(&d.cfg.machine_config, authority.as_deref())?)
+                    Ok(RenameIntent::load(&d.cfg.state_dir, &d.cfg.machine_config, authority.as_deref())?)
                 }
             })
             .await?;
@@ -45,7 +45,14 @@ impl Daemon {
                 let world = d.world()?;
                 d.lock_repo(eng)?;
                 let config = &d.cfg.machine_config;
-                let intent = prepare_rename(config, d.repo_root(), authority.as_deref(), request, authoritative)?;
+                let intent = prepare_rename(
+                    &d.cfg.state_dir,
+                    config,
+                    d.repo_root(),
+                    authority.as_deref(),
+                    request,
+                    authoritative,
+                )?;
                 intent.apply_config(config)?;
                 Ok((intent, world))
             })
@@ -75,7 +82,14 @@ impl Daemon {
         self.refresh_assignment()?;
         let base = self.applied().expect("a standalone Machine always has its Assignment");
         let (config, file) = (&self.cfg.machine_config, self.store.file().expect("a machine-local file"));
-        let intent = prepare_rename(config, self.repo_root(), None, request, Some(base.assignment.clone()))?;
+        let intent = prepare_rename(
+            &self.cfg.state_dir,
+            config,
+            self.repo_root(),
+            None,
+            request,
+            Some(base.assignment.clone()),
+        )?;
         intent.apply_standalone(config, file)?;
         // The revision after `base`, recorded by a compare-and-swap against
         // the file as the rename left it.
@@ -89,7 +103,8 @@ impl Daemon {
     /// A rename the server session finds pending when it connects.
     pub(crate) fn pending_harness_rename(&self, eng: &mut Engine) -> Result<Option<(RenameIntent, World)>> {
         let config = &self.cfg.machine_config;
-        let Some(intent) = RenameIntent::load(config, self.store.rename_authority().as_deref())? else {
+        let Some(intent) = RenameIntent::load(&self.cfg.state_dir, config, self.store.rename_authority().as_deref())?
+        else {
             return Ok(None);
         };
         let world = self.world()?;
@@ -140,13 +155,14 @@ impl Daemon {
 /// request, else a new one from `authoritative` (the Assignment where it
 /// lives). Only local files: callers fetch first.
 fn prepare_rename(
+    state: &Path,
     config: &Path,
     repo: &Path,
     authority: Option<&str>,
     request: RenameRequest,
     authoritative: Option<sk1ll_core::Assignment>,
 ) -> Result<RenameIntent> {
-    if let Some(intent) = RenameIntent::load(config, authority)? {
+    if let Some(intent) = RenameIntent::load(state, config, authority)? {
         if intent.request == request {
             return Ok(intent);
         }
@@ -154,7 +170,7 @@ fn prepare_rename(
     }
     let authoritative = authoritative
         .ok_or_else(|| Error::Conflict("the pending Harness rename finished meanwhile; reload and retry".into()))?;
-    Ok(RenameIntent::prepare(config, repo, request, &authoritative, authority)?)
+    Ok(RenameIntent::prepare(state, config, repo, request, &authoritative, authority)?)
 }
 
 pub(crate) fn rename_write(intent: &RenameIntent) -> AssignmentWrite {
@@ -176,7 +192,7 @@ fn resolve_rename(config: &Path, intent: &RenameIntent, result: Result<Assignmen
     match result {
         Ok(update) => {
             intent.apply_config(config)?;
-            intent.finish(config)?;
+            intent.finish()?;
             Ok(update)
         }
         Err(error) => {

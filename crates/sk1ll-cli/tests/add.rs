@@ -40,6 +40,7 @@ impl Env {
             .args(["--repo", &r("repo"), "--daemon-socket", &r("absent.sock"), "--daemon-state", &r("absent.json")])
             .args(args)
             .env("HOME", r("home"))
+            .env_remove("SK1LL_STATE_DIR")
             .env("XDG_CONFIG_HOME", r("home/.config"))
             .env("XDG_STATE_HOME", r("home/.local/state"))
             .env("XDG_CACHE_HOME", r("home/.cache"))

@@ -239,6 +239,7 @@ fn removal_requires_yes_without_a_terminal() {
             .arg("--repo")
             .arg(dir.path().join("repo"))
             .env("HOME", dir.path())
+            .env_remove("SK1LL_STATE_DIR")
             .env("XDG_CONFIG_HOME", dir.path().join("config"))
             .env("XDG_CACHE_HOME", dir.path().join("cache"))
             .env("XDG_STATE_HOME", dir.path().join("state"))

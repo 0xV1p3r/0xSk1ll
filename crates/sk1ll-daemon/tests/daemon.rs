@@ -174,8 +174,14 @@ impl Machine {
     fn command(&self) -> Command {
         let h = self.home.path();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_sk1ll-daemon"));
-        for k in ["SK1LL_DAEMON_SOCKET", "SK1LL_DAEMON_STATE", "SK1LL_MACHINE_CONFIG", "SK1LL_ASSIGNMENT", "SK1LL_REPO"]
-        {
+        for k in [
+            "SK1LL_DAEMON_SOCKET",
+            "SK1LL_DAEMON_STATE",
+            "SK1LL_MACHINE_CONFIG",
+            "SK1LL_ASSIGNMENT",
+            "SK1LL_REPO",
+            "SK1LL_STATE_DIR",
+        ] {
             cmd.env_remove(k);
         }
         cmd.env("HOME", h)
@@ -2924,8 +2930,11 @@ async fn reconnect_replays_harness_rename_before_first_status() {
     let mut m = solo("solo", &server.url(), Some(snap.clone()));
     m.write("personal/x/.sk1ll-id", "persisted-x");
     let cfg = Machine::machine_config(m.home.path());
+    // sk1ll's state directory, as the daemon finds it from `XDG_STATE_HOME`.
+    let state = m.home.path().join(".local/state/sk1ll");
     let authority = sk1ll_core::hash::hash_str(&format!("{}\0solo\0tok", server.url()));
     let intent = RenameIntent::prepare(
+        &state,
         &cfg,
         &m.repo(),
         RenameRequest { from: HARNESS.into(), to: "renamed".into(), replace: false },
@@ -2967,7 +2976,7 @@ async fn reconnect_replays_harness_rename_before_first_status() {
     socket.send(Message::text(serde_json::to_string(&reply).unwrap())).await.unwrap();
     let DaemonMessage::Status(report) = next_message(&mut socket).await else { panic!("expected status after replay") };
     assert_eq!(report.harnesses, ["renamed"]);
-    assert!(!RenameIntent::exists(&cfg).unwrap());
+    assert!(!RenameIntent::exists(&state, &cfg).unwrap());
     assert!(m.snapshot().unwrap().assignment.skill_enabled("renamed", &id));
 }
 

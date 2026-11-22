@@ -11,20 +11,26 @@
 //! engine to end before it starts.
 //!
 //! It is a set of OS file locks, one for each file an engine writes outside
-//! the repo and the harness directories ([`Config::machine_files`]): the
-//! state file, `machine.toml`, the Assignment file and the files kept beside
-//! the state file (a joined Machine's Assignment snapshot, a standalone
-//! one's revision and pull record, the notifications shown) and beside
-//! `machine.toml` (a pending Harness rename). Each lock is keyed on the file
-//! itself, not on the name it is configured by: it sits beside the file's
-//! real path (`<file>.engine-lock`, every symlink resolved, its own too, and
-//! its directory canonical), so two names for one file (a symlinked
-//! `machine.toml`, two state files in one directory sharing
-//! `standalone-assignment.json`) are one lock. Each path can be moved on its
-//! own (`SK1LL_DAEMON_STATE`, `SK1LL_MACHINE_CONFIG`, `SK1LL_ASSIGNMENT`), and
+//! the repo, the harness directories and sk1ll's state directory
+//! ([`Config::machine_files`]): the state file, `machine.toml`, the
+//! Assignment file and the files kept beside the state file (a joined
+//! Machine's Assignment snapshot, a standalone one's revision and pull
+//! record, the notifications shown). A pending Harness rename is kept in the
+//! state directory under `machine.toml`'s real path, so `machine.toml`'s lock
+//! covers it. Each lock is keyed on the file itself, not on the name it is
+//! configured by: its real path (every symlink resolved, its own too, and its
+//! directory canonical, see [`sk1ll_core::real_path`]), so two names for one
+//! file (a symlinked `machine.toml`, two state files in one directory sharing
+//! `standalone-assignment.json`) are one lock. The lock files all live in one
+//! directory of sk1ll's own, `locks/` in [`Config::state_dir`], each named by
+//! the hash of the real path it stands for, so none is created beside a
+//! user's file (a `machine.toml` in a dotfiles repo, say), and nothing is
+//! created while resolving. They are taken in the order of their names, the
+//! same for every engine. Each path can be moved on its own
+//! (`SK1LL_DAEMON_STATE`, `SK1LL_MACHINE_CONFIG`, `SK1LL_ASSIGNMENT`), and
 //! two engines sharing any of these files would share state, so they share
-//! the Machine. Being OS locks, they are released when the holder exits,
-//! even after a crash.
+//! the Machine, as long as they share the state directory too. Being OS
+//! locks, they are released when the holder exits, even after a crash.
 //!
 //! Core's engine lock on the repo ([`sk1ll_core::EngineLock`]) stays: it is
 //! the token core's repo operations (a pull, an Adopt, a harness change)
@@ -59,10 +65,14 @@ impl Drop for MachineLock {
 
 impl MachineLock {
     /// The lock files for `cfg`'s Machine, one per file it writes, keyed on
-    /// that file's real path.
+    /// that file's real path, in the order they are taken.
     pub fn paths(cfg: &Config) -> anyhow::Result<Vec<PathBuf>> {
-        let mut paths =
-            cfg.machine_files().iter().map(|p| Ok(lock_path(&real_path(p)?))).collect::<anyhow::Result<Vec<_>>>()?;
+        let dir = cfg.state_dir.join("locks");
+        let mut paths = cfg
+            .machine_files()
+            .iter()
+            .map(|p| Ok(dir.join(format!("{}.lock", sk1ll_core::real_path::key(p)?))))
+            .collect::<anyhow::Result<Vec<_>>>()?;
         paths.sort();
         paths.dedup();
         Ok(paths)
@@ -129,55 +139,6 @@ pub(crate) fn held_message(cfg: &Config) -> String {
     )
 }
 
-fn lock_path(file: &Path) -> PathBuf {
-    let mut name = file.file_name().map(std::ffi::OsStr::to_os_string).unwrap_or_default();
-    name.push(".engine-lock");
-    file.with_file_name(name)
-}
-
-/// The file a write to `path` changes, as one name for all its names: every
-/// symlink resolved, `path`'s own included even when it dangles (a write
-/// through it creates its target), and the deepest directory that exists
-/// canonical. Nothing is created.
-fn real_path(path: &Path) -> anyhow::Result<PathBuf> {
-    /// As the kernel's limit on following symlinks.
-    const HOPS: usize = 40;
-    let mut path = std::path::absolute(path).with_context(|| format!("resolving {}", path.display()))?;
-    for _ in 0..HOPS {
-        let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
-            bail!("{} names no file", path.display());
-        };
-        let here = canonical_dir(dir)?.join(name);
-        match std::fs::symlink_metadata(&here) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                let target = std::fs::read_link(&here).with_context(|| format!("reading {}", here.display()))?;
-                path = here.parent().expect("a file in a directory").join(target);
-            }
-            _ => return Ok(here),
-        }
-    }
-    bail!("{}: too many levels of symbolic links", path.display())
-}
-
-/// `dir` canonical as far as it exists, the rest as given.
-fn canonical_dir(dir: &Path) -> anyhow::Result<PathBuf> {
-    let mut missing = Vec::new();
-    let mut existing = dir;
-    loop {
-        match existing.canonicalize() {
-            Ok(real) => return Ok(missing.iter().rev().fold(real, |p, name| p.join(name))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
-                    return Err(e).with_context(|| format!("resolving {}", dir.display()));
-                };
-                missing.push(name.to_os_string());
-                existing = parent;
-            }
-            Err(e) => return Err(e).with_context(|| format!("resolving {}", existing.display())),
-        }
-    }
-}
-
 fn open(path: &Path) -> anyhow::Result<File> {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -207,6 +168,7 @@ mod tests {
             machine_config: dir.join("config/machine.toml"),
             assignment: dir.join("cache/assignment.json"),
             socket: dir.join("run/daemon.sock"),
+            state_dir: dir.join("state"),
             ..Config::new().unwrap()
         }
     }
@@ -286,5 +248,46 @@ mod tests {
         // Nothing shared: two Machines.
         let _p = MachineLock::acquire(&base("p")).unwrap();
         assert!(MachineLock::try_acquire(&base("q")).unwrap().is_some());
+        // No lock file beside any of the files, the one in the dotfiles
+        // directory included: they are all in the state directory.
+        assert_eq!(std::fs::read_dir(dir.path().join("dotfiles")).unwrap().count(), 1);
+    }
+
+    /// Every lock file is in `locks/` of sk1ll's state directory, named by
+    /// a hash, and taken in one order; none sits beside the files.
+    #[test]
+    fn the_lock_files_are_in_one_directory_of_sk1lls_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let machine = cfg(dir.path(), "a");
+        let lock = MachineLock::acquire(&machine).unwrap();
+        let held: Vec<PathBuf> = lock.held().map(Path::to_path_buf).collect();
+        let locks = dir.path().join("state/locks");
+        assert_eq!(held.len(), machine.machine_files().len());
+        assert!(held.is_sorted(), "taken in the order of their names: {held:?}");
+        for path in &held {
+            assert_eq!(path.parent(), Some(locks.as_path()));
+            let name = path.file_name().unwrap().to_str().unwrap();
+            assert!(name.len() == 64 + ".lock".len() && name.ends_with(".lock"), "{name}");
+        }
+        assert_eq!(MachineLock::paths(&machine).unwrap(), held);
+        // Nothing beside the Machine's files: only the lock directory was made.
+        let mut made: Vec<_> = walk(dir.path());
+        made.sort();
+        let mut expected = vec![dir.path().join("state"), locks.clone()];
+        expected.extend(held.iter().cloned());
+        expected.sort();
+        assert_eq!(made, expected);
+    }
+
+    fn walk(dir: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                found.extend(walk(&path));
+            }
+            found.push(path);
+        }
+        found
     }
 }

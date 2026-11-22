@@ -35,6 +35,7 @@ fn recover_list_shows_displaced_content() {
             "list",
         ])
         .env("HOME", &root)
+        .env_remove("SK1LL_STATE_DIR")
         .env("XDG_STATE_HOME", root.join("state"))
         .output()
         .unwrap();

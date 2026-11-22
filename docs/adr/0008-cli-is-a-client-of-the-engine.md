@@ -46,10 +46,15 @@ with one code path over them (ADR 0001, 0002, 0004).
   lock before it reads any of that, and holds it for its life: the daemon
   until it exits, a command's engine for the command. It is one OS lock per
   file an engine writes there (the state file, `machine.toml`, the
-  Assignment file, and the files kept beside the state file and beside
-  `machine.toml`), each keyed on the file's real path, every symlink
-  resolved: two names for one file are one lock, so engines that share any
-  of these files exclude each other however they are configured. A daemon starting
+  Assignment file, and the files kept beside the state file), each keyed on
+  the file's real path, every symlink resolved: two names for one file are
+  one lock, so engines that share any of these files exclude each other
+  however they are configured. The lock files live in sk1ll's own state
+  directory, named by a hash of that real path, never beside a user's file,
+  and are taken in one order. A pending Harness rename is kept there too,
+  keyed on `machine.toml`'s real path, so it is finished through whichever
+  name an engine knows `machine.toml` by, and `machine.toml`'s lock covers
+  it. A daemon starting
   while a command's engine runs waits for it (up to 30 seconds), so it
   loads what that command saved. `join` and `init` hold it too.
 - A command that changes something while another engine manages the
