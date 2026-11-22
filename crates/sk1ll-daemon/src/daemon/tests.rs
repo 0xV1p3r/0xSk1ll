@@ -10,6 +10,7 @@ use super::*;
 use crate::client::{ChangeKind, ConflictTarget, DraftEntry};
 use crate::state::PullState;
 use sk1ll_core::ItemRef;
+use sk1ll_core::git::plumbing;
 
 #[test]
 fn inventory_keeps_both_ids_when_a_draft_recreates_the_same_name() {
@@ -466,7 +467,7 @@ async fn a_confirmation_overtaken_by_a_newer_revision_is_not_applied() {
     assert_eq!(update.revision, 3, "the reply carries the revision that stands");
     assert_eq!(update.assignment, newer.assignment);
     assert_eq!(d.applied().unwrap().revision, 3);
-    let owner = d.snapshot_owner();
+    let owner = d.ident.joined().ok().map(DaemonState::registration_key);
     assert_eq!(state::load_snapshot(&d.cfg.snapshot_path(), owner.as_deref()).unwrap().unwrap().revision, 3);
 
     let writer = d.clone();
@@ -834,7 +835,7 @@ async fn a_stale_rename_confirmation_leaves_the_next_registrations_snapshot_alon
         &state.repo,
         request,
         &sk1ll_proto::Assignment::default(),
-        Some(&state.rename_authority()),
+        Some(&state.registration_key()),
     )
     .unwrap();
     let world = d.blocking(|d, _| d.world()).await.unwrap();
@@ -913,7 +914,7 @@ async fn a_rejoin_does_not_replace_a_registration_that_recovered_meanwhile() {
     let error = d.rejoin(reg, world).await.unwrap_err();
     assert!(error.to_string().contains("works again"), "{error}");
     assert_eq!(DaemonState::load(&d.cfg.state).unwrap().unwrap().token, state.token);
-    let owner = d.snapshot_owner();
+    let owner = d.ident.joined().ok().map(DaemonState::registration_key);
     assert_eq!(state::load_snapshot(&d.cfg.snapshot_path(), owner.as_deref()).unwrap().unwrap().revision, 1);
     assert!(d.ensure_managed().is_ok(), "still managing, not halted");
 }

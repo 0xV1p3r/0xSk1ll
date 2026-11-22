@@ -21,12 +21,13 @@ mod error;
 pub mod join;
 mod lifecycle;
 mod notifications;
+mod remote;
 mod server;
 pub mod service;
 pub mod state;
+mod store;
 mod watch;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, bail};
@@ -98,10 +99,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         }
         tokio::spawn(daemon::reconcile_loop(d.clone()));
         tokio::spawn(watch::run(d.clone()));
-        if !d.is_standalone() {
-            tokio::spawn(server::run(d.clone()));
-            tokio::spawn(periodic_pull(d.clone()));
-        }
+        d.remote.run(&d);
     }
     let notifications = tokio::spawn(notifications::run(d.clone()));
     let served = tokio::select! {
@@ -111,22 +109,6 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     notifications.abort();
     let _ = std::fs::remove_file(&socket);
     served
-}
-
-/// The fallback for missed nudges.
-async fn periodic_pull(d: Arc<Daemon>) {
-    let mut tick = tokio::time::interval(d.cfg.pull_every);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    tick.tick().await;
-    loop {
-        tick.tick().await;
-        if d.is_revoked() {
-            return;
-        }
-        if d.is_connected() {
-            let _ = d.pull().await;
-        }
-    }
 }
 
 async fn shutdown() {

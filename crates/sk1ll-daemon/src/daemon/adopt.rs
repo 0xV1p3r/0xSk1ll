@@ -66,7 +66,7 @@ impl Daemon {
             self.reconcile(eng)?;
             return Ok(None);
         }
-        if !self.is_standalone() && !self.is_connected() {
+        if !self.store.writable(self) {
             return Err(Error::Unavailable("Adopt needs a connection to the Server".into()));
         }
         // A pending pull's tree is partial: nothing is published into it.

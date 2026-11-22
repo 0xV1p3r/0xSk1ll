@@ -121,7 +121,9 @@ impl RenameIntent {
         file.replace(to)
     }
 
-    pub fn apply_standalone(&self, config: &Path, path: &Path) -> Result<()> {
+    /// The machine-local Assignment at `path` once renamed: the file must
+    /// still be as the intent found it, or renamed already.
+    pub fn renamed_assignment(&self, path: &Path) -> Result<Assignment> {
         let before = self
             .before_assignment
             .as_ref()
@@ -132,8 +134,14 @@ impl RenameIntent {
         if current != *before && current != after {
             return Err(Error::Changed(format!("{} changed during the pending Harness rename", path.display())));
         }
+        Ok(after)
+    }
+
+    /// Makes both writes of a machine-local rename and finishes it.
+    pub fn apply_standalone(&self, config: &Path, path: &Path) -> Result<()> {
+        let after = self.renamed_assignment(path)?;
         self.apply_config(config)?;
-        if current != after {
+        if Assignment::load(path)? != after {
             after.save(path)?;
         }
         self.finish(config)

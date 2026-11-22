@@ -14,7 +14,7 @@ impl Daemon {
     pub(super) async fn retry_stopped_pull(self: &Arc<Self>) {
         if self.draft_moved.swap(false, std::sync::atomic::Ordering::SeqCst)
             && self.lifecycle().pull_stopped()
-            && (self.is_connected() || self.is_standalone())
+            && self.remote.reachable(self)
         {
             let _ = self.pull().await;
         }
@@ -28,12 +28,9 @@ impl Daemon {
     /// was fetched last, whoever fetched it. A pull that moved nothing
     /// changed no Input, so its reconcile has nothing to do.
     pub(crate) async fn pull(self: &Arc<Self>) -> Result<PullResult> {
-        let standalone = self.is_standalone();
         self.blocking(move |d, eng| {
             d.ensure_managed()?;
-            if standalone {
-                d.require_origin()?;
-            }
+            d.remote.check(d.repo_root())?;
             d.lock_repo(eng)
         })
         .await?;
@@ -43,7 +40,9 @@ impl Daemon {
             Err(e) => Err(e),
         };
         let result = match result {
-            Ok(r) if !standalone && !matches!(r, PullResult::Blocked { .. }) => self.push_pending().await.map(|_| r),
+            Ok(r) if self.remote.pushes_commits() && !matches!(r, PullResult::Blocked { .. }) => {
+                self.push_pending().await.map(|_| r)
+            }
             result => result,
         };
         self.blocking(move |d, eng| {
@@ -67,16 +66,10 @@ impl Daemon {
         .await
     }
 
-    /// Without the engine mutex: clones the repo if it isn't there yet (a
-    /// clone has fetched), else fetches origin's branches. Neither moves the
-    /// working tree, `HEAD` or the index of an existing repo.
+    /// Without the engine mutex: fetches the Baseline from the remote
+    /// ([`crate::remote::Remote::fetch`]).
     pub(super) fn fetch_baseline(&self) -> Result<()> {
-        let root = self.repo_root();
-        if !root.join(".git").exists() {
-            plumbing::ensure_clone(root, &self.ident.joined()?.repo_url(), &[])?;
-            return Ok(());
-        }
-        Ok(Repo::open_git_only(root)?.fetch()?)
+        self.remote.fetch(self.repo_root())
     }
 
     /// Without the engine mutex: runs the filter drivers for what the next
@@ -263,10 +256,7 @@ impl Daemon {
         self.blocking(|d, eng| {
             d.ensure_managed()?;
             d.lock_repo(eng)?;
-            if d.is_standalone() {
-                d.require_origin()?;
-            }
-            Ok(())
+            d.remote.check(d.repo_root())
         })
         .await?;
         let result = self.push_pending().await;
@@ -288,12 +278,13 @@ impl Daemon {
         self.pull().await.map(drop)
     }
 
-    /// Commits under the engine mutex; a joined daemon then pushes, and the
-    /// state is reconciled once the push is done.
+    /// Commits under the engine mutex; where the remote takes commits as
+    /// they are made (the server), it then pushes, and the state is
+    /// reconciled once the push is done.
     pub(crate) async fn commit(self: &Arc<Self>, req: CommitRequest) -> Result<CommitResponse> {
         let mut response = self.blocking(move |d, eng| d.commit_locally(eng, req)).await?;
-        if !self.is_standalone() {
-            if self.is_connected() {
+        if self.remote.pushes_commits() {
+            if self.remote.reachable(self) {
                 match self.push_pending().await {
                     Ok(_) => response.pushed = true,
                     Err(e) => response.push_error = Some(crate::auth::redact(&e.to_string())),

@@ -69,7 +69,6 @@ use crate::lifecycle::Lifecycle;
 pub(crate) use crate::lifecycle::Link;
 use crate::state::{self, DaemonState, PullRecord};
 use crate::watch::WatchRoot;
-use sk1ll_core::git::plumbing;
 
 mod adopt;
 mod assignment;
@@ -85,6 +84,7 @@ mod reconcile;
 mod snapshot;
 mod views;
 
+pub(crate) use harness_rename::{prepare_rename, rename_write, resolve_rename};
 pub(crate) use reconcile::{repo_inventory, run as reconcile_loop};
 pub(crate) use snapshot::Snapshot;
 use {placement::*, reconcile::*, views::*};
@@ -137,6 +137,16 @@ pub(crate) struct Daemon {
     /// rejoin restarts the process (see [`Daemon::rejoin`]). Its `revoked`
     /// and record are as of startup; [`Daemon::lifecycle`] owns them.
     pub(crate) ident: Mode,
+    /// Where the Assignment lives: the server, or the machine-local file.
+    pub(crate) store: Box<dyn crate::store::AssignmentStore>,
+    /// What the repo fetches from and pushes to: the server, or its origin.
+    pub(crate) remote: Box<dyn crate::remote::Remote>,
+    /// An engine in a CLI process ([`crate::local`]): it connects to the
+    /// server only when a request needs the session, and runs nothing in
+    /// the background.
+    on_demand: bool,
+    /// Started the server session for a request (see [`Daemon::on_demand`]).
+    pub(crate) session_started: std::sync::Once,
     engine: Mutex<Engine>,
     /// What the daemon is doing. Never held across network I/O; the lock
     /// order is the engine mutex, then this, then the view.
@@ -204,16 +214,28 @@ pub(crate) struct Engine {
 
 impl Daemon {
     pub(crate) fn new(cfg: Config, state: DaemonState) -> anyhow::Result<Arc<Self>> {
-        Self::with_mode(cfg, Mode::Joined(state))
+        Self::with_mode(cfg, Mode::Joined(state), false)
     }
 
     pub(crate) fn standalone(cfg: Config) -> anyhow::Result<Arc<Self>> {
-        let machine = MachineConfig::load(&cfg.machine_config)?;
-        let repo = crate::locate_repo(cfg.repo.as_deref(), false)?;
-        Self::with_mode(cfg, Mode::Standalone { machine_id: machine.id, repo })
+        Self::for_machine(cfg, None, false)
     }
 
-    fn with_mode(cfg: Config, state: Mode) -> anyhow::Result<Arc<Self>> {
+    /// The daemon for `cfg`'s Machine: joined if `state` says so.
+    /// `on_demand`: an engine in a CLI process (see [`Daemon::on_demand`]).
+    pub(crate) fn for_machine(cfg: Config, state: Option<DaemonState>, on_demand: bool) -> anyhow::Result<Arc<Self>> {
+        let mode = match state {
+            Some(state) => Mode::Joined(state),
+            None => {
+                let machine = MachineConfig::load(&cfg.machine_config)?;
+                let repo = crate::locate_repo(cfg.repo.as_deref(), false)?;
+                Mode::Standalone { machine_id: machine.id, repo }
+            }
+        };
+        Self::with_mode(cfg, mode, on_demand)
+    }
+
+    fn with_mode(cfg: Config, state: Mode, on_demand: bool) -> anyhow::Result<Arc<Self>> {
         let standalone = matches!(state, Mode::Standalone { .. });
         let lifecycle = match &state {
             Mode::Joined(s) => Lifecycle::joined(s.revoked, s.record.clone()),
@@ -225,35 +247,14 @@ impl Daemon {
                 }))
             }
         };
-        let snapshot = if standalone {
-            let assignment = sk1ll_core::Assignment::load(&cfg.assignment)?;
-            let previous = state::load_snapshot(&cfg.state.with_file_name("standalone-assignment.json"), None)?;
-            let revision = previous.as_ref().map_or(1, |s| s.revision + u64::from(s.assignment != assignment));
-            Some(AssignmentSnapshot { revision, assignment, registration: None })
-        } else {
-            match state::load_snapshot(
-                &cfg.snapshot_path(),
-                state.joined().ok().map(|s| s.registration_key()).as_deref(),
-            ) {
-                Ok(Some(s)) => Some(s),
-                Ok(None) => {
-                    tracing::warn!("no stored assignment: leaving the harnesses alone until the server sends one");
-                    None
-                }
-                Err(e) => {
-                    tracing::warn!("{e:#}; leaving the harnesses alone until the server sends an assignment");
-                    None
-                }
-            }
-        };
-        if standalone && let Some(snap) = &snapshot {
-            state::save_snapshot(&cfg.state.with_file_name("standalone-assignment.json"), snap, None)?;
-        }
+        let store = crate::store::for_machine(&cfg, state.joined().ok());
+        let remote = crate::remote::for_machine(state.joined().ok());
+        let snapshot = store.load()?;
         let mut view = StatusView {
             machine_id: state.machine_id().to_string(),
             server_url: state.joined().ok().map(|s| s.server_url.clone()),
             mode: if standalone { DaemonMode::Standalone } else { DaemonMode::Joined },
-            has_origin: !standalone || plumbing::has_origin(state.repo()).unwrap_or(false),
+            has_origin: remote.has_origin(state.repo()),
             repo_ready: !standalone || state.repo().join(".git").exists(),
             repo: state.repo().to_path_buf(),
             headline: sk1ll_proto::MachineStatus::Offline,
@@ -271,6 +272,10 @@ impl Daemon {
         Ok(Arc::new(Self {
             cfg,
             ident: state,
+            store,
+            remote,
+            on_demand,
+            session_started: std::sync::Once::new(),
             applied: RwLock::new(snapshot.map(Arc::new)),
             snapshot: watch::channel(Snapshot::initial()).0,
             lifecycle: Mutex::new(lifecycle),
@@ -304,20 +309,6 @@ impl Daemon {
             wants_prefilter: AtomicBool::new(false),
             prefilter_tries: Default::default(),
         }))
-    }
-
-    /// The registration this daemon's Assignment snapshots belong to
-    /// (`None`: standalone, whose snapshot is its own).
-    pub(crate) fn snapshot_owner(&self) -> Option<String> {
-        self.ident.joined().ok().map(DaemonState::registration_key)
-    }
-
-    fn require_origin(&self) -> Result<()> {
-        self.require_repo()?;
-        if !plumbing::has_origin(self.repo_root())? {
-            return Err(Error::Conflict("this repo has no origin remote".into()));
-        }
-        Ok(())
     }
 
     pub(crate) fn init(&self, eng: &mut Engine) -> Result<()> {
@@ -474,6 +465,12 @@ impl Daemon {
 
     pub(crate) fn is_standalone(&self) -> bool {
         matches!(self.ident, Mode::Standalone { .. })
+    }
+
+    /// An engine in a CLI process ([`crate::local`]), bound to no socket:
+    /// it reaches the server only for the request it serves.
+    pub(crate) fn on_demand(&self) -> bool {
+        self.on_demand
     }
 
     pub(crate) fn require_repo(&self) -> Result<()> {
@@ -673,29 +670,19 @@ impl Daemon {
         }
     }
 
-    /// At startup: clone the repo if it isn't there yet (without the engine
-    /// mutex), drop credentials an older version left in origin's URL, and
-    /// bring the harnesses in line.
+    /// At startup: set up the repo if it isn't there yet (the fleet's
+    /// clone, without the engine mutex; it also drops credentials an older
+    /// version left in origin's URL), and bring the harnesses in line.
     pub(crate) async fn startup(self: &Arc<Self>) -> Result<()> {
         if self.idle() {
             return Ok(());
         }
-        if !self.is_standalone() {
-            // Git authenticates through the process environment (`prepare_process`).
-            let cloned =
-                self.network(|d| Ok(plumbing::ensure_clone(d.repo_root(), &d.ident.joined()?.repo_url(), &[]))).await?;
-            if let Err(e) = cloned {
-                self.set_error(format!("setting up {}: {e:#}", self.repo_root().display()));
-            }
+        // Git authenticates through the process environment (`prepare_process`).
+        if let Err(e) = self.network(|d| Ok(d.remote.set_up(d.repo_root()))).await? {
+            self.set_error(e);
         }
         self.blocking(|d, eng| {
             d.lock_repo(eng)?;
-            if !d.is_standalone()
-                && let Some(s) = d.applied()
-                && let Err(e) = s.assignment.save(&d.cfg.assignment)
-            {
-                tracing::warn!("writing the assignment cache {}: {e}", d.cfg.assignment.display());
-            }
             d.reconcile(eng).map(drop)
         })
         .await

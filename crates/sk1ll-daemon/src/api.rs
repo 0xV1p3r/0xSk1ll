@@ -31,7 +31,6 @@ use crate::client::{
 use crate::daemon::Daemon;
 use crate::error::{Error, Result};
 use crate::join::{self, JoinOptions, Joined};
-use crate::server;
 
 type St = State<Arc<Daemon>>;
 
@@ -530,17 +529,11 @@ async fn assignment(
     OriginalUri(uri): OriginalUri,
     body: Bytes,
 ) -> Result<Response> {
-    if !d.is_standalone() && (method == Method::GET || machine != d.ident.machine_id()) {
+    if machine != d.ident.machine_id() {
         return pass(State(d), method, OriginalUri(uri), body).await;
     }
-    if machine != d.ident.machine_id() {
-        return Err(Error::Conflict("This Machine is standalone; join a Fleet to use this".into()));
-    }
     if method == Method::GET {
-        // The applied Assignment, published whole: a hand edit of the file
-        // is applied (and announced) by the reconcile it wakes.
-        let snap = d.applied().expect("standalone always has an assignment");
-        return Ok(Json(snap.as_ref()).into_response());
+        return Ok(Json(d.store.get(&d).await?).into_response());
     }
     let changes = serde_json::from_slice(&body).map_err(|e| Error::BadRequest(e.to_string()))?;
     let update = d.write_assignment(sk1ll_proto::AssignmentWrite::Changes(changes)).await?;
@@ -565,9 +558,8 @@ async fn rename_harness(
 
 /// Server pass-through: same path and query under the server's `/api`.
 async fn pass(State(d): St, method: Method, OriginalUri(uri): OriginalUri, body: Bytes) -> Result<Response> {
-    d.ident.joined()?;
     let path = uri.path_and_query().map_or(uri.path(), |p| p.as_str());
-    server::proxy(&d, method, path, body).await
+    d.remote.proxy(&d, method, path, body).await
 }
 
 async fn events(State(d): St) -> impl IntoResponse {
@@ -620,8 +612,8 @@ async fn imports(State(d): St) -> Result<Json<crate::client::ImportsView>> {
 }
 
 pub(crate) async fn import_checks(d: &Daemon, mut view: crate::client::ImportsView) -> crate::client::ImportsView {
-    if !d.is_standalone()
-        && let Ok(response) = server::proxy(d, Method::GET, "/imports", Bytes::new()).await
+    if d.remote.checks_imports()
+        && let Ok(response) = d.remote.proxy(d, Method::GET, "/imports", Bytes::new()).await
         && response.status().is_success()
         && let Ok(bytes) = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024).await
         && let Ok(remote) = serde_json::from_slice::<sk1ll_proto::ImportsView>(&bytes)

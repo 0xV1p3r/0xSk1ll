@@ -92,10 +92,6 @@ impl DaemonState {
         sk1ll_core::hash::hash_str(&format!("{}\0{}\0{}", self.server_url, self.machine_id, self.token))
     }
 
-    pub(crate) fn rename_authority(&self) -> String {
-        self.registration_key()
-    }
-
     /// `None` if the machine hasn't joined.
     pub fn load(path: &Path) -> anyhow::Result<Option<Self>> {
         match fs::read_to_string(path) {

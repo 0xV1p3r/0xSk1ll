@@ -14,7 +14,6 @@ use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::Response;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use sk1ll_core::harness_rename::{RenameIntent, RenameRequest};
 use sk1ll_proto::{
     AssignmentOutcome, AssignmentSnapshot, AssignmentUpdate, AssignmentWrite, DaemonMessage, ErrorBody,
     InventoryReport, MachineReport, PROTOCOL_HEADER, PROTOCOL_VERSION, ServerMessage,
@@ -24,7 +23,10 @@ use tokio_tungstenite::tungstenite::{self, Message, client::IntoClientRequest};
 
 use crate::auth::redact;
 use crate::client::Event;
-use crate::daemon::{Daemon, Link};
+use sk1ll_core::harness_rename::{RenameIntent, RenameRequest};
+
+use crate::client::Connection;
+use crate::daemon::{Daemon, Link, rename_write};
 use crate::error::{Error, Result};
 use crate::{Config, DaemonState};
 
@@ -58,6 +60,41 @@ pub(crate) async fn write_assignment(d: &Daemon, write: AssignmentWrite) -> Resu
     })
     .await
     .map_err(|_| Error::Unavailable("the Server did not confirm the Assignment in time".into()))?
+}
+
+/// Waits for the server session. A daemon that connects on demand (an
+/// engine in a CLI process) starts it for the first request that needs it
+/// and waits until it connected or failed to; any other fails at once
+/// while it is offline.
+pub(crate) async fn connected(d: &Arc<Daemon>) -> Result<()> {
+    if d.assignment_session.borrow().is_some() && d.is_connected() {
+        return Ok(());
+    }
+    if !d.on_demand() || d.ident.joined().is_err() {
+        return Err(offline());
+    }
+    d.session_started.call_once(|| {
+        tokio::spawn(run(d.clone()));
+    });
+    let mut view = d.subscribe_view();
+    let wait = async {
+        loop {
+            let status = view.borrow_and_update().clone();
+            match status.connection {
+                Connection::Connected if d.assignment_session.borrow().is_some() => return Ok(()),
+                Connection::Offline | Connection::AuthRejected | Connection::Revoked => {
+                    return Err(Error::Unavailable(status.last_error.unwrap_or_else(|| offline().to_string())));
+                }
+                _ => {}
+            }
+            if view.changed().await.is_err() {
+                return Err(offline());
+            }
+        }
+    };
+    tokio::time::timeout(CONNECT_TIMEOUT + SEND_TIMEOUT + REQUEST_TIMEOUT, wait)
+        .await
+        .map_err(|_| Error::Unavailable("the Server did not accept the connection in time".into()))?
 }
 
 fn offline() -> Error {
@@ -194,12 +231,15 @@ async fn session(d: &Arc<Daemon>, ws: Ws, inbox: &mpsc::UnboundedSender<ServerMe
     }
     let mut next_request = 1;
     let mut pending: BTreeMap<u64, (u64, oneshot::Sender<Result<AssignmentUpdate>>)> = BTreeMap::new();
-    let catch_up = d.clone();
-    tokio::spawn(async move {
-        if let Err(e) = catch_up.on_connected().await {
-            tracing::warn!("after connecting: {e}");
-        }
-    });
+    // An engine in a CLI process serves the one request it connected for.
+    if !d.on_demand() {
+        let catch_up = d.clone();
+        tokio::spawn(async move {
+            if let Err(e) = catch_up.on_connected().await {
+                tracing::warn!("after connecting: {e}");
+            }
+        });
+    }
 
     loop {
         tokio::select! {
@@ -325,7 +365,7 @@ pub(crate) async fn proxy(d: &Daemon, method: Method, path_and_query: &str, body
     out.body(Body::from(bytes)).map_err(|e| Error::Internal(e.into()))
 }
 
-/// The authenticated Server transport shared by the daemon and direct CLI.
+/// The authenticated Server transport.
 async fn request(
     http: &reqwest::Client,
     state: &DaemonState,
@@ -357,62 +397,6 @@ pub(crate) async fn fetch_machine_assignment(
         .json()
         .await
         .map_err(|e| Error::Unavailable(redact(&e.to_string())))
-}
-
-/// The rename intent for `request`: the pending one if it is for the same
-/// request, else a new one from `authoritative` (the server's Assignment,
-/// see [`fetch_machine_assignment`]). Only local files: callers fetch first.
-pub(crate) fn prepare_rename(
-    cfg: &Config,
-    state: &DaemonState,
-    request_body: RenameRequest,
-    authoritative: Option<&sk1ll_proto::Assignment>,
-) -> Result<RenameIntent> {
-    let authority = state.rename_authority();
-    let config = &cfg.machine_config;
-    if let Some(intent) = RenameIntent::load(config, Some(&authority))? {
-        if intent.request == request_body {
-            return Ok(intent);
-        }
-        return Err(Error::Conflict("finish the pending Harness rename first".into()));
-    }
-    let authoritative = authoritative
-        .ok_or_else(|| Error::Conflict("the pending Harness rename finished meanwhile; reload and retry".into()))?;
-    Ok(RenameIntent::prepare(config, &state.repo, request_body, authoritative, Some(&authority))?)
-}
-
-pub(crate) fn rename_write(intent: &RenameIntent) -> AssignmentWrite {
-    AssignmentWrite::RenameHarness(sk1ll_proto::HarnessRename {
-        from: intent.request.from.clone(),
-        to: intent.request.to.clone(),
-        replace: intent.request.replace,
-        operation_id: intent.operation_id.clone(),
-    })
-}
-
-fn definitive_refusal(error: &Error) -> bool {
-    matches!(error, Error::Upstream(status, _) if matches!(*status,
-        StatusCode::BAD_REQUEST | StatusCode::CONFLICT | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND))
-}
-
-pub(crate) fn resolve_rename(
-    config: &std::path::Path,
-    intent: &RenameIntent,
-    result: Result<AssignmentUpdate>,
-) -> Result<AssignmentUpdate> {
-    match result {
-        Ok(update) => {
-            intent.apply_config(config)?;
-            intent.finish(config)?;
-            Ok(update)
-        }
-        Err(error) => {
-            if definitive_refusal(&error) {
-                intent.rollback_config(config)?;
-            }
-            Err(error)
-        }
-    }
 }
 
 async fn exchange(
@@ -453,12 +437,13 @@ pub async fn rename_harness_direct(
     request_body: RenameRequest,
 ) -> anyhow::Result<crate::client::HarnessRenameResult> {
     let http = http_client().build()?;
-    let authority = state.rename_authority();
+    let authority = state.registration_key();
     let authoritative = match RenameIntent::load(&cfg.machine_config, Some(&authority))? {
         Some(_) => None,
         None => Some(fetch_machine_assignment(state, &http).await?.assignment),
     };
-    let intent = prepare_rename(cfg, state, request_body, authoritative.as_ref())?;
+    let intent =
+        crate::daemon::prepare_rename(&cfg.machine_config, &state.repo, Some(&authority), request_body, authoritative)?;
     intent.apply_config(&cfg.machine_config)?;
     let (mut sink, mut stream) = direct_session(state).await?;
     let result = exchange(&mut sink, &mut stream, 1, 0, rename_write(&intent)).await;
@@ -466,7 +451,7 @@ pub async fn rename_harness_direct(
     if let Ok(update) = &result {
         save_assignment_snapshot(cfg, state, update)?;
     }
-    let update = resolve_rename(&cfg.machine_config, &intent, result)?;
+    let update = crate::daemon::resolve_rename(&cfg.machine_config, &intent, result)?;
     Ok(crate::client::HarnessRenameResult { update, routed_rules: intent.routed_rules })
 }
 
@@ -502,14 +487,14 @@ pub async fn write_assignment_direct(
     use anyhow::Context;
     let state = DaemonState::load(&cfg.state)?.context("this machine hasn't joined a fleet")?;
     let (mut sink, mut stream) = direct_session(&state).await?;
-    let authority = state.rename_authority();
+    let authority = state.registration_key();
     if let Some(intent) = RenameIntent::load(&cfg.machine_config, Some(&authority))? {
         intent.apply_config(&cfg.machine_config)?;
         let result = exchange(&mut sink, &mut stream, 1, 0, rename_write(&intent)).await;
         if let Ok(update) = &result {
             save_assignment_snapshot(cfg, &state, update)?;
         }
-        resolve_rename(&cfg.machine_config, &intent, result)?;
+        crate::daemon::resolve_rename(&cfg.machine_config, &intent, result)?;
     }
     let harnesses = sk1ll_core::MachineConfig::load(&cfg.machine_config)?.harnesses().into_keys().collect();
     let inventory = crate::daemon::repo_inventory(&state.repo, harnesses);

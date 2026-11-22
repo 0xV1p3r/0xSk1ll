@@ -127,9 +127,7 @@ impl Daemon {
         self.lock_repo(eng)?;
         Self::require_sync_ready(&Repo::open_git_only(self.repo_root())?)?;
         let reviewed = if let Some(fingerprint) = fingerprint {
-            if self.is_standalone() {
-                self.reload_local_assignment()?;
-            }
+            self.refresh_assignment()?;
             let snapshot =
                 self.applied().ok_or_else(|| Error::Conflict("waiting for the server's assignment".into()))?;
             let root = self.repo_root();

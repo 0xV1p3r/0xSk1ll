@@ -74,9 +74,9 @@ impl Inputs {
         let root = d.repo_root();
         let config = &d.cfg.machine_config;
         let intent = config.with_extension("harness-rename.json");
-        let assignment = match d.is_standalone() {
-            true => Some(settled(&d.cfg.assignment.display(), Stamp::through(&d.cfg.assignment, None)?)),
-            false => None,
+        let assignment = match d.store.file() {
+            Some(file) => Some(settled(&file.display(), Stamp::through(file, None)?)),
+            None => None,
         };
         let inputs = Self {
             repo: settled(&root.display(), working_tree(root)?),
@@ -215,9 +215,7 @@ impl Daemon {
             return Ok(ReconcileOutcome::default());
         }
         // An edit of the Assignment file is a new revision, an Input.
-        if self.is_standalone() {
-            self.reload_local_assignment()?;
-        }
+        self.refresh_assignment()?;
         let gathered = Inputs::gather(self, eng.racy);
         let started = std::time::Instant::now();
         let full = eng.full_at.is_none_or(|at| started.duration_since(at) >= self.cfg.full_reconcile_every);
@@ -263,9 +261,8 @@ impl Daemon {
 
     /// Plans and applies, in the order the Item ID and pull guards need.
     fn apply_inputs(&self, eng: &mut Engine, reviewed: Option<ReviewedSync>) -> Result<ReconcileOutcome> {
-        if let Ok(state) = self.ident.joined()
-            && RenameIntent::load(&self.cfg.machine_config, Some(&state.rename_authority()))?.is_some()
-        {
+        // One the Assignment's own file holds was finished by the refresh.
+        if RenameIntent::load(&self.cfg.machine_config, self.store.rename_authority().as_deref())?.is_some() {
             return Err(Error::Unavailable("waiting for the pending Harness rename to finish".into()));
         }
         let root = self.repo_root().to_path_buf();
@@ -273,8 +270,9 @@ impl Daemon {
             // Moved or removed: what readers had of it is gone with it.
             if self.is_standalone() {
                 self.publish_without_repo(&Self::no_repo());
-                self.roots
-                    .send_replace(vec![WatchRoot::new(root, true), WatchRoot::new(self.cfg.assignment.clone(), false)]);
+                let mut roots = vec![WatchRoot::new(root, true)];
+                roots.extend(self.store.file().map(|file| WatchRoot::new(file.to_path_buf(), false)));
+                self.roots.send_replace(roots);
                 return Ok(ReconcileOutcome::default());
             }
             let error = Error::Conflict(format!("{} is not set up yet (the server was unreachable)", root.display()));
@@ -423,7 +421,7 @@ impl Daemon {
         }
         report.conflicts = conflicts;
         let awaiting = snapshot.is_none();
-        let has_origin = !self.is_standalone() || plumbing::has_origin(&root).unwrap_or(false);
+        let has_origin = self.remote.has_origin(&root);
         // Readers see the new state before the events that send them to it.
         let generation = self.snapshot().generation + 1;
         self.snapshot.send_replace(Arc::new(Snapshot {
@@ -455,9 +453,7 @@ impl Daemon {
         }
 
         let mut roots = vec![WatchRoot::new(root.canonicalize().unwrap_or(root), true)];
-        if self.is_standalone() {
-            roots.push(WatchRoot::new(self.cfg.assignment.clone(), false));
-        }
+        roots.extend(self.store.file().map(|file| WatchRoot::new(file.to_path_buf(), false)));
         if let Some(dir) = self.cfg.machine_config.parent() {
             roots.push(WatchRoot::new(dir.to_path_buf(), false));
         }

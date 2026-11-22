@@ -193,7 +193,9 @@ async fn poll_imports(d: &Arc<Daemon>, failures: watch::Sender<Option<Items>>) {
         if !enabled(d) || view.revoked || !view.repo_ready {
             continue;
         }
-        let result = if d.is_standalone() && last_local.is_none_or(|last| last.elapsed() >= Duration::from_secs(3600)) {
+        let result = if !d.remote.checks_imports()
+            && last_local.is_none_or(|last| last.elapsed() >= Duration::from_secs(3600))
+        {
             last_local = Some(tokio::time::Instant::now());
             d.local_imports(true).await
         } else {
