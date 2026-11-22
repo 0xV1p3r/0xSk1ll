@@ -101,7 +101,7 @@ What carries out every change to the repo, the harnesses and the assignment, and
 _Avoid_: Direct mode
 
 **Preview**:
-A command that shows what a sync would do or what the repo holds (`status`, `render`, `sync --dry-run`, `list`) and changes nothing, not even what a reconcile would bring in line. It runs beside another engine.
+A command that shows what a sync would do or what the repo holds (`status`, `render`, `sync --dry-run`, `list`, `draft`, `conflicts`, `recover list`) and changes nothing, not even what a reconcile would bring in line. It runs beside another engine.
 _Avoid_: Dry run (only for `sync --dry-run` itself)
 
 **Join code**:

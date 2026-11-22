@@ -23,14 +23,16 @@ with one code path over them (ADR 0001, 0002, 0004).
 
 ## Consequences
 
-- A command run without a daemon reconciles as the daemon would: reads that
-  answer from the Snapshot (`draft`, `conflicts`) bring the harnesses in
-  line first, and changes sync after themselves.
+- A command run without a daemon reconciles as the daemon would: changes
+  sync after themselves.
 - Previews only read: `status`, `render`, `sync --dry-run`, `list`, `diff`,
-  `edit` and `harnesses` run a read-only engine that holds no lock, never
-  reconciles and writes nothing. Sent to a running daemon, what they ask
-  for never reconciles either. They plan in memory with the Inputs the
-  next reconcile would have: a machine-local Harness rename that stopped
+  `edit`, `harnesses`, `draft`, `conflicts` and `recover list` run a
+  read-only engine that holds no lock, never reconciles and writes
+  nothing, not even a missing Item ID. Sent to a running daemon, what the
+  first seven ask for never reconciles either; `draft`, `conflicts` and
+  `recover list` get the daemon's Snapshot. A read-only engine answers
+  those from a Snapshot it plans in memory instead. They plan in memory
+  with the Inputs the next reconcile would have: a machine-local Harness rename that stopped
   half-way is finished in the plan only, and a hand edit of the
   machine-local Assignment is read, not applied. Only an engine holding the
   machine lock finishes a pending rename, under its engine mutex.
@@ -64,8 +66,7 @@ with one code path over them (ADR 0001, 0002, 0004).
   process is managing this Machine". Previews still answer beside it.
 - Core's engine lock on the repo stays, taken for whatever changes the
   repo: it is the token core's repo operations require. While another
-  process holds it, a command's changes are refused, and so are reads that
-  need a reconciled Snapshot (`draft`, `conflicts`); previews still answer.
+  process holds it, a command's changes are refused; previews still answer.
 - A machine-local Assignment write has no network step: it is checked,
   given the next revision, saved and applied in one step under the engine
   mutex. The save compares the file and its revision with what the write

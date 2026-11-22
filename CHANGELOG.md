@@ -130,6 +130,11 @@ break compatibility.
 
 ### Fixed
 
+- `sk1ll draft`, `sk1ll conflicts` and `sk1ll recover list` only read:
+  without a daemon they no longer write missing Item IDs or sync the
+  harnesses, they answer beside another engine (a daemon for another repo
+  included), and their Draft, conflicts and recovery entries are planned in
+  memory.
 - A Blocked Machine that committed the clashing item could only get out
   with `git reset`: pull refused it with a hint to commit or restore, and
   restore found nothing in the Draft. Pull now turns an unpushed commit

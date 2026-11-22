@@ -174,6 +174,45 @@ impl Daemon {
         Ok(items)
     }
 
+    /// What a reconcile would publish, planned in memory from the files as
+    /// they are and written nowhere: what a read-only engine (a CLI command
+    /// that only reads, beside another engine or none) answers the Draft,
+    /// the inventory, the conflicts and the recovery area from. Items
+    /// without an Item ID show without one, as in any preview.
+    pub(crate) fn preview_snapshot(&self) -> Result<Snapshot> {
+        use sk1ll_core::sync::{ActionKind, PlanOptions};
+        self.require_repo()?;
+        let root = self.repo_root();
+        let pending = Repo::open_git_only(root)?.pull_pending()?;
+        let displaced = sync::displaced::list().map_err(Error::from);
+        let conflicts = (|| -> Result<Vec<_>> {
+            let mut views = Vec::new();
+            // A pending pull's tree is partial: the reconcile plans nothing then either.
+            if !pending && !self.view().revoked {
+                let repo = Repo::open(root)?;
+                let (harnesses, assignment) = match self.preview_inputs() {
+                    Ok(inputs) => inputs,
+                    // Waiting for the server's Assignment: the harnesses are left alone.
+                    Err(Error::Conflict(_)) if self.applied().is_none() => Default::default(),
+                    Err(e) => return Err(e),
+                };
+                let actions = sync::plan(&repo, &harnesses, &assignment, PlanOptions::default())?;
+                views.extend(actions.iter().filter(|a| a.kind == ActionKind::Conflict).map(conflict_view));
+            }
+            for entry in displaced.as_ref().map_err(Error::duplicate)?.iter().filter(|entry| entry.changed) {
+                views.push(displaced_view(entry.clone(), root));
+            }
+            Ok(views)
+        })();
+        Ok(Snapshot {
+            generation: self.snapshot().generation,
+            draft: self.draft(),
+            items: Daemon::items(root),
+            conflicts,
+            recovered: displaced.map(|entries| entries.into_iter().map(|entry| displaced_view(entry, root)).collect()),
+        })
+    }
+
     /// A reader: no engine mutex.
     pub(crate) fn draft(&self) -> Result<Vec<DraftEntry>> {
         let repo = Repo::open_git_only(self.repo_root())?;

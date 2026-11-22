@@ -257,6 +257,10 @@ struct ReadQuery {
 
 impl ReadQuery {
     async fn snapshot(&self, d: &Arc<Daemon>) -> Result<Arc<crate::daemon::Snapshot>> {
+        // A read-only engine never reconciles: it plans in memory instead.
+        if d.require_writer().is_err() {
+            return Ok(Arc::new(d.reading(|d| d.preview_snapshot()).await?));
+        }
         if self.fresh { d.fresh().await } else { d.caught_up().await }
     }
 }

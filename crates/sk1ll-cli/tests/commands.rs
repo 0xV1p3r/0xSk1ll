@@ -285,12 +285,18 @@ fn changes_take_the_engine_lock() {
         assert!(err.contains("another sk1ll process"), "{args:?}: {err}");
     }
     assert!(!repo.assignment().exists(), "assign changed nothing");
-    let reads: [&[&str]; 4] = [&["list"], &["status"], &["sync", "--dry-run"], &["render", "h"]];
+    let reads: [&[&str]; 7] = [
+        &["list"],
+        &["status"],
+        &["sync", "--dry-run"],
+        &["render", "h"],
+        &["draft"],
+        &["conflicts"],
+        &["recover", "list"],
+    ];
     for args in reads {
         repo.run(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
     }
-    let err = repo.run(&["draft"]).expect_err("no Snapshot while another process changes the repo");
-    assert!(err.contains("another sk1ll process"), "{err}");
     drop(held);
     repo.run(&["assign", "h", "skill", "pdf", "off"]).unwrap();
     assert!(repo.assignment().exists());
@@ -356,14 +362,14 @@ fn a_second_engine_for_another_repo_is_refused() {
     let skills = repo.root.join("h");
     // The engine managing `repo`, as the daemon would hold it.
     let held = sk1ll_daemon::MachineLock::acquire(&repo.daemon_config(&repo.repo)).unwrap();
-    let changes: [&[&str]; 3] = [&["sync"], &["assign", "h", "skill", "web", "off"], &["draft"]];
+    let changes: [&[&str]; 2] = [&["sync"], &["assign", "h", "skill", "web", "off"]];
     for args in changes {
         let err = outcome(repo.command_for(&other, &socket, args).output().unwrap()).expect_err("refused");
         assert!(err.contains("another sk1ll process") && err.contains("managing this Machine"), "{args:?}: {err}");
     }
     assert!(!skills.exists(), "no second engine placed anything");
     assert!(!repo.assignment().exists(), "nor wrote the Assignment");
-    for args in [&["status"][..], &["sync", "--dry-run"], &["list"]] {
+    for args in [&["status"][..], &["sync", "--dry-run"], &["list"], &["draft"], &["conflicts"]] {
         let out = outcome(repo.command_for(&other, &socket, args).output().unwrap());
         out.unwrap_or_else(|e| panic!("{args:?}: {e}"));
     }
@@ -678,4 +684,38 @@ fn a_blocked_machine_that_committed_the_clash_follows_the_hint_out() {
     b.run(&["commit", "pdf", "--push"]).unwrap();
     a.run(&["pull"]).unwrap();
     assert_eq!(skill(&a.repo), "b's edit\n");
+}
+
+/// `draft`, `conflicts` and `recover list` only read: without a daemon they
+/// write no Item ID and sync nothing, and they answer beside a daemon that
+/// manages another repo.
+#[test]
+fn draft_conflicts_and_recover_list_only_read() {
+    let repo = TestRepo::new().with_skill();
+    let sidecar = repo.repo.join("personal/pdf").join(sk1ll_core::skill::ID_FILE);
+    assert!(repo.run(&["draft"]).unwrap().contains("A skill:pdf"));
+    assert_eq!(repo.run(&["conflicts"]).unwrap(), "");
+    assert_eq!(repo.run(&["recover", "list"]).unwrap(), "");
+    assert!(!sidecar.exists(), "no Item ID written");
+    assert!(!repo.root.join("h").exists(), "no harness synced");
+
+    // A hand edit in a harness is a conflict, planned in memory.
+    repo.run(&["sync"]).unwrap();
+    fs::write(repo.root.join("h/pdf/SKILL.md"), "edited in the harness").unwrap();
+    let conflicts = repo.run(&["conflicts"]).unwrap();
+    assert!(conflicts.contains("pdf"), "{conflicts}");
+
+    let socket = repo.root.join("daemon.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let status = STATUS.replace(r#""mode":"joined""#, r#""mode":"standalone""#);
+    let daemon = std::thread::spawn(move || {
+        for _ in 0..3 {
+            assert_eq!(answer(&listener, "200 OK", &status).0, "GET /status HTTP/1.1");
+        }
+    });
+    fs::write(repo.repo.join("personal/pdf/SKILL.md"), "Edited.").unwrap();
+    assert!(repo.run_on(&socket, &["draft"]).unwrap().contains("A skill:pdf"));
+    assert!(repo.run_on(&socket, &["conflicts"]).unwrap().contains("pdf"));
+    repo.run_on(&socket, &["recover", "list"]).unwrap();
+    daemon.join().unwrap();
 }

@@ -289,7 +289,8 @@ enum RecoverCmd {
 impl Cmd {
     /// Only reads: a preview or a listing, which changes nothing on disk,
     /// not even what a reconcile would bring in line, so it runs beside
-    /// another engine (see [`fleet::Session`]).
+    /// another engine (see [`fleet::Session`]). Without a daemon, the
+    /// Draft, the conflicts and the recovery area are planned in memory.
     fn reads_only(&self) -> bool {
         matches!(
             self,
@@ -300,6 +301,9 @@ impl Cmd {
                 | Self::Diff { .. }
                 | Self::Edit { .. }
                 | Self::Harnesses { command: None, .. }
+                | Self::Draft
+                | Self::Conflicts
+                | Self::Recover { command: RecoverCmd::List }
         )
     }
 
