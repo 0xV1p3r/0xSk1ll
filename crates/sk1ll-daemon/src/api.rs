@@ -602,9 +602,16 @@ async fn rename_item(
     Ok(Json(d.blocking(move |d, eng| d.rename_item(eng, req)).await?))
 }
 
+/// A conflict is named by what a client listed, or by what it just did in a
+/// harness: one missing from the last Snapshot (an engine operation was
+/// running, so the read could not catch up) is looked up in a fresh one
+/// before it counts as gone.
 async fn conflict_diff(State(d): St, Json(req): Json<crate::client::ConflictDiffRequest>) -> Result<Json<DiffView>> {
-    d.caught_up().await;
-    Ok(Json(d.reading(move |d| d.conflict_diff(&req)).await?))
+    let mut snapshot = d.caught_up().await;
+    if req.id.is_none() && !matches!(snapshot.conflict(&req), Ok(Some(_))) {
+        snapshot = d.fresh().await?;
+    }
+    Ok(Json(d.reading(move |d| d.conflict_diff(&req, &snapshot)).await?))
 }
 
 async fn imports(State(d): St) -> Result<Json<crate::client::ImportsView>> {

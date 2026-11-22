@@ -58,6 +58,14 @@ impl Snapshot {
         read(&self.conflicts)
     }
 
+    /// The conflict `req` names by harness and name, if this Snapshot has it.
+    pub(crate) fn conflict(&self, req: &crate::client::ConflictDiffRequest) -> Result<Option<ConflictView>> {
+        Ok(self
+            .conflicts()?
+            .into_iter()
+            .find(|v| Some(&v.harness) == req.harness.as_ref() && Some(&v.name) == req.name.as_ref()))
+    }
+
     pub(crate) fn recovered(&self) -> Result<Vec<ConflictView>> {
         read(&self.recovered)
     }

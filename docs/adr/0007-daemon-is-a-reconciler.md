@@ -142,5 +142,7 @@ engine operation runs, a read answers from the last Snapshot, so an edit made
 outside sk1ll moments before may not show until the reconcile it wakes publishes
 the next one; the `draft` and `status` events follow. Reads about something in
 particular (a diff, a file, the skills browser, a preview) still read the repo
-as it is. A caller about to act on a list (`sk1ll restore --all`) asks for it
+as it is. A conflict's diff names a conflict the last Snapshot may not have
+yet (the harness edit that made it came moments ago): one it doesn't list is
+looked up again in a fresh Snapshot before it counts as gone. A caller about to act on a list (`sk1ll restore --all`) asks for it
 with `?fresh=true`, which waits for the engine and reconciles first.

@@ -1186,3 +1186,45 @@ async fn a_full_reconcile_corrects_what_the_fingerprint_missed() {
     assert_eq!(d.plans.load(Relaxed), settled.0 + 1);
     assert!(d.hashes.hashed() > settled.1 + 1, "the source and the placement, past the cache");
 }
+
+/// A conflict made a moment ago is not in the last Snapshot yet while an
+/// engine operation runs: its diff waits for a fresh one instead of
+/// answering that it no longer exists.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_conflict_diff_while_the_engine_is_busy_waits_for_a_fresh_snapshot() {
+    use crate::client::{Client, ConflictDiffRequest};
+    let dir = tempfile::tempdir().unwrap();
+    let (d, _session, _) = joined_daemon(dir.path(), PullRecord::default());
+    pdf_skill(d.repo_root());
+    d.blocking(|d, eng| d.reconcile(eng)).await.unwrap();
+    let placed = dir.path().join("h/pdf/SKILL.md");
+    assert_eq!(std::fs::read_to_string(&placed).unwrap(), "PDFs.\n");
+    let socket = dir.path().join("daemon.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let served = d.clone();
+    let server = tokio::spawn(async move { axum::serve(listener, crate::api::router(served)).await.unwrap() });
+
+    let (finish, finished) = std::sync::mpsc::channel::<()>();
+    let (started, running) = tokio::sync::oneshot::channel();
+    let engine = d.clone();
+    let busy = tokio::spawn(async move {
+        engine
+            .blocking(move |_, _| {
+                started.send(()).unwrap();
+                finished.recv().unwrap();
+                Ok(())
+            })
+            .await
+    });
+    running.await.unwrap();
+    std::fs::write(&placed, "Harness edit\n").unwrap();
+    let request = ConflictDiffRequest { harness: Some("h".into()), name: Some("pdf".into()), id: None };
+    let diff = tokio::spawn(async move { Client::new(&socket).conflict_diff(&request).await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(!diff.is_finished(), "the diff waits for the engine");
+    finish.send(()).unwrap();
+    busy.await.unwrap().unwrap();
+    let diff = diff.await.unwrap().unwrap().diff;
+    assert!(diff.contains("-Harness edit") && diff.contains("+PDFs."), "{diff}");
+    server.abort();
+}

@@ -237,7 +237,11 @@ impl Daemon {
     }
 
     /// A reader: no engine mutex.
-    pub(crate) fn conflict_diff(&self, req: &crate::client::ConflictDiffRequest) -> Result<DiffView> {
+    pub(crate) fn conflict_diff(
+        &self,
+        req: &crate::client::ConflictDiffRequest,
+        snapshot: &Snapshot,
+    ) -> Result<DiffView> {
         use sk1ll_core::Origin;
         let repo = Repo::open(self.repo_root())?;
         let (view, recovery) = if let Some(id) = &req.id {
@@ -249,12 +253,7 @@ impl Daemon {
             let view = displaced_view(entry, repo.root());
             (view, Some(target))
         } else {
-            let view = self
-                .snapshot()
-                .conflicts()?
-                .into_iter()
-                .find(|v| Some(&v.harness) == req.harness.as_ref() && Some(&v.name) == req.name.as_ref())
-                .ok_or_else(|| Error::NotFound("Conflict no longer exists".into()))?;
+            let view = snapshot.conflict(req)?.ok_or_else(|| Error::NotFound("Conflict no longer exists".into()))?;
             (view, None)
         };
         let left_source = view.path.unwrap_or(view.dest);
