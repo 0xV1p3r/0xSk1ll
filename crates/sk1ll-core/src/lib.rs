@@ -5,6 +5,7 @@
 //! IPC boundary (e.g. Tauri commands) unchanged.
 
 pub mod assignment;
+pub mod baseline_check;
 pub mod bundled;
 pub mod config_file;
 pub mod content;

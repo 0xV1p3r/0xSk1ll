@@ -16,7 +16,7 @@
 //! | POST | `/skills/adopt` | `ConflictTarget` → 204; unmanaged Adopt needs a Server connection when joined |
 //! | POST | `/items/create` | [`CreateItemRequest`] → 204 |
 //! | POST | `/items/delete` | [`DeleteItemRequest`] → 204 (a Draft deletion) |
-//! | POST | `/items/repair-ids` | → number of duplicate claims reassigned in the Draft |
+//! | POST | `/items/repair-ids` | → number of items given a fresh Item ID in the Draft (shared or missing) |
 //! | POST | `/items/rename` | [`RenameItemRequest`] → [`RenameItemResponse`] |
 //! | GET | `/draft` | → `Vec<`[`DraftEntry`]`>` |
 //! | GET | `/draft/diff?item=` | → [`DiffView`] |
@@ -241,6 +241,9 @@ pub struct CommitResponse {
     /// Pushed to the server; otherwise queued until the daemon reconnects.
     pub pushed: bool,
     pub push_error: Option<String>,
+    /// The server refused the push for good: pushing again won't help.
+    #[serde(default)]
+    pub push_refused: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

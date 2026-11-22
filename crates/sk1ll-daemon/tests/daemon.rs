@@ -1768,7 +1768,8 @@ async fn daemon_repairs_duplicate_ids_and_persists_handmade_ids_in_the_draft() {
     m.start().await;
     let error = m.client.items().await.unwrap_err();
     assert!(error.message.contains("personal/copy/.sk1ll-id") && error.message.contains("personal/x/.sk1ll-id"));
-    assert_eq!(m.client.repair_ids().await.unwrap(), 1);
+    // The copy, and the hand-made rule without one.
+    assert_eq!(m.client.repair_ids().await.unwrap(), 2);
     let items = m.client.items().await.unwrap();
     let get = |item| items.iter().find(|entry| entry.item == item).unwrap();
     let copy = get(ItemRef::Skill("copy".into()));
@@ -2025,6 +2026,42 @@ async fn a_pull_through_a_filter_driver_stays_blocked_and_says_why() {
     assert!(!m.repo().join(".git/sk1ll-pull.json").exists());
     assert_eq!(std::fs::read_to_string(m.repo().join("personal/pdf/SKILL.md")).unwrap(), "initial");
     assert!(!ran.exists(), "a filter driver ran");
+}
+
+/// sk1ll refuses to commit a tree the server would refuse; one committed
+/// by hand is refused by the server for good: the push isn't retried after
+/// a pull, the error says so, and status and the fleet show it until a fix
+/// is committed on top.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_push_the_server_refuses_for_good_is_reported_until_fixed() {
+    let server = Server::start().await;
+    let (a, _b, _) = fleet_of_two(&server).await;
+    a.write(".gitattributes", "*.bin filter=lfs\n");
+    a.write("personal/x/data.bin", "data\n");
+    let request = CommitRequest { items: vec!["x".into(), "other:.gitattributes".into()], ..Default::default() };
+    let error = a.client.commit(&request).await.unwrap_err().to_string();
+    assert!(error.contains("filter driver") && error.contains("personal/x/data.bin"), "{error}");
+    let before = server.head();
+
+    git(&a.repo(), &["add", "-A"]);
+    git(&a.repo(), &["commit", "--quiet", "-m", "by hand"]);
+    // As the server binary's check does (this embedded one runs none).
+    let hook = server.data.join("repo.git/hooks/pre-receive");
+    let refuse = "#!/bin/sh\nread -r old new ref\nif git cat-file -e \"$new:.gitattributes\" 2>/dev/null; then\n  \
+                  echo \"sk1ll-server: refusing $new: the skills repo uses a git filter driver\" >&2\n  exit 1\nfi\n";
+    std::fs::write(&hook, refuse).unwrap();
+    let error = a.client.push().await.unwrap_err().to_string();
+    assert!(error.contains("refused the push for good") && error.contains("filter driver"), "{error}");
+    assert_eq!(server.head(), before);
+    let status = a.status().await;
+    assert!(status.report.push_refused.as_deref().unwrap_or_default().contains("filter driver"), "{status:?}");
+    eventually(|| async { server.row("alpha").await?.report?.push_refused.map(drop) }).await;
+
+    std::fs::remove_file(a.repo().join(".gitattributes")).unwrap();
+    let fixed = a.commit(&["other:.gitattributes"]).await;
+    assert!(fixed.pushed, "{fixed:?}");
+    assert!(a.status().await.report.push_refused.is_none());
+    eventually(|| async { server.row("alpha").await?.report.filter(|r| r.push_refused.is_none()).map(drop) }).await;
 }
 
 /// A pull that stopped half-way (here: at a directory it can't write to)

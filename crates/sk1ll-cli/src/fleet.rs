@@ -291,6 +291,9 @@ fn print_fleet(fleet: sk1ll_proto::FleetView) {
             if !r.unpushed.is_empty() {
                 notes.push(format!("{} unpushed", r.unpushed.len()));
             }
+            if let Some(reason) = &r.push_refused {
+                notes.push(format!("push refused: {}", reason.lines().next().unwrap_or_default()));
+            }
         }
         if m.scope == Scope::SelfOnly {
             notes.push("manages only itself".into());

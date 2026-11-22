@@ -164,8 +164,14 @@ pub(crate) fn driver_paths(
         git = git.arg(format!("--source={source}"));
     }
     let out = git.args(["-z", "--stdin", "filter"]).stdin(stdin).run()?;
-    // `<path>\0<attribute>\0<value>\0`, per path.
-    let fields: Vec<&[u8]> = out.split(|b| *b == 0).collect();
+    Ok(filtered_paths(&out, configured))
+}
+
+/// The paths `git check-attr -z ... filter` output (`<path>\0filter\0<value>\0`
+/// per path) gives a filter driver, by the rules of [`driver_paths`]: what
+/// pull, the clone, a commit and the server's push check all decide by.
+pub fn filtered_paths(check_attr: &[u8], configured: &BTreeSet<String>) -> Vec<PathBuf> {
+    let fields: Vec<&[u8]> = check_attr.split(|b| *b == 0).collect();
     let mut found = BTreeSet::new();
     for f in fields.chunks(3).filter(|f| f.len() == 3) {
         let value = String::from_utf8_lossy(f[2]);
@@ -177,7 +183,7 @@ pub(crate) fn driver_paths(
             found.insert(path_from_bytes(f[0]));
         }
     }
-    Ok(found.into_iter().collect())
+    found.into_iter().collect()
 }
 
 #[cfg(test)]

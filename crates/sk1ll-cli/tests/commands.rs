@@ -741,3 +741,32 @@ fn toggling_a_rule_in_a_block_file_leaves_no_recovery_entry() {
     assert!(text.starts_with("# Mine\n") && text.contains("Use Conventional Commits."), "{text}");
     assert_eq!(repo.run(&["recover", "list"]).unwrap(), "");
 }
+
+/// A commit whose tree the server would refuse for good (a file through a
+/// filter driver) is refused before anything is committed or pushed.
+#[test]
+fn commit_refuses_a_tree_the_server_would_refuse() {
+    let (a, _b, _origin) = two_machines();
+    let head = || git_out(&a.repo, &["rev-parse", "HEAD"]);
+    let before = head();
+    fs::write(a.repo.join(".gitattributes"), "*.bin filter=lfs\n").unwrap();
+    fs::write(a.repo.join("personal/pdf/data.bin"), "data\n").unwrap();
+    let error = a.run(&["commit", "pdf", "other:.gitattributes", "--push"]).unwrap_err();
+    assert!(error.contains("filter driver") && error.contains("personal/pdf/data.bin"), "{error}");
+    assert_eq!(head(), before);
+    fs::remove_file(a.repo.join(".gitattributes")).unwrap();
+    a.run(&["commit", "pdf", "--push"]).unwrap();
+}
+
+fn git_out(root: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}

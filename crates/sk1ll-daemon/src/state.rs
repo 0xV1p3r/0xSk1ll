@@ -54,6 +54,18 @@ pub struct PullRecord {
     pub server_baseline: Option<String>,
     #[serde(default, deserialize_with = "or_default")]
     pub pull: PullState,
+    /// The server refused to take `commit` for good, until `HEAD` moves on.
+    #[serde(default, deserialize_with = "or_default", skip_serializing_if = "Option::is_none")]
+    pub push_refused: Option<PushRefusal>,
+}
+
+/// A push the server refused for good (see [`PullRecord::push_refused`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushRefusal {
+    /// The commit it refused.
+    pub commit: String,
+    /// What it said.
+    pub reason: String,
 }
 
 /// `T`, or its default (with a warning) for a value that isn't one.
@@ -336,7 +348,10 @@ mod tests {
         json["server_baseline"] = serde_json::json!("abc");
         fs::write(&record, json.to_string()).unwrap();
         let loaded = load_record(&record, &repo).unwrap();
-        assert_eq!(loaded, PullRecord { server_baseline: Some("abc".into()), pull: PullState::Clear });
+        assert_eq!(
+            loaded,
+            PullRecord { server_baseline: Some("abc".into()), pull: PullState::Clear, push_refused: None }
+        );
     }
 
     fn state() -> DaemonState {
@@ -393,6 +408,7 @@ mod tests {
         let record = PullRecord {
             server_baseline: Some("abc".into()),
             pull: PullState::Blocked { baseline: "abc".into(), items: vec!["skill:pdf".parse().unwrap()] },
+            push_refused: None,
         };
         let s = DaemonState { record: record.clone(), ..state() };
         s.save(&path).unwrap();
@@ -418,6 +434,7 @@ mod tests {
         let record = PullRecord {
             server_baseline: Some("abc".into()),
             pull: PullState::Blocked { baseline: "abc".into(), items: vec!["skill:pdf".parse().unwrap()] },
+            push_refused: None,
         };
         let (one, other) = (dir.path().join("one"), dir.path().join("other"));
         sk1ll_core::Repo::init(&one).unwrap();

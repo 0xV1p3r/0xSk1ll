@@ -57,6 +57,7 @@ function MachineDetails({ machine }: { machine: MachineRow }) {
     ...(report.clashes.length ? [['Clashes', list(report.clashes)] as [string, ReactNode]] : []),
     ...(report.blocked ? [['Blocked', 'Yes'] as [string, ReactNode]] : []),
     ...(report.behind ? [['Behind', 'Yes'] as [string, ReactNode]] : []),
+    ...(report.push_refused ? [['Push refused', report.push_refused] as [string, ReactNode]] : []),
   ]} />;
 }
 export function Fleet({ revision, machineId, initialMachine, serverUrl = null, localReport, unmanaged = [], discovery, navigate, changed, live }: {

@@ -299,7 +299,12 @@ impl Daemon {
             version: sk1ll_core::VERSION.to_string(),
             awaiting_assignment: snapshot.is_none(),
             auth_rejected_since: None,
-            report: MachineReport::default(),
+            // Before the first reconcile (a read-only engine never runs
+            // one), behind is judged against the Baseline the repo is on.
+            report: MachineReport {
+                baseline: sk1ll_core::git::plumbing::baseline(state.repo()).ok().flatten(),
+                ..MachineReport::default()
+            },
         };
         lifecycle.apply(&mut view);
         Ok(Arc::new(Self {

@@ -139,7 +139,7 @@ enum Cmd {
         #[arg(long)]
         push: bool,
     },
-    /// Give duplicate Item IDs fresh IDs in the Draft
+    /// Give each item that shares an Item ID, or has none, a fresh one in the Draft
     RepairIds,
     /// Push committed commits to origin
     Push,
@@ -553,6 +553,7 @@ fn command(s: &Session, cmd: Cmd) -> Result<()> {
                 println!("pull pending. Run `sk1ll pull` to finish");
                 return Ok(());
             }
+            print_machine_state(&s.status);
             for import in &repo.imports {
                 let state = match import.state {
                     ImportState::Clean => "clean",
@@ -609,19 +610,28 @@ fn command(s: &Session, cmd: Cmd) -> Result<()> {
                 if push {
                     s.block(c.push())?;
                     println!("pushed to origin");
-                } else {
-                    println!("run `sk1ll push` to share it with the fleet");
+                } else if s.status.has_origin {
+                    println!("run `sk1ll push` to push it to origin");
                 }
                 return Ok(());
             }
+            let later = match s.in_process() {
+                true => "run `sk1ll push` once the server is reachable, or start the daemon to push it",
+                false => "the daemon pushes it when it can",
+            };
             match (resp.pushed, resp.push_error) {
                 (true, _) => println!("pushed to the server"),
-                (false, Some(e)) => println!("not pushed yet ({e}); the daemon pushes it when it can"),
-                (false, None) => println!("not pushed yet; the daemon pushes it when it can"),
+                (false, Some(e)) if resp.push_refused => bail!("not pushed: {e}"),
+                (false, Some(e)) if push => bail!("not pushed yet ({e}); {later}"),
+                (false, Some(e)) => println!("not pushed yet ({e}); {later}"),
+                (false, None) => println!("not pushed yet; {later}"),
             }
         }
         Cmd::RepairIds => {
-            println!("reassigned {} duplicate Item ID(s) in the Draft", s.block(c.repair_ids())?);
+            println!(
+                "gave {} item(s) a fresh Item ID of their own in the Draft; commit them",
+                s.block(c.repair_ids())?
+            );
         }
         Cmd::Push => match s.block(c.push())?.pushed {
             true => {
@@ -839,6 +849,27 @@ fn resolve_assignment_item(
         }
         None => bail!("no {} named `{name}` in the repo", kind.label()),
     }
+}
+
+/// What stands between this Machine and the latest Baseline, as `status`
+/// says it before the sync plan: Blocked (and on what), a pull to run, a
+/// push the server refused.
+fn print_machine_state(status: &sk1ll_daemon::client::StatusView) {
+    let report = &status.report;
+    if report.blocked {
+        let baseline = status.server_baseline.as_deref().map(short).unwrap_or("the new one");
+        println!("blocked: the pull of baseline {baseline} is pending; {}", report_hint(&report.clashes));
+    } else if report.behind {
+        println!("behind: a newer baseline is waiting; run `sk1ll pull`");
+    }
+    if let Some(reason) = &report.push_refused {
+        println!("push refused by the server: {reason}");
+        println!("pushing again won't help: fix what it names and commit the fix");
+    }
+}
+
+fn report_hint(items: &[sk1ll_core::ItemRef]) -> String {
+    sk1ll_daemon::client::blocked_hint(items)
 }
 
 /// A recovery entry: its id, Harness, item, where it was and where it is kept.

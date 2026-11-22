@@ -417,9 +417,17 @@ impl Daemon {
             conflicts: conflict_views,
             recovered: Ok(displaced.into_iter().map(|entry| displaced_view(entry, &root)).collect()),
         }));
+        // A refused push stands until `HEAD` moves on (a fix committed, or
+        // the commit turned back into Draft).
+        let head = plumbing::rev(&root, "HEAD").ok().flatten();
         // The lifecycle derives the report's Blocked, pending and behind.
         let ((), saved) = self.publish(
-            |lc| lc.set_pull(pull),
+            |lc| {
+                lc.set_pull(pull);
+                if lc.push_refused().is_some_and(|refused| Some(&refused.commit) != head.as_ref()) {
+                    lc.set_push_refused(None);
+                }
+            },
             |v| {
                 v.repo_ready = true;
                 v.has_origin = has_origin;

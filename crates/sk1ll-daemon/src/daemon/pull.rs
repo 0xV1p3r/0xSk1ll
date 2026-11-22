@@ -5,7 +5,7 @@ use sk1ll_core::{ItemRef, PullOutcome, Repo, default_commit_message, machine_aut
 
 use crate::client::{CommitRequest, CommitResponse, Event, PullResult, PushResult};
 use crate::error::{Error, Result};
-use crate::state::PullState;
+use crate::state::{PullState, PushRefusal};
 use sk1ll_core::git::plumbing;
 
 impl Daemon {
@@ -183,13 +183,17 @@ impl Daemon {
                 })
                 .await?;
             let Some(commit) = commit else { return Ok(false) };
+            let sent = commit.clone();
             let pushed = self
                 .network(move |d| {
                     let root = d.repo_root();
-                    let pushed = Repo::open_git_only(root).and_then(|repo| repo.push_commit(&commit));
+                    let pushed = Repo::open_git_only(root).and_then(|repo| repo.push_commit(&sent));
                     if pushed.is_ok() {
                         let remote = plumbing::remote_head(root)?;
-                        d.note(|lc| lc.set_server_baseline(remote));
+                        d.note(|lc| {
+                            lc.set_server_baseline(remote);
+                            lc.set_push_refused(None);
+                        });
                     }
                     Ok(pushed)
                 })
@@ -198,6 +202,16 @@ impl Daemon {
                 Ok(()) => {
                     tracing::info!("pushed to the server");
                     return Ok(true);
+                }
+                // Its check of a new Baseline said no: trying again won't help.
+                Err(e) if is_refused_push(&e) => {
+                    let reason = refusal_reason(&e);
+                    tracing::warn!("the server refused {commit}: {reason}");
+                    self.note(|lc| lc.set_push_refused(Some(PushRefusal { commit, reason: reason.clone() })));
+                    return Err(Error::Conflict(format!(
+                        "the server refused the push for good: {reason}. Pushing again won't help: fix what it \
+                         names and commit the fix"
+                    )));
                 }
                 Err(first) if !retried && is_rejected_push(&first) => {
                     tracing::info!("push rejected ({first}); pulling first");
@@ -251,7 +265,11 @@ impl Daemon {
             if self.remote.reachable(self) {
                 match self.push_pending().await {
                     Ok(_) => response.pushed = true,
-                    Err(e) => response.push_error = Some(crate::auth::redact(&e.to_string())),
+                    Err(e) => {
+                        response.push_refused =
+                            self.lifecycle().push_refused().is_some_and(|r| r.commit == response.sha);
+                        response.push_error = Some(crate::auth::redact(&e.to_string()));
+                    }
                 }
             } else {
                 response.push_error = Some("offline: queued until the server is reachable".to_string());
@@ -289,7 +307,7 @@ impl Daemon {
         };
         let sha = repo.commit(&items, &message, author.as_deref())?;
         tracing::info!("committed {} as {sha}", items.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "));
-        Ok(CommitResponse { sha, items, message, pushed: false, push_error: None })
+        Ok(CommitResponse { sha, items, message, pushed: false, push_error: None, push_refused: false })
     }
 
     /// The server's baseline is now `baseline`: pull unless already on it. A
@@ -319,9 +337,33 @@ impl Daemon {
 }
 
 /// Whether a push failed because the server has commits we don't (worth a pull
-/// and one retry), as opposed to the server being unreachable.
+/// and one retry), as opposed to the server being unreachable or refusing it.
 pub(super) fn is_rejected_push(e: &sk1ll_core::Error) -> bool {
     let text = e.to_string();
     ["[rejected]", "non-fast-forward", "fetch first", "failed to push some refs"].iter().any(|m| text.contains(m))
         && !text.contains("unable to access")
+        && !is_refused_push(e)
+}
+
+/// Whether the server's pre-receive check refused the push: for good, until
+/// the commit changes.
+pub(super) fn is_refused_push(e: &sk1ll_core::Error) -> bool {
+    let text = e.to_string();
+    text.contains("[remote rejected]") || text.contains("pre-receive hook declined")
+}
+
+/// What the server said about a refused push: its `remote:` lines.
+fn refusal_reason(e: &sk1ll_core::Error) -> String {
+    let text = match e {
+        sk1ll_core::Error::Git { stderr, .. } => stderr.clone(),
+        e => e.to_string(),
+    };
+    let said: Vec<&str> = text
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("remote:"))
+        .map(|line| line.trim())
+        .map(|line| line.strip_prefix("sk1ll-server: ").unwrap_or(line))
+        .filter(|line| !line.is_empty())
+        .collect();
+    if said.is_empty() { text.trim().to_string() } else { said.join("\n") }
 }

@@ -890,7 +890,7 @@ async fn a_finished_pull_recorded_as_pending_is_clear_after_a_restart() {
     git(&["update-ref", "refs/remotes/origin/main", &b]);
     let items = vec![ItemRef::Skill("pdf".into())];
     let pending = |baseline: &str| PullState::Pending { baseline: baseline.into(), items: items.clone() };
-    let record = |pull| PullRecord { server_baseline: Some(b.clone()), pull };
+    let record = |pull| PullRecord { server_baseline: Some(b.clone()), pull, push_refused: None };
 
     let d = restarted(d, &state, record(pending(&a)));
     d.blocking(|d, eng| d.reconcile(eng).map(drop)).await.unwrap();

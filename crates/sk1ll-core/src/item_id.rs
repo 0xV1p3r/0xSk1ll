@@ -373,7 +373,8 @@ pub(crate) enum Mode<'a> {
     Missing,
     /// A new Item ID for each item that shares one, but the keeper: the
     /// claimant that holds it at its path in `baseline`. Only when none or
-    /// several do, the first of them by claim path keeps it.
+    /// several do, the first of them by claim path keeps it. Then one for
+    /// every item without one.
     Repair { baseline: &'a Claims },
 }
 
@@ -415,7 +416,7 @@ pub(crate) fn assign(root: &Path, include: impl Fn(&Path) -> bool, mode: Mode) -
     let mut changed = 0;
     for (path, id) in ordered {
         let replace = match &replaced {
-            Some(replaced) => replaced.contains(path.as_path()),
+            Some(replaced) => replaced.contains(path.as_path()) || id.is_none(),
             None => id.is_none() && include(path),
         };
         if !replace {
@@ -504,6 +505,17 @@ pub struct IdProblems {
     /// Item IDs more than one item claims, with those items.
     pub shared: Vec<(ItemId, Vec<ItemRef>)>,
     claims: BTreeMap<ItemRef, String>,
+}
+
+impl IdProblems {
+    /// Keeps only the items without an Item ID that `keep` takes, given
+    /// the item and where its claim is (a path, or the manifest's entry);
+    /// `None` if no problem is left.
+    pub fn retain_missing(mut self, keep: impl Fn(&ItemRef, Option<&str>) -> bool) -> Option<Self> {
+        let claims = &self.claims;
+        self.missing.retain(|item| keep(item, claims.get(item).map(String::as_str)));
+        (!self.missing.is_empty() || !self.shared.is_empty() || !self.unreadable.is_empty()).then_some(self)
+    }
 }
 
 impl std::fmt::Display for IdProblems {

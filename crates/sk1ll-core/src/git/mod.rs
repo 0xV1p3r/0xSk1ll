@@ -27,7 +27,7 @@ use crate::{Error, Result};
 
 pub mod config_env;
 mod filters;
-pub use filters::RepoGit;
+pub use filters::{RepoGit, filtered_paths};
 pub(crate) use filters::{configured_drivers, driver_paths};
 /// Unix only, like the daemon and the fleet that use it.
 #[cfg(unix)]
@@ -483,7 +483,7 @@ pub(crate) fn path_from_bytes(raw: &[u8]) -> PathBuf {
 }
 
 /// Paths from git's NUL-separated (`-z`) output.
-pub(crate) fn split_paths(out: &[u8]) -> impl Iterator<Item = PathBuf> + '_ {
+pub fn split_paths(out: &[u8]) -> impl Iterator<Item = PathBuf> + '_ {
     out.split(|b| *b == 0).filter(|p| !p.is_empty()).map(path_from_bytes)
 }
 

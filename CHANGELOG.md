@@ -130,6 +130,12 @@ break compatibility.
 
 ### Fixed
 
+- `sk1ll commit` refuses a tree the server would refuse for good (items
+  without an Item ID of their own, files through a filter driver), with the
+  server's own check and message. A push the server refuses anyway is no
+  longer reported as queued or retried after a pull: the command fails, and
+  status, `sk1ll fleet` and the app show *push refused* with the reason
+  until a fix is committed on top.
 - Rewriting a block instructions file (a rule toggled or changed) no
   longer leaves a recovery entry that is never pruned each time; only a
   forced rewrite of a block edited by hand keeps the old file, marked

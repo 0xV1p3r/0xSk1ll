@@ -169,6 +169,10 @@ pub struct MachineReport {
     /// The daemon knows it hasn't applied the latest baseline yet.
     #[serde(default)]
     pub behind: bool,
+    /// The server refused this Machine's unpushed commits for good (its
+    /// check of a new Baseline): why. Pushing again won't help.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push_refused: Option<String>,
 }
 
 /// A skill or rule's name and Item ID.

@@ -10,6 +10,7 @@ export interface MachineReport {
   baseline: string | null; drafts: ItemRef[]; unpushed: ItemRef[];
   conflicts: { item: ItemRef; harness: string }[]; harnesses: string[];
   blocked: boolean; clashes: ItemRef[]; behind: boolean;
+  push_refused?: string;
 }
 export interface StatusView {
   mode: 'joined' | 'standalone'; has_origin: boolean; repo_ready: boolean;

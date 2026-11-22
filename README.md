@@ -113,7 +113,7 @@ If Pull stops partway through, the next `sk1ll pull` or Daemon reconcile resumes
 | `fork <name>` | Turn an import into a personal skill you can edit |
 | `edit <name>` | Open a personal skill or rule in `$VISUAL` or `$EDITOR` |
 | `list` | List repo content. Use `--json` to include Item IDs or `--unmanaged` to list unmanaged skills |
-| `repair-ids` | Give duplicate Item IDs fresh IDs in the Draft; the item that holds the ID in the Baseline keeps it (else the first by path) |
+| `repair-ids` | Give each item that shares an Item ID, or has none, a fresh one in the Draft; of items sharing one, the item that holds it in the Baseline keeps it (else the first by path) |
 | `status` | Import drift and pending sync actions |
 | `sync [--dry-run] [--force]` | Write skills and instructions into harnesses |
 | `render <harness>` | Print the instruction files a harness would receive |

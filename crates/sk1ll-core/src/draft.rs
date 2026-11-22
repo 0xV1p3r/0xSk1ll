@@ -333,6 +333,18 @@ impl Repo {
         {
             return Err(Error::Invalid("nothing to commit: those items already match the baseline".into()));
         }
+        // What the server would refuse for good is never committed.
+        // An Import's Item ID is the manifest's: it counts only with the manifest.
+        let committed = |item: &ItemRef, claim: Option<&str>| {
+            items.contains(item)
+                && (!claim.is_some_and(|claim| claim.starts_with(MANIFEST_FILE)) || items.contains(&ItemRef::Manifest))
+        };
+        if let Some(reason) = crate::baseline_check::check_tree(self.root(), &tree, committed)? {
+            return Err(Error::Invalid(format!(
+                "can't commit {}: the server refuses a baseline like that: {reason}",
+                items.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+            )));
+        }
 
         let mut commit = self.git()?.args(["commit-tree", &tree]);
         if let Some(h) = &st.head {
@@ -1559,7 +1571,8 @@ mod tests {
         let err = pull_now(&b).unwrap_err().to_string();
         assert!(err.contains("sk1ll repair-ids") && err.contains("a-copy") && err.contains("b-copy"), "{err}");
         assert!(b.push().unwrap_err().to_string().contains("sk1ll repair-ids"));
-        assert_eq!(b.repair_ids().unwrap(), 1);
+        // The copy, and the fixture's items that never had an Item ID.
+        assert!(b.repair_ids().unwrap() > 1);
         assert!(b.draft().unwrap().iter().any(|change| change.item == item("skill:b-copy")));
         b.commit(&[item("skill:b-copy")], "Repair duplicate ID", None).unwrap();
         b.push().unwrap();

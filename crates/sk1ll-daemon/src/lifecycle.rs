@@ -133,6 +133,16 @@ impl Lifecycle {
         self.record.pull = pull;
     }
 
+    /// The server refused a push for good (`Some`), or that no longer
+    /// stands (`None`: a push went through, or `HEAD` moved on).
+    pub(crate) fn set_push_refused(&mut self, refusal: Option<crate::state::PushRefusal>) {
+        self.record.push_refused = refusal;
+    }
+
+    pub(crate) fn push_refused(&self) -> Option<&crate::state::PushRefusal> {
+        self.record.push_refused.as_ref()
+    }
+
     pub(crate) fn set_server_baseline(&mut self, baseline: Option<String>) {
         self.record.server_baseline = baseline;
     }
@@ -221,6 +231,7 @@ impl Lifecycle {
         r.blocked = blocked.is_some();
         r.clashes = blocked.cloned().unwrap_or_default();
         r.pull_pending = pending.cloned();
+        r.push_refused = self.record.push_refused.as_ref().map(|refusal| refusal.reason.clone());
         r.behind = pending.is_some()
             || blocked.is_some()
             || self.record.server_baseline.as_ref().is_some_and(|h| r.baseline.as_ref() != Some(h));
@@ -293,6 +304,7 @@ mod tests {
         let record = PullRecord {
             server_baseline: Some("new".into()),
             pull: PullState::Blocked { baseline: "new".into(), items: vec![item("skill:pdf")] },
+            push_refused: None,
         };
         let mut lc = Lifecycle::joined(false, record);
         lc.set_link(Link::Connected);

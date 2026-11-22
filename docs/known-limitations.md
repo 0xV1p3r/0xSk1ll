@@ -170,7 +170,8 @@ the server is plain git over HTTP and has no LFS endpoint. A pull onto a
 Baseline that writes a file through one stops before it changes anything
 and the Machine stays Blocked until `filter=` is gone from `.gitattributes`
 (the repo's or the Machine's own `.git/info/attributes`). The server refuses
-a push whose tree gives a file one. A driver needn't be configured on the
+a push whose tree gives a file one, by its `.gitattributes` alone, and
+`sk1ll commit` refuses to commit such a tree by the same rule. A driver needn't be configured on the
 Machine for its attribute to count, since the Baseline is the same
 everywhere. `git check-attr` prints `set` both for `filter` set without a
 value and for a driver called `set` (likewise `unset` and `unspecified`), so
