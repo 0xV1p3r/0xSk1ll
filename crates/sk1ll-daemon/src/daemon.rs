@@ -6,6 +6,17 @@
 //! [`EngineLock`] on the repo for its whole lifetime, so direct CLI mutations
 //! are refused.
 //!
+//! No network I/O happens with the engine mutex held. An operation that
+//! talks to the server runs in steps: it checks and takes what it will send
+//! under the mutex, releases it for the network (git's clone, fetch and push
+//! through [`Daemon::network`], Assignment writes over the server session),
+//! then takes it again to apply the result, re-checking what the result
+//! depends on: an Assignment revision applied meanwhile wins over an older
+//! confirmation, a pull moves onto whatever was fetched last, an Adopt whose
+//! item changed meanwhile is a conflict, and a daemon that stopped managing
+//! meanwhile applies nothing. Its lifecycle ([`Lifecycle`]) has a mutex of its
+//! own, so the session can mark it connected or offline at any time.
+//!
 //! Operations that only read (the draft, a diff, the skills browser, the
 //! conflicts, the inventory) run without the engine mutex
 //! ([`Daemon::reading`]), so the GUI keeps answering while a pull or a push
@@ -27,11 +38,11 @@
 //!
 //! What the outside sees ([`StatusView`]) lives in a `watch` channel: the server
 //! session sends a status whenever its report changes, and the local API and
-//! its event stream read from it.
+//! its event stream read from it. Its lifecycle fields are derived from the
+//! [`Lifecycle`] whenever it is published ([`Daemon::publish`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError};
 
 use anyhow::Context;
@@ -41,7 +52,7 @@ use sk1ll_core::{
     machine_author,
 };
 use sk1ll_core::{harness_change, harness_rename::RenameIntent, imports};
-use sk1ll_proto::{AssignmentSnapshot, AssignmentUpdate, AssignmentWrite, ConflictRef, MachineReport, headline};
+use sk1ll_proto::{AssignmentSnapshot, AssignmentUpdate, AssignmentWrite, ConflictRef, MachineReport};
 use tokio::sync::{Notify, broadcast, mpsc, watch};
 
 use crate::client::{
@@ -53,7 +64,9 @@ use crate::client::{
 };
 use crate::error::{Error, Result};
 use crate::join::{Joined, Registered};
-use crate::state::{self, DaemonState};
+use crate::lifecycle::Lifecycle;
+pub(crate) use crate::lifecycle::Link;
+use crate::state::{self, DaemonState, PullRecord, PullState};
 use crate::watch::WatchRoot;
 use crate::{Config, gitx};
 
@@ -90,18 +103,25 @@ impl Mode {
             }
         }
     }
-
-    fn revoked(&self) -> bool {
-        matches!(self, Self::Joined(s) if s.revoked)
-    }
 }
 
 pub(crate) struct Daemon {
     pub(crate) cfg: Config,
     /// Fixed for the life of the process: machine id, server URL and token. A
-    /// rejoin restarts the process (see [`Daemon::rejoin`]).
+    /// rejoin restarts the process (see [`Daemon::rejoin`]). Its `revoked`
+    /// and record are as of startup; [`Daemon::lifecycle`] owns them.
     pub(crate) ident: Mode,
     engine: Mutex<Engine>,
+    /// What the daemon is doing. Never held across network I/O; the lock
+    /// order is the engine mutex, then this, then the view.
+    lifecycle: Mutex<Lifecycle>,
+    /// One git network operation on the repo at a time (clone, fetch, push):
+    /// they run without the engine mutex, and git refuses concurrent ref
+    /// updates.
+    net: tokio::sync::Mutex<()>,
+    /// One Assignment write at a time, from its checks to applying the
+    /// server's confirmation, as when the engine mutex covered all of it.
+    assignment_writes: tokio::sync::Mutex<()>,
     /// The applied assignment. `None` when it was lost (or never stored):
     /// harnesses are left alone until the server sends one. Replaced only
     /// with the engine mutex held ([`Daemon::apply_assignment`]); read by
@@ -111,26 +131,30 @@ pub(crate) struct Daemon {
     events: broadcast::Sender<Event>,
     pub(crate) assignment_session: watch::Sender<Option<mpsc::Sender<crate::server::SessionWrite>>>,
     pub(crate) restart_assignment_session: Notify,
-    connected: AtomicBool,
-    /// A pull has confirmed that the Machine is clear of baseline clashes.
-    pub(crate) pull_cleared_blocked: AtomicBool,
-    revoked: AtomicBool,
-    /// Since when (Unix seconds) the server has been rejecting the token.
-    auth_rejected: Mutex<Option<i64>>,
     pub(crate) roots: watch::Sender<Vec<WatchRoot>>,
     pub(crate) http: reqwest::Client,
 }
 
-/// See [`Daemon::pull_state`].
+/// See [`Daemon::pull_inputs`].
 #[derive(PartialEq)]
-struct PullState {
+struct PullInputs {
     head: Option<String>,
     remote: Option<String>,
-    blocked: Option<Vec<ItemRef>>,
+    pull: PullState,
     pending: bool,
 }
 
 type ReviewedSync = (Repo, Vec<(Action, Option<String>)>);
+
+/// An unmanaged skill published into the draft, waiting for the Assignment
+/// write that enables it (see [`Daemon::adopt`]).
+struct PendingAdoption {
+    adoption: sync::unmanaged::Adoption,
+    /// Publishing created it, so a refused write takes it back out.
+    created: bool,
+    id: sk1ll_core::ItemId,
+    changes: sk1ll_proto::AssignmentChanges,
+}
 
 #[derive(Default)]
 struct RefreshOutcome {
@@ -141,15 +165,8 @@ struct RefreshOutcome {
 
 /// Mutable state, only touched with the engine mutex held.
 pub(crate) struct Engine {
-    state: Mode,
-    /// Draft items clashing with the server's newer baseline (Blocked).
-    blocked: Option<Vec<ItemRef>>,
-    /// The server's baseline as last announced or fetched.
-    server_baseline: Option<String>,
     /// Core's engine lock on the repo, held from startup (or from the clone).
     lock: Option<EngineLock>,
-    /// Joined again and about to restart: do nothing more.
-    frozen: bool,
     /// The published report is not the result of a successful refresh: the
     /// last one failed, or none ran yet. Nothing may be derived from it.
     stale: bool,
@@ -171,6 +188,16 @@ impl Daemon {
 
     fn with_mode(cfg: Config, state: Mode) -> anyhow::Result<Arc<Self>> {
         let standalone = matches!(state, Mode::Standalone { .. });
+        let lifecycle = match &state {
+            Mode::Joined(s) => Lifecycle::joined(s.revoked, s.record.clone()),
+            Mode::Standalone { .. } => {
+                let path = state::standalone_record_path(&cfg.state);
+                Lifecycle::standalone(state::load_record(&path).unwrap_or_else(|e| {
+                    tracing::warn!("{e:#}; starting without a remembered Baseline");
+                    PullRecord::default()
+                }))
+            }
+        };
         let snapshot = if standalone {
             let assignment = sk1ll_core::Assignment::load(&cfg.assignment)?;
             let previous = state::load_snapshot(&cfg.state.with_file_name("standalone-assignment.json"))?;
@@ -192,7 +219,7 @@ impl Daemon {
         if standalone && let Some(snap) = &snapshot {
             state::save_snapshot(&cfg.state.with_file_name("standalone-assignment.json"), snap)?;
         }
-        let view = StatusView {
+        let mut view = StatusView {
             machine_id: state.machine_id().to_string(),
             server_url: state.joined().ok().map(|s| s.server_url.clone()),
             mode: if standalone { DaemonMode::Standalone } else { DaemonMode::Joined },
@@ -200,15 +227,9 @@ impl Daemon {
             repo_ready: !standalone || state.repo().join(".git").exists(),
             repo: state.repo().to_path_buf(),
             headline: sk1ll_proto::MachineStatus::Offline,
-            connection: if standalone {
-                Connection::Standalone
-            } else if state.revoked() {
-                Connection::Revoked
-            } else {
-                Connection::Connecting
-            },
+            connection: Connection::Connecting,
             last_error: None,
-            revoked: state.revoked(),
+            revoked: false,
             server_baseline: None,
             assignment_revision: snapshot.as_ref().map_or(0, |s| s.revision),
             version: sk1ll_core::VERSION.to_string(),
@@ -216,17 +237,16 @@ impl Daemon {
             auth_rejected_since: None,
             report: MachineReport::default(),
         };
+        lifecycle.apply(&mut view);
         Ok(Arc::new(Self {
             cfg,
-            ident: state.clone(),
-            revoked: AtomicBool::new(state.revoked()),
+            ident: state,
             snapshot: RwLock::new(snapshot.map(Arc::new)),
+            lifecycle: Mutex::new(lifecycle),
+            net: tokio::sync::Mutex::new(()),
+            assignment_writes: tokio::sync::Mutex::new(()),
             engine: Mutex::new(Engine {
-                state,
-                blocked: None,
-                server_baseline: None,
                 lock: None,
-                frozen: false,
                 stale: true,
                 assignment_placement_failed: true,
                 #[cfg(test)]
@@ -236,9 +256,6 @@ impl Daemon {
             events: broadcast::channel(256).0,
             assignment_session: watch::channel(None).0,
             restart_assignment_session: Notify::new(),
-            connected: AtomicBool::new(false),
-            pull_cleared_blocked: AtomicBool::new(false),
-            auth_rejected: Mutex::new(None),
             roots: watch::channel(Vec::new()).0,
             http: crate::server::http_client().build().context("building the HTTP client")?,
         }))
@@ -253,7 +270,7 @@ impl Daemon {
     }
 
     pub(crate) fn init(&self, eng: &mut Engine) -> Result<()> {
-        if eng.frozen || !self.is_standalone() || self.repo_root().join(".git").exists() {
+        if self.idle() || !self.is_standalone() || self.repo_root().join(".git").exists() {
             return Err(Error::Conflict("Init requires a standalone machine without a repo".into()));
         }
         let root = self.repo_root();
@@ -304,15 +321,15 @@ impl Daemon {
         changes: &sk1ll_proto::AssignmentChanges,
     ) -> Result<sk1ll_proto::AssignmentUpdate> {
         use sk1ll_proto::ToggleKind;
-        self.ensure_managed(eng)?;
+        self.ensure_managed()?;
         self.lock_repo(eng)?;
         // An edit made outside the daemon counts as a newer revision.
         self.reload_local_assignment()?;
-        let mut repo = Repo::open(Self::root(eng))?;
+        let mut repo = Repo::open(self.repo_root())?;
         // Changing a default records every item's current value by Item ID,
         // so each item needs one. A pending pull's tree is partial: no writes.
         if !repo.pull_pending()? && repo.assign_missing_ids()? > 0 {
-            repo = Repo::open(Self::root(eng))?;
+            repo = Repo::open(self.repo_root())?;
         }
         let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
         let skills: Vec<_> = repo.skills()?.into_iter().map(|s| s.id).collect();
@@ -402,91 +419,158 @@ impl Daemon {
         errors.into_iter().map(|error| crate::auth::redact(&error)).collect()
     }
 
-    pub(crate) fn write_assignment(&self, eng: &mut Engine, write: AssignmentWrite) -> Result<AssignmentUpdate> {
+    /// Writes Assignment: to the machine-local file standalone, else through
+    /// the server session. The server may take up to its request timeout to
+    /// confirm, so a joined write holds the engine mutex only to check
+    /// whether it may be sent and, once confirmed, to apply it.
+    pub(crate) async fn write_assignment(self: &Arc<Self>, write: AssignmentWrite) -> Result<AssignmentUpdate> {
         if self.is_standalone() {
-            return match write {
-                AssignmentWrite::Changes(changes) => self.set_local_assignment(eng, &changes),
-                AssignmentWrite::Harness { harness, enabled } => {
-                    self.ensure_managed(eng)?;
-                    self.lock_repo(eng)?;
-                    self.reload_local_assignment()?;
-                    if !MachineConfig::load(&self.cfg.machine_config)?.harnesses().contains_key(&harness) {
-                        return Err(Error::BadRequest(format!("unknown harness `{harness}`")));
-                    }
-                    let mut assignment = sk1ll_core::Assignment::load(&self.cfg.assignment)?;
-                    assignment.set_harness(&harness, enabled);
-                    assignment.save(&self.cfg.assignment)?;
-                    let errors = self.saved_local_assignment(eng);
-                    let snap = self.snapshot().expect("standalone always has assignment");
-                    Ok(AssignmentUpdate {
-                        revision: snap.revision,
-                        assignment: snap.assignment.clone(),
-                        entries: Vec::new(),
-                        errors,
-                    })
+            return self.blocking(move |d, eng| d.write_local_assignment(eng, write)).await;
+        }
+        let _writes = self.assignment_writes.lock().await;
+        self.blocking(|d, _| {
+            if RenameIntent::exists(&d.cfg.machine_config)? {
+                return Err(Error::Unavailable("waiting for the pending Harness rename to finish".into()));
+            }
+            Ok(())
+        })
+        .await?;
+        let update = crate::server::write_assignment(self, write).await?;
+        self.blocking(move |d, eng| Ok(d.apply_confirmed(eng, update))).await
+    }
+
+    fn write_local_assignment(&self, eng: &mut Engine, write: AssignmentWrite) -> Result<AssignmentUpdate> {
+        match write {
+            AssignmentWrite::Changes(changes) => self.set_local_assignment(eng, &changes),
+            AssignmentWrite::Harness { harness, enabled } => {
+                self.ensure_managed()?;
+                self.lock_repo(eng)?;
+                self.reload_local_assignment()?;
+                if !MachineConfig::load(&self.cfg.machine_config)?.harnesses().contains_key(&harness) {
+                    return Err(Error::BadRequest(format!("unknown harness `{harness}`")));
                 }
-                AssignmentWrite::RenameHarness(_) => unreachable!("handled with the machine config edit"),
-            };
+                let mut assignment = sk1ll_core::Assignment::load(&self.cfg.assignment)?;
+                assignment.set_harness(&harness, enabled);
+                assignment.save(&self.cfg.assignment)?;
+                let errors = self.saved_local_assignment(eng);
+                let snap = self.snapshot().expect("standalone always has assignment");
+                Ok(AssignmentUpdate {
+                    revision: snap.revision,
+                    assignment: snap.assignment.clone(),
+                    entries: Vec::new(),
+                    errors,
+                })
+            }
+            AssignmentWrite::RenameHarness(_) => unreachable!("handled with the machine config edit"),
         }
-        if RenameIntent::exists(&self.cfg.machine_config)? {
-            return Err(Error::Unavailable("waiting for the pending Harness rename to finish".into()));
+    }
+
+    /// Applies an Assignment the server confirmed, as of now rather than as
+    /// of when it was sent. A daemon that stopped managing meanwhile applies
+    /// nothing; a newer revision applied meanwhile (its snapshot overtook the
+    /// confirmation) stands, and since the server numbers revisions in order
+    /// it already includes this write: the reply then carries that one.
+    fn apply_confirmed(&self, eng: &mut Engine, mut update: AssignmentUpdate) -> AssignmentUpdate {
+        if self.idle() {
+            tracing::info!("not applying Assignment revision {}: no longer managing", update.revision);
+            return update;
         }
-        let mut update = tokio::runtime::Handle::current().block_on(crate::server::write_assignment(self, write))?;
         let snapshot =
             AssignmentSnapshot { revision: update.revision, assignment: update.assignment.clone(), registration: None };
         update.errors = self.apply_assignment(eng, snapshot).unwrap_or_else(|e| {
             self.set_error(format!("applying the saved Assignment: {e}"));
             vec![crate::auth::redact(&e.to_string())]
         });
+        if let Some(current) = self.snapshot()
+            && current.revision > update.revision
+        {
+            tracing::info!(
+                "Assignment revision {} was confirmed after revision {} had been applied",
+                update.revision,
+                current.revision
+            );
+            update.revision = current.revision;
+            update.assignment = current.assignment.clone();
+        }
         self.event(Event::Fleet);
-        Ok(update)
+        update
     }
 
-    pub(crate) fn rename_harness(
+    /// Renames a Harness with its Assignment. Joined, the server's
+    /// Assignment is fetched and the rename written without the engine
+    /// mutex; the intent and the machine config change under it.
+    pub(crate) async fn rename_harness(
+        self: &Arc<Self>,
+        request: crate::client::HarnessRenameRequest,
+    ) -> Result<crate::client::HarnessRenameResult> {
+        if self.is_standalone() {
+            return self.blocking(move |d, eng| d.rename_local_harness(eng, request)).await;
+        }
+        let _writes = self.assignment_writes.lock().await;
+        let state = self.ident.joined()?.clone();
+        let authority = state.rename_authority();
+        let pending = self
+            .blocking(move |d, eng| {
+                d.ensure_managed()?;
+                d.lock_repo(eng)?;
+                Ok(RenameIntent::load(&d.cfg.machine_config, Some(&authority))?)
+            })
+            .await?;
+        // A rename that is already pending is resumed, not prepared again.
+        let authoritative = match pending {
+            Some(intent) if intent.request == request => None,
+            Some(_) => return Err(Error::Conflict("finish the pending Harness rename first".into())),
+            None => Some(crate::server::fetch_machine_assignment(&state, &self.http).await?.assignment),
+        };
+        let intent = self
+            .blocking(move |d, eng| {
+                d.ensure_managed()?;
+                d.lock_repo(eng)?;
+                let intent = crate::server::prepare_rename(&d.cfg, &state, request, authoritative.as_ref())?;
+                intent.apply_config(&d.cfg.machine_config)?;
+                Ok(intent)
+            })
+            .await?;
+        let result = crate::server::write_assignment(self, crate::server::rename_write(&intent)).await;
+        let routed_rules = intent.routed_rules.clone();
+        match self.blocking(move |d, eng| d.finish_harness_rename(eng, intent, result)).await {
+            Ok(update) => Ok(crate::client::HarnessRenameResult { update, routed_rules }),
+            Err(error) => {
+                self.restart_assignment_session.notify_one();
+                Err(error)
+            }
+        }
+    }
+
+    fn rename_local_harness(
         &self,
         eng: &mut Engine,
         request: crate::client::HarnessRenameRequest,
     ) -> Result<crate::client::HarnessRenameResult> {
-        self.ensure_managed(eng)?;
+        self.ensure_managed()?;
         self.lock_repo(eng)?;
         let config = &self.cfg.machine_config;
-        if self.is_standalone() {
-            let authoritative = sk1ll_core::Assignment::load(&self.cfg.assignment)?;
-            let intent = RenameIntent::prepare(config, Self::root(eng), request, &authoritative, None)?;
-            intent.apply_standalone(config, &self.cfg.assignment)?;
-            let errors = self.saved_local_assignment(eng);
-            let snap = self.snapshot().expect("standalone always has assignment");
-            return Ok(crate::client::HarnessRenameResult {
-                update: AssignmentUpdate {
-                    revision: snap.revision,
-                    assignment: snap.assignment.clone(),
-                    entries: Vec::new(),
-                    errors,
-                },
-                routed_rules: intent.routed_rules,
-            });
-        }
-        let state = self.ident.joined()?;
-        let runtime = tokio::runtime::Handle::current();
-        let intent = runtime.block_on(crate::server::prepare_rename(&self.cfg, state, request, &self.http))?;
-        intent.apply_config(config)?;
-        let result = runtime.block_on(crate::server::write_assignment(self, crate::server::rename_write(&intent)));
-        let routed_rules = intent.routed_rules.clone();
-        let update = match self.finish_harness_rename(eng, intent, result) {
-            Ok(update) => update,
-            Err(error) => {
-                self.restart_assignment_session.notify_one();
-                return Err(error);
-            }
-        };
-        Ok(crate::client::HarnessRenameResult { update, routed_rules })
+        let authoritative = sk1ll_core::Assignment::load(&self.cfg.assignment)?;
+        let intent = RenameIntent::prepare(config, self.repo_root(), request, &authoritative, None)?;
+        intent.apply_standalone(config, &self.cfg.assignment)?;
+        let errors = self.saved_local_assignment(eng);
+        let snap = self.snapshot().expect("standalone always has assignment");
+        Ok(crate::client::HarnessRenameResult {
+            update: AssignmentUpdate {
+                revision: snap.revision,
+                assignment: snap.assignment.clone(),
+                entries: Vec::new(),
+                errors,
+            },
+            routed_rules: intent.routed_rules,
+        })
     }
 
     pub(crate) fn pending_harness_rename(&self, eng: &mut Engine) -> Result<Option<RenameIntent>> {
         let authority = self.ident.joined()?.rename_authority();
         let config = &self.cfg.machine_config;
         let Some(intent) = RenameIntent::load(config, Some(&authority))? else { return Ok(None) };
-        self.ensure_managed(eng)?;
+        self.ensure_managed()?;
         self.lock_repo(eng)?;
         intent.apply_config(config)?;
         Ok(Some(intent))
@@ -563,6 +647,20 @@ impl Daemon {
         .map_err(|e| Error::Internal(anyhow::anyhow!("daemon read task failed: {e}")))?
     }
 
+    /// Runs `f`, a git network operation on the repo (clone, fetch, push), on
+    /// a blocking thread without the engine mutex, one at a time.
+    async fn network<T, F>(self: &Arc<Self>, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Daemon) -> Result<T> + Send + 'static,
+    {
+        let _net = self.net.lock().await;
+        let d = self.clone();
+        tokio::task::spawn_blocking(move || f(&d))
+            .await
+            .map_err(|e| Error::Internal(anyhow::anyhow!("daemon network task failed: {e}")))?
+    }
+
     /// Whether an engine operation is running right now.
     fn engine_busy(&self) -> bool {
         matches!(self.engine.try_lock(), Err(TryLockError::WouldBlock))
@@ -608,52 +706,93 @@ impl Daemon {
         Ok(())
     }
 
+    /// The current lifecycle.
+    pub(crate) fn lifecycle(&self) -> Lifecycle {
+        lock(&self.lifecycle).clone()
+    }
+
     pub(crate) fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::SeqCst)
+        lock(&self.lifecycle).connected()
     }
 
     pub(crate) fn is_revoked(&self) -> bool {
-        self.revoked.load(Ordering::SeqCst)
+        lock(&self.lifecycle).revoked()
     }
 
-    /// Changes the view, recomputing the headline; emits events for changes.
-    pub(crate) fn update(&self, f: impl FnOnce(&mut StatusView)) {
+    /// Changes the lifecycle (`t`) and the rest of the view (`f`) as one
+    /// publication, deriving the view's lifecycle fields and headline, and
+    /// emits events for what changed. A change to what the state file keeps
+    /// is saved first; the error says if that failed (the change stands).
+    fn publish<T>(
+        &self,
+        t: impl FnOnce(&mut Lifecycle) -> T,
+        f: impl FnOnce(&mut StatusView),
+    ) -> (T, anyhow::Result<()>) {
+        let mut lc = lock(&self.lifecycle);
+        let before = lc.clone();
+        let out = t(&mut lc);
+        let saved = if lc.persisted() != before.persisted() { self.save_lifecycle(&lc) } else { Ok(()) };
         let mut draft_changed = false;
         let changed = self.view.send_if_modified(|v| {
-            let before = v.clone();
+            let old = v.clone();
             f(v);
-            let offline = !matches!(v.connection, Connection::Connected | Connection::Standalone);
-            v.headline = headline(offline, Some(&v.report), v.server_baseline.as_deref());
-            draft_changed = before.report.drafts != v.report.drafts;
-            *v != before
+            lc.apply(v);
+            draft_changed = old.report.drafts != v.report.drafts;
+            *v != old
         });
+        let fleet = before.connected() != lc.connected() || before.revoked() != lc.revoked();
+        drop(lc);
         if changed {
             self.event(Event::Status);
         }
         if draft_changed {
             self.event(Event::Draft);
         }
-    }
-
-    /// Connected or Offline. Connecting clears an auth rejection.
-    pub(crate) fn set_connection(&self, connection: Connection) {
-        if self.is_revoked() {
-            return;
-        }
-        let connected = connection == Connection::Connected;
-        let was = self.connected.swap(connected, Ordering::SeqCst);
-        if connected {
-            *lock(&self.auth_rejected) = None;
-        }
-        self.update(|v| {
-            v.connection = connection;
-            if connected {
-                v.auth_rejected_since = None;
-            }
-        });
-        if was != connected {
+        if fleet {
             self.event(Event::Fleet);
         }
+        (out, saved)
+    }
+
+    /// Writes the lifecycle's persistent part. A halted daemon writes
+    /// nothing: the state file may already hold its next registration.
+    fn save_lifecycle(&self, lc: &Lifecycle) -> anyhow::Result<()> {
+        if lc.halted() {
+            return Ok(());
+        }
+        let (revoked, record) = lc.persisted();
+        match &self.ident {
+            Mode::Joined(s) => DaemonState { revoked, record: record.clone(), ..s.clone() }.save(&self.cfg.state),
+            Mode::Standalone { .. } => state::save_record(&state::standalone_record_path(&self.cfg.state), record),
+        }
+    }
+
+    /// A lifecycle transition whose state file failure fails the caller.
+    fn transition<T>(&self, t: impl FnOnce(&mut Lifecycle) -> T) -> Result<T> {
+        let (out, saved) = self.publish(t, |_| {});
+        saved.context("saving the daemon state")?;
+        Ok(out)
+    }
+
+    /// A lifecycle transition whose state file failure only shows in the
+    /// status: the daemon goes on from what it knows.
+    fn note<T>(&self, t: impl FnOnce(&mut Lifecycle) -> T) -> T {
+        let (out, saved) = self.publish(t, |_| {});
+        if let Err(e) = saved {
+            self.set_error(format!("saving the daemon state: {e:#}"));
+        }
+        out
+    }
+
+    /// Changes the view, recomputing the headline; emits events for changes.
+    pub(crate) fn update(&self, f: impl FnOnce(&mut StatusView)) {
+        let ((), saved) = self.publish(|_| (), f);
+        debug_assert!(saved.is_ok());
+    }
+
+    /// The server session's connection changed.
+    pub(crate) fn set_link(&self, link: Link) {
+        self.note(|lc| lc.set_link(link));
     }
 
     /// The server answered 401 to the token. That can be a proxy or a server
@@ -662,12 +801,8 @@ impl Daemon {
     /// server's `revoked` message revokes it. After `auth_warn_after`, the status
     /// says the machine was probably removed.
     pub(crate) fn set_auth_rejected(&self) {
-        if self.is_revoked() {
-            return;
-        }
-        let was = self.connected.swap(false, Ordering::SeqCst);
         let now = unix_now();
-        let since = *lock(&self.auth_rejected).get_or_insert(now);
+        let Some(since) = self.note(|lc| lc.auth_rejected(now)) else { return };
         let message = if now - since >= self.cfg.auth_warn_after.as_secs() as i64 {
             format!(
                 "the server has rejected this machine's token since {}h ago; it was probably removed from the fleet: \
@@ -682,14 +817,7 @@ impl Daemon {
         if self.view().last_error.as_deref() != Some(message.as_str()) {
             tracing::warn!("{message}");
         }
-        self.update(|v| {
-            v.connection = Connection::AuthRejected;
-            v.auth_rejected_since = Some(since);
-            v.last_error = Some(message);
-        });
-        if was {
-            self.event(Event::Fleet);
-        }
+        self.update(|v| v.last_error = Some(message));
     }
 
     pub(crate) fn set_error(&self, e: impl ToString) {
@@ -701,34 +829,24 @@ impl Daemon {
     // -----------------------------------------------------------------------
     // Engine operations (blocking, with the engine mutex held)
 
-    fn ensure_managed(&self, eng: &Engine) -> Result<()> {
-        if eng.state.revoked() {
-            return Err(Error::Conflict(
-                "this machine was removed from the fleet; the daemon no longer manages it".into(),
-            ));
-        }
-        if eng.frozen {
-            return Err(Error::Conflict("the daemon is restarting after joining again; try again".into()));
-        }
+    fn ensure_managed(&self) -> Result<()> {
+        lock(&self.lifecycle).managed().map_err(|why| Error::Conflict(why.into()))?;
         self.require_repo()
     }
 
     /// Nothing to manage: revoked, or about to restart.
-    fn idle(eng: &Engine) -> bool {
-        eng.state.revoked() || eng.frozen
-    }
-
-    fn root(eng: &Engine) -> &Path {
-        eng.state.repo()
+    fn idle(&self) -> bool {
+        lock(&self.lifecycle).idle()
     }
 
     /// Takes the engine lock on the repo if it exists and isn't held yet. Held
     /// by someone else means another sk1ll process is changing it.
     pub(crate) fn lock_repo(&self, eng: &mut Engine) -> Result<()> {
-        if eng.lock.is_some() || !eng.state.repo().join(".git").exists() {
+        let root = self.repo_root();
+        if eng.lock.is_some() || !root.join(".git").exists() {
             return Ok(());
         }
-        match EngineLock::try_acquire(eng.state.repo())? {
+        match EngineLock::try_acquire(root)? {
             Some(l) => {
                 tracing::debug!("holding {}", l.path().display());
                 eng.lock = Some(l);
@@ -736,32 +854,37 @@ impl Daemon {
             }
             None => Err(Error::Conflict(format!(
                 "another sk1ll process (a second daemon, or a CLI command working directly) is changing {}",
-                eng.state.repo().display()
+                root.display()
             ))),
         }
     }
 
-    /// At startup: clone the repo if it isn't there yet, drop credentials an
-    /// older version left in origin's URL, and bring the harnesses in line.
-    pub(crate) fn startup(&self, eng: &mut Engine) -> Result<()> {
-        if Self::idle(eng) {
+    /// At startup: clone the repo if it isn't there yet (without the engine
+    /// mutex), drop credentials an older version left in origin's URL, and
+    /// bring the harnesses in line.
+    pub(crate) async fn startup(self: &Arc<Self>) -> Result<()> {
+        if self.idle() {
             return Ok(());
         }
-        let root = eng.state.repo().to_path_buf();
-        // Git authenticates through the process environment (`prepare_process`).
-        if !self.is_standalone()
-            && let Err(e) = gitx::ensure_clone(&root, &eng.state.joined()?.repo_url(), &[])
-        {
-            self.set_error(format!("setting up {}: {e:#}", root.display()));
+        if !self.is_standalone() {
+            // Git authenticates through the process environment (`prepare_process`).
+            let cloned =
+                self.network(|d| Ok(gitx::ensure_clone(d.repo_root(), &d.ident.joined()?.repo_url(), &[]))).await?;
+            if let Err(e) = cloned {
+                self.set_error(format!("setting up {}: {e:#}", self.repo_root().display()));
+            }
         }
-        self.lock_repo(eng)?;
-        if !self.is_standalone()
-            && let Some(s) = self.snapshot()
-            && let Err(e) = s.assignment.save(&self.cfg.assignment)
-        {
-            tracing::warn!("writing the assignment cache {}: {e}", self.cfg.assignment.display());
-        }
-        self.refresh(eng)
+        self.blocking(|d, eng| {
+            d.lock_repo(eng)?;
+            if !d.is_standalone()
+                && let Some(s) = d.snapshot()
+                && let Err(e) = s.assignment.save(&d.cfg.assignment)
+            {
+                tracing::warn!("writing the assignment cache {}: {e}", d.cfg.assignment.display());
+            }
+            d.refresh(eng)
+        })
+        .await
     }
 
     /// Plans and applies the sync, then recomputes the report. Conflicts are
@@ -784,7 +907,7 @@ impl Daemon {
     }
 
     fn refresh_with_plan(&self, eng: &mut Engine, reviewed: Option<ReviewedSync>) -> Result<RefreshOutcome> {
-        if Self::idle(eng) {
+        if self.idle() {
             return Ok(RefreshOutcome::default());
         }
         if self.is_standalone() {
@@ -796,7 +919,7 @@ impl Daemon {
         }
         tracing::debug!("refreshing the local state");
         eng.stale = true;
-        let root = eng.state.repo().to_path_buf();
+        let root = self.repo_root().to_path_buf();
         if self.is_standalone() && !root.join(".git").exists() {
             self.update(|v| {
                 v.repo_ready = false;
@@ -818,21 +941,23 @@ impl Daemon {
         let repo = Repo::open_git_only(&root)?;
         let finish = repo.finish_pull(lock);
         let pending = repo.pull_pending()?;
-        let mut pending_items = Vec::new();
-        match finish {
-            Ok(None) => {}
-            Ok(Some(PullOutcome::Blocked { items, .. })) => {
-                pending_items.clone_from(&items);
-                eng.blocked = Some(items);
+        let finished = match finish {
+            Ok(None) => None,
+            Ok(Some(PullOutcome::Blocked { baseline, items })) if !pending => {
+                Some(PullState::Blocked { baseline, items })
             }
+            Ok(Some(PullOutcome::Blocked { items, .. })) => Some(PullState::Pending { items }),
             Ok(Some(_)) | Err(sk1ll_core::Error::Displaced { .. }) if !pending => {
                 tracing::info!("finished a pull that had stopped half-way");
-                eng.blocked = None;
-                self.pull_cleared_blocked.store(true, Ordering::Relaxed);
+                Some(PullState::Clear)
             }
-            Err(e) => outcome.errors.push(format!("pull: {e}")),
-            Ok(Some(_)) => {}
-        }
+            Err(e) => {
+                outcome.errors.push(format!("pull: {e}"));
+                None
+            }
+            Ok(Some(_)) => None,
+        };
+        let pull = self.pull_after_refresh(&root, finished, pending);
         // Sync waits for every item to have an Item ID; the report doesn't.
         let mut ids_ready = true;
         if !pending && reviewed.is_none() {
@@ -909,25 +1034,26 @@ impl Daemon {
             report.drafts = previous.drafts;
             report.items = previous.items;
         }
-        let blocked = !pending && eng.blocked.is_some();
-        report.clashes = if blocked { eng.blocked.clone().unwrap_or_default() } else { Vec::new() };
-        report.blocked = blocked;
-        report.pull_pending = pending.then_some(pending_items);
-        report.behind =
-            pending || blocked || eng.server_baseline.as_ref().is_some_and(|h| report.baseline.as_ref() != Some(h));
         report.conflicts = conflicts;
-        let server_baseline = eng.server_baseline.clone();
         let awaiting = snapshot.is_none();
-        self.update(|v| {
-            v.repo_ready = true;
-            v.has_origin = !self.is_standalone() || gitx::has_origin(&root).unwrap_or(false);
-            v.report = report;
-            v.server_baseline = server_baseline;
-            v.awaiting_assignment = awaiting;
-            if let Some(e) = outcome.errors.first() {
-                v.last_error = Some(crate::auth::redact(e));
-            }
-        });
+        let has_origin = !self.is_standalone() || gitx::has_origin(&root).unwrap_or(false);
+        // The lifecycle derives the report's Blocked, pending and behind.
+        let ((), saved) = self.publish(
+            |lc| lc.set_pull(pull),
+            |v| {
+                v.repo_ready = true;
+                v.has_origin = has_origin;
+                v.report = report;
+                v.awaiting_assignment = awaiting;
+                if let Some(e) = outcome.errors.first() {
+                    v.last_error = Some(crate::auth::redact(e));
+                }
+            },
+        );
+        if let Err(e) = saved {
+            outcome.errors.push(format!("saving the daemon state: {e:#}"));
+            self.update(|v| v.last_error = Some(format!("saving the daemon state: {e:#}")));
+        }
         for e in &outcome.errors {
             tracing::warn!("{}", crate::auth::redact(e));
         }
@@ -954,114 +1080,163 @@ impl Daemon {
         Ok(outcome)
     }
 
-    /// Publishes the server's baseline and the one thing in the report that
-    /// follows from it alone (`behind`), for when it is all that changed
-    /// since the last successful refresh.
-    fn publish_server_baseline(&self, eng: &Engine) {
-        let server_baseline = eng.server_baseline.clone();
-        let blocked = eng.blocked.is_some();
-        self.update(|v| {
-            v.report.behind = v.report.pull_pending.is_some()
-                || blocked
-                || server_baseline.as_ref().is_some_and(|h| v.report.baseline.as_ref() != Some(h));
-            v.server_baseline = server_baseline;
-        });
+    /// Where a refresh leaves the pull: what finishing a stopped pull
+    /// (`finished`) found, else what was known, checked against the repo. The
+    /// journal decides whether a pull is pending. A remembered block whose
+    /// Baseline `HEAD` has reached since (a pull while the daemon was
+    /// stopped) is over.
+    fn pull_after_refresh(&self, root: &Path, finished: Option<PullState>, pending: bool) -> PullState {
+        if let Some(pull) = finished {
+            return pull;
+        }
+        match self.lifecycle().pull().clone() {
+            PullState::Pending { items } if pending => PullState::Pending { items },
+            _ if pending => PullState::Pending { items: Vec::new() },
+            PullState::Pending { items } if items.is_empty() => PullState::Clear,
+            PullState::Pending { items } => match gitx::remote_head(root) {
+                Ok(Some(baseline)) => PullState::Blocked { baseline, items },
+                _ => PullState::Clear,
+            },
+            PullState::Blocked { baseline, .. }
+                if gitx::rev(root, "HEAD")
+                    .ok()
+                    .flatten()
+                    .is_some_and(|head| gitx::is_ancestor(root, &baseline, &head).unwrap_or(false)) =>
+            {
+                PullState::Clear
+            }
+            pull => pull,
+        }
     }
 
     /// What a pull or push can change among the things the report is made
     /// from: where `HEAD` and origin's branch are (the baseline, the unpushed
     /// items and the working tree a pull moves all follow from them) and
-    /// whether the machine is Blocked.
-    fn pull_state(eng: &Engine) -> Result<PullState> {
-        let root = Self::root(eng);
-        Ok(PullState {
+    /// where the pull stands.
+    fn pull_inputs(&self) -> Result<PullInputs> {
+        let root = self.repo_root();
+        Ok(PullInputs {
             head: gitx::rev(root, "HEAD")?,
             remote: gitx::remote_head(root)?,
-            blocked: eng.blocked.clone(),
+            pull: self.lifecycle().pull().clone(),
             pending: Repo::open_git_only(root)?.pull_pending()?,
         })
     }
 
     /// After file changes (or the periodic reconciliation): refresh, and if
     /// Blocked and the draft changed, try the pull again.
-    pub(crate) fn on_files_changed(&self, eng: &mut Engine) -> Result<()> {
-        if Self::idle(eng) {
-            return Ok(());
-        }
-        sync::displaced::prune()?;
-        let before = self.view.borrow().report.drafts.clone();
-        self.refresh(eng)?;
-        if eng.blocked.is_some()
-            && self.view.borrow().report.drafts != before
-            && (self.is_connected() || self.is_standalone())
-        {
-            self.pull_refreshed(eng)?;
+    pub(crate) async fn on_files_changed(self: &Arc<Self>) -> Result<()> {
+        let drafted = self
+            .blocking(|d, eng| {
+                if d.idle() {
+                    return Ok(false);
+                }
+                sync::displaced::prune()?;
+                let before = d.view.borrow().report.drafts.clone();
+                d.refresh(eng)?;
+                Ok(d.view.borrow().report.drafts != before)
+            })
+            .await?;
+        if drafted {
+            self.retry_stopped_pull().await;
         }
         Ok(())
     }
 
+    /// After a Draft change, which may have cleared what stopped the last
+    /// pull: a Blocked Machine pulls again.
+    async fn retry_stopped_pull(self: &Arc<Self>) {
+        if self.lifecycle().pull_stopped() && (self.is_connected() || self.is_standalone()) {
+            let _ = self.pull_refreshed().await;
+        }
+    }
+
     /// Fetches the server's baseline and moves onto it (draft carried along),
     /// pushes queued commits, and syncs.
-    pub(crate) fn pull(&self, eng: &mut Engine) -> Result<PullResult> {
-        if self.is_standalone() {
-            self.ensure_managed(eng)?;
-            self.require_origin()?;
-            self.lock_repo(eng)?;
-            let result = self.pull_inner(eng);
-            self.refresh(eng)?;
-            return result;
-        }
-        self.pull_with(eng, false)
+    pub(crate) async fn pull(self: &Arc<Self>) -> Result<PullResult> {
+        self.pull_with(false).await
     }
 
     /// A pull where the local state was refreshed just before (by the caller,
     /// or by the session on connecting): the sync after it is skipped if the
     /// pull moved nothing, since it would recompute the same report from the
-    /// same inputs.
-    fn pull_refreshed(&self, eng: &mut Engine) -> Result<PullResult> {
-        if self.is_standalone() {
-            return self.pull(eng);
-        }
-        self.pull_with(eng, true)
+    /// same inputs. Standalone always syncs.
+    async fn pull_refreshed(self: &Arc<Self>) -> Result<PullResult> {
+        self.pull_with(!self.is_standalone()).await
     }
 
-    fn pull_with(&self, eng: &mut Engine, refreshed: bool) -> Result<PullResult> {
-        self.ensure_managed(eng)?;
-        let root = eng.state.repo().to_path_buf();
-        if !root.join(".git").exists() {
-            gitx::ensure_clone(&root, &eng.state.joined()?.repo_url(), &[])?;
-        }
-        self.lock_repo(eng)?;
+    /// The fetch (or the first clone) and the push run without the engine
+    /// mutex; moving onto what was fetched and the sync hold it. Each step
+    /// under the mutex checks again that the daemon still manages the repo,
+    /// and moves onto whatever was fetched last, whoever fetched it.
+    async fn pull_with(self: &Arc<Self>, refreshed: bool) -> Result<PullResult> {
+        let standalone = self.is_standalone();
         // `None`: refresh whatever happens.
-        let before = if refreshed && !eng.stale { Self::pull_state(eng).ok() } else { None };
-        let result = self.pull_inner(eng).and_then(|r| {
-            if !matches!(r, PullResult::Blocked { .. }) {
-                self.push_pending(eng)?;
-            }
-            Ok(r)
-        });
-        // A failed pull may have stopped half-way: that always refreshes.
-        if result.is_ok() && before.is_some() && before == Self::pull_state(eng).ok() {
-            self.publish_server_baseline(eng);
-        } else {
-            self.refresh(eng)?;
-        }
-        match &result {
-            Ok(r) => {
-                if let PullResult::Updated { to, .. } = r {
-                    tracing::info!("baseline is now {to}");
+        let before = self
+            .blocking(move |d, eng| {
+                d.ensure_managed()?;
+                if standalone {
+                    d.require_origin()?;
                 }
-                if !matches!(r, PullResult::Blocked { .. }) {
-                    self.update(|v| v.last_error = None);
-                }
+                d.lock_repo(eng)?;
+                Ok(if refreshed && !eng.stale { d.pull_inputs().ok() } else { None })
+            })
+            .await?;
+        let result = match self.network(|d| d.fetch_baseline()).await {
+            Ok(()) => {
+                self.blocking(|d, eng| {
+                    d.ensure_managed()?;
+                    d.lock_repo(eng)?;
+                    d.pull_inner(eng)
+                })
+                .await
             }
-            Err(e) => self.set_error(format!("pull: {e}")),
-        }
-        result
+            Err(e) => Err(e),
+        };
+        let result = match result {
+            Ok(r) if !standalone && !matches!(r, PullResult::Blocked { .. }) => self.push_pending().await.map(|_| r),
+            result => result,
+        };
+        self.blocking(move |d, eng| {
+            if d.idle() {
+                return result;
+            }
+            // A failed pull may have stopped half-way: that always refreshes.
+            // So does one that another operation ran beside.
+            if !(result.is_ok() && before.is_some() && !eng.stale && before == d.pull_inputs().ok()) {
+                d.refresh(eng)?;
+            }
+            match &result {
+                Ok(r) => {
+                    if let PullResult::Updated { to, .. } = r {
+                        tracing::info!("baseline is now {to}");
+                    }
+                    if !matches!(r, PullResult::Blocked { .. }) {
+                        d.update(|v| v.last_error = None);
+                    }
+                }
+                Err(e) => d.set_error(format!("pull: {e}")),
+            }
+            result
+        })
+        .await
     }
 
+    /// Without the engine mutex: clones the repo if it isn't there yet (a
+    /// clone has fetched), else fetches origin's branches. Neither moves the
+    /// working tree, `HEAD` or the index of an existing repo.
+    fn fetch_baseline(&self) -> Result<()> {
+        let root = self.repo_root();
+        if !root.join(".git").exists() {
+            gitx::ensure_clone(root, &self.ident.joined()?.repo_url(), &[])?;
+            return Ok(());
+        }
+        Ok(Repo::open_git_only(root)?.fetch()?)
+    }
+
+    /// The local half of a pull: moves onto the baseline fetched last.
     fn pull_inner(&self, eng: &mut Engine) -> Result<PullResult> {
-        let root = eng.state.repo().to_path_buf();
+        let root = self.repo_root().to_path_buf();
         let repo = Repo::open_git_only(&root)?;
         let first = if repo.pull_pending()? {
             None
@@ -1071,97 +1246,128 @@ impl Daemon {
                 Some(_) => gitx::adopt_first_baseline_over_init(&root)?,
             }
         };
-        let result = if let Some(first) = first {
-            eng.blocked = None;
+        let (result, pull) = if let Some(first) = first {
             match first {
-                gitx::FirstBaseline::Adopted(to) => PullResult::Updated { from: None, to },
-                gitx::FirstBaseline::Empty => PullResult::UpToDate,
-                gitx::FirstBaseline::Blocked { baseline, items } => {
-                    eng.blocked = Some(items.clone());
-                    PullResult::Blocked { baseline, items, pending: false }
-                }
+                gitx::FirstBaseline::Adopted(to) => (PullResult::Updated { from: None, to }, PullState::Clear),
+                gitx::FirstBaseline::Empty => (PullResult::UpToDate, PullState::Clear),
+                gitx::FirstBaseline::Blocked { baseline, items } => (
+                    PullResult::Blocked { baseline: baseline.clone(), items: items.clone(), pending: false },
+                    PullState::Blocked { baseline, items },
+                ),
             }
         } else {
             let head = gitx::rev(&root, "HEAD")?;
             let lock = eng.lock.as_ref().ok_or_else(|| Error::Conflict(format!("{} is not locked", root.display())))?;
-            match repo.pull(lock) {
-                Ok(PullOutcome::UpToDate) => {
-                    eng.blocked = None;
-                    PullResult::UpToDate
-                }
+            match repo.pull_fetched(lock) {
+                Ok(PullOutcome::UpToDate) => (PullResult::UpToDate, PullState::Clear),
                 Ok(PullOutcome::Updated { from, to }) => {
-                    eng.blocked = None;
-                    PullResult::Updated { from: Some(from), to }
+                    (PullResult::Updated { from: Some(from), to }, PullState::Clear)
                 }
                 Ok(PullOutcome::Blocked { baseline, items }) => {
                     tracing::warn!("blocked: baseline {baseline} clashes with the draft");
-                    eng.blocked = Some(items.clone());
-                    PullResult::Blocked { baseline, items, pending: repo.pull_pending()? }
+                    let pending = repo.pull_pending()?;
+                    let pull = if pending {
+                        PullState::Pending { items: items.clone() }
+                    } else {
+                        PullState::Blocked { baseline: baseline.clone(), items: items.clone() }
+                    };
+                    (PullResult::Blocked { baseline, items, pending }, pull)
                 }
                 // The pull went through; a save made to a file it replaced
                 // is in the recovery area, which the report lists as a conflict.
                 Err(e @ sk1ll_core::Error::Displaced { .. }) if !repo.pull_pending()? => {
                     tracing::warn!("{e}");
-                    eng.blocked = None;
-                    match gitx::rev(&root, "HEAD")? {
+                    let result = match gitx::rev(&root, "HEAD")? {
                         Some(to) if Some(&to) != head.as_ref() => PullResult::Updated { from: head, to },
                         _ => PullResult::UpToDate,
-                    }
+                    };
+                    (result, PullState::Clear)
                 }
                 Err(e) => return Err(e.into()),
             }
         };
-        if let Some(remote) = gitx::remote_head(&root)? {
-            eng.server_baseline = Some(remote);
-        }
-        if eng.blocked.is_none() {
-            self.pull_cleared_blocked.store(true, Ordering::Relaxed);
-        }
+        let remote = gitx::remote_head(&root)?;
+        self.note(|lc| {
+            lc.set_pull(pull);
+            if remote.is_some() {
+                lc.set_server_baseline(remote);
+            }
+        });
         Ok(result)
     }
 
-    /// Pushes committed commits the server doesn't have. A push the server rejected
-    /// as not fast-forward is retried once after rebasing onto its baseline;
-    /// any other failure (unreachable, timed out) is returned right away.
-    fn push_pending(&self, eng: &mut Engine) -> Result<bool> {
-        let root = eng.state.repo().to_path_buf();
-        if !gitx::has_unpushed(&root)? {
-            return Ok(false);
-        }
-        let repo = Repo::open_git_only(&root)?;
-        if let Err(first) = repo.push() {
-            if !is_rejected_push(&first) {
-                return Err(first.into());
+    /// Pushes committed commits the server doesn't have. What to push is
+    /// checked under the engine mutex and pushed without it: exactly that
+    /// commit, so one made meanwhile waits for the next push. A push the
+    /// server rejected as not fast-forward is retried once after pulling its
+    /// baseline; any other failure (unreachable, timed out) is returned right
+    /// away.
+    async fn push_pending(self: &Arc<Self>) -> Result<bool> {
+        let mut retried = false;
+        loop {
+            let commit = self
+                .blocking(|d, _| {
+                    d.ensure_managed()?;
+                    let root = d.repo_root();
+                    if !gitx::has_unpushed(root)? {
+                        return Ok(None);
+                    }
+                    Ok(Repo::open_git_only(root)?.prepare_push()?)
+                })
+                .await?;
+            let Some(commit) = commit else { return Ok(false) };
+            let pushed = self
+                .network(move |d| {
+                    let root = d.repo_root();
+                    let pushed = Repo::open_git_only(root).and_then(|repo| repo.push_commit(&commit));
+                    if pushed.is_ok() {
+                        let remote = gitx::remote_head(root)?;
+                        d.note(|lc| lc.set_server_baseline(remote));
+                    }
+                    Ok(pushed)
+                })
+                .await?;
+            match pushed {
+                Ok(()) => {
+                    tracing::info!("pushed to the server");
+                    return Ok(true);
+                }
+                Err(first) if !retried && is_rejected_push(&first) => {
+                    tracing::info!("push rejected ({first}); pulling first");
+                    retried = true;
+                    self.network(|d| d.fetch_baseline()).await?;
+                    let pulled = self
+                        .blocking(|d, eng| {
+                            d.ensure_managed()?;
+                            d.pull_inner(eng)
+                        })
+                        .await?;
+                    if let PullResult::Blocked { items, .. } = pulled {
+                        let names: Vec<String> = items.iter().map(ToString::to_string).collect();
+                        return Err(Error::Conflict(format!(
+                            "can't push: the server's baseline clashes with {}; commit or restore them",
+                            names.join(", ")
+                        )));
+                    }
+                }
+                Err(e) => return Err(e.into()),
             }
-            tracing::info!("push rejected ({first}); pulling first");
-            if let PullResult::Blocked { items, .. } = self.pull_inner(eng)? {
-                let names: Vec<String> = items.iter().map(ToString::to_string).collect();
-                return Err(Error::Conflict(format!(
-                    "can't push: the server's baseline clashes with {}; commit or restore them",
-                    names.join(", ")
-                )));
-            }
-            repo.push()?;
         }
-        tracing::info!("pushed to the server");
-        eng.server_baseline = gitx::remote_head(&root)?;
-        Ok(true)
     }
 
     /// `POST /push`: pushes committed commits now.
-    pub(crate) fn push(&self, eng: &mut Engine) -> Result<PushResult> {
-        self.ensure_managed(eng)?;
-        self.lock_repo(eng)?;
-        if self.is_standalone() {
-            self.require_origin()?;
-            let repo = Repo::open_git_only(Self::root(eng))?;
-            repo.push()?;
-            eng.server_baseline = gitx::remote_head(Self::root(eng))?;
-            self.refresh(eng)?;
-            return Ok(PushResult { pushed: true });
-        }
-        let result = self.push_pending(eng);
-        self.refresh(eng)?;
+    pub(crate) async fn push(self: &Arc<Self>) -> Result<PushResult> {
+        self.blocking(|d, eng| {
+            d.ensure_managed()?;
+            d.lock_repo(eng)?;
+            if d.is_standalone() {
+                d.require_origin()?;
+            }
+            Ok(())
+        })
+        .await?;
+        let result = self.push_pending().await;
+        self.blocking(|d, eng| d.refresh(eng)).await?;
         match result {
             Ok(pushed) => Ok(PushResult { pushed }),
             Err(Error::Internal(e)) => {
@@ -1172,12 +1378,12 @@ impl Daemon {
     }
 
     /// On (re)connecting: push what's queued and pull.
-    pub(crate) fn on_connected(&self, eng: &mut Engine) -> Result<()> {
-        if Self::idle(eng) {
+    pub(crate) async fn on_connected(self: &Arc<Self>) -> Result<()> {
+        if self.idle() {
             return Ok(());
         }
         // The session refreshed before its first status, moments ago.
-        self.pull_refreshed(eng).map(drop)
+        self.pull_refreshed().await.map(drop)
     }
 
     /// A reader: no engine mutex.
@@ -1189,17 +1395,43 @@ impl Daemon {
         Ok(CommitMessage { items, message })
     }
 
-    pub(crate) fn commit(&self, eng: &mut Engine, req: CommitRequest) -> Result<CommitResponse> {
-        self.ensure_managed(eng)?;
+    /// Commits under the engine mutex; a joined daemon then pushes, and the
+    /// state is refreshed once the push is done.
+    pub(crate) async fn commit(self: &Arc<Self>, req: CommitRequest) -> Result<CommitResponse> {
+        let mut response = self.blocking(move |d, eng| d.commit_locally(eng, req)).await?;
+        if !self.is_standalone() {
+            if self.is_connected() {
+                match self.push_pending().await {
+                    Ok(_) => response.pushed = true,
+                    Err(e) => response.push_error = Some(crate::auth::redact(&e.to_string())),
+                }
+            } else {
+                response.push_error = Some("offline: queued until the server is reachable".to_string());
+            }
+        }
+        let push_error = response.push_error.clone();
+        self.blocking(move |d, eng| {
+            d.refresh(eng)?;
+            if let Some(e) = &push_error {
+                d.set_error(format!("push: {e}"));
+            }
+            Ok(())
+        })
+        .await?;
+        self.retry_stopped_pull().await;
+        Ok(response)
+    }
+
+    fn commit_locally(&self, eng: &mut Engine, req: CommitRequest) -> Result<CommitResponse> {
+        self.ensure_managed()?;
         self.lock_repo(eng)?;
-        let root = eng.state.repo().to_path_buf();
-        let repo = Repo::open_git_only(&root)?;
+        let repo = Repo::open_git_only(self.repo_root())?;
         let draft = repo.draft()?;
         let items = req.items.iter().map(|i| ItemRef::resolve(i, &draft)).collect::<Result<Vec<_>, _>>()?;
         if items.is_empty() {
             return Err(Error::BadRequest("name the draft items to commit".into()));
         }
-        let id = eng.state.machine_id().to_string();
+        let id = self.ident.machine_id().to_string();
         let message =
             req.message.filter(|m| !m.trim().is_empty()).unwrap_or_else(|| default_commit_message(&items, &id));
         let author = match req.author {
@@ -1209,40 +1441,29 @@ impl Daemon {
         };
         let sha = repo.commit(&items, &message, author.as_deref())?;
         tracing::info!("committed {} as {sha}", items.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "));
-        let (pushed, push_error) = if self.is_standalone() {
-            (false, None)
-        } else if self.is_connected() {
-            match self.push_pending(eng) {
-                Ok(_) => (true, None),
-                Err(e) => (false, Some(crate::auth::redact(&e.to_string()))),
-            }
-        } else {
-            (false, Some("offline: queued until the server is reachable".to_string()))
-        };
-        self.refresh(eng)?;
-        if let Some(e) = &push_error {
-            self.set_error(format!("push: {e}"));
-        }
-        if eng.blocked.is_some() && (self.is_connected() || self.is_standalone()) {
-            let _ = self.pull_refreshed(eng);
-        }
-        Ok(CommitResponse { sha, items, message, pushed, push_error })
+        Ok(CommitResponse { sha, items, message, pushed: false, push_error: None })
     }
 
     /// Gives each item whose Item ID is a duplicate a new one, then refreshes.
     pub(crate) fn repair_ids(&self, eng: &mut Engine) -> Result<usize> {
-        self.ensure_managed(eng)?;
+        self.ensure_managed()?;
         self.lock_repo(eng)?;
-        let count = Repo::open(Self::root(eng))?.repair_ids()?;
+        let count = Repo::open(self.repo_root())?.repair_ids()?;
         self.refresh(eng)?;
         Ok(count)
     }
 
     /// Restores draft items and refreshes the local state.
-    pub(crate) fn restore(&self, eng: &mut Engine, req: RestoreRequest) -> Result<RestoreResponse> {
-        self.ensure_managed(eng)?;
+    pub(crate) async fn restore(self: &Arc<Self>, req: RestoreRequest) -> Result<RestoreResponse> {
+        let response = self.blocking(move |d, eng| d.restore_locally(eng, req)).await?;
+        self.retry_stopped_pull().await;
+        Ok(response)
+    }
+
+    fn restore_locally(&self, eng: &mut Engine, req: RestoreRequest) -> Result<RestoreResponse> {
+        self.ensure_managed()?;
         self.lock_repo(eng)?;
-        let repo = Repo::open_git_only(Self::root(eng))?;
+        let repo = Repo::open_git_only(self.repo_root())?;
         let draft = repo.draft()?;
         let before: BTreeSet<ItemRef> = draft.iter().map(|d| d.item.clone()).collect();
         match (req.all, req.items.is_empty()) {
@@ -1261,9 +1482,6 @@ impl Daemon {
         let after: BTreeSet<ItemRef> = repo.draft()?.into_iter().map(|d| d.item).collect();
         let discarded: Vec<ItemRef> = before.difference(&after).cloned().collect();
         self.refresh(eng)?;
-        if eng.blocked.is_some() && (self.is_connected() || self.is_standalone()) {
-            let _ = self.pull_refreshed(eng);
-        }
         Ok(RestoreResponse { discarded })
     }
 
@@ -1448,13 +1666,13 @@ impl Daemon {
 
     /// The current plan; `force` plans as if overwriting. For engine
     /// operations: interrupted imports are put back first.
-    fn plan(&self, eng: &Engine, force: bool) -> Result<(Repo, Vec<Action>)> {
+    fn plan(&self, force: bool) -> Result<(Repo, Vec<Action>)> {
         let Some(snap) = self.snapshot() else {
             return Err(Error::Conflict(
                 "waiting for the server's assignment; the harnesses are left alone until it arrives".into(),
             ));
         };
-        Self::recover_imports(Self::root(eng))?;
+        Self::recover_imports(self.repo_root())?;
         self.plan_as_is(&snap, force)
     }
 
@@ -1600,16 +1818,16 @@ impl Daemon {
     /// `POST /sync`: re-syncs now; `force` also overwrites what a forced plan
     /// may overwrite (hand edits inside managed blocks).
     pub(crate) fn sync(&self, eng: &mut Engine, force: bool, fingerprint: Option<&str>) -> Result<SyncResult> {
-        self.ensure_managed(eng)?;
+        self.ensure_managed()?;
         self.lock_repo(eng)?;
-        Self::require_sync_ready(&Repo::open_git_only(Self::root(eng))?)?;
+        Self::require_sync_ready(&Repo::open_git_only(self.repo_root())?)?;
         let reviewed = if let Some(fingerprint) = fingerprint {
             if self.is_standalone() {
                 self.reload_local_assignment()?;
             }
             let snapshot =
                 self.snapshot().ok_or_else(|| Error::Conflict("waiting for the server's assignment".into()))?;
-            let root = Self::root(eng);
+            let root = self.repo_root();
             let lock = eng.lock.as_ref().ok_or_else(|| Error::Conflict(format!("{} is not locked", root.display())))?;
             let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
             // Recovery may restore a source or change a placement. Compare the
@@ -1633,8 +1851,8 @@ impl Daemon {
             None
         };
         if force && reviewed.is_none() {
-            Repo::open(Self::root(eng))?.assign_missing_ids()?;
-            let (repo, actions) = self.plan(eng, true)?;
+            Repo::open(self.repo_root())?.assign_missing_ids()?;
+            let (repo, actions) = self.plan(true)?;
             for a in actions.iter().filter(|a| a.kind != ActionKind::Conflict) {
                 sync::apply(&repo, a)?;
             }
@@ -1659,14 +1877,14 @@ impl Daemon {
     }
 
     pub(crate) fn resolve_displaced(&self, eng: &mut Engine, id: &str, adopt: bool) -> Result<Option<PathBuf>> {
-        self.ensure_managed(eng)?;
+        self.ensure_managed()?;
         self.lock_repo(eng)?;
         let result = if adopt {
-            let root = Self::root(eng);
+            let root = self.repo_root();
             let lock = eng.lock.as_ref().ok_or_else(|| Error::Conflict(format!("{} is not locked", root.display())))?;
             sync::displaced::adopt(&Repo::open_git_only(root)?, id, lock).map(Some)
         } else {
-            sync::displaced::discard_from(&Repo::open_git_only(Self::root(eng))?, id).map(|()| None)
+            sync::displaced::discard_from(&Repo::open_git_only(self.repo_root())?, id).map(|()| None)
         };
         self.refresh(eng)?;
         self.event(Event::Status);
@@ -1682,82 +1900,121 @@ impl Daemon {
         })
     }
 
-    /// Takes the harness's content into the draft.
-    pub(crate) fn adopt(&self, eng: &mut Engine, t: ConflictTarget) -> Result<()> {
-        self.ensure_managed(eng)?;
+    /// Takes the harness's content into the draft. Adopting an unmanaged
+    /// skill also enables it where it was found: the Assignment write runs
+    /// without the engine mutex, between publishing the skill and removing
+    /// the copies it came from.
+    pub(crate) async fn adopt(self: &Arc<Self>, t: ConflictTarget) -> Result<()> {
+        let Some(pending) = self.blocking(move |d, eng| d.adopt_locally(eng, t)).await? else {
+            self.retry_stopped_pull().await;
+            return Ok(());
+        };
+        let write = AssignmentWrite::Changes(pending.changes.clone());
+        let written = self.write_assignment(write).await;
+        self.blocking(move |d, eng| d.finish_adoption(eng, pending, written)).await
+    }
+
+    /// Adopts a conflict (`None`), or publishes an unmanaged skill into the
+    /// draft and returns the Assignment write that enables it.
+    fn adopt_locally(&self, eng: &mut Engine, t: ConflictTarget) -> Result<Option<PendingAdoption>> {
+        self.ensure_managed()?;
         self.lock_repo(eng)?;
-        let repo = Repo::open(Self::root(eng))?;
+        let repo = Repo::open(self.repo_root())?;
         let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
         let unmanaged = sync::unmanaged::discover(&repo, &harnesses)?
             .iter()
             .any(|s| s.name == t.name && s.variants.iter().any(|v| v.locations.iter().any(|l| l.harness == t.harness)));
         let adopted = if unmanaged { None } else { sync::unmanaged::adopted(&repo, &harnesses, &t.harness, &t.name)? };
-        if unmanaged || adopted.is_some() {
-            if !self.is_standalone() && !self.is_connected() {
-                return Err(Error::Unavailable("Adopt needs a connection to the Server".into()));
-            }
-            let adoption = match adopted {
-                Some(adoption) => adoption,
-                None => sync::unmanaged::select(&repo, &harnesses, &t.harness, &t.name)?,
-            };
-            let created = repo.personal_dir().join(&adoption.name).symlink_metadata().is_err();
-            sync::unmanaged::publish(&repo, &adoption)?;
-            let item = ItemRef::Skill(adoption.name.clone());
-            // Its toggles are keyed by Item ID: one published before (by
-            // hand, or by an interrupted Adopt) may still lack it.
-            if !repo.pull_pending()? {
-                repo.assign_missing_ids()?;
-            }
-            let id = repo
-                .item_ids()?
-                .into_iter()
-                .find_map(|(name, id)| (name == item).then_some(id))
-                .ok_or_else(|| Error::NotFound(format!("Adopt did not create {item}")))?
-                .ok_or_else(|| Error::Conflict(format!("Adopt did not give {item} an Item ID")))?;
-            let changes = sk1ll_proto::AssignmentChanges {
-                changes: adoption
-                    .locations
-                    .iter()
-                    .map(|location| sk1ll_proto::ToggleChange {
-                        harness: location.harness.clone(),
-                        kind: sk1ll_proto::ToggleKind::Skill,
-                        item_id: Some(id.clone()),
-                        name: Some(adoption.name.clone()),
-                        enabled: Some(true),
-                    })
-                    .collect(),
-                ..Default::default()
-            };
-            // Publish the draft before enabling it. On a lost reply it stays
-            // available to retry with the same ID. Original copies stay until
-            // the Assignment has been confirmed.
+        if !unmanaged && adopted.is_none() {
+            let (repo, actions) = self.plan(false)?;
+            sync::adopt(&repo, Self::find_conflict(&actions, &t)?)?;
+            tracing::info!("adopted {} from {} into the draft", t.name, t.harness);
             self.refresh(eng)?;
-            if let Err(error) = self.write_assignment(eng, AssignmentWrite::Changes(changes)) {
-                if created && matches!(error, Error::Upstream(_, _)) {
-                    sync::unmanaged::rollback(&repo, &adoption)?;
-                }
-                self.refresh(eng)?;
-                self.event(Event::Draft);
-                return Err(error);
-            }
-            let mut adoption = adoption;
-            let snapshot = self.snapshot();
-            adoption
+            return Ok(None);
+        }
+        if !self.is_standalone() && !self.is_connected() {
+            return Err(Error::Unavailable("Adopt needs a connection to the Server".into()));
+        }
+        let adoption = match adopted {
+            Some(adoption) => adoption,
+            None => sync::unmanaged::select(&repo, &harnesses, &t.harness, &t.name)?,
+        };
+        let created = repo.personal_dir().join(&adoption.name).symlink_metadata().is_err();
+        sync::unmanaged::publish(&repo, &adoption)?;
+        // Its toggles are keyed by Item ID: one published before (by
+        // hand, or by an interrupted Adopt) may still lack it.
+        if !repo.pull_pending()? {
+            repo.assign_missing_ids()?;
+        }
+        let id = Self::adopted_id(&repo, &adoption)?
+            .ok_or_else(|| Error::Conflict(format!("Adopt did not give skill:{} an Item ID", adoption.name)))?;
+        let changes = sk1ll_proto::AssignmentChanges {
+            changes: adoption
                 .locations
-                .retain(|l| snapshot.as_ref().is_some_and(|s| s.assignment.skill_enabled(&l.harness, &id)));
-            sync::unmanaged::complete(&repo, &harnesses, &adoption)?;
+                .iter()
+                .map(|location| sk1ll_proto::ToggleChange {
+                    harness: location.harness.clone(),
+                    kind: sk1ll_proto::ToggleKind::Skill,
+                    item_id: Some(id.clone()),
+                    name: Some(adoption.name.clone()),
+                    enabled: Some(true),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        // Publish the draft before enabling it. On a lost reply it stays
+        // available to retry with the same ID. Original copies stay until
+        // the Assignment has been confirmed.
+        self.refresh(eng)?;
+        Ok(Some(PendingAdoption { adoption, created, id, changes }))
+    }
+
+    /// The Item ID of an adopted skill as the repo has it now.
+    fn adopted_id(repo: &Repo, adoption: &sync::unmanaged::Adoption) -> Result<Option<sk1ll_core::ItemId>> {
+        let item = ItemRef::Skill(adoption.name.clone());
+        repo.item_ids()?
+            .into_iter()
+            .find_map(|(name, id)| (name == item).then_some(id))
+            .ok_or_else(|| Error::NotFound(format!("Adopt did not create {item}")))
+    }
+
+    /// After the Assignment write: removes the copies an enabled adoption
+    /// came from, or rolls back a refused one. If the published skill no
+    /// longer has the Item ID that was enabled (changed while the write was
+    /// in flight), the copies stay where they are and it is a conflict.
+    fn finish_adoption(
+        &self,
+        eng: &mut Engine,
+        pending: PendingAdoption,
+        written: Result<AssignmentUpdate>,
+    ) -> Result<()> {
+        let PendingAdoption { mut adoption, created, id, .. } = pending;
+        self.ensure_managed()?;
+        self.lock_repo(eng)?;
+        let repo = Repo::open(self.repo_root())?;
+        if let Err(error) = written {
+            if created && matches!(error, Error::Upstream(_, _)) {
+                sync::unmanaged::rollback(&repo, &adoption)?;
+            }
             self.refresh(eng)?;
             self.event(Event::Draft);
-            self.event(Event::Fleet);
-            return Ok(());
+            return Err(error);
         }
-        let (repo, actions) = self.plan(eng, false)?;
-        sync::adopt(&repo, Self::find_conflict(&actions, &t)?)?;
-        tracing::info!("adopted {} from {} into the draft", t.name, t.harness);
+        if Self::adopted_id(&repo, &adoption).ok().flatten().as_ref() != Some(&id) {
+            self.refresh(eng)?;
+            return Err(Error::Conflict(format!(
+                "skill:{} changed while its Assignment was being written; its copies in the harnesses are kept, \
+                 adopt it again",
+                adoption.name
+            )));
+        }
+        let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
+        let snapshot = self.snapshot();
+        adoption.locations.retain(|l| snapshot.as_ref().is_some_and(|s| s.assignment.skill_enabled(&l.harness, &id)));
+        sync::unmanaged::complete(&repo, &harnesses, &adoption)?;
         self.refresh(eng)?;
-        if eng.blocked.is_some() && (self.is_connected() || self.is_standalone()) {
-            let _ = self.pull_refreshed(eng);
-        }
+        self.event(Event::Draft);
+        self.event(Event::Fleet);
         Ok(())
     }
 
@@ -1799,9 +2056,9 @@ impl Daemon {
     }
 
     pub(crate) fn write_skill_file(&self, eng: &mut Engine, req: &crate::client::WriteFileRequest) -> Result<()> {
-        self.ensure_managed(eng)?;
+        self.ensure_managed()?;
         self.lock_repo(eng)?;
-        if !sk1ll_core::content::write_file(&Repo::open(Self::root(eng))?, req)? {
+        if !sk1ll_core::content::write_file(&Repo::open(self.repo_root())?, req)? {
             return Err(Error::Conflict("File changed on disk".into()));
         }
         self.refresh(eng)
@@ -1810,11 +2067,11 @@ impl Daemon {
     /// Replaces the harness's content with what the draft says: a forced plan,
     /// applied for this one item only.
     pub(crate) fn overwrite(&self, eng: &mut Engine, t: ConflictTarget) -> Result<()> {
-        self.ensure_managed(eng)?;
+        self.ensure_managed()?;
         self.lock_repo(eng)?;
-        let (_, actions) = self.plan(eng, false)?;
+        let (_, actions) = self.plan(false)?;
         let conflict = Self::find_conflict(&actions, &t)?;
-        let (repo, forced) = self.plan(eng, true)?;
+        let (repo, forced) = self.plan(true)?;
         let fixes: Vec<&Action> =
             forced.iter().filter(|a| a.kind != ActionKind::Conflict && matches_target(a, &t)).collect();
         if fixes.is_empty() {
@@ -1890,9 +2147,9 @@ impl Daemon {
     /// stops syncing stays. A joined machine reports its new set of
     /// harnesses to the server with the next status.
     pub(crate) fn apply_harness(&self, eng: &mut Engine, req: HarnessChangeRequest) -> Result<HarnessApplied> {
-        self.ensure_managed(eng)?;
+        self.ensure_managed()?;
         self.lock_repo(eng)?;
-        let repo = Repo::open(Self::root(eng))?;
+        let repo = Repo::open(self.repo_root())?;
         let lock = eng.lock.as_ref().ok_or_else(|| Error::Conflict("the repo is not locked".into()))?;
         let fingerprint = req
             .fingerprint
@@ -1937,10 +2194,10 @@ impl Daemon {
     pub(crate) async fn update_imports(self: &Arc<Self>, req: UpdateImportsRequest) -> Result<Vec<ImportUpdated>> {
         let UpdateImportsRequest { name, force, expected } = req;
         let (root, todo) = self
-            .blocking(move |d, eng| {
-                d.ensure_managed(eng)?;
-                let todo = Repo::open(Self::root(eng))?.update_targets(name.as_deref(), force)?;
-                Ok((Self::root(eng).to_path_buf(), todo))
+            .blocking(move |d, _| {
+                d.ensure_managed()?;
+                let todo = Repo::open(d.repo_root())?.update_targets(name.as_deref(), force)?;
+                Ok((d.repo_root().to_path_buf(), todo))
             })
             .await?;
         let fetched = unlocked(move || imports::fetch_updates(&root, todo)).await?;
@@ -1948,9 +2205,9 @@ impl Daemon {
             fetched.check_commit(expected)?;
         }
         self.blocking(move |d, eng| {
-            d.ensure_managed(eng)?;
+            d.ensure_managed()?;
             d.lock_repo(eng)?;
-            let reports = Repo::open(Self::root(eng))?.apply_updates(fetched, force);
+            let reports = Repo::open(d.repo_root())?.apply_updates(fetched, force);
             d.refresh(eng)?;
             Ok(reports?.into_iter().map(import_updated).collect())
         })
@@ -1974,8 +2231,8 @@ impl Daemon {
         upstream: Option<String>,
     ) -> Result<imports::ImportChanges> {
         let (root, targets) = self
-            .blocking(move |d, eng| {
-                let root = d.import_root(eng)?;
+            .blocking(move |d, _| {
+                let root = d.import_root()?;
                 let targets = Repo::open(&root)?.update_targets(Some(&name), true)?;
                 Ok((root, targets))
             })
@@ -1985,16 +2242,16 @@ impl Daemon {
 
     /// What a link leads to; only the import cache is written.
     pub(crate) async fn resolve_import(self: &Arc<Self>, req: ResolveImportRequest) -> Result<ResolvedSource> {
-        let root = self.blocking(|d, eng| d.import_root(eng)).await?;
+        let root = self.blocking(|d, _| d.import_root()).await?;
         let fetched = unlocked(move || {
             imports::fetch_link(&root, &req.link, given(&req.path), given(&req.git_ref), None)?.inspect()
         })
         .await?;
         // `taken` reflects the repo after the fetch, not before it.
         let r = self
-            .blocking(move |d, eng| {
-                d.ensure_managed(eng)?;
-                Ok(Repo::open(Self::root(eng))?.with_taken(fetched.resolved))
+            .blocking(move |d, _| {
+                d.ensure_managed()?;
+                Ok(Repo::open(d.repo_root())?.with_taken(fetched.resolved))
             })
             .await?;
         let candidates = r
@@ -2014,7 +2271,7 @@ impl Daemon {
 
     /// Adds an import, from a link or plain source, to the draft.
     pub(crate) async fn add_import(self: &Arc<Self>, req: AddImportRequest) -> Result<ImportUpdated> {
-        let root = self.blocking(|d, eng| d.import_root(eng)).await?;
+        let root = self.blocking(|d, _| d.import_root()).await?;
         let AddImportRequest { name, source, path, git_ref, commit } = req;
         // Staging runs checkout (and any smudge filter) here too, outside the mutex.
         let fetched = unlocked(move || {
@@ -2025,9 +2282,9 @@ impl Daemon {
         })
         .await?;
         self.blocking(move |d, eng| {
-            d.ensure_managed(eng)?;
+            d.ensure_managed()?;
             d.lock_repo(eng)?;
-            let added = Repo::open(Self::root(eng))?.add_fetched(given(&name), fetched);
+            let added = Repo::open(d.repo_root())?.add_fetched(given(&name), fetched);
             d.refresh(eng)?;
             Ok(import_updated(added?))
         })
@@ -2035,25 +2292,25 @@ impl Daemon {
     }
 
     /// The repo an import operation fetches for, if the daemon manages it.
-    fn import_root(&self, eng: &Engine) -> Result<PathBuf> {
-        self.ensure_managed(eng)?;
-        Ok(Self::root(eng).to_path_buf())
+    fn import_root(&self) -> Result<PathBuf> {
+        self.ensure_managed()?;
+        Ok(self.repo_root().to_path_buf())
     }
 
     /// Removes an import (a draft change).
     pub(crate) fn remove_import(&self, eng: &mut Engine, name: &str) -> Result<()> {
-        self.ensure_managed(eng)?;
+        self.ensure_managed()?;
         self.lock_repo(eng)?;
-        let removed = Repo::open(Self::root(eng))?.remove_import(name);
+        let removed = Repo::open(self.repo_root())?.remove_import(name);
         self.refresh(eng)?;
         Ok(removed?)
     }
 
     /// Turns an import into a personal skill (a draft change).
     pub(crate) fn fork(&self, eng: &mut Engine, name: &str) -> Result<()> {
-        self.ensure_managed(eng)?;
+        self.ensure_managed()?;
         self.lock_repo(eng)?;
-        let forked = Repo::open(Self::root(eng))?.fork(name);
+        let forked = Repo::open(self.repo_root())?.fork(name);
         self.refresh(eng)?;
         Ok(forked?)
     }
@@ -2062,7 +2319,7 @@ impl Daemon {
     /// no stored snapshot, any snapshot is taken (also one of the same
     /// revision as before), since the harnesses wait for it.
     pub(crate) fn apply_assignment(&self, eng: &mut Engine, snap: AssignmentSnapshot) -> Result<Vec<String>> {
-        if Self::idle(eng) {
+        if self.idle() {
             return Ok(Vec::new());
         }
         if let Some(have) = self.snapshot()
@@ -2097,57 +2354,56 @@ impl Daemon {
     /// The server's baseline is now `baseline`: pull unless already on it. A
     /// nudge for the baseline the machine is on (the server sends one on every
     /// connect) says nothing about the local state, so it costs no refresh.
-    pub(crate) fn nudge(&self, eng: &mut Engine, baseline: String) -> Result<()> {
-        if Self::idle(eng) {
-            return Ok(());
+    pub(crate) async fn nudge(self: &Arc<Self>, baseline: String) -> Result<()> {
+        let pull = self
+            .blocking(move |d, eng| {
+                if d.idle() {
+                    return Ok(false);
+                }
+                d.note(|lc| lc.set_server_baseline(Some(baseline.clone())));
+                d.event(Event::Fleet);
+                let current = gitx::baseline(d.repo_root()).unwrap_or(None);
+                if current.as_deref() != Some(baseline.as_str()) || d.lifecycle().pull_stopped() {
+                    return Ok(true);
+                }
+                if eng.stale {
+                    d.refresh(eng)?;
+                }
+                Ok(false)
+            })
+            .await?;
+        // Not `pull_refreshed`: the last refresh may be long ago.
+        if pull {
+            self.pull().await?;
         }
-        eng.server_baseline = Some(baseline.clone());
-        self.update(|v| v.server_baseline = Some(baseline.clone()));
-        self.event(Event::Fleet);
-        let current = gitx::baseline(Self::root(eng)).unwrap_or(None);
-        if current.as_deref() != Some(baseline.as_str()) || eng.blocked.is_some() {
-            // Not `pull_refreshed`: the last refresh may be long ago.
-            self.pull(eng).map(drop)
-        } else if eng.stale {
-            self.refresh(eng)
-        } else {
-            self.publish_server_baseline(eng);
-            Ok(())
-        }
-    }
-
-    /// Stops managing this machine. Harness files are left as they are.
-    pub(crate) fn revoke(&self, eng: &mut Engine, why: &str) -> Result<()> {
-        if eng.state.revoked() {
-            return Ok(());
-        }
-        tracing::warn!("revoked: {why}; no longer managing this machine (its files are left as they are)");
-        let Mode::Joined(state) = &mut eng.state else {
-            return Err(Error::Conflict("a standalone machine cannot be revoked".into()));
-        };
-        state.revoked = true;
-        state.save(&self.cfg.state)?;
-        self.revoked.store(true, Ordering::SeqCst);
-        self.connected.store(false, Ordering::SeqCst);
-        self.roots.send_replace(Vec::new());
-        self.update(|v| {
-            v.revoked = true;
-            v.connection = Connection::Revoked;
-            v.last_error = Some(why.to_string());
-        });
-        self.event(Event::Fleet);
         Ok(())
     }
 
-    /// Whether `POST /join` may join again: the machine was removed, or the
-    /// server rejects its token.
+    /// Stops managing this machine. Harness files are left as they are.
+    pub(crate) fn revoke(&self, _eng: &mut Engine, why: &str) -> Result<()> {
+        if self.is_standalone() {
+            return Err(Error::Conflict("a standalone machine cannot be revoked".into()));
+        }
+        let lifecycle = self.lifecycle();
+        if lifecycle.revoked() || lifecycle.halted() {
+            return Ok(());
+        }
+        tracing::warn!("revoked: {why}; no longer managing this machine (its files are left as they are)");
+        self.transition(Lifecycle::revoke)?;
+        self.roots.send_replace(Vec::new());
+        self.update(|v| v.last_error = Some(why.to_string()));
+        Ok(())
+    }
+
+    /// Whether `POST /join` may join again: the machine is standalone, was
+    /// removed, or the server rejects its token.
     pub(crate) fn can_rejoin(&self) -> bool {
-        self.is_standalone() || self.is_revoked() || self.view().connection == Connection::AuthRejected
+        lock(&self.lifecycle).can_rejoin()
     }
 
     /// Validate before registration and again under the engine lock afterwards.
-    pub(crate) fn check_standalone_join_request(&self, eng: &Engine, repo: &Path) -> Result<()> {
-        if eng.frozen {
+    pub(crate) fn check_standalone_join_request(&self, repo: &Path) -> Result<()> {
+        if self.lifecycle().halted() {
             return Err(Error::Conflict("already joining; the daemon is restarting".into()));
         }
         let requested = std::path::absolute(repo).context("resolving join repo")?;
@@ -2161,44 +2417,105 @@ impl Daemon {
         Ok(())
     }
 
-    pub(crate) fn join_standalone(&self, eng: &mut Engine, reg: Registered) -> Result<Joined> {
-        self.check_standalone_join_request(eng, &reg.state().repo)?;
+    /// Second half of a standalone `POST /join`: the Fleet's repo is cloned
+    /// privately (or the existing clone checked against the server) without
+    /// the engine mutex, then published, the credentials stored and the
+    /// daemon halted until the restart, under it.
+    pub(crate) async fn join_standalone(self: &Arc<Self>, reg: Registered) -> Result<Joined> {
+        let repo = reg.state().repo.clone();
+        self.blocking(move |d, eng| {
+            d.check_standalone_join_request(&repo)?;
+            d.lock_repo(eng)
+        })
+        .await?;
+        let (reg, prepared) = self
+            .network(move |_| {
+                let prepared = reg.prepare_standalone_repo().map_err(|e| Error::Conflict(format!("{e:#}")));
+                Ok((reg, prepared))
+            })
+            .await?;
+        let prepared = prepared?;
+        self.blocking(move |d, eng| d.activate_standalone_join(eng, reg, prepared)).await
+    }
+
+    fn activate_standalone_join(
+        &self,
+        eng: &mut Engine,
+        reg: Registered,
+        mut prepared: crate::join::StandaloneRepo,
+    ) -> Result<Joined> {
+        self.check_standalone_join_request(&reg.state().repo)?;
         self.lock_repo(eng)?;
-        let mut prepared = reg.prepare_standalone_repo().map_err(|e| Error::Conflict(format!("{e:#}")))?;
-        let activated = prepared.publish().and_then(|()| reg.persist_standalone(&self.cfg));
-        if let Err(error) = activated {
-            if let Err(recovery) = prepared.rollback() {
-                // If the replacement is still live, retain its lock. Freeze
-                // mutation when concurrent content prevents a safe restoration.
-                if let Some(lock) = prepared.take_live_lock() {
-                    eng.lock = Some(lock);
-                }
-                eng.frozen = true;
-                return Err(Error::Internal(anyhow::anyhow!("{error:#}; rollback failed: {recovery:#}")));
-            }
-            return Err(Error::Internal(error));
+        // A clone used in place was checked before its fetch: check again
+        // that no draft or commit appeared since. A replacement's publication
+        // checks the original itself.
+        if !prepared.replaces() {
+            gitx::check_standalone_join(self.repo_root(), &reg.state().repo_url())
+                .map_err(|e| Error::Conflict(format!("{e:#}")))?;
         }
+        let mut activated = Ok(());
+        self.halt_with(|| {
+            activated = prepared.publish().and_then(|()| reg.persist_standalone(&self.cfg));
+            match &activated {
+                Ok(()) => Ok(true),
+                Err(_) => match prepared.rollback() {
+                    Ok(()) => Ok(false),
+                    // If the replacement is still live, retain its lock. Stop
+                    // all changes when concurrent content prevents a safe
+                    // restoration.
+                    Err(recovery) => {
+                        if let Some(lock) = prepared.take_live_lock() {
+                            eng.lock = Some(lock);
+                        }
+                        Err(recovery)
+                    }
+                },
+            }
+        })
+        .map_err(|recovery| {
+            let error = activated.as_ref().err().map_or_else(String::new, |e| format!("{e:#}"));
+            Error::Internal(anyhow::anyhow!("{error}; rollback failed: {recovery:#}"))
+        })?;
+        activated.map_err(Error::Internal)?;
         if let Some(lock) = prepared.take_live_lock() {
             eng.lock = Some(lock);
         }
-        let joined = prepared.joined;
-        eng.frozen = true;
-        Ok(joined)
+        Ok(prepared.joined)
     }
 
-    /// Second half of `POST /join`: stores the new credentials and snapshot,
-    /// sets up the repo with them, and freezes the engine until the restart
-    /// ([`Daemon::restart`]) that brings them into effect. The outer error
+    /// Runs `f` with the lifecycle mutex held, halting the daemon if it
+    /// returns `Ok(true)`. The state file writes take that mutex too, so none
+    /// of the old identity can follow new credentials `f` stored. An `Err`
+    /// also halts it: nothing may touch the repo after a failed recovery.
+    fn halt_with(&self, f: impl FnOnce() -> anyhow::Result<bool>) -> anyhow::Result<()> {
+        let mut lc = lock(&self.lifecycle);
+        let result = f();
+        if !matches!(result, Ok(false)) {
+            lc.halt();
+        }
+        drop(lc);
+        self.update(|_| {});
+        result.map(drop)
+    }
+
+    /// Second half of a joined `POST /join`: stores the new credentials and
+    /// snapshot and halts the daemon until the restart ([`Daemon::restart`])
+    /// that brings them into effect, then sets up the repo with them, without
+    /// the engine mutex (a halted daemon changes nothing). The outer error
     /// means nothing was stored; the inner one that the repo setup failed (the
     /// restarted daemon retries it).
-    pub(crate) fn rejoin(&self, eng: &mut Engine, reg: Registered) -> Result<Result<Joined>> {
-        if eng.frozen {
-            return Err(Error::Conflict("already joined again; the daemon is restarting".into()));
-        }
-        reg.persist(&self.cfg)?;
-        eng.frozen = true;
-        tracing::info!("joined again as `{}`", reg.state().machine_id);
-        Ok(reg.set_up_repo().map_err(Error::Internal))
+    pub(crate) async fn rejoin(self: &Arc<Self>, reg: Registered) -> Result<Result<Joined>> {
+        let reg = self
+            .blocking(move |d, _| {
+                if d.lifecycle().halted() {
+                    return Err(Error::Conflict("already joined again; the daemon is restarting".into()));
+                }
+                d.halt_with(|| reg.persist(&d.cfg).map(|()| true))?;
+                tracing::info!("joined again as `{}`", reg.state().machine_id);
+                Ok(reg)
+            })
+            .await?;
+        self.network(move |_| Ok(reg.set_up_repo().map_err(Error::Internal))).await
     }
 
     /// Replaces this process with a fresh copy of itself (same PID, same
@@ -2497,9 +2814,9 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Daemon {
     pub(crate) fn create_item(&self, eng: &mut Engine, req: crate::client::CreateItemRequest) -> Result<()> {
-        self.ensure_managed(eng)?;
+        self.ensure_managed()?;
         self.lock_repo(eng)?;
-        let repo = Repo::open(Self::root(eng))?;
+        let repo = Repo::open(self.repo_root())?;
         match (&req.bundled, req.kind.as_str()) {
             (Some(bundled), "skill") => repo.add_bundled(bundled, &req.name)?,
             (Some(_), _) => return Err(Error::BadRequest("only skills are bundled".into())),
@@ -2510,9 +2827,9 @@ impl Daemon {
     }
     /// Restore brings the same Item ID and its toggles back.
     pub(crate) fn delete_item(&self, eng: &mut Engine, req: crate::client::DeleteItemRequest) -> Result<()> {
-        self.ensure_managed(eng)?;
+        self.ensure_managed()?;
         self.lock_repo(eng)?;
-        let deleted = Repo::open(Self::root(eng))?.delete_item(&req.kind, &req.name);
+        let deleted = Repo::open(self.repo_root())?.delete_item(&req.kind, &req.name);
         self.refresh(eng)?;
         Ok(deleted?)
     }
@@ -2522,9 +2839,9 @@ impl Daemon {
         req: crate::client::RenameItemRequest,
     ) -> Result<crate::client::RenameItemResponse> {
         use sk1ll_core::repo::RenameError;
-        self.ensure_managed(eng)?;
+        self.ensure_managed()?;
         self.lock_repo(eng)?;
-        let repo = Repo::open(Self::root(eng))?;
+        let repo = Repo::open(self.repo_root())?;
         // A hand-made item gets its Item ID first, so the rename keeps it.
         repo.assign_missing_ids()?;
         repo.check_rename(&req.kind, &req.name, &req.to)?;
@@ -2747,6 +3064,8 @@ impl Daemon {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
 
     #[test]
@@ -3071,6 +3390,7 @@ mod tests {
                     server_url: "http://127.0.0.1:1".into(),
                     repo: root,
                     revoked: false,
+                    record: Default::default(),
                 },
             )
             .unwrap();
@@ -3102,11 +3422,8 @@ mod tests {
                     }
                 }
             });
-            d.set_connection(Connection::Connected);
-            let error = d
-                .blocking(|d, eng| d.adopt(eng, ConflictTarget { harness: "h".into(), name: "pdf".into() }))
-                .await
-                .unwrap_err();
+            d.set_link(Link::Connected);
+            let error = d.adopt(ConflictTarget { harness: "h".into(), name: "pdf".into() }).await.unwrap_err();
             assert!(error.to_string().contains("Server refused"), "{error}");
             assert_eq!(
                 std::fs::read_to_string(source.join("SKILL.md")).unwrap(),
@@ -3116,9 +3433,7 @@ mod tests {
             if scenario == "new" {
                 assert!(!destination.exists());
                 accept.store(true, Ordering::SeqCst);
-                d.blocking(|d, eng| d.adopt(eng, ConflictTarget { harness: "h".into(), name: "pdf".into() }))
-                    .await
-                    .unwrap();
+                d.adopt(ConflictTarget { harness: "h".into(), name: "pdf".into() }).await.unwrap();
                 let index = std::fs::read(source.parent().unwrap().join(sync::INDEX_PATH)).unwrap();
                 let index: serde_json::Value = serde_json::from_slice(&index).unwrap();
                 assert_eq!(index["entries"]["pdf"]["kind"], "copy");
@@ -3132,5 +3447,174 @@ mod tests {
             }
             server.abort();
         }
+    }
+
+    /// A joined daemon on a fresh repo, its Assignment at revision 1 and
+    /// `record` in its state file, with a server session the test answers.
+    fn joined_daemon(
+        dir: &Path,
+        record: PullRecord,
+    ) -> (Arc<Daemon>, mpsc::Receiver<crate::server::SessionWrite>, DaemonState) {
+        let root = dir.join("repo");
+        Repo::init_committed(&root).unwrap();
+        let mut cfg = Config::new().unwrap();
+        cfg.state = dir.join("state/daemon.json");
+        cfg.assignment = dir.join("assignment.json");
+        cfg.machine_config = dir.join("machine.toml");
+        std::fs::write(
+            &cfg.machine_config,
+            format!(
+                "[harnesses.h]\nskills = {:?}\nmode = \"copy\"\n{}",
+                dir.join("h"),
+                sk1ll_core::machine::presets()
+                    .map(|p| format!("[harnesses.{p}]\nenabled = false\n"))
+                    .collect::<String>()
+            ),
+        )
+        .unwrap();
+        state::save_snapshot(&cfg.snapshot_path(), &AssignmentSnapshot { revision: 1, ..Default::default() }).unwrap();
+        let state =
+            DaemonState { record, ..DaemonState::new("a".into(), "http://127.0.0.1:1".into(), "t".into(), root) };
+        state.save(&cfg.state).unwrap();
+        let d = Daemon::new(cfg, state.clone()).unwrap();
+        let (tx, rx) = mpsc::channel::<crate::server::SessionWrite>(1);
+        d.assignment_session.send_replace(Some(tx));
+        d.set_link(Link::Connected);
+        (d, rx, state)
+    }
+
+    fn harness_toggle(enabled: bool) -> AssignmentWrite {
+        AssignmentWrite::Harness { harness: "h".into(), enabled }
+    }
+
+    fn confirmed(revision: u64, enabled: bool) -> Result<AssignmentUpdate> {
+        let mut assignment = sk1ll_proto::Assignment::default();
+        assignment.set_harness("h", enabled);
+        Ok(AssignmentUpdate { assignment, revision, entries: vec![], errors: vec![] })
+    }
+
+    /// The server takes its time to confirm a write; meanwhile the engine,
+    /// the readers and the status all answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slow_assignment_confirmation_blocks_no_other_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, mut session, _) = joined_daemon(dir.path(), PullRecord::default());
+        d.blocking(|d, eng| d.refresh(eng)).await.unwrap();
+        let writer = d.clone();
+        let write = tokio::spawn(async move { writer.write_assignment(harness_toggle(false)).await });
+        let request = session.recv().await.expect("the write reached the session");
+
+        let quick = std::time::Duration::from_secs(5);
+        let started = std::time::Instant::now();
+        tokio::time::timeout(quick, d.reading(|d| d.draft())).await.expect("a reader waited").unwrap();
+        tokio::time::timeout(quick, d.blocking(|d, eng| d.refresh(eng)))
+            .await
+            .expect("the engine mutex was held during the request")
+            .unwrap();
+        d.set_link(Link::Offline);
+        assert_eq!(d.view().connection, Connection::Offline);
+        assert!(started.elapsed() < quick);
+        assert!(!write.is_finished(), "the write was still waiting for the server");
+
+        request.result.send(confirmed(2, false)).unwrap();
+        let update = write.await.unwrap().unwrap();
+        assert_eq!(update.revision, 2);
+        assert_eq!(d.snapshot().unwrap().revision, 2);
+        assert_eq!(d.snapshot().unwrap().assignment, confirmed(2, false).unwrap().assignment);
+    }
+
+    /// What changes while a write is in flight decides what its confirmation
+    /// does: a newer revision stands, and a daemon that stopped managing
+    /// applies nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_confirmation_overtaken_by_a_newer_revision_is_not_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, mut session, _) = joined_daemon(dir.path(), PullRecord::default());
+        let writer = d.clone();
+        let write = tokio::spawn(async move { writer.write_assignment(harness_toggle(false)).await });
+        let request = session.recv().await.unwrap();
+        // The server's snapshot of a later write (this one's included)
+        // arrives before this write's own confirmation.
+        let newer = confirmed(3, false).unwrap();
+        let snapshot = AssignmentSnapshot { revision: 3, assignment: newer.assignment.clone(), registration: None };
+        d.blocking(move |d, eng| d.apply_assignment(eng, snapshot)).await.unwrap();
+        request.result.send(confirmed(2, true)).unwrap();
+        let update = write.await.unwrap().unwrap();
+        assert_eq!(update.revision, 3, "the reply carries the revision that stands");
+        assert_eq!(update.assignment, newer.assignment);
+        assert_eq!(d.snapshot().unwrap().revision, 3);
+        assert_eq!(state::load_snapshot(&d.cfg.snapshot_path()).unwrap().unwrap().revision, 3);
+
+        let writer = d.clone();
+        let write = tokio::spawn(async move { writer.write_assignment(harness_toggle(true)).await });
+        let request = session.recv().await.unwrap();
+        d.blocking(|d, eng| d.revoke(eng, "removed from the fleet")).await.unwrap();
+        request.result.send(confirmed(4, true)).unwrap();
+        assert_eq!(write.await.unwrap().unwrap().revision, 4);
+        assert_eq!(d.snapshot().unwrap().revision, 3, "a removed Machine applies nothing");
+    }
+
+    /// The state file keeps the block and the server's Baseline, so a
+    /// restarted daemon starts Blocked and Behind, before any pull.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restart_remembers_the_block_and_the_server_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, _session, state) = joined_daemon(dir.path(), PullRecord::default());
+        d.blocking(|d, eng| d.refresh(eng)).await.unwrap();
+        let head = gitx::rev(d.repo_root(), "HEAD").unwrap();
+        let clash = ItemRef::Skill("pdf".into());
+        let blocked = PullState::Blocked { baseline: "f00d".repeat(10), items: vec![clash.clone()] };
+        d.note(|lc| {
+            lc.set_pull(blocked.clone());
+            lc.set_server_baseline(Some("f00d".repeat(10)));
+        });
+        let saved = DaemonState::load(&d.cfg.state).unwrap().unwrap();
+        assert_eq!(saved.record.pull, blocked);
+        assert_eq!(saved.record.server_baseline, Some("f00d".repeat(10)));
+        assert_eq!((saved.token.as_str(), saved.revoked), (state.token.as_str(), false));
+
+        let cfg = d.cfg.clone();
+        drop(d);
+        let restarted = Daemon::new(cfg.clone(), DaemonState::load(&cfg.state).unwrap().unwrap()).unwrap();
+        let view = restarted.view();
+        assert!(view.report.blocked && view.report.behind);
+        assert_eq!(view.report.clashes, [clash]);
+        assert_eq!(view.server_baseline, Some("f00d".repeat(10)));
+        assert_eq!(view.connection, Connection::Connecting);
+        assert_eq!(restarted.lifecycle().pull(), &blocked);
+        // A refresh keeps it: HEAD is still not on the blocking Baseline.
+        restarted.blocking(|d, eng| d.refresh(eng)).await.unwrap();
+        assert!(restarted.view().report.blocked);
+
+        // Once HEAD contains that Baseline (a pull while the daemon was
+        // stopped), the block is over.
+        let head = head.expect("an initialized repo has a commit");
+        restarted.note(|lc| lc.set_pull(PullState::Blocked { baseline: head, items: Vec::new() }));
+        restarted.blocking(|d, eng| d.refresh(eng)).await.unwrap();
+        assert_eq!(restarted.lifecycle().pull(), &PullState::Clear);
+        assert!(!restarted.view().report.blocked);
+        assert_eq!(DaemonState::load(&cfg.state).unwrap().unwrap().record.pull, PullState::Clear);
+
+        // Removed from the Fleet: a restart stays removed.
+        restarted.blocking(|d, eng| d.revoke(eng, "removed")).await.unwrap();
+        let state = DaemonState::load(&cfg.state).unwrap().unwrap();
+        assert!(state.revoked);
+        let removed = Daemon::new(cfg, state).unwrap();
+        assert_eq!(removed.view().connection, Connection::Revoked);
+        assert!(removed.lifecycle().idle());
+    }
+
+    /// A halted daemon (joined again, restarting) never writes the state
+    /// file: it may already hold the next registration.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_halted_daemon_leaves_the_state_file_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, _session, state) = joined_daemon(dir.path(), PullRecord::default());
+        let next = DaemonState::new("b".into(), "http://127.0.0.1:2".into(), "new".into(), state.repo.clone());
+        d.halt_with(|| next.save(&d.cfg.state).map(|()| true)).unwrap();
+        d.note(|lc| lc.set_server_baseline(Some("abc".into())));
+        d.blocking(|d, eng| d.revoke(eng, "the old registration was removed")).await.unwrap();
+        assert_eq!(DaemonState::load(&d.cfg.state).unwrap(), Some(next));
+        assert!(d.ensure_managed().is_err());
     }
 }

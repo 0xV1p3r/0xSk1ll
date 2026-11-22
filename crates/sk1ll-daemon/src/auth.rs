@@ -113,6 +113,7 @@ mod tests {
             token: "s3cret".into(),
             repo: "/r".into(),
             revoked: false,
+            record: Default::default(),
         }
     }
 

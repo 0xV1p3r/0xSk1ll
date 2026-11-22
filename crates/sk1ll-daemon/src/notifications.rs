@@ -3,7 +3,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -138,11 +137,9 @@ pub(crate) async fn run(d: Arc<Daemon>) {
                 view.report.clashes.iter().map(ToString::to_string).collect()
             };
             let observations = [
-                // Before the first pull, an empty report cannot prove a Blocked state cleared.
-                (
-                    Kind::Blocked,
-                    (view.report.blocked || d.pull_cleared_blocked.load(Ordering::Relaxed)).then_some(blocked),
-                ),
+                // The daemon remembers Blocked across restarts, so even its
+                // first report says whether the Machine is.
+                (Kind::Blocked, Some(blocked)),
                 (
                     Kind::Conflict,
                     (view.repo_ready && !view.awaiting_assignment && !view.revoked).then(|| {

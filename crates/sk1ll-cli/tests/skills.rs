@@ -129,6 +129,7 @@ fn direct_adoption_rejects_a_repo_other_than_the_joined_repo() {
         server_url: "http://unused".into(),
         repo: joined.root().to_path_buf(),
         revoked: false,
+        record: Default::default(),
     }
     .save(&root.join("absent.json"))
     .unwrap();
@@ -151,6 +152,7 @@ fn joined_adoption_requires_a_running_connected_daemon() {
         server_url: "http://unused".into(),
         repo: root.join("repo"),
         revoked: false,
+        record: Default::default(),
     }
     .save(&root.join("absent.json"))
     .unwrap();

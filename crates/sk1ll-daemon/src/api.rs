@@ -292,7 +292,7 @@ async fn commit_message(State(d): St, Query(q): Query<ItemsQuery>) -> Result<Jso
 }
 
 async fn commit(State(d): St, Json(req): Json<CommitRequest>) -> Result<Json<CommitResponse>> {
-    Ok(Json(d.blocking(move |d, eng| d.commit(eng, req)).await?))
+    Ok(Json(d.commit(req).await?))
 }
 
 async fn repair_ids(State(d): St) -> Result<Json<usize>> {
@@ -300,11 +300,11 @@ async fn repair_ids(State(d): St) -> Result<Json<usize>> {
 }
 
 async fn restore(State(d): St, Json(req): Json<RestoreRequest>) -> Result<Json<RestoreResponse>> {
-    Ok(Json(d.blocking(move |d, eng| d.restore(eng, req)).await?))
+    Ok(Json(d.restore(req).await?))
 }
 
 async fn pull(State(d): St) -> Result<Json<PullResult>> {
-    Ok(Json(d.blocking(|d, eng| d.pull(eng)).await?))
+    Ok(Json(d.pull().await?))
 }
 
 async fn recovered(State(d): St) -> Result<Json<Vec<ConflictView>>> {
@@ -326,7 +326,7 @@ async fn discard_displaced(State(d): St, UrlPath(id): UrlPath<String>) -> Result
 }
 
 async fn adopt(State(d): St, Json(t): Json<ConflictTarget>) -> Result<StatusCode> {
-    d.blocking(move |d, eng| d.adopt(eng, t)).await?;
+    d.adopt(t).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -463,7 +463,7 @@ async fn render_instructions(State(d): St, UrlPath(name): UrlPath<String>) -> Re
 }
 
 async fn push(State(d): St) -> Result<Json<PushResult>> {
-    Ok(Json(d.blocking(|d, eng| d.push(eng)).await?))
+    Ok(Json(d.push().await?))
 }
 
 /// Joins again (after a removal, or while the server rejects the token), then
@@ -485,10 +485,10 @@ async fn join(State(d): St, Json(req): Json<JoinApiRequest>) -> Result<Json<Join
     };
     let joined = if d.is_standalone() {
         let repo = opts.repo.clone();
-        d.blocking(move |d, eng| d.check_standalone_join_request(eng, &repo)).await?;
+        d.blocking(move |d, _| d.check_standalone_join_request(&repo)).await?;
         let (reg, pending) =
             join::register_standalone(&d.cfg, &opts).await.map_err(|e| Error::Conflict(format!("{e:#}")))?;
-        let joined = d.blocking(move |d, eng| d.join_standalone(eng, reg)).await.map_err(|e| {
+        let joined = d.join_standalone(reg).await.map_err(|e| {
             Error::Conflict(format!("{e}; registration consumed the join code and reserved the machine id. Pending credentials are kept at {}. Fix the local obstruction and repeat the same join request to retry without a new code", pending.display()))
         })?;
         if let Err(e) = std::fs::remove_file(&pending) {
@@ -498,7 +498,7 @@ async fn join(State(d): St, Json(req): Json<JoinApiRequest>) -> Result<Json<Join
     } else {
         let replace = !d.is_revoked();
         let reg = join::register(&d.cfg, &opts, replace).await.map_err(|e| Error::BadRequest(format!("{e:#}")))?;
-        d.blocking(move |d, eng| d.rejoin(eng, reg)).await?
+        d.rejoin(reg).await?
     };
     let restart = d.clone();
     tokio::spawn(async move {
@@ -534,8 +534,7 @@ async fn assignment(
         return Ok(Json(snap).into_response());
     }
     let changes = serde_json::from_slice(&body).map_err(|e| Error::BadRequest(e.to_string()))?;
-    let update =
-        d.blocking(move |d, eng| d.write_assignment(eng, sk1ll_proto::AssignmentWrite::Changes(changes))).await?;
+    let update = d.write_assignment(sk1ll_proto::AssignmentWrite::Changes(changes)).await?;
     Ok(Json(update).into_response())
 }
 
@@ -545,14 +544,14 @@ async fn set_harness_assignment(
     Json(body): Json<sk1ll_proto::SetHarnessAssignment>,
 ) -> Result<Json<sk1ll_proto::AssignmentUpdate>> {
     let write = sk1ll_proto::AssignmentWrite::Harness { harness, enabled: body.enabled };
-    Ok(Json(d.blocking(move |d, eng| d.write_assignment(eng, write)).await?))
+    Ok(Json(d.write_assignment(write).await?))
 }
 
 async fn rename_harness(
     State(d): St,
     Json(rename): Json<crate::client::HarnessRenameRequest>,
 ) -> Result<Json<crate::client::HarnessRenameResult>> {
-    Ok(Json(d.blocking(move |d, eng| d.rename_harness(eng, rename)).await?))
+    Ok(Json(d.rename_harness(rename).await?))
 }
 
 /// Server pass-through: same path and query under the server's `/api`.

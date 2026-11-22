@@ -125,7 +125,7 @@ fn remote_branches(dir: &Path) -> anyhow::Result<Vec<String>> {
     Ok(refs.lines().filter_map(|r| r.strip_prefix(&prefix)).filter(|b| *b != "HEAD").map(str::to_string).collect())
 }
 
-fn is_ancestor(dir: &Path, a: &str, b: &str) -> anyhow::Result<bool> {
+pub(crate) fn is_ancestor(dir: &Path, a: &str, b: &str) -> anyhow::Result<bool> {
     Ok(output(dir, &["merge-base", "--is-ancestor", a, b], &[])?.status.success())
 }
 
@@ -191,11 +191,11 @@ thread_local! {
 /// Adopts an empty clone's first baseline, keeping the generated init files
 /// as draft. Every checkout destination is checked before HEAD or the index
 /// moves. Ignored files and symlinks are checked directly on disk too.
+/// Talks to no server: the caller has fetched origin's branches.
 pub(crate) fn adopt_first_baseline(dir: &Path) -> anyhow::Result<FirstBaseline> {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
-    fetch_all(dir, &[])?;
     let Some(remote) = remote_head(dir)? else {
         let others = remote_branches(dir)?;
         if others.is_empty() {
@@ -285,6 +285,7 @@ pub(crate) fn adopt_first_baseline(dir: &Path) -> anyhow::Result<FirstBaseline> 
 /// baseline of unrelated history as an unborn init would: that commit is
 /// dropped, so the starter files are draft again, and the baseline adopted.
 /// Unless it is adopted, the commit is restored. `None` when this doesn't apply.
+/// Like [`adopt_first_baseline`], it reads what the caller fetched.
 pub(crate) fn adopt_first_baseline_over_init(dir: &Path) -> anyhow::Result<Option<FirstBaseline>> {
     let Some(head) = rev(dir, "HEAD")? else { return Ok(None) };
     if branch(dir)?.as_deref() != Some(FLEET_BRANCH) || rev(dir, "HEAD^")?.is_some() {
@@ -296,7 +297,6 @@ pub(crate) fn adopt_first_baseline_over_init(dir: &Path) -> anyhow::Result<Optio
     if run(template.path(), &["write-tree"])? != run(dir, &["rev-parse", "HEAD^{tree}"])? {
         return Ok(None);
     }
-    fetch_all(dir, &[])?;
     match remote_head(dir)? {
         Some(remote) if try_run(dir, &["merge-base", &head, &remote])?.is_none() => {}
         _ => return Ok(None),
@@ -414,10 +414,18 @@ pub fn ensure_clone(dir: &Path, remote: &str, env: &[(String, String)]) -> anyho
         }
         Setup::Adopted
     } else {
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        // Cloned beside `dir` and moved into place once complete, so nothing
+        // that runs meanwhile (the daemon clones outside its engine mutex)
+        // takes a half-made clone for the repo. `dir` is missing or empty.
         let parent: PathBuf = dir.parent().map(Path::to_path_buf).unwrap_or_else(|| ".".into());
-        let target = dir.to_string_lossy();
-        run_env(&parent, &["clone", "--quiet", "--origin", REMOTE, &remote, &target], env)?;
+        std::fs::create_dir_all(&parent).with_context(|| format!("creating {}", parent.display()))?;
+        let stage = tempfile::Builder::new()
+            .prefix(".sk1ll-clone-")
+            .tempdir_in(&parent)
+            .with_context(|| format!("creating a directory in {}", parent.display()))?;
+        let target = stage.path().join("repo");
+        run_env(stage.path(), &["clone", "--quiet", "--origin", REMOTE, &remote, &target.to_string_lossy()], env)?;
+        std::fs::rename(&target, dir).with_context(|| format!("moving the clone to {}", dir.display()))?;
         Setup::Cloned
     };
     private_config(dir)?;
@@ -520,6 +528,12 @@ pub(crate) fn is_pristine_init(dir: &Path) -> anyhow::Result<bool> {
 mod tests {
     use super::*;
 
+    /// What the daemon does: fetch, then adopt from what was fetched.
+    fn fetched<T>(dir: &Path, adopt: fn(&Path) -> anyhow::Result<T>) -> anyhow::Result<T> {
+        fetch_all(dir, &[])?;
+        adopt(dir)
+    }
+
     fn git(dir: &Path, args: &[&str]) -> String {
         let out = std::process::Command::new("git")
             .arg("-C")
@@ -610,7 +624,7 @@ mod tests {
                 let head = std::fs::read(clone.join(".git/HEAD")).unwrap();
                 let index = std::fs::read(clone.join(".git/index")).unwrap();
                 assert!(
-                    matches!(adopt_first_baseline(&clone).unwrap(), FirstBaseline::Blocked { items, .. }
+                    matches!(fetched(&clone, adopt_first_baseline).unwrap(), FirstBaseline::Blocked { items, .. }
                     if items == vec![ItemRef::Skill("pdf".into())]),
                     "{scenario}, ignored={ignored}"
                 );
@@ -675,7 +689,7 @@ mod tests {
                 }))
             });
             assert!(
-                matches!(adopt_first_baseline(&clone).unwrap(), FirstBaseline::Blocked { items, .. }
+                matches!(fetched(&clone, adopt_first_baseline).unwrap(), FirstBaseline::Blocked { items, .. }
                 if items == vec![ItemRef::Skill("pdf".into())]),
                 "{scenario}"
             );
@@ -734,7 +748,7 @@ mod tests {
         Repo::init_committed(&repo).unwrap();
         git(&repo, &["remote", "add", "origin", &remote]);
         let baseline = git(&repo, &["ls-remote", &remote, "refs/heads/main"]);
-        assert!(matches!(adopt_first_baseline_over_init(&repo).unwrap(), Some(FirstBaseline::Adopted(b))
+        assert!(matches!(fetched(&repo, adopt_first_baseline_over_init).unwrap(), Some(FirstBaseline::Adopted(b))
             if baseline.starts_with(&b)));
         assert_eq!(rev(&repo, "HEAD").unwrap(), rev(&repo, "origin/main").unwrap());
         assert!(rev(&repo, "HEAD^").unwrap().is_none());
@@ -743,14 +757,14 @@ mod tests {
         // files, is an ordinary pull.
         let shared = tmp.path().join("shared");
         git(tmp.path(), &["clone", "--quiet", repo.to_str().unwrap(), shared.to_str().unwrap()]);
-        assert!(adopt_first_baseline_over_init(&shared).unwrap().is_none());
+        assert!(fetched(&shared, adopt_first_baseline_over_init).unwrap().is_none());
         let other = tmp.path().join("other");
         Repo::init_committed(&other).unwrap();
         std::fs::write(other.join("instructions/git.md"), "mine").unwrap();
         git(&other, &["add", "-A"]);
         git(&other, &["commit", "--quiet", "--amend", "-m", "mine"]);
         git(&other, &["remote", "add", "origin", &remote]);
-        assert!(adopt_first_baseline_over_init(&other).unwrap().is_none());
+        assert!(fetched(&other, adopt_first_baseline_over_init).unwrap().is_none());
         assert!(rev(&other, "HEAD").unwrap().is_some());
     }
 
@@ -794,7 +808,7 @@ mod tests {
         git(&seed, &["commit", "--quiet", "-m", "first baseline"]);
         git(&seed, &["push", "--quiet", remote.to_str().unwrap(), "main"]);
         std::fs::write(clone.join("notes"), "private notes").unwrap();
-        assert!(matches!(adopt_first_baseline(&clone).unwrap(), FirstBaseline::Adopted(_)));
+        assert!(matches!(fetched(&clone, adopt_first_baseline).unwrap(), FirstBaseline::Adopted(_)));
         assert_eq!(std::fs::read_to_string(clone.join("personal/pdf/SKILL.md")).unwrap(), "remote skill");
         assert_eq!(std::fs::read_to_string(clone.join("personal/pdf/a\nb")).unwrap(), "attachment");
         assert_eq!(std::fs::read_to_string(clone.join("notes")).unwrap(), "private notes");

@@ -14,6 +14,7 @@ use sk1ll_daemon::client::{
     AddImportRequest, Client, CommitRequest, CommitResponse, Connection, Event, ResolveImportRequest, RestoreRequest,
     StatusView,
 };
+use sk1ll_daemon::state::PullState;
 use sk1ll_proto::{
     Assignment, AssignmentChanges, AssignmentSnapshot, DaemonMessage, FleetView, HarnessAssignment, ItemRef, LogEntry,
     MachineStatus, ServerMessage, ToggleChange, ToggleKind,
@@ -449,9 +450,16 @@ fn solo(id: &str, server_url: &str, snap: Option<AssignmentSnapshot>) -> Machine
     git(m.home.path(), &["init", "--quiet", "--bare", origin.to_str().unwrap()]);
     git(&repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
     git(&repo, &["push", "--quiet", "-u", "origin", "main"]);
-    DaemonState { machine_id: id.into(), server_url: server_url.into(), token: "tok".into(), repo, revoked: false }
-        .save(&m.state_path())
-        .unwrap();
+    DaemonState {
+        machine_id: id.into(),
+        server_url: server_url.into(),
+        token: "tok".into(),
+        repo,
+        revoked: false,
+        record: Default::default(),
+    }
+    .save(&m.state_path())
+    .unwrap();
     if let Some(snap) = snap {
         write(m.snapshot_path().parent().unwrap(), "daemon-assignment.json", &serde_json::to_string(&snap).unwrap());
     }
@@ -662,8 +670,8 @@ async fn offline_commits_are_queued_and_pushed_on_reconnect() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn blocked_pull_reports_clashes_and_keeps_files() {
-    let server = Server::start().await;
-    let (a, b, base) = fleet_of_two(&server).await;
+    let mut server = Server::start().await;
+    let (a, mut b, base) = fleet_of_two(&server).await;
 
     b.write("personal/x/SKILL.md", "x by beta\n");
     eventually(|| async {
@@ -685,6 +693,21 @@ async fn blocked_pull_reports_clashes_and_keeps_files() {
     assert_eq!(std::fs::read_to_string(b.repo().join("personal/x/SKILL.md")).unwrap(), "x by beta\n");
     assert_eq!(b.head(), base);
     eventually(|| async { (server.row("beta").await?.status == MachineStatus::Blocked).then_some(()) }).await;
+
+    // The state file remembers the block, so a daemon restarted while the
+    // server is away still reports it, before it could pull again.
+    assert!(matches!(&b.state().record.pull, PullState::Blocked { items, .. } if items == &s.report.clashes));
+    assert_eq!(b.state().record.server_baseline.as_deref(), Some(p.sha.as_str()));
+    b.stop();
+    server.stop();
+    b.start().await;
+    let s = b.status().await;
+    assert_ne!(s.connection, Connection::Connected);
+    assert!(s.report.blocked && s.report.behind, "{s:?}");
+    assert_eq!(s.report.clashes, [ItemRef::Skill("x".into())]);
+    assert_eq!(s.server_baseline.as_deref(), Some(p.sha.as_str()));
+    server.launch().await;
+    eventually(|| async { (b.status().await.connection == Connection::Connected).then_some(()) }).await;
 
     // Restoring the clashing item is a draft change: the pull is retried.
     b.client.restore(&RestoreRequest { items: vec!["x".into()], all: false }).await.unwrap();
@@ -1184,9 +1207,16 @@ async fn the_startup_clone_gives_up_at_the_git_deadline() {
     let mut m =
         Machine::new("slow").with_env("SK1LL_GIT_TIMEOUT", "100ms").with_env("SK1LL_GIT_LOCAL_TIMEOUT", "100ms");
     let server_url = format!("http://127.0.0.1:{port}");
-    DaemonState { machine_id: "slow".into(), server_url, token: "tok".into(), repo: m.repo(), revoked: false }
-        .save(&m.state_path())
-        .unwrap();
+    DaemonState {
+        machine_id: "slow".into(),
+        server_url,
+        token: "tok".into(),
+        repo: m.repo(),
+        revoked: false,
+        record: Default::default(),
+    }
+    .save(&m.state_path())
+    .unwrap();
 
     // The local API only answers once startup (and so the clone) is done.
     let start = std::time::Instant::now();
@@ -1404,10 +1434,11 @@ async fn a_hanging_fetch_blocks_no_other_call() {
     assert!(err.message.contains("timed out"), "{}", err.message);
 }
 
-/// A pull holds the engine mutex while its fetch waits for the server. The
-/// read-only endpoints don't take that mutex, so the GUI keeps answering.
+/// A pull's fetch waits for the server without the engine mutex, so the
+/// read-only endpoints (which never take it) and engine operations alike keep
+/// answering.
 #[tokio::test(flavor = "multi_thread")]
-async fn reads_answer_while_a_pull_holds_the_engine_mutex() {
+async fn reads_and_syncs_answer_while_a_pull_fetches() {
     use sk1ll_daemon::client::{ConflictDiffRequest, ContentQuery, FileQuery};
     // Never accepted: the daemon stays offline and pulls only when asked.
     let server = FakeServer::new().await;
@@ -1450,9 +1481,10 @@ async fn reads_answer_while_a_pull_holds_the_engine_mutex() {
     assert_eq!(m.client.harnesses().await.unwrap().len(), 1);
     assert!(!m.client.items().await.unwrap().is_empty());
     m.client.status().await.unwrap();
+    m.client.sync(&Default::default()).await.unwrap();
     let elapsed = started.elapsed();
-    assert!(elapsed < Duration::from_secs(3), "the reads waited {elapsed:?} for the pull");
-    assert!(!stuck.is_finished(), "the pull was still holding the engine mutex");
+    assert!(elapsed < Duration::from_secs(3), "the calls waited {elapsed:?} for the pull");
+    assert!(!stuck.is_finished(), "the pull was still fetching");
 
     let err = stuck.await.unwrap().unwrap_err();
     assert!(err.message.contains("timed out"), "{}", err.message);

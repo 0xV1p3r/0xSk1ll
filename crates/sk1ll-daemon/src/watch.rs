@@ -221,7 +221,7 @@ pub(crate) fn run(d: Arc<Daemon>) -> impl Future<Output = ()> {
                 dirty.flag.store(true, Ordering::SeqCst);
             }
             if dirty.take()
-                && let Err(e) = d.blocking(|d, eng| d.on_files_changed(eng)).await
+                && let Err(e) = d.on_files_changed().await
             {
                 d.set_error(format!("sync after file change: {e}"));
             }

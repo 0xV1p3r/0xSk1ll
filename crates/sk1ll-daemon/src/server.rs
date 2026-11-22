@@ -1,8 +1,9 @@
 //! The daemon's WebSocket session and authenticated fleet REST requests.
 //!
 //! The socket sends a fresh status before assignment writes. It handles write
-//! replies itself so they can reach callers holding the engine mutex. A
-//! separate worker handles unsolicited snapshots and nudges in order.
+//! replies itself, so a write's caller waits for its reply here, without the
+//! engine mutex. A separate worker handles unsolicited snapshots and nudges
+//! in order.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -22,8 +23,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::{self, Message, client::IntoClientRequest};
 
 use crate::auth::redact;
-use crate::client::{Connection, Event};
-use crate::daemon::Daemon;
+use crate::client::Event;
+use crate::daemon::{Daemon, Link};
 use crate::error::{Error, Result};
 use crate::{Config, DaemonState};
 
@@ -89,7 +90,7 @@ pub(crate) async fn run(d: Arc<Daemon>) {
                 }
                 d.assignment_session.send_replace(None);
                 if !d.is_revoked() {
-                    d.set_connection(Connection::Offline);
+                    d.set_link(Link::Offline);
                 }
             }
             Err(ConnectError::Unauthorized) => d.set_auth_rejected(),
@@ -97,7 +98,7 @@ pub(crate) async fn run(d: Arc<Daemon>) {
                 if d.view().last_error.as_deref() != Some(e.as_str()) {
                     d.set_error(e);
                 }
-                d.set_connection(Connection::Offline);
+                d.set_link(Link::Offline);
             }
         }
         if d.is_revoked() {
@@ -185,12 +186,12 @@ async fn session(d: &Arc<Daemon>, ws: Ws, inbox: &mpsc::UnboundedSender<ServerMe
     send_report(&mut sink, refresh_report(d).await?, &mut sent, &mut seq).await?;
     let (sender, mut writes) = mpsc::channel::<SessionWrite>(16);
     d.assignment_session.send_replace(Some(sender));
-    d.set_connection(Connection::Connected);
+    d.set_link(Link::Connected);
     let mut next_request = 1;
     let mut pending: BTreeMap<u64, (u64, oneshot::Sender<Result<AssignmentUpdate>>)> = BTreeMap::new();
     let catch_up = d.clone();
     tokio::spawn(async move {
-        if let Err(e) = catch_up.blocking(|d, eng| d.on_connected(eng)).await {
+        if let Err(e) = catch_up.on_connected().await {
             tracing::warn!("after connecting: {e}");
         }
     });
@@ -276,7 +277,7 @@ async fn inbox(d: Arc<Daemon>, mut rx: mpsc::UnboundedReceiver<ServerMessage>) {
         let result = match m {
             ServerMessage::AssignmentResult { .. } => Ok(()),
             ServerMessage::Assignment(snap) => d.blocking(move |d, eng| d.apply_assignment(eng, snap).map(drop)).await,
-            ServerMessage::Nudge { baseline } => d.blocking(move |d, eng| d.nudge(eng, baseline)).await,
+            ServerMessage::Nudge { baseline } => d.nudge(baseline).await,
             ServerMessage::ImportsChanged { updates } => {
                 d.event(Event::Imports { updates });
                 Ok(())
@@ -338,11 +339,29 @@ async fn request(
     req.send().await.map_err(|e| Error::Unavailable(redact(&format!("offline: the server is unreachable ({e})"))))
 }
 
-pub(crate) async fn prepare_rename(
+/// This Machine's Assignment as the server has it now.
+pub(crate) async fn fetch_machine_assignment(
+    state: &DaemonState,
+    http: &reqwest::Client,
+) -> Result<AssignmentSnapshot> {
+    let path = format!("/machines/{}/assignment", crate::client::encode(&state.machine_id));
+    let response = request(http, state, Method::GET, &path, Bytes::new()).await?;
+    response
+        .error_for_status()
+        .map_err(|e| Error::Unavailable(redact(&e.to_string())))?
+        .json()
+        .await
+        .map_err(|e| Error::Unavailable(redact(&e.to_string())))
+}
+
+/// The rename intent for `request`: the pending one if it is for the same
+/// request, else a new one from `authoritative` (the server's Assignment,
+/// see [`fetch_machine_assignment`]). Only local files: callers fetch first.
+pub(crate) fn prepare_rename(
     cfg: &Config,
     state: &DaemonState,
     request_body: RenameRequest,
-    http: &reqwest::Client,
+    authoritative: Option<&sk1ll_proto::Assignment>,
 ) -> Result<RenameIntent> {
     let authority = state.rename_authority();
     let config = &cfg.machine_config;
@@ -352,15 +371,9 @@ pub(crate) async fn prepare_rename(
         }
         return Err(Error::Conflict("finish the pending Harness rename first".into()));
     }
-    let path = format!("/machines/{}/assignment", crate::client::encode(&state.machine_id));
-    let response = request(http, state, Method::GET, &path, Bytes::new()).await?;
-    let snapshot: AssignmentSnapshot = response
-        .error_for_status()
-        .map_err(|e| Error::Unavailable(redact(&e.to_string())))?
-        .json()
-        .await
-        .map_err(|e| Error::Unavailable(redact(&e.to_string())))?;
-    Ok(RenameIntent::prepare(config, &state.repo, request_body, &snapshot.assignment, Some(&authority))?)
+    let authoritative = authoritative
+        .ok_or_else(|| Error::Conflict("the pending Harness rename finished meanwhile; reload and retry".into()))?;
+    Ok(RenameIntent::prepare(config, &state.repo, request_body, authoritative, Some(&authority))?)
 }
 
 pub(crate) fn rename_write(intent: &RenameIntent) -> AssignmentWrite {
@@ -435,7 +448,12 @@ pub async fn rename_harness_direct(
     request_body: RenameRequest,
 ) -> anyhow::Result<crate::client::HarnessRenameResult> {
     let http = http_client().build()?;
-    let intent = prepare_rename(cfg, state, request_body, &http).await?;
+    let authority = state.rename_authority();
+    let authoritative = match RenameIntent::load(&cfg.machine_config, Some(&authority))? {
+        Some(_) => None,
+        None => Some(fetch_machine_assignment(state, &http).await?.assignment),
+    };
+    let intent = prepare_rename(cfg, state, request_body, authoritative.as_ref())?;
     intent.apply_config(&cfg.machine_config)?;
     let (mut sink, mut stream) = direct_session(state).await?;
     let result = exchange(&mut sink, &mut stream, 1, 0, rename_write(&intent)).await;

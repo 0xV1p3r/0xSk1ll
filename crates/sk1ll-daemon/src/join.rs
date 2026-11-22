@@ -238,7 +238,7 @@ async fn register_inner(
         tracing::warn!("the server serves its repo at {}, not {REPO_PATH}", joined.repo_path);
     }
     Ok(Registered {
-        state: DaemonState { machine_id: joined.machine_id, server_url, token: joined.token, repo, revoked: false },
+        state: DaemonState::new(joined.machine_id, server_url, joined.token, repo),
         snapshot: AssignmentSnapshot { revision: joined.revision, assignment: joined.assignment, registration: None },
         harnesses,
     })
@@ -387,6 +387,12 @@ struct Replacement {
     published: bool,
 }
 impl StandaloneRepo {
+    /// Whether publishing moves a private clone into place (else the
+    /// existing clone is used where it is).
+    pub(crate) fn replaces(&self) -> bool {
+        self.replacement.is_some()
+    }
+
     pub(crate) fn publish(&mut self) -> anyhow::Result<()> {
         let Some(r) = &mut self.replacement else { return Ok(()) };
         if r.had_original {
@@ -505,6 +511,7 @@ mod tests {
                 token: "secret".into(),
                 repo: root.join("repo"),
                 revoked: false,
+                record: Default::default(),
             },
             snapshot: AssignmentSnapshot { revision: 42, ..Default::default() },
             harnesses: vec![],

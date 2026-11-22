@@ -20,6 +20,7 @@ mod daemon;
 mod error;
 pub mod gitx;
 pub mod join;
+mod lifecycle;
 mod notifications;
 mod server;
 pub mod service;
@@ -88,7 +89,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     if d.is_revoked() {
         tracing::warn!("this machine was removed from the fleet; not managing it (join again to resume)");
     } else {
-        match d.blocking(|d, eng| d.startup(eng)).await {
+        match d.startup().await {
             Err(error::Error::Conflict(e)) if e.contains("another sk1ll process") => {
                 let _ = std::fs::remove_file(&socket);
                 bail!("{e}; not starting");
@@ -123,7 +124,7 @@ async fn periodic_pull(d: Arc<Daemon>) {
             return;
         }
         if d.is_connected() {
-            let _ = d.blocking(|d, eng| d.pull(eng)).await;
+            let _ = d.pull().await;
         }
     }
 }

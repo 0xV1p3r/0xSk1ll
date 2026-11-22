@@ -1133,6 +1133,7 @@ mod tests {
                 token: "tok".into(),
                 repo: self.0.clone(),
                 revoked: false,
+                record: Default::default(),
             }
             .save(&self.0.join(".git/daemon.json"))
             .unwrap();
@@ -1208,6 +1209,7 @@ mod tests {
             token: "tok".into(),
             repo: repo.0.clone(),
             revoked: false,
+            record: Default::default(),
         }
         .save(&repo.0.join(".git/daemon.json"))
         .unwrap();
