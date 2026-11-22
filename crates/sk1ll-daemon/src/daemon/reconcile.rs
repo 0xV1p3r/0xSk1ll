@@ -34,8 +34,10 @@ use crate::state::PullState;
 use crate::watch::WatchRoot;
 
 /// How long an input must have been left alone before its stamp proves it
-/// unchanged; tests write their trees just before reconciling.
-const RACY_WINDOW: std::time::Duration = if cfg!(test) { std::time::Duration::ZERO } else { HashCache::RACY_WINDOW };
+/// unchanged ([`Engine::racy`]); tests write their trees just before
+/// reconciling.
+pub(super) const RACY_WINDOW: std::time::Duration =
+    if cfg!(test) { std::time::Duration::ZERO } else { HashCache::RACY_WINDOW };
 
 /// What a reconcile reads, each part as a cheap fingerprint: equal Inputs
 /// plan and apply the same.
@@ -55,37 +57,43 @@ pub(crate) struct Inputs {
 }
 
 impl Inputs {
-    /// The Inputs as they are now, and the paths among them changed within
-    /// the racy window: only Inputs without any may be recorded.
-    pub(super) fn gather(d: &Daemon) -> sk1ll_core::Result<(Self, Vec<PathBuf>)> {
+    /// The Inputs as they are now, and those among them changed within the
+    /// racy window: only Inputs without any may be recorded.
+    pub(super) fn gather(d: &Daemon, window: std::time::Duration) -> sk1ll_core::Result<(Self, Vec<String>)> {
         let at = SystemTime::now();
         let mut racy = Vec::new();
-        let mut stamp = |path: &Path, exclude: Option<sync::Exclusion>| -> sk1ll_core::Result<String> {
-            let stamp = Stamp::of(path, exclude, false)?;
-            if !stamp.settled(at, RACY_WINDOW) {
-                racy.push(path.to_path_buf());
+        let mut settled = |what: &dyn std::fmt::Display, stamp: Stamp| -> String {
+            if !stamp.settled(at, window) {
+                racy.push(what.to_string());
             }
-            Ok(stamp.digest().to_string())
+            stamp.digest().to_string()
         };
         let root = d.repo_root();
         let config = &d.cfg.machine_config;
         let intent = config.with_extension("harness-rename.json");
+        let assignment = match d.is_standalone() {
+            true => Some(settled(&d.cfg.assignment.display(), Stamp::through(&d.cfg.assignment, None)?)),
+            false => None,
+        };
         let inputs = Self {
-            repo: stamp(root, Some(outside_git))?,
-            git: stamp(&root.join(".git"), Some(git_bookkeeping))?,
-            machine: format!("{}\n{}", stamp(config, None)?, stamp(&intent, None)?),
-            assignment: (
-                d.applied().map(|s| s.revision),
-                d.is_standalone().then(|| stamp(&d.cfg.assignment, None)).transpose()?,
+            repo: settled(&root.display(), working_tree(root)?),
+            git: settled(&"git", git_dirs(root)?),
+            machine: format!(
+                "{}\n{}",
+                settled(&config.display(), Stamp::through(config, None)?),
+                settled(&intent.display(), Stamp::through(&intent, None)?)
             ),
+            assignment: (d.applied().map(|s| s.revision), assignment),
             pull: d.lifecycle().pull().clone(),
             harnesses: MachineConfig::load(config)?
                 .harnesses()
                 .iter()
-                .map(|(name, harness)| Ok((name.clone(), sync::harness_fingerprint(harness)?)))
+                .map(|(name, harness)| {
+                    Ok((name.clone(), settled(&format_args!("harness {name}"), sync::harness_fingerprint(harness)?)))
+                })
                 .collect::<sk1ll_core::Result<_>>()?,
             // Unit tests share one recovery area, which they write at any time.
-            displaced: if cfg!(test) { String::new() } else { stamp(&sync::displaced::root()?, None)? },
+            displaced: if cfg!(test) { String::new() } else { settled(&"recovery area", sync::displaced::stamp()?) },
         };
         Ok((inputs, racy))
     }
@@ -109,9 +117,58 @@ impl Inputs {
     }
 }
 
-/// The working tree: everything but `.git` and imports being staged.
-fn outside_git(depth: usize, name: &std::ffi::OsStr) -> bool {
-    (depth == 1 && name == ".git") || name.to_string_lossy().starts_with(sk1ll_core::source::STAGE_PREFIX)
+/// The directories of the working tree whose entries sk1ll stages imports
+/// and renames in (see [`sk1ll_core::source::STAGE_PREFIX`]).
+const STAGING_DIRS: [&str; 3] =
+    [sk1ll_core::skill::PERSONAL_DIR, sk1ll_core::skill::IMPORTED_DIR, sk1ll_core::instructions::INSTRUCTIONS_DIR];
+
+/// The working tree: everything but `.git`, and imports and renames being
+/// staged. Only the staging directories sk1ll itself creates, where it
+/// creates them, are left out: a skill's own file of that name is content.
+fn working_tree(root: &Path) -> sk1ll_core::Result<Stamp> {
+    fn top(depth: usize, name: &std::ffi::OsStr) -> bool {
+        depth == 1 && (name == ".git" || STAGING_DIRS.iter().any(|dir| name == *dir))
+    }
+    fn staging(depth: usize, name: &std::ffi::OsStr) -> bool {
+        depth == 1 && name.to_string_lossy().starts_with(sk1ll_core::source::STAGE_PREFIX)
+    }
+    let mut parts = vec![(String::new(), Stamp::of(root, Some(top), false)?)];
+    for dir in STAGING_DIRS {
+        parts.push((dir.to_string(), Stamp::through(&root.join(dir), Some(staging))?));
+    }
+    Ok(Stamp::combine("working tree", parts))
+}
+
+/// `.git`, and when it is a pointer file (a linked worktree, a
+/// `--separate-git-dir`) the git directory it names and that one's common
+/// directory: `HEAD`, the refs, the index, the config and a pull's journal
+/// live there, not in the pointer.
+pub(super) fn git_dirs(root: &Path) -> sk1ll_core::Result<Stamp> {
+    /// The common directory's other worktrees are not this repo's.
+    fn common_bookkeeping(depth: usize, name: &std::ffi::OsStr) -> bool {
+        git_bookkeeping(depth, name) || (depth == 1 && name == "worktrees")
+    }
+    let dot = root.join(".git");
+    let mut parts = vec![(String::new(), Stamp::through(&dot, Some(git_bookkeeping))?)];
+    if let Some(git_dir) = pointed_git_dir(&dot) {
+        parts.push((git_dir.display().to_string(), Stamp::through(&git_dir, Some(git_bookkeeping))?));
+        if let Ok(common) = std::fs::read_to_string(git_dir.join("commondir")) {
+            let common = git_dir.join(common.trim_end_matches(['\n', '\r']));
+            parts.push((common.display().to_string(), Stamp::through(&common, Some(common_bookkeeping))?));
+        }
+    }
+    Ok(Stamp::combine("git", parts))
+}
+
+/// The git directory a `.git` pointer file names (`gitdir: <path>`, relative
+/// to the file's directory unless absolute); `None` for a real directory.
+fn pointed_git_dir(dot: &Path) -> Option<PathBuf> {
+    if !std::fs::symlink_metadata(dot).ok()?.is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(dot).ok()?;
+    let path = text.lines().next()?.strip_prefix("gitdir:")?.trim();
+    Some(dot.parent()?.join(path))
 }
 
 /// What git writes for itself: objects, logs, fetch results, lock files.
@@ -147,7 +204,7 @@ impl Daemon {
         if self.is_standalone() {
             self.reload_local_assignment()?;
         }
-        let gathered = Inputs::gather(self);
+        let gathered = Inputs::gather(self, eng.racy);
         let why = match (&gathered, &eng.reconciled) {
             _ if reviewed.is_some() => "a reviewed sync".to_string(),
             (Err(e), _) => format!("the inputs could not be read ({e})"),

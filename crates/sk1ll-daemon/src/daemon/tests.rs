@@ -904,3 +904,126 @@ async fn a_rejoin_does_not_replace_a_registration_that_recovered_meanwhile() {
     assert_eq!(state::load_snapshot(&d.cfg.snapshot_path(), owner.as_deref()).unwrap().unwrap().revision, 1);
     assert!(d.ensure_managed().is_ok(), "still managing, not halted");
 }
+
+/// Settles `d`, makes `change`, and returns how many plans the reconciles
+/// after it ran: one when the change is an Input the fingerprint sees.
+async fn plans_after(d: &Arc<Daemon>, change: impl FnOnce()) -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let reconcile = || {
+        let d = d.clone();
+        async move { d.blocking(|d, eng| d.reconcile(eng)).await.unwrap() }
+    };
+    reconcile().await;
+    reconcile().await;
+    let before = d.plans.load(Relaxed);
+    reconcile().await;
+    assert_eq!(d.plans.load(Relaxed), before, "settled before the change");
+    // A change within one tick of the clock could keep every timestamp.
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    change();
+    reconcile().await;
+    reconcile().await;
+    d.plans.load(Relaxed) - before
+}
+
+/// `personal/pdf` with a `SKILL.md`, its Item ID written.
+fn pdf_skill(root: &Path) {
+    std::fs::create_dir_all(root.join("personal/pdf")).unwrap();
+    std::fs::write(root.join("personal/pdf/SKILL.md"), "PDFs.\n").unwrap();
+    Repo::open(root).unwrap().assign_missing_ids().unwrap();
+}
+
+/// A `machine.toml` that is a symlink into a dotfiles repo is stamped
+/// through the link: an edit of its target is an Input change.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_symlinked_machine_config_is_read_through_the_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let (d, _session, _) = joined_daemon(dir.path(), PullRecord::default());
+    let target = dir.path().join("dotfiles/machine.toml");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::rename(&d.cfg.machine_config, &target).unwrap();
+    std::os::unix::fs::symlink(&target, &d.cfg.machine_config).unwrap();
+    let edit = || {
+        let text = std::fs::read_to_string(&target).unwrap();
+        std::fs::write(&target, format!("{text}\n# edited\n")).unwrap();
+    };
+    assert_eq!(plans_after(&d, edit).await, 1);
+}
+
+/// A skill's own file named like sk1ll's staging directories is content
+/// sync deploys, so an edit of it is seen; staging directories where sk1ll
+/// creates them are still left out.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_skill_file_named_like_a_stage_is_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let (d, _session, _) = joined_daemon(dir.path(), PullRecord::default());
+    let root = d.repo_root().to_path_buf();
+    let own = root.join("personal/pdf/refs/.sk1ll-stage-notes.md");
+    std::fs::create_dir_all(own.parent().unwrap()).unwrap();
+    std::fs::write(&own, "Notes.\n").unwrap();
+    pdf_skill(&root);
+    // One plan for the edit, one for the placement it changed.
+    assert_eq!(plans_after(&d, || std::fs::write(&own, "Edited notes.\n").unwrap()).await, 2);
+    let placed = dir.path().join("h/pdf/refs/.sk1ll-stage-notes.md");
+    assert_eq!(std::fs::read_to_string(placed).unwrap(), "Edited notes.\n");
+    let stage = root.join(sk1ll_core::skill::IMPORTED_DIR).join(".sk1ll-stage-1-2-3/tree/SKILL.md");
+    let staged = || {
+        std::fs::create_dir_all(stage.parent().unwrap()).unwrap();
+        std::fs::write(&stage, "Being staged.\n").unwrap();
+    };
+    assert_eq!(plans_after(&d, staged).await, 0, "an import being staged is no Input");
+}
+
+/// A harness changed within the racy window is not recorded, like any
+/// other Input: the next reconcile runs again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_harness_changed_within_the_racy_window_is_reconciled_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let (d, _session, _) = joined_daemon(dir.path(), PullRecord::default());
+    pdf_skill(d.repo_root());
+    for _ in 0..2 {
+        d.blocking(|d, eng| d.reconcile(eng)).await.unwrap();
+    }
+    let window = std::time::Duration::from_millis(400);
+    std::thread::sleep(2 * window);
+    std::fs::write(dir.path().join("h/pdf/SKILL.md"), "Edited in the harness.\n").unwrap();
+    let (_, racy) = reconcile::Inputs::gather(&d, window).unwrap();
+    assert_eq!(racy, ["harness h"]);
+    lock(&d.engine).racy = window;
+    d.blocking(|d, eng| d.reconcile(eng)).await.unwrap();
+    assert!(lock(&d.engine).reconciled.is_none(), "changed within the window: not recorded");
+    std::thread::sleep(window);
+    d.blocking(|d, eng| d.reconcile(eng)).await.unwrap();
+    assert!(lock(&d.engine).reconciled.is_some());
+}
+
+/// With `.git` a pointer file (`--separate-git-dir`, a linked worktree),
+/// the git directory it names and its common directory are the Inputs.
+#[test]
+fn a_git_pointer_is_followed_to_the_git_and_common_dirs() {
+    use sk1ll_core::git::Git;
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("main");
+    Repo::init_committed(&main).unwrap();
+    let git = |at: &Path, args: &[&str]| drop(Git::new(at).args(args).run().unwrap());
+    git(&main, &["worktree", "add", "-q", "-b", "wt", dir.path().join("wt").to_str().unwrap()]);
+    let separate = dir.path().join("separate");
+    Repo::init_committed(&separate).unwrap();
+    std::fs::rename(separate.join(".git"), dir.path().join("separate.git")).unwrap();
+    std::fs::write(separate.join(".git"), "gitdir: ../separate.git\n").unwrap();
+    type Change<'a> = Box<dyn Fn() + 'a>;
+    let wt = dir.path().join("wt");
+    let cases: [(&Path, &str, Change); 3] = [
+        (&wt, "a branch, in the common dir", Box::new(|| git(&wt, &["branch", "other"]))),
+        (&wt, "the worktree's own HEAD", Box::new(|| git(&wt, &["checkout", "-q", "-b", "moved"]))),
+        (&separate, "a separate git dir's refs", Box::new(|| git(&separate, &["branch", "other"]))),
+    ];
+    for (root, what, change) in cases {
+        let before = reconcile::git_dirs(root).unwrap();
+        assert_eq!(reconcile::git_dirs(root).unwrap(), before, "{what}");
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        change();
+        assert_ne!(reconcile::git_dirs(root).unwrap(), before, "{what}");
+    }
+}

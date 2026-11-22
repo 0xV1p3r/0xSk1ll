@@ -179,6 +179,9 @@ pub(crate) struct Engine {
     /// when the last reconcile failed, reported errors, or none ran yet, so
     /// the next one runs whatever the Inputs.
     reconciled: Option<reconcile::Inputs>,
+    /// How long an Input must have been left alone to be recorded
+    /// ([`reconcile::RACY_WINDOW`]; tests widen it).
+    racy: std::time::Duration,
     #[cfg(test)]
     after_sync_review: Option<Box<dyn FnOnce() + Send>>,
 }
@@ -260,6 +263,7 @@ impl Daemon {
             engine: Mutex::new(Engine {
                 lock: None,
                 reconciled: None,
+                racy: reconcile::RACY_WINDOW,
                 #[cfg(test)]
                 after_sync_review: None,
             }),

@@ -469,6 +469,51 @@ impl Stamp {
         }
         Ok(Self { digest: format!("stamp:{}", hex(&hasher.finalize())), newest })
     }
+
+    /// [`Stamp::of`] `path` as what reads through it see it: a symlink at
+    /// the root (or a chain of them) is stamped itself, and so is what it
+    /// resolves to, with `exclude` applied there as below a real directory.
+    /// Retargeting the link, or changing its target, changes the stamp.
+    pub fn through(path: &Path, exclude: Option<Exclusion>) -> Result<Self> {
+        let own = Self::of(path, exclude, false)?;
+        if !fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Ok(own);
+        }
+        let (target, resolved) = match fs::canonicalize(path) {
+            Ok(target) => {
+                let resolved = Self::of(&target, exclude, false)?;
+                (path_bytes(&target), resolved)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                (Vec::new(), Self { digest: hash_str("dangling"), newest: i128::MIN })
+            }
+            Err(e) => return Err(e).at(path),
+        };
+        let mut hasher = Sha256::new();
+        for part in [own.digest.as_bytes(), &target, resolved.digest.as_bytes()] {
+            hasher.update((part.len() as u64).to_le_bytes());
+            hasher.update(part);
+        }
+        Ok(Self { digest: format!("stamp:{}", hex(&hasher.finalize())), newest: own.newest.max(resolved.newest) })
+    }
+
+    /// Several stamps as one, each under its label after `header` (what
+    /// else the reader of these trees depends on): equal when the header
+    /// and every part are, settled when every part is.
+    pub fn combine(header: &str, parts: impl IntoIterator<Item = (String, Stamp)>) -> Self {
+        let mut hasher = Sha256::new();
+        let mut newest = i128::MIN;
+        hasher.update((header.len() as u64).to_le_bytes());
+        hasher.update(header);
+        for (label, stamp) in parts {
+            for part in [label.as_str(), stamp.digest.as_str()] {
+                hasher.update((part.len() as u64).to_le_bytes());
+                hasher.update(part);
+            }
+            newest = newest.max(stamp.newest);
+        }
+        Self { digest: format!("stamp:{}", hex(&hasher.finalize())), newest }
+    }
 }
 
 /// The parts of `meta` a [`Stamp`] compares, and the entry's latest mtime or

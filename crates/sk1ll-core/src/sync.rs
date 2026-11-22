@@ -254,27 +254,48 @@ fn plan_with(
 /// reads, from `lstat` alone (see [`Stamp`]): its skills directory's own
 /// entries, the whole tree of each one its ownership index records (and of
 /// a change in progress), the index and sk1ll's scratch and recovery area,
-/// and its instructions file or rules directory. Unmanaged content below a
-/// skills directory's own entries is left out, since planning does not look
-/// into it. Equal fingerprints mean planning would see the same harness.
-pub fn harness_fingerprint(harness: &Harness) -> Result<String> {
+/// and its instructions file or rules directory, with the scratch and
+/// recovery area beside a block instructions file (and beside its target).
+/// What planning reads through a symlink (a skills directory, an
+/// instructions file or rules directory that is one) is stamped through it
+/// ([`Stamp::through`]). The harness's own settings (paths, mode, format) are
+/// part of it too. Unmanaged content below a skills directory's own entries
+/// is left out, since planning does not look into it. Equal fingerprints mean
+/// planning would see the same harness; one that is not
+/// [settled](Stamp::settled) proves nothing yet.
+pub fn harness_fingerprint(harness: &Harness) -> Result<Stamp> {
     let mut parts = Vec::new();
     if let Some(dir) = harness.skills_dir() {
         fn own_entries(depth: usize, _: &std::ffi::OsStr) -> bool {
             depth > 1
         }
-        parts.push(Stamp::of(&dir, Some(own_entries), false)?.digest().to_string());
+        parts.push(("skills".to_string(), Stamp::through(&dir, Some(own_entries))?));
         let index = load_index(&dir)?;
         let names: BTreeSet<&str> =
             index.entries.keys().chain(index.pending.keys()).map(String::as_str).chain([INDEX_DIR, TMP_DIR]).collect();
         for name in names {
-            parts.push(format!("{name}\0{}", Stamp::of(&dir.join(name), None, false)?.digest()));
+            parts.push((format!("skills/{name}"), Stamp::of(&dir.join(name), None, false)?));
         }
     }
     if let Some(path) = harness.instructions_file() {
-        parts.push(Stamp::of(&path, None, false)?.digest().to_string());
+        parts.push(("instructions".to_string(), Stamp::through(&path, None)?));
+        if harness.instructions_format == InstructionsFormat::Block {
+            // Block instructions are displaced into the directory holding
+            // the file, or its target if it is a symlink.
+            let mut holders: Vec<PathBuf> = path.parent().map(Path::to_path_buf).into_iter().collect();
+            if let Ok(target) = fs::canonicalize(&path)
+                && let Some(parent) = target.parent()
+            {
+                holders.push(parent.to_path_buf());
+            }
+            holders.dedup();
+            for holder in holders {
+                let tmp = holder.join(TMP_DIR);
+                parts.push((format!("beside {}", holder.display()), Stamp::of(&tmp, None, false)?));
+            }
+        }
     }
-    Ok(hash_str(&parts.join("\n")))
+    Ok(Stamp::combine(&format!("{harness:?}"), parts))
 }
 
 /// The instruction files a harness would receive, for previewing.
@@ -2347,6 +2368,22 @@ pub mod displaced {
         holder.join(TMP_DIR).join(AREA)
     }
 
+    /// A cheap fingerprint of what [`list`] reads, from `lstat` and the small
+    /// index files: the state directory (the index, placement records, older
+    /// entries kept there) and the whole payload of every entry the index
+    /// places elsewhere (beside a skills directory, an instructions file or a
+    /// repo's git directory).
+    pub fn stamp() -> Result<Stamp> {
+        let root = root()?;
+        let mut parts = vec![(String::new(), Stamp::of(&root, None, false)?)];
+        for id in ids(&root)? {
+            if let Some(dir) = indexed(&root, &id) {
+                parts.push((id, Stamp::of(&dir, None, false)?));
+            }
+        }
+        Ok(Stamp::combine("recovery", parts))
+    }
+
     /// Every entry, oldest first.
     pub fn list() -> Result<Vec<Entry>> {
         let root = root()?;
@@ -3708,6 +3745,62 @@ mod tests {
         std::thread::sleep(Duration::from_millis(30));
         write(&tmp.path().join("skills/pdf/SKILL.md"), "Edited, managed.\n");
         assert_ne!(harness_fingerprint(harness).unwrap(), unmanaged);
+    }
+
+    /// What planning reads through a symlink changes the fingerprint: a
+    /// skills directory that is a link (its target's own entries), an
+    /// instructions file that is one (its target), and so does the recovery
+    /// area beside a block instructions file and its target, and the
+    /// harness's own settings. A fresh change leaves it unsettled.
+    #[cfg(unix)]
+    #[test]
+    fn the_harness_fingerprint_reads_through_links_and_covers_settings_and_recovery() {
+        use std::os::unix::fs::symlink;
+        let (tmp, _repo, harnesses) = skill_setup(LinkMode::Copy);
+        let dotfiles = tmp.path().join("dotfiles");
+        fs::create_dir_all(dotfiles.join("skills")).unwrap();
+        symlink(dotfiles.join("skills"), tmp.path().join("skills")).unwrap();
+        write(&dotfiles.join("AGENTS.md"), "Mine.\n");
+        let codex = tmp.path().join("codex");
+        fs::create_dir_all(&codex).unwrap();
+        symlink(dotfiles.join("AGENTS.md"), codex.join("AGENTS.md")).unwrap();
+        let mut harness = harnesses["h"].clone();
+        harness.instructions = Some(codex.join("AGENTS.md").to_string_lossy().into_owned());
+        let mut last = harness_fingerprint(&harness).unwrap();
+        type Change<'a> = Box<dyn Fn(&mut Harness) + 'a>;
+        let changes: [(&str, Change); 5] = [
+            ("an entry of the linked skills directory", Box::new(|_| write(&dotfiles.join("skills/mine/x"), "x"))),
+            ("the linked instructions file's target", Box::new(|_| write(&dotfiles.join("AGENTS.md"), "Edited.\n"))),
+            ("recovery beside the link", Box::new(|_| write(&codex.join(".sk1ll-tmp/displaced/a/content"), "a"))),
+            ("recovery beside the target", Box::new(|_| write(&dotfiles.join(".sk1ll-tmp/displaced/b/content"), "b"))),
+            ("the placement mode", Box::new(|h| h.mode = LinkMode::Symlink)),
+        ];
+        for (what, change) in changes {
+            std::thread::sleep(Duration::from_millis(30));
+            change(&mut harness);
+            let now = harness_fingerprint(&harness).unwrap();
+            assert_ne!(now, last, "{what}");
+            assert!(!now.settled(std::time::SystemTime::now(), Duration::from_secs(3600)), "{what}: just changed");
+            last = now;
+        }
+        assert!(last.settled(std::time::SystemTime::now(), Duration::ZERO));
+        assert_eq!(harness_fingerprint(&harness).unwrap(), last);
+    }
+
+    /// The recovery area's stamp covers each entry's payload where it is,
+    /// beside the instructions file it came from, not only the index.
+    #[test]
+    fn the_recovery_stamp_covers_payloads_beside_instructions() {
+        let d = Displacement::new("block update");
+        let _root = displaced::test_root(&d.tmp.path().join("state/displaced"));
+        apply(&d.repo, &d.action()).unwrap();
+        let entry = d.entry();
+        assert!(entry.path.starts_with(d.area()));
+        let before = displaced::stamp().unwrap();
+        assert_eq!(displaced::stamp().unwrap(), before);
+        std::thread::sleep(Duration::from_millis(30));
+        fs::write(d.kept_file(&entry), "Written to the recovery copy.\n").unwrap();
+        assert_ne!(displaced::stamp().unwrap(), before);
     }
 
     #[test]
