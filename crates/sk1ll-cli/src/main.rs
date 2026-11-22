@@ -7,7 +7,7 @@
 #[cfg(not(unix))]
 compile_error!("sk1ll needs Unix: it runs the daemon's engine, which uses Unix sockets and file APIs");
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -15,8 +15,8 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use sk1ll_core::{ImportState, MachineConfig, Origin, Repo};
 use sk1ll_daemon::client::{
     AddImportRequest, ChangeKind, CommitRequest, ConflictTarget, ConflictView, ContentType, CreateItemRequest,
-    DaemonMode, PlacementView, PullResult, RepoContent, ResolveImportRequest, RestoreRequest, SyncRequest,
-    UpdateImportsRequest,
+    DaemonMode, DeleteItemRequest, PlacementView, PullResult, RenameItemRequest, RepoContent, ResolveImportRequest,
+    RestoreRequest, SyncRequest, UpdateImportsRequest,
 };
 use sk1ll_proto::{AssignmentChanges, AssignmentWrite, ToggleChange, ToggleKind};
 
@@ -105,8 +105,34 @@ enum Cmd {
         #[arg(long, requires = "name", conflicts_with = "force")]
         dry_run: bool,
     },
-    /// Remove an import
+    /// Remove an import (`sk1ll delete` deletes a personal skill or rule)
     Remove { name: String },
+    /// Create a personal skill or rule in the Draft
+    #[command(
+        after_help = "Examples:\n  sk1ll new skill code-review --description 'Review a change'\n  sk1ll new rule commits"
+    )]
+    New {
+        kind: Kind,
+        name: String,
+        /// The skill's or rule's description (its frontmatter)
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// Delete a personal skill or rule in the Draft (`sk1ll remove` removes an import)
+    #[command(after_help = "Items: a skill or rule name, or skill:<name>, rule:<name>")]
+    Delete {
+        item: String,
+        /// Delete without asking for confirmation
+        #[arg(long, short)]
+        yes: bool,
+    },
+    /// Rename a personal skill or rule in the Draft; it keeps its Item ID, and with it its Assignment
+    #[command(after_help = "Items: a skill or rule name, or skill:<name>, rule:<name>")]
+    Rename {
+        item: String,
+        #[arg(value_name = "NEW_NAME")]
+        to: String,
+    },
     /// Turn an import into a personal skill you can edit
     Fork { name: String },
     /// Show import drift and pending sync actions
@@ -328,7 +354,7 @@ impl Cmd {
     }
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Kind {
     Skill,
     Rule,
@@ -608,8 +634,60 @@ fn command(s: &Session, cmd: Cmd) -> Result<()> {
             }
         }
         Cmd::Remove { name } => {
-            s.block(c.remove_import(&name))?;
+            if let Err(e) = s.block(c.remove_import(&name)) {
+                // A personal item has a name too, but nothing upstream to remove it from: it is deleted.
+                let named = |kind: Kind| personal_item(s, &format!("{}:{name}", kind.label())).ok();
+                let found: Vec<_> = match personal_item(s, &name) {
+                    Ok(item) => vec![item],
+                    Err(_) => [Kind::Skill, Kind::Rule].into_iter().filter_map(named).collect(),
+                };
+                if found.is_empty() {
+                    return Err(e);
+                }
+                let what: Vec<_> = found.iter().map(|(kind, _)| kind.label()).collect();
+                let commands: Vec<_> =
+                    found.iter().map(|(kind, name)| format!("`sk1ll delete {}`", item_arg(*kind, name))).collect();
+                bail!(
+                    "`{}` is a personal {}, not an import; delete it with {}",
+                    found[0].1,
+                    what.join(" and a personal "),
+                    commands.join(" or ")
+                );
+            }
             println!("removed {name}");
+        }
+        Cmd::New { kind, name, description } => {
+            let request =
+                CreateItemRequest { kind: kind.label().into(), name: name.clone(), description, bundled: None };
+            s.block(c.create_item(&request))?;
+            let item = item_arg(kind, &name);
+            let path = s.block(c.editable(&item))?;
+            println!("created the personal {} {name} at {}", kind.label(), path.display());
+            // The bare name, unless a skill and a rule share it.
+            let edit = if personal_item(s, &name).is_ok() { fleet::shell_arg(&name) } else { item };
+            println!("write it with `sk1ll edit {edit}`");
+        }
+        Cmd::Delete { item, yes } => {
+            let (kind, name) = personal_item(s, &item)?;
+            let item = item_arg(kind, &name);
+            if !yes {
+                if !std::io::stdin().is_terminal() {
+                    bail!("deleting a {} requires terminal confirmation or `--yes`", kind.label());
+                }
+                if !confirm(&format!("delete the personal {} {name} in the draft?", kind.label()))? {
+                    bail!("aborted");
+                }
+            }
+            s.block(c.delete_item(&DeleteItemRequest { kind: kind.label().into(), name: name.clone() }))?;
+            println!("deleted {} {name} in the draft", kind.label());
+            println!("commit the deletion with `sk1ll commit {item}`, or bring it back with `sk1ll restore {item}`");
+        }
+        Cmd::Rename { item, to } => {
+            let (kind, name) = personal_item(s, &item)?;
+            let request = RenameItemRequest { kind: kind.label().into(), name: name.clone(), to: to.clone() };
+            let renamed = s.block(c.rename_item(&request))?.item;
+            println!("renamed {} {name} to {to} in the draft; its Item ID and Assignment go with it", kind.label());
+            println!("commit the rename with `sk1ll commit {} {}`", item_arg(kind, &name), renamed);
         }
         Cmd::Fork { name } => {
             s.block(c.fork(&name))?;
@@ -824,6 +902,41 @@ fn command(s: &Session, cmd: Cmd) -> Result<()> {
         | Cmd::Completions { .. } => unreachable!(),
     }
     Ok(())
+}
+
+/// `skill:<name>` or `rule:<name>`, quoted for a shell where it needs it.
+fn item_arg(kind: Kind, name: &str) -> String {
+    fleet::shell_arg(&format!("{}:{name}", kind.label()))
+}
+
+/// The personal skill or rule `item` names: a bare name, `skill:<name>` or
+/// `rule:<name>`. An Import, or a name both a skill and a rule have, says
+/// what to run instead.
+fn personal_item(s: &Session, item: &str) -> Result<(Kind, String)> {
+    let (kinds, name) = match item.split_once(':') {
+        Some(("skill", name)) => (&[Kind::Skill][..], name),
+        Some(("rule", name)) => (&[Kind::Rule][..], name),
+        _ => (&[Kind::Skill, Kind::Rule][..], item),
+    };
+    let repo = s.block(s.client.repo(false))?;
+    let skill = repo.skills.iter().find(|skill| skill.name == name);
+    let found: Vec<Kind> = kinds
+        .iter()
+        .copied()
+        .filter(|kind| match kind {
+            Kind::Skill => skill.is_some_and(|skill| skill.origin == Origin::Personal),
+            Kind::Rule => repo.rules.iter().any(|rule| rule.name == name),
+        })
+        .collect();
+    match found[..] {
+        [kind] => Ok((kind, name.to_string())),
+        [_, _] => bail!("both a skill and a rule are named `{name}`; say `skill:{name}` or `rule:{name}`"),
+        _ if kinds.contains(&Kind::Skill) && skill.is_some_and(|skill| skill.origin == Origin::Imported) => bail!(
+            "`{name}` is an import; remove it with `sk1ll remove {0}`, or make it a personal skill with `sk1ll fork {0}`",
+            fleet::shell_arg(name)
+        ),
+        _ => bail!("no personal skill or rule named `{name}` (see `sk1ll list`)"),
+    }
 }
 
 fn require_harness(s: &Session, harness: &str) -> Result<()> {

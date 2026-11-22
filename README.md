@@ -113,7 +113,10 @@ If Pull stops partway through, the next `sk1ll pull` or Daemon reconcile resumes
 | `update <name> --dry-run` | Preview upstream commits and changed files for one Import |
 | `remove <name>` | Remove an import |
 | `fork <name>` | Turn an import into a personal skill you can edit |
+| `new skill\|rule <name> [--description <text>]` | Create a personal skill or rule in the draft |
 | `edit <name>` | Open a personal skill or rule in `$VISUAL` or `$EDITOR` |
+| `rename <item> <new-name>` | Rename a personal skill or rule in the draft. It keeps its Item ID, so its Assignment goes with it |
+| `delete <item>` | Delete a personal skill or rule in the draft, after confirming. Use `--yes` in scripts |
 | `list` | List repo content. Use `--json` to include Item IDs or `--unmanaged` to list unmanaged skills |
 | `repair-ids` | Give each item that shares an Item ID, or has none, a fresh one in the Draft; of items sharing one, the item that holds it in the Baseline keeps it (else the first by path) |
 | `status` | Import drift and pending sync actions |

@@ -497,6 +497,44 @@ fn only_a_missing_or_refused_socket_means_no_daemon() {
     repo.run_on(&sock, &["assign", "h", "skill", "pdf", "on"]).unwrap();
 }
 
+/// `new`, `rename` and `delete` do what the Library does, and `remove` of a
+/// personal item points to `delete`.
+#[test]
+fn new_rename_and_delete_personal_items() {
+    let repo = TestRepo::new();
+    repo.harness("h");
+    let created = repo.run(&["new", "skill", "review", "--description", "Review a change"]).unwrap();
+    let skill = repo.repo.join("personal/review/SKILL.md");
+    assert!(created.contains(&skill.display().to_string()) && created.contains("`sk1ll edit review`"), "{created}");
+    assert!(fs::read_to_string(&skill).unwrap().contains("Review a change"));
+    repo.run(&["new", "rule", "review"]).unwrap();
+    assert!(repo.repo.join("instructions/review.md").is_file());
+
+    let error = repo.run(&["remove", "review"]).unwrap_err();
+    assert!(error.contains("`sk1ll delete skill:review` or `sk1ll delete rule:review`"), "{error}");
+    let error = repo.run(&["remove", "skill:review"]).unwrap_err();
+    assert!(
+        error.contains("personal skill, not an import") && error.contains("`sk1ll delete skill:review`"),
+        "{error}"
+    );
+    assert!(repo.run(&["rename", "review", "x"]).unwrap_err().contains("say `skill:review` or `rule:review`"));
+
+    repo.run(&["assign", "h", "skill", "review", "off"]).unwrap();
+    let id = repo.item_id(ItemRef::Skill("review".into()));
+    let renamed = repo.run(&["rename", "skill:review", "code-review"]).unwrap();
+    assert!(renamed.contains("`sk1ll commit skill:review skill:code-review`"), "{renamed}");
+    assert_eq!(repo.item_id(ItemRef::Skill("code-review".into())), id, "the Item ID goes with it");
+    assert!(!Assignment::load(&repo.assignment()).unwrap().skill_enabled("h", &id), "and so does its toggle");
+
+    let error = repo.run(&["delete", "code-review"]).unwrap_err();
+    assert!(error.contains("terminal confirmation or `--yes`"), "{error}");
+    assert!(repo.repo.join("personal/code-review").is_dir());
+    let deleted = repo.run(&["delete", "code-review", "--yes"]).unwrap();
+    assert!(deleted.contains("`sk1ll restore skill:code-review`"), "{deleted}");
+    assert!(!repo.repo.join("personal/code-review").exists());
+    assert!(repo.run(&["delete", "nope", "--yes"]).unwrap_err().contains("no personal skill or rule named `nope`"));
+}
+
 /// `list` labels rules `rule`, leaves no trailing space for an item without
 /// a description, and speaks of Item IDs only when a pending pull holds them up.
 #[test]
