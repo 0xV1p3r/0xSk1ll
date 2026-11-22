@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::assignment::Assignment;
-use crate::hash::{copy_hash, hash_dir, hash_payload, hash_str};
+use crate::hash::{HashCache, Stamp, copy_hash, hash_dir, hash_payload, hash_str};
 use crate::instructions::{self, Rule};
 use crate::machine::{Harness, InstructionsFormat, LinkMode};
 use crate::skill::{ID_FILE, Origin, Skill};
@@ -53,7 +53,7 @@ fn import_source(path: &Path) -> bool {
 }
 
 /// What a copy of the repo skill at `source` leaves out.
-fn source_exclusion(source: &Path) -> Exclusion {
+pub(crate) fn source_exclusion(source: &Path) -> Exclusion {
     if import_source(source) { excluded_from_skill } else { excluded_from_personal_skill }
 }
 
@@ -147,18 +147,26 @@ enum Existing {
 pub mod unmanaged;
 
 /// Repo content, resolved once per plan and filtered per harness by assignment.
-struct Selection {
+struct Selection<'c> {
     skills: Vec<Skill>,
     rules: Vec<Rule>,
     /// Content hash of each repo skill a harness was compared against so
     /// far, by skill path: see [`Selection::source_hash`].
     source_hashes: RefCell<BTreeMap<PathBuf, String>>,
+    /// Where planning finds the hashes of trees unchanged since an earlier
+    /// plan (see [`plan_cached`]).
+    cache: Option<&'c HashCache>,
 }
 
-impl Selection {
-    fn new(repo: &Repo) -> Result<Self> {
+impl<'c> Selection<'c> {
+    fn new(repo: &Repo, cache: Option<&'c HashCache>) -> Result<Self> {
         let (skills, rules) = repo.content()?;
-        Ok(Self { skills, rules, source_hashes: RefCell::default() })
+        Ok(Self { skills, rules, source_hashes: RefCell::default(), cache })
+    }
+
+    /// One look at a skill destination, for planning.
+    fn observe(&self, dest: &Path) -> Result<Observed> {
+        observe_skill_with(dest, self.cache)
     }
 
     /// Content hash of a repo skill, taken once per plan however many
@@ -170,7 +178,10 @@ impl Selection {
         if let Some(hash) = self.source_hashes.borrow().get(&skill.path) {
             return Ok(hash.clone());
         }
-        let hash = deploy_hash(&skill.path)?;
+        let hash = match self.cache {
+            Some(cache) => cache.deploy_hash(&skill.path)?,
+            None => deploy_hash(&skill.path)?,
+        };
         self.source_hashes.borrow_mut().insert(skill.path.clone(), hash.clone());
         Ok(hash)
     }
@@ -199,7 +210,32 @@ pub fn plan(
     assignment: &Assignment,
     opts: PlanOptions,
 ) -> Result<Vec<Action>> {
-    let sel = Selection::new(repo)?;
+    plan_with(repo, harnesses, assignment, opts, None)
+}
+
+/// [`plan`], taking the hashes of skill trees (repo sources and harness
+/// placements) unchanged since an earlier plan from `cache`. The plan is the
+/// same as [`plan`]'s, except that a change [`HashCache`] cannot see (one
+/// within its racy window) waits for the next plan; `apply` checks every
+/// action against the destination as it is, not as the cache has it.
+pub fn plan_cached(
+    repo: &Repo,
+    harnesses: &BTreeMap<String, Harness>,
+    assignment: &Assignment,
+    opts: PlanOptions,
+    cache: &HashCache,
+) -> Result<Vec<Action>> {
+    plan_with(repo, harnesses, assignment, opts, Some(cache))
+}
+
+fn plan_with(
+    repo: &Repo,
+    harnesses: &BTreeMap<String, Harness>,
+    assignment: &Assignment,
+    opts: PlanOptions,
+    cache: Option<&HashCache>,
+) -> Result<Vec<Action>> {
+    let sel = Selection::new(repo, cache)?;
     let mut actions = Vec::new();
     for (hname, harness) in harnesses {
         plan_skills(repo, hname, harness, &sel, &sel.skills_for(assignment, hname), opts, &mut actions)?;
@@ -214,6 +250,33 @@ pub fn plan(
     Ok(actions)
 }
 
+/// A cheap fingerprint of everything in `harness` that planning its sync
+/// reads, from `lstat` alone (see [`Stamp`]): its skills directory's own
+/// entries, the whole tree of each one its ownership index records (and of
+/// a change in progress), the index and sk1ll's scratch and recovery area,
+/// and its instructions file or rules directory. Unmanaged content below a
+/// skills directory's own entries is left out, since planning does not look
+/// into it. Equal fingerprints mean planning would see the same harness.
+pub fn harness_fingerprint(harness: &Harness) -> Result<String> {
+    let mut parts = Vec::new();
+    if let Some(dir) = harness.skills_dir() {
+        fn own_entries(depth: usize, _: &std::ffi::OsStr) -> bool {
+            depth > 1
+        }
+        parts.push(Stamp::of(&dir, Some(own_entries), false)?.digest().to_string());
+        let index = load_index(&dir)?;
+        let names: BTreeSet<&str> =
+            index.entries.keys().chain(index.pending.keys()).map(String::as_str).chain([INDEX_DIR, TMP_DIR]).collect();
+        for name in names {
+            parts.push(format!("{name}\0{}", Stamp::of(&dir.join(name), None, false)?.digest()));
+        }
+    }
+    if let Some(path) = harness.instructions_file() {
+        parts.push(Stamp::of(&path, None, false)?.digest().to_string());
+    }
+    Ok(hash_str(&parts.join("\n")))
+}
+
 /// The instruction files a harness would receive, for previewing.
 pub fn render_instructions(
     repo: &Repo,
@@ -226,7 +289,7 @@ pub fn render_instructions(
     let Some(path) = h.instructions_file() else {
         return Ok(Vec::new());
     };
-    let sel = Selection::new(repo)?;
+    let sel = Selection::new(repo, None)?;
     let rules = sel.rules_for(assignment, harness);
     Ok(match h.instructions_format {
         InstructionsFormat::Block => {
@@ -265,7 +328,7 @@ pub fn instruction_file_text(file: &RenderedFile, format: InstructionsFormat) ->
 /// off, or as a Conflict when it was edited by hand. Content sk1ll doesn't
 /// manage is left out. Side-effect free; harness changes list it with this.
 pub fn placed(repo: &Repo, hname: &str, harness: &Harness) -> Result<Vec<Action>> {
-    let sel = Selection { skills: Vec::new(), rules: Vec::new(), source_hashes: RefCell::default() };
+    let sel = Selection { skills: Vec::new(), rules: Vec::new(), source_hashes: RefCell::default(), cache: None };
     let opts = PlanOptions::default();
     let mut skills = Vec::new();
     plan_skills(repo, hname, harness, &sel, &[], opts, &mut skills)?;
@@ -316,7 +379,7 @@ fn plan_skills(
     repo: &Repo,
     hname: &str,
     harness: &Harness,
-    sel: &Selection,
+    sel: &Selection<'_>,
     skills: &[&Skill],
     opts: PlanOptions,
     actions: &mut Vec<Action>,
@@ -356,7 +419,7 @@ fn plan_skills(
         }
         seen_names.insert(skill.name.clone());
         let dest = dir.join(&skill.name);
-        let seen = observe_skill(&dest)?;
+        let seen = sel.observe(&dest)?;
         let recorded = index.get(&skill.name);
         if let Err(e) = refuse_source_marker(&skill.path) {
             actions.push(action(&skill.name, ActionKind::Conflict, Some(skill), seen, Some(e.to_string())));
@@ -420,7 +483,7 @@ fn plan_skills(
             if recorded.is_none() && !entry.file_type().at(entry.path())?.is_symlink() {
                 continue;
             }
-            let seen = observe_skill(&entry.path())?;
+            let seen = sel.observe(&entry.path())?;
             match classify(repo.root(), &entry.path(), None, recorded)? {
                 Existing::ManagedCopy(_) | Existing::ManagedLink(_)
                     if !opts.force && recorded.is_some_and(|entry| seen.edited(entry)) =>
@@ -940,6 +1003,16 @@ impl Observed {
 
 /// Snapshot the entry itself, never following a skill symlink into the repo.
 fn observe_skill(dest: &Path) -> Result<Observed> {
+    observe_skill_with(dest, None)
+}
+
+/// [`observe_skill`], with the payload hash taken from `cache` while the
+/// destination is unchanged: only for planning.
+fn observe_skill_with(dest: &Path, cache: Option<&HashCache>) -> Result<Observed> {
+    let hash_payload = |path: &Path| match cache {
+        Some(cache) => cache.payload_hash(path),
+        None => hash_payload(path),
+    };
     let meta = match fs::symlink_metadata(dest) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Observed { state: None, payload: None }),
@@ -3575,6 +3648,66 @@ mod tests {
         assert!(fs::symlink_metadata(path).unwrap().file_type().is_file());
         assert_eq!(fs::read_to_string(&victim).unwrap(), "victim\n");
         assert!(fs::symlink_metadata(&planted).unwrap().file_type().is_symlink());
+    }
+
+    /// A cached plan reads no unchanged tree, and sees a change to any. A
+    /// stale cache entry can only make a plan stale: `apply` checks the
+    /// destination itself and keeps an edit the plan missed.
+    #[test]
+    fn a_cached_plan_rereads_only_changed_trees_and_apply_checks_the_real_one() {
+        let (tmp, repo, harnesses) = skill_setup(LinkMode::Copy);
+        let mut assignment = Assignment::default();
+        apply(&repo, &plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap()[0]).unwrap();
+        let cache = HashCache::with_racy_window(Duration::ZERO);
+        let cached = |assignment: &Assignment| {
+            plan_cached(&repo, &harnesses, assignment, PlanOptions::default(), &cache).unwrap()
+        };
+        assert!(cached(&assignment).is_empty());
+        let read = cache.hashed();
+        assert_eq!(read, 2, "the source and the placement");
+        assert!(cached(&assignment).is_empty());
+        assert_eq!(cache.hashed(), read, "nothing changed: nothing read");
+
+        let dest = tmp.path().join("skills/pdf");
+        let placed = hash_payload(&dest).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        write(&dest.join("SKILL.md"), "Edited in the harness.\n");
+        let actions = cached(&assignment);
+        assert_eq!(cache.hashed(), read + 1);
+        assert_eq!(actions.iter().map(|a| a.kind).collect::<Vec<_>>(), [ActionKind::Conflict]);
+
+        // A stale entry says the edited copy is still as placed: turned
+        // off, the plan removes it, and `apply` refuses.
+        cache.remember_payload(&dest, &placed);
+        let id = repo.skills().unwrap()[0].id.clone().unwrap();
+        assignment.set_skill("h", &id, false);
+        let actions = cached(&assignment);
+        assert_eq!(actions.iter().map(|a| a.kind).collect::<Vec<_>>(), [ActionKind::Remove]);
+        assert!(apply(&repo, &actions[0]).is_err());
+        assert_eq!(fs::read_to_string(dest.join("SKILL.md")).unwrap(), "Edited in the harness.\n");
+        let fresh = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
+        assert_eq!(fresh.iter().map(|a| a.kind).collect::<Vec<_>>(), [ActionKind::Conflict]);
+    }
+
+    /// The harness fingerprint changes with what planning reads in it, and
+    /// not with unmanaged content below the skills directory's own entries.
+    #[test]
+    fn the_harness_fingerprint_follows_what_planning_reads() {
+        let (tmp, repo, harnesses) = skill_setup(LinkMode::Copy);
+        let harness = &harnesses["h"];
+        let before = harness_fingerprint(harness).unwrap();
+        assert_eq!(harness_fingerprint(harness).unwrap(), before);
+        apply(&repo, &plan(&repo, &harnesses, &Assignment::default(), PlanOptions::default()).unwrap()[0]).unwrap();
+        let placed = harness_fingerprint(harness).unwrap();
+        assert_ne!(placed, before);
+        write(&tmp.path().join("skills/mine/SKILL.md"), "Mine.\n");
+        let unmanaged = harness_fingerprint(harness).unwrap();
+        assert_ne!(unmanaged, placed, "a new entry of its own");
+        write(&tmp.path().join("skills/mine/SKILL.md"), "Edited, unmanaged.\n");
+        assert_eq!(harness_fingerprint(harness).unwrap(), unmanaged, "not looked into");
+        std::thread::sleep(Duration::from_millis(30));
+        write(&tmp.path().join("skills/pdf/SKILL.md"), "Edited, managed.\n");
+        assert_ne!(harness_fingerprint(harness).unwrap(), unmanaged);
     }
 
     #[test]

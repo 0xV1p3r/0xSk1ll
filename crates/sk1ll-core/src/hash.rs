@@ -406,6 +406,220 @@ fn target_bytes(to: &Path) -> Vec<u8> {
     }
 }
 
+/// How a tree looked to `lstat`, without reading any file: each entry's path
+/// below the root, device, inode, mode and owner, and for all but
+/// directories its size, mtime and ctime. Any write, rename, `chmod`,
+/// `chown`, extended attribute change or `utimes` call changes an entry's
+/// ctime, which nobody can set by hand, so two equal stamps of a tree taken
+/// at different times mean that no entry was changed in between, unless both
+/// changes fell within one tick of the filesystem's timestamps (see
+/// [`HashCache`]). A directory's timestamps only say that an entry was
+/// added or removed, which its entries show, or that a temporary file came
+/// and went (git's lock files do, all the time), so they are left out: the
+/// extended attributes of a directory are thus the one change a stamp misses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stamp {
+    digest: String,
+    /// Latest mtime or ctime of any entry, in nanoseconds since the epoch.
+    newest: i128,
+}
+
+impl Stamp {
+    /// A fingerprint of the stamp, to compare or record.
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    /// Whether every entry was last changed more than `window` before
+    /// `at`: only then does an equal stamp taken later prove that nothing
+    /// changed, since a write within one tick of the filesystem's clock may
+    /// leave every timestamp as it was.
+    pub fn settled(&self, at: std::time::SystemTime, window: std::time::Duration) -> bool {
+        at.checked_sub(window)
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .is_some_and(|t| self.newest < t.as_nanos() as i128)
+    }
+
+    /// `path` and everything below it that `exclude` keeps (`follow_root`:
+    /// a symlink at the root is walked into, as [`hash_dir`] does). A missing
+    /// path has a stamp of its own.
+    pub fn of(path: &Path, exclude: Option<Exclusion>, follow_root: bool) -> Result<Self> {
+        let mut hasher = Sha256::new();
+        let mut newest = i128::MIN;
+        let walker = WalkDir::new(path)
+            .follow_root_links(follow_root)
+            .sort_by_file_name()
+            .into_iter()
+            .filter_entry(|e| e.depth() == 0 || exclude.is_none_or(|exclude| !exclude(e.depth(), e.file_name())));
+        for entry in walker {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) if e.depth() == 0 && e.io_error().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) => {
+                    return Ok(Self { digest: hash_str("missing"), newest });
+                }
+                Err(e) => return Err(std::io::Error::from(e)).at(path),
+            };
+            let meta = entry.metadata().map_err(std::io::Error::from).at(entry.path())?;
+            let rel = path_bytes(entry.path().strip_prefix(path).unwrap_or(entry.path()));
+            hasher.update((rel.len() as u64).to_le_bytes());
+            hasher.update(&rel);
+            let (stat, latest) = stat_of(&meta);
+            hasher.update(stat);
+            newest = newest.max(latest);
+        }
+        Ok(Self { digest: format!("stamp:{}", hex(&hasher.finalize())), newest })
+    }
+}
+
+/// The parts of `meta` a [`Stamp`] compares, and the entry's latest mtime or
+/// ctime (none for a directory).
+fn stat_of(meta: &fs::Metadata) -> (Vec<u8>, i128) {
+    let nanos = |t: std::io::Result<std::time::SystemTime>| {
+        t.ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos() as i128)
+    };
+    let mut out = Vec::with_capacity(64);
+    #[cfg(unix)]
+    let changed = {
+        use std::os::unix::fs::MetadataExt;
+        for n in [meta.dev(), meta.ino(), u64::from(meta.mode()), u64::from(meta.uid()), u64::from(meta.gid())] {
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+        i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec())
+    };
+    #[cfg(not(unix))]
+    let changed = {
+        out.push(u8::from(meta.permissions().readonly()));
+        out.push(u8::from(meta.is_dir()));
+        nanos(meta.created())
+    };
+    if meta.is_dir() {
+        return (out, i128::MIN);
+    }
+    let modified = nanos(meta.modified());
+    for n in [i128::from(meta.len()), modified, changed] {
+        out.extend_from_slice(&n.to_le_bytes());
+    }
+    (out, modified.max(changed))
+}
+
+/// Remembers the content hashes of trees by their [`Stamp`], so a tree that
+/// is unchanged since it was last hashed is not read again.
+///
+/// Only planning uses it (what a sync would do, and what to show): every
+/// step that replaces or deletes content, P7's [`remove_payload`] and the
+/// checks `apply` makes of a destination against its plan, hashes the
+/// filesystem as it is, never through this cache. A stale entry can thus at
+/// worst make a plan miss a change until the tree's next change, never make
+/// sync delete or overwrite something it should not.
+///
+/// A hash is remembered only if the tree's stamp was the same before and
+/// after hashing it, and every entry's mtime and ctime are older than the
+/// racy window before hashing began: a file written again within one tick of
+/// the filesystem's clock (a second, on some filesystems) after it was
+/// stamped could otherwise keep its ctime, size and inode with new content.
+/// Such a tree is hashed again each time until it has been left alone for
+/// that long.
+pub struct HashCache {
+    racy: std::time::Duration,
+    entries: std::sync::Mutex<std::collections::HashMap<(std::path::PathBuf, Tree), Cached>>,
+    hashed: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Tree {
+    Deploy,
+    Payload,
+}
+
+struct Cached {
+    stamp: String,
+    hash: String,
+    used: bool,
+}
+
+impl Default for HashCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HashCache {
+    /// Two seconds: more than the coarsest timestamps of a common filesystem.
+    pub const RACY_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+    pub fn new() -> Self {
+        Self::with_racy_window(Self::RACY_WINDOW)
+    }
+
+    /// A cache that remembers hashes of trees changed less than `racy` ago
+    /// (tests use zero, to remember trees they just wrote).
+    pub fn with_racy_window(racy: std::time::Duration) -> Self {
+        Self { racy, entries: Default::default(), hashed: Default::default() }
+    }
+
+    /// [`crate::sync::deploy_hash`] of the repo skill at `source`.
+    pub fn deploy_hash(&self, source: &Path) -> Result<String> {
+        let exclude = crate::sync::source_exclusion(source);
+        self.hash(source, Tree::Deploy, || Stamp::of(source, Some(exclude), true), || crate::sync::deploy_hash(source))
+    }
+
+    /// [`hash_payload`] of `path`.
+    pub(crate) fn payload_hash(&self, path: &Path) -> Result<String> {
+        self.hash(path, Tree::Payload, || Stamp::of(path, None, false), || hash_payload(path))
+    }
+
+    /// Makes `path`'s payload, as it is now, hash to `hash`: a stale entry,
+    /// to show what a plan with one does.
+    #[cfg(test)]
+    pub(crate) fn remember_payload(&self, path: &Path, hash: &str) {
+        let stamp = Stamp::of(path, None, false).unwrap().digest;
+        let mut entries = self.entries.lock().unwrap();
+        entries.insert((path.to_path_buf(), Tree::Payload), Cached { stamp, hash: hash.into(), used: true });
+    }
+
+    /// How many trees were read and hashed, rather than found unchanged.
+    pub fn hashed(&self) -> u64 {
+        self.hashed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Forgets every tree not looked up since the last sweep.
+    pub fn sweep(&self) {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries.retain(|_, cached| std::mem::take(&mut cached.used));
+    }
+
+    fn hash(
+        &self,
+        path: &Path,
+        tree: Tree,
+        stamp: impl Fn() -> Result<Stamp>,
+        hash: impl FnOnce() -> Result<String>,
+    ) -> Result<String> {
+        let started = std::time::SystemTime::now();
+        let before = stamp()?;
+        let key = (path.to_path_buf(), tree);
+        {
+            let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(cached) = entries.get_mut(&key)
+                && cached.stamp == before.digest
+            {
+                cached.used = true;
+                return Ok(cached.hash.clone());
+            }
+        }
+        let value = hash()?;
+        self.hashed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let unchanged = before.settled(started, self.racy) && stamp()? == before;
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if unchanged {
+            entries.insert(key, Cached { stamp: before.digest, hash: value.clone(), used: true });
+        } else {
+            entries.remove(&key);
+        }
+        Ok(value)
+    }
+}
+
 pub fn hash_str(text: &str) -> String {
     hash_bytes(text.as_bytes())
 }
@@ -660,5 +874,76 @@ pub(crate) mod tests {
         fs::remove_file(y.join(OsStr::from_bytes(b"f\xff"))).unwrap();
         write(&y.join(OsStr::from_bytes(b"f\xfe")), "same\n");
         assert_ne!(hash_dir(&x).unwrap(), hash_dir(&y).unwrap());
+    }
+
+    /// The cache sees every change `lstat` can: new content written over a
+    /// file with its mtime put back (ctime), a file replaced by another with
+    /// the same size and mtime (inode), a resize, a new file.
+    #[test]
+    fn the_cache_rehashes_a_tree_whose_content_changed_with_the_same_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("personal/pdf");
+        write(&dir.join("SKILL.md"), "aaaa");
+        let cache = HashCache::with_racy_window(std::time::Duration::ZERO);
+        let first = cache.deploy_hash(&dir).unwrap();
+        assert_eq!((cache.hashed(), cache.deploy_hash(&dir).unwrap()), (1, first.clone()));
+        assert_eq!(cache.hashed(), 1, "unchanged: not read again");
+
+        let file = dir.join("SKILL.md");
+        let mtime = fs::metadata(&file).unwrap().modified().unwrap();
+        let tick = || std::thread::sleep(std::time::Duration::from_millis(30));
+        type Change<'a> = Box<dyn Fn() + 'a>;
+        let changes: [(&str, &str, Change); 4] = [
+            ("rewritten, mtime kept", "bbbb", Box::new(|| fs::write(&file, "bbbb").unwrap())),
+            (
+                "replaced, mtime kept",
+                "cccc",
+                Box::new(|| {
+                    let other = tmp.path().join("other");
+                    fs::write(&other, "cccc").unwrap();
+                    fs::File::options().write(true).open(&other).unwrap().set_modified(mtime).unwrap();
+                    fs::rename(&other, &file).unwrap();
+                }),
+            ),
+            ("resized", "dddddd", Box::new(|| fs::write(&file, "dddddd").unwrap())),
+            ("a new file", "dddddd", Box::new(|| fs::write(dir.join("new.md"), "").unwrap())),
+        ];
+        let mut previous = first;
+        for (n, (case, content, change)) in changes.iter().enumerate() {
+            tick();
+            change();
+            fs::File::options().write(true).open(&file).unwrap().set_modified(mtime).unwrap();
+            assert_eq!(fs::metadata(&file).unwrap().modified().unwrap(), mtime);
+            assert_eq!(fs::read_to_string(&file).unwrap(), *content);
+            let hash = cache.deploy_hash(&dir).unwrap();
+            assert_eq!(hash, crate::sync::deploy_hash(&dir).unwrap(), "{case}");
+            assert_ne!(hash, previous, "{case}");
+            assert_eq!(cache.hashed(), 2 + n as u64, "{case}");
+            previous = hash;
+        }
+        // The cache forgets what no plan looked up since the last sweep.
+        cache.sweep();
+        cache.sweep();
+        cache.deploy_hash(&dir).unwrap();
+        assert_eq!(cache.hashed(), 6);
+    }
+
+    /// A tree written within the racy window is hashed every time, until it
+    /// has been left alone for that long.
+    #[test]
+    fn a_tree_changed_within_the_racy_window_is_not_remembered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("payload");
+        write(&dir.join("f"), "f");
+        let cache = HashCache::with_racy_window(std::time::Duration::from_secs(3600));
+        for n in 1..=2 {
+            assert_eq!(cache.payload_hash(&dir).unwrap(), hash_payload(&dir).unwrap());
+            assert_eq!(cache.hashed(), n);
+        }
+        let settled = HashCache::with_racy_window(std::time::Duration::ZERO);
+        settled.payload_hash(&dir).unwrap();
+        settled.payload_hash(&dir).unwrap();
+        assert_eq!(settled.hashed(), 1);
+        assert_ne!(Stamp::of(&dir, None, false).unwrap(), Stamp::of(&tmp.path().join("none"), None, false).unwrap());
     }
 }
