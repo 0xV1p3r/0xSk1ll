@@ -126,10 +126,13 @@ impl Daemon {
         self.ensure_managed()?;
         self.lock_repo(eng)?;
         Self::require_sync_ready(&Repo::open_git_only(self.repo_root())?)?;
+        self.refresh_assignment()?;
+        let Some(snapshot) = self.applied() else {
+            return Err(Error::Conflict(
+                "waiting for the server's assignment; the harnesses are left alone until it arrives".into(),
+            ));
+        };
         let reviewed = if let Some(fingerprint) = fingerprint {
-            self.refresh_assignment()?;
-            let snapshot =
-                self.applied().ok_or_else(|| Error::Conflict("waiting for the server's assignment".into()))?;
             let root = self.repo_root();
             let lock = eng.lock.as_ref().ok_or_else(|| Error::Conflict(format!("{} is not locked", root.display())))?;
             let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();

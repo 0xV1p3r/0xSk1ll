@@ -39,6 +39,8 @@ pub(crate) fn router(d: Arc<Daemon>) -> Router {
         .route("/status", get(status))
         .route("/init", post(init))
         .route("/items", get(items))
+        .route("/repo", get(repo_content))
+        .route("/items/editable", get(editable))
         .route("/skills", get(skills))
         .route("/skills/tree", get(skill_tree))
         .route(
@@ -249,12 +251,32 @@ struct ReadQuery {
 
 impl ReadQuery {
     async fn snapshot(&self, d: &Arc<Daemon>) -> Result<Arc<crate::daemon::Snapshot>> {
-        if self.fresh { d.fresh().await } else { Ok(d.caught_up().await) }
+        if self.fresh { d.fresh().await } else { d.caught_up().await }
     }
 }
 
 async fn items(State(d): St, Query(q): Query<ReadQuery>) -> Result<Json<Vec<ItemView>>> {
     Ok(Json(q.snapshot(&d).await?.items()?))
+}
+
+/// Read from the working tree, after catching up (`?fresh=true`: as of now,
+/// see [`ReadQuery`]), so new items have their Item IDs.
+async fn repo_content(State(d): St, Query(q): Query<ReadQuery>) -> Result<Json<crate::client::RepoContent>> {
+    if q.fresh {
+        d.fresh().await?;
+    } else {
+        let _ = d.caught_up().await;
+    }
+    Ok(Json(d.reading(|d| d.repo_content()).await?))
+}
+
+#[derive(Deserialize)]
+struct EditableQuery {
+    item: String,
+}
+
+async fn editable(State(d): St, Query(q): Query<EditableQuery>) -> Result<Json<PathBuf>> {
+    Ok(Json(d.reading(move |d| d.editable(&q.item)).await?))
 }
 
 async fn draft(State(d): St, Query(q): Query<ReadQuery>) -> Result<Json<Vec<DraftEntry>>> {
@@ -599,7 +621,7 @@ async fn rename_item(
 /// running, so the read could not catch up) is looked up in a fresh one
 /// before it counts as gone.
 async fn conflict_diff(State(d): St, Json(req): Json<crate::client::ConflictDiffRequest>) -> Result<Json<DiffView>> {
-    let mut snapshot = d.caught_up().await;
+    let mut snapshot = d.caught_up().await?;
     if req.id.is_none() && !matches!(snapshot.conflict(&req), Ok(Some(_))) {
         snapshot = d.fresh().await?;
     }

@@ -42,9 +42,10 @@ pub(crate) trait AssignmentStore: Send + Sync {
     /// Who may finish a pending Harness rename intent (see [`RenameIntent`]).
     fn rename_authority(&self) -> Option<String>;
 
-    /// Whether a write is worth trying now: checked before work a write
-    /// depends on (an Adopt publishes the skill first).
-    fn writable(&self, d: &Daemon) -> bool;
+    /// Whether a write can be sent now, without the engine mutex: checked
+    /// before work a write depends on (an Adopt publishes the skill first).
+    /// A daemon that connects on demand connects here.
+    fn ready<'a>(&'a self, d: &'a Arc<Daemon>) -> BoxFuture<'a, Result<()>>;
 
     /// Sends `write` where the Assignment lives and returns what it
     /// confirmed. Called without the engine mutex, one write at a time.
@@ -116,9 +117,8 @@ impl AssignmentStore for ServerAssignment {
         Some(self.owner.clone())
     }
 
-    fn writable(&self, d: &Daemon) -> bool {
-        // One that connects on demand connects for the write.
-        d.is_connected() || d.on_demand()
+    fn ready<'a>(&'a self, d: &'a Arc<Daemon>) -> BoxFuture<'a, Result<()>> {
+        Box::pin(server::connected(d))
     }
 
     fn send<'a>(&'a self, d: &'a Arc<Daemon>, write: AssignmentWrite) -> BoxFuture<'a, Result<AssignmentUpdate>> {
@@ -189,8 +189,8 @@ impl AssignmentStore for LocalAssignment {
         None
     }
 
-    fn writable(&self, _: &Daemon) -> bool {
-        true
+    fn ready<'a>(&'a self, _: &'a Arc<Daemon>) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async { Ok(()) })
     }
 
     /// The file is where the Assignment lives: the write is made to it under

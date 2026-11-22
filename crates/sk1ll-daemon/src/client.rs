@@ -1,11 +1,14 @@
 //! The daemon's local API: request and response types, and a small async
 //! client for it. The CLI and the GUI use this to talk to the daemon over
-//! its Unix domain socket (HTTP/1.1 + JSON).
+//! its Unix domain socket (HTTP/1.1 + JSON), or the CLI to an engine in its
+//! own process when no daemon runs ([`crate::local`]), with the same requests.
 //!
 //! | Method | Path | Body → Response |
 //! |---|---|---|
 //! | GET | `/status` | → [`StatusView`] |
 //! | GET | `/items` | → `Vec<`[`ItemView`]`>` |
+//! | GET | `/repo` | → [`RepoContent`]: the repo's skills, rules and imports as `sk1ll list` and `status` show them |
+//! | GET | `/items/editable?item=` | → the file an editor opens for a personal Skill or Rule |
 //! | GET | `/skills` | → `Vec<ContentEntry>` |
 //! | GET | `/skills/tree?item=skill:pdf` | → `Vec<FileEntry>` |
 //! | GET | `/skills/file?item=skill:pdf&path=SKILL.md` | → `FileContent` |
@@ -67,9 +70,9 @@
 
 use std::path::{Path, PathBuf};
 
+use axum::body::Body;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
 use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::de::DeserializeOwned;
@@ -183,6 +186,17 @@ pub struct ItemView {
     pub description: Option<String>,
 }
 
+/// `GET /repo`: the repo's content as `sk1ll list` and `sk1ll status` show
+/// it, read from the working tree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoContent {
+    pub skills: Vec<sk1ll_core::Skill>,
+    pub rules: Vec<sk1ll_core::Rule>,
+    pub imports: Vec<sk1ll_core::ImportStatus>,
+    /// A pull stopped half-way and has to finish first.
+    pub pull_pending: bool,
+}
+
 /// One draft item (`GET /draft`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DraftEntry {
@@ -288,6 +302,9 @@ pub struct ConflictView {
     pub reason: Option<String>,
     /// Only copied skills and rule files can be adopted, not `block` instructions.
     pub adoptable: bool,
+    /// A recovered entry written to while sk1ll replaced it: a conflict.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub changed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -683,15 +700,37 @@ impl ClientError {
 
 pub type Result<T> = std::result::Result<T, ClientError>;
 
-/// Talks to a daemon's local API; one connection per request.
-#[derive(Debug, Clone)]
+/// Talks to a daemon's local API: over its socket, one connection per
+/// request, or to an engine in this process ([`crate::local`]).
+#[derive(Clone)]
 pub struct Client {
-    socket: PathBuf,
+    transport: Transport,
+}
+
+#[derive(Clone)]
+enum Transport {
+    Socket(PathBuf),
+    /// The local API of an engine in this process, called directly.
+    InProcess(axum::Router),
+}
+
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.transport {
+            Transport::Socket(socket) => f.debug_tuple("Client").field(socket).finish(),
+            Transport::InProcess(_) => f.write_str("Client(in process)"),
+        }
+    }
 }
 
 impl Client {
     pub fn new(socket: impl Into<PathBuf>) -> Self {
-        Self { socket: socket.into() }
+        Self { transport: Transport::Socket(socket.into()) }
+    }
+
+    /// A client of the engine whose local API `router` serves, in this process.
+    pub(crate) fn in_process(router: axum::Router) -> Self {
+        Self { transport: Transport::InProcess(router) }
     }
 
     /// A client for the default socket (see [`crate::Config::default_socket`]).
@@ -699,21 +738,15 @@ impl Client {
         Ok(Self::new(crate::Config::default_socket()?))
     }
 
+    /// The daemon's socket; empty for an engine in this process.
     pub fn socket(&self) -> &Path {
-        &self.socket
+        match &self.transport {
+            Transport::Socket(socket) => socket,
+            Transport::InProcess(_) => Path::new(""),
+        }
     }
 
-    async fn send(&self, method: Method, path: &str, body: Option<Vec<u8>>) -> Result<hyper::Response<Incoming>> {
-        let stream = UnixStream::connect(&self.socket).await.map_err(|e| {
-            let not_running = matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused);
-            let message = format!("cannot reach the daemon at {}: {e}", self.socket.display());
-            ClientError { status: None, message, not_running }
-        })?;
-        let (mut sender, conn) =
-            hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.map_err(ClientError::transport)?;
-        tokio::spawn(async move {
-            let _ = conn.await;
-        });
+    async fn send(&self, method: Method, path: &str, body: Option<Vec<u8>>) -> Result<hyper::Response<Body>> {
         let mut req = Request::builder()
             .method(method)
             .uri(path)
@@ -723,7 +756,26 @@ impl Client {
             req = req.header(hyper::header::CONTENT_TYPE, "application/json");
         }
         let req = req.body(Full::new(Bytes::from(body.unwrap_or_default()))).map_err(ClientError::transport)?;
-        sender.send_request(req).await.map_err(ClientError::transport)
+        let socket = match &self.transport {
+            Transport::InProcess(router) => {
+                use tower::ServiceExt;
+                let response = router.clone().oneshot(req.map(Body::new)).await;
+                return Ok(response.unwrap_or_else(|never| match never {}));
+            }
+            Transport::Socket(socket) => socket,
+        };
+        let stream = UnixStream::connect(socket).await.map_err(|e| {
+            let not_running = matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused);
+            let message = format!("cannot reach the daemon at {}: {e}", socket.display());
+            ClientError { status: None, message, not_running }
+        })?;
+        let (mut sender, conn) =
+            hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.map_err(ClientError::transport)?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let response = sender.send_request(req).await.map_err(ClientError::transport)?;
+        Ok(response.map(Body::new))
     }
 
     /// Sends a request and returns the response body of a 2xx response.
@@ -785,6 +837,15 @@ impl Client {
     }
 
     /// [`Client::items`] as of now: waits for a running engine operation.
+    /// `fresh`: as of now, with missing Item IDs written (see [`Client::items_fresh`]).
+    pub async fn repo(&self, fresh: bool) -> Result<RepoContent> {
+        self.get(if fresh { "/repo?fresh=true" } else { "/repo" }).await
+    }
+
+    pub async fn editable(&self, item: &str) -> Result<PathBuf> {
+        self.get(&format!("/items/editable?item={}", encode(item))).await
+    }
+
     pub async fn items_fresh(&self) -> Result<Vec<ItemView>> {
         self.get("/items?fresh=true").await
     }
@@ -1122,7 +1183,7 @@ impl Client {
 
 /// Server-sent events from `GET /events`.
 pub struct EventStream {
-    body: Incoming,
+    body: Body,
     buf: String,
 }
 

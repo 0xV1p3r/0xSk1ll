@@ -1229,3 +1229,158 @@ async fn a_conflict_diff_while_the_engine_is_busy_waits_for_a_fresh_snapshot() {
     assert!(diff.contains("-Harness edit") && diff.contains("+PDFs."), "{diff}");
     server.abort();
 }
+
+/// A real server on a runtime of its own, and an engine that connects to
+/// it on demand (as the CLI's does) for a Machine `a` joined with its admin
+/// token: one harness `h`, and a skill `x` with an Item ID in its Draft.
+struct OnDemand {
+    d: Arc<Daemon>,
+    url: String,
+    http: reqwest::Client,
+    _dir: tempfile::TempDir,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+const ADMIN: &str = "admin-secret";
+
+impl OnDemand {
+    async fn start() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let (port_tx, port_rx) = std::sync::mpsc::channel();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let data = dir.path().join("server");
+        let thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                port_tx.send(listener.local_addr().unwrap().port()).unwrap();
+                let mut config = sk1ll_server::Config::new(data);
+                config.admin_token = Some(ADMIN.into());
+                tokio::select! {
+                    r = sk1ll_server::serve(config, listener) => r.unwrap(),
+                    _ = stopped => {}
+                }
+            });
+        });
+        let url = format!("http://127.0.0.1:{}", port_rx.recv().unwrap());
+        let http = reqwest::Client::new();
+        for _ in 0..200 {
+            if http.get(format!("{url}/healthz")).send().await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let root = dir.path().join("repo");
+        let cfg = Config {
+            repo: Some(root.clone()),
+            state: dir.path().join("state/daemon.json"),
+            assignment: dir.path().join("assignment.json"),
+            machine_config: dir.path().join("machine.toml"),
+            socket: dir.path().join("daemon.sock"),
+            ..Config::new().unwrap()
+        };
+        let presets = sk1ll_core::machine::presets().map(|p| format!("[harnesses.{p}]\nenabled = false\n"));
+        std::fs::write(
+            &cfg.machine_config,
+            format!("id = \"a\"\n[harnesses.h]\nskills = {:?}\nmode = \"copy\"\n{}", dir.path().join("h"), {
+                presets.collect::<String>()
+            }),
+        )
+        .unwrap();
+        let opts = crate::JoinOptions {
+            server_url: url.clone(),
+            code: String::new(),
+            admin_token: Some(ADMIN.into()),
+            machine_id: Some("a".into()),
+            copy_from: None,
+            repo: root.clone(),
+        };
+        crate::join(&cfg, opts).await.unwrap();
+        std::fs::create_dir_all(root.join("personal/x")).unwrap();
+        std::fs::write(root.join("personal/x/SKILL.md"), "x\n").unwrap();
+        std::fs::write(root.join("personal/x/.sk1ll-id"), "id-x\n").unwrap();
+        let state = DaemonState::load(&cfg.state).unwrap();
+        let d = Daemon::for_machine(cfg, state, true).unwrap();
+        Self { d, url, http, _dir: dir, stop: Some(stop), thread: Some(thread) }
+    }
+
+    async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> T {
+        let resp = self.http.get(format!("{}/api{path}", self.url)).bearer_auth(ADMIN).send().await.unwrap();
+        assert!(resp.status().is_success(), "GET {path}: {}", resp.status());
+        resp.json().await.unwrap()
+    }
+}
+
+impl Drop for OnDemand {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// An engine that connects on demand starts the session for the write,
+/// reports its inventory first (the server materializes defaults by it) and
+/// stores the confirmed snapshot.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_on_demand_engine_connects_reports_and_stores_its_write() {
+    let fleet = OnDemand::start().await;
+    let d = &fleet.d;
+    assert!(!d.is_connected(), "nothing connects before a request needs it");
+    let x: sk1ll_core::ItemId = "id-x".parse().unwrap();
+    let toggle = sk1ll_proto::ToggleChange {
+        harness: "h".into(),
+        kind: sk1ll_proto::ToggleKind::Skill,
+        item_id: Some(x.clone()),
+        name: Some("x".into()),
+        enabled: Some(false),
+    };
+    let write = AssignmentWrite::Changes(sk1ll_proto::AssignmentChanges { changes: vec![toggle], expected: None });
+    let update = d.write_assignment(write).await.unwrap();
+    assert!(d.is_connected());
+    let fleet_view: sk1ll_proto::FleetView = fleet.get("/fleet").await;
+    let report = fleet_view.machines.into_iter().find(|m| m.id == "a").unwrap().report.unwrap();
+    assert!(report.items.iter().any(|item| item.id == x), "{report:?}");
+    let owner = d.ident.joined().unwrap().registration_key();
+    let stored = state::load_snapshot(&d.cfg.snapshot_path(), Some(&owner)).unwrap().unwrap();
+    assert_eq!(stored.revision, update.revision);
+    assert!(!stored.assignment.skill_enabled("h", &x));
+    assert_eq!(d.applied().unwrap().revision, update.revision);
+}
+
+/// A rename is prepared from the Assignment the server holds, not from a
+/// stale local one: a destination stored there meanwhile is protected.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_on_demand_rename_protects_a_destination_only_the_server_has() {
+    use sk1ll_core::harness_rename::RenameIntent;
+    let fleet = OnDemand::start().await;
+    let d = &fleet.d;
+    let saved: AssignmentUpdate = fleet
+        .http
+        .put(format!("{}/api/machines/a/assignment", fleet.url))
+        .bearer_auth(ADMIN)
+        .json(&serde_json::json!({"changes":[{
+            "harness":"already-stored","kind":"skill","item_id":"absent","enabled":true
+        }]}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(d.applied().is_none_or(|s| !s.assignment.harnesses.contains_key("already-stored")));
+    let before = std::fs::read(&d.cfg.machine_config).unwrap();
+    let request = crate::client::HarnessRenameRequest { from: "h".into(), to: "already-stored".into(), replace: false };
+    let error = d.rename_harness(request).await.unwrap_err();
+    assert!(error.to_string().contains("already has an Assignment"), "{error}");
+    assert_eq!(std::fs::read(&d.cfg.machine_config).unwrap(), before);
+    assert!(!RenameIntent::exists(&d.cfg.machine_config).unwrap());
+    let snapshot: AssignmentSnapshot = fleet.get("/machines/a/assignment").await;
+    assert_eq!((snapshot.revision, snapshot.assignment), (saved.revision, saved.assignment));
+}

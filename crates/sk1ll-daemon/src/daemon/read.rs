@@ -200,6 +200,21 @@ impl Daemon {
     }
 
     /// A reader: no engine mutex.
+    pub(crate) fn repo_content(&self) -> Result<crate::client::RepoContent> {
+        let repo = Repo::open(self.repo_root())?;
+        let pull_pending = repo.pull_pending()?;
+        let imports = if pull_pending { Vec::new() } else { repo.import_status()? };
+        Ok(crate::client::RepoContent { skills: repo.skills()?, rules: repo.rules()?, imports, pull_pending })
+    }
+
+    /// A reader: the file an editor opens for a personal Skill or Rule.
+    pub(crate) fn editable(&self, item: &str) -> Result<PathBuf> {
+        let repo = Repo::open(self.repo_root())?;
+        let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
+        Ok(sk1ll_core::content::editable_path(&repo, &harnesses, item)?)
+    }
+
+    /// A reader: no engine mutex.
     pub(crate) fn skills(&self) -> Result<Vec<sk1ll_core::content::ContentEntry>> {
         let repo = Repo::open(self.repo_root())?;
         let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();

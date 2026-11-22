@@ -20,6 +20,7 @@ mod daemon;
 mod error;
 pub mod join;
 mod lifecycle;
+pub mod local;
 mod notifications;
 mod remote;
 mod server;

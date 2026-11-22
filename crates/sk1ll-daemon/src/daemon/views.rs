@@ -33,6 +33,7 @@ pub(super) fn displaced_view(entry: sync::displaced::Entry, root: &Path) -> Conf
         detected_at: None,
         reason: None,
         adoptable: true,
+        changed: entry.changed,
     }
 }
 
@@ -94,6 +95,7 @@ pub(super) fn conflict_view(a: &Action) -> ConflictView {
         dest: a.dest.clone(),
         reason: a.reason.clone(),
         adoptable,
+        changed: false,
     }
 }
 

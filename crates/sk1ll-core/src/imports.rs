@@ -18,7 +18,7 @@ pub struct UpdateReport {
     pub changed: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ImportState {
     /// Vendored content matches the lockfile.
@@ -29,7 +29,7 @@ pub enum ImportState {
     Missing,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportStatus {
     pub name: String,
     pub state: ImportState,

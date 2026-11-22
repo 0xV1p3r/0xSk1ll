@@ -30,8 +30,8 @@ impl Daemon {
     pub(crate) async fn pull(self: &Arc<Self>) -> Result<PullResult> {
         self.blocking(move |d, eng| {
             d.ensure_managed()?;
-            d.remote.check(d.repo_root())?;
-            d.lock_repo(eng)
+            d.lock_repo(eng)?;
+            d.remote.check(d.repo_root())
         })
         .await?;
         self.prefilter_tries.store(0, std::sync::atomic::Ordering::SeqCst);
@@ -256,6 +256,8 @@ impl Daemon {
         self.blocking(|d, eng| {
             d.ensure_managed()?;
             d.lock_repo(eng)?;
+            // A pending pull's tree is partial: nothing of it is pushed (core refuses it too).
+            Repo::open_git_only(d.repo_root())?.require_no_pending_pull()?;
             d.remote.check(d.repo_root())
         })
         .await?;

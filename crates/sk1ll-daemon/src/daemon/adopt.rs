@@ -39,6 +39,13 @@ impl Daemon {
     /// without the engine mutex, between publishing the skill and removing
     /// the copies it came from.
     pub(crate) async fn adopt(self: &Arc<Self>, t: ConflictTarget) -> Result<()> {
+        let target = t.clone();
+        if self.reading(move |d| d.adopts_unmanaged(&target)).await? {
+            self.store
+                .ready(self)
+                .await
+                .map_err(|e| Error::Unavailable(format!("Adopt needs a connection to the Server ({e})")))?;
+        }
         let Some(pending) = self.blocking(move |d, eng| d.adopt_locally(eng, t)).await? else {
             self.retry_stopped_pull().await;
             return Ok(());
@@ -55,19 +62,13 @@ impl Daemon {
         self.lock_repo(eng)?;
         let repo = Repo::open(self.repo_root())?;
         let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
-        let unmanaged = sync::unmanaged::discover(&repo, &harnesses)?
-            .iter()
-            .any(|s| s.name == t.name && s.variants.iter().any(|v| v.locations.iter().any(|l| l.harness == t.harness)));
-        let adopted = if unmanaged { None } else { sync::unmanaged::adopted(&repo, &harnesses, &t.harness, &t.name)? };
+        let (unmanaged, adopted) = Self::unmanaged_adoption(&repo, &harnesses, &t)?;
         if !unmanaged && adopted.is_none() {
             let (repo, actions) = self.plan(false)?;
             sync::adopt(&repo, Self::find_conflict(&actions, &t)?)?;
             tracing::info!("adopted {} from {} into the draft", t.name, t.harness);
             self.reconcile(eng)?;
             return Ok(None);
-        }
-        if !self.store.writable(self) {
-            return Err(Error::Unavailable("Adopt needs a connection to the Server".into()));
         }
         // A pending pull's tree is partial: nothing is published into it.
         repo.require_no_pending_pull()?;
@@ -104,6 +105,29 @@ impl Daemon {
         // the Assignment has been confirmed.
         self.reconcile(eng)?;
         Ok(Some(PendingAdoption { adoption, created, id, changes, world }))
+    }
+
+    /// A reader: whether adopting `t` takes an unmanaged skill in (and so
+    /// writes Assignment), rather than a conflict's content.
+    pub(super) fn adopts_unmanaged(&self, t: &ConflictTarget) -> Result<bool> {
+        let repo = Repo::open(self.repo_root())?;
+        let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
+        let (unmanaged, adopted) = Self::unmanaged_adoption(&repo, &harnesses, t)?;
+        Ok(unmanaged || adopted.is_some())
+    }
+
+    /// Whether `t` is an unmanaged skill, and else the adoption of one that
+    /// an interrupted Adopt published already.
+    fn unmanaged_adoption(
+        repo: &Repo,
+        harnesses: &std::collections::BTreeMap<String, sk1ll_core::Harness>,
+        t: &ConflictTarget,
+    ) -> Result<(bool, Option<sync::unmanaged::Adoption>)> {
+        let unmanaged = sync::unmanaged::discover(repo, harnesses)?
+            .iter()
+            .any(|s| s.name == t.name && s.variants.iter().any(|v| v.locations.iter().any(|l| l.harness == t.harness)));
+        let adopted = if unmanaged { None } else { sync::unmanaged::adopted(repo, harnesses, &t.harness, &t.name)? };
+        Ok((unmanaged, adopted))
     }
 
     /// The Item ID of an adopted skill as the repo has it now.

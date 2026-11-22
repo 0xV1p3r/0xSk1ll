@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{ItemId, Result};
 
@@ -10,14 +10,14 @@ pub const PERSONAL_DIR: &str = "personal";
 pub const IMPORTED_DIR: &str = "imported";
 pub const ID_FILE: &str = ".sk1ll-id";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Origin {
     Personal,
     Imported,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Skill {
     pub id: Option<ItemId>,
     pub name: String,

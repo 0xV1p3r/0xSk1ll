@@ -23,8 +23,9 @@ impl Daemon {
     pub(crate) async fn update_imports(self: &Arc<Self>, req: UpdateImportsRequest) -> Result<Vec<ImportUpdated>> {
         let UpdateImportsRequest { name, force, expected } = req;
         let (root, todo) = self
-            .blocking(move |d, _| {
+            .blocking(move |d, eng| {
                 d.ensure_managed()?;
+                d.lock_repo(eng)?;
                 let todo = Repo::open(d.repo_root())?.update_targets(name.as_deref(), force)?;
                 Ok((d.repo_root().to_path_buf(), todo))
             })
@@ -100,7 +101,13 @@ impl Daemon {
 
     /// Adds an import, from a link or plain source, to the draft.
     pub(crate) async fn add_import(self: &Arc<Self>, req: AddImportRequest) -> Result<ImportUpdated> {
-        let root = self.blocking(|d, _| d.import_root()).await?;
+        // Refused at once, before the fetch, while another process changes the repo.
+        let root = self
+            .blocking(|d, eng| {
+                d.lock_repo(eng)?;
+                d.import_root()
+            })
+            .await?;
         let AddImportRequest { name, source, path, git_ref, commit } = req;
         // Staging runs checkout (and any smudge filter) here too, outside the mutex.
         let fetched = unlocked(move || {

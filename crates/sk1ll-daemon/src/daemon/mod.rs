@@ -407,25 +407,35 @@ impl Daemon {
     /// The Snapshot, brought up to date first if the engine is free, so a
     /// read right after an edit sees it: the reconcile skips at once if no
     /// Input changed. A reader never waits for an engine operation: while
-    /// one runs, it gets the Snapshot of the last reconcile.
-    pub(crate) async fn caught_up(self: &Arc<Self>) -> Arc<Snapshot> {
+    /// one runs, it gets the Snapshot of the last reconcile. Only when none
+    /// was ever published (an engine in a CLI process whose repo another
+    /// process is changing) is the reconcile's failure the answer.
+    pub(crate) async fn caught_up(self: &Arc<Self>) -> Result<Arc<Snapshot>> {
         let d = self.clone();
-        let _ = tokio::task::spawn_blocking(move || {
+        let failed = tokio::task::spawn_blocking(move || {
             let mut eng = match d.engine.try_lock() {
                 Ok(eng) => eng,
                 Err(TryLockError::Poisoned(e)) => e.into_inner(),
-                Err(TryLockError::WouldBlock) => return,
+                Err(TryLockError::WouldBlock) => return None,
             };
-            if let Err(e) = d.reconcile(&mut eng) {
-                tracing::debug!("reading the last Snapshot: {e}");
-            }
+            d.reconcile(&mut eng).err()
         })
-        .await;
+        .await
+        .ok()
+        .flatten();
         // A stopped pull worth trying again is the background's to try.
         if self.draft_moved.load(std::sync::atomic::Ordering::SeqCst) {
             self.wake();
         }
-        self.snapshot()
+        let snapshot = self.snapshot();
+        match failed {
+            Some(e) if snapshot.generation == 0 => Err(e),
+            Some(e) => {
+                tracing::debug!("reading the last Snapshot: {e}");
+                Ok(snapshot)
+            }
+            None => Ok(snapshot),
+        }
     }
 
     /// The Snapshot as of now, for a caller about to act on what it lists

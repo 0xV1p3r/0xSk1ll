@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::hash::hash_str;
 use crate::skill::{frontmatter_field, split_frontmatter};
@@ -35,7 +35,7 @@ const NOTE: &str = "<!-- Managed by 0xSk1ll: edit instructions/ in your skills r
 
 /// One `instructions/<name>.md` file. Rules are rendered in file-name
 /// order, so numeric prefixes (`10-git.md`) control ordering.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rule {
     pub id: Option<ItemId>,
     pub name: String,
