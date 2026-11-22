@@ -836,12 +836,14 @@ fn command(s: &Session, cmd: Cmd) -> Result<()> {
                 (false, None) => println!("not pushed yet; {later}"),
             }
         }
-        Cmd::RepairIds => {
-            println!(
-                "gave {} item(s) a fresh Item ID of their own in the Draft; commit them",
-                s.block(c.repair_ids())?
-            );
-        }
+        Cmd::RepairIds => match s.block(c.repair_ids())? {
+            0 => println!("every item has an Item ID of its own; nothing to repair"),
+            n => println!(
+                "gave {} a fresh Item ID of its own in the Draft; commit {}",
+                plural(n, "item", "items"),
+                if n == 1 { "it" } else { "them" }
+            ),
+        },
         Cmd::Push => match s.block(c.push())?.pushed {
             true => {
                 println!("pushed to {}", if s.status.mode == DaemonMode::Standalone { "origin" } else { "the server" })
@@ -859,7 +861,11 @@ fn command(s: &Session, cmd: Cmd) -> Result<()> {
                 for d in &draft {
                     println!("{} {}", change_sym(d.change), d.item);
                 }
-                if !yes && !confirm(&format!("discard all {} draft item(s)?", draft.len()))? {
+                let question = match draft.len() {
+                    1 => "discard the draft item?".to_string(),
+                    n => format!("discard all {n} draft items?"),
+                };
+                if !yes && !confirm(&question)? {
                     bail!("aborted");
                 }
             }
@@ -892,8 +898,9 @@ fn command(s: &Session, cmd: Cmd) -> Result<()> {
             PullResult::Blocked { baseline, items, pending: false, uncommitted } => {
                 if !uncommitted.is_empty() {
                     eprintln!(
-                        "turned {} unpushed commit(s) back into Draft, nothing lost: they conflict with baseline {}",
-                        uncommitted.len(),
+                        "turned {} back into Draft, nothing lost: {} with baseline {}",
+                        plural(uncommitted.len(), "unpushed commit", "unpushed commits"),
+                        if uncommitted.len() == 1 { "it conflicts" } else { "they conflict" },
                         short(&baseline)
                     );
                     for commit in &uncommitted {
@@ -1007,6 +1014,10 @@ fn assign(
         AssignmentWrite::Changes(AssignmentChanges { changes, expected: None })
     };
     let machine = s.status.machine_id.clone();
+    let requested = match &write {
+        AssignmentWrite::Changes(changes) => changes.changes.clone(),
+        _ => Vec::new(),
+    };
     let update = match write {
         AssignmentWrite::Harness { harness, enabled } => s.block(s.client.set_harness_assignment(&harness, enabled))?,
         AssignmentWrite::Changes(changes) => s.block(s.client.set_assignment(&machine, &changes))?,
@@ -1022,23 +1033,41 @@ fn assign(
     if let Some(state) = all {
         println!("{harness}: skills and rules {}, and both defaults", state.label());
     }
+    let standalone = s.status.mode == DaemonMode::Standalone;
     for e in &update.entries {
-        let what = match (&e.kind, &e.name) {
-            (ToggleKind::NewSkillsDefault, _) => "skills default".to_string(),
-            (ToggleKind::NewRulesDefault, _) => "rules default".to_string(),
-            (k, Some(n)) => format!("{} {n}", if *k == ToggleKind::Skill { "skill" } else { "rule" }),
-            (_, None) => "?".to_string(),
-        };
-        let after = match e.after {
-            Some(true) => "on",
-            Some(false) => "off",
-            None => "default",
-        };
-        println!("{}: {what} {after}", e.harness);
+        println!("{}: {}", e.harness, toggle_text(e.kind, e.name.as_deref(), e.after));
     }
-    let whose = if s.status.mode == DaemonMode::Standalone { "local" } else { "fleet" };
-    println!("{whose} assignment of {machine} is now revision {}", update.revision);
+    // A machine-local write logs nothing, and a fleet one logs only what changed:
+    // the toggles asked for are echoed either way.
+    let unchanged = update.revision == s.status.assignment_revision;
+    if update.entries.is_empty() {
+        for c in &requested {
+            let already = if unchanged { " (already)" } else { "" };
+            println!("{}: {}{already}", c.harness, toggle_text(c.kind, c.name.as_deref(), c.enabled));
+        }
+    }
+    let whose = if standalone { "local" } else { "fleet" };
+    match unchanged {
+        true => println!("{whose} assignment of {machine} unchanged at revision {}", update.revision),
+        false => println!("{whose} assignment of {machine} is now revision {}", update.revision),
+    }
     Ok(())
+}
+
+/// One Assignment toggle as `assign` echoes it: `skill pdf off`, `rules default on`.
+fn toggle_text(kind: ToggleKind, name: Option<&str>, value: Option<bool>) -> String {
+    let what = match (kind, name) {
+        (ToggleKind::NewSkillsDefault, _) => "skills default".to_string(),
+        (ToggleKind::NewRulesDefault, _) => "rules default".to_string(),
+        (ToggleKind::Skill, name) => format!("skill {}", name.unwrap_or("?")),
+        (ToggleKind::Rule, name) => format!("rule {}", name.unwrap_or("?")),
+    };
+    let value = match value {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "default",
+    };
+    format!("{what} {value}")
 }
 
 /// What `assign` toggles: an item (`None` when only defaults, or `--all`, change).

@@ -748,7 +748,7 @@ fn a_blocked_machine_that_committed_the_clash_follows_the_hint_out() {
     // What the docs used to suggest: commit the clashing item.
     b.run(&["commit", "pdf"]).unwrap();
     let blocked = b.run(&["pull"]).unwrap_err();
-    assert!(blocked.contains("turned 1 unpushed commit(s) back into Draft"), "{blocked}");
+    assert!(blocked.contains("turned 1 unpushed commit back into Draft"), "{blocked}");
     assert!(blocked.contains("Run `sk1ll restore skill:pdf`"), "{blocked}");
     assert_eq!(skill(&b.repo), "b's edit\n", "nothing lost");
     assert!(b.run(&["draft"]).unwrap().contains("M skill:pdf"));
@@ -969,6 +969,19 @@ fn init_beside_a_daemon_for_another_repo_names_it() {
     assert!(error.contains("the sk1ll daemon manages /elsewhere") && error.contains("new-repo"), "{error}");
     assert!(!target.exists());
     daemon.join().unwrap();
+}
+
+/// A machine-local `assign` echoes the toggle as a fleet one does, and says
+/// when it changed nothing.
+#[test]
+fn standalone_assign_echoes_the_toggle() {
+    let repo = TestRepo::new().with_skill();
+    let off = repo.run(&["assign", "h", "skill", "pdf", "off"]).unwrap();
+    assert!(off.starts_with("h: skill pdf off\nlocal assignment of test is now revision "), "{off}");
+    let again = repo.run(&["assign", "h", "skill", "pdf", "off"]).unwrap();
+    assert!(again.contains("h: skill pdf off (already)") && again.contains("unchanged at revision"), "{again}");
+    let default = repo.run(&["assign", "h", "--default-rules", "off"]).unwrap();
+    assert!(default.starts_with("h: rules default off\n"), "{default}");
 }
 
 /// `commit` without items says how to name them or commit them all, and
