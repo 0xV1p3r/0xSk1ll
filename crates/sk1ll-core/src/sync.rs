@@ -815,7 +815,28 @@ fn apply_instructions(repo: &Repo, action: &Action, content: Option<&str>, expec
         baseline: None,
     };
     let spliced = instructions::splice(&text, block.as_ref(), content);
-    replace_file(dest, &spliced, unchanged, displace)?.map_or(Ok(()), Err)
+    // Splicing keeps every byte outside the block. A block that is still
+    // what sk1ll wrote (or none) is sk1ll's own, so the rewrite displaces
+    // nothing anyone wrote and leaves no recovery entry; a forced rewrite
+    // of a hand-edited block keeps the old file there for good.
+    let old = match block.as_ref().is_some_and(instructions::Block::edited) {
+        false => OldCopy::DropIfIntact,
+        true => OldCopy::KeepMarked,
+    };
+    replace_file(dest, &spliced, unchanged, displace, old)?.map_or(Ok(()), Err)
+}
+
+/// What [`replace_file`] does with the recovery entry of the file it replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OldCopy {
+    /// Keep it, pruned like any other once unchanged (if it can be).
+    Keep,
+    /// It held only content sk1ll owns: drop it at once if nothing wrote to
+    /// it during the swap.
+    DropIfIntact,
+    /// It held a hand edit sk1ll was told to overwrite: keep it, marked
+    /// changed, until it is adopted or discarded.
+    KeepMarked,
 }
 
 fn apply_skill(repo: &Repo, action: &Action, adopted: bool, reviewed_digest: Option<&str>) -> Result<()> {
@@ -1230,6 +1251,7 @@ fn replace_file(
     text: &str,
     unchanged: impl FnOnce() -> Result<()>,
     displace: Displace,
+    old: OldCopy,
 ) -> Result<Option<Error>> {
     let real = match fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_symlink() => fs::canonicalize(path).at(path)?,
@@ -1292,7 +1314,12 @@ fn replace_file(
     }
     #[cfg(test)]
     hook(Hook::AfterSwap, path);
-    held.map_or(Ok(None), |held| held.finish(false))
+    let Some(held) = held else { return Ok(None) };
+    match old {
+        OldCopy::Keep => held.finish(false),
+        OldCopy::DropIfIntact => held.finish_owned(),
+        OldCopy::KeepMarked => held.finish_kept().map(|()| None),
+    }
 }
 
 /// [`place`], with something at `to` reported as a change since the plan.
@@ -2595,7 +2622,7 @@ pub mod displaced {
             ownership: None,
             baseline: None,
         };
-        replace_file(dest, &text, unchanged, displace)
+        replace_file(dest, &text, unchanged, displace, OldCopy::Keep)
     }
 
     /// Removes the entries that still match what sync expected and are older
@@ -3302,6 +3329,29 @@ pub mod displaced {
             Ok(changed.then(|| self.displaced_error()))
         }
 
+        /// [`finish`](Self::finish) for content sk1ll owned: an entry that
+        /// still matches is dropped right away instead of kept for
+        /// [`GRACE`]; one written to during the swap is kept, changed.
+        pub(super) fn finish_owned(self) -> Result<Option<Error>> {
+            if !self.intact().unwrap_or(false) {
+                return self.finish(false);
+            }
+            if self.held == Some(Held::Linked) {
+                remove_if_there(&self.content())?;
+            }
+            if !release(&self.root, &self.id, &self.dir)? {
+                return self.finish(false);
+            }
+            Ok(None)
+        }
+
+        /// [`finish`](Self::finish) for a hand edit sk1ll was told to
+        /// overwrite: the entry is kept, marked changed, so it is listed as
+        /// a conflict until adopted or discarded.
+        pub(super) fn finish_kept(self) -> Result<()> {
+            settle(&self.id, &self.dest, true)
+        }
+
         fn displaced_error(&self) -> Error {
             Error::Displaced { dest: self.dest.clone(), kept: self.content(), id: self.id.clone() }
         }
@@ -3795,7 +3845,11 @@ mod tests {
     fn the_recovery_stamp_covers_payloads_beside_instructions() {
         let d = Displacement::new("block update");
         let _root = displaced::test_root(&d.tmp.path().join("state/displaced"));
-        apply(&d.repo, &d.action()).unwrap();
+        // Only a block edited by hand leaves an entry when it is rewritten (forced).
+        let text = fs::read_to_string(&d.dest).unwrap();
+        write(&d.dest, &text.replace("Use CC.", "Use CC by hand."));
+        let forced = plan(&d.repo, &d.harnesses, &d.assignment, PlanOptions { force: true }).unwrap();
+        apply(&d.repo, &forced[0]).unwrap();
         let entry = d.entry();
         assert!(entry.path.starts_with(d.area()));
         let before = displaced::stamp().unwrap();
@@ -4832,6 +4886,44 @@ mod tests {
         }
     }
 
+    /// Rewrites of a block instructions file that only replace what sk1ll
+    /// wrote (a rule toggled off and on, a rule changed) keep every byte
+    /// outside the block and leave no recovery entry, also when the block
+    /// is removed and the file left empty. A forced rewrite of a block
+    /// edited by hand keeps the old file for good, marked changed.
+    #[test]
+    fn rewriting_an_owned_block_leaves_no_recovery_entry() {
+        let (tmp, repo, harnesses, dest) = instructions_setup(InstructionsFormat::Block);
+        let _root = displaced::test_root(&tmp.path().join("recovery"));
+        let mut assignment = Assignment::default();
+        let sync = |assignment: &Assignment, force| {
+            for action in plan(&repo, &harnesses, assignment, PlanOptions { force }).unwrap() {
+                apply(&repo, &action).unwrap();
+            }
+        };
+        sync(&assignment, false);
+        assignment.set_rule("h", &rule_id(&repo, "git"), false);
+        sync(&assignment, false);
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "", "the block is gone");
+        assignment.set_rule("h", &rule_id(&repo, "git"), true);
+        sync(&assignment, false);
+        write(&dest, &format!("# Mine\n\n{}", fs::read_to_string(&dest).unwrap()));
+        edit_rule_body(&repo.root().join("instructions/git.md"), "Use CC always.\n");
+        sync(&assignment, false);
+        let text = fs::read_to_string(&dest).unwrap();
+        assert!(text.starts_with("# Mine\n") && text.contains("Use CC always."), "{text}");
+        assert!(displaced::list().unwrap().is_empty(), "{:?}", displaced::list().unwrap());
+
+        let edited = text.replace("Use CC always.", "Use CC by hand.");
+        write(&dest, &edited);
+        assert_eq!(plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap()[0].kind, ActionKind::Conflict);
+        sync(&assignment, true);
+        let entries = displaced::list().unwrap();
+        assert!(entries.len() == 1 && entries[0].changed, "{entries:?}");
+        assert_eq!(fs::read_to_string(&entries[0].path).unwrap(), edited);
+        assert!(displaced::prune_older_than(Duration::ZERO).unwrap().is_empty());
+    }
+
     #[test]
     fn absent_rule_is_omitted_from_placements_but_removed_from_index() {
         let (_tmp, repo, harnesses, dir) = instructions_setup(InstructionsFormat::Rules);
@@ -5836,12 +5928,13 @@ mod tests {
     /// The recovery copy is the displaced original itself (renamed, or for
     /// files hard-linked, never copied), so a writer that held the old file
     /// open keeps writing into it after sync is done, wherever the state
-    /// directory is.
+    /// directory is. An owned block rewrite keeps no copy (see
+    /// `rewriting_an_owned_block_leaves_no_recovery_entry`).
     #[cfg(unix)]
     #[test]
     fn late_writes_after_sync_reach_the_recovery_copy_wherever_the_state_dir_is() {
         use std::io::Write;
-        for case in ["skill update", "skill removal", "rule update", "rule removal", "block update"] {
+        for case in ["skill update", "skill removal", "rule update", "rule removal"] {
             for state_elsewhere in [false, true] {
                 let d = Displacement::new(case);
                 let _root = displaced::test_root(&d.tmp.path().join("state/displaced"));

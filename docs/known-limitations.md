@@ -14,6 +14,13 @@ original. If that rename lands after sync's last check of a block
 instructions file and before sync's own rename, sync can replace the
 editor's file. Recovery holds the version from before the editor's rename.
 
+Rewriting a block that is still what sk1ll wrote (a rule toggled or
+changed) keeps every byte outside the block and leaves no recovery entry:
+the old file is held in recovery only during the swap and dropped once it
+checks unchanged. A write through a descriptor still open on the old file
+after that is lost. A forced rewrite of a block edited by hand keeps the
+old file in recovery until you adopt or discard it.
+
 ## Placement anchors and directory locks
 
 A skill symlink's ownership follows its target. Recreating the identical

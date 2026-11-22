@@ -130,6 +130,10 @@ break compatibility.
 
 ### Fixed
 
+- Rewriting a block instructions file (a rule toggled or changed) no
+  longer leaves a recovery entry that is never pruned each time; only a
+  forced rewrite of a block edited by hand keeps the old file, marked
+  changed, until it is adopted or discarded.
 - `sk1ll draft`, `sk1ll conflicts` and `sk1ll recover list` only read:
   without a daemon they no longer write missing Item IDs or sync the
   harnesses, they answer beside another engine (a daemon for another repo

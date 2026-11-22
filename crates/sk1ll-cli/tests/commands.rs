@@ -719,3 +719,25 @@ fn draft_conflicts_and_recover_list_only_read() {
     repo.run_on(&socket, &["recover", "list"]).unwrap();
     daemon.join().unwrap();
 }
+
+/// Toggling a rule off and on rewrites a block instructions file twice;
+/// neither rewrite leaves a recovery entry, since the block was sk1ll's own.
+#[test]
+fn toggling_a_rule_in_a_block_file_leaves_no_recovery_entry() {
+    let repo = TestRepo::new();
+    let agents = repo.root.join("AGENTS.md");
+    let mut config = fs::read_to_string(repo.root.join("machine.toml")).unwrap();
+    config.push_str(&format!("[harnesses.b]\ninstructions = {:?}\n", agents.to_str().unwrap()));
+    fs::write(repo.root.join("machine.toml"), config).unwrap();
+    fs::write(repo.repo.join("instructions/git.md"), "---\ndescription: Git\n---\nUse Conventional Commits.\n")
+        .unwrap();
+    fs::write(&agents, "# Mine\n").unwrap();
+    repo.run(&["sync"]).unwrap();
+    for state in ["off", "on", "off", "on"] {
+        repo.run(&["assign", "b", "rule", "git", state]).unwrap();
+        repo.run(&["sync"]).unwrap();
+    }
+    let text = fs::read_to_string(&agents).unwrap();
+    assert!(text.starts_with("# Mine\n") && text.contains("Use Conventional Commits."), "{text}");
+    assert_eq!(repo.run(&["recover", "list"]).unwrap(), "");
+}
