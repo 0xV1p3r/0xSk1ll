@@ -2579,6 +2579,38 @@ mod tests {
         assert_eq!(git(&f.b, &["status", "--porcelain"]), "");
     }
 
+    /// A filter driver (git-lfs's smudge downloads) runs when the Baseline is
+    /// fetched, without the engine lock; the pull, under it, writes what it
+    /// converted to then, once cleaning it gives the blob back.
+    #[cfg(unix)]
+    #[test]
+    fn filter_drivers_run_at_fetch_not_under_the_engine_lock() {
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        write(&f.b.join(".git/info/attributes"), "*.md filter=up\n");
+        git(&f.b, &["config", "filter.up.clean", "sed s/V2/v2/"]);
+        git(&f.b, &["config", "filter.up.smudge", "sed s/v2/V2/"]);
+        write(&f.a.join("personal/pdf/SKILL.md"), "pdf v2\n");
+        write(&f.a.join("instructions/git.md"), "git v2\n");
+        commit_all(&f.a, "two files");
+        a.push().unwrap();
+        b.fetch().unwrap();
+        assert!(f.b.join(".git/sk1ll-pull-filtered").is_dir());
+        // From now on, running the driver would show.
+        git(&f.b, &["config", "filter.up.smudge", "sed s/^/LIVE/"]);
+        // Tampered with: cleaning it doesn't give the blob, so it is converted again.
+        let dir = f.b.join(".git/sk1ll-pull-filtered");
+        let entries: Vec<_> = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+        assert_eq!(entries.len(), 2);
+        let tampered = entries.iter().find(|p| fs::read(p).unwrap() == b"git V2\n").unwrap();
+        fs::write(tampered, "SOMETHING ELSE\n").unwrap();
+        let lock = crate::EngineLock::acquire(&f.b).unwrap();
+        assert!(matches!(b.pull_fetched(&lock).unwrap(), PullOutcome::Updated { .. }));
+        assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "pdf V2\n", "converted at fetch");
+        assert_eq!(read(&f.b.join("instructions/git.md")), "LIVEgit v2\n", "converted again");
+        assert!(!dir.exists(), "forgotten once the pull is done");
+    }
+
     #[cfg(unix)]
     #[test]
     fn pull_keeps_permissions_and_sets_the_executable_bit() {

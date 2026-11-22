@@ -260,7 +260,82 @@ impl Pull<'_> {
     fn fetch(&self) -> Result<()> {
         let all = format!("+refs/heads/*:refs/remotes/{REMOTE}/*");
         self.git().args(["fetch", "--quiet", "--prune", "--no-recurse-submodules", REMOTE, &all]).run()?;
+        // Best effort: what isn't there is converted when it is written.
+        let _ = self.prefilter();
         Ok(())
+    }
+
+    /// Where [`Pull::prefilter`] keeps what checking out a blob writes.
+    fn prefiltered_dir(&self) -> PathBuf {
+        self.git_dir.join(PREFILTERED)
+    }
+
+    /// Runs the `filter` drivers (git-lfs's smudge, say, which downloads)
+    /// for the blobs the fetched Baseline brings, so that the pull, which
+    /// runs them under the caller's engine lock, needs no network: it uses
+    /// what this wrote, once it has checked that cleaning it gives the blob
+    /// back ([`Convert::content`]). Needs no lock: it writes only to its own
+    /// directory in the git directory. Paths without a filter driver need
+    /// no network to convert and are left to the pull.
+    fn prefilter(&self) -> Result<()> {
+        let dir = self.prefiltered_dir();
+        match fs::remove_dir_all(&dir) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e).at(&dir),
+            _ => {}
+        }
+        let Some(head) = rev(self.git(), "HEAD")? else { return Ok(()) };
+        let Some(remote) = rev(self.git(), &format!("refs/remotes/{REMOTE}/{FLEET_BRANCH}"))? else { return Ok(()) };
+        let base = self.git().args(["merge-base", &head, &remote]).text()?;
+        let files: Vec<_> = self
+            .changes(&base, &remote)?
+            .into_iter()
+            .filter_map(|c| c.new.filter(|e| matches!(e.mode.as_str(), "100644" | "100755")).map(|e| (c.path, e)))
+            .collect();
+        if files.is_empty() {
+            return Ok(());
+        }
+        // As the pull will read them: from the new Baseline if it changes
+        // `.gitattributes`, else from the working tree.
+        let source = files
+            .iter()
+            .any(|(path, _)| path.file_name().is_some_and(|n| n == ".gitattributes"))
+            .then(|| remote.clone());
+        let git = || match &source {
+            Some(commit) => self.git().arg(format!("--attr-source={commit}")),
+            None => self.git(),
+        };
+        let mut paths = Vec::new();
+        for (path, _) in &files {
+            paths.extend_from_slice(&crate::git::path_bytes(path));
+            paths.push(0);
+        }
+        let out = git().args(["check-attr", "-z", "--stdin", "filter"]).stdin(paths).run()?;
+        let fields: Vec<&[u8]> = out.split(|b| *b == 0).collect();
+        let filtered: BTreeSet<PathBuf> = fields
+            .chunks(3)
+            .filter(|f| f.len() == 3 && !matches!(f[2], b"unspecified" | b"unset"))
+            .map(|f| path_from_bytes(f[0]))
+            .collect();
+        for (path, entry) in files.iter().filter(|(path, _)| filtered.contains(path)) {
+            let bytes = git().args(["cat-file", "--filters"]).arg(path_option(path)).arg(&entry.oid).run()?;
+            fs::create_dir_all(&dir).at(&dir)?;
+            let file = dir.join(prefiltered_key(&entry.oid, path, source.as_deref()));
+            let staged = file.with_extension("tmp");
+            fs::write(&staged, bytes).at(&staged)?;
+            fs::rename(&staged, &file).at(&file)?;
+        }
+        Ok(())
+    }
+
+    /// What [`Pull::prefilter`] wrote for `entry` at `path`, read with
+    /// `.gitattributes` from `source` (`None`: the working tree).
+    fn prefiltered(&self, entry: &Entry, path: &Path, source: Option<&str>) -> Option<Vec<u8>> {
+        fs::read(self.prefiltered_dir().join(prefiltered_key(&entry.oid, path, source))).ok()
+    }
+
+    /// The pull is done: what was converted for it is not needed any more.
+    fn forget_prefiltered(&self) {
+        let _ = fs::remove_dir_all(self.prefiltered_dir());
     }
 
     /// Finishes a pull that stopped half-way first, then pulls.
@@ -419,6 +494,7 @@ impl Pull<'_> {
                 }
                 journal.remove(self)?;
                 tree.clear();
+                self.forget_prefiltered();
                 let to = rev(self.git(), "HEAD")?.ok_or_else(|| Error::Invalid("HEAD is missing".into()))?;
                 return Ok(Finished::Updated { from: journal.old.clone(), to, displaced });
             }
@@ -489,6 +565,7 @@ impl Pull<'_> {
         hook(Before::Done)?;
         journal.remove(self)?;
         tree.clear();
+        self.forget_prefiltered();
         let to = rev(self.git(), "HEAD")?.ok_or_else(|| Error::Invalid("HEAD is missing".into()))?;
         Ok(Finished::Updated { from: journal.old.clone(), to, displaced })
     }
@@ -1074,9 +1151,29 @@ impl<'a> Convert<'a> {
                 false => Content::File { bytes: target, executable: false },
             });
         }
+        let executable = entry.mode == "100755";
+        // Converted before the engine lock was taken, if it needed a filter
+        // driver: used once cleaning it gives this blob back.
+        let source = self.attributes.as_ref().map(|(_, target)| target.as_str());
+        if let Some(bytes) = self.pull.prefiltered(entry, path, source) {
+            let clean = self.git(Side::Target).args(["hash-object", "--stdin"]).arg(path_option(path));
+            if clean.stdin(bytes.clone()).text()? == entry.oid {
+                return Ok(Content::File { bytes, executable });
+            }
+        }
         let filters = self.git(Side::Target).args(["cat-file", "--filters"]).arg(path_option(path)).arg(&entry.oid);
-        Ok(Content::File { bytes: filters.run()?, executable: entry.mode == "100755" })
+        Ok(Content::File { bytes: filters.run()?, executable })
     }
+}
+
+/// Where [`Pull::prefilter`] keeps its conversions, in the git directory.
+const PREFILTERED: &str = "sk1ll-pull-filtered";
+
+/// One conversion's file name: the blob, the path (its attributes decide
+/// the filter) and where the attributes come from.
+fn prefiltered_key(oid: &str, path: &Path, source: Option<&str>) -> String {
+    let path = String::from_utf8_lossy(&crate::git::path_bytes(path)).into_owned();
+    crate::hash::hash_str(&format!("{oid}\0{path}\0{}", source.unwrap_or_default()))
 }
 
 /// `--path=<path>`, for `hash-object` and `cat-file --filters`.
