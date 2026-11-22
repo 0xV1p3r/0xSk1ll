@@ -130,6 +130,10 @@ break compatibility.
 
 ### Fixed
 
+- Restoring both sides of a case-only Skill or Rule rename on a
+  case-insensitive filesystem puts the Baseline's spelling back, even when
+  the directory holds an ignored file, with no-replace renames that move
+  everything in it along.
 - A commit can repair Item ID metadata the Baseline can't read (a manifest
   committed as invalid TOML, a rule with broken frontmatter): it is checked
   against the rest of `HEAD`, and the tree it makes is checked strictly.

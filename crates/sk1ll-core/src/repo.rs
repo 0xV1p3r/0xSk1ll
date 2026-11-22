@@ -470,6 +470,52 @@ pub(crate) fn check_rename_stage(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The spelling the directory holding `wanted` stores it by, if that is
+/// another one that only differs in case and is the same file (a
+/// case-insensitive filesystem): `personal/PDF` where `personal/pdf` was
+/// asked for. `None` if the exact spelling is there, or nothing is.
+pub(crate) fn stored_spelling(wanted: &Path) -> Result<Option<PathBuf>> {
+    let (Some(parent), Some(name)) = (wanted.parent(), wanted.file_name().and_then(|n| n.to_str())) else {
+        return Ok(None);
+    };
+    let Ok(entries) = fs::read_dir(parent) else { return Ok(None) };
+    let mut found = None;
+    for entry in entries {
+        let entry = entry.at(parent)?.file_name();
+        if entry == name {
+            return Ok(None);
+        }
+        if entry.to_str().is_some_and(|stored| stored.eq_ignore_ascii_case(name)) {
+            found = Some(parent.join(entry));
+        }
+    }
+    match found {
+        Some(stored) if case_alias(&stored, wanted)? => Ok(Some(stored)),
+        _ => Ok(None),
+    }
+}
+
+/// Renames `stored` to `wanted`, names that differ only in case, through a
+/// stage of its own and with no-replace renames only, so whatever is in it
+/// (ignored files included) moves along and nothing at either name is ever
+/// replaced: a case-insensitive filesystem sees one name for both.
+pub(crate) fn respell(stored: &Path, wanted: &Path) -> Result<()> {
+    let stage = rename_stage(stored);
+    crate::sync::rename_noreplace(stored, &stage).at(&stage)?;
+    if let Err(publish) = crate::sync::rename_noreplace(&stage, wanted) {
+        if let Err(rollback) = crate::sync::rename_noreplace(&stage, stored) {
+            return Err(Error::Invalid(format!(
+                "{} could not be renamed to {} ({publish}) or back ({rollback}); it is left at {}",
+                stored.display(),
+                wanted.display(),
+                stage.display()
+            )));
+        }
+        return Err(Error::Io { path: wanted.to_path_buf(), source: publish });
+    }
+    Ok(())
+}
+
 /// A case-insensitive lookup must alias the source, with no separate directory
 /// entry at the destination spelling (a distinct hard link can share an inode).
 pub(crate) fn case_alias(from: &Path, dest: &Path) -> Result<bool> {
@@ -875,6 +921,74 @@ mod create_tests {
         repo.commit(&[old, new.clone()], "Rename Rule", None).unwrap();
         assert_eq!(crate::content::item_ids_at(repo.root(), "HEAD").unwrap(), [(new, id)].into());
         assert!(repo.draft().unwrap().is_empty());
+    }
+
+    /// Whether `dir`'s filesystem folds case (macOS's default APFS does).
+    fn folds_case(dir: &Path) -> bool {
+        let probe = dir.join("case-probe");
+        fs::write(&probe, "").unwrap();
+        let folds = dir.join("CASE-PROBE").exists();
+        fs::remove_file(probe).unwrap();
+        folds
+    }
+
+    /// Respelling moves the directory as a whole, ignored files and all,
+    /// through a stage of its own, and replaces nothing.
+    #[test]
+    fn respelling_moves_everything_and_replaces_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (stored, wanted) = (tmp.path().join("PDF"), tmp.path().join("pdf"));
+        fs::create_dir(&stored).unwrap();
+        fs::write(stored.join("SKILL.md"), "PDFs.\n").unwrap();
+        fs::write(stored.join("notes.tmp"), "ignored\n").unwrap();
+        respell(&stored, &wanted).unwrap();
+        let names: Vec<_> = fs::read_dir(tmp.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, ["pdf"]);
+        assert_eq!(fs::read_to_string(wanted.join("notes.tmp")).unwrap(), "ignored\n");
+        if !folds_case(tmp.path()) {
+            // Something of its own at the wanted spelling stays, and so does the stored one.
+            fs::create_dir(&stored).unwrap();
+            assert!(respell(&stored, &wanted).is_err());
+            assert!(stored.is_dir() && wanted.join("SKILL.md").is_file());
+        }
+    }
+
+    /// The stored spelling only counts where the filesystem folds case (it
+    /// is the same directory): on a case-sensitive one, `PDF` is another
+    /// directory than `pdf`, so nothing is respelled.
+    #[test]
+    fn a_stored_spelling_needs_a_case_folding_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("PDF")).unwrap();
+        let found = stored_spelling(&tmp.path().join("pdf")).unwrap();
+        match folds_case(tmp.path()) {
+            true => assert_eq!(found, Some(tmp.path().join("PDF"))),
+            false => assert_eq!(found, None),
+        }
+        assert_eq!(stored_spelling(&tmp.path().join("PDF")).unwrap(), None);
+    }
+
+    /// Restoring both sides of `pdf` -> `PDF` puts the Baseline's spelling
+    /// back even when the directory holds an ignored file, which keeps
+    /// restore from removing it. Only a case-insensitive filesystem (macOS)
+    /// gets there; elsewhere the two spellings are two directories.
+    #[test]
+    fn restoring_a_case_only_rename_restores_the_spelling() {
+        let tmp = tempfile::tempdir().unwrap();
+        if !folds_case(tmp.path()) {
+            return;
+        }
+        let repo = Repo::init_committed(tmp.path()).unwrap();
+        repo.create_item("skill", "pdf", "PDF").unwrap();
+        let old = ItemRef::Skill("pdf".into());
+        repo.commit(std::slice::from_ref(&old), "Add Skill", None).unwrap();
+        fs::write(tmp.path().join(".gitignore"), "*.tmp\n").unwrap();
+        repo.rename_item("skill", "pdf", "PDF").unwrap();
+        fs::write(repo.personal_dir().join("PDF/notes.tmp"), "ignored\n").unwrap();
+        repo.restore(&[old, ItemRef::Skill("PDF".into())]).unwrap();
+        let names: Vec<_> = fs::read_dir(repo.personal_dir()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, ["pdf"]);
+        assert!(repo.personal_dir().join("pdf/notes.tmp").is_file());
     }
 
     #[test]

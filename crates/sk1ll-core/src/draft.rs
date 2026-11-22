@@ -471,7 +471,35 @@ impl Repo {
         if let (Some(head), false) = (&st.head, in_head.is_empty()) {
             self.git()?.literal().args(["checkout", "--quiet", head, "--"]).args(&in_head).run()?;
         }
+        self.restore_spellings(&selected, &st)?;
         Ok(kept)
+    }
+
+    /// After restoring both sides of a case-only rename (`pdf` to `PDF`) on
+    /// a case-insensitive filesystem, the checkout writes the Baseline's
+    /// files into the directory as it is spelled now: one that still holds
+    /// an ignored file was never removed. Gives it back the Baseline's
+    /// spelling, everything in it moving along.
+    fn restore_spellings(&self, selected: &[DraftItem], st: &Status) -> Result<()> {
+        let mut wanted = BTreeSet::new();
+        for path in selected.iter().flat_map(|d| &d.paths).filter(|p| st.head_paths.contains(*p)) {
+            match ItemRef::for_path(path) {
+                ItemRef::Skill(name) if path.starts_with(PERSONAL_DIR) => {
+                    wanted.insert(Path::new(PERSONAL_DIR).join(name));
+                }
+                ItemRef::Rule(_) => {
+                    wanted.insert(path.clone());
+                }
+                _ => {}
+            }
+        }
+        for rel in wanted {
+            let path = self.root().join(&rel);
+            if let Some(stored) = crate::repo::stored_spelling(&path)? {
+                crate::repo::respell(&stored, &path)?;
+            }
+        }
+        Ok(())
     }
 
     /// Moves each file or symlink at `paths` (repo-relative) into a recovery

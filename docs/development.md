@@ -49,6 +49,8 @@ python3 crates/sk1ll-gui/tests/test_dev_fleet.py
 
 The CLI's command tests run the `sk1ll` binary, each with its own `HOME` and XDG directories: every command runs the engine, which reconciles, and would otherwise find your own harnesses through the presets.
 
+A few tests need a case-insensitive filesystem (macOS's default APFS) and return early elsewhere, such as restoring both sides of a case-only rename; on Linux only the pieces they are built from run (the respelling move, the alias check). The macOS CI job runs them.
+
 The automated tests don't drive the desktop app. Test interactive GUI flows by hand against the dev fleet.
 
 Time sync planning with `cargo test -p sk1ll-core sync_plan_no_change -- --ignored --nocapture`.
