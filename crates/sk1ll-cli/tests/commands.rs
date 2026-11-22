@@ -942,6 +942,21 @@ fn init_beside_a_daemon_for_another_repo_names_it() {
     daemon.join().unwrap();
 }
 
+/// `commit` without items says how to name them or commit them all, and
+/// `--all` commits every draft item.
+#[test]
+fn commit_names_its_items_or_takes_them_all() {
+    let repo = TestRepo::new().with_skill();
+    fs::write(repo.repo.join("instructions/git.md"), "Use Conventional Commits.\n").unwrap();
+    let error = repo.run(&["commit"]).unwrap_err();
+    assert!(error.contains("`sk1ll draft`") && error.contains("`sk1ll commit --all`"), "{error}");
+    assert!(repo.run(&["commit", "pdf", "--all"]).is_err());
+    let out = repo.run(&["commit", "--all"]).unwrap();
+    assert!(out.contains("skill:pdf") && out.contains("rule:git"), "{out}");
+    assert_eq!(repo.run(&["draft"]).unwrap(), "no draft: on the baseline\n");
+    assert!(repo.run(&["commit", "--all"]).unwrap().contains("no draft to commit"));
+}
+
 /// A standalone commit without an `origin` has nowhere to push to, and says nothing of it.
 #[test]
 fn a_commit_without_an_origin_says_nothing_of_pushing() {

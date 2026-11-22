@@ -153,8 +153,11 @@ enum Cmd {
     /// Commit draft items as the new baseline
     #[command(after_help = "Items: a skill or rule name, or skill:<name>, rule:<name>, manifest, other:<path>")]
     Commit {
-        #[arg(required = true)]
+        #[arg(conflicts_with = "all")]
         items: Vec<String>,
+        /// Commit every draft item
+        #[arg(long)]
+        all: bool,
         /// Commit message (default: "commit <items> from <machine>")
         #[arg(short, long)]
         message: Option<String>,
@@ -789,7 +792,22 @@ fn command(s: &Session, cmd: Cmd) -> Result<()> {
             }
         }
         Cmd::Diff { item } => print!("{}", s.block(c.diff(&item))?.diff),
-        Cmd::Commit { items, message, author, push } => {
+        Cmd::Commit { items, all, message, author, push } => {
+            let items = match (items.is_empty(), all) {
+                (false, _) => items,
+                (true, true) => {
+                    let draft = s.block(c.draft_fresh())?;
+                    if draft.is_empty() {
+                        println!("no draft to commit: on the baseline");
+                        return Ok(());
+                    }
+                    draft.iter().map(|d| d.item.to_string()).collect()
+                }
+                (true, false) => bail!(
+                    "name the draft items to commit (`sk1ll draft` lists them), or commit every one with `sk1ll \
+                     commit --all`"
+                ),
+            };
             let resp = s.block(c.commit(&CommitRequest { items, message, author }))?;
             println!("committed {} as {}", names(&resp.items), short(&resp.sha));
             if s.status.mode == DaemonMode::Standalone {
