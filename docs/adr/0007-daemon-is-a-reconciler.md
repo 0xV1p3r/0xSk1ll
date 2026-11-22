@@ -21,9 +21,12 @@ skips the reconcile when their fingerprint is unchanged.
 
 Where the Assignment lives and what the repo fetches from are an
 `AssignmentStore` and a `Remote`, picked once by whether the Machine joined,
-so the steps below are one code path for both. A standalone write reaches
-the machine-local file under an engine step of its own and is applied like a
-server's confirmation.
+so the steps below are one code path for both. A standalone write has no
+network step, so it is not split: under the engine mutex it is made from
+the applied revision, saved to the machine-local file and its revision by a
+compare-and-swap against what is on disk, and applied, in one step (see
+[ADR 0008](0008-cli-is-a-client-of-the-engine.md)). A machine-local Harness
+rename is one such step too.
 
 An operation that talks to the server checks and takes what it sends under
 the engine mutex, releases it for the network, then takes it again to apply

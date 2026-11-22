@@ -97,8 +97,12 @@ The background process on each machine that keeps its harnesses matching its dra
 _Avoid_: Agent (reserved for the AI tools that harnesses run)
 
 **Engine**:
-What carries out every change to the repo, the harnesses and the assignment, and reconciles them: inside the daemon, or inside a single `sk1ll` command when no daemon runs.
+What carries out every change to the repo, the harnesses and the assignment, and reconciles them: inside the daemon, or inside a single `sk1ll` command when no daemon runs. One engine at a time manages a Machine, whatever repo it is for: it holds the **machine lock** for its life.
 _Avoid_: Direct mode
+
+**Preview**:
+A command that shows what a sync would do or what the repo holds (`status`, `render`, `sync --dry-run`, `list`) and changes nothing, not even what a reconcile would bring in line. It runs beside another engine.
+_Avoid_: Dry run (only for `sync --dry-run` itself)
 
 **Join code**:
 A single-use code that lets a new machine enter the fleet and receive its own credential.

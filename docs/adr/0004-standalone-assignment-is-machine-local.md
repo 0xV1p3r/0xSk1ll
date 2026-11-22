@@ -6,6 +6,7 @@ This complements [ADR 0001](0001-assignment-is-server-state.md). Joined machines
 
 ## Consequences
 
-- The daemon watches `assignment.json` so hand edits take effect too; a pending Harness rename is finished before it is read.
+- The daemon watches `assignment.json` so hand edits take effect too. A pending Harness rename is finished by the engine, under the machine lock, before it reconciles; reading the file never finishes one, and previews plan with it finished in memory.
+- A toggle is saved by a compare-and-swap against the file and its revision, so a hand edit landing while it is made becomes a revision of its own and the toggle is made again on top of it.
 - A separate local snapshot stores a monotonic revision for API readers. It is not a fleet assignment snapshot.
 - Joining replaces the local assignment with the server's assignment. Standalone changes are not uploaded as log entries.

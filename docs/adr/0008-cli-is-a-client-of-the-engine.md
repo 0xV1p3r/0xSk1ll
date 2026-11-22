@@ -24,16 +24,44 @@ with one code path over them (ADR 0001, 0002, 0004).
 ## Consequences
 
 - A command run without a daemon reconciles as the daemon would: reads that
-  answer from the Snapshot bring the harnesses in line first, and changes
-  sync after themselves. `sync --dry-run`, `render` and `status` still only
-  preview.
+  answer from the Snapshot (`draft`, `conflicts`) bring the harnesses in
+  line first, and changes sync after themselves.
+- Previews only read: `status`, `render`, `sync --dry-run`, `list`, `diff`,
+  `edit` and `harnesses` run a read-only engine that holds no lock, never
+  reconciles and writes nothing. They plan in memory with the Inputs the
+  next reconcile would have: a machine-local Harness rename that stopped
+  half-way is finished in the plan only, and a hand edit of the
+  machine-local Assignment is read, not applied. Only an engine holding the
+  machine lock finishes a pending rename, under its engine mutex.
 - The engine in a command's process runs nothing in the background. A joined
   one connects to the server only for a request that needs the session (an
   Assignment write, a Harness rename, an unmanaged Adopt) and does not pull
   when it connects; git's fetch and push need no session.
-- While another process holds the repo's engine lock, a command's changes
-  are refused, and so are reads that need a reconciled Snapshot (`draft`,
-  `conflicts`); previews and `list` still answer.
+- One engine at a time manages a Machine, whatever repo it is for. What it
+  changes is mostly the Machine's: `machine.toml` and a pending Harness
+  rename, the Assignment (the machine-local file and its revision, or a
+  joined Machine's snapshot and its mirror), the state file and the harness
+  directories with their ownership indexes. So an engine takes the machine
+  lock (OS locks beside the state file, `machine.toml` and the Assignment
+  file) before it reads any of that, and holds it for its life: the daemon
+  until it exits, a command's engine for the command. A daemon starting
+  while a command's engine runs waits for it (up to 30 seconds), so it
+  loads what that command saved. `join` and `init` hold it too.
+- A command that changes something while another engine manages the
+  Machine is refused: a daemon for another repo says it manages that repo
+  (select it, or stop the daemon); a running command's engine, or one for
+  another config dir sharing these files, makes it fail with "another sk1ll
+  process is managing this Machine". Previews still answer beside it.
+- Core's engine lock on the repo stays, taken for whatever changes the
+  repo: it is the token core's repo operations require. While another
+  process holds it, a command's changes are refused, and so are reads that
+  need a reconciled Snapshot (`draft`, `conflicts`); previews still answer.
+- A machine-local Assignment write has no network step: it is checked,
+  given the next revision, saved and applied in one step under the engine
+  mutex. The save compares the file and its revision with what the write
+  was made from; a hand edit that landed meanwhile is taken up as a
+  revision of its own and the write made again on top, so a toggle that
+  reports success is saved and never overwrites the edit.
 - A joined Machine's commands work on the repo it joined; another selected
   repo is refused.
 - `sk1ll init` creates a repo itself unless a daemon waits for one there: it

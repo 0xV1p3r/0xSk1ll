@@ -51,6 +51,34 @@ the change fails and says so. ACLs and extended attributes of `machine.toml`
 are not kept, and its owner and group only where the filesystem lets sk1ll
 set them.
 
+## A hand edit of assignment.json at the moment a toggle is saved
+
+A machine-local toggle is saved by comparing `assignment.json` and its
+revision with what the toggle was made from, then replacing the file
+atomically. A hand edit that lands before that comparison becomes a revision
+of its own and the toggle is made again on top of it. One that lands in the
+gap between the comparison and the rename is replaced and lost, as described
+above for block instructions files. A save into that gap needs exceptional
+timing; the next toggle or reconcile does not bring it back.
+
+## One engine per Machine, and what keys it
+
+The machine lock is a set of OS file locks beside the state file,
+`machine.toml` and `assignment.json` (`*.engine-lock`). Two engines that
+share any of those files are one Machine and exclude each other. Two config
+dirs that share none of them are two Machines, even if their `machine.toml`
+files name the same harness directories: only each harness directory's own
+lock keeps their syncs apart then, and their Assignments are separate. Like
+the directory lock, the machine lock needs a filesystem with working locks
+between all writers.
+
+A daemon that starts while a command's engine runs waits up to 30 seconds for
+it, then fails to start; start it again once the command ends. A command that
+changes something while the daemon manages another repo is refused rather
+than sent to it, since the daemon manages one repo at a time. Previews run
+beside any engine and take no lock, so one that reads while another engine
+writes can see a file it is about to write and one it has written already.
+
 ## Directory placement without a no-replace rename
 
 On Linux, directories are placed with `renameat2(RENAME_NOREPLACE)`. On macOS
