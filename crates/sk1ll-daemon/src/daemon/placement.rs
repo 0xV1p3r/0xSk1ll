@@ -45,8 +45,8 @@ impl Daemon {
         }
         let repo = Repo::open(self.repo_root())?;
         Self::require_sync_ready(&repo)?;
-        let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
-        let actions = sync::plan(&repo, &harnesses, &self.current_assignment()?, PlanOptions { force })?;
+        let (harnesses, assignment) = self.preview_inputs()?;
+        let actions = sync::plan(&repo, &harnesses, &assignment, PlanOptions { force })?;
         let sources = Self::sync_source_digests(&actions, sync::deploy_hash)?;
         Self::sync_preview_result(&actions, &sources)
     }
@@ -100,8 +100,8 @@ impl Daemon {
 
     pub(crate) fn render_instructions(&self, name: &str) -> Result<Vec<InstructionPreview>> {
         let repo = Repo::open(self.repo_root())?;
-        let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
-        let files = sync::render_instructions(&repo, &harnesses, &self.current_assignment()?, name)?;
+        let (harnesses, assignment) = self.preview_inputs()?;
+        let files = sync::render_instructions(&repo, &harnesses, &assignment, name)?;
         let format = harnesses[name].instructions_format;
         files
             .into_iter()

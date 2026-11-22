@@ -5,6 +5,10 @@
 //! applies the confirmed snapshot under the mutex, after checking that it is
 //! still in the [`World`](crate::daemon::World) it sent it from.
 //!
+//! Loading and reading change nothing: a pending Harness rename is finished
+//! only under the engine mutex and the machine lock
+//! ([`AssignmentStore::finish_interrupted_rename`]), never by a reader.
+//!
 //! [ADR 0001]: ../../../docs/adr/0001-assignment-is-server-state.md
 //! [ADR 0004]: ../../../docs/adr/0004-standalone-assignment-is-machine-local.md
 
@@ -23,17 +27,27 @@ use crate::{Config, server};
 
 /// Where the Assignment lives, and how a write reaches it.
 pub(crate) trait AssignmentStore: Send + Sync {
-    /// The stored snapshot to start from. `None` until there is one: a
-    /// joined Machine leaves its harnesses alone until the server sends it.
+    /// The stored snapshot to start from, read without writing anything (the
+    /// caller saves it if it holds the machine lock). `None` until there is
+    /// one: a joined Machine leaves its harnesses alone until the server
+    /// sends it.
     fn load(&self) -> anyhow::Result<Option<AssignmentSnapshot>>;
 
     /// Stores `snap`, about to be applied, so a restart starts from it.
     fn save(&self, snap: &AssignmentSnapshot) -> Result<()>;
 
-    /// Under the engine mutex: what changed where the Assignment lives
-    /// without the daemon (a hand edit of the file), as the snapshot that
-    /// follows `applied`. `None`: nothing did.
+    /// What changed where the Assignment lives without the daemon (a hand
+    /// edit of the file), as the snapshot that follows `applied`. `None`:
+    /// nothing did. Writes nothing, so readers may call it too.
     fn reload(&self, applied: Option<&AssignmentSnapshot>) -> Result<Option<AssignmentSnapshot>>;
+
+    /// Under the engine mutex and the machine lock: finishes a machine-local
+    /// Harness rename that stopped between its writes. Nothing for a joined
+    /// Machine, whose session finishes its own.
+    fn finish_interrupted_rename(&self) -> Result<()>;
+
+    /// The machine-local store.
+    fn local(&self) -> Option<&LocalAssignment>;
 
     /// A file whose edits change the Assignment: an Input of the reconcile,
     /// and watched.
@@ -84,19 +98,17 @@ struct ServerAssignment {
 
 impl AssignmentStore for ServerAssignment {
     fn load(&self) -> anyhow::Result<Option<AssignmentSnapshot>> {
-        let snap = match state::load_snapshot(&self.snapshot, Some(&self.owner)) {
-            Ok(Some(snap)) => snap,
+        match state::load_snapshot(&self.snapshot, Some(&self.owner)) {
+            Ok(Some(snap)) => Ok(Some(snap)),
             Ok(None) => {
                 tracing::warn!("no stored assignment: leaving the harnesses alone until the server sends one");
-                return Ok(None);
+                Ok(None)
             }
             Err(e) => {
                 tracing::warn!("{e:#}; leaving the harnesses alone until the server sends an assignment");
-                return Ok(None);
+                Ok(None)
             }
-        };
-        self.write_mirror(&snap);
-        Ok(Some(snap))
+        }
     }
 
     fn save(&self, snap: &AssignmentSnapshot) -> Result<()> {
@@ -107,6 +119,14 @@ impl AssignmentStore for ServerAssignment {
 
     fn reload(&self, _: Option<&AssignmentSnapshot>) -> Result<Option<AssignmentSnapshot>> {
         Ok(None)
+    }
+
+    fn finish_interrupted_rename(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn local(&self) -> Option<&LocalAssignment> {
+        None
     }
 
     fn file(&self) -> Option<&Path> {
@@ -144,7 +164,7 @@ impl ServerAssignment {
 /// A standalone Machine's Assignment: the machine-local file, which the
 /// daemon and hand edits change. Its revision, kept next to the state file,
 /// grows with every change the daemon sees; it never becomes fleet state.
-struct LocalAssignment {
+pub(crate) struct LocalAssignment {
     file: PathBuf,
     revisions: PathBuf,
     machine_config: PathBuf,
@@ -155,9 +175,7 @@ impl AssignmentStore for LocalAssignment {
         let assignment = Assignment::load(&self.file)?;
         let previous = state::load_snapshot(&self.revisions, None)?;
         let revision = previous.as_ref().map_or(1, |s| s.revision + u64::from(s.assignment != assignment));
-        let snap = AssignmentSnapshot { revision, assignment, registration: None };
-        state::save_snapshot(&self.revisions, &snap, None)?;
-        Ok(Some(snap))
+        Ok(Some(AssignmentSnapshot { revision, assignment, registration: None }))
     }
 
     fn save(&self, snap: &AssignmentSnapshot) -> Result<()> {
@@ -169,16 +187,23 @@ impl AssignmentStore for LocalAssignment {
     }
 
     fn reload(&self, applied: Option<&AssignmentSnapshot>) -> Result<Option<AssignmentSnapshot>> {
-        // A rename that stopped between its two writes is finished first.
-        if let Some(intent) = RenameIntent::load(&self.machine_config, None)? {
-            intent.apply_standalone(&self.machine_config, &self.file)?;
-        }
         let assignment = Assignment::load(&self.file)?;
         if applied.is_some_and(|s| s.assignment == assignment) {
             return Ok(None);
         }
         let revision = applied.map_or(1, |s| s.revision + 1);
         Ok(Some(AssignmentSnapshot { revision, assignment, registration: None }))
+    }
+
+    fn finish_interrupted_rename(&self) -> Result<()> {
+        if let Some(intent) = RenameIntent::load(&self.machine_config, None)? {
+            intent.apply_standalone(&self.machine_config, &self.file)?;
+        }
+        Ok(())
+    }
+
+    fn local(&self) -> Option<&LocalAssignment> {
+        Some(self)
     }
 
     fn file(&self) -> Option<&Path> {

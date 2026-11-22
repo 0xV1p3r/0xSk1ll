@@ -62,8 +62,10 @@ pub(crate) struct Registered {
 /// Joins the fleet: registers this machine and its harnesses with the server,
 /// stores the token (0600) and the assignment snapshot, and clones the
 /// server's repo (or adopts an existing clone of it). The repo path is checked
-/// before the code is spent.
+/// before the code is spent. Holds the machine lock throughout, so no engine
+/// runs on the Machine meanwhile.
 pub async fn join(cfg: &Config, opts: JoinOptions) -> anyhow::Result<Joined> {
+    let _machine = crate::MachineLock::acquire(cfg)?;
     let reg = register(cfg, &opts, false).await?;
     reg.persist(cfg)?;
     tokio::task::spawn_blocking(move || reg.set_up_repo()).await?

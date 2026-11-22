@@ -327,6 +327,11 @@ fn ago(secs: i64) -> String {
 /// Where a command's requests go: the running daemon when it manages the
 /// repo, else an engine started in this process for the command (see
 /// [`sk1ll_daemon::local`]). Either way, the same local API.
+///
+/// One engine at a time manages a Machine, whatever repo it is for: a
+/// command that changes something runs only where it holds the machine
+/// lock. One that only reads ([`Access::Read`]) starts a read-only engine,
+/// which holds no lock and changes nothing, so it answers beside another.
 pub(crate) struct Session {
     /// The engine in this process, if no daemon serves the command.
     engine: Option<sk1ll_daemon::local::Engine>,
@@ -335,32 +340,56 @@ pub(crate) struct Session {
     rt: tokio::runtime::Runtime,
 }
 
+/// What a command does to the Machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Access {
+    /// Only reads: a preview, a listing.
+    Read,
+    /// May change the repo, the harnesses or the Assignment.
+    Write,
+}
+
 impl Session {
     /// The session for a command about `repo`. A daemon that isn't
-    /// running (no socket, or connection refused) or manages another repo
-    /// means an engine in this process; any other failure to talk to the
-    /// daemon is an error, since one may well be running.
-    pub(crate) fn open(cli: &Cli, repo: &Path) -> Result<Self> {
-        let cfg = daemon_config(cli)?;
-        let state = DaemonState::load(&cfg.state)?;
+    /// running (no socket, or connection refused) means an engine in this
+    /// process; any other failure to talk to the daemon is an error, since
+    /// one may well be running. A daemon that manages another repo is the
+    /// Machine's engine: a command that only reads runs beside it, read-only;
+    /// one that changes something is refused.
+    pub(crate) fn open(cli: &Cli, repo: &Path, access: Access) -> Result<Self> {
         let (rt, daemon) = Self::daemon(cli)?;
         if let Some((client, status)) = daemon {
             if same_path(&status.repo, repo) {
                 return Ok(Self { engine: None, client, status, rt });
             }
+            if access == Access::Write {
+                bail!(
+                    "the sk1ll daemon manages {} on this Machine, so it alone changes its harnesses and \
+                     Assignment; select that repo, or stop the daemon to work on {}",
+                    status.repo.display(),
+                    repo.display()
+                );
+            }
             eprintln!(
-                "note: the sk1ll daemon manages {}, not {}; running this command in this process",
+                "note: the sk1ll daemon manages {}, not {}; reading {} in this process",
                 status.repo.display(),
+                repo.display(),
                 repo.display()
             );
         }
-        if let Some(state) = state.as_ref().filter(|s| !s.revoked) {
-            check_joined_repo(repo, state)?;
-        }
+        let cfg = Config { repo: Some(repo.to_path_buf()), ..daemon_config(cli)? };
+        let state_path = cfg.state.clone();
         let engine = {
             let _runtime = rt.enter();
-            sk1ll_daemon::local::Engine::start(Config { repo: Some(repo.to_path_buf()), ..cfg })?
+            match access {
+                // Takes the machine lock before reading the state file.
+                Access::Write => sk1ll_daemon::local::Engine::start(cfg)?,
+                Access::Read => sk1ll_daemon::local::Engine::read_only(cfg)?,
+            }
         };
+        if let Some(state) = DaemonState::load(&state_path)?.filter(|s| !s.revoked) {
+            check_joined_repo(repo, &state)?;
+        }
         let client = engine.client().clone();
         let status = rt.block_on(client.status())?;
         Ok(Self { engine: Some(engine), client, status, rt })
@@ -380,7 +409,7 @@ impl Session {
             Some(state) => state.repo,
             None => sk1ll_daemon::locate_repo(cli.repo.as_deref(), false)?,
         };
-        Self::open(cli, &repo)
+        Self::open(cli, &repo, Access::Write)
     }
 
     /// The running daemon, if it manages `repo`.

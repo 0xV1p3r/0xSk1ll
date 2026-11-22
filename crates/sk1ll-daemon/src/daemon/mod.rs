@@ -2,9 +2,11 @@
 //!
 //! Every operation that changes the repo, the harnesses or the daemon's state
 //! runs on a blocking thread with the engine mutex held ([`Daemon::blocking`]),
-//! so they never interleave; across processes, the daemon holds core's
-//! [`EngineLock`] on the repo for its whole lifetime, so direct CLI mutations
-//! are refused.
+//! so they never interleave. Across processes, an engine holds the
+//! [`MachineLock`] for its whole life, taken before it reads any of the
+//! Machine's state, so no two engines ever change one Machine; and core's
+//! [`EngineLock`] on the repo it manages. An engine that holds no machine lock
+//! ([`Access::ReadOnly`], a CLI preview) changes nothing at all.
 //!
 //! No network I/O happens with the engine mutex held. An operation that
 //! talks to the server runs in steps: it checks and takes what it will send
@@ -62,13 +64,13 @@ use sk1ll_core::{EngineLock, MachineConfig, Repo};
 use sk1ll_proto::{AssignmentSnapshot, MachineReport};
 use tokio::sync::{Notify, broadcast, mpsc, watch};
 
-use crate::Config;
 use crate::client::{Connection, DaemonMode, Event, StatusView};
 use crate::error::{Error, Result};
 use crate::lifecycle::Lifecycle;
 pub(crate) use crate::lifecycle::Link;
 use crate::state::{self, DaemonState, PullRecord};
 use crate::watch::WatchRoot;
+use crate::{Config, MachineLock};
 
 mod adopt;
 mod assignment;
@@ -97,6 +99,20 @@ const BLOCK_NAME: &str = "instructions";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct World {
     epoch: u64,
+}
+
+/// What an engine may change, and how long it holds the [`MachineLock`].
+pub(crate) enum Access {
+    /// The daemon: holds the lock for its life and works in the background.
+    Daemon(MachineLock),
+    /// A command's engine in the CLI ([`crate::local`]): holds the lock for
+    /// the command, runs nothing in the background and connects to the
+    /// server only for a request that needs the session.
+    OnDemand(MachineLock),
+    /// A command that only reads (a preview): holds no lock and changes
+    /// nothing, not even what a reconcile would bring in line. Every engine
+    /// operation is refused; readers answer from the files as they are.
+    ReadOnly,
 }
 
 /// Process identity. Standalone has no server credentials or fleet state.
@@ -145,6 +161,9 @@ pub(crate) struct Daemon {
     /// server only when a request needs the session, and runs nothing in
     /// the background.
     on_demand: bool,
+    /// Held for the engine's life; `None` for a read-only one, which may
+    /// change nothing (see [`Access`]).
+    machine_lock: Option<MachineLock>,
     /// Started the server session for a request (see [`Daemon::on_demand`]).
     pub(crate) session_started: std::sync::Once,
     engine: Mutex<Engine>,
@@ -205,17 +224,32 @@ pub(crate) struct Engine {
 }
 
 impl Daemon {
+    #[cfg(test)]
     pub(crate) fn new(cfg: Config, state: DaemonState) -> anyhow::Result<Arc<Self>> {
-        Self::with_mode(cfg, Mode::Joined(state), false)
+        let lock = MachineLock::acquire(&cfg)?;
+        Self::for_machine(cfg, Some(state), Access::Daemon(lock))
     }
 
+    #[cfg(test)]
     pub(crate) fn standalone(cfg: Config) -> anyhow::Result<Arc<Self>> {
-        Self::for_machine(cfg, None, false)
+        let lock = MachineLock::acquire(&cfg)?;
+        Self::for_machine(cfg, None, Access::Daemon(lock))
     }
 
-    /// The daemon for `cfg`'s Machine: joined if `state` says so.
-    /// `on_demand`: an engine in a CLI process (see [`Daemon::on_demand`]).
-    pub(crate) fn for_machine(cfg: Config, state: Option<DaemonState>, on_demand: bool) -> anyhow::Result<Arc<Self>> {
+    /// The daemon for `cfg`'s Machine. It takes the machine lock before it
+    /// reads anything of the Machine, waiting up to `patience` for a
+    /// command's engine to end, so it starts from what that engine saved,
+    /// never from what it read before.
+    pub(crate) async fn start(cfg: Config, patience: std::time::Duration) -> anyhow::Result<Arc<Self>> {
+        use anyhow::Context;
+        let machine = MachineLock::wait(&cfg, patience).await.context("not starting")?;
+        let state = DaemonState::load(&cfg.state)?;
+        Self::for_machine(cfg, state, Access::Daemon(machine))
+    }
+
+    /// The engine for `cfg`'s Machine: joined if `state` says so. The
+    /// caller took the machine lock `access` carries before it read `state`.
+    pub(crate) fn for_machine(cfg: Config, state: Option<DaemonState>, access: Access) -> anyhow::Result<Arc<Self>> {
         let mode = match state {
             Some(state) => Mode::Joined(state),
             None => {
@@ -224,10 +258,15 @@ impl Daemon {
                 Mode::Standalone { machine_id: machine.id, repo }
             }
         };
-        Self::with_mode(cfg, mode, on_demand)
+        Self::with_mode(cfg, mode, access)
     }
 
-    fn with_mode(cfg: Config, state: Mode, on_demand: bool) -> anyhow::Result<Arc<Self>> {
+    fn with_mode(cfg: Config, state: Mode, access: Access) -> anyhow::Result<Arc<Self>> {
+        let (on_demand, machine_lock) = match access {
+            Access::Daemon(lock) => (false, Some(lock)),
+            Access::OnDemand(lock) => (true, Some(lock)),
+            Access::ReadOnly => (true, None),
+        };
         let standalone = matches!(state, Mode::Standalone { .. });
         let lifecycle = match &state {
             Mode::Joined(s) => Lifecycle::joined(s.revoked, s.record.clone()),
@@ -242,6 +281,12 @@ impl Daemon {
         let store = crate::store::for_machine(&cfg, state.joined().ok());
         let remote = crate::remote::for_machine(state.joined().ok());
         let snapshot = store.load()?;
+        // Only an engine that holds the machine lock writes what it loaded.
+        if machine_lock.is_some()
+            && let Some(snap) = &snapshot
+        {
+            store.save(snap)?;
+        }
         let mut view = StatusView {
             machine_id: state.machine_id().to_string(),
             server_url: state.joined().ok().map(|s| s.server_url.clone()),
@@ -267,6 +312,7 @@ impl Daemon {
             store,
             remote,
             on_demand,
+            machine_lock,
             session_started: std::sync::Once::new(),
             applied: RwLock::new(snapshot.map(Arc::new)),
             snapshot: watch::channel(Snapshot::initial()).0,
@@ -331,6 +377,7 @@ impl Daemon {
         T: Send + 'static,
         F: FnOnce(&Daemon, &mut Engine) -> Result<T> + Send + 'static,
     {
+        self.require_writer()?;
         let d = self.clone();
         tokio::task::spawn_blocking(move || {
             let mut engine = lock(&d.engine);
@@ -384,6 +431,17 @@ impl Daemon {
             .map_err(|e| Error::Internal(anyhow::anyhow!("daemon network task failed: {e}")))?
     }
 
+    /// Fails for a read-only engine ([`Access::ReadOnly`]): it holds no
+    /// machine lock, so it may change nothing.
+    pub(crate) fn require_writer(&self) -> Result<()> {
+        if self.machine_lock.is_none() {
+            return Err(Error::Conflict(
+                "this command only reads, so its engine changes nothing; run a command that changes it".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Whether an engine operation is running right now.
     fn engine_busy(&self) -> bool {
         matches!(self.engine.try_lock(), Err(TryLockError::WouldBlock))
@@ -399,8 +457,13 @@ impl Daemon {
     /// Input changed. A reader never waits for an engine operation: while
     /// one runs, it gets the Snapshot of the last reconcile. Only when none
     /// was ever published (an engine in a CLI process whose repo another
-    /// process is changing) is the reconcile's failure the answer.
+    /// process is changing) is the reconcile's failure the answer. A
+    /// read-only engine never reconciles: it only has what it published.
     pub(crate) async fn caught_up(self: &Arc<Self>) -> Result<Arc<Snapshot>> {
+        if let Err(e) = self.require_writer() {
+            let snapshot = self.snapshot();
+            return if snapshot.generation == 0 { Err(e) } else { Ok(snapshot) };
+        }
         let d = self.clone();
         let failed = tokio::task::spawn_blocking(move || {
             let mut eng = match d.engine.try_lock() {
@@ -612,7 +675,7 @@ impl Daemon {
     // -----------------------------------------------------------------------
     // Engine operations (blocking, with the engine mutex held)
 
-    fn ensure_managed(&self) -> Result<()> {
+    pub(crate) fn ensure_managed(&self) -> Result<()> {
         lock(&self.lifecycle).managed().map_err(|why| Error::Conflict(why.into()))?;
         self.require_repo()
     }
@@ -653,6 +716,7 @@ impl Daemon {
     /// Takes the engine lock on the repo if it exists and isn't held yet. Held
     /// by someone else means another sk1ll process is changing it.
     pub(crate) fn lock_repo(&self, eng: &mut Engine) -> Result<()> {
+        self.require_writer()?;
         let root = self.repo_root();
         if eng.lock.is_some() || !root.join(".git").exists() {
             return Ok(());

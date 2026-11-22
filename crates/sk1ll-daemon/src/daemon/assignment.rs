@@ -8,10 +8,14 @@ use crate::client::Event;
 use crate::error::{Error, Result};
 
 impl Daemon {
-    /// Under the engine mutex: applies what changed where the Assignment
-    /// lives without the daemon (a hand edit of the machine-local file), as
-    /// a new revision readers see. Harnesses follow with the next reconcile.
+    /// Under the engine mutex (and so the machine lock): finishes a
+    /// machine-local Harness rename that stopped between its writes, then
+    /// applies what changed where the Assignment lives without the daemon (a
+    /// hand edit of the machine-local file), as a new revision readers see.
+    /// Harnesses follow with the next reconcile.
     pub(crate) fn refresh_assignment(&self) -> Result<()> {
+        self.require_writer()?;
+        self.store.finish_interrupted_rename()?;
         let Some(snap) = self.store.reload(self.applied().as_deref())? else { return Ok(()) };
         self.store.save(&snap)?;
         self.publish_assignment(snap);
@@ -102,6 +106,22 @@ impl Daemon {
         applied.map(|snap| snap.assignment.clone()).ok_or_else(|| {
             Error::Conflict("waiting for the server's assignment; the harnesses are left alone until it arrives".into())
         })
+    }
+
+    /// What a preview plans with: the harnesses and the Assignment as the
+    /// next reconcile would have them. A machine-local Harness rename that
+    /// stopped between its writes is finished in memory only, as that
+    /// reconcile will finish it on disk. Writes nothing.
+    pub(super) fn preview_inputs(
+        &self,
+    ) -> Result<(std::collections::BTreeMap<String, sk1ll_core::Harness>, sk1ll_core::Assignment)> {
+        let config = &self.cfg.machine_config;
+        if let Some(file) = self.store.local().and(self.store.file())
+            && let Some(intent) = RenameIntent::load(config, None)?
+        {
+            return Ok((intent.renamed_config(config)?.harnesses(), intent.renamed_assignment(file)?));
+        }
+        Ok((sk1ll_core::MachineConfig::load(config)?.harnesses(), self.current_assignment()?))
     }
 
     /// Stores `snap` and syncs, unless it is older than what was applied. With

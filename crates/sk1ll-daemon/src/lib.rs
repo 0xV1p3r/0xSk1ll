@@ -3,7 +3,9 @@
 //! runs standalone against the same repo and machine-local assignment as the
 //! direct CLI. Joined machines use the fleet's repo and assignment snapshots.
 //!
-//! - Core's engine lock stays held while the daemon manages a repo.
+//! - The machine lock ([`MachineLock`]) is held for the daemon's whole life,
+//!   taken before it reads any of the Machine's state; core's engine lock on
+//!   the repo too while it manages one.
 //! - File watches and periodic reconciliation apply local changes in both modes.
 //! - Standalone commits stay local; explicit push/pull use the repo's origin.
 //! - Joined commits push immediately or queue while offline. Assignment arrives
@@ -21,6 +23,7 @@ mod error;
 pub mod join;
 mod lifecycle;
 pub mod local;
+mod machine_lock;
 mod notifications;
 mod remote;
 mod server;
@@ -35,6 +38,7 @@ use anyhow::{Context, bail};
 pub use config::{Config, locate_repo, parse_duration};
 use daemon::Daemon;
 pub use join::{JoinOptions, Joined, join, join_or_rejoin};
+pub use machine_lock::MachineLock;
 pub use state::DaemonState;
 
 static PREPARED: AtomicBool = AtomicBool::new(false);
@@ -65,8 +69,13 @@ pub unsafe fn prepare_process(cfg: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How long a starting daemon waits for a command's engine to end.
+const MACHINE_LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Runs until Ctrl-C / SIGTERM, standalone when daemon.json is absent.
-/// Fails if another process holds the repo's engine lock.
+/// Takes the machine lock before it reads anything of the Machine, waiting
+/// a while for a command's engine to end; fails if another process still
+/// holds it, or holds the repo's engine lock.
 ///
 /// [`prepare_process`] must have been called first.
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
@@ -74,11 +83,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         bail!("sk1ll_daemon::prepare_process must run before sk1ll_daemon::run");
     }
     sk1ll_core::git::require_git(sk1ll_core::git::MIN_VERSION)?;
-    let state = DaemonState::load(&cfg.state)?;
-    let d = match state {
-        Some(state) => Daemon::new(cfg, state)?,
-        None => Daemon::standalone(cfg)?,
-    };
+    let d = Daemon::start(cfg, MACHINE_LOCK_PATIENCE).await?;
     let listener = api::bind(&d.cfg.socket).await?;
     tracing::info!("sk1ll daemon {}: local API on {}", sk1ll_core::VERSION, d.cfg.socket.display());
     let socket = d.cfg.socket.clone();

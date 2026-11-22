@@ -524,6 +524,7 @@ async fn a_restart_remembers_the_block_and_the_server_baseline() {
     restarted.blocking(|d, eng| d.revoke(eng, "removed")).await.unwrap();
     let state = DaemonState::load(&cfg.state).unwrap().unwrap();
     assert!(state.revoked);
+    drop(restarted);
     let removed = Daemon::new(cfg, state).unwrap();
     assert_eq!(removed.view().connection, Connection::Revoked);
     assert!(removed.lifecycle().idle());
@@ -1320,7 +1321,8 @@ impl OnDemand {
         std::fs::write(root.join("personal/x/SKILL.md"), "x\n").unwrap();
         std::fs::write(root.join("personal/x/.sk1ll-id"), "id-x\n").unwrap();
         let state = DaemonState::load(&cfg.state).unwrap();
-        let d = Daemon::for_machine(cfg, state, true).unwrap();
+        let lock = crate::MachineLock::acquire(&cfg).unwrap();
+        let d = Daemon::for_machine(cfg, state, super::Access::OnDemand(lock)).unwrap();
         Self { d, url, http, _dir: dir, stop: Some(stop), thread: Some(thread) }
     }
 
@@ -1402,4 +1404,66 @@ async fn an_on_demand_rename_protects_a_destination_only_the_server_has() {
     assert!(!RenameIntent::exists(&d.cfg.machine_config).unwrap());
     let snapshot: AssignmentSnapshot = fleet.get("/machines/a/assignment").await;
     assert_eq!((snapshot.revision, snapshot.assignment), (saved.revision, saved.assignment));
+}
+
+/// Adds copy-mode harnesses to `d`'s `machine.toml`.
+fn add_harnesses(d: &Daemon, names: &[&str]) {
+    let mut config = std::fs::read_to_string(&d.cfg.machine_config).unwrap();
+    for name in names {
+        let skills = d.cfg.machine_config.with_file_name(name);
+        config.push_str(&format!("[harnesses.{name}]\nskills = {:?}\nmode = \"copy\"\n", skills.to_str().unwrap()));
+    }
+    std::fs::write(&d.cfg.machine_config, config).unwrap();
+}
+
+/// A daemon that starts while a command's engine (for any repo) is making
+/// a toggle waits for it to end, then starts from what it saved: it never
+/// loads revision N before the command persists N+1 and reconciles with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_starting_daemon_waits_for_a_commands_toggle_and_starts_from_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let command = standalone_with_pdf(dir.path());
+    add_harnesses(&command, &["h"]);
+    let cfg = command.cfg.clone();
+    let before = command.applied().unwrap().revision;
+    let starting = tokio::spawn(Daemon::start(cfg.clone(), std::time::Duration::from_secs(20)));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!starting.is_finished(), "the daemon waits for the command's engine");
+    let update = command.write_assignment(harness_toggle(false)).await.unwrap();
+    assert_eq!(update.revision, before + 1);
+    drop(command);
+    let daemon = tokio::time::timeout(std::time::Duration::from_secs(10), starting).await.unwrap().unwrap().unwrap();
+    let applied = daemon.applied().unwrap();
+    assert_eq!(applied.revision, update.revision);
+    assert!(!applied.assignment.harness("h").new_skills_default, "the toggle is applied");
+    assert_eq!(
+        state::load_snapshot(&cfg.state.with_file_name("standalone-assignment.json"), None).unwrap().unwrap().revision,
+        update.revision
+    );
+}
+
+/// Reading the Assignment never finishes a pending machine-local rename:
+/// only a reconcile, under the machine lock, does.
+#[tokio::test(flavor = "multi_thread")]
+async fn reading_the_assignment_leaves_a_pending_rename_alone() {
+    use sk1ll_core::harness_rename::{RenameIntent, RenameRequest};
+    let dir = tempfile::tempdir().unwrap();
+    let d = standalone_with_pdf(dir.path());
+    add_harnesses(&d, &["h"]);
+    let mut assignment = sk1ll_core::Assignment::default();
+    assignment.set_harness("h", false);
+    assignment.save(&d.cfg.assignment).unwrap();
+    let config = d.cfg.machine_config.clone();
+    let request = RenameRequest { from: "h".into(), to: "renamed".into(), replace: false };
+    RenameIntent::prepare(&config, d.repo_root(), request, &assignment, None).unwrap().apply_config(&config).unwrap();
+    let (config_before, file_before) = (std::fs::read(&config).unwrap(), std::fs::read(&d.cfg.assignment).unwrap());
+    let current = d.current_assignment().unwrap();
+    let (harnesses, planned) = d.preview_inputs().unwrap();
+    assert!(current.harnesses.contains_key("h"), "the file as it is");
+    assert!(harnesses.contains_key("renamed") && !planned.harness("renamed").new_skills_default);
+    assert!(RenameIntent::exists(&config).unwrap());
+    assert_eq!(std::fs::read(&config).unwrap(), config_before);
+    assert_eq!(std::fs::read(&d.cfg.assignment).unwrap(), file_before);
+    d.blocking(|d, eng| d.reconcile(eng).map(drop)).await.unwrap();
+    assert!(!RenameIntent::exists(&config).unwrap(), "a reconcile finishes it");
 }

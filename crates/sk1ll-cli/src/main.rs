@@ -287,6 +287,22 @@ enum RecoverCmd {
 }
 
 impl Cmd {
+    /// Only reads: a preview or a listing, which changes nothing on disk,
+    /// not even what a reconcile would bring in line, so it runs beside
+    /// another engine (see [`fleet::Session`]).
+    fn reads_only(&self) -> bool {
+        matches!(
+            self,
+            Self::Status
+                | Self::Render { .. }
+                | Self::Sync { dry_run: true, .. }
+                | Self::List { .. }
+                | Self::Diff { .. }
+                | Self::Edit { .. }
+                | Self::Harnesses { command: None, .. }
+        )
+    }
+
     /// Works on a repo whose configuration is damaged: it needs only git.
     fn git_only(&self) -> bool {
         matches!(self, Self::Draft | Self::Diff { .. } | Self::Restore { .. } | Self::Commit { .. } | Self::Pull)
@@ -356,7 +372,8 @@ fn run(cli: Cli) -> Result<()> {
         let root = path.as_deref().map_or_else(|| Ok(repo.clone()), std::path::absolute)?;
         return init(&cli, &root);
     }
-    let session = Session::open(&cli, &repo)?;
+    let access = if cli.cmd.reads_only() { fleet::Access::Read } else { fleet::Access::Write };
+    let session = Session::open(&cli, &repo, access)?;
     match cli.cmd {
         Cmd::Harnesses { all, command } => harnesses::run(&session, all, command),
         cmd => command(&session, cmd),
@@ -365,7 +382,8 @@ fn run(cli: Cli) -> Result<()> {
 
 /// `sk1ll init`: creates the repo an engine then manages. A daemon waiting
 /// for one at this path makes it; otherwise it is made here, under the
-/// engine lock of the repo the path is in (if it is in one).
+/// machine lock (it may write `machine.toml`) and the engine lock of the
+/// repo the path is in (if it is in one).
 fn init(cli: &Cli, root: &Path) -> Result<()> {
     sk1ll_core::git::require_git(sk1ll_core::git::MIN_VERSION)?;
     if let Some(session) = Session::daemon_for(cli, root)?
@@ -373,10 +391,12 @@ fn init(cli: &Cli, root: &Path) -> Result<()> {
     {
         session.block(session.client.init())?;
     } else {
+        let cfg = fleet::daemon_config(cli)?;
+        let _machine = sk1ll_daemon::MachineLock::acquire(&cfg)?;
         let _lock = sk1ll_core::EngineLock::for_new_repo(root)?;
         // A machine without machine.toml is set up for the first time here:
         // it takes up the opt-in presets it finds (see MachineConfig::adopt_detected_presets).
-        let machine_path = cli.machine_config.clone().map_or_else(MachineConfig::default_path, Ok)?;
+        let machine_path = cfg.machine_config;
         if !root.join(".git").exists() && std::fs::symlink_metadata(&machine_path).is_err() {
             for warning in MachineConfig::adopt_detected_presets(&machine_path, root)? {
                 eprintln!("{warning}");

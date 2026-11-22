@@ -374,7 +374,7 @@ impl MachineConfig {
         Self::parse(&snapshot.text()?, snapshot.path())
     }
 
-    fn parse(text: &str, path: &Path) -> Result<Self> {
+    pub(crate) fn parse(text: &str, path: &Path) -> Result<Self> {
         let mut config: Self =
             toml::from_str(text).map_err(|e| Error::Parse { path: path.to_path_buf(), message: e.to_string() })?;
         if config.id.trim().is_empty() {

@@ -47,9 +47,15 @@ impl TestRepo {
     }
 
     fn command_on(&self, socket: &Path, args: &[&str]) -> Command {
+        self.command_for(&self.repo, socket, args)
+    }
+
+    /// A command about `repo`, on this Machine (its config, Assignment and
+    /// state file).
+    fn command_for(&self, repo: &Path, socket: &Path, args: &[&str]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_sk1ll"));
         cmd.arg("--repo")
-            .arg(&self.repo)
+            .arg(repo)
             .arg("--machine-config")
             .arg(self.root.join("machine.toml"))
             .arg("--assignment")
@@ -78,6 +84,31 @@ impl TestRepo {
 
     fn run_on(&self, socket: &Path, args: &[&str]) -> Result<String, String> {
         outcome(self.command_on(socket, args).output().unwrap())
+    }
+
+    /// Another committed repo on the same Machine, with a skill `web`.
+    fn other_repo(&self) -> PathBuf {
+        let other = self.root.join("other");
+        Repo::init(&other).unwrap();
+        fs::create_dir(other.join("personal/web")).unwrap();
+        fs::write(other.join("personal/web/SKILL.md"), "Web.").unwrap();
+        git(&other, &["config", "user.name", "Test"]);
+        git(&other, &["config", "user.email", "test@example.com"]);
+        git(&other, &["add", "."]);
+        git(&other, &["commit", "-qm", "seed"]);
+        other
+    }
+
+    /// The daemon's configuration for this Machine, managing `repo`.
+    fn daemon_config(&self, repo: &Path) -> sk1ll_daemon::Config {
+        sk1ll_daemon::Config {
+            repo: Some(repo.to_path_buf()),
+            state: self.state(),
+            machine_config: self.root.join("machine.toml"),
+            assignment: self.assignment(),
+            socket: self.root.join("no-daemon.sock"),
+            ..sk1ll_daemon::Config::new().unwrap()
+        }
     }
 
     fn assignment(&self) -> PathBuf {
@@ -308,6 +339,58 @@ fn repair_ids_keeps_the_id_with_the_baselines_claimant() {
     repo.run(&["sync"]).unwrap();
     assert!(skills.join("web/SKILL.md").is_file(), "web keeps its placement");
     assert!(!skills.join("aweb").exists(), "the copy is new, and new skills are off in h");
+}
+
+/// One engine at a time per Machine, whatever repo it manages: while one
+/// for this repo runs (a daemon, or another command), a command about
+/// another repo changes nothing of the Machine's harnesses or Assignment.
+/// Previews still answer, changing nothing either.
+#[test]
+fn a_second_engine_for_another_repo_is_refused() {
+    let repo = TestRepo::new().with_skill();
+    let other = repo.other_repo();
+    let socket = repo.root.join("no-daemon.sock");
+    let skills = repo.root.join("h");
+    // The engine managing `repo`, as the daemon would hold it.
+    let held = sk1ll_daemon::MachineLock::acquire(&repo.daemon_config(&repo.repo)).unwrap();
+    let changes: [&[&str]; 3] = [&["sync"], &["assign", "h", "skill", "web", "off"], &["draft"]];
+    for args in changes {
+        let err = outcome(repo.command_for(&other, &socket, args).output().unwrap()).expect_err("refused");
+        assert!(err.contains("another sk1ll process") && err.contains("managing this Machine"), "{args:?}: {err}");
+    }
+    assert!(!skills.exists(), "no second engine placed anything");
+    assert!(!repo.assignment().exists(), "nor wrote the Assignment");
+    for args in [&["status"][..], &["sync", "--dry-run"], &["list"]] {
+        let out = outcome(repo.command_for(&other, &socket, args).output().unwrap());
+        out.unwrap_or_else(|e| panic!("{args:?}: {e}"));
+    }
+    assert!(!skills.exists() && !repo.assignment().exists(), "previews change nothing");
+    drop(held);
+    outcome(repo.command_for(&other, &socket, &["sync"]).output().unwrap()).unwrap();
+    assert!(skills.join("web/SKILL.md").is_file());
+}
+
+/// A standalone daemon managing another repo is this Machine's engine: a
+/// command that changes something is refused, saying so, instead of
+/// running a second engine beside it; one that only reads runs here.
+#[test]
+fn a_daemon_for_another_repo_refuses_changes_and_lets_reads_through() {
+    let repo = TestRepo::new().with_skill();
+    let socket = repo.root.join("daemon.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let status = STATUS.replace(r#""mode":"joined""#, r#""mode":"standalone""#);
+    let daemon = std::thread::spawn(move || {
+        for _ in 0..2 {
+            assert_eq!(answer(&listener, "200 OK", &status).0, "GET /status HTTP/1.1");
+        }
+    });
+    let err = repo.run_on(&socket, &["sync"]).expect_err("the daemon alone changes this Machine");
+    assert!(err.contains("the sk1ll daemon manages /elsewhere"), "{err}");
+    assert!(!repo.root.join("h").exists());
+    let plan = repo.run_on(&socket, &["sync", "--dry-run"]).unwrap();
+    assert!(plan.contains("pdf"), "{plan}");
+    assert!(!repo.root.join("h").exists());
+    daemon.join().unwrap();
 }
 
 /// A pull that stopped half-way leaves a partial tree: nothing writes

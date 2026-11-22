@@ -277,3 +277,71 @@ fn standalone_sync_recovers_a_harness_rename_after_config_was_saved() {
     assert!(!saved.harnesses.contains_key("a"));
     assert!(!saved.harness("new-a").new_skills_default);
 }
+
+/// Every file and directory under `root`: its kind, mode and contents.
+fn tree(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, (String, u32, Vec<u8>)> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut found = std::collections::BTreeMap::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            let mode = meta.permissions().mode();
+            let rel = path.strip_prefix(root).unwrap().to_path_buf();
+            let value = if meta.is_symlink() {
+                ("link".into(), mode, std::fs::read_link(&path).unwrap().into_os_string().into_encoded_bytes())
+            } else if meta.is_dir() {
+                pending.push(path);
+                ("dir".into(), mode, Vec::new())
+            } else {
+                ("file".into(), mode, std::fs::read(&path).unwrap())
+            };
+            found.insert(rel, value);
+        }
+    }
+    found
+}
+
+/// Previews only read: with a Harness rename stopped half-way, a disabled
+/// Harness and a skill without an Item ID (all of which a reconcile would
+/// change), `status`, `render` and `sync --dry-run` leave every file as it
+/// was. They plan as the next reconcile would, with the rename finished.
+#[test]
+fn previews_leave_a_pending_rename_and_the_harnesses_byte_identical() {
+    use sk1ll_core::harness_rename::{RenameIntent, RenameRequest};
+    let fixture = Fixture::new();
+    let root = fixture.0.path();
+    fixture.write("repo/personal/pdf/SKILL.md", "PDFs.");
+    fixture.write("repo/instructions/git.md", "Git.");
+    let mut assignment = sk1ll_core::Assignment::default();
+    assignment.set_harness("b", false);
+    assignment.save(&root.join("assignment.json")).unwrap();
+    let config = root.join("machine.toml");
+    let pending = RenameIntent::prepare(
+        &config,
+        &root.join("repo"),
+        RenameRequest { from: "a".into(), to: "new-a".into(), replace: false },
+        &assignment,
+        None,
+    )
+    .unwrap();
+    pending.apply_config(&config).unwrap();
+    let before = tree(root);
+
+    let status = fixture.run(&["status"]);
+    assert!(status.contains("+ ") && status.contains("pdf"), "{status}");
+    let plan = fixture.run(&["sync", "--dry-run"]);
+    assert_eq!(plan, status, "status shows the dry run's plan");
+    let harnesses: Vec<_> = plan.lines().filter_map(|line| line.split_whitespace().nth(1)).collect();
+    assert_eq!(harnesses, ["c", "new-a"], "the renamed Harness, not the disabled one: {plan}");
+    fixture.run(&["render", "new-a"]);
+
+    assert_eq!(tree(root), before, "a preview changed the filesystem");
+    assert!(RenameIntent::exists(&config).unwrap());
+    // A sync, which changes things, finishes the rename.
+    fixture.run(&["sync"]);
+    assert!(!RenameIntent::exists(&config).unwrap());
+    // `new-a` keeps `a`'s skills directory.
+    assert!(root.join("a/pdf/SKILL.md").is_file() && !root.join("b/pdf").exists());
+}

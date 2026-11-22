@@ -121,6 +121,16 @@ impl RenameIntent {
         file.replace(to)
     }
 
+    /// The machine config at `config` once renamed, without writing it:
+    /// the file must still be as the intent found it, or renamed already.
+    pub fn renamed_config(&self, config: &Path) -> Result<MachineConfig> {
+        let current = Snapshot::take(config)?.text()?;
+        if current != self.before_config && current != self.after_config {
+            return Err(Error::Changed(format!("{} changed during the pending Harness rename", config.display())));
+        }
+        MachineConfig::parse(&self.after_config, config)
+    }
+
     /// The machine-local Assignment at `path` once renamed: the file must
     /// still be as the intent found it, or renamed already.
     pub fn renamed_assignment(&self, path: &Path) -> Result<Assignment> {
