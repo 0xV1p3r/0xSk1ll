@@ -11,6 +11,12 @@
 //! only under the engine mutex and the machine lock
 //! ([`AssignmentStore::finish_interrupted_rename`]), never by a reader.
 //!
+//! What was just loaded is never written back unless something changed, and
+//! every machine-local save is a compare-and-swap against the exact bytes of
+//! the file and its revision record it was derived from
+//! ([`LocalAssignment::swap`]): a hand edit that lands after the load fails
+//! the save instead of being replaced by what was loaded before it.
+//!
 //! [ADR 0001]: ../../../docs/adr/0001-assignment-is-server-state.md
 //! [ADR 0004]: ../../../docs/adr/0004-standalone-assignment-is-machine-local.md
 
@@ -35,7 +41,15 @@ pub(crate) trait AssignmentStore: Send + Sync {
     /// sends it.
     fn load(&self) -> anyhow::Result<Option<AssignmentSnapshot>>;
 
-    /// Stores `snap`, about to be applied, so a restart starts from it.
+    /// [`load`](AssignmentStore::load), for an engine that holds the machine
+    /// lock, as it starts: what it loads is recorded where it lives if it
+    /// isn't yet (a hand edit made while no engine ran becomes a revision of
+    /// its own), and nothing is written if it is.
+    fn settle(&self) -> anyhow::Result<Option<AssignmentSnapshot>>;
+
+    /// Stores `snap`, a server's snapshot about to be applied, so a restart
+    /// starts from it. Only for a store that isn't
+    /// [`local`](AssignmentStore::local), whose writes are compare-and-swaps.
     fn save(&self, snap: &AssignmentSnapshot) -> Result<()>;
 
     /// What changed where the Assignment lives without the daemon (a hand
@@ -74,6 +88,14 @@ pub(crate) trait AssignmentStore: Send + Sync {
     fn get<'a>(&'a self, d: &'a Arc<Daemon>) -> BoxFuture<'a, Result<AssignmentSnapshot>>;
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The next machine-local store made on this thread starts with it as
+    /// its [`LocalAssignment::before_swap`], so a test reaches the swap a
+    /// daemon makes as it starts.
+    pub(crate) static BEFORE_FIRST_SWAP: std::cell::Cell<Option<Box<dyn FnOnce() + Send>>> = Default::default();
+}
+
 /// The store for `cfg`: the server's for a joined Machine, else the file.
 pub(crate) fn for_machine(cfg: &Config, joined: Option<&DaemonState>) -> Box<dyn AssignmentStore> {
     match joined {
@@ -87,7 +109,7 @@ pub(crate) fn for_machine(cfg: &Config, joined: Option<&DaemonState>) -> Box<dyn
             revisions: cfg.state.with_file_name("standalone-assignment.json"),
             machine_config: cfg.machine_config.clone(),
             #[cfg(test)]
-            before_swap: Default::default(),
+            before_swap: std::sync::Mutex::new(BEFORE_FIRST_SWAP.take()),
         }),
     }
 }
@@ -115,6 +137,17 @@ impl AssignmentStore for ServerAssignment {
                 Ok(None)
             }
         }
+    }
+
+    fn settle(&self) -> anyhow::Result<Option<AssignmentSnapshot>> {
+        let snapshot = self.load()?;
+        // The mirror is only a copy of the stored snapshot, for reading.
+        if let Some(snap) = &snapshot
+            && sk1ll_core::Assignment::load(&self.mirror).ok().as_ref() != Some(&snap.assignment)
+        {
+            self.write_mirror(snap);
+        }
+        Ok(snapshot)
     }
 
     fn save(&self, snap: &AssignmentSnapshot) -> Result<()> {
@@ -181,27 +214,23 @@ pub(crate) struct LocalAssignment {
 
 impl AssignmentStore for LocalAssignment {
     fn load(&self) -> anyhow::Result<Option<AssignmentSnapshot>> {
-        let assignment = Assignment::load(&self.file)?;
-        let previous = state::load_snapshot(&self.revisions, None)?;
-        let revision = previous.as_ref().map_or(1, |s| s.revision + u64::from(s.assignment != assignment));
-        Ok(Some(AssignmentSnapshot { revision, assignment, registration: None }))
+        Ok(Some(self.observe()?.snapshot(None)))
     }
 
-    fn save(&self, snap: &AssignmentSnapshot) -> Result<()> {
-        // Assignment::save replaces the file atomically.
-        if Assignment::load(&self.file)? != snap.assignment {
-            snap.assignment.save(&self.file)?;
-        }
-        Ok(state::save_snapshot(&self.revisions, snap, None)?)
+    fn settle(&self) -> anyhow::Result<Option<AssignmentSnapshot>> {
+        Ok(Some(self.settle_after(None)?))
+    }
+
+    fn save(&self, _: &AssignmentSnapshot) -> Result<()> {
+        Err(Error::Internal(anyhow::anyhow!("a machine-local Assignment is saved by a compare-and-swap, not stored")))
     }
 
     fn reload(&self, applied: Option<&AssignmentSnapshot>) -> Result<Option<AssignmentSnapshot>> {
-        let assignment = Assignment::load(&self.file)?;
-        if applied.is_some_and(|s| s.assignment == assignment) {
+        let observed = self.observe()?;
+        if applied.is_some_and(|s| s.assignment == observed.assignment) {
             return Ok(None);
         }
-        let revision = applied.map_or(1, |s| s.revision + 1);
-        Ok(Some(AssignmentSnapshot { revision, assignment, registration: None }))
+        Ok(Some(observed.snapshot(applied)))
     }
 
     fn finish_interrupted_rename(&self) -> Result<()> {
@@ -250,7 +279,60 @@ impl AssignmentStore for LocalAssignment {
 /// by hand while it was being made.
 const WRITE_ATTEMPTS: usize = 3;
 
+/// What a machine-local snapshot is derived from, read once: the exact bytes
+/// of the Assignment file and of its revision record, and what they hold.
+pub(crate) struct Observed {
+    file: Option<Vec<u8>>,
+    record: Option<Vec<u8>>,
+    assignment: Assignment,
+    recorded: Option<AssignmentSnapshot>,
+}
+
+impl Observed {
+    /// The snapshot the file is: at the recorded revision, or at the one
+    /// after it if the file changed since (a hand edit). `floor`, the
+    /// applied snapshot, keeps revisions from going back if the record does.
+    fn snapshot(&self, floor: Option<&AssignmentSnapshot>) -> AssignmentSnapshot {
+        let previous = match (self.recorded.as_ref(), floor) {
+            (Some(recorded), Some(floor)) if floor.revision > recorded.revision => Some(floor),
+            (Some(recorded), _) => Some(recorded),
+            (None, floor) => floor,
+        };
+        let revision = previous.map_or(1, |p| p.revision + u64::from(p.assignment != self.assignment));
+        AssignmentSnapshot { revision, assignment: self.assignment.clone(), registration: None }
+    }
+
+    /// Whether `snap` is what the record holds already.
+    fn records(&self, snap: &AssignmentSnapshot) -> bool {
+        self.recorded.as_ref() == Some(snap)
+    }
+}
+
 impl LocalAssignment {
+    /// Reads the file and its revision record.
+    pub(crate) fn observe(&self) -> Result<Observed> {
+        let record = state::read_snapshot(&self.revisions)?;
+        let recorded = state::parse_snapshot(&self.revisions, record.as_deref(), None)?;
+        let (file, assignment) = Assignment::observe(&self.file)?;
+        Ok(Observed { file, record, assignment, recorded })
+    }
+
+    /// Under the machine lock: the snapshot the file is, recorded as such
+    /// unless it is already (a hand edit becomes the revision after
+    /// `applied`), by a compare-and-swap; a hand edit that lands meanwhile is
+    /// read again, never replaced. Writes nothing when nothing changed.
+    pub(crate) fn settle_after(&self, applied: Option<&AssignmentSnapshot>) -> Result<AssignmentSnapshot> {
+        for _ in 0..WRITE_ATTEMPTS {
+            let observed = self.observe()?;
+            let snap = observed.snapshot(applied);
+            if observed.records(&snap) || self.swap(&observed, &snap)? {
+                return Ok(snap);
+            }
+            tracing::info!("the Assignment file changed while its revision was recorded; reading it again");
+        }
+        Err(Error::Conflict("the Assignment file kept changing while its revision was recorded; try again".into()))
+    }
+
     /// Makes `write` to the file, under the engine mutex and the machine
     /// lock, in one step: what it is made from (the applied revision, with a
     /// hand edit taken up first), the next revision, saving both and
@@ -263,8 +345,11 @@ impl LocalAssignment {
         d.ensure_managed()?;
         d.lock_repo(eng)?;
         for _ in 0..WRITE_ATTEMPTS {
-            d.refresh_assignment()?;
-            let base = d.applied().expect("a standalone Machine always has its Assignment");
+            self.finish_interrupted_rename()?;
+            // Made from the file as it is now, a hand edit included.
+            let observed = self.observe()?;
+            let applied = d.applied();
+            let base = observed.snapshot(applied.as_deref());
             let mut assignment = base.assignment.clone();
             match write {
                 AssignmentWrite::Changes(changes) => {
@@ -280,11 +365,16 @@ impl LocalAssignment {
                 }
             }
             if assignment == base.assignment {
-                let errors = d.install_assignment(eng, None);
+                // Nothing to write but a hand edit's revision, if there was one.
+                if !observed.records(&base) && !self.swap(&observed, &base)? {
+                    continue;
+                }
+                let newer = (applied.as_deref() != Some(&base)).then(|| base.clone());
+                let errors = d.install_assignment(eng, newer);
                 return Ok(AssignmentUpdate { revision: base.revision, assignment, entries: Vec::new(), errors });
             }
             let snap = AssignmentSnapshot { revision: base.revision + 1, assignment, registration: None };
-            if !self.swap(&base, &snap)? {
+            if !self.swap(&observed, &snap)? {
                 tracing::info!("the Assignment file changed while a write was made from it; making it again");
                 continue;
             }
@@ -295,22 +385,31 @@ impl LocalAssignment {
         Err(Error::Conflict("the Assignment file kept changing while this write was made; try again".into()))
     }
 
-    /// Saves `next` if the file and its revision are still `base`: `false`,
-    /// with nothing written, if not. The file is replaced atomically, its
-    /// revision after it, so a stop in between leaves a file that is newer
-    /// than its revision, which the next load counts as one more.
-    pub(crate) fn swap(&self, base: &AssignmentSnapshot, next: &AssignmentSnapshot) -> Result<bool> {
-        // A hand edit landing after the write was made from the file.
+    /// Saves `next` if the file and its revision record still hold exactly
+    /// the bytes `base` read: `false`, with nothing written, if not. Only
+    /// what changed is written: the file if `next` changes the Assignment,
+    /// the record if it isn't `next` already. The file is replaced
+    /// atomically, its record after it, so a stop in between leaves a file
+    /// that is newer than its record, which the next load counts as one more.
+    pub(crate) fn swap(&self, base: &Observed, next: &AssignmentSnapshot) -> Result<bool> {
+        // A hand edit landing after `base` was read.
         #[cfg(test)]
         if let Some(edit) = self.before_swap.lock().unwrap_or_else(|e| e.into_inner()).take() {
             edit();
         }
-        let stored = state::load_snapshot(&self.revisions, None)?;
-        if Assignment::load(&self.file)? != base.assignment || stored.is_some_and(|s| s.revision != base.revision) {
+        if state::read_snapshot(&self.revisions)? != base.record {
             return Ok(false);
         }
-        next.assignment.save(&self.file)?;
-        state::save_snapshot(&self.revisions, next, None)?;
+        if next.assignment != base.assignment {
+            if !next.assignment.swap(&self.file, base.file.as_deref())? {
+                return Ok(false);
+            }
+        } else if Assignment::observe(&self.file)?.0 != base.file {
+            return Ok(false);
+        }
+        if !base.records(next) {
+            state::save_snapshot(&self.revisions, next, None)?;
+        }
         Ok(true)
     }
 }

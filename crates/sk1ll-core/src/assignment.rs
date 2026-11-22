@@ -80,11 +80,35 @@ impl Assignment {
 
     /// Loads `path`; a missing file is the all-enabled default.
     pub fn load(path: &Path) -> Result<Self> {
-        match crate::config_file::read_text(path, true)? {
-            Some(text) => serde_json::from_str(&text)
-                .map_err(|e| Error::Parse { path: path.to_path_buf(), message: e.to_string() }),
-            None => Ok(Self::default()),
+        Ok(Self::observe(path)?.1)
+    }
+
+    /// The file's exact bytes (`None`: there is none) and what they hold,
+    /// read once: what a compare-and-swap of the file compares against.
+    pub fn observe(path: &Path) -> Result<(Option<Vec<u8>>, Self)> {
+        let bytes = crate::config_file::read_regular(path, true)?;
+        let assignment = match &bytes {
+            Some(bytes) => {
+                let parse = |message: String| Error::Parse { path: path.to_path_buf(), message };
+                let text = std::str::from_utf8(bytes).map_err(|e| parse(e.to_string()))?;
+                serde_json::from_str(text).map_err(|e| parse(e.to_string()))?
+            }
+            None => Self::default(),
+        };
+        Ok((bytes, assignment))
+    }
+
+    /// Saves `self` over the file only if it still holds exactly `expected`
+    /// (`None`: there is no file), the bytes what is saved was derived from;
+    /// `false`, with nothing written, if not. The file is replaced
+    /// atomically, so only a write landing between the check and the rename
+    /// can still be replaced.
+    pub fn swap(&self, path: &Path, expected: Option<&[u8]>) -> Result<bool> {
+        if crate::config_file::read_regular(path, true)?.as_deref() != expected {
+            return Ok(false);
         }
+        self.save(path)?;
+        Ok(true)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {

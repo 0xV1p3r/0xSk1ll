@@ -77,10 +77,10 @@ impl Daemon {
         let (config, file) = (&self.cfg.machine_config, self.store.file().expect("a machine-local file"));
         let intent = prepare_rename(config, self.repo_root(), None, request, Some(base.assignment.clone()))?;
         intent.apply_standalone(config, file)?;
-        let assignment = sk1ll_core::Assignment::load(file)?;
-        let revision = base.revision + u64::from(assignment != base.assignment);
-        let snap = AssignmentSnapshot { revision, assignment: assignment.clone(), registration: None };
-        self.store.save(&snap)?;
+        // The revision after `base`, recorded by a compare-and-swap against
+        // the file as the rename left it.
+        let snap = self.store.local().expect("a machine-local store").settle_after(Some(&base))?;
+        let (revision, assignment) = (snap.revision, snap.assignment.clone());
         let errors = self.install_assignment(eng, (revision > base.revision).then_some(snap));
         let update = AssignmentUpdate { revision, assignment, entries: Vec::new(), errors };
         Ok(crate::client::HarnessRenameResult { update, routed_rules: intent.routed_rules })

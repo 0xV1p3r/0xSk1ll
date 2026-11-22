@@ -280,13 +280,9 @@ impl Daemon {
         };
         let store = crate::store::for_machine(&cfg, state.joined().ok());
         let remote = crate::remote::for_machine(state.joined().ok());
-        let snapshot = store.load()?;
-        // Only an engine that holds the machine lock writes what it loaded.
-        if machine_lock.is_some()
-            && let Some(snap) = &snapshot
-        {
-            store.save(snap)?;
-        }
+        // Only an engine that holds the machine lock records what it loads,
+        // and only what changed (see `AssignmentStore::settle`).
+        let snapshot = if machine_lock.is_some() { store.settle()? } else { store.load()? };
         let mut view = StatusView {
             machine_id: state.machine_id().to_string(),
             server_url: state.joined().ok().map(|s| s.server_url.clone()),

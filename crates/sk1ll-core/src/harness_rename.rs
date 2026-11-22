@@ -27,7 +27,8 @@ pub struct RenameIntent {
 }
 
 impl RenameIntent {
-    fn path(config: &Path) -> PathBuf {
+    /// Where the intent for the machine config at `config` is kept.
+    pub fn path(config: &Path) -> PathBuf {
         config.with_extension("harness-rename.json")
     }
 
@@ -134,25 +135,34 @@ impl RenameIntent {
     /// The machine-local Assignment at `path` once renamed: the file must
     /// still be as the intent found it, or renamed already.
     pub fn renamed_assignment(&self, path: &Path) -> Result<Assignment> {
+        Ok(self.renamed_from(path)?.2)
+    }
+
+    /// The Assignment file's exact bytes, what they hold and what the
+    /// rename makes of it (see [`RenameIntent::renamed_assignment`]).
+    fn renamed_from(&self, path: &Path) -> Result<(Option<Vec<u8>>, Assignment, Assignment)> {
         let before = self
             .before_assignment
             .as_ref()
             .ok_or_else(|| Error::Invalid("this Harness rename needs the Server".into()))?;
         let mut after = before.clone();
         after.rename_harness(&self.request.from, &self.request.to);
-        let current = Assignment::load(path)?;
+        let (bytes, current) = Assignment::observe(path)?;
         if current != *before && current != after {
             return Err(Error::Changed(format!("{} changed during the pending Harness rename", path.display())));
         }
-        Ok(after)
+        Ok((bytes, current, after))
     }
 
-    /// Makes both writes of a machine-local rename and finishes it.
+    /// Makes both writes of a machine-local rename and finishes it. The
+    /// Assignment file is written only if it still holds what the rename
+    /// was made from: a hand edit that landed meanwhile fails the rename,
+    /// which stays pending, rather than being replaced.
     pub fn apply_standalone(&self, config: &Path, path: &Path) -> Result<()> {
-        let after = self.renamed_assignment(path)?;
+        let (bytes, current, after) = self.renamed_from(path)?;
         self.apply_config(config)?;
-        if Assignment::load(path)? != after {
-            after.save(path)?;
+        if current != after && !after.swap(path, bytes.as_deref())? {
+            return Err(Error::Changed(format!("{} changed during the pending Harness rename", path.display())));
         }
         self.finish(config)
     }

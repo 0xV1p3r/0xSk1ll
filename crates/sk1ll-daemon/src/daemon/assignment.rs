@@ -12,13 +12,19 @@ impl Daemon {
     /// machine-local Harness rename that stopped between its writes, then
     /// applies what changed where the Assignment lives without the daemon (a
     /// hand edit of the machine-local file), as a new revision readers see.
-    /// Harnesses follow with the next reconcile.
+    /// It writes only that revision's record, by a compare-and-swap against
+    /// the bytes it read, never the file it read it from (see
+    /// [`crate::store::LocalAssignment::settle_after`]). Harnesses follow
+    /// with the next reconcile.
     pub(crate) fn refresh_assignment(&self) -> Result<()> {
         self.require_writer()?;
         self.store.finish_interrupted_rename()?;
-        let Some(snap) = self.store.reload(self.applied().as_deref())? else { return Ok(()) };
-        self.store.save(&snap)?;
-        self.publish_assignment(snap);
+        let Some(local) = self.store.local() else { return Ok(()) };
+        let applied = self.applied();
+        let snap = local.settle_after(applied.as_deref())?;
+        if applied.as_deref() != Some(&snap) {
+            self.publish_assignment(snap);
+        }
         Ok(())
     }
 

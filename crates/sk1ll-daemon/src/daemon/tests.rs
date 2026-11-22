@@ -1530,3 +1530,68 @@ async fn previews_through_the_daemon_never_reconcile() {
     assert!(repo.skills.iter().any(|s| s.name == "new" && s.id.is_some()), "a fresh read catches up");
     assert!(id.exists());
 }
+
+/// `g` switched off in the Assignment file, as a hand edit.
+fn hand_edit(file: &Path, harness: &'static str) -> impl FnOnce() + Send + 'static {
+    let file = file.to_path_buf();
+    move || {
+        let mut hand = sk1ll_core::Assignment::load(&file).unwrap();
+        hand.set_harness(harness, false);
+        hand.save(&file).unwrap();
+    }
+}
+
+fn revision_record(d: &Daemon) -> std::path::PathBuf {
+    d.cfg.state.with_file_name("standalone-assignment.json")
+}
+
+/// Taking up a hand edit of the machine-local file writes only its
+/// revision, and only if the file still holds what was read: a second hand
+/// edit landing in between is kept, never replaced by the first.
+#[tokio::test(flavor = "multi_thread")]
+async fn taking_up_a_hand_edit_never_replaces_a_newer_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = standalone_with_pdf(dir.path());
+    add_harnesses(&d, &["h", "g"]);
+    let base = d.applied().unwrap().revision;
+    let file = d.cfg.assignment.clone();
+    hand_edit(&file, "h")();
+    *d.store.local().unwrap().before_swap.lock().unwrap() = Some(Box::new(hand_edit(&file, "g")));
+    d.blocking(|d, _| d.refresh_assignment()).await.unwrap();
+    let saved = sk1ll_core::Assignment::load(&file).unwrap();
+    assert!(!saved.harness("h").new_skills_default && !saved.harness("g").new_skills_default, "both edits kept");
+    let applied = d.applied().unwrap();
+    assert_eq!((applied.revision, &applied.assignment), (base + 1, &saved), "taken up as one revision");
+    let stored = state::load_snapshot(&revision_record(&d), None).unwrap().unwrap();
+    assert_eq!((stored.revision, &stored.assignment), (base + 1, &saved));
+}
+
+/// A daemon starting over a hand edit made while no engine ran records it
+/// as a revision, without replacing a second edit that lands meanwhile; and
+/// one starting over nothing new writes nothing at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_starting_daemon_writes_back_nothing_it_loaded() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let d = standalone_with_pdf(dir.path());
+    add_harnesses(&d, &["h", "g"]);
+    let (cfg, base) = (d.cfg.clone(), d.applied().unwrap().revision);
+    let record = revision_record(&d);
+    drop(d);
+    let stamp = |path: &Path| std::fs::metadata(path).map(|m| (m.ino(), m.mtime_nsec(), m.len())).ok();
+    let before = (stamp(&cfg.assignment), stamp(&record));
+    let d = Daemon::standalone(cfg.clone()).unwrap();
+    assert_eq!((stamp(&cfg.assignment), stamp(&record)), before, "nothing changed, nothing written");
+    assert_eq!(d.applied().unwrap().revision, base);
+    drop(d);
+
+    hand_edit(&cfg.assignment, "h")();
+    crate::store::BEFORE_FIRST_SWAP.set(Some(Box::new(hand_edit(&cfg.assignment, "g"))));
+    let d = Daemon::standalone(cfg.clone()).unwrap();
+    let saved = sk1ll_core::Assignment::load(&cfg.assignment).unwrap();
+    assert!(!saved.harness("h").new_skills_default && !saved.harness("g").new_skills_default, "both edits kept");
+    let applied = d.applied().unwrap();
+    assert_eq!((applied.revision, &applied.assignment), (base + 1, &saved));
+    let stored = state::load_snapshot(&record, None).unwrap().unwrap();
+    assert_eq!((stored.revision, &stored.assignment), (base + 1, &saved));
+}

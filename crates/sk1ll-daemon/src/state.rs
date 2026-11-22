@@ -228,15 +228,32 @@ impl StoredSnapshot {
 /// `owner` is given and the snapshot belongs to another registration (or to
 /// none); an unreadable one is an error, which the daemon treats like none.
 pub fn load_snapshot(path: &Path, owner: Option<&str>) -> anyhow::Result<Option<AssignmentSnapshot>> {
-    let stored: StoredSnapshot = match fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?,
+    parse_snapshot(path, read_snapshot(path)?.as_deref(), owner)
+}
+
+/// The stored snapshot's exact bytes, `None` if there is none: what a
+/// compare-and-swap of it compares against.
+pub(crate) fn read_snapshot(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
         // A symlink to nowhere is a broken snapshot, not a missing one.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && fs::symlink_metadata(path).is_ok() => {
-            return Err(e).with_context(|| format!("reading {}: a symlink to a missing file", path.display()));
+            Err(e).with_context(|| format!("reading {}: a symlink to a missing file", path.display()))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// [`load_snapshot`] of `bytes` read from `path`.
+pub(crate) fn parse_snapshot(
+    path: &Path,
+    bytes: Option<&[u8]>,
+    owner: Option<&str>,
+) -> anyhow::Result<Option<AssignmentSnapshot>> {
+    let Some(bytes) = bytes else { return Ok(None) };
+    let stored: StoredSnapshot =
+        serde_json::from_slice(bytes).with_context(|| format!("parsing {}", path.display()))?;
     if owner.is_some() && stored.owner.as_deref() != owner {
         tracing::warn!("{} belongs to another registration of this Machine; ignoring it", path.display());
         return Ok(None);
