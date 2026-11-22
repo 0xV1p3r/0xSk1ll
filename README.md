@@ -98,7 +98,7 @@ repaired items.
 
 Pull requires Git 2.40 or later, and 2.42 when the new Baseline changes a `.gitattributes` file. It updates only the working-tree paths the new Baseline changes, one at a time, and leaves the Draft where it is. Replayed commits get this Machine as their committer and lose their signatures. Pull drops commits that become empty and keeps commits that started empty. Pull refuses unpushed merge commits, submodules and sparse checkouts. File changes need atomic filesystem operations on Linux or macOS. Pull checks for support before it starts changing files.
 
-If Pull stops partway through, the next `sk1ll pull` or Daemon reconcile resumes it. Edits to paths it already updated stay as Draft on the new Baseline. While Pull is pending, `git status` shows the partially updated tree, and `sk1ll commit`, `sk1ll sync`, `sk1ll push` and `sk1ll repair-ids` refuse to run. A harness change is saved but syncs once the Pull finishes. Restoring an item a Pull is Blocked on, or that blocks a pending Pull, keeps your version in recovery. Pull recovery entries stay until you adopt or discard them.
+If Pull stops partway through, the next `sk1ll pull` or Daemon reconcile resumes it. Edits to paths it already updated stay as Draft on the new Baseline. While Pull is pending, `git status` shows the partially updated tree, and `sk1ll commit`, `sk1ll sync`, `sk1ll push` and `sk1ll repair-ids` refuse to run. A harness change is saved but syncs once the Pull finishes. Restoring an item a Pull is Blocked on, or that blocks a pending Pull, keeps your version in recovery. Pull recovery entries stay until you adopt or discard them. Pull and `sk1ll recover adopt` also keep each file they replace, a committed version: `sk1ll recover list` marks your version `changed` and those `unchanged`, safe to discard. `sk1ll status` counts the changed entries.
 
 ## Commands
 
@@ -123,7 +123,7 @@ If Pull stops partway through, the next `sk1ll pull` or Daemon reconcile resumes
 | `assign <harness> --all on\|off` | Set every Skill and Rule and both defaults. With a Fleet, this includes Baseline items the Machine has yet to pull |
 | `conflicts` | List harness and recovery conflicts |
 | `adopt <harness> <name>` | Copy a hand edit or an unmanaged skill into the draft. A hand edit goes into the item it was placed from, found by its Item ID even if it was renamed since |
-| `recover list\|adopt\|discard` | Inspect content that sync moved aside |
+| `recover list\|adopt\|discard` | Inspect content that sync or pull moved aside: each entry's id, item, harness (or `pull`), age and whether it changed. `--paths` adds where it was and where it is kept |
 | `draft`, `diff`, `commit`, `push`, `restore`, `pull` | Draft workflow, see above |
 | `join <server-url> <code>` | Join a fleet and clone its repo; `--admin-token` instead of a code for the first machine |
 | `daemon` | Run the daemon in the foreground |

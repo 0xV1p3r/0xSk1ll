@@ -333,7 +333,7 @@ fn utc(secs: i64) -> String {
     format!("{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02} UTC", rest / 3600, rest % 3600 / 60, rest % 60)
 }
 
-fn ago(secs: i64) -> String {
+pub(crate) fn ago(secs: i64) -> String {
     match secs.max(0) {
         s if s < 60 => format!("{s}s ago"),
         s if s < 3600 => format!("{}m ago", s / 60),

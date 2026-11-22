@@ -281,8 +281,12 @@ enum FleetCmd {
 
 #[derive(Subcommand)]
 enum RecoverCmd {
-    /// List recovery entries: their id, harness, item, where the content was and where it is kept
-    List,
+    /// List recovery entries: their id, item, harness (or `pull`), age and whether they changed
+    List {
+        /// Also print where each entry's content was and where it is kept
+        #[arg(long)]
+        paths: bool,
+    },
     /// Put an entry's content back (into the repo as a Draft change, or a block file into its harness)
     Adopt {
         /// The entry's id, as `sk1ll recover list` or `sk1ll conflicts` prints it
@@ -314,7 +318,7 @@ impl Cmd {
                 | Self::Harnesses { command: None, .. }
                 | Self::Draft
                 | Self::Conflicts
-                | Self::Recover { command: RecoverCmd::List }
+                | Self::Recover { command: RecoverCmd::List { .. } }
         )
     }
 
@@ -466,7 +470,7 @@ fn command(s: &Session, cmd: Cmd) -> Result<()> {
             // Their ids and names are what the next command acts on.
             for e in s.block(c.conflicts_fresh())? {
                 if e.kind.as_deref() == Some("displaced") {
-                    print_recovered(&e);
+                    print_recovered(&e, false);
                 } else {
                     let kind = if e.adoptable { "item" } else { "instructions" };
                     let reason = conflict_reason(&e.harness, kind, &e.name, e.reason.as_deref());
@@ -474,9 +478,9 @@ fn command(s: &Session, cmd: Cmd) -> Result<()> {
                 }
             }
         }
-        Cmd::Recover { command: RecoverCmd::List } => {
+        Cmd::Recover { command: RecoverCmd::List { paths } } => {
             for e in s.block(c.recovered_fresh())? {
-                print_recovered(&e);
+                print_recovered(&e, paths);
             }
         }
         Cmd::Recover { command: RecoverCmd::Adopt { id } } => {
@@ -607,11 +611,22 @@ fn command(s: &Session, cmd: Cmd) -> Result<()> {
                 };
                 println!("import {:<24} {}", import.name, state);
             }
-            print_plan(&s.block(c.preview_sync())?.actions.unwrap_or_default());
+            // Changed entries are what the user still has to adopt or discard.
+            let kept = s.block(c.recovered_fresh())?.into_iter().filter(|e| e.changed).count();
+            if kept > 0 {
+                println!(
+                    "recovery: {} to adopt or discard; review with `sk1ll recover list`",
+                    plural(kept, "changed entry", "changed entries")
+                );
+            }
+            // Blocked, Behind or a Conflict: placing nothing doesn't make the Machine in sync.
+            let settled = kept == 0 && s.status.headline >= sk1ll_proto::MachineStatus::Drafting;
+            let actions = s.block(c.preview_sync())?.actions.unwrap_or_default();
+            print_plan(&actions, if settled { "harnesses in sync" } else { "nothing to place in the harnesses" });
         }
         Cmd::Sync { dry_run: true, force } => {
             let preview = s.block(c.sync(&SyncRequest { dry_run: true, force, ..Default::default() }))?;
-            print_plan(&preview.actions.unwrap_or_default());
+            print_plan(&preview.actions.unwrap_or_default(), "harnesses in sync");
         }
         Cmd::Sync { dry_run: false, force } => {
             let result = s.block(c.sync(&SyncRequest { force, ..Default::default() }))?;
@@ -951,17 +966,28 @@ fn report_hint(items: &[sk1ll_core::ItemRef]) -> String {
     sk1ll_daemon::client::blocked_hint(items)
 }
 
-/// A recovery entry: its id, Harness, item, where it was and where it is kept.
-fn print_recovered(e: &ConflictView) {
+/// A recovery entry: its id, item, Harness (`pull` for the repo's own
+/// files), age and what it holds; with `paths`, where it was and where it
+/// is kept.
+fn print_recovered(e: &ConflictView, paths: bool) {
     let item = e.item.as_ref().map(ToString::to_string).unwrap_or_else(|| e.name.clone());
-    println!(
-        "{} {} {item} {} {}{}",
-        e.id.as_deref().unwrap_or_default(),
-        e.harness,
-        e.dest.display(),
-        e.path.as_deref().unwrap_or(Path::new("")).display(),
-        if e.changed { " (changed)" } else { "" }
-    );
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let age = e.displaced_at.map(|at| fleet::ago(now.saturating_sub(at) as i64)).unwrap_or_default();
+    // Restore keeps the version a pull is Blocked on as a changed entry.
+    // A pull, and `recover adopt` (only over a path with no Draft change),
+    // keep each file they replace too: a committed version while unchanged.
+    let pull = e.harness == sk1ll_core::sync::displaced::PULL;
+    let what = match (e.changed, pull) {
+        (true, true) => "changed: your version; `sk1ll recover adopt` it",
+        (true, false) => "changed: written to while or after it was set aside; adopt or discard it",
+        (false, true) => "unchanged: a committed version a pull or adopt replaced; safe to discard",
+        (false, false) => "unchanged: as it was when set aside",
+    };
+    println!("{:<28} {item:<24} {:<10} {age:<8} {what}", e.id.as_deref().unwrap_or_default(), e.harness);
+    if paths {
+        println!("  was at   {}", e.dest.display());
+        println!("  kept in  {}", e.path.as_deref().unwrap_or(Path::new("")).display());
+    }
 }
 
 fn print_import_changes(name: &str, changes: sk1ll_core::imports::ImportChanges) {
@@ -1018,10 +1044,11 @@ fn confirm(question: &str) -> Result<bool> {
     Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
 }
 
-/// A sync plan: `+` create, `~` update, `-` remove, `!` a conflict left alone.
-fn print_plan(actions: &[PlacementView]) {
+/// A sync plan: `+` create, `~` update, `-` remove, `!` a conflict left
+/// alone, or `empty` for a plan with nothing in it.
+fn print_plan(actions: &[PlacementView], empty: &str) {
     if actions.is_empty() {
-        println!("harnesses in sync");
+        println!("{empty}");
     }
     for a in actions {
         let sym = match a.kind.as_str() {
