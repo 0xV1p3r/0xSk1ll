@@ -5,9 +5,9 @@ use std::sync::Arc;
 use anyhow::Context;
 
 use crate::error::{Error, Result};
-use crate::gitx;
 use crate::join::{Joined, Registered};
 use crate::lifecycle::Lifecycle;
+use sk1ll_core::git::plumbing;
 
 impl Daemon {
     /// Stops managing this machine. Harness files are left as they are.
@@ -83,7 +83,7 @@ impl Daemon {
         // that no draft or commit appeared since. A replacement's publication
         // checks the original itself.
         if !prepared.replaces() {
-            gitx::check_standalone_join(self.repo_root(), &reg.state().repo_url())
+            plumbing::check_standalone_join(self.repo_root(), &reg.state().repo_url())
                 .map_err(|e| Error::Conflict(format!("{e:#}")))?;
         }
         let mut activated = Ok(());

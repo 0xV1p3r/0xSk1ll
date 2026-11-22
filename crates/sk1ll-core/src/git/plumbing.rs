@@ -1,26 +1,25 @@
-//! Git plumbing the daemon needs beyond `sk1ll_core::Repo`: reading refs,
-//! ancestry, unpushed items, and setting up the local clone. Never prompts.
+//! Git plumbing beyond [`crate::Repo`]: reading refs, ancestry, unpushed
+//! items, and setting up the local clone of a fleet's repo. Never prompts.
 //!
-//! Every command, clone included, runs through [`sk1ll_core::git::Git`], so it
+//! Every command, clone included, runs through [`super::Git`], so it
 //! has the same execution deadline as core's own git calls
 //! (`SK1LL_GIT_TIMEOUT` / `SK1LL_GIT_LOCAL_TIMEOUT`): a server that accepts the
 //! connection and then never answers can't hold the daemon forever.
 //!
-//! No URL here carries credentials (see [`crate::auth`]), and error messages
-//! are redacted all the same.
+//! No URL here carries credentials (git authenticates through its
+//! environment, see [`super::config_env`]), and error messages are redacted
+//! all the same ([`crate::redact`]).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
+use super::Git;
+use crate::draft::{FLEET_BRANCH, REMOTE};
+use crate::redact::redact;
+use crate::{ItemRef, Repo};
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
-use sk1ll_core::draft::{FLEET_BRANCH, REMOTE};
-use sk1ll_core::git::Git;
-use sk1ll_core::{ItemRef, Repo};
-
-use crate::auth::redact;
-use crate::state::{has_credentials, without_credentials};
 
 type Env<'a> = &'a [(String, String)];
 
@@ -33,9 +32,9 @@ fn command(dir: &Path, args: &[&str], env: Env) -> Git {
 }
 
 /// A core git error with the URL-ish parts redacted.
-fn redacted(e: sk1ll_core::Error) -> anyhow::Error {
+fn redacted(e: crate::Error) -> anyhow::Error {
     match e {
-        sk1ll_core::Error::Git { args, stderr } => {
+        crate::Error::Git { args, stderr } => {
             anyhow::anyhow!("`git {}` failed: {}", redact(&args), redact(&stderr))
         }
         e => anyhow::anyhow!("{}", redact(&e.to_string())),
@@ -51,7 +50,7 @@ fn failed(args: &[&str], out: &Output) -> anyhow::Error {
 }
 
 /// Diff two text snapshots using Git's unified diff, without touching the repo.
-pub(crate) fn diff_text(before: Option<&str>, after: &str) -> anyhow::Result<String> {
+pub fn diff_text(before: Option<&str>, after: &str) -> anyhow::Result<String> {
     if before == Some(after) {
         return Ok(String::new());
     }
@@ -72,7 +71,7 @@ pub(crate) fn diff_text(before: Option<&str>, after: &str) -> anyhow::Result<Str
 }
 
 /// Runs git; non-zero is an error. Returns trimmed stdout.
-pub(crate) fn run(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
+pub fn run(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
     run_env(dir, args, &[])
 }
 
@@ -90,16 +89,16 @@ fn try_run(dir: &Path, args: &[&str]) -> anyhow::Result<Option<String>> {
     Ok(out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string()))
 }
 
-pub(crate) fn rev(dir: &Path, name: &str) -> anyhow::Result<Option<String>> {
+pub fn rev(dir: &Path, name: &str) -> anyhow::Result<Option<String>> {
     try_run(dir, &["rev-parse", "--verify", "--quiet", &format!("{name}^{{commit}}")])
 }
 
-pub(crate) fn branch(dir: &Path) -> anyhow::Result<Option<String>> {
+pub fn branch(dir: &Path) -> anyhow::Result<Option<String>> {
     try_run(dir, &["symbolic-ref", "--quiet", "--short", "HEAD"])
 }
 
 /// `refs/remotes/origin/main`: the server's baseline as last fetched or pushed.
-pub(crate) fn remote_head(dir: &Path) -> anyhow::Result<Option<String>> {
+pub fn remote_head(dir: &Path) -> anyhow::Result<Option<String>> {
     rev(dir, &format!("refs/remotes/{REMOTE}/{FLEET_BRANCH}"))
 }
 
@@ -125,13 +124,13 @@ fn remote_branches(dir: &Path) -> anyhow::Result<Vec<String>> {
     Ok(refs.lines().filter_map(|r| r.strip_prefix(&prefix)).filter(|b| *b != "HEAD").map(str::to_string).collect())
 }
 
-pub(crate) fn is_ancestor(dir: &Path, a: &str, b: &str) -> anyhow::Result<bool> {
+pub fn is_ancestor(dir: &Path, a: &str, b: &str) -> anyhow::Result<bool> {
     Ok(output(dir, &["merge-base", "--is-ancestor", a, b], &[])?.status.success())
 }
 
 /// The server baseline the working tree is built on: origin's branch if `HEAD`
 /// contains it, else where `HEAD` forked from it (Blocked: the old baseline).
-pub(crate) fn baseline(dir: &Path) -> anyhow::Result<Option<String>> {
+pub fn baseline(dir: &Path) -> anyhow::Result<Option<String>> {
     let (Some(remote), Some(head)) = (remote_head(dir)?, rev(dir, "HEAD")?) else {
         return Ok(None);
     };
@@ -142,7 +141,7 @@ pub(crate) fn baseline(dir: &Path) -> anyhow::Result<Option<String>> {
 }
 
 /// Whether `HEAD` has commits origin doesn't.
-pub(crate) fn has_unpushed(dir: &Path) -> anyhow::Result<bool> {
+pub fn has_unpushed(dir: &Path) -> anyhow::Result<bool> {
     let Some(head) = rev(dir, "HEAD")? else {
         return Ok(false);
     };
@@ -153,7 +152,7 @@ pub(crate) fn has_unpushed(dir: &Path) -> anyhow::Result<bool> {
 }
 
 /// Items touched by commits in `HEAD` that origin doesn't have.
-pub(crate) fn unpushed_items(dir: &Path) -> anyhow::Result<Vec<ItemRef>> {
+pub fn unpushed_items(dir: &Path) -> anyhow::Result<Vec<ItemRef>> {
     if !has_unpushed(dir)? {
         return Ok(Vec::new());
     }
@@ -177,7 +176,7 @@ pub(crate) fn unpushed_items(dir: &Path) -> anyhow::Result<Vec<ItemRef>> {
 }
 
 /// The first baseline can clash with files even though HEAD is unborn.
-pub(crate) enum FirstBaseline {
+pub enum FirstBaseline {
     Empty,
     Adopted(String),
     Blocked { baseline: String, items: Vec<ItemRef> },
@@ -192,7 +191,7 @@ thread_local! {
 /// as draft. Every checkout destination is checked before HEAD or the index
 /// moves. Ignored files and symlinks are checked directly on disk too.
 /// Talks to no server: the caller has fetched origin's branches.
-pub(crate) fn adopt_first_baseline(dir: &Path) -> anyhow::Result<FirstBaseline> {
+pub fn adopt_first_baseline(dir: &Path) -> anyhow::Result<FirstBaseline> {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
@@ -255,7 +254,7 @@ pub(crate) fn adopt_first_baseline(dir: &Path) -> anyhow::Result<FirstBaseline> 
             hook();
         }
     });
-    let directory = sk1ll_core::placement::Directory::open(dir, false)?;
+    let directory = crate::placement::Directory::open(dir, false)?;
     for (path, mode, oid) in missing {
         let blob = output(dir, &["cat-file", "blob", &oid], &[])?;
         if !blob.status.success() {
@@ -286,7 +285,7 @@ pub(crate) fn adopt_first_baseline(dir: &Path) -> anyhow::Result<FirstBaseline> 
 /// dropped, so the starter files are draft again, and the baseline adopted.
 /// Unless it is adopted, the commit is restored. `None` when this doesn't apply.
 /// Like [`adopt_first_baseline`], it reads what the caller fetched.
-pub(crate) fn adopt_first_baseline_over_init(dir: &Path) -> anyhow::Result<Option<FirstBaseline>> {
+pub fn adopt_first_baseline_over_init(dir: &Path) -> anyhow::Result<Option<FirstBaseline>> {
     let Some(head) = rev(dir, "HEAD")? else { return Ok(None) };
     if branch(dir)?.as_deref() != Some(FLEET_BRANCH) || rev(dir, "HEAD^")?.is_some() {
         return Ok(None);
@@ -400,7 +399,7 @@ pub fn check_shares_history(dir: &Path, env: &[(String, String)]) -> anyhow::Res
 }
 
 /// Makes `dir` a clone of `remote` (see [`check_repo_path`]). `env` is how
-/// git authenticates (see [`crate::auth::git_credentials_env`]); origin
+/// git authenticates (see [`super::config_env`]); origin
 /// never carries credentials, and an existing clone whose origin (or push
 /// URL) still has them from an older version is rewritten without them.
 pub fn ensure_clone(dir: &Path, remote: &str, env: &[(String, String)]) -> anyhow::Result<Setup> {
@@ -443,13 +442,13 @@ fn private_config(dir: &Path) -> anyhow::Result<()> {
 }
 
 /// Whether this repo defines its own origin remote.
-pub(crate) fn has_origin(dir: &Path) -> anyhow::Result<bool> {
+pub fn has_origin(dir: &Path) -> anyhow::Result<bool> {
     Ok(try_run(dir, &["remote", "get-url", "origin"])?.is_some())
 }
 
 /// A standalone repo may join only when it is an untouched init, or an
 /// unchanged clone of this server without any local commits to preserve.
-pub(crate) fn check_standalone_join(dir: &Path, remote: &str) -> anyhow::Result<()> {
+pub fn check_standalone_join(dir: &Path, remote: &str) -> anyhow::Result<()> {
     if is_pristine_init(dir)? {
         return Ok(());
     }
@@ -479,7 +478,7 @@ pub(crate) fn check_standalone_join(dir: &Path, remote: &str) -> anyhow::Result<
 /// The repo may be unborn, or hold only the commit of those files that
 /// `init_committed` makes: one root commit on the fleet branch, no other
 /// refs, nothing staged or changed.
-pub(crate) fn is_pristine_init(dir: &Path) -> anyhow::Result<bool> {
+pub fn is_pristine_init(dir: &Path) -> anyhow::Result<bool> {
     if dir.symlink_metadata().is_ok_and(|m| m.is_symlink()) || !dir.join(".git").is_dir() {
         return Ok(false);
     }
@@ -522,6 +521,39 @@ pub(crate) fn is_pristine_init(dir: &Path) -> anyhow::Result<bool> {
     Repo::init(template.path())?;
     let (mut expected, mut actual) = (Default::default(), Default::default());
     Ok(files(template.path(), template.path(), &mut expected)? && files(dir, dir, &mut actual)? && expected == actual)
+}
+
+/// `url` without `user:password@`, for comparing remotes.
+pub fn without_credentials(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => {
+            let (host, path) = rest.split_once('/').map_or((rest, ""), |(h, p)| (h, p));
+            let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
+            let path = path.trim_end_matches('/');
+            if path.is_empty() { format!("{scheme}://{host}") } else { format!("{scheme}://{host}/{path}") }
+        }
+        None => url.trim_end_matches('/').to_string(),
+    }
+}
+
+/// Whether `url` carries `user[:password]@`.
+pub fn has_credentials(url: &str) -> bool {
+    url.split_once("://").is_some_and(|(_, rest)| rest.split('/').next().is_some_and(|host| host.contains('@')))
+}
+
+/// The canonical git directory of the repo at `root`, `None` while it is no
+/// git repo (yet).
+pub fn absolute_git_dir(root: &Path) -> Option<PathBuf> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--absolute-git-dir"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let text = String::from_utf8(out.stdout).ok()?;
+    Path::new(text.trim_end_matches('\n')).canonicalize().ok()
 }
 
 #[cfg(test)]
@@ -569,6 +601,17 @@ mod tests {
         git(&dir, &["commit", "--quiet", "-m", "my own root"]);
         git(&dir, &["remote", "add", REMOTE, remote]);
         dir
+    }
+
+    #[test]
+    fn credentials_in_urls() {
+        assert_eq!(
+            without_credentials("https://ws:t0k@server.example:8443/git/repo.git"),
+            "https://server.example:8443/git/repo.git"
+        );
+        assert_eq!(without_credentials("http://h/git/repo.git/"), "http://h/git/repo.git");
+        assert!(has_credentials("https://ws:t0k@server.example/git/repo.git"));
+        assert!(!has_credentials("https://server.example/git/a@b"));
     }
 
     #[test]

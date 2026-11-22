@@ -485,7 +485,7 @@ async fn a_restart_remembers_the_block_and_the_server_baseline() {
     let dir = tempfile::tempdir().unwrap();
     let (d, _session, state) = joined_daemon(dir.path(), PullRecord::default());
     d.blocking(|d, eng| d.reconcile(eng).map(drop)).await.unwrap();
-    let head = gitx::rev(d.repo_root(), "HEAD").unwrap();
+    let head = plumbing::rev(d.repo_root(), "HEAD").unwrap();
     let clash = ItemRef::Skill("pdf".into());
     let blocked = PullState::Blocked { baseline: "f00d".repeat(10), items: vec![clash.clone()] };
     d.note(|lc| {

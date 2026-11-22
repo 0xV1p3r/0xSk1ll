@@ -209,8 +209,8 @@ fn join(cli: Cli) -> Result<()> {
     };
     let (joined, via_daemon) = runtime()?.block_on(sk1ll_daemon::join_or_rejoin(&cfg, opts))?;
     let how = match joined.setup {
-        sk1ll_daemon::gitx::Setup::Cloned => "cloned the fleet repo into",
-        sk1ll_daemon::gitx::Setup::Adopted => "using the existing clone at",
+        sk1ll_core::git::plumbing::Setup::Cloned => "cloned the fleet repo into",
+        sk1ll_core::git::plumbing::Setup::Adopted => "using the existing clone at",
     };
     println!("joined the fleet as {}", joined.machine_id);
     println!("{how} {}", joined.repo.display());

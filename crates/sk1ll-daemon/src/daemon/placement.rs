@@ -7,7 +7,7 @@ use sk1ll_core::{MachineConfig, Repo};
 
 use crate::client::{Event, InstructionPreview, SyncResult};
 use crate::error::{Error, Result};
-use crate::gitx;
+use sk1ll_core::git::plumbing;
 
 impl Daemon {
     /// The current plan; `force` plans as if overwriting. For engine
@@ -107,7 +107,7 @@ impl Daemon {
             .into_iter()
             .map(|file| {
                 let (before, next_content) = sync::instruction_file_text(&file, format)?;
-                let diff = gitx::diff_text(before.as_deref(), &next_content)?;
+                let diff = plumbing::diff_text(before.as_deref(), &next_content)?;
                 Ok(InstructionPreview {
                     path: file.path,
                     format,

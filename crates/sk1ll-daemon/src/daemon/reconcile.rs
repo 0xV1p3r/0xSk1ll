@@ -32,9 +32,9 @@ use sk1ll_proto::{ConflictRef, MachineReport};
 
 use crate::client::{ConflictView, PlacementView};
 use crate::error::{Error, Result};
-use crate::gitx;
 use crate::state::PullState;
 use crate::watch::WatchRoot;
+use sk1ll_core::git::plumbing;
 
 /// How long an input must have been left alone before its stamp proves it
 /// unchanged ([`Engine::racy`]); tests write their trees just before
@@ -423,7 +423,7 @@ impl Daemon {
         }
         report.conflicts = conflicts;
         let awaiting = snapshot.is_none();
-        let has_origin = !self.is_standalone() || gitx::has_origin(&root).unwrap_or(false);
+        let has_origin = !self.is_standalone() || plumbing::has_origin(&root).unwrap_or(false);
         // Readers see the new state before the events that send them to it.
         let generation = self.snapshot().generation + 1;
         self.snapshot.send_replace(Arc::new(Snapshot {
@@ -508,10 +508,10 @@ impl Daemon {
             return pull;
         }
         let reached = |baseline: &str| {
-            gitx::rev(root, "HEAD")
+            plumbing::rev(root, "HEAD")
                 .ok()
                 .flatten()
-                .is_some_and(|head| gitx::is_ancestor(root, baseline, &head).unwrap_or(false))
+                .is_some_and(|head| plumbing::is_ancestor(root, baseline, &head).unwrap_or(false))
         };
         match (self.lifecycle().pull().clone(), journal) {
             (PullState::Pending { baseline, items }, Some(journal)) if baseline == journal => {
@@ -622,9 +622,9 @@ pub(crate) fn repo_inventory(root: &Path, harnesses: Vec<String>) -> sk1ll_proto
 pub(super) fn repo_report(root: &Path, harnesses: Vec<String>, drafts: Vec<ItemRef>) -> Result<MachineReport> {
     let inventory = repo_inventory(root, harnesses);
     Ok(MachineReport {
-        baseline: gitx::baseline(root)?,
+        baseline: plumbing::baseline(root)?,
         drafts,
-        unpushed: gitx::unpushed_items(root)?,
+        unpushed: plumbing::unpushed_items(root)?,
         harnesses: inventory.harnesses,
         items: inventory.items,
         inventory_complete: inventory.inventory_complete,

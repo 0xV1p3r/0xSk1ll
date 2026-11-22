@@ -154,16 +154,7 @@ impl RepoIdentity {
     pub fn of(root: &Path) -> Option<Self> {
         use std::os::unix::fs::MetadataExt;
         let root = root.canonicalize().ok()?;
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .args(["rev-parse", "--absolute-git-dir"])
-            .stderr(std::process::Stdio::null())
-            .output()
-            .ok()
-            .filter(|o| o.status.success())?;
-        let text = String::from_utf8(out.stdout).ok()?;
-        let git_dir = Path::new(text.trim_end_matches('\n')).canonicalize().ok()?;
+        let git_dir = sk1ll_core::git::plumbing::absolute_git_dir(&root)?;
         let meta = fs::metadata(&git_dir).ok()?;
         Some(Self { root, git_dir, dev: meta.dev(), ino: meta.ino() })
     }
@@ -265,24 +256,6 @@ pub fn load_assignment_if_present(cfg: &crate::Config) -> anyhow::Result<Option<
     Ok(Some(sk1ll_proto::Assignment::load(&cfg.assignment)?))
 }
 
-/// `url` without `user:password@`, for comparing remotes.
-pub(crate) fn without_credentials(url: &str) -> String {
-    match url.split_once("://") {
-        Some((scheme, rest)) => {
-            let (host, path) = rest.split_once('/').map_or((rest, ""), |(h, p)| (h, p));
-            let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
-            let path = path.trim_end_matches('/');
-            if path.is_empty() { format!("{scheme}://{host}") } else { format!("{scheme}://{host}/{path}") }
-        }
-        None => url.trim_end_matches('/').to_string(),
-    }
-}
-
-/// Whether `url` carries `user[:password]@`.
-pub(crate) fn has_credentials(url: &str) -> bool {
-    url.split_once("://").is_some_and(|(_, rest)| rest.split('/').next().is_some_and(|host| host.contains('@')))
-}
-
 /// Writes `path` atomically with mode 0600, creating its directory (0700).
 pub(crate) fn write_private(path: &Path, body: &[u8]) -> anyhow::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
@@ -328,10 +301,10 @@ mod tests {
         let s = state();
         assert_eq!(s.repo_url(), "https://server.example:8443/git/repo.git");
         assert_eq!(s.ws_url(), "wss://server.example:8443/api/ws");
-        assert_eq!(without_credentials("https://ws:t0k@server.example:8443/git/repo.git"), s.repo_url());
-        assert_eq!(without_credentials("http://h/git/repo.git/"), "http://h/git/repo.git");
-        assert!(has_credentials("https://ws:t0k@server.example/git/repo.git"));
-        assert!(!has_credentials("https://server.example/git/a@b"));
+        assert_eq!(
+            sk1ll_core::git::plumbing::without_credentials("https://ws:t0k@server.example:8443/git/repo.git"),
+            s.repo_url()
+        );
     }
 
     #[cfg(unix)]

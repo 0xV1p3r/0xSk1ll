@@ -8,7 +8,7 @@ use sk1ll_core::{ItemRef, MachineConfig, Repo, default_commit_message};
 
 use crate::client::{ChangeKind, CommitMessage, DiffView, DraftEntry, ItemView};
 use crate::error::{Error, Result};
-use crate::gitx;
+use sk1ll_core::git::plumbing;
 
 impl Daemon {
     /// A reader: no engine mutex.
@@ -34,8 +34,8 @@ impl Daemon {
                 .map(|p| String::from_utf8_lossy(p).into_owned())
                 .collect())
         };
-        let baseline = gitx::baseline(root)?;
-        let head = gitx::rev(root, "HEAD")?;
+        let baseline = plumbing::baseline(root)?;
+        let head = plumbing::rev(root, "HEAD")?;
         let baseline_paths = paths(baseline.as_deref())?;
         let head_paths = if head == baseline { baseline_paths.clone() } else { paths(head.as_deref())? };
         let mut inventory = BTreeMap::<ItemRef, ItemView>::new();
@@ -62,7 +62,7 @@ impl Daemon {
             };
             inventory.entry(draft.item.clone()).or_insert_with(|| entry(draft.item)).draft = Some(change);
         }
-        for item in gitx::unpushed_items(root)? {
+        for item in plumbing::unpushed_items(root)? {
             inventory.entry(item.clone()).or_insert_with(|| entry(item)).unpushed = true;
         }
         // Descriptions of skills without a draft come from git: one
@@ -203,7 +203,7 @@ impl Daemon {
     pub(crate) fn skills(&self) -> Result<Vec<sk1ll_core::content::ContentEntry>> {
         let repo = Repo::open(self.repo_root())?;
         let harnesses = MachineConfig::load(&self.cfg.machine_config)?.harnesses();
-        let baseline = gitx::baseline(repo.root())?;
+        let baseline = plumbing::baseline(repo.root())?;
         let snapshot = self.applied();
         let assignment = snapshot.as_ref().map(|s| s.assignment.clone()).unwrap_or_default();
         let mut entries = sk1ll_core::content::list(&repo, &harnesses, &assignment, baseline.as_deref())?;

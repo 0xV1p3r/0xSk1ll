@@ -5,8 +5,8 @@ use sk1ll_core::{ItemRef, PullOutcome, Repo, default_commit_message, machine_aut
 
 use crate::client::{CommitRequest, CommitResponse, Event, PullResult, PushResult};
 use crate::error::{Error, Result};
-use crate::gitx;
 use crate::state::PullState;
+use sk1ll_core::git::plumbing;
 
 impl Daemon {
     /// After a Draft change, which may have cleared what stopped the last
@@ -73,7 +73,7 @@ impl Daemon {
     pub(super) fn fetch_baseline(&self) -> Result<()> {
         let root = self.repo_root();
         if !root.join(".git").exists() {
-            gitx::ensure_clone(root, &self.ident.joined()?.repo_url(), &[])?;
+            plumbing::ensure_clone(root, &self.ident.joined()?.repo_url(), &[])?;
             return Ok(());
         }
         Ok(Repo::open_git_only(root)?.fetch()?)
@@ -124,7 +124,7 @@ impl Daemon {
         };
         let root = self.repo_root();
         let baseline = match baseline.is_empty() {
-            true => gitx::remote_head(root)?.unwrap_or_default(),
+            true => plumbing::remote_head(root)?.unwrap_or_default(),
             false => baseline.clone(),
         };
         let pull = match Repo::open_git_only(root)?.pull_pending()? {
@@ -148,22 +148,22 @@ impl Daemon {
         let first = if repo.pull_pending()? {
             None
         } else {
-            match gitx::rev(&root, "HEAD")? {
-                None => Some(gitx::adopt_first_baseline(&root)?),
-                Some(_) => gitx::adopt_first_baseline_over_init(&root)?,
+            match plumbing::rev(&root, "HEAD")? {
+                None => Some(plumbing::adopt_first_baseline(&root)?),
+                Some(_) => plumbing::adopt_first_baseline_over_init(&root)?,
             }
         };
         let (result, pull) = if let Some(first) = first {
             match first {
-                gitx::FirstBaseline::Adopted(to) => (PullResult::Updated { from: None, to }, PullState::Clear),
-                gitx::FirstBaseline::Empty => (PullResult::UpToDate, PullState::Clear),
-                gitx::FirstBaseline::Blocked { baseline, items } => (
+                plumbing::FirstBaseline::Adopted(to) => (PullResult::Updated { from: None, to }, PullState::Clear),
+                plumbing::FirstBaseline::Empty => (PullResult::UpToDate, PullState::Clear),
+                plumbing::FirstBaseline::Blocked { baseline, items } => (
                     PullResult::Blocked { baseline: baseline.clone(), items: items.clone(), pending: false },
                     PullState::Blocked { baseline, items },
                 ),
             }
         } else {
-            let head = gitx::rev(&root, "HEAD")?;
+            let head = plumbing::rev(&root, "HEAD")?;
             let lock = eng.lock.as_ref().ok_or_else(|| Error::Conflict(format!("{} is not locked", root.display())))?;
             match repo.pull_fetched(lock) {
                 Ok(PullOutcome::UpToDate) => (PullResult::UpToDate, PullState::Clear),
@@ -184,7 +184,7 @@ impl Daemon {
                 // is in the recovery area, which the report lists as a conflict.
                 Err(e @ sk1ll_core::Error::Displaced { .. }) if !repo.pull_pending()? => {
                     tracing::warn!("{e}");
-                    let result = match gitx::rev(&root, "HEAD")? {
+                    let result = match plumbing::rev(&root, "HEAD")? {
                         Some(to) if Some(&to) != head.as_ref() => PullResult::Updated { from: head, to },
                         _ => PullResult::UpToDate,
                     };
@@ -194,7 +194,7 @@ impl Daemon {
                 Err(e) => return Err(e.into()),
             }
         };
-        let remote = gitx::remote_head(&root)?;
+        let remote = plumbing::remote_head(&root)?;
         self.note(|lc| {
             lc.set_pull(pull);
             if remote.is_some() {
@@ -217,7 +217,7 @@ impl Daemon {
                 .blocking(|d, _| {
                     d.ensure_managed()?;
                     let root = d.repo_root();
-                    if !gitx::has_unpushed(root)? {
+                    if !plumbing::has_unpushed(root)? {
                         return Ok(None);
                     }
                     Ok(Repo::open_git_only(root)?.prepare_push()?)
@@ -229,7 +229,7 @@ impl Daemon {
                     let root = d.repo_root();
                     let pushed = Repo::open_git_only(root).and_then(|repo| repo.push_commit(&commit));
                     if pushed.is_ok() {
-                        let remote = gitx::remote_head(root)?;
+                        let remote = plumbing::remote_head(root)?;
                         d.note(|lc| lc.set_server_baseline(remote));
                     }
                     Ok(pushed)
@@ -348,7 +348,7 @@ impl Daemon {
                 }
                 d.note(|lc| lc.set_server_baseline(Some(baseline.clone())));
                 d.event(Event::Fleet);
-                let current = gitx::baseline(d.repo_root()).unwrap_or(None);
+                let current = plumbing::baseline(d.repo_root()).unwrap_or(None);
                 if current.as_deref() != Some(baseline.as_str()) || d.lifecycle().pull_stopped() {
                     return Ok(true);
                 }

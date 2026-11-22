@@ -9,6 +9,8 @@
 //! inherits it. The CLI does the same for its direct mode.
 
 use base64::Engine as _;
+use sk1ll_core::git::config_env::merge_config_env;
+pub use sk1ll_core::redact::redact;
 
 use crate::state::DaemonState;
 
@@ -39,65 +41,6 @@ fn header_key(server_url: &str) -> String {
 fn header_value(state: &DaemonState) -> String {
     let basic = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", state.machine_id, state.token));
     format!("Authorization: Basic {basic}")
-}
-
-/// Adds `key = value` to the env-scoped config that `get` reads.
-fn merge_config_env(get: impl Fn(&str) -> Option<String>, key: &str, value: &str) -> Vec<(String, String)> {
-    let count: usize = get("GIT_CONFIG_COUNT").and_then(|v| v.trim().parse().ok()).unwrap_or(0);
-    let is_ours = |i: &usize| get(&format!("GIT_CONFIG_KEY_{i}")).is_some_and(|k| k.eq_ignore_ascii_case(key));
-    let existing = (0..count).find(is_ours);
-    match existing {
-        Some(i) => vec![(format!("GIT_CONFIG_VALUE_{i}"), value.to_string())],
-        None => vec![
-            ("GIT_CONFIG_COUNT".to_string(), (count + 1).to_string()),
-            (format!("GIT_CONFIG_KEY_{count}"), key.to_string()),
-            (format!("GIT_CONFIG_VALUE_{count}"), value.to_string()),
-        ],
-    }
-}
-
-/// `text` with URL userinfo (`scheme://user:pass@`) and `Basic`/`Bearer`
-/// credentials replaced by `***`, for logs and errors.
-pub fn redact(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(i) = rest.find("://") {
-        let (head, tail) = rest.split_at(i + 3);
-        out.push_str(head);
-        let end = tail
-            .find(|c: char| c == '/' || c.is_whitespace() || matches!(c, '\'' | '"' | '`' | '>' | ')'))
-            .unwrap_or(tail.len());
-        let authority = &tail[..end];
-        match authority.rfind('@') {
-            Some(at) => {
-                out.push_str("***@");
-                out.push_str(&authority[at + 1..]);
-            }
-            None => out.push_str(authority),
-        }
-        rest = &tail[end..];
-    }
-    out.push_str(rest);
-    for scheme in ["Basic ", "Bearer ", "basic ", "bearer "] {
-        out = redact_after(&out, scheme);
-    }
-    out
-}
-
-fn redact_after(text: &str, marker: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(i) = rest.find(marker) {
-        let (head, tail) = rest.split_at(i + marker.len());
-        out.push_str(head);
-        let end = tail.find(|c: char| c.is_whitespace() || matches!(c, '\'' | '"')).unwrap_or(tail.len());
-        if end > 0 {
-            out.push_str("***");
-        }
-        rest = &tail[end..];
-    }
-    out.push_str(rest);
-    out
 }
 
 #[cfg(test)]
@@ -146,16 +89,5 @@ mod tests {
             [("GIT_CONFIG_COUNT", "1"), ("GIT_CONFIG_KEY_0", key.as_str()), ("GIT_CONFIG_VALUE_0", "old")].into();
         let env = merge_config_env(|k| ours.get(k).map(|v| v.to_string()), &key, "new");
         assert_eq!(env, [("GIT_CONFIG_VALUE_0".to_string(), "new".to_string())]);
-    }
-
-    #[test]
-    fn redaction() {
-        assert_eq!(
-            redact("`git clone http://ws:tok@h:1/git/repo.git x` failed: 'https://a@b/c'"),
-            "`git clone http://***@h:1/git/repo.git x` failed: 'https://***@b/c'"
-        );
-        assert_eq!(redact("http://h/git/repo.git"), "http://h/git/repo.git");
-        assert_eq!(redact("Authorization: Basic d3M6dG9r here"), "Authorization: Basic *** here");
-        assert_eq!(redact("Bearer abc"), "Bearer ***");
     }
 }

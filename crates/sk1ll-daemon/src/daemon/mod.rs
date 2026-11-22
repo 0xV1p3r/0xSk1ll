@@ -62,13 +62,14 @@ use sk1ll_core::{EngineLock, MachineConfig, Repo};
 use sk1ll_proto::{AssignmentSnapshot, MachineReport};
 use tokio::sync::{Notify, broadcast, mpsc, watch};
 
+use crate::Config;
 use crate::client::{Connection, DaemonMode, Event, StatusView};
 use crate::error::{Error, Result};
 use crate::lifecycle::Lifecycle;
 pub(crate) use crate::lifecycle::Link;
 use crate::state::{self, DaemonState, PullRecord};
 use crate::watch::WatchRoot;
-use crate::{Config, gitx};
+use sk1ll_core::git::plumbing;
 
 mod adopt;
 mod assignment;
@@ -252,7 +253,7 @@ impl Daemon {
             machine_id: state.machine_id().to_string(),
             server_url: state.joined().ok().map(|s| s.server_url.clone()),
             mode: if standalone { DaemonMode::Standalone } else { DaemonMode::Joined },
-            has_origin: !standalone || gitx::has_origin(state.repo()).unwrap_or(false),
+            has_origin: !standalone || plumbing::has_origin(state.repo()).unwrap_or(false),
             repo_ready: !standalone || state.repo().join(".git").exists(),
             repo: state.repo().to_path_buf(),
             headline: sk1ll_proto::MachineStatus::Offline,
@@ -313,7 +314,7 @@ impl Daemon {
 
     fn require_origin(&self) -> Result<()> {
         self.require_repo()?;
-        if !gitx::has_origin(self.repo_root())? {
+        if !plumbing::has_origin(self.repo_root())? {
             return Err(Error::Conflict("this repo has no origin remote".into()));
         }
         Ok(())
@@ -682,7 +683,7 @@ impl Daemon {
         if !self.is_standalone() {
             // Git authenticates through the process environment (`prepare_process`).
             let cloned =
-                self.network(|d| Ok(gitx::ensure_clone(d.repo_root(), &d.ident.joined()?.repo_url(), &[]))).await?;
+                self.network(|d| Ok(plumbing::ensure_clone(d.repo_root(), &d.ident.joined()?.repo_url(), &[]))).await?;
             if let Err(e) = cloned {
                 self.set_error(format!("setting up {}: {e:#}", self.repo_root().display()));
             }

@@ -9,8 +9,8 @@ use sk1ll_proto::{AssignmentSnapshot, ErrorBody, JoinCode, JoinRequest, JoinResp
 
 use crate::Config;
 use crate::client::{Client, JoinApiRequest};
-use crate::gitx::{self, Setup};
 use crate::state::{self, DaemonState};
+use sk1ll_core::git::plumbing::{self, Setup};
 
 #[derive(Clone)]
 pub struct JoinOptions {
@@ -135,7 +135,7 @@ async fn register_with_timeout(
 pub(crate) async fn register_standalone(cfg: &Config, opts: &JoinOptions) -> anyhow::Result<(Registered, PathBuf)> {
     let url = opts.server_url.trim().trim_end_matches('/');
     let repo = absolute(&opts.repo)?;
-    gitx::check_standalone_join(&repo, &format!("{url}{REPO_PATH}"))?;
+    plumbing::check_standalone_join(&repo, &format!("{url}{REPO_PATH}"))?;
     let machine = MachineConfig::load(&cfg.machine_config)?;
     let id = opts.machine_id.as_deref().unwrap_or(&machine.id);
     // Repeating the original request after a local failure uses the issued
@@ -176,7 +176,7 @@ async fn register_inner(
     if !(server_url.starts_with("http://") || server_url.starts_with("https://")) {
         bail!("the server URL must start with http:// or https:// (got `{}`)", crate::auth::redact(&server_url));
     }
-    if crate::state::has_credentials(&server_url) {
+    if plumbing::has_credentials(&server_url) {
         bail!("the server URL must not contain credentials");
     }
     if insecure_http(&server_url) {
@@ -196,9 +196,9 @@ async fn register_inner(
     let repo = absolute(&opts.repo)?;
     let remote = format!("{server_url}{REPO_PATH}");
     if standalone {
-        gitx::check_standalone_join(&repo, &remote)?;
+        plumbing::check_standalone_join(&repo, &remote)?;
     } else {
-        gitx::check_repo_path(&repo, &remote)?;
+        plumbing::check_repo_path(&repo, &remote)?;
     }
 
     // Joining a machine without a repo is its first-run setup: it takes up
@@ -318,8 +318,8 @@ impl Registered {
     /// Build the replacement privately and lock it before it can become live.
     pub(crate) fn prepare_standalone_repo(&self) -> anyhow::Result<StandaloneRepo> {
         let repo = &self.state.repo;
-        gitx::check_standalone_join(repo, &self.state.repo_url())?;
-        let pristine = gitx::is_pristine_init(repo)?;
+        plumbing::check_standalone_join(repo, &self.state.repo_url())?;
+        let pristine = plumbing::is_pristine_init(repo)?;
         let exists = repo.symlink_metadata().is_ok();
         let empty = exists && std::fs::read_dir(repo)?.next().is_none();
         if !pristine && exists && !empty {
@@ -390,13 +390,13 @@ impl Registered {
 
     fn set_up_repo_at(&self, repo: &Path) -> anyhow::Result<Joined> {
         let env = crate::auth::git_credentials_env(&self.state);
-        let setup = gitx::ensure_clone(repo, &self.state.repo_url(), &env).with_context(|| {
+        let setup = plumbing::ensure_clone(repo, &self.state.repo_url(), &env).with_context(|| {
             format!("joined, but setting up {} failed; the daemon retries at startup", repo.display())
         })?;
         // An existing clone must continue the server's history (its branch was
         // checked before the code was spent; its history needs the server).
         if setup == Setup::Adopted {
-            gitx::check_shares_history(repo, &env)
+            plumbing::check_shares_history(repo, &env)
                 .with_context(|| format!("joined, but the existing clone at {} can't be used", repo.display()))?;
         }
         Ok(Joined {
@@ -435,7 +435,7 @@ impl StandaloneRepo {
         if r.had_original {
             // Refuse edits made while the private clone was being built.
             let empty = std::fs::read_dir(&r.repo)?.next().is_none();
-            if !empty && !gitx::is_pristine_init(&r.repo)? {
+            if !empty && !plumbing::is_pristine_init(&r.repo)? {
                 bail!("the standalone repo changed during join; move the draft aside and retry");
             }
             sk1ll_core::placement::rename_noreplace(&r.repo, &r.area.join("repo"))?;
@@ -561,7 +561,7 @@ mod tests {
         let reg = registration(tmp.path());
         let seed = tmp.path().join("seed");
         sk1ll_core::Repo::init(&seed).unwrap();
-        let git = |dir: &Path, args: &[&str]| gitx::run(dir, args).unwrap();
+        let git = |dir: &Path, args: &[&str]| plumbing::run(dir, args).unwrap();
         git(&seed, &["add", "-A"]);
         git(
             &seed,

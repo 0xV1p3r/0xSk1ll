@@ -3530,6 +3530,7 @@ dependencies = [
 name = "sk1ll-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "dirs 6.0.0",
  "getrandom 0.4.3",
  "libc",

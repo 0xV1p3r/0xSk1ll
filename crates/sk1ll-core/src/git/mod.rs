@@ -25,6 +25,11 @@ use std::time::{Duration, Instant};
 
 use crate::{Error, Result};
 
+pub mod config_env;
+/// Unix only, like the daemon and the fleet that use it.
+#[cfg(unix)]
+pub mod plumbing;
+
 /// Oldest Git version sk1ll supports.
 pub const MIN_VERSION: (u32, u32) = (2, 40);
 

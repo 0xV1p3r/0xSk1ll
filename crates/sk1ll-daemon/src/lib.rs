@@ -18,7 +18,6 @@ pub mod client;
 mod config;
 mod daemon;
 mod error;
-pub mod gitx;
 pub mod join;
 mod lifecycle;
 mod notifications;
