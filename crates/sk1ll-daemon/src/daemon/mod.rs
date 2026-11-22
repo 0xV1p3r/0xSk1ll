@@ -1,0 +1,566 @@
+//! The daemon's shared state and its operations on the repo and harnesses.
+//!
+//! Every operation that changes the repo, the harnesses or the daemon's state
+//! runs on a blocking thread with the engine mutex held ([`Daemon::blocking`]),
+//! so they never interleave; across processes, the daemon holds core's
+//! [`EngineLock`] on the repo for its whole lifetime, so direct CLI mutations
+//! are refused.
+//!
+//! No network I/O happens with the engine mutex held. An operation that
+//! talks to the server runs in steps: it checks and takes what it will send
+//! under the mutex, releases it for the network (git's clone, fetch and push
+//! through [`Daemon::network`], Assignment writes over the server session),
+//! then takes it again to apply the result, re-checking what the result
+//! depends on: an Assignment revision applied meanwhile wins over an older
+//! confirmation, a pull moves onto whatever was fetched last, an Adopt whose
+//! item changed meanwhile is a conflict, and a daemon that stopped managing
+//! meanwhile applies nothing. Its lifecycle ([`Lifecycle`]) has a mutex of its
+//! own, so the session can mark it connected or offline at any time.
+//!
+//! Operations that only read (the draft, a diff, the skills browser, the
+//! conflicts, the inventory) run without the engine mutex
+//! ([`Daemon::reading`]), so the GUI keeps answering while a long engine
+//! operation (a sync of many skills) runs. They need the repo root, which is fixed
+//! for the process ([`Daemon::ident`]), and the applied assignment, which is
+//! published in [`Daemon::snapshot`]. A reader:
+//!
+//! - never writes: not the repo, not a harness, not git's index (the process
+//!   environment turns off git's opportunistic index refresh, see
+//!   [`crate::prepare_process`]), and it does not finish an interrupted
+//!   import ([`Daemon::recover_imports`] needs the engine mutex and the
+//!   [`EngineLock`]). Until the next refresh has put such an import back, a
+//!   reader shows the repo as it is, with that import missing;
+//! - may see the repo in the middle of a concurrent operation (a pull moving
+//!   the working tree). What it returns is then momentarily stale and the
+//!   event that follows the operation makes the client ask again; a read
+//!   that failed while an operation was running is retried before it is
+//!   reported as a failure.
+//!
+//! What the outside sees ([`StatusView`]) lives in a `watch` channel: the server
+//! session sends a status whenever its report changes, and the local API and
+//! its event stream read from it. Its lifecycle fields are derived from the
+//! [`Lifecycle`] whenever it is published ([`Daemon::publish`]).
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError};
+
+use anyhow::Context;
+use sk1ll_core::{EngineLock, MachineConfig, Repo};
+use sk1ll_proto::{AssignmentSnapshot, MachineReport};
+use tokio::sync::{Notify, broadcast, mpsc, watch};
+
+use crate::client::{Connection, DaemonMode, Event, StatusView};
+use crate::error::{Error, Result};
+use crate::lifecycle::Lifecycle;
+pub(crate) use crate::lifecycle::Link;
+use crate::state::{self, DaemonState, PullRecord};
+use crate::watch::WatchRoot;
+use crate::{Config, gitx};
+
+mod adopt;
+mod assignment;
+mod content;
+mod harness_rename;
+mod harnesses;
+mod import;
+mod membership;
+mod placement;
+mod pull;
+mod read;
+mod reconcile;
+mod views;
+
+pub(crate) use reconcile::repo_inventory;
+use {placement::*, reconcile::*, views::*};
+
+/// Name a `block` instructions conflict goes by (one block per harness).
+const BLOCK_NAME: &str = "instructions";
+
+/// Process identity. Standalone has no server credentials or fleet state.
+#[derive(Clone)]
+pub(crate) enum Mode {
+    Joined(DaemonState),
+    Standalone { machine_id: String, repo: PathBuf },
+}
+
+impl Mode {
+    pub(crate) fn machine_id(&self) -> &str {
+        match self {
+            Self::Joined(s) => &s.machine_id,
+            Self::Standalone { machine_id, .. } => machine_id,
+        }
+    }
+
+    pub(crate) fn repo(&self) -> &Path {
+        match self {
+            Self::Joined(s) => &s.repo,
+            Self::Standalone { repo, .. } => repo,
+        }
+    }
+
+    pub(crate) fn joined(&self) -> Result<&DaemonState> {
+        match self {
+            Self::Joined(s) => Ok(s),
+            Self::Standalone { .. } => {
+                Err(Error::Conflict("This Machine is standalone; join a Fleet to use this".into()))
+            }
+        }
+    }
+}
+
+pub(crate) struct Daemon {
+    pub(crate) cfg: Config,
+    /// Fixed for the life of the process: machine id, server URL and token. A
+    /// rejoin restarts the process (see [`Daemon::rejoin`]). Its `revoked`
+    /// and record are as of startup; [`Daemon::lifecycle`] owns them.
+    pub(crate) ident: Mode,
+    engine: Mutex<Engine>,
+    /// What the daemon is doing. Never held across network I/O; the lock
+    /// order is the engine mutex, then this, then the view.
+    lifecycle: Mutex<Lifecycle>,
+    /// One git network operation on the repo at a time (clone, fetch, push):
+    /// they run without the engine mutex, and git refuses concurrent ref
+    /// updates.
+    net: tokio::sync::Mutex<()>,
+    /// One Assignment write at a time, from its checks to applying the
+    /// server's confirmation, as when the engine mutex covered all of it.
+    assignment_writes: tokio::sync::Mutex<()>,
+    /// The applied assignment. `None` when it was lost (or never stored):
+    /// harnesses are left alone until the server sends one. Replaced only
+    /// with the engine mutex held ([`Daemon::apply_assignment`]); read by
+    /// anyone, readers without the engine mutex included.
+    snapshot: RwLock<Option<Arc<AssignmentSnapshot>>>,
+    view: watch::Sender<StatusView>,
+    events: broadcast::Sender<Event>,
+    pub(crate) assignment_session: watch::Sender<Option<mpsc::Sender<crate::server::SessionWrite>>>,
+    pub(crate) restart_assignment_session: Notify,
+    pub(crate) roots: watch::Sender<Vec<WatchRoot>>,
+    pub(crate) http: reqwest::Client,
+}
+
+/// Mutable state, only touched with the engine mutex held.
+pub(crate) struct Engine {
+    /// Core's engine lock on the repo, held from startup (or from the clone).
+    lock: Option<EngineLock>,
+    /// The published report is not the result of a successful refresh: the
+    /// last one failed, or none ran yet. Nothing may be derived from it.
+    stale: bool,
+    assignment_placement_failed: bool,
+    #[cfg(test)]
+    after_sync_review: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl Daemon {
+    pub(crate) fn new(cfg: Config, state: DaemonState) -> anyhow::Result<Arc<Self>> {
+        Self::with_mode(cfg, Mode::Joined(state))
+    }
+
+    pub(crate) fn standalone(cfg: Config) -> anyhow::Result<Arc<Self>> {
+        let machine = MachineConfig::load(&cfg.machine_config)?;
+        let repo = crate::locate_repo(cfg.repo.as_deref(), false)?;
+        Self::with_mode(cfg, Mode::Standalone { machine_id: machine.id, repo })
+    }
+
+    fn with_mode(cfg: Config, state: Mode) -> anyhow::Result<Arc<Self>> {
+        let standalone = matches!(state, Mode::Standalone { .. });
+        let lifecycle = match &state {
+            Mode::Joined(s) => Lifecycle::joined(s.revoked, s.record.clone()),
+            Mode::Standalone { .. } => {
+                let path = state::standalone_record_path(&cfg.state);
+                Lifecycle::standalone(state::load_record(&path).unwrap_or_else(|e| {
+                    tracing::warn!("{e:#}; starting without a remembered Baseline");
+                    PullRecord::default()
+                }))
+            }
+        };
+        let snapshot = if standalone {
+            let assignment = sk1ll_core::Assignment::load(&cfg.assignment)?;
+            let previous = state::load_snapshot(&cfg.state.with_file_name("standalone-assignment.json"))?;
+            let revision = previous.as_ref().map_or(1, |s| s.revision + u64::from(s.assignment != assignment));
+            Some(AssignmentSnapshot { revision, assignment, registration: None })
+        } else {
+            match state::load_snapshot(&cfg.snapshot_path()) {
+                Ok(Some(s)) => Some(s),
+                Ok(None) => {
+                    tracing::warn!("no stored assignment: leaving the harnesses alone until the server sends one");
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!("{e:#}; leaving the harnesses alone until the server sends an assignment");
+                    None
+                }
+            }
+        };
+        if standalone && let Some(snap) = &snapshot {
+            state::save_snapshot(&cfg.state.with_file_name("standalone-assignment.json"), snap)?;
+        }
+        let mut view = StatusView {
+            machine_id: state.machine_id().to_string(),
+            server_url: state.joined().ok().map(|s| s.server_url.clone()),
+            mode: if standalone { DaemonMode::Standalone } else { DaemonMode::Joined },
+            has_origin: !standalone || gitx::has_origin(state.repo()).unwrap_or(false),
+            repo_ready: !standalone || state.repo().join(".git").exists(),
+            repo: state.repo().to_path_buf(),
+            headline: sk1ll_proto::MachineStatus::Offline,
+            connection: Connection::Connecting,
+            last_error: None,
+            revoked: false,
+            server_baseline: None,
+            assignment_revision: snapshot.as_ref().map_or(0, |s| s.revision),
+            version: sk1ll_core::VERSION.to_string(),
+            awaiting_assignment: snapshot.is_none(),
+            auth_rejected_since: None,
+            report: MachineReport::default(),
+        };
+        lifecycle.apply(&mut view);
+        Ok(Arc::new(Self {
+            cfg,
+            ident: state,
+            snapshot: RwLock::new(snapshot.map(Arc::new)),
+            lifecycle: Mutex::new(lifecycle),
+            net: tokio::sync::Mutex::new(()),
+            assignment_writes: tokio::sync::Mutex::new(()),
+            engine: Mutex::new(Engine {
+                lock: None,
+                stale: true,
+                assignment_placement_failed: true,
+                #[cfg(test)]
+                after_sync_review: None,
+            }),
+            view: watch::channel(view).0,
+            events: broadcast::channel(256).0,
+            assignment_session: watch::channel(None).0,
+            restart_assignment_session: Notify::new(),
+            roots: watch::channel(Vec::new()).0,
+            http: crate::server::http_client().build().context("building the HTTP client")?,
+        }))
+    }
+
+    fn require_origin(&self) -> Result<()> {
+        self.require_repo()?;
+        if !gitx::has_origin(self.repo_root())? {
+            return Err(Error::Conflict("this repo has no origin remote".into()));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn init(&self, eng: &mut Engine) -> Result<()> {
+        if self.idle() || !self.is_standalone() || self.repo_root().join(".git").exists() {
+            return Err(Error::Conflict("Init requires a standalone machine without a repo".into()));
+        }
+        let root = self.repo_root();
+        if let Ok(meta) = root.symlink_metadata()
+            && (!meta.is_dir() || std::fs::read_dir(root).context("reading repo directory")?.next().is_some())
+        {
+            return Err(Error::Conflict(format!(
+                "{} is not an empty directory; choose an empty repo directory",
+                root.display()
+            )));
+        }
+        std::fs::create_dir_all(root).context("creating repo directory")?;
+        // First-run setup ends here: take up the opt-in presets it kept on.
+        for warning in MachineConfig::adopt_detected_presets(&self.cfg.machine_config, root)? {
+            tracing::warn!("{warning}");
+        }
+        Repo::init_committed(root)?;
+        self.lock_repo(eng)?;
+        self.refresh(eng)
+    }
+
+    /// Runs `f` with the engine on a blocking thread. The engine mutex is
+    /// released as soon as `f` returns, whether it succeeded or not.
+    pub(crate) async fn blocking<T, F>(self: &Arc<Self>, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Daemon, &mut Engine) -> Result<T> + Send + 'static,
+    {
+        let d = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut engine = lock(&d.engine);
+            f(&d, &mut engine)
+        })
+        .await
+        .map_err(|e| Error::Internal(anyhow::anyhow!("daemon task failed: {e}")))?
+    }
+
+    /// Runs the read-only `f` on a blocking thread without the engine mutex
+    /// (see the module docs for what a reader may do). If `f` fails while an
+    /// engine operation is running, the repo may just have been in between
+    /// two states: `f` is tried again a moment later, twice at most, so a
+    /// long operation delays a real error only briefly.
+    pub(crate) async fn reading<T, F>(self: &Arc<Self>, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: Fn(&Daemon) -> Result<T> + Send + 'static,
+    {
+        const RETRIES: usize = 2;
+        const PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
+        let d = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut tries = 0;
+            loop {
+                match f(&d) {
+                    Err(e) if tries < RETRIES && d.engine_busy() => {
+                        tracing::debug!("retrying a read that failed during an engine operation: {e}");
+                        tries += 1;
+                        std::thread::sleep(PAUSE);
+                    }
+                    result => return result,
+                }
+            }
+        })
+        .await
+        .map_err(|e| Error::Internal(anyhow::anyhow!("daemon read task failed: {e}")))?
+    }
+
+    /// Runs `f`, a git network operation on the repo (clone, fetch, push), on
+    /// a blocking thread without the engine mutex, one at a time.
+    async fn network<T, F>(self: &Arc<Self>, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Daemon) -> Result<T> + Send + 'static,
+    {
+        let _net = self.net.lock().await;
+        let d = self.clone();
+        tokio::task::spawn_blocking(move || f(&d))
+            .await
+            .map_err(|e| Error::Internal(anyhow::anyhow!("daemon network task failed: {e}")))?
+    }
+
+    /// Whether an engine operation is running right now.
+    fn engine_busy(&self) -> bool {
+        matches!(self.engine.try_lock(), Err(TryLockError::WouldBlock))
+    }
+
+    /// The applied assignment, if there is one.
+    pub(crate) fn snapshot(&self) -> Option<Arc<AssignmentSnapshot>> {
+        self.snapshot.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The repo, for readers: the same path as the engine's, which never
+    /// changes while the process runs.
+    fn repo_root(&self) -> &Path {
+        self.ident.repo()
+    }
+
+    pub(crate) fn view(&self) -> StatusView {
+        self.view.borrow().clone()
+    }
+
+    pub(crate) fn subscribe_view(&self) -> watch::Receiver<StatusView> {
+        self.view.subscribe()
+    }
+
+    pub(crate) fn subscribe_events(&self) -> broadcast::Receiver<Event> {
+        self.events.subscribe()
+    }
+
+    pub(crate) fn event(&self, e: Event) {
+        let _ = self.events.send(e);
+    }
+
+    pub(crate) fn is_standalone(&self) -> bool {
+        matches!(self.ident, Mode::Standalone { .. })
+    }
+
+    pub(crate) fn require_repo(&self) -> Result<()> {
+        if self.is_standalone() && !self.repo_root().join(".git").exists() {
+            return Err(Error::Conflict(
+                "this machine has no skills repo yet; initialize it with `sk1ll init` or POST /init".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The current lifecycle.
+    pub(crate) fn lifecycle(&self) -> Lifecycle {
+        lock(&self.lifecycle).clone()
+    }
+
+    pub(crate) fn is_connected(&self) -> bool {
+        lock(&self.lifecycle).connected()
+    }
+
+    pub(crate) fn is_revoked(&self) -> bool {
+        lock(&self.lifecycle).revoked()
+    }
+
+    /// Changes the lifecycle (`t`) and the rest of the view (`f`) as one
+    /// publication, deriving the view's lifecycle fields and headline, and
+    /// emits events for what changed. A change to what the state file keeps
+    /// is saved first; the error says if that failed (the change stands).
+    fn publish<T>(
+        &self,
+        t: impl FnOnce(&mut Lifecycle) -> T,
+        f: impl FnOnce(&mut StatusView),
+    ) -> (T, anyhow::Result<()>) {
+        let mut lc = lock(&self.lifecycle);
+        let before = lc.clone();
+        let out = t(&mut lc);
+        let saved = if lc.persisted() != before.persisted() { self.save_lifecycle(&lc) } else { Ok(()) };
+        let mut draft_changed = false;
+        let changed = self.view.send_if_modified(|v| {
+            let old = v.clone();
+            f(v);
+            lc.apply(v);
+            draft_changed = old.report.drafts != v.report.drafts;
+            *v != old
+        });
+        let fleet = before.connected() != lc.connected() || before.revoked() != lc.revoked();
+        drop(lc);
+        if changed {
+            self.event(Event::Status);
+        }
+        if draft_changed {
+            self.event(Event::Draft);
+        }
+        if fleet {
+            self.event(Event::Fleet);
+        }
+        (out, saved)
+    }
+
+    /// Writes the lifecycle's persistent part. A halted daemon writes
+    /// nothing: the state file may already hold its next registration.
+    fn save_lifecycle(&self, lc: &Lifecycle) -> anyhow::Result<()> {
+        if lc.halted() {
+            return Ok(());
+        }
+        let (revoked, record) = lc.persisted();
+        match &self.ident {
+            Mode::Joined(s) => DaemonState { revoked, record: record.clone(), ..s.clone() }.save(&self.cfg.state),
+            Mode::Standalone { .. } => state::save_record(&state::standalone_record_path(&self.cfg.state), record),
+        }
+    }
+
+    /// A lifecycle transition whose state file failure fails the caller.
+    fn transition<T>(&self, t: impl FnOnce(&mut Lifecycle) -> T) -> Result<T> {
+        let (out, saved) = self.publish(t, |_| {});
+        saved.context("saving the daemon state")?;
+        Ok(out)
+    }
+
+    /// A lifecycle transition whose state file failure only shows in the
+    /// status: the daemon goes on from what it knows.
+    fn note<T>(&self, t: impl FnOnce(&mut Lifecycle) -> T) -> T {
+        let (out, saved) = self.publish(t, |_| {});
+        if let Err(e) = saved {
+            self.set_error(format!("saving the daemon state: {e:#}"));
+        }
+        out
+    }
+
+    /// Changes the view, recomputing the headline; emits events for changes.
+    pub(crate) fn update(&self, f: impl FnOnce(&mut StatusView)) {
+        let ((), saved) = self.publish(|_| (), f);
+        debug_assert!(saved.is_ok());
+    }
+
+    /// The server session's connection changed.
+    pub(crate) fn set_link(&self, link: Link) {
+        self.note(|lc| lc.set_link(link));
+    }
+
+    /// The server answered 401 to the token. That can be a proxy or a server
+    /// misconfiguration as well as a removal while the daemon was away, so the
+    /// machine keeps being managed and the connection is retried; only the
+    /// server's `revoked` message revokes it. After `auth_warn_after`, the status
+    /// says the machine was probably removed.
+    pub(crate) fn set_auth_rejected(&self) {
+        let now = unix_now();
+        let Some(since) = self.note(|lc| lc.auth_rejected(now)) else { return };
+        let message = if now - since >= self.cfg.auth_warn_after.as_secs() as i64 {
+            format!(
+                "the server has rejected this machine's token since {}h ago; it was probably removed from the fleet: \
+                 join again with `sk1ll join <server-url> <join-code>` (still managing the harnesses meanwhile)",
+                (now - since) / 3600
+            )
+        } else {
+            "the server rejected this machine's token (HTTP 401); retrying. If it was removed from the fleet, \
+             join again with `sk1ll join <server-url> <join-code>`"
+                .to_string()
+        };
+        if self.view().last_error.as_deref() != Some(message.as_str()) {
+            tracing::warn!("{message}");
+        }
+        self.update(|v| v.last_error = Some(message));
+    }
+
+    pub(crate) fn set_error(&self, e: impl ToString) {
+        let e = crate::auth::redact(&e.to_string());
+        tracing::warn!("{e}");
+        self.update(|v| v.last_error = Some(e));
+    }
+
+    // -----------------------------------------------------------------------
+    // Engine operations (blocking, with the engine mutex held)
+
+    fn ensure_managed(&self) -> Result<()> {
+        lock(&self.lifecycle).managed().map_err(|why| Error::Conflict(why.into()))?;
+        self.require_repo()
+    }
+
+    /// Nothing to manage: revoked, or about to restart.
+    fn idle(&self) -> bool {
+        lock(&self.lifecycle).idle()
+    }
+
+    /// Takes the engine lock on the repo if it exists and isn't held yet. Held
+    /// by someone else means another sk1ll process is changing it.
+    pub(crate) fn lock_repo(&self, eng: &mut Engine) -> Result<()> {
+        let root = self.repo_root();
+        if eng.lock.is_some() || !root.join(".git").exists() {
+            return Ok(());
+        }
+        match EngineLock::try_acquire(root)? {
+            Some(l) => {
+                tracing::debug!("holding {}", l.path().display());
+                eng.lock = Some(l);
+                Ok(())
+            }
+            None => Err(Error::Conflict(format!(
+                "another sk1ll process (a second daemon, or a CLI command working directly) is changing {}",
+                root.display()
+            ))),
+        }
+    }
+
+    /// At startup: clone the repo if it isn't there yet (without the engine
+    /// mutex), drop credentials an older version left in origin's URL, and
+    /// bring the harnesses in line.
+    pub(crate) async fn startup(self: &Arc<Self>) -> Result<()> {
+        if self.idle() {
+            return Ok(());
+        }
+        if !self.is_standalone() {
+            // Git authenticates through the process environment (`prepare_process`).
+            let cloned =
+                self.network(|d| Ok(gitx::ensure_clone(d.repo_root(), &d.ident.joined()?.repo_url(), &[]))).await?;
+            if let Err(e) = cloned {
+                self.set_error(format!("setting up {}: {e:#}", self.repo_root().display()));
+            }
+        }
+        self.blocking(|d, eng| {
+            d.lock_repo(eng)?;
+            if !d.is_standalone()
+                && let Some(s) = d.snapshot()
+                && let Err(e) = s.assignment.save(&d.cfg.assignment)
+            {
+                tracing::warn!("writing the assignment cache {}: {e}", d.cfg.assignment.display());
+            }
+            d.refresh(eng)
+        })
+        .await
+    }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests;
