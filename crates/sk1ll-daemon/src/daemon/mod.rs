@@ -179,6 +179,9 @@ pub(crate) struct Engine {
     /// when the last reconcile failed, reported errors, or none ran yet, so
     /// the next one runs whatever the Inputs.
     reconciled: Option<reconcile::Inputs>,
+    /// When the last full reconcile began (see [`Config::full_reconcile_every`]);
+    /// `None` until one succeeds, so the first one after startup is full.
+    full_at: Option<std::time::Instant>,
     /// How long an Input must have been left alone to be recorded
     /// ([`reconcile::RACY_WINDOW`]; tests widen it).
     racy: std::time::Duration,
@@ -263,6 +266,7 @@ impl Daemon {
             engine: Mutex::new(Engine {
                 lock: None,
                 reconciled: None,
+                full_at: None,
                 racy: reconcile::RACY_WINDOW,
                 #[cfg(test)]
                 after_sync_review: None,

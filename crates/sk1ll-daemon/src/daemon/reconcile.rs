@@ -13,7 +13,10 @@
 //! engine mutex they hold, so their reply reflects the reconciled state.
 //! A reconcile that failed, reported errors, or saw an input change within
 //! the racy window (see [`HashCache`]) records no fingerprint, so the next
-//! wake reconciles again.
+//! wake reconciles again. The first reconcile after startup, and then one at
+//! most every [`Config::full_reconcile_every`], is full: it plans whatever
+//! the fingerprint says and empties the hash cache first, bounding how long a
+//! change metadata cannot show goes unnoticed.
 
 use super::*;
 use std::collections::BTreeMap;
@@ -205,8 +208,11 @@ impl Daemon {
             self.reload_local_assignment()?;
         }
         let gathered = Inputs::gather(self, eng.racy);
+        let started = std::time::Instant::now();
+        let full = eng.full_at.is_none_or(|at| started.duration_since(at) >= self.cfg.full_reconcile_every);
         let why = match (&gathered, &eng.reconciled) {
             _ if reviewed.is_some() => "a reviewed sync".to_string(),
+            _ if full => "a full reconcile, whatever the inputs".to_string(),
             (Err(e), _) => format!("the inputs could not be read ({e})"),
             (Ok(_), None) => "no reconcile succeeded since the last change".to_string(),
             (Ok((now, _)), Some(before)) if now == before => {
@@ -218,9 +224,17 @@ impl Daemon {
         tracing::debug!("reconciling: {why}");
         eng.reconciled = None;
         let reviewed_plan = reviewed.is_some();
+        if full && !reviewed_plan {
+            // Metadata can't see everything (a write through a shared
+            // mapping, a directory's extended attributes): read every tree.
+            self.hashes.clear();
+        }
         let outcome = self.apply_inputs(eng, reviewed);
         self.hashes.sweep();
         let outcome = outcome?;
+        if full && !reviewed_plan {
+            eng.full_at = Some(started);
+        }
         match gathered {
             Ok((inputs, racy)) if racy.is_empty() && !reviewed_plan && outcome.errors.is_empty() => {
                 eng.reconciled = Some(inputs);

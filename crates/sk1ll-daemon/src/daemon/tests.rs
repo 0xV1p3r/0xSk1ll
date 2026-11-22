@@ -1061,3 +1061,43 @@ async fn a_missing_standalone_repo_replaces_the_snapshot() {
     assert!(!d.view().repo_ready);
     assert!(d.view().report.items.is_empty());
 }
+
+/// The periodic full reconcile plans whatever the recorded Inputs say and
+/// rehashes every tree: it puts back a placement whose change no stamp saw.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_reconcile_corrects_what_the_fingerprint_missed() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = tempfile::tempdir().unwrap();
+    let (d, _session, _) = joined_daemon(dir.path(), PullRecord::default());
+    pdf_skill(d.repo_root());
+    for _ in 0..2 {
+        d.blocking(|d, eng| d.reconcile(eng)).await.unwrap();
+    }
+    let placed = dir.path().join("h/pdf");
+    assert!(placed.join("SKILL.md").is_file());
+    // A change the fingerprint missed: recorded as if seen.
+    std::fs::remove_dir_all(&placed).unwrap();
+    let (inputs, _) = reconcile::Inputs::gather(&d, std::time::Duration::ZERO).unwrap();
+    lock(&d.engine).reconciled = Some(inputs);
+    let plans = d.plans.load(Relaxed);
+    d.blocking(|d, eng| d.reconcile(eng)).await.unwrap();
+    assert_eq!(d.plans.load(Relaxed), plans, "stuck until the full reconcile");
+    assert!(!placed.exists());
+    let due = std::time::Instant::now().checked_sub(d.cfg.full_reconcile_every);
+    lock(&d.engine).full_at = due;
+    d.blocking(|d, eng| d.reconcile(eng)).await.unwrap();
+    assert_eq!(d.plans.load(Relaxed), plans + 1);
+    assert_eq!(std::fs::read_to_string(placed.join("SKILL.md")).unwrap(), "PDFs.\n");
+    // Nothing is due again until the interval has passed once more.
+    for _ in 0..2 {
+        d.blocking(|d, eng| d.reconcile(eng)).await.unwrap();
+    }
+    let settled = (d.plans.load(Relaxed), d.hashes.hashed());
+    d.blocking(|d, eng| d.reconcile(eng)).await.unwrap();
+    assert_eq!((d.plans.load(Relaxed), d.hashes.hashed()), settled);
+    // Then nothing changed, and every tree is read again all the same.
+    lock(&d.engine).full_at = std::time::Instant::now().checked_sub(d.cfg.full_reconcile_every);
+    d.blocking(|d, eng| d.reconcile(eng)).await.unwrap();
+    assert_eq!(d.plans.load(Relaxed), settled.0 + 1);
+    assert!(d.hashes.hashed() > settled.1 + 1, "the source and the placement, past the cache");
+}

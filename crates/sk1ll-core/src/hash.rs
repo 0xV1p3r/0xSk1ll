@@ -627,6 +627,12 @@ impl HashCache {
         self.hashed.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Forgets every tree, so each is read and hashed again: a full
+    /// reconcile does, to bound what a stale entry can hide.
+    pub fn clear(&self) {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
     /// Forgets every tree not looked up since the last sweep.
     pub fn sweep(&self) {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());

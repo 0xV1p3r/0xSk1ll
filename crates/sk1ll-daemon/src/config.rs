@@ -4,6 +4,9 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use sk1ll_core::{Assignment, MachineConfig};
 
+/// How often a full reconcile runs by default (see [`Config::full_reconcile_every`]).
+pub const FULL_RECONCILE_EVERY: Duration = Duration::from_secs(600);
+
 /// Daemon settings: where its files live and how often it does things.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -31,6 +34,11 @@ pub struct Config {
     /// Local re-sync of the harnesses, whether or not the server is reachable
     /// (`SK1LL_RECONCILE_INTERVAL`, default `60s`).
     pub reconcile_every: Duration,
+    /// A reconcile that plans and rehashes everything, whatever the input
+    /// fingerprint and the hash cache say, at most this long after the last
+    /// one (`SK1LL_FULL_RECONCILE_INTERVAL`, default `10m`): what metadata
+    /// misses is noticed by then, give or take one `reconcile_every`.
+    pub full_reconcile_every: Duration,
     /// After the server has rejected the token this long, `/status` says the
     /// machine was probably removed (`SK1LL_AUTH_WARN_AFTER`, default `24h`).
     /// It is never revoked automatically.
@@ -54,6 +62,7 @@ impl Config {
             debounce: Duration::from_millis(300),
             debounce_max: Duration::from_secs(2),
             reconcile_every: Duration::from_secs(60),
+            full_reconcile_every: FULL_RECONCILE_EVERY,
             auth_warn_after: Duration::from_secs(24 * 3600),
             reconnect_min: Duration::from_millis(500),
             reconnect_max: Duration::from_secs(60),
@@ -89,6 +98,7 @@ impl Config {
         dur("SK1LL_DEBOUNCE", &mut cfg.debounce)?;
         dur("SK1LL_DEBOUNCE_MAX", &mut cfg.debounce_max)?;
         dur("SK1LL_RECONCILE_INTERVAL", &mut cfg.reconcile_every)?;
+        dur("SK1LL_FULL_RECONCILE_INTERVAL", &mut cfg.full_reconcile_every)?;
         dur("SK1LL_AUTH_WARN_AFTER", &mut cfg.auth_warn_after)?;
         dur("SK1LL_RECONNECT_MAX", &mut cfg.reconnect_max)?;
         cfg.reconnect_min = cfg.reconnect_min.min(cfg.reconnect_max);
