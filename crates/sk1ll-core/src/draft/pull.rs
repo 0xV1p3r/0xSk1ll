@@ -77,9 +77,18 @@ pub(super) enum Before {
 /// crash would: whatever it changed stays, journal included.
 pub(super) type Hook<'a> = &'a mut dyn FnMut(Before) -> Result<()>;
 
-pub(super) fn run(repo: &Repo, hook: Hook) -> Result<PullOutcome> {
+/// `fetch`: fetch [`REMOTE`] first. Without it, the pull moves onto the
+/// baseline fetched last (see [`fetch`]).
+pub(super) fn run(repo: &Repo, fetch: bool, hook: Hook) -> Result<PullOutcome> {
     let _ = crate::sync::displaced::prune();
-    with_pull(repo, |pull| pull.run(hook))
+    with_pull(repo, |pull| pull.run(fetch, hook))
+}
+
+/// Fetches every branch of [`REMOTE`] into `refs/remotes`, pruning the ones
+/// it no longer has. Only the object store and remote-tracking refs change:
+/// neither `HEAD`, the index nor the working tree, so it needs no engine lock.
+pub(super) fn fetch(repo: &Repo) -> Result<()> {
+    with_pull(repo, |pull| pull.fetch())
 }
 
 /// Finishes a pull that stopped half-way, if there is one, without fetching.
@@ -248,8 +257,14 @@ impl Pull<'_> {
         Git::for_pull(&self.root, self.hooks)
     }
 
+    fn fetch(&self) -> Result<()> {
+        let all = format!("+refs/heads/*:refs/remotes/{REMOTE}/*");
+        self.git().args(["fetch", "--quiet", "--prune", "--no-recurse-submodules", REMOTE, &all]).run()?;
+        Ok(())
+    }
+
     /// Finishes a pull that stopped half-way first, then pulls.
-    fn run(&self, hook: Hook) -> Result<PullOutcome> {
+    fn run(&self, fetch: bool, hook: Hook) -> Result<PullOutcome> {
         let resumed = match Journal::load(self)? {
             Some(mut journal) => {
                 let baseline = journal.baseline.clone();
@@ -265,7 +280,7 @@ impl Pull<'_> {
                 None
             }
         };
-        let (outcome, displaced) = self.update(hook)?;
+        let (outcome, displaced) = self.update(fetch, hook)?;
         let (outcome, displaced) = match resumed {
             None => (outcome, displaced),
             Some((from, earlier)) => {
@@ -283,8 +298,8 @@ impl Pull<'_> {
         displaced.map_or(Ok(outcome), Err)
     }
 
-    /// Fetches and moves onto the new baseline.
-    fn update(&self, hook: Hook) -> Result<(PullOutcome, Option<Error>)> {
+    /// Fetches (if `fetch`) and moves onto the new baseline.
+    fn update(&self, fetch: bool, hook: Hook) -> Result<(PullOutcome, Option<Error>)> {
         let branch = on_fleet_branch(self.git(), self.repo)?;
         // Submodules are refused, in HEAD or only in the index, before anything else.
         let head = rev(self.git(), "HEAD")?;
@@ -293,8 +308,9 @@ impl Pull<'_> {
             None => BTreeSet::new(),
         };
         self.index()?;
-        let all = format!("+refs/heads/*:refs/remotes/{REMOTE}/*");
-        self.git().args(["fetch", "--quiet", "--prune", "--no-recurse-submodules", REMOTE, &all]).run()?;
+        if fetch {
+            self.fetch()?;
+        }
         let Some(remote) = rev(self.git(), &format!("refs/remotes/{REMOTE}/{FLEET_BRANCH}"))? else {
             let prefix = format!("refs/remotes/{REMOTE}/");
             let refs = self.git().args(["for-each-ref", "--format=%(refname)", &prefix]).text()?;

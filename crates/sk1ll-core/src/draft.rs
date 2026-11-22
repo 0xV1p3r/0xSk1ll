@@ -344,15 +344,36 @@ impl Repo {
 
     /// Pushes [`FLEET_BRANCH`] to [`REMOTE`]; it must be checked out.
     pub fn push(&self) -> Result<()> {
+        match self.prepare_push()? {
+            Some(commit) => self.push_commit(&commit),
+            None => Ok(()),
+        }
+    }
+
+    /// The checks [`push`](Self::push) makes before it talks to [`REMOTE`]:
+    /// returns the commit to push (`HEAD`), or `None` on an unborn branch.
+    /// Only reads, so a caller can check under its engine lock and push the
+    /// commit without it ([`push_commit`](Self::push_commit)).
+    pub fn prepare_push(&self) -> Result<Option<String>> {
         self.on_fleet_branch()?;
         // Its branch has yet to move to the replayed commits.
         self.require_no_pending_pull()?;
-        if let Some(head) = rev(self.git(), "HEAD")? {
-            let claims = crate::item_id::claims_at(self.root(), &head, |_| true, true)?;
-            crate::item_id::check_claims(&claims).map_err(|e| repair_before(e, "push"))?;
-        }
-        let refspec = format!("refs/heads/{FLEET_BRANCH}:refs/heads/{FLEET_BRANCH}");
+        let Some(head) = rev(self.git(), "HEAD")? else { return Ok(None) };
+        let claims = crate::item_id::claims_at(self.root(), &head, |_| true, true)?;
+        crate::item_id::check_claims(&claims).map_err(|e| repair_before(e, "push"))?;
+        Ok(Some(head))
+    }
+
+    /// Pushes `commit` (from [`prepare_push`](Self::prepare_push)) as
+    /// [`REMOTE`]'s [`FLEET_BRANCH`], and records it as that remote branch.
+    /// It pushes that exact commit, whatever the local branch has become
+    /// since: a pull that rebased it meanwhile has moved off what the server
+    /// had, so git refuses the push as not fast-forward.
+    pub fn push_commit(&self, commit: &str) -> Result<()> {
+        let refspec = format!("{commit}:refs/heads/{FLEET_BRANCH}");
         self.git().args(["push", "--quiet", REMOTE, &refspec]).run()?;
+        let tracking = format!("refs/remotes/{REMOTE}/{FLEET_BRANCH}");
+        self.git().args(["update-ref", "-m", "sk1ll: push", &tracking, commit]).run()?;
         Ok(())
     }
 
@@ -515,7 +536,23 @@ impl Repo {
     /// as): then there is nothing to pull yet, and the first push creates it.
     pub fn pull(&self, lock: &crate::EngineLock) -> Result<PullOutcome> {
         lock.check_for(self.root())?;
-        let pulled = pull::run(self, &mut |_| Ok(()));
+        let pulled = pull::run(self, true, &mut |_| Ok(()));
+        self.check_pulled_ids(pulled)
+    }
+
+    /// Fetches [`REMOTE`]'s branches, the network half of a [`pull`](Self::pull).
+    /// It changes no file, no `HEAD` and no index, so it needs no engine lock:
+    /// a caller fetches first and then, holding its lock, moves onto what it
+    /// fetched with [`pull_fetched`](Self::pull_fetched).
+    pub fn fetch(&self) -> Result<()> {
+        pull::fetch(self)
+    }
+
+    /// [`pull`](Self::pull) onto the baseline [`fetch`](Self::fetch) fetched
+    /// last, without talking to [`REMOTE`]: the local half of a pull.
+    pub fn pull_fetched(&self, lock: &crate::EngineLock) -> Result<PullOutcome> {
+        lock.check_for(self.root())?;
+        let pulled = pull::run(self, false, &mut |_| Ok(()));
         self.check_pulled_ids(pulled)
     }
 
@@ -582,7 +619,7 @@ impl Repo {
     fn pull_at(&self, point: pull::Before, f: impl FnOnce()) -> Result<PullOutcome> {
         let _lock = crate::EngineLock::acquire(self.root())?;
         let mut f = Some(f);
-        pull::run(self, &mut |at| {
+        pull::run(self, true, &mut |at| {
             if at == point
                 && let Some(f) = f.take()
             {
@@ -596,7 +633,7 @@ impl Repo {
     #[cfg(test)]
     fn pull_crashing_at(&self, point: pull::Before) -> Result<PullOutcome> {
         let _lock = crate::EngineLock::acquire(self.root())?;
-        pull::run(self, &mut |at| match at == point {
+        pull::run(self, true, &mut |at| match at == point {
             true => Err(Error::Invalid(format!("crashed at {at:?}"))),
             false => Ok(()),
         })
@@ -1296,6 +1333,33 @@ mod tests {
         assert_eq!(pull_now(&b).unwrap(), PullOutcome::Updated { from: old, to: new });
         assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "v2\n");
         assert_eq!(pull_now(&b).unwrap(), PullOutcome::UpToDate);
+    }
+
+    /// A caller can fetch and push without its engine lock: the local half
+    /// of a pull only moves onto what was fetched, and a push sends the exact
+    /// commit that was checked.
+    #[test]
+    fn fetching_and_pushing_split_from_the_local_steps() {
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        let old = git(&f.b, &["rev-parse", "HEAD"]);
+        write(&f.a.join("personal/pdf/SKILL.md"), "v2\n");
+        let checked = a.commit(&[item("skill:pdf")], "v2", None).unwrap();
+        assert_eq!(a.prepare_push().unwrap().as_deref(), Some(checked.as_str()));
+        // A commit made after the check is not pushed with it.
+        write(&f.a.join("instructions/git.md"), "later\n");
+        let later = a.commit(&[item("rule:git")], "later", None).unwrap();
+        a.push_commit(&checked).unwrap();
+        assert_eq!(git(&f.a, &["rev-parse", "refs/remotes/origin/main"]), checked);
+        assert_eq!(git(&f.a, &["rev-parse", "HEAD"]), later);
+
+        let lock = crate::EngineLock::acquire(&f.b).unwrap();
+        assert_eq!(b.pull_fetched(&lock).unwrap(), PullOutcome::UpToDate, "nothing fetched yet");
+        assert_eq!(git(&f.b, &["rev-parse", "HEAD"]), old);
+        b.fetch().unwrap();
+        assert_eq!(git(&f.b, &["rev-parse", "HEAD"]), old, "a fetch moves no branch");
+        assert_eq!(b.pull_fetched(&lock).unwrap(), PullOutcome::Updated { from: old, to: checked });
+        assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "v2\n");
     }
 
     /// An import being staged stays where it is, even with a `.gitignore`
