@@ -899,6 +899,25 @@ async fn a_finished_pull_recorded_as_pending_is_clear_after_a_restart() {
     assert!(matches!(d.lifecycle().pull(), PullState::Blocked { baseline, .. } if *baseline == b));
 }
 
+/// A state file whose pull record another version wrote (a pending pull
+/// without its Baseline) doesn't keep the daemon from starting: the record
+/// is dropped, and the reconcile decides from the journal and `HEAD`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_starts_over_an_unreadable_pull_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let (d, _session, state) = joined_daemon(dir.path(), PullRecord::default());
+    let mut json = serde_json::to_value(&state).unwrap();
+    json["pull"] = serde_json::json!({ "state": "pending", "items": ["skill:pdf"] });
+    std::fs::write(&d.cfg.state, json.to_string()).unwrap();
+    let cfg = d.cfg.clone();
+    drop(d);
+    let loaded = DaemonState::load(&cfg.state).unwrap().expect("loads");
+    assert_eq!(loaded.record.pull, PullState::Clear);
+    let d = Daemon::new(cfg, loaded).unwrap();
+    d.blocking(|d, eng| d.reconcile(eng).map(drop)).await.unwrap();
+    assert_eq!(d.lifecycle().pull(), &PullState::Clear);
+}
+
 /// A join that registered while the old registration recovered (its token
 /// works again) stores nothing: the daemon keeps its registration.
 #[tokio::test(flavor = "multi_thread")]

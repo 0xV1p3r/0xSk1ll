@@ -76,7 +76,11 @@ A pending pull is remembered with the Baseline its journal moves onto. One
 whose journal is gone finished before the process could record it: it is
 Clear once `HEAD` contains that Baseline, whatever was fetched since, which
 the next pull takes up. A
-standalone daemon's record names its repo and is dropped for any other.
+standalone daemon's record names its repo and is dropped for any other. The
+record is a hint: a part of it the daemon can't read (another version wrote
+it) is dropped with a warning instead of keeping the daemon from starting,
+and the startup reconcile derives the pull's state from its journal and
+`HEAD`; the next pull finds a block again.
 
 ## One reconcile over fingerprinted Inputs
 

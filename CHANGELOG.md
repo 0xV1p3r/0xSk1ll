@@ -128,6 +128,10 @@ break compatibility.
 
 ### Fixed
 
+- The daemon starts when its state file holds a pull record it can't read
+  (a pending pull another version recorded without its Baseline): it drops
+  that record with a warning and derives the pull's state from its journal
+  and `HEAD`.
 - A conflict's diff requested while the daemon was busy no longer answers
   that the conflict is gone.
 - Daemon state writes use exclusive private staging files. Failed desktop

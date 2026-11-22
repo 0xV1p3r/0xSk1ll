@@ -41,13 +41,34 @@ pub enum PullState {
 }
 
 /// What the daemon remembers about the server's Baseline across restarts.
+///
+/// Only a hint: a field that can't be read (written by another version, say)
+/// is dropped with a warning rather than keep the daemon from starting. The
+/// reconcile at startup derives where the Machine stands from the pull's
+/// journal and `HEAD` (see `Daemon::pull_after_reconcile`), and the next
+/// pull finds a block again.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRecord {
     /// The server's Baseline as last announced, fetched or pushed.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub server_baseline: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub pull: PullState,
+}
+
+/// `T`, or its default (with a warning) for a value that isn't one.
+fn or_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_else(|e| {
+        tracing::warn!(
+            "dropping an unreadable part of the remembered pull state ({e}); the journal and HEAD decide it instead"
+        );
+        T::default()
+    }))
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,6 +285,41 @@ mod tests {
         assert_eq!(fs::read(&target).unwrap(), b"keep");
         assert_eq!(fs::read(&path).unwrap(), b"private");
         assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    /// A record another version wrote (a pending pull without its
+    /// Baseline) loads without it, the rest of the state intact.
+    #[test]
+    fn an_unreadable_pull_record_is_dropped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.json");
+        let mut json = serde_json::to_value(state()).unwrap();
+        json["pull"] = serde_json::json!({ "state": "pending", "items": ["skill:pdf"] });
+        json["server_baseline"] = serde_json::json!(["not", "a", "commit"]);
+        fs::write(&path, json.to_string()).unwrap();
+        let loaded = DaemonState::load(&path).unwrap().unwrap();
+        assert_eq!(loaded.record, PullRecord::default());
+        assert_eq!(loaded, state());
+
+        json["pull"] = serde_json::json!({ "state": "blocked", "baseline": "abc", "items": ["skill:pdf"] });
+        json["server_baseline"] = serde_json::json!("abc");
+        fs::write(&path, json.to_string()).unwrap();
+        let loaded = DaemonState::load(&path).unwrap().unwrap();
+        let items = vec!["skill:pdf".parse().unwrap()];
+        assert_eq!(loaded.record.pull, PullState::Blocked { baseline: "abc".into(), items });
+        assert_eq!(loaded.record.server_baseline.as_deref(), Some("abc"));
+
+        // A standalone daemon's record the same way.
+        let repo = dir.path().join("repo");
+        sk1ll_core::Repo::init(&repo).unwrap();
+        let record = dir.path().join("standalone-state.json");
+        save_record(&record, &repo, &PullRecord::default()).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+        json["pull"] = serde_json::json!({ "state": "pending", "items": [] });
+        json["server_baseline"] = serde_json::json!("abc");
+        fs::write(&record, json.to_string()).unwrap();
+        let loaded = load_record(&record, &repo).unwrap();
+        assert_eq!(loaded, PullRecord { server_baseline: Some("abc".into()), pull: PullState::Clear });
     }
 
     fn state() -> DaemonState {
