@@ -33,16 +33,16 @@ impl Snapshot {
         Arc::new(Self { generation: 0, draft: pending(), items: pending(), conflicts: pending(), recovered: pending() })
     }
 
-    /// What readers see while a standalone daemon's repo is missing (moved
-    /// or removed): `error` for every part, as for every other request
+    /// What readers see while the repo is missing (moved or removed) or
+    /// can't be opened: `error` for every part, as for every other request
     /// about the repo, never the items of the repo that was there.
-    pub(super) fn without_repo(generation: u64, error: fn() -> Error) -> Arc<Self> {
+    pub(super) fn without_repo(generation: u64, error: &Error) -> Arc<Self> {
         Arc::new(Self {
             generation,
-            draft: Err(error()),
-            items: Err(error()),
-            conflicts: Err(error()),
-            recovered: Err(error()),
+            draft: Err(error.duplicate()),
+            items: Err(error.duplicate()),
+            conflicts: Err(error.duplicate()),
+            recovered: Err(error.duplicate()),
         })
     }
 

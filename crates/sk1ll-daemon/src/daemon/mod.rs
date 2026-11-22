@@ -466,7 +466,7 @@ impl Daemon {
     }
 
     pub(crate) fn require_repo(&self) -> Result<()> {
-        if self.is_standalone() && !self.repo_root().join(".git").exists() {
+        if self.is_standalone() && !reconcile::repo_present(self.repo_root()) {
             return Err(Self::no_repo());
         }
         Ok(())

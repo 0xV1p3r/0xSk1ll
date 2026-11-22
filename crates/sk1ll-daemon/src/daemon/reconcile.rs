@@ -163,6 +163,17 @@ pub(super) fn git_dirs(root: &Path) -> sk1ll_core::Result<Stamp> {
     Ok(Stamp::combine("git", parts))
 }
 
+/// Whether the repo at `root` is there: `.git` exists and, when it is a
+/// pointer file, names a git directory that exists (one moved or removed
+/// leaves a repo as missing as removing `.git`).
+pub(super) fn repo_present(root: &Path) -> bool {
+    let dot = root.join(".git");
+    match pointed_git_dir(&dot) {
+        Some(git_dir) => git_dir.join("HEAD").exists(),
+        None => dot.exists(),
+    }
+}
+
 /// The git directory a `.git` pointer file names (`gitdir: <path>`, relative
 /// to the file's directory unless absolute); `None` for a real directory.
 fn pointed_git_dir(dot: &Path) -> Option<PathBuf> {
@@ -255,29 +266,31 @@ impl Daemon {
             return Err(Error::Unavailable("waiting for the pending Harness rename to finish".into()));
         }
         let root = self.repo_root().to_path_buf();
-        if self.is_standalone() && !root.join(".git").exists() {
+        if !repo_present(&root) {
             // Moved or removed: what readers had of it is gone with it.
-            let generation = self.snapshot().generation + 1;
-            self.snapshot.send_replace(Snapshot::without_repo(generation, Self::no_repo));
-            self.update(|v| {
-                v.repo_ready = false;
-                v.has_origin = false;
-                v.last_error = None;
-                v.report = MachineReport::default();
-            });
-            self.roots
-                .send_replace(vec![WatchRoot::new(root, true), WatchRoot::new(self.cfg.assignment.clone(), false)]);
-            return Ok(ReconcileOutcome::default());
+            if self.is_standalone() {
+                self.publish_without_repo(&Self::no_repo());
+                self.roots
+                    .send_replace(vec![WatchRoot::new(root, true), WatchRoot::new(self.cfg.assignment.clone(), false)]);
+                return Ok(ReconcileOutcome::default());
+            }
+            let error = Error::Conflict(format!("{} is not set up yet (the server was unreachable)", root.display()));
+            self.publish_without_repo(&error);
+            return Err(error);
         }
-        if !root.join(".git").exists() {
-            return Err(Error::Conflict(format!("{} is not set up yet (the server was unreachable)", root.display())));
-        }
+        let repo = match Repo::open_git_only(&root) {
+            Ok(repo) => repo,
+            Err(e) => {
+                let error = Error::from(e);
+                self.publish_without_repo(&error);
+                return Err(error);
+            }
+        };
         self.lock_repo(eng)?;
         let machine = MachineConfig::load(&self.cfg.machine_config)?;
         let harnesses = machine.harnesses();
         let lock = eng.lock.as_ref().ok_or_else(|| Error::Conflict(format!("{} is not locked", root.display())))?;
         let mut outcome = ReconcileOutcome::default();
-        let repo = Repo::open_git_only(&root)?;
         let finish = repo.finish_pull(lock);
         let pending = repo.pull_pending()?;
         let finished = match finish {
@@ -444,6 +457,20 @@ impl Daemon {
             changed
         });
         Ok(outcome)
+    }
+
+    /// Publishes a Snapshot whose every part is `error`, and an empty
+    /// report: the repo is missing or can't be opened, so nothing of the one
+    /// that was there may still be answered.
+    fn publish_without_repo(&self, error: &Error) {
+        let generation = self.snapshot().generation + 1;
+        self.snapshot.send_replace(Snapshot::without_repo(generation, error));
+        self.update(|v| {
+            v.repo_ready = false;
+            v.has_origin = false;
+            v.last_error = None;
+            v.report = MachineReport::default();
+        });
     }
 
     /// Where a reconcile leaves the pull: what finishing a stopped pull
