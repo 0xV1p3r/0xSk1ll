@@ -784,6 +784,11 @@ impl Client {
         self.get("/items").await
     }
 
+    /// [`Client::items`] as of now: waits for a running engine operation.
+    pub async fn items_fresh(&self) -> Result<Vec<ItemView>> {
+        self.get("/items?fresh=true").await
+    }
+
     pub async fn skills(&self) -> Result<Vec<ContentEntry>> {
         self.get("/skills").await
     }
@@ -804,8 +809,16 @@ impl Client {
         self.post_empty("/skills/adopt", target).await
     }
 
+    /// The Draft from the daemon's last Snapshot: never waits, so it may
+    /// lag behind an edit made a moment ago while an engine operation runs.
     pub async fn draft(&self) -> Result<Vec<DraftEntry>> {
         self.get("/draft").await
+    }
+
+    /// The Draft as of now, for acting on what it lists: waits for a running
+    /// engine operation and reconciles first.
+    pub async fn draft_fresh(&self) -> Result<Vec<DraftEntry>> {
+        self.get("/draft?fresh=true").await
     }
 
     pub async fn diff(&self, item: &str) -> Result<DiffView> {
@@ -836,6 +849,11 @@ impl Client {
         self.get("/conflicts/displaced").await
     }
 
+    /// [`Client::recovered`] as of now: waits for a running engine operation.
+    pub async fn recovered_fresh(&self) -> Result<Vec<ConflictView>> {
+        self.get("/conflicts/displaced?fresh=true").await
+    }
+
     pub async fn adopt_displaced(&self, id: &str) -> Result<PathBuf> {
         self.post(&format!("/conflicts/displaced/{}/adopt", encode(id)), &()).await
     }
@@ -846,6 +864,11 @@ impl Client {
 
     pub async fn conflicts(&self) -> Result<Vec<ConflictView>> {
         self.get("/conflicts").await
+    }
+
+    /// [`Client::conflicts`] as of now: waits for a running engine operation.
+    pub async fn conflicts_fresh(&self) -> Result<Vec<ConflictView>> {
+        self.get("/conflicts?fresh=true").await
     }
 
     pub async fn adopt(&self, target: &ConflictTarget) -> Result<()> {

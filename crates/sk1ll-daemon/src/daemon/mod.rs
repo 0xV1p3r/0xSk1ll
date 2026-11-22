@@ -409,6 +409,14 @@ impl Daemon {
         self.snapshot()
     }
 
+    /// The Snapshot as of now, for a caller about to act on what it lists
+    /// (`?fresh=true`): waits for a running engine operation, then
+    /// reconciles. Unlike [`Daemon::caught_up`], it may wait.
+    pub(crate) async fn fresh(self: &Arc<Self>) -> Result<Arc<Snapshot>> {
+        self.blocking(|d, eng| if d.idle() { Ok(()) } else { d.reconcile(eng).map(drop) }).await?;
+        Ok(self.snapshot())
+    }
+
     /// The applied assignment, if there is one.
     pub(crate) fn applied(&self) -> Option<Arc<AssignmentSnapshot>> {
         self.applied.read().unwrap_or_else(|e| e.into_inner()).clone()

@@ -239,12 +239,27 @@ async fn status(State(d): St) -> Json<StatusView> {
     Json(d.view())
 }
 
-async fn items(State(d): St) -> Result<Json<Vec<ItemView>>> {
-    Ok(Json(d.caught_up().await.items()?))
+/// `?fresh=true`: the caller acts on what it reads (`sk1ll restore --all`),
+/// so the read waits for a running engine operation and reconciles first
+/// (see `Daemon::fresh`) instead of answering from the last Snapshot.
+#[derive(Deserialize, Default)]
+struct ReadQuery {
+    #[serde(default)]
+    fresh: bool,
 }
 
-async fn draft(State(d): St) -> Result<Json<Vec<DraftEntry>>> {
-    Ok(Json(d.caught_up().await.draft()?))
+impl ReadQuery {
+    async fn snapshot(&self, d: &Arc<Daemon>) -> Result<Arc<crate::daemon::Snapshot>> {
+        if self.fresh { d.fresh().await } else { Ok(d.caught_up().await) }
+    }
+}
+
+async fn items(State(d): St, Query(q): Query<ReadQuery>) -> Result<Json<Vec<ItemView>>> {
+    Ok(Json(q.snapshot(&d).await?.items()?))
+}
+
+async fn draft(State(d): St, Query(q): Query<ReadQuery>) -> Result<Json<Vec<DraftEntry>>> {
+    Ok(Json(q.snapshot(&d).await?.draft()?))
 }
 
 async fn skills(State(d): St) -> Result<Json<Vec<sk1ll_core::content::ContentEntry>>> {
@@ -305,12 +320,12 @@ async fn pull(State(d): St) -> Result<Json<PullResult>> {
     Ok(Json(d.pull().await?))
 }
 
-async fn recovered(State(d): St) -> Result<Json<Vec<ConflictView>>> {
-    Ok(Json(d.caught_up().await.recovered()?))
+async fn recovered(State(d): St, Query(q): Query<ReadQuery>) -> Result<Json<Vec<ConflictView>>> {
+    Ok(Json(q.snapshot(&d).await?.recovered()?))
 }
 
-async fn conflicts(State(d): St) -> Result<Json<Vec<ConflictView>>> {
-    Ok(Json(d.caught_up().await.conflicts()?))
+async fn conflicts(State(d): St, Query(q): Query<ReadQuery>) -> Result<Json<Vec<ConflictView>>> {
+    Ok(Json(q.snapshot(&d).await?.conflicts()?))
 }
 
 async fn adopt_displaced(State(d): St, UrlPath(id): UrlPath<String>) -> Result<Json<PathBuf>> {

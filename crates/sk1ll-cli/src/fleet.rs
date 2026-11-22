@@ -506,7 +506,12 @@ impl Daemon {
         match cmd {
             Cmd::Conflicts | Cmd::Recover { command: crate::RecoverCmd::List } => {
                 let entries =
-                    if matches!(cmd, Cmd::Conflicts) { self.block(c.conflicts())? } else { self.block(c.recovered())? };
+                    // Their ids and names are what the next command acts on.
+                    if matches!(cmd, Cmd::Conflicts) {
+                        self.block(c.conflicts_fresh())?
+                    } else {
+                        self.block(c.recovered_fresh())?
+                    };
                 for e in entries {
                     if e.kind.as_deref() == Some("displaced") {
                         println!(
@@ -553,7 +558,8 @@ impl Daemon {
             },
             Cmd::Restore { items, all, yes } => {
                 if all {
-                    let draft = self.block(c.draft())?;
+                    // What is confirmed is what gets restored: as of now.
+                    let draft = self.block(c.draft_fresh())?;
                     if draft.is_empty() {
                         println!("no draft to restore");
                         return Ok(());

@@ -685,13 +685,22 @@ async fn readers_answer_from_the_last_snapshot_while_the_engine_is_busy() {
     assert!(!items.iter().any(|i| i.item.to_string() == "skill:notes"));
     assert!(conflicts.is_empty());
     assert_eq!(status.report.drafts.len(), 1);
+    // A caller about to act on the list asks for it as of now: it waits
+    // for the engine, then sees the change.
+    let fresh = tokio::spawn({
+        let socket = socket.clone();
+        async move { Client::new(&socket).draft_fresh().await.unwrap() }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(!fresh.is_finished(), "a fresh read waits for the engine");
     finish.send(()).unwrap();
     busy.await.unwrap().unwrap();
+    assert_eq!(names(fresh.await.unwrap()), ["skill:notes", "skill:pdf"]);
 
     // The engine is free: a reader first brings the Snapshot up to date.
     assert_eq!(names(client.draft().await.unwrap()), ["skill:notes", "skill:pdf"]);
     let second = d.snapshot();
-    assert_eq!(second.generation, first.generation + 1);
+    assert!(second.generation > first.generation);
     assert_eq!(names(first.draft().unwrap()), ["skill:pdf"], "a published Snapshot never changes");
     // Writing the new skill's Item ID changed the tree: one more pass, then
     // nothing changes and no new Snapshot is published.

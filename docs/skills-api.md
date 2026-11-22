@@ -180,7 +180,10 @@ Refresh on the existing `draft`, `status` and `fleet` SSE events at `GET /events
 `GET /draft`, `/items`, `/conflicts` and `/conflicts/displaced` answer from
 the Daemon's last reconcile, brought up to date first unless an engine
 operation is running; then they answer at once with the previous state, and
-the `draft` or `status` event follows the reconcile that catches up.
+the `draft` or `status` event follows the reconcile that catches up. Add
+`?fresh=true` to act on what is listed: the read then waits for a running
+engine operation and reconciles first. The CLI does so for `restore --all`,
+`conflicts` and `recover list`; the GUI keeps reads that never wait.
 Adopt emits `draft` after creating the Draft and after finishing replacement.
 
 `POST /imports/fork` already takes:
