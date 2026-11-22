@@ -1749,6 +1749,12 @@ fn placed_target(repo: &Repo, kind: displaced::Kind, src: &Path, leaf: &str) -> 
     };
     match holders.as_slice() {
         [_] => adopt_target(repo, kind, Path::new(leaf), Some(&id)),
+        // An Adopt of it that stopped half-way: the repo's version of the
+        // item, with that ID, is in recovery, and its path is free again.
+        [] if let Some(dest) = interrupted_adopt(repo, kind, &id)? => {
+            let leaf = dest.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            adopt_target(repo, kind, Path::new(&leaf), None)
+        }
         [] => {
             let same_name = match kind {
                 displaced::Kind::Rule => rules.iter().any(|r| r.name == name),
@@ -1773,6 +1779,31 @@ fn placed_target(repo: &Repo, kind: displaced::Kind, src: &Path, leaf: &str) -> 
             many.iter().map(|(name, path)| format!("`{name}` ({})", path.display())).collect::<Vec<_>>().join(", ")
         ))),
     }
+}
+
+/// The path of the repo item with Item ID `id` an Adopt moved into
+/// recovery and didn't put a copy in place of: the entry is there, and
+/// nothing is at its path.
+fn interrupted_adopt(repo: &Repo, kind: displaced::Kind, id: &ItemId) -> Result<Option<PathBuf>> {
+    for entry in displaced::list()? {
+        if entry.harness != REPO_HOLDER || entry.kind != kind || !entry.dest.starts_with(repo.root()) {
+            continue;
+        }
+        if fs::symlink_metadata(&entry.dest).is_ok() {
+            continue;
+        }
+        let held = match kind {
+            displaced::Kind::Rule => {
+                let Ok(file) = fs::File::open(&entry.path) else { continue };
+                instructions::read_explicit_id(file, &entry.path).ok().flatten()
+            }
+            _ => ItemId::read_skill(&entry.path).ok().flatten(),
+        };
+        if held.as_ref() == Some(id) {
+            return Ok(Some(entry.dest));
+        }
+    }
+    Ok(None)
 }
 
 fn recovery_target_changed(id: Option<&ItemId>) -> Error {
