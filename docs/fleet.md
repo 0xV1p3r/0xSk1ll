@@ -160,7 +160,7 @@ tail -n 50 ~/Library/Logs/sk1ll/daemon.log
 
 The LaunchAgent has its own `PATH`. When setup or the app creates the plist, it looks up `git` on its current `PATH` and prepends Git's directory if the agent's default list lacks it. To change the agent's search path, edit `EnvironmentVariables` → `PATH` in the plist. Run `launchctl bootout "gui/$(id -u)/app.v1p3r.sk1ll.daemon"` if the agent is loaded, then run the start commands above to load the change.
 
-While it runs, the daemon holds the repo's engine lock. CLI commands that change the repo go through the daemon, and the daemon refuses to start while another sk1ll process holds the lock. Running `sk1ll join` again after the machine was removed also goes through the daemon, which then restarts itself with the new credentials.
+While it runs, the daemon holds the repo's engine lock. CLI commands that change the repo go through the daemon, and the daemon refuses to start while another sk1ll process holds the lock. A slow or unreachable server holds up only the request waiting for it: the daemon fetches, pushes, clones and waits for the server to confirm an Assignment change without blocking its other work, so status, reads, syncs and local edits keep answering. Running `sk1ll join` again after the machine was removed also goes through the daemon, which then restarts itself with the new credentials.
 
 On Linux, the local API socket is `$XDG_RUNTIME_DIR/sk1ll/daemon.sock`, with a fallback to `~/.config/sk1ll/run/daemon.sock` when there is no runtime directory. On macOS it is `~/Library/Application Support/sk1ll/run/daemon.sock`. The socket has mode 0600 and its directory must belong to the user and have mode 0700. On macOS the socket path can be at most 103 bytes. If it is too long, set `SK1LL_DAEMON_SOCKET` to a shorter path in a private directory for the daemon and its clients.
 
@@ -168,7 +168,7 @@ The table lists Linux paths. On macOS, config and data use `~/Library/Applicatio
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SK1LL_DAEMON_STATE` | Platform config directory’s `sk1ll/daemon.json` | Machine id, server URL, token and repo path |
+| `SK1LL_DAEMON_STATE` | Platform config directory’s `sk1ll/daemon.json` | Machine id, server URL, token and repo path, and the server's last known baseline and whether the machine is Blocked on it |
 | `SK1LL_DAEMON_SOCKET` | `$XDG_RUNTIME_DIR/sk1ll/daemon.sock` | Local API socket |
 | `SK1LL_MACHINE_CONFIG` | `~/.config/sk1ll/machine.toml` | Harness configuration |
 | `SK1LL_ASSIGNMENT` | `~/.cache/sk1ll/assignment.json` | Local assignment in standalone; server mirror when joined |
@@ -194,7 +194,7 @@ The table lists Linux paths. On macOS, config and data use `~/Library/Applicatio
 | Drafting | The machine has a draft. |
 | In sync | Latest baseline, no draft, no conflicts. |
 
-To clear Blocked, commit or restore the clashing items, then run `sk1ll pull`. A Pull that stopped half-way (it crashed, or hit an error) is finished by the next Pull or by the daemon's next refresh, without fetching again.
+To clear Blocked, commit or restore the clashing items, then run `sk1ll pull`. The daemon remembers Blocked and the server's baseline across restarts (a standalone daemon, which has no `daemon.json`, keeps them in `standalone-state.json` in the same directory), so it reports them before it can reach the server again. A Pull that stopped half-way (it crashed, or hit an error) is finished by the next Pull or by the daemon's next refresh, without fetching again.
 
 Join codes expire after `SK1LL_SERVER_JOIN_CODE_TTL` (default `24h`), using the server duration syntax. `sk1ll fleet invite` and the GUI show the exact time.
 

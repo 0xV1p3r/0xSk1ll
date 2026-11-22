@@ -19,8 +19,8 @@
 //!
 //! Operations that only read (the draft, a diff, the skills browser, the
 //! conflicts, the inventory) run without the engine mutex
-//! ([`Daemon::reading`]), so the GUI keeps answering while a pull or a push
-//! waits for the server under it. They need the repo root, which is fixed
+//! ([`Daemon::reading`]), so the GUI keeps answering while a long engine
+//! operation (a sync of many skills) runs. They need the repo root, which is fixed
 //! for the process ([`Daemon::ident`]), and the applied assignment, which is
 //! published in [`Daemon::snapshot`]. A reader:
 //!
@@ -621,7 +621,7 @@ impl Daemon {
     /// (see the module docs for what a reader may do). If `f` fails while an
     /// engine operation is running, the repo may just have been in between
     /// two states: `f` is tried again a moment later, twice at most, so a
-    /// long operation (a hanging fetch) delays a real error only briefly.
+    /// long operation delays a real error only briefly.
     pub(crate) async fn reading<T, F>(self: &Arc<Self>, f: F) -> Result<T>
     where
         T: Send + 'static,
