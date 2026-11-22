@@ -544,8 +544,9 @@ pub(crate) async fn run(d: Arc<Daemon>) {
 /// materializes defaults nor prunes orphans by it, while metadata is
 /// unreadable, a pull is pending (the tree is partial), an item has no
 /// Item ID yet (a reconcile writes one; none is ever derived), or two items
-/// share one (until `repair-ids`).
-fn repo_inventory(root: &Path, harnesses: Vec<String>) -> sk1ll_proto::InventoryReport {
+/// share one (until `repair-ids`). A report with only those and `harnesses`
+/// filled in.
+fn repo_inventory(root: &Path, harnesses: Vec<String>) -> MachineReport {
     let inventory = sk1ll_core::item_id::working_inventory(root);
     let mut errors = inventory.errors;
     match Repo::open_git_only(root).and_then(|repo| repo.pull_pending()) {
@@ -571,7 +572,7 @@ fn repo_inventory(root: &Path, harnesses: Vec<String>) -> sk1ll_proto::Inventory
         }
     }
     let inventory_error = errors.first().map(|error| crate::auth::redact(error));
-    sk1ll_proto::InventoryReport {
+    MachineReport {
         items,
         inventory_complete: inventory_error.is_none(),
         inventory_error,
@@ -581,16 +582,11 @@ fn repo_inventory(root: &Path, harnesses: Vec<String>) -> sk1ll_proto::Inventory
 }
 
 pub(super) fn repo_report(root: &Path, harnesses: Vec<String>, drafts: Vec<ItemRef>) -> Result<MachineReport> {
-    let inventory = repo_inventory(root, harnesses);
     Ok(MachineReport {
         baseline: plumbing::baseline(root)?,
         drafts,
         unpushed: plumbing::unpushed_items(root)?,
-        harnesses: inventory.harnesses,
-        items: inventory.items,
-        inventory_complete: inventory.inventory_complete,
-        inventory_error: inventory.inventory_error,
-        ..Default::default()
+        ..repo_inventory(root, harnesses)
     })
 }
 

@@ -29,8 +29,7 @@ use futures_util::stream::SplitStream;
 use futures_util::{Sink, SinkExt, StreamExt};
 use serde_json::Value;
 use sk1ll_proto::{
-    AssignmentOutcome, AssignmentSnapshot, AssignmentWrite, DaemonMessage, InventoryReport, ItemRef, MachineReport,
-    Scope, ServerMessage,
+    AssignmentOutcome, AssignmentSnapshot, AssignmentWrite, DaemonMessage, ItemRef, MachineReport, Scope, ServerMessage,
 };
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -215,21 +214,10 @@ async fn read_loop(
                             tracing::warn!("{machine}: ignoring status {seq} after status {stored}");
                             continue;
                         }
-                        match on_report(server, machine, id, token_hash, Report::Status(report), cancel).await {
+                        match on_report(server, machine, id, token_hash, report, cancel).await {
                             Ok(true) => stored = seq,
                             Ok(false) => {}
                             Err(e) => return tracing::error!("{machine}: storing status: {e}; closing"),
-                        }
-                    }
-                    Ok(DaemonMessage::Inventory(report)) => {
-                        let seq = report.seq;
-                        if seq <= stored {
-                            continue;
-                        }
-                        match on_report(server, machine, id, token_hash, Report::Inventory(report), cancel).await {
-                            Ok(true) => stored = seq,
-                            Ok(false) => {}
-                            Err(e) => return tracing::error!("{machine}: storing inventory: {e}; closing"),
                         }
                     }
                     Ok(DaemonMessage::SetAssignment { req, write }) => {
@@ -325,7 +313,6 @@ fn text(msg: &ServerMessage) -> Message {
 fn parse(mut v: Value) -> std::result::Result<DaemonMessage, String> {
     let fields: &[&str] = match v.get("type").and_then(Value::as_str) {
         Some("status") => &["drafts", "unpushed", "clashes", "conflicts", "items"],
-        Some("inventory") => &["items"],
         _ => &[],
     };
     for &field in fields {
@@ -351,11 +338,6 @@ fn parse(mut v: Value) -> std::result::Result<DaemonMessage, String> {
     serde_json::from_value(v).map_err(|e| e.to_string())
 }
 
-enum Report {
-    Status(MachineReport),
-    Inventory(InventoryReport),
-}
-
 /// Stores the report if the session is still current and its token still
 /// valid (`false` if not); adds harnesses the machine has no assignment for
 /// (all off).
@@ -364,7 +346,7 @@ async fn on_report(
     machine: &str,
     id: u64,
     token_hash: &str,
-    report: Report,
+    report: MachineReport,
     cancel: &CancellationToken,
 ) -> Result<bool> {
     if cancel.is_cancelled() {
@@ -382,21 +364,8 @@ async fn on_report(
             }
             let tx = conn.transaction()?;
             let Some(record) = db::machine(&tx, &m)? else { return Ok(None) };
-            let (report, harnesses) = match report {
-                Report::Status(report) => {
-                    let harnesses = report.harnesses.clone();
-                    (report, harnesses)
-                }
-                Report::Inventory(update) => {
-                    let mut report = record.report.unwrap_or_default();
-                    report.items = update.items;
-                    report.inventory_complete = update.inventory_complete;
-                    report.inventory_error = update.inventory_error;
-                    (report, update.harnesses)
-                }
-            };
             db::save_report(&tx, &m, &report, now)?;
-            let added = assign::new_harness_changes(&record.assignment, &harnesses);
+            let added = assign::new_harness_changes(&record.assignment, &report.harnesses);
             let mut latest = None;
             if !added.is_empty() {
                 latest = Some(assign::apply(&tx, &m, assign::SERVER_AUTHOR, added, now, &[], false)?.snapshot());

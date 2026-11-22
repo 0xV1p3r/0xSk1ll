@@ -122,6 +122,8 @@ break compatibility.
 
 - The pull's filter-driver conversion cache (`.git/sk1ll-pull-filtered/`)
   and its retries.
+- The `inventory` WebSocket frame, which nothing sent since every command
+  runs through an engine that reports full status.
 - Push-time toggle sweeping and the Restore notification outbox.
 - Assignment copying during item rename and its offline override.
 - Compatibility fallbacks for older Assignment and join-code formats.

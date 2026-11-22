@@ -53,8 +53,6 @@ pub enum DaemonMessage {
     Hello { machine_id: String },
     /// The machine's current state; send on connect and whenever it changes.
     Status(MachineReport),
-    /// A short-lived CLI session updates Item IDs without replacing fleet status.
-    Inventory(InventoryReport),
     /// A change to this machine's own assignment. Answered with
     /// [`ServerMessage::AssignmentResult`] carrying the same `req`.
     SetAssignment { req: u64, write: AssignmentWrite },
@@ -171,16 +169,6 @@ pub struct MachineReport {
     /// The daemon knows it hasn't applied the latest baseline yet.
     #[serde(default)]
     pub behind: bool,
-}
-
-/// Inventory data a short-lived session can update without a full refresh.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InventoryReport {
-    pub seq: u64,
-    pub items: Vec<ReportedItem>,
-    pub inventory_complete: bool,
-    pub inventory_error: Option<String>,
-    pub harnesses: Vec<String>,
 }
 
 /// A skill or rule's name and Item ID.
