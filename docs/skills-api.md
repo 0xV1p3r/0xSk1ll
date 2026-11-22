@@ -26,7 +26,7 @@ These endpoints use the Daemon's local Unix socket. Shared Rust types are in
 `type` is `personal`, `import`, `rule`, or `unmanaged`. `item` is
 `skill:<name>` or `rule:<name>`, and is null for unmanaged Skills. The Item ID
 field `id` is omitted for unmanaged Skills. It is null for an item that has no
-Item ID yet; the next refresh writes one, and until then the item follows the
+Item ID yet; the next reconcile writes one, and until then the item follows the
 Harness defaults.
 `description` is a string or null. `draft` is `added`, `modified`, `deleted`,
 or null. `in_baseline` refers to the applied fleet Baseline, so an unpushed
@@ -140,7 +140,7 @@ existing UTF-8 text file of at most 1 MiB in a Personal Skill or Rule. Rule
 frontmatter must parse. Fork an Import or Adopt an Unmanaged skill before
 editing. The Daemon refuses symlink traversal on writes.
 
-A successful save returns `204 No Content` and refreshes the Draft and
+A successful save returns `204 No Content` and reconciles the Draft and
 Harnesses. A stale fingerprint returns `409 Conflict`. To replace the new
 disk contents, read the file again and use its new fingerprint. See
 [Known limitations](known-limitations.md#a-concurrent-save-in-the-library-editor)
@@ -177,6 +177,10 @@ follow their new-Skills defaults. Success is returned after these steps finish.
 There is no offline adoption queue or background adoption replay.
 
 Refresh on the existing `draft`, `status` and `fleet` SSE events at `GET /events`.
+`GET /draft`, `/items`, `/conflicts` and `/conflicts/displaced` answer from
+the Daemon's last reconcile, brought up to date first unless an engine
+operation is running; then they answer at once with the previous state, and
+the `draft` or `status` event follows the reconcile that catches up.
 Adopt emits `draft` after creating the Draft and after finishing replacement.
 
 `POST /imports/fork` already takes:

@@ -91,7 +91,7 @@ repaired items.
 
 Pull requires Git 2.40 or later, and 2.42 when the new Baseline changes a `.gitattributes` file. It updates only the working-tree paths the new Baseline changes, one at a time, and leaves the Draft where it is. Replayed commits get this Machine as their committer and lose their signatures. Pull drops commits that become empty and keeps commits that started empty. Pull refuses unpushed merge commits, submodules and sparse checkouts. File changes need atomic filesystem operations on Linux or macOS. Pull checks for support before it starts changing files.
 
-If Pull stops partway through, the next `sk1ll pull` or Daemon refresh resumes it. Edits to paths it already updated stay as Draft on the new Baseline. While Pull is pending, `git status` shows the partially updated tree, and `sk1ll commit`, `sk1ll sync`, `sk1ll push` and `sk1ll repair-ids` refuse to run. A harness change is saved but syncs once the Pull finishes. Copy aside any edit blocking a pending Pull before restoring the item. Pull recovery entries stay until you adopt or discard them.
+If Pull stops partway through, the next `sk1ll pull` or Daemon reconcile resumes it. Edits to paths it already updated stay as Draft on the new Baseline. While Pull is pending, `git status` shows the partially updated tree, and `sk1ll commit`, `sk1ll sync`, `sk1ll push` and `sk1ll repair-ids` refuse to run. A harness change is saved but syncs once the Pull finishes. Copy aside any edit blocking a pending Pull before restoring the item. Pull recovery entries stay until you adopt or discard them.
 
 ## Commands
 
