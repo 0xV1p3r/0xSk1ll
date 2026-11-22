@@ -36,7 +36,10 @@ the result against the state as it is now:
   still has the Item ID it gave it.
 - A rejoin registers unlocked, then stores the new registration only if the
   old one is still replaceable (removed, or its token still refused); else
-  it asks the server to remove the new one again. Assignment snapshots are
+  it asks the server to remove the new one again. That check, storing the
+  credentials and the halt are one critical section of the lifecycle, so the
+  session can't connect the old registration in between; a connection after
+  the halt is ignored. Assignment snapshots are
   tagged with their registration and written before the credentials, so a
   stop in between never pairs new credentials with old toggles.
 - git's clone, fetch and push run unlocked, one at a time. A pull fetches,
@@ -62,8 +65,10 @@ stands against the server's Baseline (Blocked, a pull pending, the Baseline
 last known) are one value with explicit transitions. The status the daemon
 publishes derives from it. The state file keeps its Blocked state and
 Baseline, so a restarted daemon starts Blocked and Behind before it can pull.
-A remembered pending pull whose journal is gone finished before the process
-could record it: it is Clear once `HEAD` contains the server's Baseline. A
+A pending pull is remembered with the Baseline its journal moves onto. One
+whose journal is gone finished before the process could record it: it is
+Clear once `HEAD` contains that Baseline, whatever was fetched since, which
+the next pull takes up. A
 standalone daemon's record names its repo and is dropped for any other.
 
 ## One reconcile over fingerprinted Inputs
@@ -108,10 +113,13 @@ on the next wake: it plans and applies whatever the fingerprint says and
 empties the hash cache first, so every tree is read again. A change only that
 pass sees is reconciled within the interval plus one periodic tick.
 
-A standalone daemon whose repo disappears (moved or removed) publishes a
-Snapshot without it: every reader of the Draft, the inventory, the conflicts
-and the recovery area gets the same "no skills repo" error as any other request
-about the repo, and the report is emptied.
+A standalone daemon whose repo disappears (moved or removed, or a `.git`
+pointer file whose git directory is gone) publishes a Snapshot without it:
+every reader of the Draft, the inventory, the conflicts and the recovery area
+gets the same "no skills repo" error as any other request about the repo, and
+the report is emptied. Any reconcile that fails because the repo can't be
+opened does the same, with the error that stopped it, rather than leave the
+last Snapshot standing.
 
 Planning takes the hashes of skill trees (repo sources, Harness placements) from
 a cache keyed by that same metadata, with the same two-second rule. The cache
