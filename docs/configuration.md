@@ -98,6 +98,7 @@ Change harnesses at any time in Settings, or with `sk1ll harnesses`:
 ```sh
 sk1ll harnesses --all                             # also turned-off harnesses and available presets
 sk1ll harnesses disable gemini                    # stop syncing into it
+sk1ll harnesses disable gemini --take-out         # take out what sk1ll placed there first, then stop
 sk1ll harnesses enable gemini                     # sync into it again
 sk1ll harnesses add agents --skills ~/.agents/skills --mode copy
 sk1ll harnesses add codex --instructions ''       # adjust a preset; options left out keep their value
@@ -107,20 +108,18 @@ sk1ll harnesses rename agents team-agents         # rename a custom harness and 
 
 Each change edits `machine.toml` in place, so comments and layout survive. Setting a value back to the preset's removes the override; a harness that was synced into stays on (with `enabled = true` if nothing else would keep it). Before writing, sk1ll shows two lists:
 
-- **Already placed.** What sync put where the change stops syncing: a turned-off or removed harness, or a path the harness no longer uses. A change never removes anything: these items stay where they are, and sk1ll stops managing them. Copies edited by hand are marked.
+- **Already placed.** What sync put where the change stops syncing: a turned-off or removed harness, or a path the harness no longer uses. A change on its own never removes anything: these items stay where they are, and sk1ll stops managing them. Copies edited by hand are marked.
 - **Then sync.** What the changed harness receives next.
 
-To take placed content out, turn the harness's items off before the change, so the normal sync removes them with all its checks (each removal goes through the recovery area, and a hand-edited copy stays):
+To take placed content out, add `--take-out` to `disable` or `remove`. The preview lists what is taken out, and the confirmation and `--yes` work as for any change. sk1ll then turns the harness's items off (every skill and rule, and both defaults, as `sk1ll assign <harness> --all off` does), and the sync that follows removes what it placed with all its checks: each removal goes through the recovery area, and a hand-edited copy stays. Only if nothing managed is left in the harness does it change `machine.toml`, after checking that it hasn't changed since the preview. Otherwise it reports what failed and what is still placed and leaves `machine.toml` as it is. The items stay off, so running the same command again finishes the job.
 
 ```sh
-sk1ll assign kiro --all off     # every skill and rule, and both defaults
-sk1ll sync                      # not needed when the daemon runs
-sk1ll harnesses disable kiro    # nothing is left behind now
+sk1ll harnesses disable kiro --take-out   # nothing is left behind
 ```
 
 Harness-wide changes set both defaults and every stored toggle. Items without a toggle inherit the resulting default.
 
-In Settings, **Turn off this Harness's items first** in the preview does the same in the Assignment and waits for local sync before previewing again. A joined machine writes to the Server first.
+In Settings, the preview of a disable or remove that would leave content behind offers **Take out and turn off** (or **Take out and remove**), which does the same, and **Leave in place**. A joined machine writes the Assignment to the Server first.
 
 The change is then applied and the harnesses synced. It goes through the daemon when one manages the repo, else through the engine the command runs. The CLI asks for confirmation on a terminal. Pass `--yes` in scripts. Turning a Harness back on restores its toggles. Renaming a Harness moves both defaults and its toggles to the new name. Renaming a preset disables the original preset and gives the new custom Harness the same paths and settings. A joined machine reports its new set of harnesses to the server with its next status.
 
@@ -161,6 +160,8 @@ Harnesses don't share one global `AGENTS.md`, so each harness sets an `instructi
 | `rules` | One copied file per rule, listed in a hidden `.sk1ll-state/index.json` index | `~/.claude/rules/`, which Claude Code loads for every project |
 
 The `rules` format keeps each Rule's frontmatter except for `id:` and `harnesses:`, so Claude's `paths:` key still scopes a rule to matching files. It copies instead of symlinking because Claude Code skips symlinked rule files in some sessions (Cowork). Sync never touches rule files you wrote yourself and reports a name clash as a conflict.
+
+With every rule turned off for a `block` harness, sync takes its block out. If sync created the file and it still holds exactly what sync last wrote, so nothing but whitespace is left, sync removes the file too, into the recovery area like every other removal. A file that was there before sync first wrote to it, or that anyone else has written to since, is never removed: sync only takes its block out.
 
 `sk1ll render <harness>` prints what a harness would receive.
 

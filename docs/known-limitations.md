@@ -163,6 +163,67 @@ loss is unsupported. Keep external Git commands that switch branches or
 write the index out of the repo during Pull. Pull checks the branch again
 before writing the index, and another Git command can still race that check.
 
+## An interrupted keep mine
+
+`sk1ll pull --keep` moves each kept file into recovery, one path at a time,
+before its pull, and only the run itself puts them back: after its pull went
+through, or, when the pull stays Blocked on an item it wasn't told to keep,
+where they were. It puts them back one by one too. A run that stops part-way,
+because the process exits or an error comes once a file has moved, puts
+nothing more back, and nothing resumes it. An automatic resume would have to
+tell what the run left at each path from what you did since, which it can't
+always do: a vacant path is either a file the run hadn't put back yet or one
+you deleted.
+
+So what is where after a stop depends on how far the run got. A file it had
+not moved yet is where it was, in your Draft. A file it moved is in recovery,
+and its path holds the Baseline's version, or nothing. A file it had already
+put back, when it stopped while settling, is back in your Draft. The next
+pull or daemon reconcile finishes the pull side as any pull does, clears the
+run's staging, and saves a report of each version still in recovery, with
+its `sk1ll recover adopt <id>`. `sk1ll status`, every `sk1ll pull` and the
+app's Draft screen show that report until you have adopted or discarded each
+version in it. Its notes (staging left as it is, a deletion of yours) have
+nothing to adopt: they stay until you dismiss them with `sk1ll recover
+dismiss-notes` or **Dismiss notes** in the app. An index entry the pull's un-commit staged at a kept path is
+reset to `HEAD`'s only where the journal names it as the run's own and it is
+still exactly that. Any other staging at a kept path is left as it is, and
+the report says so.
+
+## An index change while keep mine resets a kept path
+
+Keep mine checks a kept path's staging to tell yours from what the pull's
+un-commit staged, and later resets that path's index entry to `HEAD`'s. In
+between, as separate commands, it journals the path, moves its file into
+recovery and saves the journal. A `git add` (or another command that changes
+the index) that lands on that path anywhere from the staging check through
+the reset is undone by the reset; no duration is promised for that window,
+though it covers only those few steps for one path. What was staged is not lost: the
+staged content is in the object store until it is garbage-collected (`git
+fsck --lost-found` finds it), and the kept file itself is in recovery. Stage
+it again after the keep is done.
+
+## A deletion during keep mine's settlement
+
+When the run puts a kept file back, it first checks that the path is not
+vacant while the new Baseline has a file there (that would be a deletion of
+yours, made while the keep ran). A deletion that lands between that check
+and the publish, a few milliseconds, can be undone: the kept copy is put
+back where you just deleted the Baseline's file. Nothing of yours is lost,
+since the file put back is your kept version. Delete it again if you meant
+to, or restore the item with `sk1ll restore <item>`.
+
+## Staging the same content keep mine staged
+
+The pull's un-commit records the exact index entry it leaves at each path of
+the commits it turns back into Draft, and keep mine treats a staged path as
+its own only while the entry is still exactly that. If you stage content
+identical to that entry (same mode and blob) yourself, keep mine can't tell
+your staging from its own, and may reset it. The content is not lost: it is
+in the commit the un-commit turned back into Draft (in the reflog), and keep
+mine keeps the file itself in recovery. Stage it again after the keep is
+done.
+
 ## Filter drivers in the skills repo
 
 The skills repo doesn't support git filter drivers (Git LFS and the like):
