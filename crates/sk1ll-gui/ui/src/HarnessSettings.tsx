@@ -12,7 +12,7 @@ import { toast } from './toast';
 import { api, errorStatus } from './api';
 import { useMutation, useResource } from './hooks';
 import { ErrorNotice, Loading, Pending } from './shared';
-import type { HarnessChange, HarnessChoice, HarnessView, PlacementView } from './types';
+import type { HarnessChange, HarnessChoice, HarnessTakenOut, HarnessView, PlacementView } from './types';
 
 type HarnessPaths = HarnessView['harness'];
 
@@ -110,65 +110,76 @@ const changeTitle = (change: HarnessChange) => ({
   enable: `Turn on ${change.name}?`, disable: `Turn off ${change.name}?`, set: `Save ${change.name}?`, remove: `Remove ${change.name} from machine.toml?`,
 })[change.op];
 
-// The confirmation step: what sk1ll placed where the change stops syncing (it stays), and what sync does next.
+// The confirmation step: what sk1ll placed where the change stops syncing, and what sync does next. A disable or
+// remove can take that content out first (Take out), or leave it in place, unmanaged.
 export function ChangeDialog({ change, onClose, onApplied }: { change: HarnessChange; onClose: () => void; onApplied: () => void }) {
   const load = useCallback(() => api.previewHarness({ change }), [change]);
   const preview = useResource(load, 0);
   const [failed, setFailed] = useState<string[]>();
+  const [notTakenOut, setNotTakenOut] = useState<HarnessTakenOut>();
   const apply = useMutation();
+  const takeOut = useMutation();
   const refreshPreview = () => {
     preview.setData(undefined);
     return preview.refresh();
   };
-  const turnOff = useMutation(() => void refreshPreview());
   const managed = preview.data?.placed.filter(p => p.kind === 'remove').length ?? 0;
   const edited = preview.data?.placed.filter(p => p.kind === 'conflict').length ?? 0;
-  const busy = apply.pending || turnOff.pending;
+  const offersTakeOut = (change.op === 'disable' || change.op === 'remove') && managed > 0 && !!preview.data?.before;
+  const busy = apply.pending || takeOut.pending;
+  const verb = change.op === 'remove' ? 'remove' : 'turn off';
+  const ready = !!preview.data?.fingerprint && !preview.error && !preview.loading && !busy;
+  const conflictAware = async <T,>(run: () => Promise<T>) => {
+    try {
+      return await run();
+    } catch (error) {
+      if (errorStatus(error) === 409) preview.setData(undefined);
+      throw error;
+    }
+  };
+  const applyChange = () => void apply.run(() => conflictAware(() => api.applyHarness({ change, fingerprint: preview.data?.fingerprint })), result => {
+    if (result.errors.length) return setFailed(result.errors);
+    toast({ title: 'Harness changed', description: 'The Harnesses are synced.' });
+    onApplied();
+  });
+  const takeOutAndApply = () => void takeOut.run(() => conflictAware(() => api.takeOutHarness({ change, fingerprint: preview.data?.fingerprint })), result => {
+    if (!result.applied) return setNotTakenOut(result);
+    setNotTakenOut(undefined);
+    if (result.errors.length) return setFailed(result.errors);
+    toast({ title: change.op === 'remove' ? `Removed ${change.name}` : `Turned off ${change.name}`, description: `Took out ${result.taken_out.length} placed ${result.taken_out.length === 1 ? 'item' : 'items'}.` });
+    onApplied();
+  });
   return <Dialog open onOpenChange={next => { if (!next && !busy) onClose(); }}>
     <DialogContent showCloseButton={!busy} className="sm:max-w-2xl"><DialogHeader><DialogTitle>{changeTitle(change)}</DialogTitle>
-      <DialogDescription>{preview.data ? <>Changes <code className="font-mono text-xs break-all">{preview.data.path}</code>, then syncs. It never removes anything.</> : 'Checking what this change does…'}</DialogDescription></DialogHeader>
+      <DialogDescription>{preview.data ? <>Changes <code className="font-mono text-xs break-all">{preview.data.path}</code>, then syncs.{offersTakeOut ? ' Take out removes what sk1ll placed here first; Leave in place keeps it, unmanaged.' : ' It never removes anything.'}</> : 'Checking what this change does…'}</DialogDescription></DialogHeader>
       <ErrorNotice error={preview.error} title="This change can't be made" />
       {preview.loading && !preview.data && <Loading rows={2} />}
       {preview.data && <div className="flex max-h-[50vh] flex-col gap-4 overflow-y-auto">
         <section aria-label="Already placed"><h3 className="text-sm font-medium">Already placed by sk1ll</h3>
           {preview.data.warnings?.map(warning => <p key={warning} role="status" className="text-sm text-muted-foreground">{warning}</p>)}
           {preview.data.placed.length === 0 ? !preview.data.warnings?.length && <p className="text-sm text-muted-foreground">{preview.data.before ? 'Nothing that sk1ll placed is left behind by this change.' : 'Nothing: sk1ll does not sync into this Harness yet.'}</p> : <>
-            <p className="text-sm text-muted-foreground">These stay where they are, no longer managed by sk1ll.{edited > 0 && ` ${edited} edited by hand.`}</p>
-            <Placements rows={preview.data.placed} placed />
-            {managed > 0 && preview.data.before && <div className="mt-2 flex flex-col items-start gap-1">
-              <Button variant="outline" size="sm" disabled={busy} onClick={() => void turnOff.run(async () => {
-                const result = await api.setHarnessAssignment(change.name, false);
-                if (result.errors?.length) {
-                  throw new Error(`Assignment saved, but sync failed: ${result.errors.join('\n')}`);
-                }
-                toast({ title: `Turned off ${change.name}'s items`, description: 'Sync removes what it placed there; copies edited by hand stay.' });
-              })}><Pending pending={turnOff.pending}>Turn off this Harness's items first</Pending></Button>
-              <p className="text-xs text-muted-foreground">Sets every Skill and Rule off for {change.name} in the Assignment, so sync takes out what it placed. Then preview again.</p></div>}</>}
-          <ErrorNotice error={turnOff.error} />
+            <p className="text-sm text-muted-foreground">{offersTakeOut
+              ? `Take out turns ${change.name}'s items off in the Assignment, so sync removes what it placed (into Recovery, as any removal), and only then ${change.op === 'remove' ? 'removes' : 'turns off'} the Harness.${edited > 0 ? ` ${edited} edited by hand ${edited === 1 ? 'stays' : 'stay'} either way.` : ''}`
+              : `These stay where they are, no longer managed by sk1ll.${edited > 0 ? ` ${edited} edited by hand.` : ''}`}</p>
+            <Placements rows={preview.data.placed} placed /></>}
         </section>
         <section aria-label="Then sync"><h3 className="text-sm font-medium">Then sync</h3>
           {preview.data.awaiting_assignment ? <p className="text-sm text-muted-foreground">No Assignment yet: the Harness is left alone until the Server sends one.</p>
             : preview.data.sync.length === 0 ? <p className="text-sm text-muted-foreground">{preview.data.after ? 'Nothing to place: the Harness already matches.' : 'Nothing: the Harness is no longer synced.'}</p>
             : <Placements rows={preview.data.sync} />}
         </section></div>}
-      <ErrorNotice error={apply.error} />
+      <ErrorNotice error={apply.error} /><ErrorNotice error={takeOut.error} />
+      {notTakenOut && <section aria-label="Not taken out" className="text-sm"><p className="font-medium">machine.toml was not changed{notTakenOut.left?.length ? `: ${notTakenOut.left.length} placed ${notTakenOut.left.length === 1 ? 'item is' : 'items are'} still there` : ''}. {change.name}'s items stay off in the Assignment; fix what failed, then Take out again.</p>
+        <ul className="mt-1 list-disc pl-5 text-destructive">{[...notTakenOut.errors, ...(notTakenOut.left ?? []).map(p => `Still placed: ${p.dest}`)].map(e => <li key={e} className="break-all">{e}</li>)}</ul></section>}
       {failed && <section aria-label="What failed" className="text-sm"><p className="font-medium">machine.toml was changed, but not everything went through:</p>
         <ul className="mt-1 list-disc pl-5 text-destructive">{failed.map(e => <li key={e} className="break-all">{e}</li>)}</ul></section>}
       <DialogFooter>{failed ? <Button onClick={onApplied}>Done</Button> : <>
         <Button variant="outline" disabled={busy} onClick={onClose}>Cancel</Button>
-        {(apply.error || preview.error) && !preview.loading && !busy && <Button variant="outline" onClick={() => void refreshPreview()}>Preview again</Button>}
-        <Button disabled={!preview.data?.fingerprint || !!preview.error || preview.loading || busy} onClick={() => void apply.run(async () => {
-          try {
-            return await api.applyHarness({ change, fingerprint: preview.data?.fingerprint });
-          } catch (error) {
-            if (errorStatus(error) === 409) preview.setData(undefined);
-            throw error;
-          }
-        }, result => {
-          if (result.errors.length) return setFailed(result.errors);
-          toast({ title: 'Harness changed', description: 'The Harnesses are synced.' });
-          onApplied();
-        })}><Pending pending={apply.pending}>Apply</Pending></Button></>}</DialogFooter>
+        {(apply.error || takeOut.error || preview.error) && !preview.loading && !busy && <Button variant="outline" onClick={() => void refreshPreview()}>Preview again</Button>}
+        {offersTakeOut ? <>
+          <Button variant="outline" disabled={!ready} onClick={applyChange}><Pending pending={apply.pending}>Leave in place and {verb}</Pending></Button>
+          <Button disabled={!ready} onClick={takeOutAndApply}><Pending pending={takeOut.pending}>Take out and {verb}</Pending></Button></>
+          : <Button disabled={!ready} onClick={applyChange}><Pending pending={apply.pending}>Apply</Pending></Button>}</>}</DialogFooter>
     </DialogContent></Dialog>;
 }
 

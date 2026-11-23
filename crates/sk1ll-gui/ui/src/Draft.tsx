@@ -13,7 +13,7 @@ import { api } from './api';
 import { useMutation, useResource } from './hooks';
 import { Action, ChangeBadge, DiffLines, ErrorNotice, KindBadge, Loading, Nothing, Notice, Panel, PanelToolbar, Pending } from './shared';
 import { captureReview, confirmReview, loadDraft, reconcileReview, type DraftReview } from './draftReview';
-import type { DraftEntry, CommitResponse, PullResult, StatusView } from './types';
+import type { DraftEntry, CommitResponse, PullKeepResult, PullResult, StatusView } from './types';
 
 function Diff({ item, diff }: { item: string; diff: string }) {
   return <pre tabIndex={0} className="diff mt-2 min-w-0 max-w-full max-h-[32rem] overflow-auto rounded-md border bg-muted/40 p-3 font-mono text-xs leading-relaxed outline-none [tab-size:4] focus-visible:ring-3 focus-visible:ring-ring"
@@ -64,6 +64,9 @@ export function Draft({ revision, status, changed }: { revision: number; status:
   const [result, setResult] = useState<CommitResponse>();
   const [resultHidden, setResultHidden] = useState(false);
   const [pull, setPull] = useState<PullResult>();
+  const [keep, setKeep] = useState<{ items: string[]; all: boolean }>();
+  const [kept, setKept] = useState<PullKeepResult>();
+  const keepTrigger = useRef<HTMLButtonElement>(null);
   const mutation = useMutation(changed);
   const prefill = useMutation();
   const push = useMutation(changed);
@@ -80,13 +83,29 @@ export function Draft({ revision, status, changed }: { revision: number; status:
   const items = (selectionTouched.current ? selected : data?.map(entry => entry.item) ?? []).filter(item => data?.some(d => d.item === item));
   const all = !!data?.length && items.length === data.length;
   const blocked = status.report.blocked || status.report.clashes.length > 0 || pull?.state === 'blocked';
+  const clashes = pull?.state === 'blocked' ? pull.items : status.report.clashes;
+  const keepNames = keep?.all ? clashes.join(', ') : keep?.items.join(', ');
   const allExpanded = !!data?.length && data.every(entry => expanded.includes(entry.item));
-  const pullAction = noOrigin ? <Button variant="outline" disabled>Pull</Button> : <Action label="Pull Baseline" action={async () => { const value = await api.pull(); setPull(value); toast({ title: value.state === 'blocked' ? 'Pull blocked' : 'Pull complete' }); }} onDone={changed} />;
+  const pullAction = noOrigin ? <Button variant="outline" disabled>Pull</Button> : <Action label="Pull Baseline" action={async () => { const value = await api.pull(); setPull(value); setKept(undefined); toast({ title: value.state === 'blocked' ? 'Pull blocked' : 'Pull complete' }); }} onDone={changed} />;
   const unpushed = [...new Set([...status.report.unpushed, ...(!result?.pushed ? result?.items ?? [] : [])])];
   return <>
+    {!!status.keep_report?.length && <Notice title="Interrupted Keep mine" tone="destructive">
+      An interrupted Keep mine left your versions in Recovery. Adopt each one you want back in Conflicts → Recovered content, or run the command shown.
+      <ul className="flex flex-col gap-1" aria-label="Kept versions in recovery">{status.keep_report.map(u => <li key={`${u.item}:${u.entry ?? u.error}`} className="text-xs">
+        <span className="font-mono">{u.item}</span>: {u.error}{u.entry && <> <code className="font-mono">sk1ll recover adopt {u.entry}</code></>}</li>)}</ul>
+      {status.keep_report.some(u => !u.entry) && <div><Action label="Dismiss notes" action={api.dismissKeepNotes} onDone={changed} /></div>}</Notice>}
     {blocked && <Notice title="Blocked" tone="destructive">
-      The new Baseline also changes these items. Restore them (your version is kept in Recovery), Pull, then adopt your version back from Recovery as Draft.
-      <p className="text-xs">{(pull?.state === 'blocked' ? pull.items : status.report.clashes).join(', ')}</p>{pullAction}</Notice>}
+      The new Baseline also changes these items, which this Machine changed too. <strong>Keep mine</strong> pulls the new Baseline and puts your version back on top as Draft: the whole file wins, so the other Machine's change to it is overwritten. <strong>Restore</strong> takes the Baseline's version instead (yours is kept in Recovery), then Pull.
+      <ul className="flex flex-col gap-1" aria-label="Clashing items">{clashes.map(item => <li key={item} className="flex flex-wrap items-center gap-2">
+        <span className="min-w-0 flex-1 truncate font-mono text-xs">{item}</span>
+        <Button size="sm" variant="outline" disabled={noOrigin || mutation.pending} aria-label={`Keep mine: ${item}`} onClick={event => { keepTrigger.current = event.currentTarget; setKeep({ items: [item], all: false }); }}>Keep mine</Button>
+        <Button size="sm" variant="outline" className="enabled:text-destructive-foreground" aria-label={`Restore ${item}`} disabled={!data?.some(entry => entry.item === item) || reviewDisabled}
+          onClick={event => { if (data) { restoreTrigger.current = event.currentTarget; setRestore({ review: captureReview(data, [item]), all: false }); } }}>Restore</Button>
+      </li>)}</ul>
+      <div className="flex flex-wrap gap-2">{clashes.length > 1 && <Button size="sm" disabled={noOrigin || mutation.pending} onClick={event => { keepTrigger.current = event.currentTarget; setKeep({ items: [], all: true }); }}>Keep mine for all</Button>}{pullAction}</div></Notice>}
+    {kept && !!kept.kept?.length && <Notice title="Kept your version">
+      Your version of {kept.kept.join(', ')} is back on top of {kept.pull.state === 'updated' ? `Baseline ${kept.pull.to}` : 'the new Baseline'} as Draft, replacing the other Machine's change. Review its diff below (or run <code className="font-mono text-xs">sk1ll diff {kept.kept.join(' ')}</code>), then Commit.
+      <div><Button variant="ghost" onClick={() => setKept(undefined)}>Dismiss</Button></div></Notice>}
     <Panel label="Draft"><PanelToolbar>
       {standalone && <><Button variant="outline" disabled={noOrigin || push.pending} onClick={pushNow}>Push</Button>{pullAction}{noOrigin && <span className="text-xs text-muted-foreground">Push and Pull require an origin git remote.</span>}</>}
       {data?.length !== 0 && <><Button ref={commitTrigger} disabled={!items.length || prefill.pending || reviewDisabled}
@@ -105,7 +124,7 @@ export function Draft({ revision, status, changed }: { revision: number; status:
     </PanelToolbar><ErrorNotice error={error} /><ErrorNotice error={prefill.error} />
     <ErrorNotice error={push.error} />
     {unpushed.length > 0 && <div ref={result && !result.pushed ? completion : undefined} tabIndex={-1} className="px-3.5 pt-3 outline-none"><Alert role="status" className="border-info/30 bg-brand-soft px-3 py-2.5"><ArrowUpFromLine /><AlertTitle>{unpushed.length} unpushed {unpushed.length === 1 ? 'item' : 'items'}</AlertTitle><AlertDescription className="flex flex-wrap items-center gap-x-3 gap-y-2"><div className="min-w-0 flex-1"><ul className="mt-1 flex flex-wrap gap-1" aria-label="Unpushed items">{unpushed.map(item => <li className="max-w-full truncate rounded border bg-background/40 px-1.5 py-0.5 font-mono text-xs text-foreground/85" key={item} title={item}>{item.replace(/^(skill|rule|other):/, '')}</li>)}</ul>{result && !result.pushed && !resultHidden && <><p>Commit complete: <code className="font-mono text-xs">{result.sha}</code></p>{result.push_error && <p>{result.push_error}</p>}<Button variant="ghost" onClick={() => setResultHidden(true)}>Dismiss commit result</Button></>}</div><Button size="sm" disabled={noOrigin || push.pending} onClick={pushNow}>Push now</Button></AlertDescription></Alert></div>}
-    {pull && pull.state !== 'blocked' && <Notice title="Pull complete">{pull.state === 'updated' ? `Baseline ${pull.to}` : 'Already on the latest Baseline.'}</Notice>}
+    {pull && pull.state !== 'blocked' && !kept?.kept?.length && <Notice title="Pull complete">{pull.state === 'updated' ? `Baseline ${pull.to}` : 'Already on the latest Baseline.'}</Notice>}
     {result?.pushed && !resultHidden && <div ref={completion} tabIndex={-1} className="outline-none"><Notice title="Commit complete"><code className="font-mono text-xs">{result.sha}</code><p>{standalone ? 'Pushed to origin.' : 'Pushed to the Server.'}</p><Button variant="ghost" onClick={() => setResultHidden(true)}>Dismiss</Button></Notice></div>}
     {loading && !data && <Loading />}{data?.length === 0 && <Nothing title="Draft is clean">This Machine has no Draft changes.</Nothing>}
     {!!data?.length && <FieldSet className="min-w-0 w-full max-w-full gap-0"><FieldLegend className="sr-only">Draft items</FieldLegend>
@@ -140,6 +159,22 @@ export function Draft({ revision, status, changed }: { revision: number; status:
             });
           }}><Pending pending={mutation.pending}>Commit</Pending></Button>
         </DialogFooter></DialogContent></Dialog>
+    <Dialog open={!!keep} onOpenChange={open => { if (!open && !mutation.pending) setKeep(undefined); }}>
+      <DialogContent finalFocus={keepTrigger} showCloseButton={!mutation.pending}><DialogHeader>
+        <DialogTitle>Keep your version of {keep?.all ? 'every clashing item' : keepNames}?</DialogTitle>
+        <DialogDescription>Pull the new Baseline, then put your version of {keepNames} back on top as a Draft change. The whole file wins: the other Machine's change to {keep?.all || (keep?.items.length ?? 0) > 1 ? 'these items' : 'this item'} is overwritten in your Draft. Review the diff (or <code className="font-mono text-xs">sk1ll diff</code>) before you Commit.</DialogDescription>
+      </DialogHeader>
+        <ErrorNotice error={mutation.error} /><DialogFooter>
+          <Button variant="outline" disabled={mutation.pending} onClick={() => setKeep(undefined)}>Cancel</Button>
+          <Button variant="destructive" disabled={mutation.pending} onClick={() => {
+            if (keep) void mutation.run(() => api.pullKeep(keep), value => {
+              setPull(value.pull); setKept(value); setKeep(undefined);
+              if (value.kept?.length) { setExpanded(previous => [...new Set([...previous, ...value.kept ?? []])]); toast({ title: 'Kept your version' }); }
+              else toast({ title: value.pull.state === 'blocked' ? 'Still blocked' : 'Pull complete' });
+            });
+          }}><Pending pending={mutation.pending}>Keep mine</Pending></Button>
+        </DialogFooter></DialogContent>
+    </Dialog>
     <Dialog open={!!restore} onOpenChange={open => { if (!open && !mutation.pending) setRestore(undefined); }}>
       <DialogContent finalFocus={restoreTrigger} showCloseButton={!mutation.pending}><DialogHeader>
         <DialogTitle>Restore {restore?.all ? 'all Draft items' : `${restoreReview?.items.length ?? 0} selected items`}?</DialogTitle>

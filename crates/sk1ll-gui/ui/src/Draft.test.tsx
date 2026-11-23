@@ -7,7 +7,7 @@ import { api } from './api';
 import type { DraftEntry, StatusView } from './types';
 
 vi.mock('./api', () => ({ api: {
-  draft: vi.fn(), diff: vi.fn(), commitMessage: vi.fn(), commit: vi.fn(), restore: vi.fn(), pull: vi.fn(), push: vi.fn(),
+  draft: vi.fn(), diff: vi.fn(), commitMessage: vi.fn(), commit: vi.fn(), restore: vi.fn(), pull: vi.fn(), pullKeep: vi.fn(), push: vi.fn(), dismissKeepNotes: vi.fn(),
 }, errorMessage: (error: unknown) => String(error) }));
 const status = { report: { blocked: false, clashes: [], unpushed: [] } } as unknown as StatusView;
 const entry = (item: string): DraftEntry => ({ item, change: 'added', paths: [`${item}/SKILL.md`], fingerprint: 'initial' });
@@ -236,4 +236,79 @@ it('pushes separately after a standalone commit when selected', async () => {
   fireEvent.click(within(dialog).getByRole('button', { name: 'Commit' }));
   await waitFor(() => expect(api.push).toHaveBeenCalledOnce());
   expect(vi.mocked(api.commit).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(api.push).mock.invocationCallOrder[0]);
+});
+
+it('lists what an interrupted Keep mine left in recovery, with the command for each', async () => {
+  const keep_report = [
+    { item: 'skill:pdf', entry: '1700-pull-SKILL_md', error: 'the keep stopped after its pull; your version is in recovery' },
+    { item: 'skill:pdf', entry: null, error: 'personal/pdf/SKILL.md has staged content the keep didn\'t record as its own, so it is left as it is' },
+  ];
+  render(<Draft revision={0} status={{ ...status, keep_report } as StatusView} changed={changed} />);
+  const list = await screen.findByRole('list', { name: 'Kept versions in recovery' });
+  expect(within(list).getByText('sk1ll recover adopt 1700-pull-SKILL_md')).toBeTruthy();
+  expect(within(list).getByText(/left as it is/)).toBeTruthy();
+  expect(screen.getByText(/Conflicts → Recovered content/)).toBeTruthy();
+  vi.mocked(api.dismissKeepNotes).mockResolvedValue(1);
+  fireEvent.click(screen.getByRole('button', { name: 'Dismiss notes' }));
+  await waitFor(() => expect(api.dismissKeepNotes).toHaveBeenCalled());
+  await waitFor(() => expect(changed).toHaveBeenCalled());
+});
+it('offers Dismiss notes only when the report has notes', async () => {
+  const keep_report = [{ item: 'skill:pdf', entry: '1700-pull-SKILL_md', error: 'the keep stopped after its pull; your version is in recovery' }];
+  render(<Draft revision={0} status={{ ...status, keep_report } as StatusView} changed={changed} />);
+  await screen.findByRole('list', { name: 'Kept versions in recovery' });
+  expect(screen.queryByRole('button', { name: 'Dismiss notes' })).toBeNull();
+});
+it('shows no interrupted Keep mine notice without a report', async () => {
+  render(<Draft revision={0} status={status} changed={changed} />);
+  await screen.findByRole('checkbox', { name: 'Select skill:reviewed' });
+  expect(screen.queryByText('Interrupted Keep mine')).toBeNull();
+});
+
+describe('Keep mine', () => {
+  const blockedOn = (clashes: string[]) => ({ ...status, report: { ...status.report, blocked: true, clashes } }) as StatusView;
+  it('confirms that the whole file wins, then shows what it kept and its diff', async () => {
+    entries = [{ ...entry('skill:pdf'), change: 'modified' }]; diffs = { 'skill:pdf': '-theirs\n+mine' };
+    vi.mocked(api.pullKeep).mockResolvedValue({ pull: { state: 'updated', from: 'old', to: 'new123' }, kept: ['skill:pdf'] });
+    render(<Draft revision={0} status={blockedOn(['skill:pdf'])} changed={changed} />);
+    await screen.findByRole('checkbox', { name: 'Select skill:pdf' });
+    expect(screen.queryByRole('button', { name: 'Keep mine for all' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Keep mine: skill:pdf' }));
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByText(/The whole file wins: the other Machine's change to this item is overwritten/)).toBeTruthy();
+    expect(within(dialog).getByText('sk1ll diff')).toBeTruthy();
+    expect(api.pullKeep).not.toHaveBeenCalled();
+    fireEvent.click(button(dialog, 'Keep mine'));
+    await waitFor(() => expect(api.pullKeep).toHaveBeenCalledWith({ items: ['skill:pdf'], all: false }));
+    const notice = await screen.findByText(/Your version of skill:pdf is back on top of Baseline new123/);
+    expect(notice.textContent).toMatch(/replacing the other Machine's change/);
+    expect(screen.getByText('sk1ll diff skill:pdf')).toBeTruthy();
+    expect(button(document.body, 'Diff for skill:pdf').getAttribute('aria-expanded')).toBe('true');
+    expect(changed).toHaveBeenCalled();
+  });
+  it('keeps every clashing item at once, and says when the pull is still blocked', async () => {
+    entries = [entry('skill:pdf'), entry('rule:git')];
+    vi.mocked(api.pullKeep).mockResolvedValue({ pull: { state: 'blocked', baseline: 'b', items: ['skill:pdf', 'rule:git', 'rule:style'] } });
+    render(<Draft revision={0} status={blockedOn(['skill:pdf', 'rule:git'])} changed={changed} />);
+    await screen.findByRole('checkbox', { name: 'Select skill:pdf' });
+    fireEvent.click(screen.getByRole('button', { name: 'Keep mine for all' }));
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByText('Keep your version of every clashing item?')).toBeTruthy();
+    expect(within(dialog).getByText(/change to these items is overwritten/)).toBeTruthy();
+    fireEvent.click(button(dialog, 'Keep mine'));
+    await waitFor(() => expect(api.pullKeep).toHaveBeenCalledWith({ items: [], all: true }));
+    // The pull found a third clash: the notice lists it, and nothing was kept.
+    await screen.findByRole('button', { name: 'Keep mine: rule:style' });
+    expect(screen.queryByText(/is back on top/)).toBeNull();
+  });
+  it('offers Restore next to Keep mine to take the Baseline instead', async () => {
+    entries = [entry('skill:pdf')];
+    render(<Draft revision={0} status={blockedOn(['skill:pdf', 'rule:committed'])} changed={changed} />);
+    await screen.findByRole('checkbox', { name: 'Select skill:pdf' });
+    expect(button(document.body, 'Restore rule:committed').disabled).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: 'Restore skill:pdf' }));
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.click(button(dialog, 'Restore selected'));
+    await waitFor(() => expect(api.restore).toHaveBeenCalledWith({ items: ['skill:pdf'], all: false }));
+  });
 });
