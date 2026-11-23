@@ -82,14 +82,18 @@ sk1ll restore pdf                    # discard one item's draft
 sk1ll pull                           # fetch the new baseline, keep the draft on top
 ```
 
-Commands take a bare skill or rule name, or `skill:<name>`, `rule:<name>`, `manifest` and `other:<path>`. `pull` never merges. If the new baseline changes an item that is also in your draft, `pull` changes nothing and marks the machine Blocked. An unpushed commit that conflicts with the new baseline is turned back into draft changes first (only the branch moves; no file changes), so it blocks the pull the same way. To get past it:
+Commands take a bare skill or rule name, or `skill:<name>`, `rule:<name>`, `manifest` and `other:<path>`. `pull` never merges. If the new baseline changes an item that is also in your draft, `pull` changes nothing and marks the machine Blocked. An unpushed commit that conflicts with the new baseline is turned back into draft changes first (only the branch moves; no file changes), so it blocks the pull the same way. To get past it, keep yours or take theirs:
 
 ```sh
-sk1ll restore pdf          # your version goes to recovery; prints its entry ids
+sk1ll pull --keep pdf      # keep mine: take the new baseline, put your pdf back on top as draft
+sk1ll diff pdf             # review: your whole file replaced the other machine's change to it
+sk1ll commit pdf           # or merge by hand first
+
+sk1ll restore pdf          # take theirs: your version goes to recovery (prints its entry ids)
 sk1ll pull
-sk1ll recover adopt <id>   # your version comes back as draft on the new baseline
-sk1ll diff pdf             # merge by hand if needed, then commit
 ```
+
+`sk1ll pull --keep-all` keeps your version of every clashing item. Keep mine works per file: the other machine's change to that item is overwritten in your draft, so review the diff before you commit. While the pull also clashes with an item you didn't name, nothing changes and it stays Blocked. It refuses an item you staged a change in: unstage it or commit it first. If a step fails, your version stays in recovery and the error names the `sk1ll recover adopt <id>` that finishes by hand. An interrupted keep (a crash, a stop) puts nothing more back on its own: the next `sk1ll pull` or daemon reconcile reports each version left in recovery with its `sk1ll recover adopt <id>`, in `sk1ll status` and the app until you adopt or discard each one.
 
 The daemon and mutating commands write a new Item ID for hand-made Skills, Rules,
 and Import entries that lack one. These writes are part of the Draft and get

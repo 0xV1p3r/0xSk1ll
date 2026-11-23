@@ -9,6 +9,16 @@ break compatibility.
 
 ### Added
 
+- Keep mine for a Blocked pull in one step: `sk1ll pull --keep <items>` or
+  `--keep-all`, and **Keep mine** in the app's Blocked notice, take the new
+  Baseline and put this Machine's version of the clashing items back on top
+  as Draft. A keep that is interrupted leaves your versions in recovery, and
+  the next pull or reconcile reports each one for `sk1ll recover adopt`.
+- `sk1ll harnesses disable <h> --take-out` (and `remove`), and **Take out and
+  turn off** in Settings, take out what sk1ll placed in a Harness before
+  changing `machine.toml`, and change nothing there if that fails.
+- Sync removes a block instructions file it created once turning every rule
+  off leaves it empty and untouched.
 - List and clear orphan Assignment toggles in the desktop matrix or with
   `sk1ll fleet orphans` and `sk1ll fleet prune-orphans`.
 - `sk1ll repair-ids` gives items that share an Item ID fresh ones in the
