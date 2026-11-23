@@ -11,8 +11,8 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use sk1ll_daemon::DaemonState;
 use sk1ll_daemon::client::{
-    AddImportRequest, Client, CommitRequest, CommitResponse, Connection, Event, ResolveImportRequest, RestoreRequest,
-    StatusView,
+    AddImportRequest, Client, CommitRequest, CommitResponse, Connection, Event, PullKeepRequest, PullResult,
+    ResolveImportRequest, RestoreRequest, StatusView,
 };
 use sk1ll_daemon::state::PullState;
 use sk1ll_proto::{
@@ -91,6 +91,17 @@ impl Server {
         let resp = self.http.post(format!("{}/api/join-codes", self.url())).bearer_auth(ADMIN).send().await.unwrap();
         assert!(resp.status().is_success());
         resp.json::<sk1ll_proto::JoinCode>().await.unwrap().code
+    }
+
+    /// A join code for a Machine that may manage only itself.
+    async fn self_join_code(&self) -> String {
+        let url = format!("{}/api/join-codes", self.url());
+        let body = serde_json::json!({ "scope": "self" });
+        let resp = self.http.post(url).bearer_auth(ADMIN).json(&body).send().await.unwrap();
+        assert!(resp.status().is_success());
+        let code = resp.json::<sk1ll_proto::JoinCode>().await.unwrap();
+        assert_eq!(code.scope, sk1ll_proto::Scope::SelfOnly);
+        code.code
     }
 
     async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> T {
@@ -237,7 +248,10 @@ impl Machine {
 
     /// Joins with a fresh code; returns what the command printed.
     async fn join(&self, server: &Server) -> String {
-        let code = server.join_code().await;
+        self.join_with(server, server.join_code().await).await
+    }
+
+    async fn join_with(&self, server: &Server, code: String) -> String {
         let mut cmd = self.command();
         cmd.args(["join", &server.url(), &code, "--id", &self.id, "--repo"]).arg(self.repo());
         let out = tokio::task::spawn_blocking(move || cmd.output().unwrap()).await.unwrap();
@@ -495,18 +509,24 @@ async fn assign(via: &Machine, machine: &str, changes: Vec<ToggleChange>) {
 }
 
 /// Polls `f` until it returns `Some` (up to 30 s).
-async fn eventually<T, F, Fut>(mut f: F) -> T
+/// Polls `f` until it holds, for up to 30 seconds; a timeout names the
+/// condition by where `eventually` was called.
+#[track_caller]
+fn eventually<T, F, Fut>(mut f: F) -> impl Future<Output = T>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Option<T>>,
 {
-    for _ in 0..300 {
-        if let Some(v) = f().await {
-            return v;
+    let at = std::panic::Location::caller();
+    async move {
+        for _ in 0..300 {
+            if let Some(v) = f().await {
+                return v;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        panic!("the condition at {at} never held within 30s");
     }
-    panic!("condition never held");
 }
 
 /// `alpha` joins the fresh server and commits the new repo with skill `x`;
@@ -576,6 +596,27 @@ async fn standalone_harness_assignment_reaches_items_with_spaces() {
     assert!(result.errors.is_empty());
     assert!(!result.assignment.skill_enabled(HARNESS, &skill_id("pdf")));
     assert!(!result.assignment.skill_enabled(HARNESS, &skill_id("old name")));
+}
+
+/// A Machine with `self` scope can set its own Harness Assignment through
+/// `POST /machines/{id}/assignment/harness/{harness}`, and the server
+/// refuses it another Machine's, which stays as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn machine_harness_assignment_of_another_machine_is_refused_to_self_scope() {
+    let server = Server::start().await;
+    let (a, _b, _) = fleet_of_two(&server).await;
+    let mut own = Machine::new("gamma");
+    own.join_with(&server, server.self_join_code().await).await;
+    own.start_connected().await;
+    eventually(|| async { (server.row("gamma").await?.scope == sk1ll_proto::Scope::SelfOnly).then_some(()) }).await;
+    let before = a.client.assignment("alpha").await.unwrap();
+    let refused = own.client.set_machine_harness_assignment("alpha", HARNESS, true).await.unwrap_err();
+    assert_eq!(refused.status, Some(403), "{refused:?}");
+    assert_eq!(a.client.assignment("alpha").await.unwrap(), before, "unchanged");
+    let mine = own.client.set_machine_harness_assignment("gamma", HARNESS, true).await.unwrap();
+    assert!(!mine.entries.is_empty(), "{mine:?}");
+    assert!(mine.entries.iter().all(|entry| entry.machine == "gamma" && entry.author == "gamma"), "{mine:?}");
+    assert!(mine.assignment.skill_enabled(HARNESS, &skill_id("x")), "the change is there: {mine:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -740,6 +781,68 @@ async fn blocked_pull_reports_clashes_and_keeps_files() {
     })
     .await;
     assert_eq!(std::fs::read_to_string(b.repo().join("personal/x/SKILL.md")).unwrap(), "x by alpha\n");
+}
+
+/// `POST /pull/keep` takes the new Baseline and puts the Draft's version
+/// back on top: the Machine is no longer Blocked and its version is Draft.
+/// Here, not among the library's tests: its recovery entries are in this
+/// daemon's own state directory, which no other test's reconcile lists.
+#[tokio::test(flavor = "multi_thread")]
+async fn keep_mine_clears_blocked_with_the_draft_on_top() {
+    let server = Server::start().await;
+    let (a, b, _) = fleet_of_two(&server).await;
+    b.write("personal/x/SKILL.md", "x by beta\n");
+    eventually(|| async {
+        server.row("beta").await?.report?.drafts.contains(&ItemRef::Skill("x".into())).then_some(())
+    })
+    .await;
+    a.write("personal/x/SKILL.md", "x by alpha\n");
+    let p = a.commit(&["x"]).await;
+    assert!(p.pushed);
+    eventually(|| async { b.status().await.report.blocked.then_some(()) }).await;
+
+    let request = |items: &[&str], all| PullKeepRequest { items: items.iter().map(|i| i.to_string()).collect(), all };
+    let refused = b.client.pull_keep(&request(&["rule:none"], false)).await.unwrap_err();
+    assert!(refused.to_string().contains("is neither in the draft nor in an unpushed commit"), "{refused}");
+    let kept = b.client.pull_keep(&request(&["x"], false)).await.unwrap();
+    assert!(matches!(kept.pull, PullResult::Updated { .. }), "{kept:?}");
+    assert_eq!(kept.kept, [ItemRef::Skill("x".into())]);
+    assert_eq!(std::fs::read_to_string(b.repo().join("personal/x/SKILL.md")).unwrap(), "x by beta\n");
+    assert_eq!(b.head(), p.sha, "on the new baseline");
+    let s = b.status().await;
+    assert!(!s.report.blocked, "{s:?}");
+    assert!(s.report.drafts.contains(&ItemRef::Skill("x".into())), "{s:?}");
+}
+
+/// An interrupted keep's report lists a version in recovery in the status
+/// through later reconciles and errors, until that version is discarded.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_keep_report_stays_in_the_status_until_its_version_is_acted_on() {
+    let server = Server::start().await;
+    let (a, b, _) = fleet_of_two(&server).await;
+    b.write("personal/x/SKILL.md", "x by beta\n");
+    eventually(|| async {
+        server.row("beta").await?.report?.drafts.contains(&ItemRef::Skill("x".into())).then_some(())
+    })
+    .await;
+    a.write("personal/x/SKILL.md", "x by alpha\n");
+    assert!(a.commit(&["x"]).await.pushed);
+    eventually(|| async { b.status().await.report.blocked.then_some(()) }).await;
+    // Restoring an item the pull is Blocked on keeps its version in recovery.
+    let kept = b.client.restore(&RestoreRequest { items: vec!["x".into()], all: false }).await.unwrap().kept;
+    let id = kept.into_iter().next().expect("a recovery entry");
+    let report = serde_json::json!([{ "item": "skill:x", "entry": id, "error": "the keep stopped after its pull" }]);
+    std::fs::write(b.repo().join(".git/sk1ll-keep-report.json"), report.to_string()).unwrap();
+    // A fresh read waits for, and runs, a reconcile, which reads the report.
+    let listed = || async {
+        b.client.recovered_fresh().await.unwrap();
+        b.client.status().await.unwrap().keep_report.iter().any(|u| u.entry.as_ref() == Some(&id))
+    };
+    eventually(|| async { listed().await.then_some(()) }).await;
+    assert!(listed().await, "still there after another reconcile");
+    b.client.discard_displaced(&id).await.unwrap();
+    eventually(|| async { (!listed().await).then_some(()) }).await;
+    assert!(!b.repo().join(".git/sk1ll-keep-report.json").exists());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1138,24 +1241,43 @@ async fn joining_again_while_the_daemon_runs_resumes_management() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn replacing_a_watched_skills_directory_rearms_the_watch() {
+    const WAKE: &str = "file changes: waking a reconcile";
     let server = FakeServer::new().await;
-    let mut m = solo("solo", &server.url(), Some(snapshot(1, &["x"]))).with_env("SK1LL_RECONCILE_INTERVAL", "1h");
+    // No periodic pull or reconcile within the test, wakes that fire fast,
+    // and a log line for each wake file events cause.
+    let mut m = solo("solo", &server.url(), Some(snapshot(1, &["x"])))
+        .with_env("SK1LL_RECONCILE_INTERVAL", "1h")
+        .with_env("SK1LL_FULL_RECONCILE_INTERVAL", "1h")
+        .with_env("SK1LL_PULL_INTERVAL", "1h")
+        .with_env("SK1LL_DEBOUNCE", "100ms")
+        .with_env("SK1LL_DEBOUNCE_MAX", "300ms")
+        .with_env("RUST_LOG", "info,sk1ll_daemon=debug");
     m.start().await;
+    // The initial watches are in place before the local API answers.
     eventually(|| async { (m.harness_skill("x").as_deref() == Some("x\n")).then_some(()) }).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
     std::fs::rename(m.skills(), m.skills().with_file_name("old-skills")).unwrap();
     std::fs::create_dir(m.skills()).unwrap();
+    // Placed again: the daemon saw the replacement, with no reconcile due for an hour.
     eventually(|| async { (m.harness_skill("x").as_deref() == Some("x\n")).then_some(()) }).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Idle: no file-event wake in a whole cycle of waiting out the debounce
+    // maximum and a fresh read, which waits for the reconcile running.
+    let wakes = || m.log().matches(WAKE).count();
+    let mut before = wakes();
+    loop {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        m.client.recovered_fresh().await.unwrap();
+        match wakes() {
+            now if now == before => break,
+            now => before = now,
+        }
+    }
+    // One edit, no retry: the conflict it causes must come with a wake the watch caused.
     std::fs::write(m.skills().join("x/SKILL.md"), "edited in the replacement directory\n").unwrap();
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        eventually(|| async {
-            m.status().await.report.conflicts.iter().any(|c| c.item == ItemRef::Skill("x".into())).then_some(())
-        }),
-    )
-    .await
-    .expect("edits in the new inode must be watched without waiting for reconciliation");
+    eventually(|| async {
+        m.status().await.report.conflicts.iter().any(|c| c.item == ItemRef::Skill("x".into())).then_some(())
+    })
+    .await;
+    assert!(wakes() > before, "the edit's wake came from the watch on the new directory");
 }
 
 // ---------------------------------------------------------------------------

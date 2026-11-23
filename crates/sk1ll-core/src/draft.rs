@@ -19,7 +19,10 @@ use crate::manifest::MANIFEST_FILE;
 use crate::skill::{IMPORTED_DIR, PERSONAL_DIR};
 use crate::{Error, IoExt, Repo, Result, machine};
 
+mod keep;
 mod pull;
+
+pub use keep::{Keep, KeptPull, Unkept, report_text};
 
 /// The only remote: the server (see ADR 0002).
 pub const REMOTE: &str = "origin";
@@ -412,6 +415,31 @@ impl Repo {
     /// That is how the version of an item a pull is Blocked on survives the
     /// restore that clears the way. Returns the entries' ids.
     pub fn restore_keeping(&self, items: &[ItemRef], keep: &BTreeSet<ItemRef>) -> Result<Vec<String>> {
+        self.restore_recording(items, keep, None, &mut |_| Ok(()))
+    }
+
+    /// [`restore_keeping`](Self::restore_keeping), telling `record` about
+    /// each kept file before it moves into recovery, and about each file the
+    /// Draft deletes, before anything changes: what "keep mine" journals.
+    ///
+    /// A kept item is restored without overwriting or deleting anything in
+    /// the working tree: once its files are in recovery, the Baseline's go
+    /// in only where nothing is, and only the index changes otherwise. So a
+    /// save made at one of its paths meanwhile stays where it is (the error
+    /// says so). A kept path whose staged version differs from its file is
+    /// refused before anything changes: only one of the two could be kept.
+    ///
+    /// `user_staged`, for keep mine: the paths the user had staged before
+    /// it began. A kept path among them is refused; a kept path staged
+    /// since (by the pull's un-commit) is the operation's own, and `record`
+    /// hears what is staged there before the restore resets it.
+    fn restore_recording(
+        &self,
+        items: &[ItemRef],
+        keep: &BTreeSet<ItemRef>,
+        user_staged: Option<&BTreeSet<PathBuf>>,
+        record: &mut dyn FnMut(keep::Event) -> Result<()>,
+    ) -> Result<Vec<String>> {
         let (selected, st) = self.select(items, "restored")?;
         if selected.iter().any(|d| d.item == ItemRef::Manifest) && !st.head_paths.contains(Path::new(MANIFEST_FILE)) {
             return Err(Error::Invalid(format!(
@@ -450,9 +478,28 @@ impl Repo {
                 )));
             }
         }
-        let kept = self.keep_in_recovery(selected.iter().filter(|d| keep.contains(&d.item)).flat_map(|d| &d.paths))?;
-        let (in_head, new): (Vec<&PathBuf>, Vec<&PathBuf>) =
-            selected.iter().flat_map(|d| &d.paths).partition(|p| st.head_paths.contains(*p));
+        let kept_paths: Vec<(&ItemRef, &PathBuf)> = selected
+            .iter()
+            .filter(|d| keep.contains(&d.item))
+            .flat_map(|d| d.paths.iter().map(move |p| (&d.item, p)))
+            .collect();
+        if let Some(user_staged) = user_staged {
+            self.refuse_user_staged(&kept_paths, user_staged)?;
+        }
+        self.refuse_staged_differing(&kept_paths, st.head.as_deref())?;
+        self.refuse_obstructed(&kept_paths, &st)?;
+        // Kept paths staged now are the pull's un-commit's (the user's are
+        // refused above): journaled as the operation's own, path by path.
+        let owned = match user_staged {
+            Some(_) => self.staged_paths()?,
+            None => BTreeSet::new(),
+        };
+        let kept = self.keep_and_restore(&kept_paths, &st, &owned, record)?;
+        let (in_head, new): (Vec<&PathBuf>, Vec<&PathBuf>) = selected
+            .iter()
+            .filter(|d| !keep.contains(&d.item))
+            .flat_map(|d| &d.paths)
+            .partition(|p| st.head_paths.contains(*p));
         // New paths go first: one may be in the way of a baseline file (a file
         // that became a directory) that the checkout below brings back.
         if !new.is_empty() {
@@ -473,6 +520,123 @@ impl Repo {
         }
         self.restore_spellings(&selected, &st)?;
         Ok(kept)
+    }
+
+    /// The items committed here but not on [`REMOTE`]'s [`FLEET_BRANCH`] as
+    /// fetched last: what a pull can turn back into Draft.
+    pub(crate) fn unpushed_items(&self) -> Result<BTreeSet<ItemRef>> {
+        let remote = format!("refs/remotes/{REMOTE}/{FLEET_BRANCH}");
+        let (Some(head), Some(remote)) = (rev(self.git()?, "HEAD")?, rev(self.git()?, &remote)?) else {
+            return Ok(BTreeSet::new());
+        };
+        let base = self.git()?.args(["merge-base", &head, &remote]).output()?;
+        if !base.status.success() {
+            return Ok(BTreeSet::new());
+        }
+        let base = String::from_utf8_lossy(&base.stdout).trim().to_string();
+        let out = self.git()?.args(["diff", "--name-only", "-z", "--relative", "--no-renames", &base, &head]).run()?;
+        Ok(split_paths(&out).map(|p| ItemRef::for_path(&p)).collect())
+    }
+
+    /// The paths (repo-relative) whose index entry differs from `HEAD`'s:
+    /// staged changes, additions and removals.
+    pub(crate) fn staged_paths(&self) -> Result<BTreeSet<PathBuf>> {
+        let mut git = self.git()?.args(["diff", "--cached", "--name-only", "-z", "--relative", "--no-renames"]);
+        if let Some(head) = rev(self.git()?, "HEAD")? {
+            git = git.arg(head);
+        }
+        Ok(split_paths(&git.run()?).collect())
+    }
+
+    /// [`staged_paths`](Self::staged_paths) the user staged: all but those
+    /// whose index entry is still exactly what pull's un-commit left there.
+    pub(crate) fn user_staged_paths(&self) -> Result<BTreeSet<PathBuf>> {
+        let staged = self.staged_paths()?;
+        if staged.is_empty() {
+            return Ok(staged);
+        }
+        let uncommitted = pull::uncommitted_staging(self)?;
+        let root = self.root().canonicalize().at(self.root())?;
+        let mut user = BTreeSet::new();
+        for rel in staged {
+            let current = self.index_entry(&rel)?.map(|keep::IndexEntry(mode, oid)| (mode, oid));
+            if uncommitted.get(&root.join(&rel)) != Some(&current) {
+                user.insert(rel);
+            }
+        }
+        Ok(user)
+    }
+
+    /// Refuses to keep a path the user had staged: keep mine works on the
+    /// files, so it would leave that staging out of what it keeps.
+    fn refuse_user_staged(&self, paths: &[(&ItemRef, &PathBuf)], staged: &BTreeSet<PathBuf>) -> Result<()> {
+        if let Some((item, path)) = paths.iter().find(|(_, p)| staged.contains(*p)) {
+            let root = shell_quote(&self.root().to_string_lossy());
+            let path = shell_quote(&path.to_string_lossy());
+            return Err(Error::Invalid(format!(
+                "`{item}` has a staged change at {path}, which keep mine would leave out. Unstage it with `git -C \
+                 {root} restore --staged -- {path}`, or commit it, then try again"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Refuses to keep a path whose staged version differs from the file:
+    /// recovery would keep only the file, and the restore drops the staged one.
+    fn refuse_staged_differing(&self, paths: &[(&ItemRef, &PathBuf)], head: Option<&str>) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let list = |cached: bool| -> Result<BTreeSet<PathBuf>> {
+            let mut git = self.git()?.literal().args(["diff", "--name-only", "-z", "--relative", "--no-renames"]);
+            if cached {
+                git = git.arg("--cached").args(head);
+            }
+            Ok(split_paths(&git.arg("--").args(paths.iter().map(|(_, p)| *p)).run()?).collect())
+        };
+        let (staged, unstaged) = (list(true)?, list(false)?);
+        // A staged removal leaves no index entry, which `git diff` doesn't
+        // compare with a file made there since.
+        let out = self
+            .git()?
+            .literal()
+            .args(["ls-files", "-z", "--cached", "--"])
+            .args(paths.iter().map(|(_, p)| *p))
+            .run()?;
+        let indexed: BTreeSet<PathBuf> = split_paths(&out).collect();
+        let differs = |p: &PathBuf| {
+            unstaged.contains(p) || (!indexed.contains(p) && fs::symlink_metadata(self.root().join(p)).is_ok())
+        };
+        if let Some((item, path)) = paths.iter().find(|(_, p)| staged.contains(*p) && differs(p)) {
+            let root = shell_quote(&self.root().to_string_lossy());
+            let path = shell_quote(&path.to_string_lossy());
+            return Err(Error::Invalid(format!(
+                "`{item}` has a staged version of {path} that differs from the file, and only one of them could be \
+                 kept. Stage the file with `git -C {root} add -- {path}`, or drop the staged version with `git -C \
+                 {root} restore --staged -- {path}`, then try again"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Refuses to keep paths the Baseline's files couldn't go back to: a
+    /// parent that is a file (or a link) that isn't itself kept, and moved
+    /// aside first. Checked before anything changes.
+    fn refuse_obstructed(&self, paths: &[(&ItemRef, &PathBuf)], st: &Status) -> Result<()> {
+        let kept: BTreeSet<&PathBuf> = paths.iter().map(|(_, p)| *p).collect();
+        for (item, rel) in paths.iter().filter(|(_, p)| st.head_paths.contains(*p)) {
+            for parent in rel.ancestors().skip(1).filter(|a| !a.as_os_str().is_empty()) {
+                let in_the_way = fs::symlink_metadata(self.root().join(parent)).is_ok_and(|m| !m.is_dir());
+                if in_the_way && !kept.contains(&parent.to_path_buf()) {
+                    return Err(Error::Invalid(format!(
+                        "`{item}` can't be restored: {} is in the way of {}; move it aside, then try again",
+                        parent.display(),
+                        rel.display()
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// After restoring both sides of a case-only rename (`pdf` to `PDF`) on
@@ -502,42 +666,142 @@ impl Repo {
         Ok(())
     }
 
-    /// Moves each file or symlink at `paths` (repo-relative) into a recovery
-    /// entry of its own in the git directory's recovery area, as pull does
-    /// for what it displaces; a path with nothing there (a deletion) is
-    /// skipped. Returns the entries' ids.
+    /// Keeps each of `paths` (repo-relative, with their item) in recovery
+    /// and restores it, one path at a time, telling `record` first what it
+    /// will do there (and, for tests, each step): the file or symlink moves
+    /// into a recovery entry of its own in the git directory's recovery
+    /// area, as pull does for what it displaces; its index entry follows
+    /// `HEAD`; the Baseline's file goes in where nothing is
+    /// ([`pull::place_baseline`]). Nothing in the working tree is ever
+    /// removed or replaced. A path with nothing there that the Baseline has
+    /// (a deletion) is only recorded and restored. New paths go first: one
+    /// may be in the way of a Baseline file (a file that became a
+    /// directory). So a stop leaves at most one path between its move and
+    /// its Baseline file; an interrupted run puts nothing back (see
+    /// [`keep`]), and the journal records each step before it is taken: a
+    /// path's recovery entry before its file moves, its staging as the
+    /// operation's own only after that, and before its index changes. A
+    /// path something new is at stays as it is, and is an error. Returns
+    /// the recovery entries' ids.
     #[cfg(unix)]
-    fn keep_in_recovery<'a>(&self, paths: impl Iterator<Item = &'a PathBuf>) -> Result<Vec<String>> {
-        use crate::sync::displaced::{Displacing, Kind, PULL};
-        let paths: Vec<&PathBuf> = paths.collect();
+    fn keep_and_restore(
+        &self,
+        paths: &[(&ItemRef, &PathBuf)],
+        st: &Status,
+        owned: &BTreeSet<PathBuf>,
+        record: &mut dyn FnMut(keep::Event) -> Result<()>,
+    ) -> Result<Vec<String>> {
+        // Journals a path's staging as the operation's own, once its recovery
+        // entry is journaled and its file moved, and before its index changes.
+        let own = |item: &ItemRef, rel: &Path, record: &mut dyn FnMut(keep::Event) -> Result<()>| -> Result<()> {
+            match owned.contains(rel) {
+                true => record(keep::Event::Staged(item.clone(), self.root().join(rel), self.index_entry(rel)?)),
+                false => Ok(()),
+            }
+        };
         if paths.is_empty() {
             return Ok(Vec::new());
         }
         let git_dir = PathBuf::from(self.git()?.args(["rev-parse", "--absolute-git-dir"]).text()?);
-        let mut kept = Vec::new();
-        for rel in paths {
-            let path = self.root().join(rel);
-            match fs::symlink_metadata(&path) {
-                Ok(meta) if !meta.is_dir() => {}
-                _ => continue,
+        let root = self.root().canonicalize().at(self.root())?;
+        let (in_head, new): (Vec<_>, Vec<_>) = paths.iter().copied().partition(|(_, p)| st.head_paths.contains(*p));
+        let (mut kept, mut taken) = (Vec::new(), Vec::new());
+        for (item, rel) in &new {
+            kept.extend(self.keep_one(item, rel, &git_dir, record)?);
+            own(item, rel, record)?;
+        }
+        if !new.is_empty() {
+            let rels: Vec<&PathBuf> = new.iter().map(|(_, p)| *p).collect();
+            self.git()?.args(["update-index", "--force-remove", "-z", "--stdin"]).stdin(nul_list(&rels)).run()?;
+            for rel in rels {
+                prune_empty_parents(self.root(), rel);
+                if fs::symlink_metadata(root.join(rel)).is_ok() {
+                    taken.push(root.join(rel));
+                }
             }
-            let mut held = Displacing::begin(Some(self), Kind::Draft, PULL, &path, None, None, &git_dir)?;
-            if let Err(e) = held.take(&path) {
-                held.abandon();
-                return Err(e);
+        }
+        if let Some(head) = &st.head {
+            for (item, rel) in &in_head {
+                kept.extend(self.keep_one(item, rel, &git_dir, record)?);
+                own(item, rel, record)?;
+                self.git()?.literal().args(["reset", "--quiet", head, "--"]).arg(rel).run()?;
+                let dest = root.join(rel);
+                let staged = &mut || record(keep::Event::Placing);
+                match pull::place_baseline(self, std::slice::from_ref(&dest), staged)?.is_empty() {
+                    true => record(keep::Event::Published(self.root().join(rel)))?,
+                    false => taken.push(dest),
+                }
             }
-            kept.push(held.id().to_string());
-            held.finish(false)?;
+        }
+        if !taken.is_empty() {
+            let names: Vec<String> = taken.iter().map(|p| p.display().to_string()).collect();
+            return Err(Error::Changed(format!(
+                "{} {} written to while it was restored; that new version stays where it is, and the one before it \
+                 is kept in recovery (see `sk1ll recover list`)",
+                names.join(", "),
+                if taken.len() == 1 { "was" } else { "were" }
+            )));
         }
         Ok(kept)
     }
 
+    /// Journals `rel`, then moves what is there into a recovery entry: its
+    /// id, or `None` for a deletion. A directory is left alone.
+    #[cfg(unix)]
+    fn keep_one(
+        &self,
+        item: &ItemRef,
+        rel: &Path,
+        git_dir: &Path,
+        record: &mut dyn FnMut(keep::Event) -> Result<()>,
+    ) -> Result<Option<String>> {
+        use crate::sync::displaced::{Displacing, Kind, PULL};
+        let path = self.root().join(rel);
+        let kept = |entry| keep::Kept { item: item.clone(), dest: path.clone(), entry };
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if !meta.is_dir() => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                record(keep::Event::Kept(kept(None)))?;
+                return Ok(None);
+            }
+            _ => return Ok(None),
+        }
+        let mut held = Displacing::begin(Some(self), Kind::Draft, PULL, &path, None, None, git_dir)?;
+        let id = held.id().to_string();
+        if let Err(e) = record(keep::Event::Kept(kept(Some(id.clone())))).and_then(|()| held.take(&path)) {
+            held.abandon();
+            return Err(e);
+        }
+        held.finish(false)?;
+        record(keep::Event::Moved(path))?;
+        Ok(Some(id))
+    }
+
     #[cfg(not(unix))]
-    fn keep_in_recovery<'a>(&self, paths: impl Iterator<Item = &'a PathBuf>) -> Result<Vec<String>> {
-        match paths.count() {
+    fn keep_and_restore(
+        &self,
+        paths: &[(&ItemRef, &PathBuf)],
+        _: &Status,
+        _: &BTreeSet<PathBuf>,
+        _: &mut dyn FnMut(keep::Event) -> Result<()>,
+    ) -> Result<Vec<String>> {
+        match paths.len() {
             0 => Ok(Vec::new()),
             _ => Err(Error::Invalid("keeping a restored version in recovery needs Unix".into())),
         }
+    }
+
+    /// The index entry at `rel` (repo-relative): mode and blob, or `None`.
+    fn index_entry(&self, rel: &Path) -> Result<Option<keep::IndexEntry>> {
+        let out = self.git()?.literal().args(["ls-files", "-s", "-z", "--"]).arg(rel).run()?;
+        Ok(entry_fields(&out, 0, 1))
+    }
+
+    /// `HEAD`'s entry at `rel` (repo-relative): mode and blob, or `None`.
+    fn head_entry(&self, rel: &Path) -> Result<Option<keep::IndexEntry>> {
+        let Some(head) = rev(self.git()?, "HEAD")? else { return Ok(None) };
+        let out = self.git()?.literal().args(["ls-tree", "-z", &head, "--"]).arg(rel).run()?;
+        Ok(entry_fields(&out, 0, 2))
     }
 
     fn check_id_transitions(&self, head: Option<&str>, selected: &[ItemRef], operation: &str) -> Result<()> {
@@ -740,6 +1004,53 @@ impl Repo {
             Ok(Some(outcome)) => self.check_pulled_ids(Ok(outcome)).map(Some),
             Err(e) => self.check_pulled_ids(Err(e)).map(Some),
         }
+    }
+
+    /// "Keep mine" for a Blocked pull, in one step (see [`keep`]): onto the
+    /// baseline [`fetch`](Self::fetch) fetched last, with the Draft's
+    /// version of the clashing items in `keep` (each whole file) put back
+    /// on top as Draft changes. Unless `keep` names every item the pull is
+    /// Blocked on, nothing changes and the outcome is that Blocked. A step
+    /// that fails leaves every kept file in recovery, and the error names
+    /// the command that finishes by hand.
+    pub fn pull_keeping(&self, lock: &crate::EngineLock, keep: &Keep) -> Result<KeptPull> {
+        lock.check_for(self.root())?;
+        keep::run(self, lock, keep, &mut |_| Ok(()))
+    }
+
+    /// Reports a [`pull_keeping`](Self::pull_keeping) that was interrupted,
+    /// once no pull is pending, and removes its journal: `None` if there is
+    /// none, else each kept version, left in recovery for `sk1ll recover
+    /// adopt`. Nothing is adopted (see [`keep`]).
+    pub fn finish_keeping(&self, lock: &crate::EngineLock) -> Result<Option<Vec<Unkept>>> {
+        lock.check_for(self.root())?;
+        keep::finish(self)
+    }
+
+    /// The saved report of interrupted [`pull_keeping`](Self::pull_keeping)
+    /// runs: each kept version still in recovery, until adopted or
+    /// discarded. Only reads, apart from dropping what was acted on.
+    pub fn keep_report(&self) -> Result<Vec<Unkept>> {
+        keep::report(self)
+    }
+
+    /// [`keep_report`](Self::keep_report), writing nothing, for previews.
+    pub fn peek_keep_report(&self) -> Result<Vec<Unkept>> {
+        keep::peek_report(self)
+    }
+
+    /// Dismisses the notes of [`keep_report`](Self::keep_report) (the
+    /// entries with no recovery id); returns how many there were.
+    pub fn dismiss_keep_notes(&self) -> Result<usize> {
+        keep::dismiss_notes(self)
+    }
+
+    /// [`pull_keeping`](Self::pull_keeping), calling `step` at each step:
+    /// an error stops it there, as a crash would.
+    #[cfg(test)]
+    fn pull_keeping_with(&self, keep: &Keep, step: &mut dyn FnMut(keep::Step) -> Result<()>) -> Result<KeptPull> {
+        let lock = crate::EngineLock::acquire(self.root())?;
+        keep::run(self, &lock, keep, step)
     }
 
     /// [`pull`](Self::pull), running `f` once when it reaches `point`.
@@ -1090,6 +1401,21 @@ fn split_author(author: &str) -> (String, String) {
             (name.to_string(), email.unwrap_or_default())
         }
     }
+}
+
+/// The mode and object of the first `<fields>\t<path>` record in `out`,
+/// at the given field positions.
+fn entry_fields(out: &[u8], mode: usize, oid: usize) -> Option<keep::IndexEntry> {
+    let record = out.split(|b| *b == 0).find(|r| !r.is_empty())?;
+    let tab = record.iter().position(|b| *b == b'\t')?;
+    let fields: Vec<&str> = std::str::from_utf8(&record[..tab]).ok()?.split(' ').collect();
+    Some(keep::IndexEntry(fields.get(mode)?.to_string(), fields.get(oid)?.to_string()))
+}
+
+/// `s` as one word for a POSIX shell, for commands in messages.
+fn shell_quote(s: &str) -> String {
+    let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | ':' | '@' | '+' | ',');
+    if !s.is_empty() && s.chars().all(plain) { s.to_string() } else { format!("'{}'", s.replace('\'', "'\\''")) }
 }
 
 /// Item names use `/`; only on Windows is `\\` a separator too.
@@ -1886,6 +2212,559 @@ mod tests {
         crate::sync::displaced::adopt(&b, &skill.id, &_lock).unwrap();
         assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "b's edit\n");
         assert!(items_of(&b).contains(&item("skill:pdf")));
+    }
+
+    /// Both Machines change `pdf`; `b` also deletes a file of it and adds one.
+    #[cfg(unix)]
+    fn kept_clash(f: &Fleet) -> (String, String) {
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        write(&f.a.join("personal/pdf/SKILL.md"), "a's edit\n");
+        write(&f.a.join("personal/pdf/ref.md"), "a's reference\n");
+        let remote = a.commit(&[item("skill:pdf")], "a", None).unwrap();
+        a.push().unwrap();
+        write(&f.b.join("personal/pdf/SKILL.md"), "b's edit\n");
+        fs::remove_file(f.b.join("personal/pdf/ref.md")).unwrap();
+        write(&f.b.join("personal/pdf/notes.md"), "b's notes\n");
+        let base = git(&f.b, &["rev-parse", "HEAD"]);
+        assert!(matches!(pull_now(&b).unwrap(), PullOutcome::Blocked { .. }));
+        (base, remote)
+    }
+
+    #[cfg(unix)]
+    fn assert_kept(f: &Fleet) {
+        assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "b's edit\n");
+        assert_eq!(read(&f.b.join("personal/pdf/notes.md")), "b's notes\n");
+        assert!(!f.b.join("personal/pdf/ref.md").exists(), "b's deletion wins too");
+        assert!(!keep::journal_exists(&repo(&f.b)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keep_mine_takes_the_baseline_and_puts_the_draft_back_on_top() {
+        let f = Fleet::new();
+        let b = repo(&f.b);
+        let (base, remote) = kept_clash(&f);
+        let kept = b.pull_keeping_with(&Keep::All, &mut |_| Ok(())).unwrap();
+        assert_eq!(
+            kept,
+            KeptPull {
+                outcome: PullOutcome::Updated { from: base, to: remote.clone() },
+                kept: vec![item("skill:pdf")]
+            }
+        );
+        assert_eq!(git(&f.b, &["rev-parse", "HEAD"]), remote);
+        assert_kept(&f);
+        // A Draft change on the new Baseline, ready to commit.
+        assert!(items_of(&b).contains(&item("skill:pdf")));
+        let diff = b.diff(&item("skill:pdf")).unwrap();
+        assert!(diff.contains("-a's edit") && diff.contains("+b's edit"), "{diff}");
+        b.commit(&[item("skill:pdf")], "b wins", None).unwrap();
+        b.push().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keep_mine_leaves_a_pull_blocked_on_an_item_it_doesnt_name() {
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        write(&f.a.join("instructions/git.md"), "a's rule\n");
+        a.commit(&[item("rule:git")], "a rule", None).unwrap();
+        let (base, _) = kept_clash(&f);
+        write(&f.b.join("instructions/git.md"), "b's rule\n");
+        let draft = b.draft().unwrap();
+        let kept = b.pull_keeping_with(&Keep::Items(vec![item("skill:pdf")]), &mut |_| Ok(())).unwrap();
+        assert!(matches!(&kept.outcome, PullOutcome::Blocked { items, .. } if items.len() == 2), "{kept:?}");
+        assert!(kept.kept.is_empty());
+        assert_eq!(git(&f.b, &["rev-parse", "HEAD"]), base);
+        assert_eq!(b.draft().unwrap(), draft, "nothing moved");
+        let err = b.pull_keeping_with(&Keep::Items(vec![item("rule:style")]), &mut |_| Ok(())).unwrap_err();
+        assert!(err.to_string().contains("`rule:style` is neither in the draft nor in an unpushed commit"), "{err}");
+        b.pull_keeping_with(&Keep::All, &mut |_| Ok(())).unwrap();
+        assert_kept(&f);
+        assert_eq!(read(&f.b.join("instructions/git.md")), "b's rule\n");
+    }
+
+    /// A kept file that can't go back (something new is at its path) stays
+    /// in recovery, and the error says how to finish.
+    #[cfg(unix)]
+    #[test]
+    fn keep_mine_that_cant_put_a_file_back_leaves_it_in_recovery() {
+        let f = Fleet::new();
+        let b = repo(&f.b);
+        let (_, remote) = kept_clash(&f);
+        let skill = f.b.join("personal/pdf/SKILL.md");
+        let err = b
+            .pull_keeping_with(&Keep::All, &mut |step| {
+                if step == keep::Step::Settle {
+                    write(&skill, "written meanwhile\n");
+                }
+                Ok(())
+            })
+            .unwrap_err()
+            .to_string();
+        assert_eq!(git(&f.b, &["rev-parse", "HEAD"]), remote, "the pull went through");
+        assert_eq!(read(&skill), "written meanwhile\n");
+        let id = err
+            .split("kept in recovery as ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .unwrap_or_else(|| panic!("{err}"));
+        assert!(err.contains(&format!("`sk1ll recover adopt {id}`")), "{err}");
+        let entry = crate::sync::displaced::get(id).unwrap();
+        assert_eq!(read(&entry.path), "b's edit\n");
+        assert!(!keep::journal_exists(&b));
+        // The rest went back.
+        assert_eq!(read(&f.b.join("personal/pdf/notes.md")), "b's notes\n");
+        b.restore(&[item("skill:pdf")]).unwrap();
+        let lock = crate::EngineLock::acquire(b.root()).unwrap();
+        crate::sync::displaced::adopt(&b, id, &lock).unwrap();
+        assert_eq!(read(&skill), "b's edit\n");
+    }
+
+    /// A save at a kept path after its file moved into recovery is never
+    /// overwritten or deleted by the restore: it stays, and the version
+    /// before it is in recovery, with the command to bring it back.
+    #[cfg(unix)]
+    #[test]
+    fn keep_mine_never_overwrites_a_save_made_during_its_restore() {
+        let f = Fleet::new();
+        let b = repo(&f.b);
+        let (base, _) = kept_clash(&f);
+        let (skill, notes) = (f.b.join("personal/pdf/SKILL.md"), f.b.join("personal/pdf/notes.md"));
+        let err = b
+            .pull_keeping_with(&Keep::All, &mut |at| {
+                if let keep::Step::Moved(path) = at {
+                    assert!(!path.exists(), "moved into recovery");
+                    if path.ends_with("SKILL.md") {
+                        write(&skill, "saved again\n");
+                    } else if path.ends_with("notes.md") {
+                        write(&notes, "notes saved again\n");
+                    }
+                }
+                Ok(())
+            })
+            .unwrap_err()
+            .to_string();
+        assert_eq!(read(&skill), "saved again\n");
+        assert_eq!(read(&notes), "notes saved again\n", "a Draft-only path isn't deleted");
+        assert_eq!(git(&f.b, &["rev-parse", "HEAD"]), base, "nothing pulled");
+        assert!(err.contains("`sk1ll recover adopt "), "{err}");
+        let kept: Vec<String> = crate::sync::displaced::list()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.dest.starts_with(f.b.canonicalize().unwrap()) && e.changed)
+            .map(|e| read(&e.path))
+            .collect();
+        assert!(kept.contains(&"b's edit\n".to_string()) && kept.contains(&"b's notes\n".to_string()), "{kept:?}");
+    }
+
+    /// [`Repo::pull_keeping_with`], stopping at the first step `stop` picks, as a crash would.
+    #[cfg(unix)]
+    fn keep_stopping(b: &Repo, stop: impl Fn(&keep::Step) -> bool) {
+        let crashed = b.pull_keeping_with(&Keep::All, &mut |at| match stop(&at) {
+            true => Err(Error::Invalid(format!("crashed at {at:?}"))),
+            false => Ok(()),
+        });
+        assert!(crashed.is_err());
+        assert!(keep::journal_exists(b));
+    }
+
+    fn at_skill(published: bool) -> impl Fn(&keep::Step) -> bool {
+        move |at| match at {
+            keep::Step::Moved(path) if !published => path.ends_with("personal/pdf/SKILL.md"),
+            keep::Step::Published(path) if published => path.ends_with("personal/pdf/SKILL.md"),
+            _ => false,
+        }
+    }
+
+    /// Items named before the first pull may clash only through an unpushed
+    /// commit the pull turns back into Draft; a name that can't clash at
+    /// all is refused before anything changes.
+    #[cfg(unix)]
+    #[test]
+    fn keep_mine_takes_names_that_clash_only_in_an_unpushed_commit() {
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        write(&f.a.join("personal/pdf/SKILL.md"), "a's edit\n");
+        write(&f.a.join("instructions/git.md"), "a's rule\n");
+        a.commit(&[item("skill:pdf"), item("rule:git")], "a", None).unwrap();
+        a.push().unwrap();
+        write(&f.b.join("personal/pdf/SKILL.md"), "b's edit\n");
+        b.commit(&[item("skill:pdf")], "b", None).unwrap();
+        write(&f.b.join("instructions/git.md"), "b's rule\n");
+        b.fetch().unwrap();
+        let head = git(&f.b, &["rev-parse", "HEAD"]);
+        let bogus = Keep::Items(vec![item("rule:git"), item("rule:style")]);
+        let err = b.pull_keeping_with(&bogus, &mut |_| Ok(())).unwrap_err().to_string();
+        assert!(err.contains("`rule:style` is neither in the draft nor in an unpushed commit"), "{err}");
+        assert_eq!(git(&f.b, &["rev-parse", "HEAD"]), head, "nothing changed");
+        let both = Keep::Items(vec![item("rule:git"), item("skill:pdf")]);
+        let kept = b.pull_keeping_with(&both, &mut |_| Ok(())).unwrap();
+        assert_eq!(kept.kept, [item("skill:pdf"), item("rule:git")]);
+        assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "b's edit\n");
+        assert!(read(&f.b.join("instructions/git.md")).ends_with("b's rule\n"));
+    }
+
+    #[cfg(unix)]
+    fn finish_keeping_now(b: &Repo) -> Option<Vec<Unkept>> {
+        b.finish_keeping(&crate::EngineLock::acquire(b.root()).unwrap()).unwrap()
+    }
+
+    /// A directory made at a kept path while it is restored stops the
+    /// restore safely: the directory stays, the kept version stays in
+    /// recovery with the command to bring it back, and nothing is left that
+    /// stops the next pull.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_in_the_way_of_a_restore_is_left_alone() {
+        let f = Fleet::new();
+        let b = repo(&f.b);
+        let (base, _) = kept_clash(&f);
+        let skill = f.b.join("personal/pdf/SKILL.md");
+        let err = b
+            .pull_keeping_with(&Keep::All, &mut |at| {
+                if at_skill(false)(&at) {
+                    fs::create_dir(&skill).unwrap();
+                    write(&skill.join("inside.md"), "a directory's file\n");
+                }
+                Ok(())
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`sk1ll recover adopt "), "{err}");
+        assert_eq!(read(&skill.join("inside.md")), "a directory's file\n");
+        assert_eq!(git(&f.b, &["rev-parse", "HEAD"]), base);
+        assert!(!keep::journal_exists(&b));
+        assert!(!f.b.join(".git/sk1ll-keep-stage").exists());
+        // Stopped once files moved: none is put back, each is reported.
+        assert!(!f.b.join("personal/pdf/notes.md").exists());
+        assert!(err.contains("An interrupted keep left your versions in recovery"), "{err}");
+        assert!(matches!(pull_now(&b).unwrap(), PullOutcome::Blocked { .. }));
+    }
+
+    /// Where an interrupted keep stops: each step a crash can fall on.
+    #[cfg(unix)]
+    #[cfg(unix)]
+    type StopPoint = (&'static str, Box<dyn Fn(&keep::Step) -> bool>);
+
+    #[cfg(unix)]
+    fn stop_points() -> Vec<StopPoint> {
+        let first = |step: keep::Step| move |at: &keep::Step| *at == step;
+        vec![
+            ("journal written", Box::new(first(keep::Step::Restore))),
+            (
+                "recovery entry journaled",
+                Box::new(|at: &keep::Step| matches!(at, keep::Step::Recorded(p) if p.ends_with("SKILL.md"))),
+            ),
+            (
+                "new file moved",
+                Box::new(|at: &keep::Step| matches!(at, keep::Step::Moved(p) if p.ends_with("notes.md"))),
+            ),
+            ("tracked file moved", Box::new(at_skill(false))),
+            ("baseline file staged", Box::new(first(keep::Step::Staged))),
+            ("baseline file published", Box::new(at_skill(true))),
+            ("before the pull", Box::new(first(keep::Step::Pull))),
+            ("after the pull", Box::new(first(keep::Step::Settle))),
+        ]
+    }
+
+    /// An interrupted keep, at every stop point, then a later edit and a
+    /// deletion by the user: settling adopts nothing and touches neither;
+    /// each kept version is reported in recovery; the index holds nothing
+    /// staged at kept paths; no staging is left, nor any pending pull.
+    #[cfg(unix)]
+    #[test]
+    fn an_interrupted_keep_leaves_your_versions_in_recovery_reported() {
+        for (point, stop) in stop_points() {
+            let f = Fleet::new();
+            let b = repo(&f.b);
+            let (base, remote) = kept_clash(&f);
+            let draft = b.draft().unwrap();
+            keep_stopping(&b, stop);
+            let (skill, notes) = (f.b.join("personal/pdf/SKILL.md"), f.b.join("personal/pdf/notes.md"));
+            write(&skill, "a later edit\n");
+            let _ = fs::remove_file(&notes);
+            let report = finish_keeping_now(&b).expect("a journal to report");
+            assert!(!keep::journal_exists(&b), "{point}");
+            assert!(!f.b.join(".git/sk1ll-keep-stage").exists(), "{point}");
+            assert!(!b.pull_pending().unwrap(), "{point}");
+            assert_eq!(read(&skill), "a later edit\n", "{point}: the later edit stands");
+            assert!(!notes.exists(), "{point}: the deletion stands");
+            assert_eq!(git(&f.b, &["diff", "--cached", "--name-only", "--", "personal/pdf"]), "", "{point}");
+            let head = git(&f.b, &["rev-parse", "HEAD"]);
+            assert!(head == base || head == remote, "{point}");
+            let ids: Vec<&String> = report.iter().filter_map(|u| u.entry.as_ref()).collect();
+            if point == "journal written" {
+                assert!(report.is_empty(), "{point}: nothing moved: {report:?}");
+                assert_eq!(b.draft().unwrap().len(), draft.len(), "{point}");
+                continue;
+            }
+            assert!(!ids.is_empty(), "{point}: {report:?}");
+            for id in ids {
+                let entry = crate::sync::displaced::get(id).unwrap();
+                assert!(entry.changed, "{point}: listed as your version");
+            }
+            // Not moved yet (not reached, or journaled only): SKILL.md stayed where it was, unreported.
+            let skill_reported = report.iter().any(|u| {
+                u.entry.as_ref().is_some_and(|id| crate::sync::displaced::get(id).unwrap().dest.ends_with("SKILL.md"))
+            });
+            let skill_moved = !["new file moved", "recovery entry journaled"].contains(&point);
+            assert_eq!(skill_reported, skill_moved, "{point}: {report:?}");
+            assert_eq!(b.keep_report().unwrap(), report, "{point}: saved until acted on");
+        }
+    }
+
+    /// Every kept version an interrupted keep reports comes back with
+    /// `recover adopt`, once its path holds no Draft change.
+    #[cfg(unix)]
+    #[test]
+    fn an_interrupted_keep_is_finished_by_hand_with_recover_adopt() {
+        let f = Fleet::new();
+        let b = repo(&f.b);
+        let (_, remote) = kept_clash(&f);
+        keep_stopping(&b, |at| *at == keep::Step::Settle);
+        let report = finish_keeping_now(&b).unwrap();
+        assert_eq!(git(&f.b, &["rev-parse", "HEAD"]), remote, "the pull side is done");
+        let lock = crate::EngineLock::acquire(b.root()).unwrap();
+        for id in report.iter().filter_map(|u| u.entry.as_ref()) {
+            crate::sync::displaced::adopt(&b, id, &lock).unwrap();
+        }
+        drop(lock);
+        assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "b's edit\n");
+        assert_eq!(read(&f.b.join("personal/pdf/notes.md")), "b's notes\n");
+    }
+
+    /// The pull's un-commit stages a committed clash: that staging is the
+    /// keep's own once journaled. Interrupted after that and before the keep
+    /// reset it, settling resets it while it is still exactly that; staged
+    /// since by the user, it is left as it is and reported. Interrupted
+    /// before it was journaled (after the file moved), its ownership is
+    /// uncertain: left as it is, and reported.
+    #[cfg(unix)]
+    #[test]
+    fn an_interrupted_keep_resets_only_its_own_staging() {
+        for (user_stages, journaled) in [(false, true), (true, true), (false, false)] {
+            let f = Fleet::new();
+            let (a, b) = (repo(&f.a), repo(&f.b));
+            write(&f.a.join("personal/pdf/SKILL.md"), "a's edit\n");
+            a.commit(&[item("skill:pdf")], "a", None).unwrap();
+            a.push().unwrap();
+            write(&f.b.join("personal/pdf/SKILL.md"), "b's edit\n");
+            b.commit(&[item("skill:pdf")], "b", None).unwrap();
+            b.fetch().unwrap();
+            match journaled {
+                true => keep_stopping(&b, |at| matches!(at, keep::Step::Owned(p) if p.ends_with("SKILL.md"))),
+                false => keep_stopping(&b, at_skill(false)),
+            }
+            let staged = || git(&f.b, &["diff", "--cached", "--name-only"]);
+            assert!(staged().contains("personal/pdf/SKILL.md"), "the un-commit's, not reset yet");
+            if user_stages {
+                write(&f.b.join("personal/pdf/SKILL.md"), "staged by the user\n");
+                git(&f.b, &["add", "personal/pdf/SKILL.md"]);
+            }
+            let report = finish_keeping_now(&b).unwrap();
+            let skill_staged = || staged().lines().any(|l| l == "personal/pdf/SKILL.md");
+            match (user_stages, journaled) {
+                (false, true) => assert!(!skill_staged(), "reset: it was the keep's own"),
+                (true, _) => {
+                    assert!(skill_staged(), "the user's staging stays");
+                    assert!(report.iter().any(|u| u.error.contains("was staged since the keep stopped")), "{report:?}");
+                }
+                (false, false) => {
+                    assert!(skill_staged(), "not journaled as its own: left as it is");
+                    assert!(report.iter().any(|u| u.error.contains("didn't record as its own")), "{report:?}");
+                }
+            }
+            assert!(report.iter().any(|u| u.entry.is_some()), "{report:?}");
+        }
+    }
+
+    /// A plain pull that turned a committed clash back into Draft staged it:
+    /// a later keep takes that staging as the operation's own; once the
+    /// user stages something else there, it is theirs, and refused.
+    #[cfg(unix)]
+    #[test]
+    fn keep_mine_tells_a_pull_s_staging_from_the_user_s() {
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        write(&f.a.join("personal/pdf/SKILL.md"), "a's edit\n");
+        a.commit(&[item("skill:pdf")], "a", None).unwrap();
+        a.push().unwrap();
+        write(&f.b.join("personal/pdf/SKILL.md"), "b's edit\n");
+        b.commit(&[item("skill:pdf")], "b", None).unwrap();
+        assert!(matches!(pull_now(&b).unwrap(), PullOutcome::Blocked { uncommitted, .. } if uncommitted.len() == 1));
+        assert!(
+            git(&f.b, &["diff", "--cached", "--name-only"]).contains("personal/pdf/SKILL.md"),
+            "staged by the pull"
+        );
+        write(&f.b.join("personal/pdf/SKILL.md"), "b's edit, staged again\n");
+        git(&f.b, &["add", "personal/pdf/SKILL.md"]);
+        let err = b.pull_keeping_with(&Keep::All, &mut |_| Ok(())).unwrap_err().to_string();
+        assert!(err.contains("has a staged change"), "{err}");
+        git(&f.b, &["restore", "--staged", "--", "personal/pdf/SKILL.md"]);
+        write(&f.b.join("personal/pdf/SKILL.md"), "b's edit\n");
+        // Committed and pulled once more: the pull's own staging again.
+        b.commit(&[item("skill:pdf")], "b again", None).unwrap();
+        assert!(matches!(pull_now(&b).unwrap(), PullOutcome::Blocked { .. }));
+        let kept = b.pull_keeping_with(&Keep::All, &mut |_| Ok(())).unwrap();
+        assert_eq!(kept.kept, [item("skill:pdf")]);
+        assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "b's edit\n");
+    }
+
+    /// A pull stopped right after its un-commit moved the branch, before it
+    /// recorded what it staged: a keep can't tell that staging from the
+    /// user's, so it refuses, and nothing is lost.
+    #[cfg(unix)]
+    #[test]
+    fn an_un_commit_stopped_before_recording_its_staging_counts_as_the_user_s() {
+        let f = Fleet::new();
+        let (a, b) = (repo(&f.a), repo(&f.b));
+        write(&f.a.join("personal/pdf/SKILL.md"), "a's edit\n");
+        a.commit(&[item("skill:pdf")], "a", None).unwrap();
+        a.push().unwrap();
+        write(&f.b.join("personal/pdf/SKILL.md"), "b's edit\n");
+        b.commit(&[item("skill:pdf")], "b", None).unwrap();
+        assert!(b.pull_crashing_at(pull::Before::Uncommitted).is_err());
+        assert!(!f.b.join(".git/sk1ll-uncommitted.json").exists(), "recorded only once the branch moved");
+        let err = b.pull_keeping_with(&Keep::All, &mut |_| Ok(())).unwrap_err().to_string();
+        assert!(err.contains("has a staged change"), "{err}");
+        assert_eq!(read(&f.b.join("personal/pdf/SKILL.md")), "b's edit\n");
+        assert!(git(&f.b, &["diff", "--cached", "--name-only"]).contains("personal/pdf/SKILL.md"));
+    }
+
+    /// An interrupted keep's report stays until the user acts: each version
+    /// adopted or discarded drops out, and the report goes with the last.
+    /// A recovery entry that can't be read stays listed, to check again.
+    #[cfg(unix)]
+    #[test]
+    fn an_interrupted_keep_s_report_stays_until_each_version_is_acted_on() {
+        let f = Fleet::new();
+        let b = repo(&f.b);
+        kept_clash(&f);
+        keep_stopping(&b, |at| *at == keep::Step::Settle);
+        let report = finish_keeping_now(&b).unwrap();
+        let ids: Vec<String> = report.iter().filter_map(|u| u.entry.clone()).collect();
+        assert_eq!(ids.len(), 2, "{report:?}");
+        let saved = f.b.join(".git/sk1ll-keep-report.json");
+        assert!(saved.exists());
+        assert_eq!(b.keep_report().unwrap(), report, "read again, still there");
+        // An entry that can't be read is not dropped.
+        let meta = crate::sync::displaced::get(&ids[0]).unwrap().path.with_file_name("entry.json");
+        let good = fs::read(&meta).unwrap();
+        fs::write(&meta, "not json").unwrap();
+        assert!(b.keep_report().unwrap().iter().any(|u| u.entry.as_ref() == Some(&ids[0])));
+        fs::write(&meta, good).unwrap();
+        let lock = crate::EngineLock::acquire(b.root()).unwrap();
+        crate::sync::displaced::adopt(&b, &ids[0], &lock).unwrap();
+        drop(lock);
+        let left = b.keep_report().unwrap();
+        assert!(
+            left.iter().all(|u| u.entry.as_ref() != Some(&ids[0]))
+                && left.iter().any(|u| u.entry.as_ref() == Some(&ids[1]))
+        );
+        crate::sync::displaced::discard(&ids[1]).unwrap();
+        assert!(b.keep_report().unwrap().iter().all(|u| u.entry.is_none()), "every version acted on; notes stay");
+        b.dismiss_keep_notes().unwrap();
+        assert!(!saved.exists(), "gone once every version was acted on and the notes dismissed");
+    }
+
+    /// Only an entry confirmed gone drops out of the report: a corrupt or
+    /// unreadable index record, or content that can't be read, keeps its id.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_recovery_entry_stays_in_the_report() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fleet::new();
+        let b = repo(&f.b);
+        kept_clash(&f);
+        keep_stopping(&b, |at| *at == keep::Step::Settle);
+        let report = finish_keeping_now(&b).unwrap();
+        let id = report.iter().find_map(|u| u.entry.clone()).unwrap();
+        let listed = || b.keep_report().unwrap().iter().any(|u| u.entry.as_ref() == Some(&id));
+        let record = crate::sync::displaced::root().unwrap().join(".index").join(&id);
+        let dir = crate::sync::displaced::get(&id).unwrap().path.parent().unwrap().to_path_buf();
+        let mode = |path: &Path, mode| fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        let good = fs::read(&record).unwrap();
+        fs::write(&record, "not json").unwrap();
+        assert!(listed(), "a corrupt index record");
+        fs::write(&record, &good).unwrap();
+        mode(&record, 0o000);
+        assert!(listed(), "an unreadable index record");
+        mode(&record, 0o600);
+        mode(&dir, 0o000);
+        assert!(listed(), "unreadable content");
+        mode(&dir, 0o700);
+        assert!(listed(), "readable again: still there");
+        crate::sync::displaced::discard(&id).unwrap();
+        assert!(!listed(), "confirmed gone: drops out");
+    }
+
+    /// Notes (no recovery entry) stay in the report through every read
+    /// until dismissed; versions in recovery stay through a dismissal.
+    #[cfg(unix)]
+    #[test]
+    fn report_notes_stay_until_dismissed() {
+        let f = Fleet::new();
+        let b = repo(&f.b);
+        kept_clash(&f);
+        keep_stopping(&b, |at| *at == keep::Step::Settle);
+        let report = finish_keeping_now(&b).unwrap();
+        let notes = report.iter().filter(|u| u.entry.is_none()).count();
+        assert_eq!(notes, 1, "ref.md, which the Draft deleted: {report:?}");
+        let ids: Vec<String> = report.iter().filter_map(|u| u.entry.clone()).collect();
+        let lock = crate::EngineLock::acquire(b.root()).unwrap();
+        crate::sync::displaced::adopt(&b, &ids[0], &lock).unwrap();
+        drop(lock);
+        crate::sync::displaced::discard(&ids[1]).unwrap();
+        for _ in 0..3 {
+            let left = b.keep_report().unwrap();
+            assert!(left.len() == 1 && left[0].entry.is_none(), "the note stays: {left:?}");
+        }
+        assert_eq!(b.dismiss_keep_notes().unwrap(), 1);
+        assert!(b.keep_report().unwrap().is_empty());
+        assert!(!f.b.join(".git/sk1ll-keep-report.json").exists());
+        assert_eq!(b.dismiss_keep_notes().unwrap(), 0);
+    }
+
+    /// Staging the user did at a kept path is refused before anything
+    /// changes, whatever it holds: staged as the file, staged differently,
+    /// or a staged removal with the file made again.
+    #[cfg(unix)]
+    #[test]
+    fn keep_mine_refuses_a_kept_path_the_user_staged() {
+        for case in ["same", "different", "removed"] {
+            let f = Fleet::new();
+            let b = repo(&f.b);
+            kept_clash(&f);
+            let rel = "personal/pdf/SKILL.md";
+            match case {
+                "same" => drop(git(&f.b, &["add", rel])),
+                "different" => {
+                    git(&f.b, &["add", rel]);
+                    write(&f.b.join(rel), "working copy\n");
+                }
+                _ => drop(git(&f.b, &["rm", "--cached", "--quiet", rel])),
+            }
+            let before = (git(&f.b, &["diff", "--cached", "--name-only"]), read(&f.b.join(rel)));
+            let head = git(&f.b, &["rev-parse", "HEAD"]);
+            let err = b.pull_keeping_with(&Keep::All, &mut |_| Ok(())).unwrap_err().to_string();
+            assert!(err.contains("has a staged change") && err.contains("restore --staged"), "{case}: {err}");
+            assert_eq!((git(&f.b, &["diff", "--cached", "--name-only"]), read(&f.b.join(rel))), before, "{case}");
+            assert_eq!(git(&f.b, &["rev-parse", "HEAD"]), head, "{case}");
+            assert!(!keep::journal_exists(&b), "{case}");
+            git(&f.b, &["restore", "--staged", "--", rel]);
+            b.pull_keeping_with(&Keep::All, &mut |_| Ok(())).unwrap();
+            assert_eq!(git(&f.b, &["diff", "--cached", "--name-only"]), "", "{case}");
+        }
+    }
+
+    #[test]
+    fn commands_in_messages_quote_paths_for_the_shell() {
+        assert_eq!(shell_quote("personal/pdf/SKILL.md"), "personal/pdf/SKILL.md");
+        assert_eq!(shell_quote("my notes/a b.md"), "'my notes/a b.md'");
+        assert_eq!(shell_quote("it's;$(x)"), "'it'\\''s;$(x)'");
+        assert_eq!(shell_quote("~/x"), "'~/x'");
+        assert_eq!(shell_quote(""), "''");
     }
 
     #[cfg(unix)]

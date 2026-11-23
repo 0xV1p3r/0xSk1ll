@@ -28,6 +28,18 @@ impl Daemon {
         Ok(result?)
     }
 
+    /// `POST /keep-report/dismiss-notes`: drops the notes of the keep
+    /// report (no recovery id to act on), on the user's word; returns how
+    /// many. Versions in recovery stay until adopted or discarded.
+    pub(crate) fn dismiss_keep_notes(&self, eng: &mut Engine) -> Result<usize> {
+        self.ensure_managed()?;
+        self.lock_repo(eng)?;
+        let dismissed = Repo::open_git_only(self.repo_root())?.dismiss_keep_notes()?;
+        self.reconcile(eng)?;
+        self.event(Event::Status);
+        Ok(dismissed)
+    }
+
     pub(super) fn find_conflict<'a>(actions: &'a [Action], t: &ConflictTarget) -> Result<&'a Action> {
         actions.iter().find(|a| a.kind == ActionKind::Conflict && matches_target(a, t)).ok_or_else(|| {
             Error::NotFound(format!("no conflict for `{}` in `{}` (see GET /conflicts)", t.name, t.harness))

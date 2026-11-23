@@ -297,6 +297,7 @@ mod tests {
             server_baseline: None,
             assignment_revision: 1,
             version: String::new(),
+            keep_report: Vec::new(),
             awaiting_assignment: false,
             auth_rejected_since: None,
             report: sk1ll_proto::MachineReport { baseline: Some("old".into()), ..Default::default() },

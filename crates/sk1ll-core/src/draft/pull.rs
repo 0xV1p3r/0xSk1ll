@@ -57,6 +57,9 @@ use worktree::{Content, Node, Outcome, Worktree};
 pub(super) enum Before {
     /// Unpushed commits are replayed; the last checks against the draft are next.
     Checks,
+    /// The branch moved back from unpushed commits that conflict; what the
+    /// un-commit staged is recorded next.
+    Uncommitted,
     /// The last checks passed; the journal is written next.
     Journal,
     /// The journal is written; the `n`th path, in the order pull goes
@@ -145,8 +148,11 @@ pub(super) fn pending(repo: &Repo) -> Result<bool> {
 }
 
 /// Puts the content of a pull's recovery entry back at its path, as a draft
-/// change. Only over a path without draft changes: what is there is in the
-/// baseline (and goes to the recovery area in turn), so nothing is lost.
+/// change. Only where nothing is, or over a path without draft changes:
+/// what is there is in the baseline (and goes to the recovery area in
+/// turn), so nothing is lost. A vacant path takes it whatever `HEAD` and
+/// the index say there: a Draft deletion, or a restore that stopped after
+/// moving the file aside (see [`super::keep`]), holds nothing to lose.
 pub(super) fn adopt(repo: &Repo, entry: &crate::sync::displaced::Entry) -> Result<()> {
     if pending(repo)? {
         return Err(Error::PullPending);
@@ -167,7 +173,7 @@ pub(super) fn adopt(repo: &Repo, entry: &crate::sync::displaced::Entry) -> Resul
             Some(_) => convert.holds(&node, tracked.as_ref(), path)?,
             None => node == Node::Missing,
         };
-        if !clean || !staged_as(staged, tracked.as_ref()) {
+        if node != Node::Missing && (!clean || !staged_as(staged, tracked.as_ref())) {
             return Err(Error::Invalid(format!(
                 "{} has local content or a staged change. Move it aside or restore `{}` before adopting `{}`",
                 entry.dest.display(),
@@ -176,6 +182,130 @@ pub(super) fn adopt(repo: &Repo, entry: &crate::sync::displaced::Entry) -> Resul
             )));
         }
         tree.adopt(path, &node, entry)
+    })
+}
+
+/// Writes `HEAD`'s version of each of `dests` where restore moved the
+/// Draft's into recovery, only where nothing is (see [`Worktree::place_new`]):
+/// returns the ones something new was at, left as they are.
+pub(super) fn place_baseline(
+    repo: &Repo,
+    dests: &[PathBuf],
+    staged: &mut dyn FnMut() -> Result<()>,
+) -> Result<Vec<PathBuf>> {
+    if dests.is_empty() {
+        return Ok(Vec::new());
+    }
+    with_pull(repo, |pull| {
+        let root = pull.root.canonicalize().at(&pull.root)?;
+        let head = rev(pull.git(), "HEAD")?.ok_or_else(|| Error::Invalid("there is no baseline to restore".into()))?;
+        let tree = Worktree::open(&pull.root, &pull.git_dir)?;
+        let convert = Convert::with_attributes(pull, None)?;
+        let mut taken = Vec::new();
+        for dest in dests {
+            let path = dest
+                .strip_prefix(&root)
+                .map_err(|_| Error::Invalid(format!("{} is outside {}", dest.display(), root.display())))?;
+            let Some(entry) = pull.entry_at(&head, path)? else { continue };
+            if !tree.place_new(path, &convert.content(&entry, path)?, staged)? {
+                taken.push(dest.clone());
+            }
+        }
+        Ok(taken)
+    })
+}
+
+/// The index entries (mode and object id, or none) pull's un-commit left
+/// at the paths of the commits it turned back into Draft, by absolute path
+/// (git-quoted): the operation's staging, not the user's, while the entry
+/// is still exactly that.
+#[derive(Default, Serialize, Deserialize)]
+struct Uncommitted(BTreeMap<String, Option<(String, String)>>);
+
+impl Uncommitted {
+    const FILE: &'static str = "sk1ll-uncommitted.json";
+
+    fn load(git_dir: &Path) -> Result<Self> {
+        let path = git_dir.join(Self::FILE);
+        match fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str(&text).map_err(|e| Error::Parse { path, message: e.to_string() }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e).at(path),
+        }
+    }
+
+    fn save(&self, git_dir: &Path) -> Result<()> {
+        let body = serde_json::to_vec_pretty(self).map_err(|e| Error::Invalid(e.to_string()))?;
+        crate::config_file::replace_private(&git_dir.join(Self::FILE), &body)
+    }
+}
+
+/// The mode and object id of the first `ls-files -s` record in `out`.
+fn index_fields(out: &[u8]) -> Option<(String, String)> {
+    let record = out.split(|b| *b == 0).find(|r| !r.is_empty())?;
+    let tab = record.iter().position(|b| *b == b'\t')?;
+    let mut fields = std::str::from_utf8(&record[..tab]).ok()?.split(' ');
+    Some((fields.next()?.to_string(), fields.next()?.to_string()))
+}
+
+/// What pull's un-commit staged, by absolute path (see [`Uncommitted`]).
+pub(super) fn uncommitted_staging(repo: &Repo) -> Result<BTreeMap<PathBuf, Option<(String, String)>>> {
+    with_pull(repo, |pull| {
+        let staged = Uncommitted::load(&pull.git_dir)?;
+        Ok(staged
+            .0
+            .into_iter()
+            .filter_map(|(quoted, entry)| Some((path_from_bytes(&super::unquote_path(&quoted)?), entry)))
+            .collect())
+    })
+}
+
+/// Removes what a keep's restore staged and never published (see
+/// [`Worktree::place_new`]): a copy of a Baseline file, in a directory of
+/// the keep's own.
+pub(super) fn clear_keep_stage(git_dir: &Path) -> Result<()> {
+    let stage = worktree::keep_stage(git_dir);
+    let slot = stage.join(worktree::KEEP_SLOT);
+    for removed in [fs::remove_file(&slot).at(&slot), fs::remove_dir(&stage).at(&stage)] {
+        match removed {
+            Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {}
+            result => result?,
+        }
+    }
+    Ok(())
+}
+
+/// Takes the file at `dest` out of the working tree, as a Draft deletion,
+/// into a recovery entry of its own: only while it holds what `HEAD` has,
+/// with nothing staged, so what goes is in the Baseline. Nothing there is
+/// done already.
+pub(super) fn take_out(repo: &Repo, dest: &Path) -> Result<()> {
+    if pending(repo)? {
+        return Err(Error::PullPending);
+    }
+    with_pull(repo, |pull| {
+        let root = pull.root.canonicalize().at(&pull.root)?;
+        let path = dest
+            .strip_prefix(&root)
+            .map_err(|_| Error::Invalid(format!("{} is outside {}", dest.display(), root.display())))?;
+        let tree = Worktree::open(&pull.root, &pull.git_dir)?;
+        let node = tree.read(path)?;
+        if node == Node::Missing {
+            return Ok(());
+        }
+        let head = rev(pull.git(), "HEAD")?;
+        let tracked = head.as_deref().map(|head| pull.entry_at(head, path)).transpose()?.flatten();
+        let index = pull.index()?;
+        let staged = index.get(path).map(Vec::as_slice).unwrap_or_default();
+        let convert = Convert::with_attributes(pull, None)?;
+        if tracked.is_none() || !convert.holds(&node, tracked.as_ref(), path)? || !staged_as(staged, tracked.as_ref()) {
+            return Err(Error::Invalid(format!(
+                "{} has local content or a staged change. Move it aside or restore `{}`",
+                dest.display(),
+                pull.item(path),
+            )));
+        }
+        tree.take_out(path, &node)
     })
 }
 
@@ -442,7 +572,20 @@ impl Pull<'_> {
         let commits: Vec<String> = log.lines().map(str::to_string).collect();
         let reference = format!("refs/heads/{branch}");
         let message = "sk1ll: pull turns unpushed commits that conflict with the new baseline back into Draft";
+        // What the index holds at the paths these commits change is staged
+        // by this un-commit, not by the user: recorded, so a keep can tell,
+        // once the branch has moved. A stop in between leaves it unrecorded,
+        // which a keep then refuses as the user's: never the other way round.
+        let changed = self.git().args(["diff", "--name-only", "-z", "--no-renames", &clash.parent, head]).run()?;
+        let paths: Vec<PathBuf> = crate::git::split_paths(&changed).collect();
+        let mut staged = Uncommitted::load(&self.git_dir)?;
+        for path in &paths {
+            let out = self.git().literal().args(["ls-files", "-s", "-z", "--"]).arg(path).run()?;
+            staged.0.insert(super::quote_path(&crate::git::path_bytes(&self.root.join(path))), index_fields(&out));
+        }
         self.git().args(["update-ref", "--no-deref", "-m", message, &reference, &clash.parent, head]).run()?;
+        hook(Before::Uncommitted)?;
+        staged.save(&self.git_dir)?;
         let (outcome, displaced) = self.update(false, hook)?;
         let outcome = match outcome {
             PullOutcome::Blocked { baseline, mut items, uncommitted } => {

@@ -312,6 +312,18 @@ impl Daemon {
         let journal =
             if pending { Some(repo.pending_pull_baseline().ok().flatten().unwrap_or_default()) } else { None };
         let pull = self.pull_after_reconcile(&root, finished, journal);
+        // A "keep mine" that stopped half-way becomes its saved report;
+        // nothing of it is adopted. The report is read on every reconcile.
+        if !pending && let Err(e) = repo.finish_keeping(lock) {
+            outcome.errors.push(format!("keep: {e}"));
+        }
+        let keep_report = match repo.keep_report() {
+            Ok(report) => Some(report),
+            Err(e) => {
+                outcome.errors.push(format!("keep report: {e}"));
+                None
+            }
+        };
         // Sync waits for every item to have an Item ID; the report doesn't.
         let mut ids_ready = true;
         if !pending && reviewed.is_none() {
@@ -429,6 +441,9 @@ impl Daemon {
                 }
             },
             |v| {
+                if let Some(report) = keep_report {
+                    v.keep_report = report;
+                }
                 v.repo_ready = true;
                 v.has_origin = has_origin;
                 v.report = report;

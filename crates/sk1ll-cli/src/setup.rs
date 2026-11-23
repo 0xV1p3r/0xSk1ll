@@ -164,8 +164,8 @@ fn choose_harnesses(input: &mut Input, machine_config: &Path, session: &Session,
         }
         if !enabled && !preview.placed.is_empty() {
             println!(
-                "  what sk1ll placed in {0} stays there, no longer managed; to take it out, enable {0} again, run \
-                 `sk1ll assign {0} --all off` and `sk1ll sync`, then disable it",
+                "  what sk1ll placed in {0} stays there, no longer managed; to take it out, enable {0} again, then run \
+                 `sk1ll harnesses disable {0} --take-out`",
                 choice.name
             );
         }

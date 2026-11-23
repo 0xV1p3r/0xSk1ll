@@ -796,7 +796,8 @@ fn apply_instructions(repo: &Repo, action: &Action, content: Option<&str>, expec
     }
     let dest = &action.dest;
     recover_file_siblings(&action.harness, dest)?;
-    let text = instructions::read_optional(dest)?.unwrap_or_default();
+    let existing = instructions::read_optional(dest)?;
+    let text = existing.clone().unwrap_or_default();
     let block = instructions::find_block(&text, dest)?;
     if block.as_ref().map(|b| hash_str(&b.inner)).as_deref() != expected {
         return Err(changed_since_plan(dest));
@@ -817,6 +818,20 @@ fn apply_instructions(repo: &Repo, action: &Action, content: Option<&str>, expec
         baseline: None,
     };
     let spliced = instructions::splice(&text, block.as_ref(), content);
+    // A file sync created stays sync's only while it holds exactly what
+    // sync last wrote: anything else (an edit anywhere, a file replaced)
+    // makes it the user's for good, and it is never removed.
+    let created = displaced::created_block(dest)?;
+    let owned = match &created {
+        Some(created) => existing.is_some() && !is_symlink(dest) && created.is(dest)?,
+        None => false,
+    };
+    if created.is_some() && !owned {
+        displaced::record_created_block(dest, None)?;
+    }
+    if let (None, true, Some(created)) = (content, owned && spliced.trim().is_empty(), &created) {
+        return remove_created_block(repo, &action.harness, dest, created, unchanged);
+    }
     // Splicing keeps every byte outside the block. A block that is still
     // what sk1ll wrote (or none) is sk1ll's own, so the rewrite displaces
     // nothing anyone wrote and leaves no recovery entry; a forced rewrite
@@ -825,7 +840,61 @@ fn apply_instructions(repo: &Repo, action: &Action, content: Option<&str>, expec
         false => OldCopy::DropIfIntact,
         true => OldCopy::KeepMarked,
     };
-    replace_file(dest, &spliced, unchanged, displace, old)?.map_or(Ok(()), Err)
+    let (displaced, published) = replace_file_published(dest, &spliced, unchanged, displace, old)?;
+    // Recorded after the write: a crash in between leaves no record, and
+    // the file stays, as one that sync didn't create would.
+    if (existing.is_none() || owned) && !is_symlink(dest) {
+        let created =
+            published.map(|(file, payload)| displaced::CreatedBlock { written: hash_str(&spliced), file, payload });
+        displaced::record_created_block(dest, created.as_ref())?;
+    }
+    displaced.map_or(Ok(()), Err)
+}
+
+fn is_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+}
+
+/// Takes out a block instructions file sync created once its block is the
+/// last of it: under the directory's lock, only while it is still the very
+/// file sync published, unchanged (identity, text, bytes and mode), and
+/// into the recovery area as every removal goes, so a write that races it
+/// is kept. The file is checked once more where it was moved to: if it
+/// isn't sync's after all, it goes back (or, if something took its place,
+/// stays in recovery for good), and nothing is removed.
+fn remove_created_block(
+    repo: &Repo,
+    harness: &str,
+    dest: &Path,
+    created: &displaced::CreatedBlock,
+    unchanged: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let holder = dest.parent().ok_or_else(|| Error::Invalid(format!("{} has no parent", dest.display())))?;
+    let _lock = DirLock::acquire(holder)?;
+    unchanged()?;
+    if !created.is(dest)? {
+        return Err(changed_since_plan(dest));
+    }
+    let kind = displaced::Kind::Instructions;
+    // Its backup holds only what sync wrote: pruned once unchanged and old enough.
+    let payload = Some(created.payload.as_str());
+    let mut held =
+        displaced::Displacing::begin(Some(repo), kind, harness, dest, Some(&created.written), payload, holder)?;
+    #[cfg(test)]
+    hook(Hook::BeforeSwap, dest);
+    if let Err(e) = held.take(dest) {
+        held.abandon();
+        return Err(e);
+    }
+    #[cfg(test)]
+    hook(Hook::AfterAside, dest);
+    if !created.is(&held.content())? {
+        held.put_back()?;
+        return Err(changed_since_plan(dest));
+    }
+    let displaced = held.finish(false)?;
+    displaced::record_created_block(dest, None)?;
+    displaced.map_or(Ok(()), Err)
 }
 
 /// What [`replace_file`] does with the recovery entry of the file it replaced.
@@ -1255,6 +1324,21 @@ fn replace_file(
     displace: Displace,
     old: OldCopy,
 ) -> Result<Option<Error>> {
+    replace_file_published(path, text, unchanged, displace, old).map(|(displaced, _)| displaced)
+}
+
+/// The identity and payload fingerprint of a file sync published.
+type Published = (FileId, String);
+
+/// [`replace_file`], also returning the identity and payload fingerprint
+/// of the file it published, read from the staged file before the rename.
+fn replace_file_published(
+    path: &Path,
+    text: &str,
+    unchanged: impl FnOnce() -> Result<()>,
+    displace: Displace,
+    old: OldCopy,
+) -> Result<(Option<Error>, Option<Published>)> {
     let real = match fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_symlink() => fs::canonicalize(path).at(path)?,
         _ => path.to_path_buf(),
@@ -1269,6 +1353,11 @@ fn replace_file(
     let fail = |e: Error| {
         let _ = fs::remove_file(&tmp);
         Err(e)
+    };
+    let published = match (rule_identity(&tmp), hash_payload(&tmp)) {
+        (Ok(Some(file)), Ok(payload)) => Some((file, payload)),
+        (Err(e), _) | (_, Err(e)) => return fail(e),
+        _ => None,
     };
     #[cfg(test)]
     hook(Hook::BeforeSwap, path);
@@ -1316,12 +1405,13 @@ fn replace_file(
     }
     #[cfg(test)]
     hook(Hook::AfterSwap, path);
-    let Some(held) = held else { return Ok(None) };
-    match old {
+    let Some(held) = held else { return Ok((None, published)) };
+    let displaced = match old {
         OldCopy::Keep => held.finish(false),
         OldCopy::DropIfIntact => held.finish_owned(),
         OldCopy::KeepMarked => held.finish_kept().map(|()| None),
-    }
+    }?;
+    Ok((displaced, published))
 }
 
 /// [`place`], with something at `to` reported as a change since the plan.
@@ -2429,6 +2519,45 @@ pub mod displaced {
         remove_if_there(&pending)
     }
 
+    /// What sync last wrote to a block instructions file it created: the
+    /// hash of the whole text, and the file it published: its identity and
+    /// payload fingerprint (bytes and mode).
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub(crate) struct CreatedBlock {
+        pub(crate) written: String,
+        pub(crate) file: FileId,
+        pub(crate) payload: String,
+    }
+
+    impl CreatedBlock {
+        /// Whether `path` is still the very file sync published, unchanged.
+        pub(super) fn is(&self, path: &Path) -> Result<bool> {
+            Ok(rule_identity(path)? == Some(self.file)
+                && fingerprint(Kind::Instructions, path)?.as_deref() == Some(self.written.as_str())
+                && hash_payload(path)? == self.payload)
+        }
+    }
+
+    /// What sync last wrote to the block instructions file at `dest`, if
+    /// sync created it (see [`record_created_block`]).
+    pub(super) fn created_block(dest: &Path) -> Result<Option<CreatedBlock>> {
+        read_placement::<CreatedBlock>(&placement_path(Kind::Instructions, dest)?)
+    }
+
+    /// Records that sync created the block instructions file at `dest`
+    /// and last published `created` there; `None` forgets it, for good.
+    pub(super) fn record_created_block(dest: &Path, created: Option<&CreatedBlock>) -> Result<()> {
+        let path = placement_path(Kind::Instructions, dest)?;
+        match created {
+            Some(created) => {
+                make_dirs(path.parent().unwrap())?;
+                let bytes = serde_json::to_vec(created).map_err(|e| Error::Invalid(e.to_string()))?;
+                crate::config_file::replace_private(&path, &bytes)
+            }
+            None => remove_if_there(&path),
+        }
+    }
+
     fn read_placement<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
         crate::config_file::read_text(path, false)?
             .map(|text| {
@@ -2527,11 +2656,63 @@ pub mod displaced {
     }
 
     pub fn get(id: &str) -> Result<Entry> {
+        find(id)?.ok_or_else(|| Error::Invalid(format!("no displaced entry `{id}`")))
+    }
+
+    /// [`get`], with `None` only for an entry confirmed gone (adopted or
+    /// discarded): no index record and no legacy directory, no directory
+    /// where the record points, or no content in it. Anything that can't
+    /// be read (the record, the directory, the content, the metadata) is
+    /// an error, so a caller never takes an unreadable entry for a gone one.
+    pub fn find(id: &str) -> Result<Option<Entry>> {
         let root = root()?;
-        match locate(&root, id).map(|dir| load(&dir)).transpose()?.flatten() {
-            Some((meta, path)) => entry(id.to_string(), meta, path),
-            None => Err(Error::Invalid(format!("no displaced entry `{id}`"))),
+        let Some(dir) = locate_checked(&root, id)? else { return Ok(None) };
+        let content = dir.join(CONTENT);
+        match fs::symlink_metadata(&content) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).at(&content),
+            Ok(_) => {}
         }
+        let meta_path = dir.join(META);
+        let text = fs::read_to_string(&meta_path).at(&meta_path)?;
+        let meta: Meta = serde_json::from_str(&text)
+            .map_err(|e| Error::Parse { path: meta_path.clone(), message: e.to_string() })?;
+        if meta.version != VERSION {
+            return Err(Error::Invalid(format!("recovery entry `{id}` is of another version of sk1ll")));
+        }
+        entry(id.to_string(), meta, content).map(Some)
+    }
+
+    /// [`locate`] for [`find`]: `None` only where the entry is confirmed
+    /// gone; a record or directory that can't be read is an error.
+    fn locate_checked(root: &Path, id: &str) -> Result<Option<PathBuf>> {
+        if !valid_id(id) {
+            return Ok(None);
+        }
+        let record = root.join(INDEX).join(id);
+        let text = match fs::read_to_string(&record) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let legacy = root.join(id);
+                return match fs::symlink_metadata(&legacy) {
+                    Ok(m) if m.is_dir() => Ok(Some(legacy)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Ok(_) => Err(Error::Invalid(format!("{} is not a recovery entry", legacy.display()))),
+                    Err(e) => Err(e).at(&legacy),
+                };
+            }
+            Err(e) => return Err(e).at(&record),
+        };
+        let IndexPath(dir) =
+            serde_json::from_str(&text).map_err(|e| Error::Parse { path: record.clone(), message: e.to_string() })?;
+        match fs::symlink_metadata(&dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).at(&dir),
+            Ok(_) => {}
+        }
+        indexed(root, id).map(Some).ok_or_else(|| {
+            Error::Invalid(format!("the recovery index record {} is not a recovery entry", record.display()))
+        })
     }
 
     /// Deletes an entry and its content for good, whatever it holds: the
@@ -3104,7 +3285,7 @@ pub mod displaced {
 
     /// What sync compares content by: a skill as [`observe_skill`] sees it,
     /// a file by the hash of its text.
-    pub(super) fn fingerprint(kind: Kind, path: &Path) -> Result<Option<String>> {
+    pub(crate) fn fingerprint(kind: Kind, path: &Path) -> Result<Option<String>> {
         match kind {
             Kind::Skill => Ok(observe_skill(path)?.state),
             Kind::Rule => super::rule_state(path),
@@ -4982,8 +5163,7 @@ mod tests {
 
     /// Rewrites of a block instructions file that only replace what sk1ll
     /// wrote (a rule toggled off and on, a rule changed) keep every byte
-    /// outside the block and leave no recovery entry, also when the block
-    /// is removed and the file left empty. A forced rewrite of a block
+    /// outside the block and leave no recovery entry. A forced rewrite of a block
     /// edited by hand keeps the old file for good, marked changed.
     #[test]
     fn rewriting_an_owned_block_leaves_no_recovery_entry() {
@@ -4998,7 +5178,10 @@ mod tests {
         sync(&assignment, false);
         assignment.set_rule("h", &rule_id(&repo, "git"), false);
         sync(&assignment, false);
-        assert_eq!(fs::read_to_string(&dest).unwrap(), "", "the block is gone");
+        assert!(!dest.exists(), "sync created it, and its block was all of it");
+        let entries = displaced::list().unwrap();
+        assert!(entries.len() == 1 && !entries[0].changed, "taken out into recovery: {entries:?}");
+        assert_eq!(displaced::prune_older_than(Duration::ZERO).unwrap().len(), 1);
         assignment.set_rule("h", &rule_id(&repo, "git"), true);
         sync(&assignment, false);
         write(&dest, &format!("# Mine\n\n{}", fs::read_to_string(&dest).unwrap()));
@@ -5016,6 +5199,136 @@ mod tests {
         assert!(entries.len() == 1 && entries[0].changed, "{entries:?}");
         assert_eq!(fs::read_to_string(&entries[0].path).unwrap(), edited);
         assert!(displaced::prune_older_than(Duration::ZERO).unwrap().is_empty());
+    }
+
+    /// Turning every rule off for a block file: one sync created and that
+    /// holds nothing but its block is taken out; any other stays, emptied
+    /// of the block.
+    #[test]
+    fn an_emptied_block_file_goes_only_if_sync_created_it_and_nobody_touched_it() {
+        let toggle = |repo: &Repo, harnesses: &BTreeMap<String, Harness>, on: bool| {
+            let mut assignment = Assignment::default();
+            assignment.set_rule("h", &rule_id(repo, "git"), on);
+            for action in plan(repo, harnesses, &assignment, PlanOptions::default()).unwrap() {
+                apply(repo, &action).unwrap();
+            }
+        };
+        // Created, then emptied: removed, into recovery.
+        let (tmp, repo, harnesses, dest) = instructions_setup(InstructionsFormat::Block);
+        let _root = displaced::test_root(&tmp.path().join("recovery"));
+        toggle(&repo, &harnesses, true);
+        assert!(fs::read_to_string(&dest).unwrap().contains("Use CC."));
+        toggle(&repo, &harnesses, false);
+        assert!(!dest.exists());
+        let entries = displaced::list().unwrap();
+        assert!(entries.len() == 1 && entries[0].dest == dest && !entries[0].changed, "{entries:?}");
+        assert!(displaced::created_block(&dest).unwrap().is_none(), "the record goes with it");
+
+        // There before sync wrote to it (empty): kept.
+        let (tmp, repo, harnesses, dest) = instructions_setup(InstructionsFormat::Block);
+        let _root = displaced::test_root(&tmp.path().join("recovery"));
+        write(&dest, "");
+        toggle(&repo, &harnesses, true);
+        toggle(&repo, &harnesses, false);
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "");
+
+        // Edited by the user after sync created it (whitespace only): kept for good.
+        let (tmp, repo, harnesses, dest) = instructions_setup(InstructionsFormat::Block);
+        let _root = displaced::test_root(&tmp.path().join("recovery"));
+        toggle(&repo, &harnesses, true);
+        write(&dest, &format!("\n{}", fs::read_to_string(&dest).unwrap()));
+        toggle(&repo, &harnesses, false);
+        assert!(dest.exists() && fs::read_to_string(&dest).unwrap().trim().is_empty(), "kept, emptied of the block");
+        toggle(&repo, &harnesses, true);
+        toggle(&repo, &harnesses, false);
+        assert!(dest.exists(), "once the user's, always the user's");
+
+        // Text added outside the block: kept, with that text.
+        let (tmp, repo, harnesses, dest) = instructions_setup(InstructionsFormat::Block);
+        let _root = displaced::test_root(&tmp.path().join("recovery"));
+        toggle(&repo, &harnesses, true);
+        write(&dest, &format!("# Mine\n\n{}", fs::read_to_string(&dest).unwrap()));
+        toggle(&repo, &harnesses, false);
+        assert_eq!(fs::read_to_string(&dest).unwrap().trim(), "# Mine");
+        assert!(displaced::list().unwrap().is_empty());
+    }
+
+    /// The record is of the very file sync published: a file of the user's
+    /// put in its place with the same text, or the same file given another
+    /// mode, is the user's, and only its block is taken out.
+    #[cfg(unix)]
+    #[test]
+    fn an_emptied_block_file_replaced_or_rechmodded_by_the_user_stays() {
+        use std::os::unix::fs::PermissionsExt;
+        let toggle = |repo: &Repo, harnesses: &BTreeMap<String, Harness>, on: bool| {
+            let mut assignment = Assignment::default();
+            assignment.set_rule("h", &rule_id(repo, "git"), on);
+            for action in plan(repo, harnesses, &assignment, PlanOptions::default()).unwrap() {
+                apply(repo, &action).unwrap();
+            }
+        };
+        for case in ["replaced", "chmod"] {
+            let (tmp, repo, harnesses, dest) = instructions_setup(InstructionsFormat::Block);
+            let _root = displaced::test_root(&tmp.path().join("recovery"));
+            toggle(&repo, &harnesses, true);
+            let text = fs::read_to_string(&dest).unwrap();
+            match case {
+                "replaced" => {
+                    let mine = tmp.path().join("mine.md");
+                    write(&mine, &text);
+                    fs::rename(&mine, &dest).unwrap();
+                }
+                _ => fs::set_permissions(&dest, fs::Permissions::from_mode(0o600)).unwrap(),
+            }
+            assert_eq!(fs::read_to_string(&dest).unwrap(), text, "{case}: same text");
+            toggle(&repo, &harnesses, false);
+            assert!(dest.exists(), "{case}: the user's file stays");
+            assert!(displaced::created_block(&dest).unwrap().is_none(), "{case}: and is the user's for good");
+        }
+    }
+
+    /// The removal checks the file it moved aside too: one that isn't what
+    /// sync published goes back, and nothing is removed.
+    #[cfg(unix)]
+    #[test]
+    fn a_created_block_file_swapped_during_its_removal_goes_back() {
+        let (tmp, repo, harnesses, dest) = instructions_setup(InstructionsFormat::Block);
+        let _root = displaced::test_root(&tmp.path().join("recovery"));
+        let mut assignment = Assignment::default();
+        apply(&repo, &plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap()[0]).unwrap();
+        let text = fs::read_to_string(&dest).unwrap();
+        assignment.set_rule("h", &rule_id(&repo, "git"), false);
+        let actions = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
+        let swap = {
+            let (dest, mine) = (dest.clone(), tmp.path().join("mine.md"));
+            move |_: &Path| {
+                write(&mine, &text);
+                fs::rename(&mine, &dest).unwrap();
+            }
+        };
+        assert!(with_hook(Hook::BeforeSwap, swap, || apply(&repo, &actions[0])).is_err());
+        assert!(dest.exists(), "put back");
+        assert!(displaced::list().unwrap().is_empty(), "{:?}", displaced::list().unwrap());
+    }
+
+    /// A write that lands while sync takes the file out is never lost: the
+    /// file is put back, or kept in recovery, changed.
+    #[test]
+    fn a_write_racing_the_removal_of_a_created_block_file_is_kept() {
+        let (tmp, repo, harnesses, dest) = instructions_setup(InstructionsFormat::Block);
+        let _root = displaced::test_root(&tmp.path().join("recovery"));
+        let mut assignment = Assignment::default();
+        apply(&repo, &plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap()[0]).unwrap();
+        assignment.set_rule("h", &rule_id(&repo, "git"), false);
+        let actions = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
+        assert_eq!(actions[0].kind, ActionKind::Remove);
+        let late = {
+            let dest = dest.clone();
+            move |_: &Path| write(&dest, "Late edit.\n")
+        };
+        assert!(with_hook(Hook::BeforeSwap, late, || apply(&repo, &actions[0])).is_err());
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "Late edit.\n", "left where it was");
+        assert!(displaced::created_block(&dest).unwrap().is_some(), "not forgotten: nothing was removed");
     }
 
     #[test]

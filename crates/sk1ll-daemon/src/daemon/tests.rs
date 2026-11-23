@@ -7,7 +7,7 @@ use super::assignment::newer;
 use super::pull::is_rejected_push;
 use super::read::{DESCRIPTION_CAP, parse_batch, small_blob};
 use super::*;
-use crate::client::{ChangeKind, ConflictTarget, DraftEntry};
+use crate::client::{ChangeKind, ConflictTarget, DraftEntry, HarnessChangeRequest};
 use crate::state::PullState;
 use sk1ll_core::ItemRef;
 use sk1ll_core::git::plumbing;
@@ -1649,4 +1649,251 @@ async fn a_starting_daemon_writes_back_nothing_it_loaded() {
     assert_eq!((applied.revision, &applied.assignment), (base + 1, &saved));
     let stored = state::load_snapshot(&record, None).unwrap().unwrap();
     assert_eq!((stored.revision, &stored.assignment), (base + 1, &saved));
+}
+
+/// `POST /harnesses/take-out` turns the harness's items off, lets sync take
+/// out what it placed, and only then disables the harness; a stale preview
+/// turns nothing off, and a removal that fails leaves `machine.toml` as it
+/// is and the items off, so a retry finishes it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn take_out_disables_a_harness_only_once_its_placements_are_gone() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let d = standalone_with_pdf(dir.path());
+    add_harnesses(&d, &["h"]);
+    d.write_assignment(harness_toggle(true)).await.unwrap();
+    let skills = d.cfg.machine_config.with_file_name("h");
+    assert!(skills.join("pdf/SKILL.md").exists());
+    let request = |fingerprint: Option<String>| HarnessChangeRequest {
+        change: sk1ll_core::HarnessChange::Disable { name: "h".into() },
+        fingerprint,
+    };
+    let preview = d.preview_harness(&request(None).change).unwrap();
+    assert_eq!(preview.placed.iter().filter(|p| p.kind == "remove").count(), 1, "{preview:?}");
+    let enabled = || d.harnesses().unwrap().iter().any(|h| h.name == "h");
+
+    let stale = d.take_out_harness(request(Some("stale".into()))).await.unwrap_err();
+    assert!(stale.to_string().contains("preview again"), "{stale}");
+    assert!(d.applied().unwrap().assignment.harness("h").new_skills_default, "nothing turned off");
+
+    std::fs::set_permissions(&skills, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let failed = d.take_out_harness(request(Some(preview.fingerprint.clone()))).await.unwrap();
+    std::fs::set_permissions(&skills, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!failed.applied && failed.left.len() == 1 && !failed.errors.is_empty(), "{failed:?}");
+    assert!(enabled(), "machine.toml unchanged");
+    assert!(!d.applied().unwrap().assignment.harness("h").new_skills_default, "the items stay off");
+
+    let done = d.take_out_harness(request(Some(preview.fingerprint))).await.unwrap();
+    assert!(done.applied && done.left.is_empty(), "{done:?}");
+    assert_eq!(done.taken_out.len(), 1);
+    assert!(!skills.join("pdf").exists(), "taken out");
+    assert!(!enabled(), "disabled");
+}
+
+/// Only a "keep mine" run moves a Draft file into recovery: a Blocked pull
+/// state on the edited item, without a keep journal, leaves every
+/// reconcile's hands off the Draft.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blocked_reconcile_without_a_keep_leaves_the_draft_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = standalone_with_pdf(dir.path());
+    let skill = d.repo_root().join("personal/pdf/SKILL.md");
+    std::fs::write(&skill, "my edit\n").unwrap();
+    let pdf = ItemRef::Skill("pdf".into());
+    d.note(|lc| lc.set_pull(PullState::Blocked { baseline: "f00d".repeat(10), items: vec![pdf.clone()] }));
+    for _ in 0..3 {
+        d.blocking(|d, eng| d.reconcile(eng).map(drop)).await.unwrap();
+    }
+    assert_eq!(std::fs::read_to_string(&skill).unwrap(), "my edit\n");
+    let own: Vec<_> = sync::displaced::list().unwrap().into_iter().filter(|e| e.dest.starts_with(dir.path())).collect();
+    assert!(own.is_empty(), "{own:?}");
+    assert!(d.snapshot().draft().unwrap().iter().any(|e| e.item == pdf));
+}
+
+/// A standalone daemon with harness `h` holding a copy of `pdf`, and the
+/// request that disables `h` after taking it out, as previewed.
+async fn placed_in_h(dir: &Path) -> (Arc<Daemon>, std::path::PathBuf, HarnessChangeRequest) {
+    let d = standalone_with_pdf(dir);
+    add_harnesses(&d, &["h"]);
+    d.write_assignment(harness_toggle(true)).await.unwrap();
+    let skills = d.cfg.machine_config.with_file_name("h");
+    assert!(skills.join("pdf/SKILL.md").exists());
+    let change = sk1ll_core::HarnessChange::Disable { name: "h".into() };
+    let fingerprint = Some(d.preview_harness(&change).unwrap().fingerprint);
+    (d, skills, HarnessChangeRequest { change, fingerprint })
+}
+
+fn h_enabled(d: &Daemon) -> bool {
+    d.harnesses().unwrap().iter().any(|h| h.name == "h")
+}
+
+/// A scan that can't list what is placed is not an empty harness: nothing
+/// changes in `machine.toml`, the scan error is reported, the items stay off.
+#[tokio::test(flavor = "multi_thread")]
+async fn take_out_needs_a_complete_scan_before_it_changes_machine_toml() {
+    let dir = tempfile::tempdir().unwrap();
+    let (d, skills, request) = placed_in_h(dir.path()).await;
+    let index = skills.join(".sk1ll-state/index.json");
+    assert!(index.exists());
+    std::fs::write(&index, "not an index").unwrap();
+    let failed = d.take_out_harness(request).await.unwrap();
+    assert!(!failed.applied, "{failed:?}");
+    assert!(failed.errors.iter().any(|e| e.contains("Could not list old placements")), "{failed:?}");
+    assert!(h_enabled(&d), "machine.toml unchanged");
+    assert!(!d.applied().unwrap().assignment.harness("h").new_skills_default, "the items stay off");
+}
+
+/// A hand edit of `machine.toml` while a take-out runs: nothing changes
+/// there, and the errors say what was already done.
+#[tokio::test(flavor = "multi_thread")]
+async fn take_out_reports_what_it_did_when_machine_toml_changed_meanwhile() {
+    let dir = tempfile::tempdir().unwrap();
+    let (d, skills, request) = placed_in_h(dir.path()).await;
+    let config = d.cfg.machine_config.clone();
+    lock(&d.engine).before_take_out_apply = Some(Box::new(move || {
+        let text = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(&config, format!("{text}\n# edited by hand\n")).unwrap();
+    }));
+    let done = d.take_out_harness(request).await.unwrap();
+    assert!(!done.applied && done.left.is_empty(), "{done:?}");
+    assert_eq!(done.taken_out.len(), 1);
+    assert_eq!(
+        done.errors,
+        ["machine.toml changed since the preview. h's items were turned off and 1 placed item was taken out; h is \
+          still on. Preview again"]
+    );
+    assert!(!skills.join("pdf").exists());
+    assert!(h_enabled(&d), "still on");
+}
+
+/// Harness changes through the daemon wait for a take-out in progress:
+/// while one holds the lock, an apply polled to its first wait has not
+/// entered its protected step; once the take-out ends, it does.
+#[tokio::test(flavor = "multi_thread")]
+async fn harness_changes_wait_for_a_take_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let (d, _, request) = placed_in_h(dir.path()).await;
+    let (entered_tx, entered) = tokio::sync::oneshot::channel();
+    let (proceed, proceed_rx) = tokio::sync::oneshot::channel();
+    *lock(&d.take_out_entered) = Some(entered_tx);
+    *lock(&d.take_out_proceed) = Some(proceed_rx);
+    let taking_out = tokio::spawn({
+        let (d, request) = (d.clone(), request.clone());
+        async move { d.take_out_harness(request).await }
+    });
+    entered.await.unwrap();
+    let (applied_tx, applied) = std::sync::mpsc::channel();
+    *lock(&d.apply_entered) = Some(applied_tx);
+    let mut applying = std::pin::pin!(d.apply_harness_serialized(request));
+    tokio::select! {
+        biased;
+        _ = &mut applying => panic!("applied while a take-out holds the lock"),
+        _ = std::future::ready(()) => {}
+    }
+    assert!(applied.try_recv().is_err(), "the apply entered while the take-out held the lock");
+    proceed.send(()).unwrap();
+    assert!(taking_out.await.unwrap().unwrap().applied);
+    // The take-out changed machine.toml since this request's preview.
+    assert!(applying.await.is_err());
+    assert!(applied.try_recv().is_ok(), "the apply ran once the take-out was done");
+}
+
+/// The write scans again: a scan that fails there writes nothing, and
+/// the result still says what the take-out did.
+#[tokio::test(flavor = "multi_thread")]
+async fn take_out_writes_only_from_a_complete_scan_of_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let (d, skills, request) = placed_in_h(dir.path()).await;
+    // Another skill is placed, then its index entry made unreadable, after the last check.
+    let index = skills.join(".sk1ll-state/index.json");
+    lock(&d.engine).before_take_out_write = Some(Box::new(move || std::fs::write(&index, "not an index").unwrap()));
+    let done = d.take_out_harness(request).await.unwrap();
+    assert!(!done.applied, "{done:?}");
+    assert!(done.errors.iter().any(|e| e.contains("machine.toml was not changed")), "{done:?}");
+    assert!(
+        done.errors.iter().any(|e| e.contains("h's items were turned off and 1 placed item was taken out")),
+        "{done:?}"
+    );
+    assert!(h_enabled(&d), "machine.toml unchanged");
+    assert!(!d.applied().unwrap().assignment.harness("h").new_skills_default, "the items stay off");
+}
+
+/// A hand edit that removes the harness while a take-out runs: the result
+/// still says what was done, and lists the harnesses as they are now.
+#[tokio::test(flavor = "multi_thread")]
+async fn take_out_reports_what_it_did_when_the_harness_went_meanwhile() {
+    let dir = tempfile::tempdir().unwrap();
+    let (d, _, request) = placed_in_h(dir.path()).await;
+    let config = d.cfg.machine_config.clone();
+    lock(&d.engine).before_take_out_apply = Some(Box::new(move || {
+        let text = std::fs::read_to_string(&config).unwrap();
+        let start = text.find("[harnesses.h]").unwrap();
+        let end = text[start + 1..].find("\n[").map_or(text.len(), |i| start + 1 + i + 1);
+        std::fs::write(&config, format!("{}{}", &text[..start], &text[end..])).unwrap();
+    }));
+    let done = d.take_out_harness(request).await.unwrap();
+    assert!(!done.applied, "{done:?}");
+    assert_eq!(
+        done.errors,
+        ["machine.toml was not changed: no harness `h` (see `sk1ll harnesses --all`). h's items were turned off; \
+          what sync took out is unknown, since no complete scan verified it; h is no longer in machine.toml. Preview \
+          again"]
+    );
+    assert!(done.taken_out.is_empty() && done.left.is_empty(), "{done:?}");
+    assert!(!done.harnesses.iter().any(|h| h.name == "h"), "as machine.toml is now: {:?}", done.harnesses);
+}
+
+/// A hand edit that turns the harness off while a take-out runs: the
+/// report says it is off now, and what the take-out did.
+#[tokio::test(flavor = "multi_thread")]
+async fn take_out_reports_a_harness_turned_off_by_hand_meanwhile() {
+    let dir = tempfile::tempdir().unwrap();
+    let (d, _, request) = placed_in_h(dir.path()).await;
+    let config = d.cfg.machine_config.clone();
+    lock(&d.engine).before_take_out_apply = Some(Box::new(move || {
+        let text = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(&config, text.replace("[harnesses.h]\n", "[harnesses.h]\nenabled = false\n")).unwrap();
+    }));
+    let done = d.take_out_harness(request).await.unwrap();
+    assert!(!done.applied, "{done:?}");
+    assert_eq!(
+        done.errors,
+        ["machine.toml changed since the preview. h's items were turned off and 1 placed item was taken out; h is \
+          off in machine.toml. Preview again"]
+    );
+    assert_eq!(done.taken_out.len(), 1);
+    assert!(done.harnesses.iter().any(|h| h.name == "h" && !h.enabled), "{:?}", done.harnesses);
+}
+
+/// A reconcile that finds an interrupted keep's journal saves its report
+/// and shows it in the status, adopts nothing, and drops the journal; a
+/// note stays through later reconciles until dismissed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reconcile_reports_an_interrupted_keep() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = standalone_with_pdf(dir.path());
+    let root = d.repo_root().to_path_buf();
+    let journal = root.join(".git/sk1ll-keep.json");
+    let dest = root.join("personal/pdf/SKILL.md");
+    let body = serde_json::json!({
+        "phase": "pulling",
+        "kept": [{ "item": "skill:pdf", "dest": format!("\"{}\"", dest.display()), "entry": null }],
+        "staged": [],
+    });
+    std::fs::write(&journal, body.to_string()).unwrap();
+    d.blocking(|d, eng| d.reconcile(eng).map(drop)).await.unwrap();
+    assert!(!journal.exists());
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), "PDFs.\n", "nothing adopted or changed");
+    // A note stays, through later reconciles, until dismissed.
+    for _ in 0..2 {
+        let shown = d.view().keep_report;
+        assert!(shown.len() == 1 && shown[0].entry.is_none(), "{shown:?}");
+        d.blocking(|d, eng| d.reconcile(eng).map(drop)).await.unwrap();
+    }
+    assert_eq!(d.blocking(|d, eng| d.dismiss_keep_notes(eng)).await.unwrap(), 1);
+    assert!(d.view().keep_report.is_empty(), "{:?}", d.view().keep_report);
+    // With a version in recovery, the report stays through any later reconcile and error.
+    // A version in recovery is end to end, in tests/daemon.rs: a recovery
+    // entry here would be in the index every test in this process shares.
 }

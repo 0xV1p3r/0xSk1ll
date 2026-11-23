@@ -664,6 +664,58 @@ fn harness_changes_preview_apply_and_sync() {
     assert!(repo.run(&["harnesses", "add", "x", "--skills", "relative", "--yes"]).is_err());
 }
 
+/// `--take-out` turns the harness's items off and syncs, so what sk1ll
+/// placed there goes, and makes the change only once that worked.
+#[cfg(unix)]
+#[test]
+fn harness_disable_and_remove_take_out_what_was_placed() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = TestRepo::new();
+    for name in ["pdf", "web"] {
+        fs::create_dir_all(repo.repo.join("personal").join(name)).unwrap();
+        fs::write(repo.repo.join("personal").join(name).join("SKILL.md"), "Skill.").unwrap();
+    }
+    let config = repo.root.join("machine.toml");
+    let skills = repo.root.join("h/skills");
+    let add = ["harnesses", "add", "h", "--skills", skills.to_str().unwrap(), "--mode", "copy", "--yes"];
+    repo.run(&add).unwrap();
+    assert!(skills.join("pdf/SKILL.md").is_file() && skills.join("web/SKILL.md").is_file());
+    let disabled = || !repo.run(&["harnesses"]).unwrap().lines().any(|line| line.starts_with("h "));
+
+    // Without it, the preview names the one-step command.
+    let preview = repo.run(&["harnesses", "disable", "h"]).unwrap_err();
+    assert!(preview.contains("`sk1ll harnesses disable h --take-out`"), "{preview}");
+
+    // A removal that fails: nothing changes in machine.toml, the items stay off.
+    fs::set_permissions(&skills, fs::Permissions::from_mode(0o555)).unwrap();
+    let failed = repo.run(&["harnesses", "disable", "h", "--take-out", "--yes"]);
+    fs::set_permissions(&skills, fs::Permissions::from_mode(0o755)).unwrap();
+    let failed = failed.unwrap_err();
+    assert!(failed.contains("left machine.toml as it is: 2 placed items are still in h"), "{failed}");
+    assert!(failed.contains("`sk1ll harnesses disable h --take-out` again"), "{failed}");
+    assert!(!disabled());
+    assert!(!Assignment::load(&repo.assignment()).unwrap().harness("h").new_skills_default, "the items stay off");
+
+    // A copy edited by hand stays; the rest goes.
+    fs::write(skills.join("web/SKILL.md"), "Edited by hand.").unwrap();
+    let done = repo.run(&["harnesses", "disable", "h", "--take-out", "--yes"]).unwrap();
+    assert!(done.contains("first h's items are turned off and sync takes out what sk1ll placed there"), "{done}");
+    assert!(done.contains("edited by hand, so it stays there"), "{done}");
+    assert!(done.contains("took out 1 placed item from h"), "{done}");
+    assert!(!skills.join("pdf").exists(), "taken out");
+    assert_eq!(fs::read_to_string(skills.join("web/SKILL.md")).unwrap(), "Edited by hand.");
+    assert!(disabled());
+
+    // `remove --take-out` takes out what is placed, then drops the entry.
+    fs::remove_dir_all(skills.join("web")).unwrap();
+    repo.run(&["harnesses", "enable", "h", "--yes"]).unwrap();
+    repo.run(&["assign", "h", "--all", "on"]).unwrap();
+    assert!(skills.join("pdf/SKILL.md").is_file());
+    repo.run(&["harnesses", "remove", "h", "--take-out", "--yes"]).unwrap();
+    assert!(!skills.join("pdf").exists() && !skills.join("web").exists());
+    assert!(!fs::read_to_string(&config).unwrap().contains("[harnesses.h]"));
+}
+
 /// A pending pull's tree is partial: the change is saved, but nothing
 /// is placed and no Item ID is written until the pull is finished.
 #[test]
@@ -740,7 +792,8 @@ fn a_blocked_machine_that_committed_the_clash_follows_the_hint_out() {
     a.run(&["commit", "pdf", "--push"]).unwrap();
 
     let blocked = b.run(&["pull"]).unwrap_err();
-    assert!(blocked.contains("Run `sk1ll restore skill:pdf`"), "{blocked}");
+    assert!(blocked.contains("`sk1ll pull --keep skill:pdf`"), "{blocked}");
+    assert!(blocked.contains("`sk1ll restore skill:pdf`"), "{blocked}");
     assert!(!blocked.contains("commit or restore"), "{blocked}");
     let status = b.run(&["status"]).unwrap();
     assert!(status.contains("blocked: the pull of baseline") && status.contains("sk1ll restore skill:pdf"), "{status}");
@@ -749,7 +802,7 @@ fn a_blocked_machine_that_committed_the_clash_follows_the_hint_out() {
     b.run(&["commit", "pdf"]).unwrap();
     let blocked = b.run(&["pull"]).unwrap_err();
     assert!(blocked.contains("turned 1 unpushed commit back into Draft"), "{blocked}");
-    assert!(blocked.contains("Run `sk1ll restore skill:pdf`"), "{blocked}");
+    assert!(blocked.contains("`sk1ll restore skill:pdf`"), "{blocked}");
     assert_eq!(skill(&b.repo), "b's edit\n", "nothing lost");
     assert!(b.run(&["draft"]).unwrap().contains("M skill:pdf"));
     // Pushing says the same.
@@ -779,6 +832,87 @@ fn a_blocked_machine_that_committed_the_clash_follows_the_hint_out() {
     b.run(&["commit", "pdf", "--push"]).unwrap();
     a.run(&["pull"]).unwrap();
     assert_eq!(skill(&a.repo), "b's edit\n");
+}
+
+/// `pull --keep` clears Blocked in one step: the new Baseline comes in and
+/// this Machine's version goes back on top as Draft, ready to review and
+/// commit; an item not named keeps the pull Blocked.
+#[test]
+fn a_blocked_machine_keeps_its_version_in_one_step() {
+    let (a, b, _origin) = two_machines();
+    let read = |path: &Path| fs::read_to_string(path).unwrap();
+    let skill = |repo: &Path| read(&repo.join("personal/pdf/SKILL.md"));
+    fs::write(a.repo.join("personal/pdf/SKILL.md"), "a's edit\n").unwrap();
+    fs::write(a.repo.join("instructions/git.md"), "a's rule\n").unwrap();
+    a.run(&["commit", "pdf", "rule:git", "--push"]).unwrap();
+    fs::write(b.repo.join("personal/pdf/SKILL.md"), "b's edit\n").unwrap();
+    fs::write(b.repo.join("instructions/git.md"), "b's rule\n").unwrap();
+    // Committing the clash first changes nothing: the pull turns it back into Draft.
+    b.run(&["commit", "pdf"]).unwrap();
+
+    // The Draft's clash is found first.
+    let blocked = b.run(&["pull"]).unwrap_err();
+    assert!(blocked.contains("`sk1ll pull --keep rule:git`"), "{blocked}");
+    let status = b.run(&["status"]).unwrap();
+    assert!(status.contains("`sk1ll pull --keep rule:git`"), "{status}");
+    // Keeping it finds the commit's clash next, which isn't named: still
+    // Blocked, on both, and the Draft is as it was.
+    let still = b.run(&["pull", "--keep", "git"]).unwrap_err();
+    assert!(still.contains("turned 1 unpushed commit back into Draft"), "{still}");
+    assert!(still.contains("`sk1ll pull --keep skill:pdf rule:git`"), "{still}");
+    assert_eq!(skill(&b.repo), "b's edit\n");
+    assert!(read(&b.repo.join("instructions/git.md")).ends_with("b's rule\n"));
+
+    let kept = b.run(&["pull", "--keep", "pdf", "--keep", "git"]).unwrap();
+    assert!(kept.contains("baseline "), "{kept}");
+    assert!(kept.contains("kept your version of skill:pdf, rule:git on top"), "{kept}");
+    assert!(kept.contains("replaces the other change"), "{kept}");
+    assert!(kept.contains("`sk1ll diff skill:pdf rule:git`"), "{kept}");
+    assert_eq!(skill(&b.repo), "b's edit\n");
+    assert!(read(&b.repo.join("instructions/git.md")).ends_with("b's rule\n"));
+    let diff = b.run(&["diff", "pdf"]).unwrap();
+    assert!(diff.contains("-a's edit") && diff.contains("+b's edit"), "{diff}");
+    assert!(!b.run(&["status"]).unwrap().contains("blocked"));
+    b.run(&["commit", "--all", "--push"]).unwrap();
+    a.run(&["pull"]).unwrap();
+    assert_eq!(skill(&a.repo), "b's edit\n");
+
+    // `--keep-all` names every clashing item.
+    fs::write(a.repo.join("personal/pdf/SKILL.md"), "a again\n").unwrap();
+    a.run(&["commit", "pdf", "--push"]).unwrap();
+    fs::write(b.repo.join("personal/pdf/SKILL.md"), "b again\n").unwrap();
+    b.run(&["pull", "--keep-all"]).unwrap();
+    assert_eq!(skill(&b.repo), "b again\n");
+    assert!(b.run(&["pull", "--keep", "pdf"]).unwrap().contains("already on the latest baseline"));
+}
+
+/// What an interrupted keep left is printed by `status` and by every
+/// `pull`, a failed one too, until acted on; its notes stay until
+/// `recover dismiss-notes`.
+#[test]
+fn an_interrupted_keep_s_report_is_shown_until_dismissed() {
+    let (a, b, _origin) = two_machines();
+    let note = "the keep stopped after its pull; your draft deleted personal/pdf/ref.md";
+    let report = serde_json::json!([{ "item": "skill:pdf", "entry": null, "error": note }]);
+    fs::write(b.repo.join(".git/sk1ll-keep-report.json"), report.to_string()).unwrap();
+    fs::write(a.repo.join("personal/pdf/SKILL.md"), "a's edit\n").unwrap();
+    a.run(&["commit", "pdf", "--push"]).unwrap();
+    fs::write(b.repo.join("personal/pdf/SKILL.md"), "b's edit\n").unwrap();
+
+    let failed = b.run(&["pull"]).unwrap_err();
+    assert!(failed.contains("blocked:"), "the pull's own error: {failed}");
+    assert!(failed.contains("an interrupted keep left your versions in recovery") && failed.contains(note), "{failed}");
+    // A pull that fails outright, here because the remote is gone, says so too.
+    git(&b.repo, &["remote", "set-url", "origin", "/nonexistent/origin.git"]);
+    let failed = b.run(&["pull"]).unwrap_err();
+    assert!(failed.contains("/nonexistent/origin.git"), "the pull's own error: {failed}");
+    assert!(failed.contains(note), "{failed}");
+    let status = b.run(&["status"]).unwrap();
+    assert!(status.contains(note) && status.contains("`sk1ll recover dismiss-notes`"), "{status}");
+    assert!(b.run(&["status"]).unwrap().contains(note), "still there on a second read");
+    assert!(b.run(&["recover", "dismiss-notes"]).unwrap().contains("dismissed 1 note"));
+    assert!(!b.run(&["status"]).unwrap().contains(note));
+    assert!(b.run(&["recover", "dismiss-notes"]).unwrap().contains("no notes to dismiss"));
 }
 
 /// `draft`, `conflicts` and `recover list` only read: without a daemon they

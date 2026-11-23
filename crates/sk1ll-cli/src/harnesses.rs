@@ -33,9 +33,11 @@ pub(crate) enum HarnessCmd {
         #[command(flatten)]
         opts: ChangeOpts,
     },
-    /// Stop syncing into a harness (what sk1ll placed there stays; `sk1ll assign <name> --all off` first takes it out)
+    /// Stop syncing into a harness (what sk1ll placed there stays, unless --take-out)
     Disable {
         name: String,
+        #[command(flatten)]
+        take: TakeOut,
         #[command(flatten)]
         opts: ChangeOpts,
     },
@@ -64,6 +66,8 @@ pub(crate) enum HarnessCmd {
     Remove {
         name: String,
         #[command(flatten)]
+        take: TakeOut,
+        #[command(flatten)]
         opts: ChangeOpts,
     },
 }
@@ -73,6 +77,13 @@ pub(crate) struct ChangeOpts {
     /// Don't ask for confirmation
     #[arg(long, short)]
     yes: bool,
+}
+
+#[derive(Args)]
+pub(crate) struct TakeOut {
+    /// First turn the harness's items off and sync, taking out what sk1ll placed there; the change is made only if that worked
+    #[arg(long)]
+    take_out: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -88,13 +99,14 @@ pub(crate) enum Mode {
 }
 
 impl HarnessCmd {
-    /// The change and its options; `add` starts from `current`, the harness as it is now.
-    fn split(self, current: Option<Harness>) -> (HarnessChange, ChangeOpts) {
-        match self {
+    /// The change and its options, and whether to take out what sk1ll
+    /// placed first; `add` starts from `current`, the harness as it is now.
+    fn split(self, current: Option<Harness>) -> (HarnessChange, ChangeOpts, bool) {
+        let (change, opts) = match self {
             Self::Rename { .. } => unreachable!("renames are applied separately"),
             Self::Enable { name, opts } => (HarnessChange::Enable { name }, opts),
-            Self::Disable { name, opts } => (HarnessChange::Disable { name }, opts),
-            Self::Remove { name, opts } => (HarnessChange::Remove { name }, opts),
+            Self::Disable { name, take, opts } => return (HarnessChange::Disable { name }, opts, take.take_out),
+            Self::Remove { name, take, opts } => return (HarnessChange::Remove { name }, opts, take.take_out),
             Self::Add { name, skills, instructions, format, mode, opts } => {
                 let mut harness = current.unwrap_or_default();
                 let path = |v: String| Some(v).filter(|v| !v.is_empty());
@@ -116,7 +128,8 @@ impl HarnessCmd {
                 }
                 (HarnessChange::Set { name, harness }, opts)
             }
-        }
+        };
+        (change, opts, false)
     }
 }
 
@@ -149,7 +162,7 @@ pub(crate) fn run(s: &Session, all: bool, command: Option<HarnessCmd>) -> Result
         }
         _ => None,
     };
-    let (change, opts) = command.split(current);
+    let (change, opts, take_out) = command.split(current);
     let view = |p: &PlacementView, placed: bool| Row {
         kind: p.kind.clone(),
         harness: p.harness.clone(),
@@ -165,15 +178,50 @@ pub(crate) fn run(s: &Session, all: bool, command: Option<HarnessCmd>) -> Result
     for warning in &preview.warnings {
         eprintln!("warning: {warning}");
     }
-    print_preview(&preview.path, &req.change, &rows, preview.awaiting_assignment);
+    print_preview(&preview.path, &req.change, &rows, preview.awaiting_assignment, take_out);
     decide(&opts)?;
     req.fingerprint = Some(preview.fingerprint);
+    if take_out {
+        return take_out_and_apply(s, &req);
+    }
     let applied = s.block(s.client.apply_harness(&req))?;
     for e in &applied.errors {
         eprintln!("error: {e}");
     }
     if !applied.errors.is_empty() {
         bail!("machine.toml changed, but {} failed", crate::plural(applied.errors.len(), "step", "steps"));
+    }
+    println!("harnesses in sync");
+    Ok(())
+}
+
+/// `--take-out`: the engine turns the items off and syncs, then makes the
+/// change only if nothing it placed is left.
+fn take_out_and_apply(s: &Session, req: &HarnessChangeRequest) -> Result<()> {
+    let name = req.change.name();
+    let done = s.block(s.client.take_out_harness(req))?;
+    if !done.taken_out.is_empty() {
+        println!("took out {} from {name}", crate::plural(done.taken_out.len(), "placed item", "placed items"));
+    }
+    for e in &done.errors {
+        eprintln!("error: {e}");
+    }
+    if !done.applied {
+        for p in &done.left {
+            eprintln!("still placed: {} {} at {}", p.item, p.name, p.dest.display());
+        }
+        let why = match done.left.len() {
+            0 => "see the errors above".to_string(),
+            n => format!("{} still in {name}", crate::plural(n, "placed item is", "placed items are")),
+        };
+        bail!(
+            "left machine.toml as it is: {why}. Its items stay off; fix what failed, then run `sk1ll harnesses {} \
+             {name} --take-out` again",
+            if matches!(req.change, HarnessChange::Remove { .. }) { "remove" } else { "disable" }
+        );
+    }
+    if !done.errors.is_empty() {
+        bail!("machine.toml changed, but {} failed", crate::plural(done.errors.len(), "step", "steps"));
     }
     println!("harnesses in sync");
     Ok(())
@@ -262,18 +310,33 @@ fn print_rows(rows: &[&Row]) {
     }
 }
 
-fn print_preview(config: &Path, change: &HarnessChange, rows: &[Row], awaiting_assignment: bool) {
+fn print_preview(config: &Path, change: &HarnessChange, rows: &[Row], awaiting_assignment: bool, take_out: bool) {
     println!("changes {}", config.display());
     let placed: Vec<_> = rows.iter().filter(|r| r.placed).collect();
-    if !placed.is_empty() {
+    let (managed, edited): (Vec<&Row>, Vec<&Row>) = placed.iter().partition(|r| r.kind == "remove");
+    if take_out {
+        let name = change.name();
+        if !managed.is_empty() {
+            println!(
+                "first {name}'s items are turned off and sync takes out what sk1ll placed there (into recovery, as \
+                 any removal):"
+            );
+            print_rows(&managed);
+        }
+        if !edited.is_empty() {
+            println!("edited by hand, so it stays there, no longer managed:");
+            print_rows(&edited);
+        }
+        if !placed.is_empty() {
+            println!("the change is made only once that is done");
+        }
+    } else if !placed.is_empty() {
         println!("sk1ll placed this where the harness stops syncing; it stays there, no longer managed:");
         print_rows(&placed);
-        if placed.iter().any(|r| r.kind == "remove") {
+        if !managed.is_empty() {
             let name = change.name();
-            println!(
-                "to take it out instead, cancel and turn the harness's items off first: \
-                 `sk1ll assign {name} --all off` (which syncs), then run this again"
-            );
+            let verb = if matches!(change, HarnessChange::Remove { .. }) { "remove" } else { "disable" };
+            println!("to take it out instead, cancel and run `sk1ll harnesses {verb} {name} --take-out`");
         }
     }
     let sync: Vec<_> = rows.iter().filter(|r| !r.placed).collect();
@@ -368,7 +431,7 @@ mod tests {
             opts: ChangeOpts { yes: true },
         };
         let current = Harness { instructions: Some("/rules".into()), mode: LinkMode::Copy, ..Harness::default() };
-        let (change, _) = cmd.split(Some(current));
+        let (change, _, _) = cmd.split(Some(current));
         let HarnessChange::Set { name, harness } = change else { panic!("{change:?}") };
         assert_eq!(name, "agents");
         assert_eq!(harness.skills.as_deref(), Some("~/.agents/skills"));

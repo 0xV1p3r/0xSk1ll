@@ -66,12 +66,14 @@ command!(commit_message(items: Vec<String>) -> CommitMessage, commit_message(&it
 command!(commit(request: CommitRequest) -> CommitResponse, commit(&request));
 command!(restore(request: RestoreRequest) -> RestoreResponse, restore(&request));
 command!(pull() -> PullResult, pull());
+command!(pull_keep(request: PullKeepRequest) -> PullKeepResult, pull_keep(&request));
 command!(conflicts() -> Vec<ConflictView>, conflicts());
 command!(recovered() -> Vec<ConflictView>, recovered());
 command!(adopt(target: ConflictTarget) -> (), adopt(&target));
 command!(overwrite(target: ConflictTarget) -> (), overwrite(&target));
 command!(adopt_displaced(id: String) -> PathBuf, adopt_displaced(&id));
 command!(discard_displaced(id: String) -> (), discard_displaced(&id));
+command!(dismiss_keep_notes() -> usize, dismiss_keep_notes());
 command!(harnesses() -> Vec<HarnessView>, harnesses());
 command!(setup_harnesses() -> Vec<HarnessChoice>, setup_harnesses());
 command!(set_setup_harness(name: String, enabled: bool) -> Vec<HarnessChoice>, set_setup_harness(&name, enabled));
@@ -87,6 +89,7 @@ command!(
     set_harness_assignment(&harness, enabled)
 );
 command!(apply_harness(request: HarnessChangeRequest) -> HarnessApplied, apply_harness(&request));
+command!(take_out_harness(request: HarnessChangeRequest) -> HarnessTakenOut, take_out_harness(&request));
 command!(resolve_import(request: ResolveImportRequest) -> ResolvedSource, resolve_import(&request));
 command!(add_import(request: AddImportRequest) -> ImportUpdated, add_import(&request));
 command!(imports() -> ImportsView, imports());
