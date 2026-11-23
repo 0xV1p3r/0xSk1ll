@@ -18,7 +18,11 @@ export interface StatusView {
   last_error: string | null; revoked: boolean; server_baseline: string | null; assignment_revision: number;
   awaiting_assignment: boolean; auth_rejected_since: number | null; report: MachineReport;
   version?: string;
+  // What interrupted keeps left in recovery, until each version is adopted or discarded.
+  keep_report?: Unkept[];
 }
+// A kept version still in recovery (`entry`, its recovery id), or a note (`entry` null).
+export interface Unkept { item: ItemRef; entry: string | null; error: string }
 // What a Machine may manage, from its join code.
 export type Scope = 'fleet' | 'self';
 // `registration`: random and new for every join (two joins can share a `joined_at` second).
@@ -66,6 +70,8 @@ export interface RestoreRequest { items: string[]; all: boolean }
 export interface RestoreResponse { discarded: ItemRef[]; kept?: string[] }
 export type PullResult = { state: 'up_to_date' } | { state: 'updated'; from: string | null; to: string }
   | { state: 'blocked'; baseline: string; items: ItemRef[]; pending?: boolean; uncommitted?: string[] };
+export interface PullKeepRequest { items: string[]; all: boolean }
+export interface PullKeepResult { pull: PullResult; kept?: ItemRef[] }
 export interface ConflictView {
   kind?: string; id?: string; item?: ItemRef; path?: string; displaced_at?: number;
   // Harness conflicts only: newest mtime of the Harness content (when it was last edited), not a first-seen time.
@@ -102,6 +108,8 @@ export interface HarnessPreview {
 }
 // `errors`: what the sync after the change failed to place; machine.toml changed either way.
 export interface HarnessApplied { harnesses: HarnessChoice[]; errors: string[] }
+// `left`: managed content still placed, so machine.toml was not changed (`applied` false) and the items stay off.
+export interface HarnessTakenOut { applied: boolean; taken_out: PlacementView[]; left?: PlacementView[]; harnesses: HarnessChoice[]; errors: string[] }
 // How the app can start the Daemon itself; not a Daemon type.
 export type ServiceManager = 'systemd' | 'launchd';
 export interface ServiceInfo { default_socket: boolean; binary: string | null; manager: ServiceManager; available: boolean; active: boolean; restartable: boolean; unit: string | null }

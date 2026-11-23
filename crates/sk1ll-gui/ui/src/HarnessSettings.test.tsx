@@ -5,7 +5,7 @@ import { HarnessPanel, harnessOrigin } from './HarnessSettings';
 import { api } from './api';
 import { toast } from './toast';
 import type { HarnessChoice, HarnessPreview } from './types';
-vi.mock('./api', () => ({ api: { harnessSettings: vi.fn(), previewHarness: vi.fn(), applyHarness: vi.fn(), openMachineConfig: vi.fn(),
+vi.mock('./api', () => ({ api: { harnessSettings: vi.fn(), previewHarness: vi.fn(), applyHarness: vi.fn(), takeOutHarness: vi.fn(), openMachineConfig: vi.fn(),
   setHarnessAssignment: vi.fn() }, errorMessage: String, errorStatus: (e: { status?: number }) => e?.status }));
 vi.mock('./toast', () => ({ toast: vi.fn() }));
 afterEach(cleanup);
@@ -26,6 +26,7 @@ beforeEach(() => {
   vi.mocked(api.harnessSettings).mockResolvedValue({ path: '/cfg/machine.toml', harnesses });
   vi.mocked(api.previewHarness).mockResolvedValue(preview());
   vi.mocked(api.applyHarness).mockResolvedValue({ harnesses, errors: [] });
+  vi.mocked(api.takeOutHarness).mockResolvedValue({ applied: true, taken_out: [preview().placed[0]], harnesses, errors: [] });
   vi.mocked(api.setHarnessAssignment).mockResolvedValue({
     assignment: { harnesses: {} }, revision: 1, entries: [],
   });
@@ -43,7 +44,7 @@ it('labels origins and hides presets that are not on this Machine', async () => 
   expect(screen.getByRole('button', { name: 'Remove agents' })).toBeTruthy();
 });
 
-it('previews a disable, which leaves what sk1ll placed, and applies it', async () => {
+it('previews a disable and can leave what sk1ll placed in place', async () => {
   const changed = mount();
   fireEvent.click(await screen.findByRole('checkbox', { name: 'Sync into codex' }));
   const dialog = await screen.findByRole('dialog');
@@ -51,39 +52,71 @@ it('previews a disable, which leaves what sk1ll placed, and applies it', async (
   expect(await within(dialog).findByText('/h/.codex/skills/pdf')).toBeTruthy();
   expect(within(dialog).getByText('Edited by hand')).toBeTruthy();
   expect(within(dialog).queryByRole('checkbox')).toBeNull();
-  fireEvent.click(within(dialog).getByRole('button', { name: 'Apply' }));
+  expect(within(dialog).queryByRole('button', { name: "Turn off this Harness's items first" })).toBeNull();
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Leave in place and turn off' }));
   await waitFor(() => expect(api.applyHarness).toHaveBeenCalledWith({ fingerprint: "preview", change: { op: 'disable', name: 'codex' } }));
   await waitFor(() => expect(changed).toHaveBeenCalled());
 });
 
-it("turns the Harness's items off in the Assignment first, then previews again", async () => {
-  vi.mocked(api.setHarnessAssignment).mockResolvedValueOnce({
-    assignment: { harnesses: {} }, revision: 1, entries: [],
-  });
+it('takes out what sk1ll placed and turns the Harness off in one step', async () => {
+  const changed = mount();
+  fireEvent.click(await screen.findByRole('checkbox', { name: 'Sync into codex' }));
+  const dialog = await screen.findByRole('dialog');
+  await within(dialog).findByText('/h/.codex/skills/pdf');
+  expect(within(dialog).getByText(/Take out turns codex's items off in the Assignment, so sync removes what it placed/)).toBeTruthy();
+  expect(within(dialog).getByText(/1 edited by hand stays either way/)).toBeTruthy();
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Take out and turn off' }));
+  await waitFor(() => expect(api.takeOutHarness).toHaveBeenCalledWith({ fingerprint: 'preview', change: { op: 'disable', name: 'codex' } }));
+  await waitFor(() => expect(changed).toHaveBeenCalled());
+  expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Turned off codex', description: 'Took out 1 placed item.' }));
+  expect(api.applyHarness).not.toHaveBeenCalled();
+  expect(api.setHarnessAssignment).not.toHaveBeenCalled();
+});
+
+it('leaves the Harness on when placements fail to come out, and retries', async () => {
+  const left = preview().placed[0];
+  vi.mocked(api.takeOutHarness).mockResolvedValueOnce({ applied: false, taken_out: [], left: [left], harnesses, errors: ['remove /h/.codex/skills/pdf: permission denied'] });
+  const changed = mount();
+  fireEvent.click(await screen.findByRole('checkbox', { name: 'Sync into codex' }));
+  const dialog = await screen.findByRole('dialog');
+  await within(dialog).findByText('/h/.codex/skills/pdf');
+  const button = within(dialog).getByRole('button', { name: 'Take out and turn off' });
+  fireEvent.click(button);
+  expect(await within(dialog).findByText(/machine.toml was not changed: 1 placed item is still there/)).toBeTruthy();
+  expect(within(dialog).getByText(/codex's items stay off in the Assignment/)).toBeTruthy();
+  expect(within(dialog).getByText('remove /h/.codex/skills/pdf: permission denied')).toBeTruthy();
+  expect(changed).not.toHaveBeenCalled();
+  await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false));
+  fireEvent.click(button);
+  await waitFor(() => expect(changed).toHaveBeenCalled());
+  expect(api.takeOutHarness).toHaveBeenCalledTimes(2);
+});
+
+it('says what failed when nothing is left but the scan or machine.toml stopped Take out', async () => {
+  vi.mocked(api.takeOutHarness).mockResolvedValueOnce({ applied: false, taken_out: [], harnesses, errors: ['Could not list old placements for codex: bad index'] });
   mount();
   fireEvent.click(await screen.findByRole('checkbox', { name: 'Sync into codex' }));
   const dialog = await screen.findByRole('dialog');
   await within(dialog).findByText('/h/.codex/skills/pdf');
-  vi.mocked(api.previewHarness).mockResolvedValue(preview({ placed: [] }));
-  fireEvent.click(within(dialog).getByRole('button', { name: "Turn off this Harness's items first" }));
-  await waitFor(() => expect(api.setHarnessAssignment).toHaveBeenCalledWith('codex', false));
-  expect(await within(dialog).findByText('Nothing that sk1ll placed is left behind by this change.')).toBeTruthy();
-  expect(api.applyHarness).not.toHaveBeenCalled();
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Take out and turn off' }));
+  expect(await within(dialog).findByText(/^machine.toml was not changed\. codex's items stay off/)).toBeTruthy();
+  expect(within(dialog).getByText('Could not list old placements for codex: bad index')).toBeTruthy();
 });
 
-it('shows placement errors after saving an Assignment and allows a retry', async () => {
-  vi.mocked(api.setHarnessAssignment).mockResolvedValueOnce({
-    assignment: { harnesses: {} }, revision: 1, entries: [], errors: ['permission denied'],
-  });
+it('offers Take out and remove for a removal, and only Apply when nothing is placed', async () => {
+  vi.mocked(api.previewHarness).mockResolvedValue(preview({ name: 'agents' }));
   mount();
+  fireEvent.click(await screen.findByRole('button', { name: 'Remove agents' }));
+  let dialog = await screen.findByRole('dialog');
+  expect(await within(dialog).findByRole('button', { name: 'Take out and remove' })).toBeTruthy();
+  expect(within(dialog).getByRole('button', { name: 'Leave in place and remove' })).toBeTruthy();
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+  vi.mocked(api.previewHarness).mockResolvedValue(preview({ placed: [] }));
   fireEvent.click(await screen.findByRole('checkbox', { name: 'Sync into codex' }));
-  const dialog = await screen.findByRole('dialog');
-  const button = await within(dialog).findByRole('button', { name: "Turn off this Harness's items first" });
-  fireEvent.click(button);
-  expect(await within(dialog).findByText(/Assignment saved, but sync failed: permission denied/)).toBeTruthy();
-  expect(toast).not.toHaveBeenCalled();
-  fireEvent.click(button);
-  await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: "Turned off codex's items" })));
+  dialog = await screen.findByRole('dialog');
+  expect(await within(dialog).findByText('Nothing that sk1ll placed is left behind by this change.')).toBeTruthy();
+  expect(within(dialog).getByRole('button', { name: 'Apply' })).toBeTruthy();
+  expect(within(dialog).queryByRole('button', { name: 'Take out and turn off' })).toBeNull();
 });
 
 it('validates a new Harness before previewing it', async () => {
@@ -136,13 +169,13 @@ it('asks for a fresh preview when machine.toml changed meanwhile, and lists what
   fireEvent.click(await screen.findByRole('checkbox', { name: 'Sync into codex' }));
   const dialog = await screen.findByRole('dialog');
   await within(dialog).findByText('/h/.codex/skills/pdf');
-  fireEvent.click(within(dialog).getByRole('button', { name: 'Apply' }));
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Leave in place and turn off' }));
   expect(await within(dialog).findByText(/nothing was written/)).toBeTruthy();
   fireEvent.click(within(dialog).getByRole('button', { name: 'Preview again' }));
   await waitFor(() => expect(api.previewHarness).toHaveBeenCalledTimes(2));
   vi.mocked(api.applyHarness).mockResolvedValue({ harnesses, errors: ['sync /h/x: permission denied'] });
-  await waitFor(() => expect((within(dialog).getByRole('button', { name: 'Apply' }) as HTMLButtonElement).disabled).toBe(false));
-  fireEvent.click(within(dialog).getByRole('button', { name: 'Apply' }));
+  await waitFor(() => expect((within(dialog).getByRole('button', { name: 'Leave in place and turn off' }) as HTMLButtonElement).disabled).toBe(false));
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Leave in place and turn off' }));
   await waitFor(() => expect(api.applyHarness).toHaveBeenCalledTimes(2));
   expect(await within(dialog).findByText('sync /h/x: permission denied')).toBeTruthy();
   expect(changed).not.toHaveBeenCalled();
@@ -150,16 +183,18 @@ it('asks for a fresh preview when machine.toml changed meanwhile, and lists what
   await waitFor(() => expect(changed).toHaveBeenCalled());
 });
 
-it('disables Apply if re-preview after turning off items fails', async () => {
+it('asks for a fresh preview when machine.toml changed before Take out', async () => {
+  vi.mocked(api.takeOutHarness).mockRejectedValueOnce(Object.assign(new Error('machine.toml changed since the preview — preview again'), { status: 409 }));
   mount();
   fireEvent.click(await screen.findByRole('checkbox', { name: 'Sync into codex' }));
   const dialog = await screen.findByRole('dialog');
   await within(dialog).findByText('/h/.codex/skills/pdf');
-  vi.mocked(api.previewHarness).mockRejectedValueOnce(new Error('Preview unavailable'));
-  fireEvent.click(within(dialog).getByRole('button', { name: "Turn off this Harness's items first" }));
-  await within(dialog).findByText(/Preview unavailable/);
-  expect(within(dialog).queryByText('/h/.codex/skills/pdf')).toBeNull();
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Take out and turn off' }));
+  expect(await within(dialog).findByText(/preview again/)).toBeTruthy();
+  // The stale preview is gone: nothing can be applied until it is taken again.
   expect((within(dialog).getByRole('button', { name: 'Apply' }) as HTMLButtonElement).disabled).toBe(true);
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Preview again' }));
+  await waitFor(() => expect(api.previewHarness).toHaveBeenCalledTimes(2));
 });
 
 it('opens the daemon configuration even when settings cannot be parsed', async () => {

@@ -320,3 +320,15 @@ it('shows every Machine again when the selected Machine was removed', async () =
   expect(await screen.findByRole('button', { name: 'Show details for desktop' })).toBeTruthy();
   expect(screen.queryByText('No Machines')).toBeNull();
 });
+
+it('leads Blocked guidance with Keep mine and keeps Restore as taking the Baseline', async () => {
+  vi.mocked(api.fleet).mockResolvedValue({ baseline: null, machines: [
+    machineRow({ id: 'local', status: 'blocked', report: machineReport({ blocked: true, clashes: ['skill:pdf'] }) }),
+    machineRow({ id: 'other', status: 'blocked', report: machineReport({ blocked: true, clashes: ['skill:pdf'] }) }),
+  ] });
+  render(<TooltipProvider><Fleet revision={0} machineId="local" navigate={vi.fn()} changed={vi.fn()} live /></TooltipProvider>);
+  const own = await screen.findByText(/^In Draft, Keep mine on the clashing items/);
+  expect(own.textContent).toMatch(/over the other change\), or Restore them to take the Baseline/);
+  expect(screen.getByText(/^On other, Keep mine on the clashing items/)).toBeTruthy();
+  expect(screen.queryByText(/adopt it back from Recovery/)).toBeNull();
+});
