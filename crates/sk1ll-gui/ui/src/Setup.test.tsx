@@ -3,11 +3,11 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { App } from './App';
 import { api } from './api';
-import { GettingStarted, showGettingStarted } from './Setup';
+import { GettingStarted, StartingAssignment, showGettingStarted } from './Setup';
 import type { ContentEntry, HarnessChoice, StatusView } from './types';
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(async () => () => {}) }));
 vi.mock('./api', () => ({ api: { status: vi.fn(), connectionInfo: vi.fn(), skills: vi.fn(), recovered: vi.fn(), imports: vi.fn(), fleet: vi.fn(), log: vi.fn(), logFacets: vi.fn(), init: vi.fn(),
-  setupHarnesses: vi.fn(), setSetupHarness: vi.fn(), daemonService: vi.fn(), restartDaemon: vi.fn(), push: vi.fn(), startDaemon: vi.fn(), join: vi.fn(), harnesses: vi.fn(), items: vi.fn(), setAssignment: vi.fn(), joinCode: vi.fn() }, errorMessage: String }));
+  setupHarnesses: vi.fn(), setSetupHarness: vi.fn(), daemonService: vi.fn(), restartDaemon: vi.fn(), push: vi.fn(), startDaemon: vi.fn(), join: vi.fn(), harnesses: vi.fn(), setHarnessAssignment: vi.fn(), joinCode: vi.fn() }, errorMessage: String }));
 vi.mock('./Skills', () => ({ Skills: ({ handoff }: { handoff: { create?: string } }) => <div data-create={handoff.create}>Local library</div> }));
 vi.mock('./Matrix', () => ({ Matrix: () => <div>Matrix</div> }));
 
@@ -52,8 +52,7 @@ it('chooses Harnesses before anything is synced', async () => {
 it('joins a Fleet, waits for the restart and turns everything on', async () => {
   vi.mocked(api.join).mockImplementation(async () => { current = joined; return { machine_id: 'box', repo: '/home/me/skills', setup: 'cloned', harnesses: ['claude'], revision: 1 }; });
   vi.mocked(api.harnesses).mockResolvedValue([{ name: 'claude', origin: 'detected', harness: choice('claude').harness }]);
-  vi.mocked(api.items).mockResolvedValue([{ item: 'skill:pdf', id: 'pdf', in_baseline: true, draft: null, unpushed: false, description: null }]);
-  vi.mocked(api.setAssignment).mockResolvedValue({ assignment: { harnesses: {} }, revision: 2, entries: [] });
+  vi.mocked(api.setHarnessAssignment).mockResolvedValue({ assignment: { harnesses: {} }, revision: 2, entries: [] });
   render(<App />);
   await continueTo('Join a Fleet');
   fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
@@ -64,11 +63,74 @@ it('joins a Fleet, waits for the restart and turns everything on', async () => {
   fireEvent.click(screen.getByRole('button', { name: 'Join Fleet' }));
   await waitFor(() => expect(api.join).toHaveBeenCalledWith({ server_url: 'https://skills.example.com', code: 'ONCE', admin_token: undefined, machine_id: undefined, copy_from: undefined }));
   fireEvent.click(await screen.findByRole('button', { name: 'Turn everything on' }));
-  await waitFor(() => expect(api.setAssignment).toHaveBeenCalledWith('box', { changes: [
-    { harness: 'claude', kind: 'new_skills_default', enabled: true }, { harness: 'claude', kind: 'new_rules_default', enabled: true },
-    { harness: 'claude', kind: 'skill', item_id: 'pdf', name: 'pdf', enabled: true },
-  ] }));
+  await waitFor(() => expect(api.setHarnessAssignment).toHaveBeenCalledWith('claude', true));
   expect(await screen.findByRole('heading', { name: 'Fleet' })).toBeTruthy();
+});
+
+it('reports failures from turning everything on before leaving', async () => {
+  current = joined;
+  vi.mocked(api.harnesses).mockResolvedValue(['claude', 'codex', 'gemini'].map(name => ({ name, origin: 'detected' as const, harness: choice(name).harness })));
+  vi.mocked(api.setHarnessAssignment).mockImplementation(async harness => {
+    if (harness === 'gemini') throw 'Server unreachable';
+    return { assignment: { harnesses: {} }, revision: 2, entries: [], errors: harness === 'codex' ? ['placing skill:pdf: permission denied'] : [] };
+  });
+  const onDone = vi.fn();
+  render(<StartingAssignment status={joined} onDone={onDone} openMatrix={vi.fn()} />);
+  fireEvent.click(screen.getByRole('button', { name: 'Turn everything on' }));
+  const notice = await screen.findByRole('alert');
+  expect(within(notice).getByText('Not everything was turned on')).toBeTruthy();
+  expect(within(notice).getByText('codex: placing skill:pdf: permission denied')).toBeTruthy();
+  expect(within(notice).getByText('gemini: Server unreachable')).toBeTruthy();
+  expect(api.setHarnessAssignment).toHaveBeenCalledTimes(3);
+  expect(onDone).not.toHaveBeenCalled();
+  expect(screen.queryByRole('button', { name: 'Leave everything off' })).toBeNull();
+  fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
+  expect(onDone).toHaveBeenCalledOnce();
+});
+
+it('keeps the earlier failures when a retry fails before writing anything', async () => {
+  current = joined;
+  vi.mocked(api.harnesses).mockResolvedValueOnce(['claude', 'codex'].map(name => ({ name, origin: 'detected' as const, harness: choice(name).harness })));
+  vi.mocked(api.setHarnessAssignment).mockImplementation(async harness => { if (harness === 'codex') throw 'Server unreachable'; return { assignment: { harnesses: {} }, revision: 2, entries: [] }; });
+  const onDone = vi.fn();
+  render(<StartingAssignment status={joined} onDone={onDone} openMatrix={vi.fn()} />);
+  fireEvent.click(screen.getByRole('button', { name: 'Turn everything on' }));
+  expect(await screen.findByText('codex: Server unreachable')).toBeTruthy();
+  vi.mocked(api.harnesses).mockRejectedValueOnce('Daemon unreachable');
+  fireEvent.click(screen.getByRole('button', { name: 'Turn everything on' }));
+  expect(await screen.findByText('Daemon unreachable')).toBeTruthy();
+  expect(screen.getByText('codex: Server unreachable')).toBeTruthy();
+  expect(screen.queryByRole('button', { name: 'Leave everything off' })).toBeNull();
+  expect(onDone).not.toHaveBeenCalled();
+});
+
+it('says when no Harness is on instead of leaving as if everything was turned on', async () => {
+  current = joined;
+  vi.mocked(api.harnesses).mockResolvedValue([]);
+  const onDone = vi.fn();
+  render(<StartingAssignment status={joined} onDone={onDone} openMatrix={vi.fn()} />);
+  fireEvent.click(screen.getByRole('button', { name: 'Turn everything on' }));
+  expect(await screen.findByText('No Harness is on')).toBeTruthy();
+  expect(onDone).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
+  expect(onDone).toHaveBeenCalledOnce();
+});
+
+it('keeps the wizard on Harnesses while a choice saves, then lets it continue past a failed save', async () => {
+  let fail!: (error: unknown) => void;
+  vi.mocked(api.setSetupHarness).mockImplementation(() => new Promise((_, reject) => { fail = reject; }));
+  render(<App />);
+  await continueTo();
+  fireEvent.click(screen.getByRole('checkbox', { name: 'Sync codex' }));
+  await waitFor(() => expect(api.setSetupHarness).toHaveBeenCalledWith('codex', false));
+  expect((screen.getByRole('button', { name: 'Continue' }) as HTMLButtonElement).disabled).toBe(true);
+  expect((screen.getByRole('button', { name: 'Back' }) as HTMLButtonElement).disabled).toBe(true);
+  fail('machine.toml is read-only');
+  expect(await screen.findByText('machine.toml is read-only')).toBeTruthy();
+  expect((screen.getByRole('button', { name: 'Continue' }) as HTMLButtonElement).disabled).toBe(false);
+  expect((screen.getByRole('button', { name: 'Back' }) as HTMLButtonElement).disabled).toBe(false);
+  fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
+  expect(await screen.findByRole('button', { name: 'Create skills repo' })).toBeTruthy();
 });
 
 it('starts a new Fleet with the admin token and skips straight to the matrix', async () => {
@@ -84,7 +146,7 @@ it('starts a new Fleet with the admin token and skips straight to the matrix', a
   await waitFor(() => expect(api.join).toHaveBeenCalledWith({ server_url: 'https://skills.example.com', code: '', admin_token: 'secret', machine_id: 'first', copy_from: undefined }));
   fireEvent.click(await screen.findByRole('button', { name: 'Choose in the Assignment matrix' }));
   expect(await screen.findByRole('heading', { name: 'Assignment matrix' })).toBeTruthy();
-  expect(api.setAssignment).not.toHaveBeenCalled();
+  expect(api.setHarnessAssignment).not.toHaveBeenCalled();
 });
 
 it('skips the starting Assignment when it was copied from another Machine', async () => {

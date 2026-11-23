@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { applyToggle, cellState, emptyHarness, everythingOn, headline, insecureHttp, itemStateLabel, mergeAssignments, statusLabels, statusOrder, statusTone } from './model';
+import { applyToggle, cellState, emptyHarness, headline, insecureHttp, itemStateLabel, mergeAssignments, statusLabels, statusOrder, statusTone } from './model';
 import type { Assignment, MachineReport } from './types';
 
 const report: MachineReport = { seq: 1, items: [], baseline: 'a', drafts: [], unpushed: [], conflicts: [], harnesses: [], blocked: false, clashes: [], behind: false };
@@ -68,18 +68,6 @@ describe('revisioned Assignment snapshots', () => {
 });
 
 describe('first-run setup', () => {
-  it('turns on defaults first, then every Baseline item, in each Harness', () => {
-    const items = [
-      { item: 'skill:pdf', id: 'pdf', in_baseline: true, draft: null, unpushed: false, description: null },
-      { item: 'rule:git', id: 'git', in_baseline: true, draft: null, unpushed: false, description: null },
-      { item: 'skill:local', id: 'local', in_baseline: false, draft: 'added' as const, unpushed: false, description: null },
-    ];
-    expect(everythingOn(['claude'], items)).toEqual([
-      { harness: 'claude', kind: 'new_skills_default', enabled: true }, { harness: 'claude', kind: 'new_rules_default', enabled: true },
-      { harness: 'claude', kind: 'skill', item_id: 'pdf', name: 'pdf', enabled: true }, { harness: 'claude', kind: 'rule', item_id: 'git', name: 'git', enabled: true },
-    ]);
-    expect(everythingOn([], items)).toEqual([]);
-  });
   it('warns about plain HTTP except to this computer', () => {
     expect(insecureHttp('http://skills.example.com')).toBe(true);
     expect(insecureHttp('http://10.0.0.5:7878')).toBe(true);

@@ -14,7 +14,7 @@ import wordmarkLight from '@branding/wordmark-light.svg';
 import { cn } from '@/lib/utils';
 import { api, errorMessage } from './api';
 import { useMutation, useResource } from './hooks';
-import { everythingOn, insecureHttp, plural } from './model';
+import { insecureHttp, plural } from './model';
 import { JoinCodeButton } from './Settings';
 import { Details, ErrorNotice, Loading, Notice, Panel, PanelToolbar, Pending, SectionTitle } from './shared';
 import type { ContentEntry, DaemonStarted, HarnessChoice, Scope, ServiceManager, StatusView } from './types';
@@ -113,6 +113,8 @@ export type SetupResult = { joined: false } | { joined: true; copied: boolean };
 export function SetupWizard({ status, onDone }: { status: StatusView; onDone: (result: SetupResult) => void }) {
   const [step, setStep] = useState<'path' | 'harnesses' | 'details'>('path');
   const docs = useMutation();
+  // Owned here so Back and Continue wait for a Harness choice to save. A failed save stays visible but never traps the wizard.
+  const harnessSave = useMutation();
   const [path, setPath] = useState<SetupPath>('local');
   if (step === 'path') return <Frame wide step="Step 1 of 3" title="Set up this Machine" description="0xSk1ll keeps your agent Skills and Rules in one git repo and syncs them into every Harness.">
     <fieldset className="flex flex-col gap-2"><legend className="sr-only">How this Machine is used</legend>
@@ -127,15 +129,14 @@ export function SetupWizard({ status, onDone }: { status: StatusView; onDone: (r
     <div><Button onClick={() => setStep('harnesses')}>Continue</Button></div>
   </Frame>;
   if (step === 'harnesses') return <Frame wide step="Step 2 of 3" title="Choose Harnesses" description="Sync places Skills and Rules into each Harness you keep on. Harnesses are saved in this Machine's machine.toml.">
-    <HarnessStep />
-    <div className="flex gap-2"><Button variant="outline" onClick={() => setStep('path')}><ArrowLeft data-icon="inline-start" />Back</Button><Button onClick={() => setStep('details')}>Continue</Button></div>
+    <HarnessStep toggle={harnessSave} />
+    <div className="flex gap-2"><Button variant="outline" disabled={harnessSave.pending} onClick={() => setStep('path')}><ArrowLeft data-icon="inline-start" />Back</Button><Button disabled={harnessSave.pending} onClick={() => setStep('details')}>Continue</Button></div>
   </Frame>;
   return <DetailsStep path={path} status={status} back={() => setStep('harnesses')} onDone={onDone} />;
 }
 
-function HarnessStep() {
+function HarnessStep({ toggle }: { toggle: ReturnType<typeof useMutation> }) {
   const choices = useResource(api.setupHarnesses, 0);
-  const toggle = useMutation();
   const [changing, setChanging] = useState<string>();
   if (choices.loading && !choices.data) return <Loading rows={2} />;
   const shown = choices.data?.filter(choice => choice.installed || choice.enabled) ?? [];
@@ -196,20 +197,32 @@ function DetailsStep({ path, status, back, onDone }: { path: SetupPath; status: 
 
 // After joining without --copy-from, the Server gives this Machine an all-off Assignment.
 export function StartingAssignment({ status, onDone, openMatrix }: { status: StatusView; onDone: () => void; openMatrix: () => void }) {
-  const run = useMutation(onDone);
+  const run = useMutation();
+  // What turning everything on could not do, shown before leaving this screen. A retry that fails before writing keeps it.
+  const [left, setLeft] = useState<{ errors: string[]; empty: boolean }>();
   const connected = status.connection === 'connected';
   return <Frame wide title="Choose the starting Assignment" description={`${status.machine_id} joined the Fleet. Its Harnesses start with every Skill and Rule off.`}>
     {!connected && <Badge variant="secondary" role="status"><LoaderCircle className="animate-spin" />Connecting to the Server…</Badge>}
     <div className="flex flex-col gap-2">
       <Button className="self-start" disabled={!connected || run.pending} onClick={() => void run.run(async () => {
-        const [harnesses, items] = await Promise.all([api.harnesses(), api.items()]);
-        if (harnesses.length) await api.setAssignment(status.machine_id, { changes: everythingOn(harnesses.map(h => h.name), items) });
-      })}><Pending pending={run.pending}>Turn everything on</Pending></Button>
+        // The Daemon sets every Baseline item and both defaults per Harness, including items this Machine hasn't pulled yet.
+        const errors: string[] = [], harnesses = await api.harnesses();
+        for (const { name } of harnesses) {
+          try {
+            const result = await api.setHarnessAssignment(name, true);
+            errors.push(...(result.errors ?? []).map(error => `${name}: ${error}`));
+          } catch (e) { errors.push(`${name}: ${errorMessage(e)}`); }
+        }
+        return { errors, empty: !harnesses.length };
+      }, value => { if (value.errors.length || value.empty) setLeft(value); else onDone(); })}><Pending pending={run.pending}>Turn everything on</Pending></Button>
       <p className="text-xs text-muted-foreground">Every Skill and Rule in every Harness on this Machine, including ones added later.</p>
     </div>
     <ErrorNotice error={run.error} />
-    <div className="flex flex-wrap gap-2"><Button variant="outline" disabled={run.pending} onClick={openMatrix}>Choose in the Assignment matrix</Button>
-      <Button variant="ghost" disabled={run.pending} onClick={onDone}>Leave everything off</Button></div>
+    {left?.empty && <Notice title="No Harness is on">There was nothing to turn on. Turn Harnesses on in Settings, then set the Assignment in the matrix.</Notice>}
+    {!!left?.errors.length && <Notice title="Not everything was turned on" tone="destructive">
+      <ul className="list-disc pl-5">{left.errors.map(line => <li key={line} className="break-words">{line}</li>)}</ul></Notice>}
+    <div className="flex flex-wrap gap-2">{left && <Button onClick={onDone}>Continue</Button>}<Button variant="outline" disabled={run.pending} onClick={openMatrix}>Choose in the Assignment matrix</Button>
+      {!left && <Button variant="ghost" disabled={run.pending} onClick={onDone}>Leave everything off</Button>}</div>
   </Frame>;
 }
 
