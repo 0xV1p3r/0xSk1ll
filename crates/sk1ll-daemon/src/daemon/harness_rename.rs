@@ -18,6 +18,7 @@ impl Daemon {
         self: &Arc<Self>,
         request: crate::client::HarnessRenameRequest,
     ) -> Result<crate::client::HarnessRenameResult> {
+        let _harnesses = self.harness_changes.lock().await;
         let _writes = self.assignment_writes.lock().await;
         if self.store.local().is_some() {
             return self.blocking(move |d, eng| d.rename_harness_here(eng, request)).await;

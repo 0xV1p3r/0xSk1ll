@@ -24,9 +24,9 @@ use tokio::sync::broadcast::error::RecvError;
 use crate::client::{
     API_HEADER, API_VERSION, AddImportRequest, CommitMessage, CommitRequest, CommitResponse, ConflictTarget,
     ConflictView, DiffView, DraftEntry, Event, HarnessApplied, HarnessChangeRequest, HarnessChoice, HarnessPreview,
-    HarnessSettings, HarnessView, ImportName, ImportUpdated, InstructionPreview, ItemView, JoinApiRequest, PullResult,
-    PushResult, ResolveImportRequest, ResolvedSource, RestoreRequest, RestoreResponse, SetHarnessEnabled, StatusView,
-    SyncRequest, SyncResult, UpdateImportsRequest,
+    HarnessSettings, HarnessView, ImportName, ImportUpdated, InstructionPreview, ItemView, JoinApiRequest,
+    PullKeepRequest, PullKeepResult, PullResult, PushResult, ResolveImportRequest, ResolvedSource, RestoreRequest,
+    RestoreResponse, SetHarnessEnabled, StatusView, SyncRequest, SyncResult, UpdateImportsRequest,
 };
 use crate::daemon::Daemon;
 use crate::error::{Error, Result};
@@ -54,10 +54,12 @@ pub(crate) fn router(d: Arc<Daemon>) -> Router {
         .route("/commit/message", get(commit_message))
         .route("/restore", post(restore))
         .route("/pull", post(pull))
+        .route("/pull/keep", post(pull_keep))
         .route("/conflicts", get(conflicts))
         .route("/conflicts/displaced", get(recovered))
         .route("/conflicts/displaced/{id}/adopt", post(adopt_displaced))
         .route("/conflicts/displaced/{id}/discard", post(discard_displaced))
+        .route("/keep-report/dismiss-notes", post(dismiss_keep_notes))
         .route("/conflicts/adopt", post(adopt))
         .route("/conflicts/overwrite", post(overwrite))
         .route("/harnesses", get(harnesses))
@@ -66,6 +68,7 @@ pub(crate) fn router(d: Arc<Daemon>) -> Router {
         .route("/harnesses/config/path", get(machine_config_path))
         .route("/harnesses/preview", post(preview_harness))
         .route("/harnesses/apply", post(apply_harness))
+        .route("/harnesses/take-out", post(take_out_harness))
         .route("/setup/harnesses", get(setup_harnesses))
         .route("/setup/harnesses/{name}", post(set_setup_harness))
         .route("/imports", get(imports))
@@ -353,6 +356,10 @@ async fn pull(State(d): St) -> Result<Json<PullResult>> {
     Ok(Json(d.pull().await?))
 }
 
+async fn pull_keep(State(d): St, Json(req): Json<PullKeepRequest>) -> Result<Json<PullKeepResult>> {
+    Ok(Json(d.pull_keep(req).await?))
+}
+
 async fn recovered(State(d): St, Query(q): Query<ReadQuery>) -> Result<Json<Vec<ConflictView>>> {
     Ok(Json(q.snapshot(&d).await?.recovered()?))
 }
@@ -369,6 +376,10 @@ async fn adopt_displaced(State(d): St, UrlPath(id): UrlPath<String>) -> Result<J
 async fn discard_displaced(State(d): St, UrlPath(id): UrlPath<String>) -> Result<StatusCode> {
     d.blocking(move |d, eng| d.resolve_displaced(eng, &id, false)).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn dismiss_keep_notes(State(d): St) -> Result<Json<usize>> {
+    Ok(Json(d.blocking(|d, eng| d.dismiss_keep_notes(eng)).await?))
 }
 
 async fn adopt(State(d): St, Json(t): Json<ConflictTarget>) -> Result<StatusCode> {
@@ -394,6 +405,7 @@ async fn set_setup_harness(
     UrlPath(name): UrlPath<String>,
     Json(req): Json<SetHarnessEnabled>,
 ) -> Result<Json<Vec<HarnessChoice>>> {
+    let _harnesses = d.harness_changes.lock().await;
     Ok(Json(d.blocking(move |d, eng| d.set_setup_harness(eng, &name, req.enabled)).await?))
 }
 
@@ -405,6 +417,7 @@ async fn notifications_enabled(State(d): St) -> Result<Json<bool>> {
 }
 
 async fn set_notifications(State(d): St, Json(enabled): Json<bool>) -> Result<Json<bool>> {
+    let _harnesses = d.harness_changes.lock().await;
     d.blocking(move |d, _| Ok(sk1ll_core::machine::MachineConfig::set_notifications(&d.cfg.machine_config, enabled)?))
         .await?;
     Ok(Json(enabled))
@@ -423,7 +436,14 @@ async fn preview_harness(State(d): St, Json(req): Json<HarnessChangeRequest>) ->
 }
 
 async fn apply_harness(State(d): St, Json(req): Json<HarnessChangeRequest>) -> Result<Json<HarnessApplied>> {
-    Ok(Json(d.blocking(move |d, eng| d.apply_harness(eng, req)).await?))
+    Ok(Json(d.apply_harness_serialized(req).await?))
+}
+
+async fn take_out_harness(
+    State(d): St,
+    Json(req): Json<HarnessChangeRequest>,
+) -> Result<Json<crate::client::HarnessTakenOut>> {
+    Ok(Json(d.take_out_harness(req).await?))
 }
 
 #[derive(serde::Deserialize)]

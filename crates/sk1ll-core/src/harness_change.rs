@@ -118,6 +118,37 @@ pub fn apply(
     Ok(plan)
 }
 
+/// [`apply`] for a change made after taking out what sk1ll placed: the
+/// plan it writes from must have scanned every placement, and found none
+/// still managed, or nothing is written ([`Error::Changed`]).
+pub fn apply_taken_out(
+    _lock: &crate::EngineLock,
+    repo: &Repo,
+    path: &Path,
+    change: &HarnessChange,
+    expected: &str,
+) -> Result<ChangePlan> {
+    let snapshot = Snapshot::take(path)?;
+    if snapshot.fingerprint() != expected {
+        return Err(Error::Changed("machine.toml changed since the preview — preview again".into()));
+    }
+    let plan = plan_snapshot(repo, change, None, snapshot)?;
+    if let Some(warning) = plan.warnings.first() {
+        return Err(Error::Changed(format!("{warning}; machine.toml was not changed")));
+    }
+    let left = plan.placed.iter().filter(|a| a.kind == sync::ActionKind::Remove).count();
+    if left > 0 {
+        return Err(Error::Changed(format!(
+            "{left} placed {} still there; machine.toml was not changed",
+            if left == 1 { "item is" } else { "items are" }
+        )));
+    }
+    if plan.snapshot.text()? != plan.text {
+        plan.snapshot.replace(&plan.text)?;
+    }
+    Ok(plan)
+}
+
 /// The part of `old` that no harness in `after` syncs into any more.
 fn left_part(old: &Harness, after: &BTreeMap<String, Harness>) -> Harness {
     let skills = old.skills_dir().map(|p| real(&p));

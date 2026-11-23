@@ -177,6 +177,19 @@ pub(crate) struct Daemon {
     /// One Assignment write at a time, from its checks to applying the
     /// server's confirmation, as when the engine mutex covered all of it.
     assignment_writes: tokio::sync::Mutex<()>,
+    /// One change to `machine.toml`'s harnesses at a time. A take-out holds
+    /// it from its preview check to the change, across its Assignment
+    /// write; taken before [`Daemon::assignment_writes`] where both are.
+    pub(crate) harness_changes: tokio::sync::Mutex<()>,
+    /// Tests synchronize on the harness-change lock: told when a take-out
+    /// holds it, a take-out then waits for `take_out_proceed`; an apply
+    /// tells `apply_entered` once it holds it.
+    #[cfg(test)]
+    pub(super) take_out_entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    #[cfg(test)]
+    pub(super) take_out_proceed: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    #[cfg(test)]
+    pub(super) apply_entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     /// The applied assignment. `None` when it was lost (or never stored):
     /// harnesses are left alone until the server sends one. Replaced only
     /// with the engine mutex held ([`Daemon::apply_assignment`]); read by
@@ -221,6 +234,12 @@ pub(crate) struct Engine {
     /// replaceable, before the new one is stored.
     #[cfg(test)]
     before_rejoin_persist: Option<Box<dyn FnOnce() + Send>>,
+    /// Runs inside a take-out, after the sync and before `machine.toml` changes.
+    #[cfg(test)]
+    pub(super) before_take_out_apply: Option<Box<dyn FnOnce() + Send>>,
+    /// Runs inside a take-out, after its last check and before the write.
+    #[cfg(test)]
+    pub(super) before_take_out_write: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl Daemon {
@@ -297,6 +316,10 @@ impl Daemon {
             server_baseline: None,
             assignment_revision: snapshot.as_ref().map_or(0, |s| s.revision),
             version: sk1ll_core::VERSION.to_string(),
+            // Read here too, for an engine that never reconciles (a preview).
+            keep_report: sk1ll_core::Repo::open_git_only(state.repo())
+                .and_then(|repo| repo.peek_keep_report())
+                .unwrap_or_default(),
             awaiting_assignment: snapshot.is_none(),
             auth_rejected_since: None,
             // Before the first reconcile (a read-only engine never runs
@@ -320,6 +343,13 @@ impl Daemon {
             lifecycle: Mutex::new(lifecycle),
             net: tokio::sync::Mutex::new(()),
             assignment_writes: tokio::sync::Mutex::new(()),
+            harness_changes: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            take_out_entered: Mutex::new(None),
+            #[cfg(test)]
+            take_out_proceed: Mutex::new(None),
+            #[cfg(test)]
+            apply_entered: Mutex::new(None),
             engine: Mutex::new(Engine {
                 lock: None,
                 reconciled: None,
@@ -329,6 +359,10 @@ impl Daemon {
                 after_sync_review: None,
                 #[cfg(test)]
                 before_rejoin_persist: None,
+                #[cfg(test)]
+                before_take_out_apply: None,
+                #[cfg(test)]
+                before_take_out_write: None,
             }),
             view: watch::channel(view).0,
             events: broadcast::channel(256).0,

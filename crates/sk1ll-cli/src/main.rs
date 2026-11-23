@@ -15,8 +15,8 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use sk1ll_core::{ImportState, MachineConfig, Origin, Repo};
 use sk1ll_daemon::client::{
     AddImportRequest, ChangeKind, CommitRequest, ConflictTarget, ConflictView, ContentType, CreateItemRequest,
-    DaemonMode, DeleteItemRequest, PlacementView, PullResult, RenameItemRequest, RepoContent, ResolveImportRequest,
-    RestoreRequest, SyncRequest, UpdateImportsRequest,
+    DaemonMode, DeleteItemRequest, PlacementView, PullKeepRequest, PullResult, RenameItemRequest, RepoContent,
+    ResolveImportRequest, RestoreRequest, SyncRequest, UpdateImportsRequest,
 };
 use sk1ll_proto::{AssignmentChanges, AssignmentWrite, ToggleChange, ToggleKind};
 
@@ -184,7 +184,14 @@ enum Cmd {
         yes: bool,
     },
     /// Fetch the latest baseline from origin, keeping the draft on top
-    Pull,
+    Pull {
+        /// When Blocked: keep your version of these clashing items (each whole file, over the other change)
+        #[arg(long, num_args = 1.., value_name = "ITEM", conflicts_with = "keep_all")]
+        keep: Vec<String>,
+        /// When Blocked: keep your version of every clashing item
+        #[arg(long)]
+        keep_all: bool,
+    },
     /// Copy a conflicting harness copy back into the repo as a draft change
     Adopt { harness: String, name: String },
     /// Print the instruction files a harness would receive
@@ -331,6 +338,8 @@ enum RecoverCmd {
         #[arg(value_name = "ID")]
         id: String,
     },
+    /// Dismiss the notes an interrupted keep left (those with no recovery entry to adopt)
+    DismissNotes,
 }
 
 impl Cmd {
@@ -356,7 +365,7 @@ impl Cmd {
 
     /// Works on a repo whose configuration is damaged: it needs only git.
     fn git_only(&self) -> bool {
-        matches!(self, Self::Draft | Self::Diff { .. } | Self::Restore { .. } | Self::Commit { .. } | Self::Pull)
+        matches!(self, Self::Draft | Self::Diff { .. } | Self::Restore { .. } | Self::Commit { .. } | Self::Pull { .. })
     }
 }
 
@@ -519,6 +528,10 @@ fn command(s: &Session, cmd: Cmd) -> Result<()> {
             println!("adopted into {}", s.block(c.adopt_displaced(&id))?.display());
         }
         Cmd::Recover { command: RecoverCmd::Discard { id } } => s.block(c.discard_displaced(&id))?,
+        Cmd::Recover { command: RecoverCmd::DismissNotes } => match s.block(c.dismiss_keep_notes())? {
+            0 => println!("no notes to dismiss"),
+            n => println!("dismissed {}; `sk1ll status` shows what is left", plural(n, "note", "notes")),
+        },
         Cmd::List { unmanaged: true, .. } => {
             for skill in s.block(c.skills())?.into_iter().filter(|e| e.kind == ContentType::Unmanaged) {
                 let harnesses: std::collections::BTreeSet<_> =
@@ -882,37 +895,59 @@ fn command(s: &Session, cmd: Cmd) -> Result<()> {
             }
             if !resp.kept.is_empty() {
                 println!("kept your version of what the pull is blocked on in recovery: {}", resp.kept.join(" "));
-                println!("after `sk1ll pull`, bring it back as Draft with `sk1ll recover adopt <id>`");
+                println!(
+                    "run `sk1ll pull` to take the new baseline; `sk1ll recover adopt <id>` brings yours back after"
+                );
             }
         }
-        Cmd::Pull => match s.block(c.pull())? {
-            PullResult::UpToDate => println!("already on the latest baseline"),
-            PullResult::Updated { from, to } => {
-                println!("baseline {} -> {}", from.as_deref().map_or("(none)", short), short(&to));
+        Cmd::Pull { keep, keep_all } => {
+            let pulled = match (keep_all, keep.is_empty()) {
+                (false, true) => s.block(c.pull()).map(|result| (result, Vec::new())),
+                _ => s.block(c.pull_keep(&PullKeepRequest { items: keep, all: keep_all })).map(|r| (r.pull, r.kept)),
+            };
+            // What an interrupted keep left in recovery, whether the pull went
+            // through or not; not being able to read it hides nothing else.
+            if let Ok(status) = s.block(c.status()) {
+                print_keep_report(&status.keep_report);
             }
-            PullResult::Blocked { baseline, items, pending: true, .. } => bail!(
-                "pull pending at {}: {} changed while it was updating them. Run `sk1ll restore {}` (your version is \
-                 kept in recovery), then `sk1ll pull` to finish, then `sk1ll recover adopt <id>` for each id the \
-                 restore printed",
-                short(&baseline),
-                names(&items),
-                spaced(&items)
-            ),
-            PullResult::Blocked { baseline, items, pending: false, uncommitted } => {
-                if !uncommitted.is_empty() {
-                    eprintln!(
-                        "turned {} back into Draft, nothing lost: {} with baseline {}",
-                        plural(uncommitted.len(), "unpushed commit", "unpushed commits"),
-                        if uncommitted.len() == 1 { "it conflicts" } else { "they conflict" },
-                        short(&baseline)
-                    );
-                    for commit in &uncommitted {
-                        eprintln!("  {commit}");
-                    }
+            let (result, kept) = pulled?;
+            match result {
+                PullResult::UpToDate => println!("already on the latest baseline"),
+                PullResult::Updated { from, to } => {
+                    println!("baseline {} -> {}", from.as_deref().map_or("(none)", short), short(&to));
                 }
-                bail!("blocked: {}", sk1ll_daemon::client::blocked_hint(&items))
+                PullResult::Blocked { baseline, items, pending: true, .. } => bail!(
+                    "pull pending at {}: {} changed while it was updating them. Keep your version with `sk1ll pull \
+                     --keep {}`, or take the new baseline's with `sk1ll restore {}` and then `sk1ll pull`",
+                    short(&baseline),
+                    names(&items),
+                    spaced(&items),
+                    spaced(&items)
+                ),
+                PullResult::Blocked { baseline, items, pending: false, uncommitted } => {
+                    if !uncommitted.is_empty() {
+                        eprintln!(
+                            "turned {} back into Draft, nothing lost: {} with baseline {}",
+                            plural(uncommitted.len(), "unpushed commit", "unpushed commits"),
+                            if uncommitted.len() == 1 { "it conflicts" } else { "they conflict" },
+                            short(&baseline)
+                        );
+                        for commit in &uncommitted {
+                            eprintln!("  {commit}");
+                        }
+                    }
+                    bail!("blocked: {}", sk1ll_daemon::client::blocked_hint(&items))
+                }
             }
-        },
+            if !kept.is_empty() {
+                println!(
+                    "kept your version of {} on top, as Draft: it replaces the other change to {}",
+                    names(&kept),
+                    if kept.len() == 1 { "it" } else { "them" }
+                );
+                println!("review with `sk1ll diff {}`, then `sk1ll commit {}`", spaced(&kept), spaced(&kept));
+            }
+        }
         Cmd::Adopt { harness, name } => {
             require_harness(s, &harness)?;
             s.block(c.adopt(&ConflictTarget { harness: harness.clone(), name: name.clone() }))?;
@@ -1188,6 +1223,28 @@ fn print_machine_state(status: &sk1ll_daemon::client::StatusView) {
     if let Some(reason) = &report.push_refused {
         println!("push refused by the server: {reason}");
         println!("pushing again won't help: fix what it names and commit the fix");
+    }
+    print_keep_report(&status.keep_report);
+    if let Some(error) = &status.last_error {
+        println!("last error: {error}");
+    }
+}
+
+/// What interrupted keeps left in recovery, each with the command that
+/// brings it back.
+fn print_keep_report(report: &[sk1ll_core::draft::Unkept]) {
+    if report.is_empty() {
+        return;
+    }
+    println!("an interrupted keep left your versions in recovery:");
+    for u in report {
+        match &u.entry {
+            Some(id) => println!("  {} ({}): bring it back with `sk1ll recover adopt {id}`", u.item, u.error),
+            None => println!("  {} ({})", u.item, u.error),
+        }
+    }
+    if report.iter().any(|u| u.entry.is_none()) {
+        println!("once read, dismiss the notes with `sk1ll recover dismiss-notes`");
     }
 }
 

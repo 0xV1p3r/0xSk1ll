@@ -1,9 +1,10 @@
 use super::*;
 use std::sync::Arc;
 
+use sk1ll_core::draft::Keep;
 use sk1ll_core::{ItemRef, PullOutcome, Repo, default_commit_message, machine_author};
 
-use crate::client::{CommitRequest, CommitResponse, Event, PullResult, PushResult};
+use crate::client::{CommitRequest, CommitResponse, Event, PullKeepRequest, PullKeepResult, PullResult, PushResult};
 use crate::error::{Error, Result};
 use crate::state::{PullState, PushRefusal};
 use sk1ll_core::git::plumbing;
@@ -28,6 +29,27 @@ impl Daemon {
     /// was fetched last, whoever fetched it. A pull that moved nothing
     /// changed no Input, so its reconcile has nothing to do.
     pub(crate) async fn pull(self: &Arc<Self>) -> Result<PullResult> {
+        self.pull_keeping(None).await.map(|(result, _)| result)
+    }
+
+    /// `POST /pull/keep`: [`Daemon::pull`], keeping the Draft's version of
+    /// the clashing items named (see [`Repo::pull_keeping`]).
+    pub(crate) async fn pull_keep(self: &Arc<Self>, req: PullKeepRequest) -> Result<PullKeepResult> {
+        let keep = match (req.all, req.items.is_empty()) {
+            (true, true) => Keep::All,
+            (false, false) => {
+                let root = self.repo_root().to_path_buf();
+                let draft = self.blocking(move |_, _| Ok(Repo::open_git_only(&root)?.draft()?)).await?;
+                Keep::Items(req.items.iter().map(|i| ItemRef::resolve(i, &draft)).collect::<Result<_, _>>()?)
+            }
+            (true, false) => return Err(Error::BadRequest("pass either items or all, not both".into())),
+            (false, true) => return Err(Error::BadRequest("name the clashing items to keep, or pass all".into())),
+        };
+        let (pull, kept) = self.pull_keeping(Some(keep)).await?;
+        Ok(PullKeepResult { pull, kept })
+    }
+
+    async fn pull_keeping(self: &Arc<Self>, keep: Option<Keep>) -> Result<(PullResult, Vec<ItemRef>)> {
         self.blocking(move |d, eng| {
             d.ensure_managed()?;
             d.lock_repo(eng)?;
@@ -35,12 +57,12 @@ impl Daemon {
         })
         .await?;
         let result = match self.network(|d| d.fetch_baseline()).await {
-            Ok(()) => self.pull_fetched().await,
+            Ok(()) => self.pull_fetched_keeping(keep).await,
             Err(e) => Err(e),
         };
         let result = match result {
-            Ok(r) if self.remote.pushes_commits() && !matches!(r, PullResult::Blocked { .. }) => {
-                self.push_pending().await.map(|_| r)
+            Ok((r, kept)) if self.remote.pushes_commits() && !matches!(r, PullResult::Blocked { .. }) => {
+                self.push_pending().await.map(|_| (r, kept))
             }
             result => result,
         };
@@ -50,7 +72,7 @@ impl Daemon {
             }
             d.reconcile(eng)?;
             match &result {
-                Ok(r) => {
+                Ok((r, _)) => {
                     if let PullResult::Updated { to, .. } = r {
                         tracing::info!("baseline is now {to}");
                     }
@@ -74,10 +96,14 @@ impl Daemon {
     /// The local half of a pull ([`Daemon::pull_inner`]) under the engine
     /// mutex.
     async fn pull_fetched(self: &Arc<Self>) -> Result<PullResult> {
+        self.pull_fetched_keeping(None).await.map(|(result, _)| result)
+    }
+
+    async fn pull_fetched_keeping(self: &Arc<Self>, keep: Option<Keep>) -> Result<(PullResult, Vec<ItemRef>)> {
         self.blocking(move |d, eng| {
             d.ensure_managed()?;
             d.lock_repo(eng)?;
-            d.pull_inner(eng)
+            d.pull_inner(eng, keep.as_ref())
         })
         .await
     }
@@ -86,7 +112,13 @@ impl Daemon {
     /// Baseline that writes a file through a filter driver, which the skills
     /// repo doesn't support, leaves the Machine Blocked on it, and the error
     /// says why.
-    pub(super) fn pull_inner(&self, eng: &mut Engine) -> Result<PullResult> {
+    ///
+    /// With `keep`, it keeps the Draft's version of those clashing items
+    /// and returns the ones it kept. A plain pull finishes a keep that
+    /// stopped half-way, once no pull is pending.
+    fn pull_inner(&self, eng: &mut Engine, keep: Option<&Keep>) -> Result<(PullResult, Vec<ItemRef>)> {
+        let mut kept = Vec::new();
+
         let root = self.repo_root().to_path_buf();
         let repo = Repo::open_git_only(&root)?;
         let first = if repo.pull_pending()? {
@@ -114,7 +146,22 @@ impl Daemon {
         } else {
             let head = plumbing::rev(&root, "HEAD")?;
             let lock = eng.lock.as_ref().ok_or_else(|| Error::Conflict(format!("{} is not locked", root.display())))?;
-            match repo.pull_fetched(lock) {
+            let pulled = match keep {
+                Some(keep) => repo.pull_keeping(lock, keep).map(|pulled| {
+                    kept = pulled.kept;
+                    pulled.outcome
+                }),
+                None => repo.pull_fetched(lock),
+            };
+            let pulled = match pulled {
+                // An interrupted keep becomes its saved report, read with the status.
+                Ok(outcome) if keep.is_none() && !repo.pull_pending()? => {
+                    repo.finish_keeping(lock)?;
+                    Ok(outcome)
+                }
+                pulled => pulled,
+            };
+            match pulled {
                 Ok(PullOutcome::UpToDate) => (PullResult::UpToDate, PullState::Clear),
                 Ok(PullOutcome::Updated { from, to }) => {
                     (PullResult::Updated { from: Some(from), to }, PullState::Clear)
@@ -160,7 +207,7 @@ impl Daemon {
                 lc.set_server_baseline(remote);
             }
         });
-        Ok(result)
+        Ok((result, kept))
     }
 
     /// Pushes committed commits the server doesn't have. What to push is

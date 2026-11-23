@@ -24,10 +24,12 @@
 //! | POST | `/commit` | [`CommitRequest`] → [`CommitResponse`] |
 //! | POST | `/restore` | [`RestoreRequest`] → [`RestoreResponse`] |
 //! | POST | `/pull` | → [`PullResult`] |
+//! | POST | `/pull/keep` | [`PullKeepRequest`] → [`PullKeepResult`]; a Blocked pull keeping the Draft's version of clashing items |
 //! | GET | `/conflicts` | → `Vec<`[`ConflictView`]`>` |
 //! | GET | `/conflicts/displaced` | → all recovered entries |
 //! | POST | `/conflicts/displaced/{id}/adopt` | → destination path |
 //! | POST | `/conflicts/displaced/{id}/discard` | → 204 |
+//! | POST | `/keep-report/dismiss-notes` | → how many notes of the keep report were dismissed |
 //! | POST | `/conflicts/adopt`, `/conflicts/overwrite` | [`ConflictTarget`] → 204 |
 //! | GET | `/harnesses` | → `Vec<`[`HarnessView`]`>` |
 //! | GET | `/setup/harnesses` | → `Vec<`[`HarnessChoice`]`>` |
@@ -35,6 +37,7 @@
 //! | GET / POST | `/notifications` | read or set the desktop notification preference as a JSON boolean |
 //! | GET | `/harnesses/config` | → [`HarnessSettings`] |
 //! | POST | `/harnesses/preview` | [`HarnessChangeRequest`] → [`HarnessPreview`]; changes nothing |
+//! | POST | `/harnesses/take-out` | [`HarnessChangeRequest`] (disable or remove) → [`HarnessTakenOut`]; turns the harness's items off and syncs, then makes the change only if nothing it placed is left |
 //! | POST | `/harnesses/apply` | [`HarnessChangeRequest`] → [`HarnessApplied`]; then syncs; never removes placed content; 409 if `machine.toml` changed while it was written |
 //! | POST | `/imports/{name}/update` | Optional `?force=true` → [`ImportUpdated`] |
 //! | POST | `/imports/{name}/update-reviewed` | `{expected, force}` → [`ImportUpdated`] |
@@ -164,6 +167,10 @@ pub struct StatusView {
     /// The daemon's build ([`sk1ll_core::VERSION`]).
     #[serde(default)]
     pub version: String,
+    /// What interrupted keeps left in recovery, until the user adopts or
+    /// discards each version: read from the repo on every reconcile.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keep_report: Vec<sk1ll_core::draft::Unkept>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -293,16 +300,35 @@ pub enum PullResult {
     },
 }
 
+/// `POST /pull/keep`: pull, keeping the Draft's version of the clashing
+/// `items` (or of every one, with `all`) on top of the new Baseline. The
+/// pull stays Blocked while it clashes with an item not named.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullKeepRequest {
+    #[serde(default)]
+    pub items: Vec<String>,
+    #[serde(default)]
+    pub all: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullKeepResult {
+    pub pull: PullResult,
+    /// The items whose Draft version is back on top of the new Baseline.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kept: Vec<ItemRef>,
+}
+
 /// What clears a pull Blocked on `items`, as every message about it says:
-/// restore them (each version is kept in recovery), pull, then adopt the
-/// kept versions back as Draft on the new Baseline.
+/// keep this Machine's version with `sk1ll pull --keep`, or take the new
+/// Baseline's by restoring them.
 pub fn blocked_hint(items: &[ItemRef]) -> String {
     let names: Vec<String> = items.iter().map(ToString::to_string).collect();
     let names = names.join(" ");
     format!(
-        "the new baseline also changes {names}, which this machine changed too. Run `sk1ll restore {names}` (your \
-         version is kept in recovery), then `sk1ll pull`, then `sk1ll recover adopt <id>` for each id the restore \
-         printed, to bring your version back as Draft on the new baseline"
+        "the new baseline also changes {names}, which this machine changed too. Keep your version (the whole file, \
+         over the other change) with `sk1ll pull --keep {names}`, or take the new baseline's with `sk1ll restore \
+         {names}` and then `sk1ll pull`"
     )
 }
 
@@ -401,8 +427,8 @@ pub struct HarnessPreview {
     /// The harness once the change is made (`None`: no longer synced into).
     pub after: Option<sk1ll_core::Harness>,
     /// Content sk1ll placed where the change stops syncing. The change
-    /// leaves it in place, unmanaged; to take it out, turn the harness's
-    /// items off in its assignment first and let sync remove them.
+    /// leaves it in place, unmanaged; `POST /harnesses/take-out` takes it
+    /// out first instead.
     pub placed: Vec<PlacementView>,
     #[serde(default)]
     pub warnings: Vec<String>,
@@ -419,6 +445,23 @@ pub struct HarnessApplied {
     pub harnesses: Vec<HarnessChoice>,
     /// What the sync after the change failed to place; `machine.toml` was
     /// changed either way.
+    pub errors: Vec<String>,
+}
+
+/// `POST /harnesses/take-out`: the harness's items were turned off and
+/// synced; `machine.toml` was changed (`applied`) only if that took out
+/// everything sk1ll placed there. Else `left` lists what is still placed
+/// and the items stay off, so the same request can be retried.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessTakenOut {
+    pub applied: bool,
+    /// What sync took out (into the recovery area where its rules say so).
+    pub taken_out: Vec<PlacementView>,
+    /// Managed content still placed: why the change wasn't made.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub left: Vec<PlacementView>,
+    pub harnesses: Vec<HarnessChoice>,
+    /// What the syncs failed to place or remove.
     pub errors: Vec<String>,
 }
 
@@ -935,6 +978,10 @@ impl Client {
         self.post("/pull", &()).await
     }
 
+    pub async fn pull_keep(&self, req: &PullKeepRequest) -> Result<PullKeepResult> {
+        self.post("/pull/keep", req).await
+    }
+
     pub async fn recovered(&self) -> Result<Vec<ConflictView>> {
         self.get("/conflicts/displaced").await
     }
@@ -950,6 +997,10 @@ impl Client {
 
     pub async fn discard_displaced(&self, id: &str) -> Result<()> {
         self.post_empty(&format!("/conflicts/displaced/{}/discard", encode(id)), &()).await
+    }
+
+    pub async fn dismiss_keep_notes(&self) -> Result<usize> {
+        self.post("/keep-report/dismiss-notes", &()).await
     }
 
     pub async fn conflicts(&self) -> Result<Vec<ConflictView>> {
@@ -999,6 +1050,13 @@ impl Client {
 
     pub async fn preview_harness(&self, req: &HarnessChangeRequest) -> Result<HarnessPreview> {
         self.post("/harnesses/preview", req).await
+    }
+
+    pub async fn take_out_harness(&self, req: &HarnessChangeRequest) -> Result<HarnessTakenOut> {
+        if req.fingerprint.as_deref().is_none_or(str::is_empty) {
+            return Err(ClientError::transport("a reviewed preview is required"));
+        }
+        self.post("/harnesses/take-out", req).await
     }
 
     pub async fn apply_harness(&self, req: &HarnessChangeRequest) -> Result<HarnessApplied> {

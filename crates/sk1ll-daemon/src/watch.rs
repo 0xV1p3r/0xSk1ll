@@ -200,6 +200,7 @@ pub(crate) fn run(d: Arc<Daemon>) -> impl Future<Output = ()> {
         reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         reconcile.tick().await;
         loop {
+            let mut file_events = false;
             tokio::select! {
                 changed = roots_rx.changed() => {
                     if changed.is_err() {
@@ -207,7 +208,10 @@ pub(crate) fn run(d: Arc<Daemon>) -> impl Future<Output = ()> {
                     }
                     roots = roots_rx.borrow_and_update().clone();
                 }
-                () = dirty.notify.notified() => settle(&dirty, &d).await,
+                () = dirty.notify.notified() => {
+                    settle(&dirty, &d).await;
+                    file_events = true;
+                }
                 _ = reconcile.tick() => dirty.flag.store(true, Ordering::SeqCst),
             }
             if d.is_revoked() {
@@ -223,6 +227,9 @@ pub(crate) fn run(d: Arc<Daemon>) -> impl Future<Output = ()> {
                 dirty.flag.store(true, Ordering::SeqCst);
             }
             if dirty.take() {
+                if file_events {
+                    tracing::debug!("file changes: waking a reconcile");
+                }
                 d.wake();
             }
         }

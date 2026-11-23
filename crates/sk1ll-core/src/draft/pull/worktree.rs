@@ -13,6 +13,16 @@ use crate::Error;
 #[cfg(unix)]
 use crate::sync::displaced::Kind;
 
+/// Where a keep's restore stages a Baseline file (see
+/// [`Worktree::place_new`]), in the git directory `git_dir`: apart from
+/// pull's staging, so what a stopped restore leaves never stops a pull.
+pub(super) fn keep_stage(git_dir: &std::path::Path) -> std::path::PathBuf {
+    git_dir.join("sk1ll-keep-stage")
+}
+
+/// The one file in [`keep_stage`].
+pub(super) const KEEP_SLOT: &str = "file";
+
 /// What is at a path, read in one go.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Node {
@@ -318,6 +328,59 @@ mod unix {
             held.finish(false)?.map_or(Ok(()), Err)
         }
 
+        /// Writes `content` at `path` only while nothing is there, creating
+        /// its parents: `false` (and nothing written) if something is, so a
+        /// save made there meanwhile is never replaced.
+        pub(in super::super) fn place_new(
+            &self,
+            path: &Path,
+            content: &Content,
+            staged: &mut dyn FnMut() -> Result<()>,
+        ) -> Result<bool> {
+            let dest = self.root.join(path);
+            let (parent, name) = self.dir.parent(path, true).at(&dest)?;
+            if read(&parent, &name).at(&dest)? != Node::Missing {
+                return Ok(false);
+            }
+            let slot = super::keep_stage(&self.holder).join(super::KEEP_SLOT);
+            remove_file(&slot)?;
+            let slot = self.stage_as(slot, content, None)?;
+            staged()?;
+            let published = publish(&slot, &parent, &name);
+            let _ = fs::remove_file(&slot);
+            if let Some(stage) = slot.parent() {
+                let _ = fs::remove_dir(stage);
+            }
+            match published {
+                Ok(()) => Ok(true),
+                Err(Errno::EXIST) => Ok(false),
+                Err(e) => Err(io::Error::from(e)).at(&dest),
+            }
+        }
+
+        /// Moves what is at `path`, as long as it is `node`, into a new
+        /// recovery entry: a Draft deletion that keeps what it removes.
+        pub(in super::super) fn take_out(&self, path: &Path, node: &Node) -> Result<()> {
+            let dest = self.root.join(path);
+            let (parent, name) = self.dir.parent(path, false).at(&dest)?;
+            if read(&parent, &name).at(&dest)? != *node {
+                return Err(Error::Changed(format!("{} changed while it was taken out", dest.display())));
+            }
+            let mut held =
+                Displacing::begin(None, Kind::Draft, PULL, &dest, Some(&fingerprint(node)), None, &self.holder)?;
+            match held.take_at(&parent, &name) {
+                Ok(true) => held.finish(false)?.map_or(Ok(()), Err),
+                Ok(false) => {
+                    held.abandon();
+                    Ok(())
+                }
+                Err(e) => {
+                    held.abandon();
+                    Err(e)
+                }
+            }
+        }
+
         fn slot(&self, i: usize) -> PathBuf {
             self.stage.join(i.to_string())
         }
@@ -345,11 +408,15 @@ mod unix {
         /// exactly `permissions`, or else as git creates files (the umask
         /// applies).
         fn stage(&self, i: usize, content: &Content, permissions: Option<u32>) -> Result<PathBuf> {
-            match fs::DirBuilder::new().mode(0o700).create(&self.stage) {
-                Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e).at(&self.stage),
+            self.stage_as(self.slot(i), content, permissions)
+        }
+
+        fn stage_as(&self, staged: PathBuf, content: &Content, permissions: Option<u32>) -> Result<PathBuf> {
+            let dir = staged.parent().unwrap_or(&self.stage);
+            match fs::DirBuilder::new().mode(0o700).create(dir) {
+                Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e).at(dir),
                 _ => {}
             }
-            let staged = self.slot(i);
             match content {
                 Content::Link(target) => std::os::unix::fs::symlink(OsStr::from_bytes(target), &staged).at(&staged)?,
                 Content::File { bytes, executable } => {
@@ -566,6 +633,17 @@ mod other {
             unreachable!()
         }
         pub(in super::super) fn adopt(&self, _: &Path, _: &Node, _: &Entry) -> Result<()> {
+            unreachable!()
+        }
+        pub(in super::super) fn take_out(&self, _: &Path, _: &Node) -> Result<()> {
+            unreachable!()
+        }
+        pub(in super::super) fn place_new(
+            &self,
+            _: &Path,
+            _: &Content,
+            _: &mut dyn FnMut() -> Result<()>,
+        ) -> Result<bool> {
             unreachable!()
         }
         pub(in super::super) fn prune<'p>(&self, _: impl Iterator<Item = &'p Path>) {
