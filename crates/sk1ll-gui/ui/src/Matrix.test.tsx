@@ -521,7 +521,10 @@ describe('Machine-indexed state', () => {
     await waitFor(() => expect(api.setAssignment).toHaveBeenCalledWith('toString', expect.anything()));
     // Bulk changes skip the Machine that never loaded.
     vi.spyOn(window, 'confirm').mockReturnValueOnce(true);
-    fireEvent.click(screen.getByRole('button', { name: 'Actions for skill:pdf' }));
+    // The row's actions stay disabled until the toString write settles.
+    const actions = screen.getByRole('button', { name: 'Actions for skill:pdf' });
+    await waitFor(() => expect((actions as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(actions);
     fireEvent.click(await screen.findByRole('menuitem', { name: 'Disable in all visible Harnesses' }));
     await waitFor(() => expect(toast).toHaveBeenCalled());
     expect(vi.mocked(api.setAssignment).mock.calls.some(([machine]) => machine === 'constructor')).toBe(false);
