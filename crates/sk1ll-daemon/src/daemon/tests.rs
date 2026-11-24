@@ -943,6 +943,25 @@ async fn a_rejoin_does_not_replace_a_registration_that_recovered_meanwhile() {
     assert!(d.ensure_managed().is_ok(), "still managing, not halted");
 }
 
+/// A status event must expose the rejection and its explanation together.
+#[test]
+fn auth_rejection_publishes_one_complete_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let (d, _session, _) = joined_daemon(dir.path(), PullRecord::default());
+    d.set_link(Link::Offline);
+    d.set_error("an earlier repository error");
+    let mut events = d.subscribe_events();
+
+    d.set_auth_rejected();
+
+    let view = d.view();
+    assert_eq!(view.connection, crate::client::Connection::AuthRejected);
+    assert!(view.auth_rejected_since.is_some());
+    assert!(view.last_error.as_deref().unwrap().contains("401"));
+    assert!(matches!(events.try_recv(), Ok(Event::Status)));
+    assert!(matches!(events.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
+}
+
 /// The session's connection can't slip in between the check that the old
 /// registration is replaceable and the halt that replaces it: either it
 /// connects first (and the join stores nothing) or the halt comes first (and
