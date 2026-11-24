@@ -28,6 +28,8 @@ pub(crate) enum Link {
     /// Machine keeps working and retrying; only the server's explicit
     /// `revoked` message removes it.
     AuthRejected,
+    /// The server speaks another protocol version; retried like Offline.
+    Incompatible,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +194,7 @@ impl Lifecycle {
             Fleet::Joined { link: Link::Connected, .. } => Connection::Connected,
             Fleet::Joined { link: Link::Offline, .. } => Connection::Offline,
             Fleet::Joined { link: Link::AuthRejected, .. } => Connection::AuthRejected,
+            Fleet::Joined { link: Link::Incompatible, .. } => Connection::Incompatible,
             Fleet::Halted { was, .. } => *was,
             Fleet::Revoked => Connection::Revoked,
         }
@@ -297,6 +300,8 @@ mod tests {
             server_baseline: None,
             assignment_revision: 1,
             version: String::new(),
+            protocol: 1,
+            server: None,
             keep_report: Vec::new(),
             awaiting_assignment: false,
             auth_rejected_since: None,

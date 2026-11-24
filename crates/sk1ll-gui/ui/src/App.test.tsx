@@ -6,7 +6,7 @@ import { App } from './App';
 import { api } from './api';
 import type { StatusView } from './types';
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(async () => () => {}) }));
-vi.mock('./api', () => ({ api: { status: vi.fn(), connectionInfo: vi.fn(), skills: vi.fn(), recovered: vi.fn(), imports: vi.fn(), fleet: vi.fn(), log: vi.fn(), logFacets: vi.fn(), init: vi.fn(), setupHarnesses: vi.fn(), writeSkillFile: vi.fn(), skillFile: vi.fn() }, errorMessage: String, errorStatus: (e: {status?: number}) => e?.status }));
+vi.mock('./api', () => ({ api: { status: vi.fn(), restartDaemon: vi.fn(), connectionInfo: vi.fn(), skills: vi.fn(), recovered: vi.fn(), imports: vi.fn(), fleet: vi.fn(), log: vi.fn(), logFacets: vi.fn(), init: vi.fn(), setupHarnesses: vi.fn(), writeSkillFile: vi.fn(), skillFile: vi.fn() }, errorMessage: String, errorStatus: (e: {status?: number}) => e?.status }));
 vi.mock('./Skills', () => ({
   Skills: ({ fileEditState }: { fileEditState: { current: string } }) => <SkillFile
     file={{ path: 'SKILL.md', fingerprint: 'original', text: 'Original', binary: false, too_large: false, size: 8 }}
@@ -78,4 +78,22 @@ it('keeps a dirty Library editor mounted across daemon failure and saves against
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(document.activeElement).toBe(screen.getByRole('heading', { name: 'SKILL.md' }));
   } finally { cleanup(); vi.useRealTimers(); }
+});
+it('says which side to upgrade when the Server speaks another protocol', async () => {
+  vi.mocked(api.status).mockResolvedValue({ ...status, connection: 'incompatible', version: '0.2.0 (abc1234567)', protocol: 2, server: { version: '0.1.0', protocol: 1 } });
+  render(<App />);
+  expect(await screen.findByText('Server is out of date')).toBeTruthy();
+  expect(screen.getByText(/SK1LL_SERVER_VERSION=0\.2\.0 docker compose/)).toBeTruthy();
+});
+it('offers to restart a Daemon older than the app, and hides a dismissed older Server', async () => {
+  localStorage.clear();
+  vi.mocked(api.status).mockResolvedValue({ ...status, connection: 'connected', version: '0.0.1 (abc1234567)', protocol: 2, server: { version: '0.0.0', protocol: 2 } });
+  vi.mocked(api.restartDaemon).mockResolvedValue();
+  render(<App />);
+  expect(await screen.findByText('The Daemon still runs 0.0.1')).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: 'Restart daemon' }));
+  await waitFor(() => expect(api.restartDaemon).toHaveBeenCalled());
+  fireEvent.click(screen.getByRole('button', { name: 'Dismiss for Server 0.0.0' }));
+  expect(screen.queryByText('The Server runs an older release')).toBeNull();
+  expect(JSON.parse(localStorage.getItem('sk1ll-dismissed-server-versions') ?? '[]')).toEqual(['0.0.0']);
 });

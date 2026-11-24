@@ -16,14 +16,14 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use sk1ll_proto::{
     AssignmentOutcome, AssignmentSnapshot, AssignmentUpdate, AssignmentWrite, DaemonMessage, ErrorBody, MachineReport,
-    PROTOCOL_HEADER, PROTOCOL_VERSION, ServerMessage,
+    PROTOCOL_HEADER, PROTOCOL_VERSION, ServerMessage, VERSION_HEADER,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::{self, Message, client::IntoClientRequest};
 
 use crate::DaemonState;
 use crate::auth::redact;
-use crate::client::{Connection, Event};
+use crate::client::{Connection, Event, ServerVersion};
 use crate::daemon::{Daemon, Link, rename_write};
 use crate::error::{Error, Result};
 
@@ -38,7 +38,34 @@ enum ConnectError {
     /// HTTP 401 on the upgrade: the token was refused, by the server or by
     /// something in front of it.
     Unauthorized,
+    /// HTTP 426: the server speaks another protocol version.
+    Incompatible(String, ServerVersion),
     Other(String),
+}
+
+/// Which side to upgrade, when the server named its protocol: protocol
+/// versions only grow, so the lower one is the older side.
+fn incompatible(server: &ServerVersion) -> Option<String> {
+    let theirs = server.protocol?;
+    let release = server.version.as_deref().map_or_else(String::new, |v| format!("sk1ll {v}, "));
+    let ours = env!("CARGO_PKG_VERSION");
+    let upgrade = if theirs < PROTOCOL_VERSION {
+        "upgrade the Server to this Machine's release"
+    } else {
+        "upgrade sk1ll on this Machine to the Server's release"
+    };
+    Some(format!(
+        "the Server runs {release}protocol {theirs}; this Machine runs sk1ll {ours}, protocol {PROTOCOL_VERSION}: {upgrade}"
+    ))
+}
+
+/// The versions a server response names in its headers.
+fn server_version(headers: &axum::http::HeaderMap) -> ServerVersion {
+    let get = |name| headers.get(name).and_then(|v| v.to_str().ok()).map(|v| v.trim().to_string());
+    ServerVersion {
+        version: get(VERSION_HEADER).filter(|v| !v.is_empty()),
+        protocol: get(PROTOCOL_HEADER).and_then(|v| v.parse().ok()),
+    }
 }
 
 pub(crate) struct SessionWrite {
@@ -79,7 +106,7 @@ pub(crate) async fn connected(d: &Arc<Daemon>) -> Result<()> {
             let status = view.borrow_and_update().clone();
             match status.connection {
                 Connection::Connected if d.assignment_session.borrow().is_some() => return Ok(()),
-                Connection::Offline | Connection::AuthRejected | Connection::Revoked => {
+                Connection::Offline | Connection::AuthRejected | Connection::Incompatible | Connection::Revoked => {
                     return Err(Error::Unavailable(status.last_error.unwrap_or_else(|| offline().to_string())));
                 }
                 _ => {}
@@ -116,7 +143,8 @@ pub(crate) async fn run(d: Arc<Daemon>) {
     let mut backoff = d.cfg.reconnect_min;
     while !d.is_revoked() {
         match connect(state).await {
-            Ok(ws) => {
+            Ok((ws, server)) => {
+                d.update(|v| v.server = Some(server));
                 backoff = d.cfg.reconnect_min;
                 tracing::info!("connected to {}", state.server_url);
                 if let Err(e) = session(&d, ws, &inbox_tx).await {
@@ -128,6 +156,13 @@ pub(crate) async fn run(d: Arc<Daemon>) {
                 }
             }
             Err(ConnectError::Unauthorized) => d.set_auth_rejected(),
+            Err(ConnectError::Incompatible(e, server)) => {
+                d.update(|v| v.server = Some(server));
+                if d.view().last_error.as_deref() != Some(e.as_str()) {
+                    d.set_error(e);
+                }
+                d.set_link(Link::Incompatible);
+            }
             Err(ConnectError::Other(e)) => {
                 if d.view().last_error.as_deref() != Some(e.as_str()) {
                     d.set_error(e);
@@ -160,7 +195,7 @@ fn jitter(d: Duration) -> Duration {
     d / 2 + d.mul_f64(frac / 2.0)
 }
 
-async fn connect(state: &DaemonState) -> std::result::Result<Ws, ConnectError> {
+async fn connect(state: &DaemonState) -> std::result::Result<(Ws, ServerVersion), ConnectError> {
     let other = |e: &dyn std::fmt::Display| ConnectError::Other(redact(&format!("server unreachable (offline): {e}")));
     let mut req = state.ws_url().into_client_request().map_err(|e| other(&e))?;
     let auth = HeaderValue::from_str(&format!("Bearer {}", state.token)).map_err(|_| other(&"bad token"))?;
@@ -174,10 +209,12 @@ async fn connect(state: &DaemonState) -> std::result::Result<Ws, ConnectError> {
         Ok(Err(tungstenite::Error::Http(resp))) if resp.status() == StatusCode::UPGRADE_REQUIRED => {
             let body = resp.body().as_deref().and_then(|b| serde_json::from_slice::<ErrorBody>(b).ok());
             let fallback = || sk1ll_proto::protocol_mismatch(&PROTOCOL_VERSION.to_string());
-            Err(ConnectError::Other(body.map_or_else(fallback, |b| b.error)))
+            let server = server_version(resp.headers());
+            let error = incompatible(&server).unwrap_or_else(|| body.map_or_else(fallback, |b| b.error));
+            Err(ConnectError::Incompatible(error, server))
         }
         Ok(Err(e)) => Err(other(&e)),
-        Ok(Ok((ws, _))) => Ok(ws),
+        Ok(Ok((ws, resp))) => Ok((ws, server_version(resp.headers()))),
     }
 }
 

@@ -3,7 +3,9 @@
 export type ItemRef = string;
 export type ItemId = string;
 export type MachineStatus = 'offline' | 'blocked' | 'conflict' | 'behind' | 'drafting' | 'in_sync';
-export type Connection = 'connecting' | 'connected' | 'offline' | 'auth_rejected' | 'revoked' | 'standalone';
+export type Connection = 'connecting' | 'connected' | 'offline' | 'auth_rejected' | 'incompatible' | 'revoked' | 'standalone';
+// The Server's release and protocol, from the headers of its last handshake response.
+export interface ServerVersion { version: string | null; protocol: number | null }
 export interface MachineReport {
   seq: number; items: { item: ItemRef; id: ItemId }[];
   inventory_complete?: boolean; inventory_error?: string;
@@ -18,6 +20,8 @@ export interface StatusView {
   last_error: string | null; revoked: boolean; server_baseline: string | null; assignment_revision: number;
   awaiting_assignment: boolean; auth_rejected_since: number | null; report: MachineReport;
   version?: string;
+  // The Daemon's protocol version, and what the Server last said about its versions.
+  protocol?: number; server?: ServerVersion | null;
   // What interrupted keeps left in recovery, until each version is adopted or discarded.
   keep_report?: Unkept[];
 }

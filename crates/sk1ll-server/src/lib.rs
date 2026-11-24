@@ -414,10 +414,12 @@ async fn check_protocol(request: Request, next: Next) -> Response {
     }
 }
 
-/// Tags every response with the server's protocol version.
+/// Tags every response with the server's protocol and release versions.
 async fn announce_protocol(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
-    response.headers_mut().insert(PROTOCOL_HEADER, HeaderValue::from(PROTOCOL_VERSION));
+    let headers = response.headers_mut();
+    headers.insert(PROTOCOL_HEADER, HeaderValue::from(PROTOCOL_VERSION));
+    headers.insert(sk1ll_proto::VERSION_HEADER, HeaderValue::from_static(env!("CARGO_PKG_VERSION")));
     response
 }
 

@@ -28,6 +28,8 @@ import { eventTopics } from './invalidation';
 import { plural } from './model';
 import { SyncDialog } from './SyncDialogs';
 import { Settings, ownScope } from './Settings';
+import { VersionNotices } from './VersionNotices';
+import { version as appVersion } from '../package.json';
 import { ConnectionPage, GettingStarted, RestartingPage, SetupWizard, StartingAssignment, Wordmark, showGettingStarted, type SetupResult } from './Setup';
 import { ErrorNotice, Loading, Notice } from './shared';
 import type { CommandError, DaemonConnection, StatusView } from './types';
@@ -279,6 +281,7 @@ export function App() {
           {status.last_error && <p className="font-mono text-xs">{status.last_error}</p>}
           <p>If this Machine was removed or its credential rotated, create a join code on another Machine and rejoin.</p>
           <div><Button variant="outline" size="sm" className="mt-2" onClick={() => navigate('Settings')}>Rejoin in Settings</Button></div></Notice>}
+        <VersionNotices status={status} app={appVersion} />
         <ErrorNotice error={error} />
         {conflict && (screen === 'Library' || screen === 'Draft') && <Alert variant="warning" role="status" className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg px-3 py-2.5">
           <TriangleAlert /><AlertTitle>This Machine has {status.report.conflicts.length === 1 ? 'a Conflict' : `${status.report.conflicts.length} Conflicts`}</AlertTitle>

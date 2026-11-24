@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { applyToggle, cellState, emptyHarness, headline, insecureHttp, itemStateLabel, mergeAssignments, statusLabels, statusOrder, statusTone } from './model';
+import { applyToggle, releaseOrder, versionNotices, cellState, emptyHarness, headline, insecureHttp, itemStateLabel, mergeAssignments, statusLabels, statusOrder, statusTone } from './model';
 import type { Assignment, MachineReport } from './types';
 
 const report: MachineReport = { seq: 1, items: [], baseline: 'a', drafts: [], unpushed: [], conflicts: [], harnesses: [], blocked: false, clashes: [], behind: false };
@@ -73,5 +73,35 @@ describe('first-run setup', () => {
     expect(insecureHttp('http://10.0.0.5:7878')).toBe(true);
     for (const url of ['https://skills.example.com', 'http://localhost:7878', 'http://127.0.0.1:7878', 'http://[::1]:7878', 'not a url', ''])
       expect(insecureHttp(url)).toBe(false);
+  });
+});
+
+describe('releases and version notices', () => {
+  it('orders releases by number, then pre-release', () => {
+    expect(releaseOrder('0.1.0', '0.2.0')).toBeLessThan(0);
+    expect(releaseOrder('0.10.0', '0.9.3')).toBeGreaterThan(0);
+    expect(releaseOrder('0.2.0 (abc1234567)', '0.2.0')).toBe(0);
+    expect(releaseOrder('0.2.0-rc.1', '0.2.0')).toBeLessThan(0);
+    expect(releaseOrder('0.2.0-rc.9', '0.2.0-rc.10')).toBeLessThan(0);
+    expect(releaseOrder('0.2.0-rc', '0.2.0-rc.1')).toBeLessThan(0);
+    expect(releaseOrder('dev', '0.2.0')).toBeNull();
+    expect(releaseOrder(null, '0.2.0')).toBeNull();
+  });
+  const base = { connection: 'connected' as const, version: '0.2.0 (abc1234567)', protocol: 2, server: null };
+  it('says which side a protocol mismatch should upgrade', () => {
+    expect(versionNotices({ ...base, connection: 'incompatible', server: { version: '0.1.0', protocol: 1 } }, '0.2.0'))
+      .toEqual([{ kind: 'server-incompatible', server: '0.1.0' }]);
+    expect(versionNotices({ ...base, connection: 'incompatible', server: { version: '0.3.0', protocol: 3 } }, '0.2.0'))
+      .toEqual([{ kind: 'app-incompatible', server: '0.3.0' }]);
+    expect(versionNotices({ ...base, connection: 'incompatible', server: { version: null, protocol: null } }, '0.2.0'))
+      .toEqual([{ kind: 'incompatible' }]);
+  });
+  it('warns about an older compatible Server and an older Daemon', () => {
+    expect(versionNotices({ ...base, server: { version: '0.1.9', protocol: 2 } }, '0.2.0'))
+      .toEqual([{ kind: 'server-older', server: '0.1.9', machine: '0.2.0' }]);
+    expect(versionNotices({ ...base, server: { version: '0.2.0', protocol: 2 } }, '0.2.1'))
+      .toEqual([{ kind: 'daemon-older', daemon: '0.2.0', app: '0.2.1' }]);
+    expect(versionNotices({ ...base, server: { version: '0.3.0', protocol: 2 } }, '0.2.0')).toEqual([]);
+    expect(versionNotices({ ...base, version: '' }, '0.2.0')).toEqual([]);
   });
 });
