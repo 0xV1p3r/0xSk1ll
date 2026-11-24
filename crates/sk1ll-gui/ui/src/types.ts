@@ -178,3 +178,6 @@ export interface MachineAssignmentCopy {
   source_expected?: Expected;
 }
 export interface AssignmentCopyPreview { count: number; target: Expected; source: Expected }
+// A newer app release (sk1ll-gui/src-tauri/src/updates.rs). `notes`: its CHANGELOG section; `date`: RFC 3339.
+export interface AvailableUpdate { version: string; current_version: string; notes: string | null; date: string | null }
+export type UpdateProgress = { stage: 'downloading'; percent: number | null } | { stage: 'installing' | 'restarting_daemon' | 'relaunching' };

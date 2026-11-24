@@ -2,7 +2,12 @@ name: Release
 
 # Push a tag like v0.1.0. This builds the Linux archives and the .deb, then
 # opens a draft GitHub release to review and publish. Publishing it builds the
-# server image (server-image.yml).
+# server image (server-image.yml) and, for a stable tag, offers the .deb to the
+# app's updater: latest.json is its manifest, at releases/latest.
+#
+# The build jobs never see the updater signing key. The sign job, in the
+# `release` environment (v* tags only, approved by hand), signs the finished
+# .deb with its TAURI_SIGNING_PRIVATE_KEY secret and runs nothing else.
 #
 # Nothing here reads a cache: a tag build can restore caches the default
 # branch wrote, so a poisoned CI cache would end up in the release.
@@ -73,7 +78,9 @@ jobs:
           # The .deb ships the CLI next to the app, so the app starts a daemon of its own version.
           mkdir -p crates/sk1ll-gui/src-tauri/binaries
           cp target/release/sk1ll crates/sk1ll-gui/src-tauri/binaries/sk1ll-x86_64-unknown-linux-gnu
-          (cd crates/sk1ll-gui/ui && pnpm tauri build --config src-tauri/tauri.release.conf.json)
+          # Unsigned: the sign job adds the updater signature.
+          (cd crates/sk1ll-gui/ui && pnpm tauri build --config src-tauri/tauri.release.conf.json \
+            --config '{"bundle":{"createUpdaterArtifacts":false}}')
       - name: Package
         run: scripts/package-release.sh x86_64 target/release/sk1ll target/release/sk1ll-server target/release/sk1ll-gui
       - name: Add the .deb
@@ -109,8 +116,48 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  sign:
+    needs: linux-x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # Holds the TAURI_SIGNING_PRIVATE_KEY secret; only v* tags may deploy to it.
+    environment: release
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4.3.0
+        with:
+          package_json_file: crates/sk1ll-gui/ui/package.json
+      - uses: actions/setup-node@v5.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      # Only the Tauri CLI runs in this job: no install scripts, no build.
+      - name: Install the Tauri CLI
+        working-directory: crates/sk1ll-gui/ui
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: linux-x86_64
+          path: bundles
+      - name: Sign the .deb for the updater
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          [[ -n $TAURI_SIGNING_PRIVATE_KEY ]] || { echo "the release environment has no TAURI_SIGNING_PRIVATE_KEY secret" >&2; exit 1; }
+          shopt -s nullglob
+          debs=("$GITHUB_WORKSPACE"/bundles/*.deb)
+          [[ ${#debs[@]} -eq 1 ]] || { echo "expected one .deb, found ${#debs[@]}" >&2; exit 1; }
+          pnpm --dir crates/sk1ll-gui/ui exec tauri signer sign --app-version "${GITHUB_REF_NAME#v}" "${debs[0]}"
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: updater-signatures
+          path: bundles/*.sig
+          if-no-files-found: error
+
   release:
-    needs: [verify, linux-x86_64, linux-aarch64]
+    needs: [verify, linux-x86_64, linux-aarch64, sign]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -125,6 +172,22 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: Updater manifest
+        working-directory: dist
+        run: |
+          shopt -s nullglob
+          debs=(*.deb)
+          [[ ${#debs[@]} -eq 1 && -f ${debs[0]}.sig ]] || { echo "missing the .deb or its updater signature" >&2; exit 1; }
+          version="${GITHUB_REF_NAME#v}"
+          # The notes are this version's CHANGELOG section, as in the release.
+          awk -v v="$version" '/^## \[/ { if (found) exit; if (index($0, "## [" v "]") == 1) { found = 1; next } } found' \
+            ../CHANGELOG.md > ../notes.md
+          # The app updates only when installed from this .deb, so it is the only platform entry.
+          jq -n --arg version "$version" --rawfile notes ../notes.md --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg url "https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/${debs[0]}" \
+            --rawfile sig "${debs[0]}.sig" \
+            '{version: $version, notes: $notes, pub_date: $date,
+              platforms: {"linux-x86_64-deb": {url: $url, signature: $sig}}}' > latest.json
       - name: Checksums
         working-directory: dist
         run: sha256sum -- * > SHA256SUMS

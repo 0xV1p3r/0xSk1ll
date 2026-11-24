@@ -29,6 +29,8 @@ import { plural } from './model';
 import { SyncDialog } from './SyncDialogs';
 import { Settings, ownScope } from './Settings';
 import { VersionNotices } from './VersionNotices';
+import { AppUpdateNotice, UpdateToServerRelease } from './AppUpdate';
+import { checkAtStartup, checkForUpdate } from './updateStore';
 import { version as appVersion } from '../package.json';
 import { ConnectionPage, GettingStarted, RestartingPage, SetupWizard, StartingAssignment, Wordmark, showGettingStarted, type SetupResult } from './Setup';
 import { ErrorNotice, Loading, Notice } from './shared';
@@ -151,6 +153,8 @@ export function App() {
   const heading = useRef<HTMLHeadingElement>(null);
   const navigated = useRef(false);
   const fileEditState = useRef<FileEditState>('clean');
+  // Once per run, unless turned off in Settings; builds that can't update themselves skip it.
+  useEffect(() => { checkAtStartup(); }, []);
   const navigate = useCallback((next: Screen, machine?: string) => { if (!canLeaveFile(fileEditState.current)) return false; navigated.current = true; setMatrixTarget(undefined); setFleetTarget(previous => machine ? { id: machine, visit: (previous?.visit ?? 0) + 1 } : undefined); setOpenAdd(0); setSkillsHandoff({}); setScreen(next); window.location.hash = screenHash(next); return true; }, []);
   useEffect(() => {
     const hashchange = () => { const next = screenFromHash(window.location.hash); if (next !== screen && !navigate(next)) window.history.replaceState(null, '', screenHash(screen)); };
@@ -235,6 +239,7 @@ export function App() {
     return () => { alive = false; };
   }, [revisions.status]);
   const preserveEditor = fileEditState.current !== 'clean';
+  const canLeaveForUpdate = () => canLeaveFile(fileEditState.current);
   if (apiMismatch && !preserveEditor) return <TooltipProvider><ConnectionPage socket={socket} error={apiMismatch} apiMismatch /></TooltipProvider>;
   // Give the restart after a join time before offering to start the Daemon.
   if (joinedAt !== undefined && status?.mode !== 'joined') return <TooltipProvider><RestartingPage /></TooltipProvider>;
@@ -281,7 +286,8 @@ export function App() {
           {status.last_error && <p className="font-mono text-xs">{status.last_error}</p>}
           <p>If this Machine was removed or its credential rotated, create a join code on another Machine and rejoin.</p>
           <div><Button variant="outline" size="sm" className="mt-2" onClick={() => navigate('Settings')}>Rejoin in Settings</Button></div></Notice>}
-        <VersionNotices status={status} app={appVersion} />
+        <AppUpdateNotice canLeave={canLeaveForUpdate} />
+        <VersionNotices status={status} app={appVersion} update={<UpdateToServerRelease canLeave={canLeaveForUpdate} />} />
         <ErrorNotice error={error} />
         {conflict && (screen === 'Library' || screen === 'Draft') && <Alert variant="warning" role="status" className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg px-3 py-2.5">
           <TriangleAlert /><AlertTitle>This Machine has {status.report.conflicts.length === 1 ? 'a Conflict' : `${status.report.conflicts.length} Conflicts`}</AlertTitle>
@@ -298,7 +304,7 @@ export function App() {
         {screen === 'Conflicts' && <Conflicts revision={revision} changed={changed} reviewDraft={() => navigate('Draft')} />}
         {screen === 'Imports' && <Imports openAdd={openAdd} revision={revisions.imports} changed={changed} reviewDraft={() => navigate('Draft')} />}
         {screen === 'Assignment log' && <Log fleetRevision={revisions.fleet} revision={revision + revisions.history} changed={changed} />}
-        {screen === 'Settings' && <Settings fleetRevision={revisions.fleet} revision={revision} status={status} socket={socket} changed={changed} />}
+        {screen === 'Settings' && <Settings fleetRevision={revisions.fleet} revision={revision} status={status} socket={socket} changed={changed} canLeave={canLeaveForUpdate} />}
       </main>
     </SidebarInset>
     {syncOpen && <SyncDialog onClose={() => setSyncOpen(false)} changed={changed} />}
@@ -311,6 +317,7 @@ export function App() {
       ...(canSync ? [{ id: 'action-sync', label: 'Action: Sync now', select: () => setSyncOpen(true) }] : []),
       { id: 'action-check-imports', background: true, label: 'Action: Check Imports', select: () => void runAction(async () => { const result = await api.checkImports(); return { title: 'Import check complete', description: `${plural(result.updates.length, 'update')}, ${plural(result.errors.length, 'failed check')}`, tone: result.errors.length ? 'destructive' : undefined }; }) },
       { id: 'action-getting-started', label: 'Action: Show getting started', select: () => { if (!navigate('Library')) return; showGettingStarted(); setChecklistReopened(true); setChecklist(value => value + 1); } },
+      { id: 'action-check-updates', label: 'Action: Check for app updates', select: () => { navigate('Settings'); void checkForUpdate(); } },
       { id: 'action-add-import', label: 'Action: Add Import', select: () => { navigate('Imports'); setOpenAdd(n => n + 1); } },
       ...(['Skill', 'Rule'] as const).map(type => ({ id: `action-new-${type.toLowerCase()}`, label: `Action: New ${type}`, select: () => { if (!navigate('Library')) return; setSkillsHandoff({ create: type === 'Skill' ? 'skill' : 'rule' }); } })),
       ...(skills.data ?? []).map((entry, index) => ({ id: `content-${index}`, label: `${entry.type === 'rule' ? 'Rule' : 'Skill'}: ${entry.name}`, select: () => { if (!navigate('Library')) return; setSkillsHandoff({ search: entry.name }); } })),

@@ -6,6 +6,13 @@
     "category": "DeveloperTool",
     "shortDescription": "Agent skills and instructions, synced into every harness",
     "externalBin": ["binaries/sk1ll"],
-    "linux": { "deb": { "depends": ["git (>= 1:2.40)"] } }
+    "linux": { "deb": { "depends": ["git (>= 1:2.40)"] } },
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDcyRjUyOTY2NDhCRTE4REUKUldUZUdMNUlaaW4xY3Z2Mjg5aFZXcENGenJLQ0Jkd3ZSNWIwREZ2R3lhYmFaWlYxYzRwMEx0WkYK",
+      "endpoints": ["https://github.com/0xV1p3r/0xSk1ll/releases/latest/download/latest.json"]
+    }
   }
 }

@@ -33,7 +33,7 @@ it('saves editor changes', async () => {
 
 it('orders sections and hides inactive diagnostic rows', async () => {
   mount(); await screen.findByLabelText('Preferred editor');
-  expect(screen.getAllByRole('heading', { level: 2 }).map(node => node.textContent)).toEqual(['This machine', 'Fleet membership', 'Editor', 'Diagnostics']);
+  expect(screen.getAllByRole('heading', { level: 2 }).map(node => node.textContent)).toEqual(['This machine', 'Fleet membership', 'Editor', 'App updates', 'Diagnostics']);
   expect(screen.queryByText('Auth rejected since')).toBeNull();
   expect(screen.getByText('/daemon.sock')).toBeTruthy(); expect(screen.getByText('Assignment revision')).toBeTruthy();
 });
