@@ -9,6 +9,12 @@ break compatibility.
 
 ### Added
 
+- The Server names its release on every response (`sk1ll-version`). A
+  protocol mismatch is its own connection state, `incompatible`, which says
+  the Server's release and which side to upgrade. The app warns when the
+  Server is out of date or newer than this Machine, when a compatible Server
+  runs an older release, and when the Daemon is older than the app.
+  `sk1ll status` shows the Server's release.
 - Keep mine for a Blocked pull in one step: `sk1ll pull --keep <items>` or
   `--keep-all`, and **Keep mine** in the app's Blocked notice, take the new
   Baseline and put this Machine's version of the clashing items back on top

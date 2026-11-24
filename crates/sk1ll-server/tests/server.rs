@@ -365,10 +365,13 @@ async fn requests_from_another_protocol_version_are_refused() {
         let resp = fleet(version).await;
         assert_eq!(resp.status(), StatusCode::OK, "{version:?}");
         assert_eq!(resp.headers()[header], sk1ll_proto::PROTOCOL_VERSION.to_string());
+        assert_eq!(resp.headers()[sk1ll_proto::VERSION_HEADER], env!("CARGO_PKG_VERSION"));
     }
     let refused = fleet(Some("2")).await;
     assert_eq!(refused.status(), StatusCode::UPGRADE_REQUIRED);
     assert_eq!(refused.headers()[header], "1");
+    // A refusal names the server's release too, so the daemon can say which side is older.
+    assert_eq!(refused.headers()[sk1ll_proto::VERSION_HEADER], env!("CARGO_PKG_VERSION"));
     let body: Value = refused.json().await.unwrap();
     assert!(body["error"].as_str().unwrap().contains("speaks version 1, this machine speaks 2"), "{body}");
 
@@ -378,6 +381,7 @@ async fn requests_from_another_protocol_version_are_refused() {
     match tokio_tungstenite::connect_async(ws).await {
         Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
             assert_eq!(resp.status(), StatusCode::UPGRADE_REQUIRED.as_u16());
+            assert_eq!(resp.headers()[sk1ll_proto::VERSION_HEADER], env!("CARGO_PKG_VERSION"));
         }
         other => panic!("expected a refused upgrade, got {:?}", other.map(|_| ())),
     }

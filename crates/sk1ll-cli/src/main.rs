@@ -1225,9 +1225,49 @@ fn print_machine_state(status: &sk1ll_daemon::client::StatusView) {
         println!("pushing again won't help: fix what it names and commit the fix");
     }
     print_keep_report(&status.keep_report);
+    if let Some(line) = server_version_line(status) {
+        println!("{line}");
+    }
     if let Some(error) = &status.last_error {
         println!("last error: {error}");
     }
+}
+
+/// The Server's release, once it named one, with a hint when it is older
+/// than this Machine's. A protocol mismatch is in `last_error` already.
+fn server_version_line(status: &sk1ll_daemon::client::StatusView) -> Option<String> {
+    let server = status.server.as_ref()?.version.as_deref()?;
+    let ours = env!("CARGO_PKG_VERSION");
+    let older = matches!(release_order(server, ours), Some(std::cmp::Ordering::Less));
+    let compatible = status.connection != sk1ll_daemon::client::Connection::Incompatible;
+    Some(if older && compatible {
+        format!("server: sk1ll {server}, older than this Machine's {ours}; upgrade the Server to get its fixes")
+    } else {
+        format!("server: sk1ll {server}")
+    })
+}
+
+/// Orders two `major.minor.patch[-pre]` releases; a pre-release comes
+/// before its release. `None`: one of them isn't a release number.
+fn release_order(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    fn parse(v: &str) -> Option<([u64; 3], Option<&str>)> {
+        let v = v.split_whitespace().next()?;
+        let (core, pre) = v.split_once('-').map_or((v, None), |(c, p)| (c, Some(p)));
+        let mut parts = core.split('.').map(|p| p.parse().ok());
+        let numbers = [parts.next()??, parts.next()??, parts.next()??];
+        parts.next().is_none().then_some((numbers, pre))
+    }
+    let ((a, a_pre), (b, b_pre)) = (parse(a)?, parse(b)?);
+    Some(a.cmp(&b).then_with(|| match (a_pre, b_pre) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (Some(x), Some(y)) => {
+            // Dot-separated identifiers; numbers compare as numbers (`rc.9` < `rc.10`).
+            let id = |p: &str| p.parse::<u64>().map_or((1, 0, p.to_string()), |n| (0, n, String::new()));
+            x.split('.').map(id).cmp(y.split('.').map(id))
+        }
+    }))
 }
 
 /// What interrupted keeps left in recovery, each with the command that
@@ -1432,6 +1472,19 @@ fn short(sha: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn releases_order_by_number_then_pre_release() {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        let order = super::release_order;
+        assert_eq!(order("0.1.0", "0.2.0"), Some(Less));
+        assert_eq!(order("0.10.0", "0.9.3"), Some(Greater));
+        assert_eq!(order("0.2.0 (abc1234567)", "0.2.0"), Some(Equal));
+        assert_eq!(order("0.2.0-rc.1", "0.2.0"), Some(Less));
+        assert_eq!(order("0.2.0-rc.9", "0.2.0-rc.10"), Some(Less));
+        assert_eq!(order("0.2", "0.2.0"), None);
+        assert_eq!(order("dev", "0.2.0"), None);
+    }
+
     use super::*;
 
     #[test]

@@ -66,6 +66,8 @@ export function Settings({ revision, fleetRevision = revision, status, socket, c
   const diagnostics: [string, string | number][] = [
     ['Mode', standalone ? 'Standalone' : 'Joined'], ['App version', appVersion],
     ...(status.version ? [['Daemon version', status.version] as [string, string]] : []),
+    ...(status.server?.version ? [['Server version', status.server.version] as [string, string]] : []),
+    ...(status.server?.protocol != null ? [['Server protocol', `${status.server.protocol} (this Machine: ${status.protocol ?? 'unknown'})`] as [string, string]] : []),
     ['Repository', status.repo], ['Origin', status.has_origin ? 'Configured' : 'None'],
     ['Socket', socket], ['Assignment revision', status.assignment_revision],
   ];

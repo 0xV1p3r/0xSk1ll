@@ -1,4 +1,4 @@
-import type { Assignment, CachedAssignmentSnapshot as AssignmentSnapshot, HarnessAssignment, ItemId, ItemRef, ItemView, MachineReport, MachineRow, MachineStatus, ToggleChange } from './types';
+import type { Assignment, StatusView, CachedAssignmentSnapshot as AssignmentSnapshot, HarnessAssignment, ItemId, ItemRef, ItemView, MachineReport, MachineRow, MachineStatus, ToggleChange } from './types';
 
 export const statusOrder: MachineStatus[] = ['offline', 'blocked', 'conflict', 'behind', 'drafting', 'in_sync'];
 export const statusLabels: Record<MachineStatus, string> = {
@@ -87,4 +87,51 @@ export function ago(seconds: number | null, now = Date.now() / 1000): string {
     if (Math.abs(delta) >= size) return relative.format(Math.round(delta / size), unit);
   }
   return Math.abs(delta) < 10 ? 'Just now' : relative.format(Math.round(delta), 'second');
+}
+
+type Release = { core: number[]; pre: string[] | null };
+function parseRelease(value: string | null | undefined): Release | null {
+  // `0.2.0`, `0.2.0-rc.1`, or the Daemon's `0.2.0 (abc1234567)`.
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\s|$)/.exec(value?.trim() ?? '');
+  return match ? { core: match.slice(1, 4).map(Number), pre: match[4]?.split('.') ?? null } : null;
+}
+const numeric = (part: string) => /^\d+$/.test(part);
+// Orders two releases (negative: `a` is older); a pre-release comes before its release. `null`: not both releases.
+export function releaseOrder(a: string | null | undefined, b: string | null | undefined): number | null {
+  const x = parseRelease(a), y = parseRelease(b);
+  if (!x || !y) return null;
+  for (let i = 0; i < 3; i++) if (x.core[i] !== y.core[i]) return x.core[i] - y.core[i];
+  if (!x.pre || !y.pre) return x.pre ? -1 : y.pre ? 1 : 0;
+  for (let i = 0; i < Math.max(x.pre.length, y.pre.length); i++) {
+    const p = x.pre[i], q = y.pre[i];
+    if (p === undefined || q === undefined) return p === undefined ? -1 : 1;
+    if (p === q) continue;
+    if (numeric(p) && numeric(q)) return Number(p) - Number(q);
+    if (numeric(p) !== numeric(q)) return numeric(p) ? -1 : 1;
+    return p < q ? -1 : 1;
+  }
+  return 0;
+}
+// The release part of a version, without the Daemon's `(commit)`.
+export const releaseOf = (value: string | null | undefined) => /^\S+/.exec(value?.trim() ?? '')?.[0] ?? '';
+export type VersionNotice =
+  | { kind: 'server-incompatible' | 'app-incompatible'; server: string | null }
+  | { kind: 'incompatible' }
+  | { kind: 'server-older'; server: string; machine: string }
+  | { kind: 'daemon-older'; daemon: string; app: string };
+// What the header warns about versions: a Server this Machine can't talk to (and which side is older),
+// a compatible but older Server, and a Daemon older than this app (an update not yet restarted into).
+export function versionNotices(status: Pick<StatusView, 'connection' | 'version' | 'protocol' | 'server'>, app: string): VersionNotice[] {
+  const notices: VersionNotice[] = [];
+  const daemon = releaseOf(status.version);
+  const server = status.server?.version ?? null;
+  const theirs = status.server?.protocol ?? null;
+  if (status.connection === 'incompatible') {
+    if (theirs === null || status.protocol === undefined) notices.push({ kind: 'incompatible' });
+    else notices.push({ kind: theirs < status.protocol ? 'server-incompatible' : 'app-incompatible', server });
+  } else if (server && (releaseOrder(server, daemon) ?? 0) < 0) {
+    notices.push({ kind: 'server-older', server, machine: daemon });
+  }
+  if ((releaseOrder(daemon, app) ?? 0) < 0) notices.push({ kind: 'daemon-older', daemon, app });
+  return notices;
 }

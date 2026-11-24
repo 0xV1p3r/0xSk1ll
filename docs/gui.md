@@ -49,6 +49,12 @@ The Imports screen marks Imports the Server didn't check under its [import check
 
 When an upgrade leaves the app and Daemon on different local API versions, the connection screen offers **Restart daemon** for a running systemd user service on the default socket. It shows terminal instructions for other setups.
 
+The header warns about versions too:
+
+- **Server is out of date** or **This app is out of date**: the Server speaks another protocol, so the Daemon can't connect. The banner names the Server's release and which side to upgrade. For an old Server it gives the `docker compose` command that runs this Machine's release.
+- **The Server runs an older release**: the two still work together. Dismiss it to hide it until the Server changes release.
+- **The Daemon still runs …**: the Daemon is on an older release than the app, for example after an update it hasn't restarted into. **Restart daemon** restarts the user service.
+
 ## Run it
 
 Install Rust, pnpm and the Tauri v2 prerequisites. On Linux that includes GTK3 and WebKitGTK 4.1. On macOS install the Xcode Command Line Tools with `xcode-select --install`. The app uses the system WebKit. Then start the daemon (or let the app start it) and the app:

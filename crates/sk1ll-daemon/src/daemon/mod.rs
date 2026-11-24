@@ -316,6 +316,8 @@ impl Daemon {
             server_baseline: None,
             assignment_revision: snapshot.as_ref().map_or(0, |s| s.revision),
             version: sk1ll_core::VERSION.to_string(),
+            protocol: sk1ll_proto::PROTOCOL_VERSION,
+            server: None,
             // Read here too, for an engine that never reconciles (a preview).
             keep_report: sk1ll_core::Repo::open_git_only(state.repo())
                 .and_then(|repo| repo.peek_keep_report())

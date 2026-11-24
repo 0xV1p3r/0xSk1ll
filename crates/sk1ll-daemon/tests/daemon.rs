@@ -423,6 +423,11 @@ impl FakeServer {
 
     /// Answers the next connection with HTTP 401, as a proxy might.
     async fn refuse_401(&self) {
+        self.refuse("HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
+    }
+
+    /// Answers the next connection's request with `response`.
+    async fn refuse(&self, response: &str) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut tcp = self.tcp().await;
         let mut buf = Vec::new();
@@ -434,7 +439,7 @@ impl FakeServer {
             }
             buf.extend_from_slice(&chunk[..n]);
         }
-        tcp.write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await.unwrap();
+        tcp.write_all(response.as_bytes()).await.unwrap();
         let _ = tcp.shutdown().await;
     }
 }
@@ -1016,6 +1021,41 @@ async fn a_401_is_not_a_revocation() {
     .await;
     assert_eq!(s.auth_rejected_since, None);
     assert!(!m.state().revoked);
+}
+
+/// A server of another protocol version refuses the connection (426) and
+/// names its release: the status says so and which side to upgrade, the
+/// machine keeps being managed, and a later accepted connection clears it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_of_another_protocol_is_incompatible_and_named() {
+    let server = FakeServer::new().await;
+    let mut m = solo("solo", &server.url(), Some(snapshot(1, &["x"])));
+    m.start().await;
+
+    let newer = sk1ll_proto::PROTOCOL_VERSION + 1;
+    let body = r#"{"error":"protocol mismatch"}"#;
+    server
+        .refuse(&format!(
+            "HTTP/1.1 426 Upgrade Required\r\nsk1ll-protocol: {newer}\r\nsk1ll-version: 9.9.9\r\n\
+             content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        ))
+        .await;
+    let s = eventually(|| async {
+        let s = m.status().await;
+        (s.connection == Connection::Incompatible).then_some(s)
+    })
+    .await;
+    let named = sk1ll_daemon::client::ServerVersion { version: Some("9.9.9".into()), protocol: Some(newer) };
+    assert_eq!(s.server.as_ref(), Some(&named), "{s:?}");
+    assert_eq!(s.protocol, sk1ll_proto::PROTOCOL_VERSION);
+    assert_eq!(s.headline, sk1ll_proto::MachineStatus::Offline);
+    let error = s.last_error.unwrap_or_default();
+    assert!(error.contains("sk1ll 9.9.9") && error.contains("upgrade sk1ll on this Machine"), "{error}");
+
+    server.refuse_401().await;
+    let (_ws, _) = server.accept().await;
+    eventually(|| async { (m.status().await.connection == Connection::Connected).then_some(()) }).await;
 }
 
 /// #3: the token is never in a remote URL, `.git/config`, or any output;

@@ -125,8 +125,22 @@ pub enum Connection {
     /// token. Like Offline, the machine keeps working and keeps retrying;
     /// only the server's explicit `revoked` message removes it.
     AuthRejected,
+    /// The server speaks another protocol version ([`StatusView::server`]
+    /// says which release it runs). Like Offline, the machine keeps working
+    /// from its cache and retrying, until one side is upgraded.
+    Incompatible,
     /// The machine was removed from the fleet; the daemon no longer manages it.
     Revoked,
+}
+
+/// The server's versions, from the headers of its last handshake response
+/// (a refused one included).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerVersion {
+    /// Its release (`0.2.0`), or `None` if it didn't say.
+    pub version: Option<String>,
+    /// Its [`sk1ll_proto::PROTOCOL_VERSION`].
+    pub protocol: Option<u32>,
 }
 
 /// Whether this machine manages its own repo or belongs to a fleet.
@@ -167,6 +181,13 @@ pub struct StatusView {
     /// The daemon's build ([`sk1ll_core::VERSION`]).
     #[serde(default)]
     pub version: String,
+    /// The daemon's [`sk1ll_proto::PROTOCOL_VERSION`].
+    #[serde(default)]
+    pub protocol: u32,
+    /// What the server last said about its versions; `None` before the
+    /// first answer, and on a standalone machine.
+    #[serde(default)]
+    pub server: Option<ServerVersion>,
     /// What interrupted keeps left in recovery, until the user adopts or
     /// discards each version: read from the repo on every reconcile.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

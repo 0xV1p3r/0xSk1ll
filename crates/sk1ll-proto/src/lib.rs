@@ -25,6 +25,11 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// request without it (e.g. `curl` with the admin token) is accepted.
 pub const PROTOCOL_HEADER: &str = "sk1ll-protocol";
 
+/// Response header carrying the server's release version, next to
+/// [`PROTOCOL_HEADER`] on every response (a refusal included), so a daemon
+/// can say which side is older.
+pub const VERSION_HEADER: &str = "sk1ll-version";
+
 /// Why a peer speaking `theirs` can't talk to one speaking [`PROTOCOL_VERSION`].
 pub fn protocol_mismatch(theirs: &str) -> String {
     format!(
