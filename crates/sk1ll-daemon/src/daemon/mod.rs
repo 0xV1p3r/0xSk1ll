@@ -685,22 +685,31 @@ impl Daemon {
     /// says the machine was probably removed.
     pub(crate) fn set_auth_rejected(&self) {
         let now = unix_now();
-        let Some(since) = self.note(|lc| lc.auth_rejected(now)) else { return };
-        let message = if now - since >= self.cfg.auth_warn_after.as_secs() as i64 {
-            format!(
-                "the server has rejected this machine's token since {}h ago; it was probably removed from the fleet: \
-                 join again with `sk1ll join <server-url> <join-code>` (still managing the harnesses meanwhile)",
-                (now - since) / 3600
-            )
-        } else {
-            "the server rejected this machine's token (HTTP 401); retrying. If it was removed from the fleet, \
-             join again with `sk1ll join <server-url> <join-code>`"
-                .to_string()
-        };
-        if self.view().last_error.as_deref() != Some(message.as_str()) {
-            tracing::warn!("{message}");
+        let since = std::cell::Cell::new(None);
+        let ((), saved) = self.publish(
+            |lc| since.set(lc.auth_rejected(now)),
+            |v| {
+                let Some(since) = since.get() else { return };
+                let message = if now - since >= self.cfg.auth_warn_after.as_secs() as i64 {
+                    format!(
+                        "the server has rejected this machine's token since {}h ago; it was probably removed from the fleet: \
+                         join again with `sk1ll join <server-url> <join-code>` (still managing the harnesses meanwhile)",
+                        (now - since) / 3600
+                    )
+                } else {
+                    "the server rejected this machine's token (HTTP 401); retrying. If it was removed from the fleet, \
+                     join again with `sk1ll join <server-url> <join-code>`"
+                        .to_string()
+                };
+                if v.last_error.as_deref() != Some(message.as_str()) {
+                    tracing::warn!("{message}");
+                }
+                v.last_error = Some(message);
+            },
+        );
+        if let Err(e) = saved {
+            self.set_error(format!("saving the daemon state: {e:#}"));
         }
-        self.update(|v| v.last_error = Some(message));
     }
 
     pub(crate) fn set_error(&self, e: impl ToString) {
