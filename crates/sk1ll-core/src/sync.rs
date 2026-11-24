@@ -2450,7 +2450,7 @@ pub mod displaced {
         use sha2::{Digest, Sha256};
         let absolute = std::path::absolute(dest).at(dest)?;
         let digest = Sha256::digest(crate::git::path_bytes(&absolute));
-        Ok(root()?.join(".placements").join(format!("{kind:?}-{digest:x}")))
+        Ok(root()?.join(".placements").join(format!("{kind:?}-{}", crate::hash::hex(&digest))))
     }
 
     /// Where the record a change in progress gives `dest` waits (see

@@ -159,7 +159,7 @@ pub(crate) fn draft_fingerprint(repo: &Path, paths: &[PathBuf]) -> std::io::Resu
             Err(error) => return Err(error),
         }
     }
-    Ok(format!("{:x}", hash.finalize()))
+    Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 impl Bridge {

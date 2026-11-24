@@ -304,7 +304,7 @@ impl Snapshot {
             hash.update(seen.owner.1.to_le_bytes());
             hash.update(&seen.bytes);
         }
-        format!("{:x}", hash.finalize())
+        crate::hash::hex(&hash.finalize())
     }
 
     pub fn exists(&self) -> bool {
