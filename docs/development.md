@@ -68,10 +68,24 @@ Workflows name actions by version tag, and `.github/workflows/actions.lock` pins
 1. Set the version in `Cargo.toml`, `crates/sk1ll-gui/src-tauri/tauri.conf.json`, `crates/sk1ll-gui/ui/package.json` and the `SK1LL_SERVER_VERSION` default in `deploy/docker-compose.server.yml`. Then run `cargo build` so `Cargo.lock` follows.
 2. Date the version's section in `CHANGELOG.md`. Bump `PROTOCOL_VERSION` in `sk1ll-proto` or `API_VERSION` in `sk1ll-daemon`'s client if the server protocol or the local API changed incompatibly.
 3. Run `scripts/check-version.sh vX.Y.Z` and the checks above, then tag and push: `git tag vX.Y.Z && git push origin vX.Y.Z`.
-4. `.github/workflows/release.yml` builds the Linux x86_64 and aarch64 archives, the Linux `.deb` and the macOS arm64 archive with an unsigned app bundle, and opens a draft release with `SHA256SUMS` and the changelog section. A tag that isn't `vX.Y.Z` opens a pre-release. Review it and publish it.
-5. Publishing it runs `.github/workflows/server-image.yml`, which pushes the server image for the tag, and `:latest` unless it's a pre-release.
+4. `.github/workflows/release.yml` builds the Linux x86_64 and aarch64 archives and the Linux `.deb`. The `sign` job waits for your approval of the `release` environment, then signs the `.deb` for the app's updater. The workflow opens a draft release with `SHA256SUMS`, the changelog section, the `.deb.sig` and `latest.json`. A tag that isn't `vX.Y.Z` opens a pre-release. Review it and publish it.
+5. Publishing it runs `.github/workflows/server-image.yml`, which pushes the server image for the tag, and `:latest` unless it's a pre-release. A published stable release is also what installed apps update to: they read `releases/latest/download/latest.json`, which skips drafts and pre-releases.
 
-Once the repository is public, both workflows attest the build provenance of what they ship: `gh attestation verify <file> --repo 0xV1p3r/0xSk1ll`.
+Both workflows attest the build provenance of what they ship: `gh attestation verify <file> --repo 0xV1p3r/0xSk1ll`.
+
+### App updates
+
+The release `.deb` carries the updater config in `crates/sk1ll-gui/src-tauri/tauri.release.conf.json`: the minisign public key and the `latest.json` endpoint. `scripts/check-version.sh` checks both. The private key is the `TAURI_SIGNING_PRIVATE_KEY` secret of the `release` environment and has no password. Only the `sign` job sees it, and that job runs nothing but the Tauri CLI. Losing the key means installed apps can't update any more. A new key ships in a release that the old key signed.
+
+To build a signed `.deb` locally, set `TAURI_SIGNING_PRIVATE_KEY` to the key (or its path) and run the build from [Build](gui.md#build). Without it, add `--config '{"bundle":{"createUpdaterArtifacts":false}}'`.
+
+### Repository settings
+
+These live on GitHub, not in the repo. To recreate them, use `gh api` with the same values:
+
+- Ruleset **Protect main** (`~DEFAULT_BRANCH`, no bypass): no deletion, no force-push, and the `check` and `actions-lock` checks from GitHub Actions must pass.
+- Ruleset **Release tags** (`refs/tags/v*`, repository admins bypass): no creation, update, deletion or force-push. Only an admin can push a release tag.
+- Environment **release**: deployable from `v*` tags only, with the owner as required reviewer. It holds `TAURI_SIGNING_PRIVATE_KEY`.
 
 Builds read the commit for `--version` from git, or from `SK1LL_COMMIT` where there is no `.git` (the server image takes it as a build argument). The toolchain is pinned in `rust-toolchain.toml`.
 
