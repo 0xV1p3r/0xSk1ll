@@ -9,6 +9,13 @@ break compatibility.
 
 ### Added
 
+- The app updates itself from the GitHub releases. It checks at startup
+  (off in Settings) and shows the new release with its notes. **Update and
+  restart** installs the signed `.deb`, restarts the Daemon into it and
+  relaunches the app. Releases carry `latest.json` and the `.deb`'s updater
+  signature.
+- `sk1ll status` in a terminal says when a newer release is out, checking at
+  most once a day (`SK1LL_NO_UPDATE_CHECK=1` turns it off).
 - The Server names its release on every response (`sk1ll-version`). A
   protocol mismatch is its own connection state, `incompatible`, which says
   the Server's release and which side to upgrade. The app warns when the

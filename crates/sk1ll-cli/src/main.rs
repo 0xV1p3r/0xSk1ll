@@ -24,6 +24,7 @@ use fleet::Session;
 
 mod fleet;
 mod harnesses;
+mod release_check;
 mod setup;
 
 #[derive(Parser)]
@@ -719,6 +720,9 @@ fn command(s: &Session, cmd: Cmd) -> Result<()> {
                 return Ok(());
             }
             print_machine_state(&s.status);
+            if let Some(line) = release_check::notice() {
+                println!("{line}");
+            }
             for import in &repo.imports {
                 let state = match import.state {
                     ImportState::Clean => "clean",

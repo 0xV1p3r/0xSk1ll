@@ -55,6 +55,12 @@ The header warns about versions too:
 - **The Server runs an older release**: the two still work together. Dismiss it to hide it until the Server changes release.
 - **The Daemon still runs …**: the Daemon is on an older release than the app, for example after an update it hasn't restarted into. **Restart daemon** restarts the user service.
 
+## Updates
+
+The release `.deb` updates itself from the GitHub releases. It checks once at startup. Turn that off, or check by hand, under Settings → App updates, or choose **Action: Check for app updates** in the command palette. A newer release shows in the header with its release notes. **Update and restart** downloads the package, checks its signature, installs it (the system asks for your password), restarts the Daemon's user service into the new `sk1ll`, and relaunches the app. With unsaved Library edits, it asks before discarding them. **Skip this version** hides that release until a newer one comes out. A Daemon that isn't the user service keeps running the old release, and the app offers **Restart daemon** once it relaunches. Other builds, such as `pnpm tauri dev` or `--no-bundle`, never check.
+
+`sk1ll status` in a terminal says when a newer release is out. It asks GitHub at most once a day and caches the answer. Set `SK1LL_NO_UPDATE_CHECK=1` to turn that off.
+
 ## Run it
 
 Install Rust, pnpm and the Tauri v2 prerequisites. On Linux that includes GTK3 and WebKitGTK 4.1. On macOS install the Xcode Command Line Tools with `xcode-select --install`. The app uses the system WebKit. Then start the daemon (or let the app start it) and the app:
