@@ -1,4 +1,5 @@
 import { version as appVersion } from '../package.json';
+import { AppUpdateSettings } from './AppUpdate';
 import { useCallback, useRef, useState } from 'react';
 import { LoaderCircle, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -58,8 +59,10 @@ export function JoinCodeButton({ label, serverUrl, variant = 'outline', scope: o
       </DialogContent></Dialog>
   </div>;
 }
-export function Settings({ revision, fleetRevision = revision, status, socket, changed }: {
+export function Settings({ revision, fleetRevision = revision, status, socket, changed, canLeave = () => true }: {
   status: StatusView; socket: string; fleetRevision?: number; revision: number; changed: () => void;
+  // False keeps unsaved Library edits (an app update relaunches).
+  canLeave?: () => boolean;
 }) {
   const [previewHarness, setPreviewHarness] = useState<string>();
   const standalone = status.mode === 'standalone';
@@ -161,6 +164,9 @@ export function Settings({ revision, fleetRevision = revision, status, socket, c
           <Button variant="outline" size="icon" aria-label="Refresh editors" title="Refresh editors" disabled={editorData.loading} onClick={() => { setPreferred(undefined); setRefresh(value => value + 1); }}><RefreshCw /></Button></div></Field>}
       </div>
 
+    </Panel>
+    <Panel label="App updates"><PanelToolbar><SectionTitle>App updates</SectionTitle></PanelToolbar>
+      <div className="p-3.5"><AppUpdateSettings canLeave={canLeave} /></div>
     </Panel>
     <Panel label="Diagnostics"><PanelToolbar><SectionTitle>Diagnostics</SectionTitle>
       <Action className="ml-auto" label="Copy diagnostics" doneLabel="Copied" action={() => navigator.clipboard.writeText(

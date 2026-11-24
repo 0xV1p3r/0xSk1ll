@@ -20,6 +20,13 @@ if [[ $# -gt 0 && "$1" != "v$cargo" ]]; then
   echo "tag $1 doesn't match version $cargo" >&2
   status=1
 fi
+# The app's updater asks this repository's latest release, and needs the public key to check it.
+repository=$(sed -n 's/^repository = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+updater=$(python3 -c 'import json; u = json.load(open("crates/sk1ll-gui/src-tauri/tauri.release.conf.json"))["plugins"]["updater"]; print(u["pubkey"] and " ".join(u["endpoints"]))')
+if [[ "$updater" != "$repository/releases/latest/download/latest.json" ]]; then
+  echo "tauri.release.conf.json: the updater needs a pubkey and the one endpoint $repository/releases/latest/download/latest.json" >&2
+  status=1
+fi
 if ! grep -q "^## \[$cargo\]" CHANGELOG.md; then
   echo "CHANGELOG.md has no section for $cargo" >&2
   status=1

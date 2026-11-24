@@ -56,6 +56,10 @@ export const api = {
   daemonService: () => invoke<T.ServiceInfo>('daemon_service'),
   openFleetDeploymentDocs: () => invoke<void>('open_fleet_deployment_docs'),
   restartDaemon: () => invoke<void>('restart_daemon'),
+  updaterAvailable: () => invoke<boolean>('updater_available'),
+  checkUpdate: () => invoke<T.AvailableUpdate | null>('check_update'),
+  // Resolves only if the app didn't relaunch; progress arrives as `app-update-progress`.
+  installUpdate: (version: string) => invoke<void>('install_update', { version }),
   startDaemon: () => invoke<T.DaemonStarted>('start_daemon'),
   imports: () => invoke<T.ImportsView>('imports'),
   resolveImport: (request: T.ResolveRequest) => invoke<T.ResolvedSource>('resolve_import', { request }),

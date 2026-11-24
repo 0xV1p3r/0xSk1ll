@@ -214,6 +214,25 @@ pub async fn start_daemon() -> Result<sk1ll_daemon::service::Started> {
         .map_err(local_error)
 }
 
+/// Not a Daemon call: whether this build can update itself (see [`crate::updates`]).
+#[tauri::command]
+pub fn updater_available(app: tauri::AppHandle) -> bool {
+    crate::updates::available(&app)
+}
+
+/// Not a Daemon call: asks the releases for a newer app.
+#[tauri::command]
+pub async fn check_update(app: tauri::AppHandle) -> Result<Option<crate::updates::AvailableUpdate>> {
+    crate::updates::check(&app).await.map_err(local_error)
+}
+
+/// Not a Daemon call: installs `version`, the update the last check found, restarts the
+/// Daemon and relaunches. Progress arrives as [`crate::updates::PROGRESS_EVENT`].
+#[tauri::command]
+pub async fn install_update(app: tauri::AppHandle, version: String) -> Result<()> {
+    crate::updates::install(&app, &version).await.map_err(local_error)
+}
+
 /// Restarts the local user service after a local API mismatch.
 #[tauri::command]
 pub async fn restart_daemon() -> Result<()> {

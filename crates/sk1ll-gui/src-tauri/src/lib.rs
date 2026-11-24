@@ -4,6 +4,7 @@ pub mod commands;
 pub mod editors;
 pub mod events;
 pub mod service;
+pub mod updates;
 
 use sk1ll_daemon::client::Client;
 use tauri::{Emitter, Manager};
@@ -14,7 +15,9 @@ pub fn run() {
     tauri::Builder::default()
         .manage(editors::EditorCache::default())
         .manage(commands::Bridge::new(client.clone()))
+        .manage(updates::Found::default())
         .setup(move |app| {
+            updates::register(app.handle())?;
             let handle = app.handle().clone();
             let task = tauri::async_runtime::spawn(events::forward(client.clone(), move |name, payload| {
                 let _ = handle.emit(name, payload);
@@ -72,6 +75,9 @@ pub fn run() {
             commands::daemon_service,
             commands::start_daemon,
             commands::restart_daemon,
+            commands::updater_available,
+            commands::check_update,
+            commands::install_update,
             commands::open_fleet_deployment_docs,
             commands::imports,
             commands::resolve_import,
