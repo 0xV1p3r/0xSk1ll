@@ -1,13 +1,13 @@
 //! Commands use the Daemon's response types and never retry writes.
 //! Draft entries also include byte fingerprints for confirmation review.
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sk1ll_daemon::Joined;
 use sk1ll_daemon::client::*;
 use std::path::{Path, PathBuf};
 use tauri::State;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CommandError {
     pub message: String,
     pub status: Option<u16>,
@@ -124,7 +124,7 @@ command!(join(request: JoinApiRequest) -> Joined, join(&request));
 command!(join_code(scope: Scope) -> JoinCode, join_code(scope));
 command!(remove_machine(machine: String) -> (), remove_machine(&machine));
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ReviewDraftEntry {
     #[serde(flatten)]
     pub entry: DraftEntry,

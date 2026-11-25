@@ -1,0 +1,421 @@
+{
+  "assignment_changes": {
+    "changes": [
+      {
+        "enabled": true,
+        "harness": "claude",
+        "item_id": "01J0DEPLOY",
+        "kind": "skill",
+        "name": "deploy"
+      },
+      {
+        "enabled": null,
+        "harness": "claude",
+        "item_id": "01J0DEPLOY",
+        "kind": "rule",
+        "name": "deploy"
+      },
+      {
+        "enabled": false,
+        "harness": "claude",
+        "kind": "new_skills_default"
+      },
+      {
+        "enabled": false,
+        "harness": "claude",
+        "kind": "new_rules_default"
+      }
+    ],
+    "expected": {
+      "registration": "reg-workstation",
+      "revision": 42
+    }
+  },
+  "assignment_copy_preview": {
+    "changes": [
+      {
+        "after": false,
+        "before": null,
+        "harness": "codex",
+        "item_id": "01J0DEPLOY",
+        "kind": "skill",
+        "name": "deploy"
+      }
+    ],
+    "count": 1,
+    "source": {
+      "registration": "reg-workstation",
+      "revision": 17
+    },
+    "target": {
+      "registration": "reg-workstation",
+      "revision": 42
+    }
+  },
+  "assignment_snapshot": {
+    "harnesses": {
+      "claude": {
+        "new_rules_default": false,
+        "new_skills_default": true,
+        "rules": {
+          "01J0STYLE": true
+        },
+        "skills": {
+          "01J0DEPLOY": false
+        }
+      }
+    },
+    "registration": "reg-workstation",
+    "revision": 42
+  },
+  "assignment_update": {
+    "assignment": {
+      "harnesses": {
+        "claude": {
+          "new_rules_default": false,
+          "new_skills_default": true,
+          "rules": {
+            "01J0STYLE": true
+          },
+          "skills": {
+            "01J0DEPLOY": false
+          }
+        }
+      }
+    },
+    "entries": [
+      {
+        "after": null,
+        "at": 1760000000,
+        "author": "dev@workstation",
+        "before": true,
+        "cause": {
+          "type": "change"
+        },
+        "harness": "claude",
+        "id": 120,
+        "item_id": "01J0DEPLOY",
+        "kind": "skill",
+        "machine": "workstation",
+        "name": "deploy"
+      }
+    ],
+    "errors": [
+      "could not reach laptop"
+    ],
+    "revision": 43
+  },
+  "copy_mode": {
+    "merge": {
+      "expected": {
+        "registration": "reg-workstation",
+        "revision": 42
+      },
+      "harnesses": [
+        {
+          "from": "claude",
+          "to": "codex"
+        }
+      ],
+      "mode": "merge",
+      "source": "laptop",
+      "source_expected": {
+        "registration": "reg-workstation",
+        "revision": 17
+      }
+    },
+    "replace": {
+      "expected": {
+        "registration": "reg-workstation",
+        "revision": 42
+      },
+      "harnesses": [
+        {
+          "from": "claude",
+          "to": "codex"
+        }
+      ],
+      "mode": "replace",
+      "source": "laptop",
+      "source_expected": {
+        "registration": "reg-workstation",
+        "revision": 17
+      }
+    }
+  },
+  "fleet_view": {
+    "baseline": "9f3c2a17d4e1",
+    "machines": [
+      {
+        "connected": true,
+        "id": "workstation",
+        "joined_at": 1757000000,
+        "last_seen": 1760000000,
+        "registration": "reg-workstation",
+        "report": {
+          "baseline": "9f3c2a17d4e1",
+          "behind": true,
+          "blocked": true,
+          "clashes": [
+            "skill:deploy"
+          ],
+          "conflicts": [
+            {
+              "harness": "codex",
+              "item": "skill:code-review"
+            }
+          ],
+          "drafts": [
+            "skill:release-notes",
+            "rule:style"
+          ],
+          "harnesses": [
+            "claude",
+            "codex"
+          ],
+          "inventory_complete": false,
+          "inventory_error": "could not read ~/.codex/skills",
+          "items": [
+            {
+              "id": "01J0DEPLOY",
+              "item": "skill:deploy"
+            }
+          ],
+          "push_refused": "the Server refused the push",
+          "seq": 7,
+          "unpushed": [
+            "skill:release-notes"
+          ]
+        },
+        "scope": "fleet",
+        "status": "blocked"
+      },
+      {
+        "connected": false,
+        "id": "ci-runner",
+        "joined_at": 1757000000,
+        "last_seen": null,
+        "registration": "reg-ci-runner",
+        "report": null,
+        "scope": "self",
+        "status": "offline"
+      }
+    ]
+  },
+  "join_api_request": {
+    "admin": {
+      "admin_token": "adm",
+      "code": "",
+      "copy_from": "workstation",
+      "machine_id": "laptop",
+      "repo": "/home/dev/skills",
+      "server_url": "https://skills.example.com"
+    },
+    "code": {
+      "code": "sk1ll-join-7Q2M",
+      "copy_from": "workstation",
+      "machine_id": "laptop",
+      "repo": "/home/dev/skills",
+      "server_url": "https://skills.example.com"
+    }
+  },
+  "join_code": {
+    "code": "sk1ll-join-7Q2M",
+    "expires_at": 1760086400,
+    "scope": "self"
+  },
+  "joined": {
+    "adopted": {
+      "harnesses": [
+        "claude"
+      ],
+      "machine_id": "laptop",
+      "repo": "/home/dev/skills",
+      "revision": 1,
+      "setup": "adopted"
+    },
+    "cloned": {
+      "harnesses": [
+        "claude"
+      ],
+      "machine_id": "laptop",
+      "repo": "/home/dev/skills",
+      "revision": 1,
+      "setup": "cloned"
+    }
+  },
+  "log_cause": {
+    "change": {
+      "type": "change"
+    },
+    "default_materialized": {
+      "type": "default_materialized"
+    },
+    "harness_added": {
+      "type": "harness_added"
+    },
+    "harness_renamed": {
+      "from": "claude-code",
+      "to": "claude",
+      "type": "harness_renamed"
+    },
+    "machine_removed": {
+      "type": "machine_removed"
+    },
+    "orphan_pruned": {
+      "type": "orphan_pruned"
+    },
+    "undo": {
+      "entry": 101,
+      "type": "undo"
+    }
+  },
+  "log_entry": {
+    "new_rules_default": {
+      "after": null,
+      "at": 1760000000,
+      "author": "dev@workstation",
+      "before": true,
+      "cause": {
+        "type": "change"
+      },
+      "harness": "claude",
+      "id": 120,
+      "item_id": null,
+      "kind": "new_rules_default",
+      "machine": "workstation",
+      "name": null
+    },
+    "new_skills_default": {
+      "after": null,
+      "at": 1760000000,
+      "author": "dev@workstation",
+      "before": true,
+      "cause": {
+        "type": "change"
+      },
+      "harness": "claude",
+      "id": 120,
+      "item_id": null,
+      "kind": "new_skills_default",
+      "machine": "workstation",
+      "name": null
+    },
+    "rule": {
+      "after": null,
+      "at": 1760000000,
+      "author": "dev@workstation",
+      "before": true,
+      "cause": {
+        "type": "change"
+      },
+      "harness": "claude",
+      "id": 120,
+      "item_id": "01J0DEPLOY",
+      "kind": "rule",
+      "machine": "workstation",
+      "name": "deploy"
+    },
+    "skill": {
+      "after": null,
+      "at": 1760000000,
+      "author": "dev@workstation",
+      "before": true,
+      "cause": {
+        "type": "change"
+      },
+      "harness": "claude",
+      "id": 120,
+      "item_id": "01J0DEPLOY",
+      "kind": "skill",
+      "machine": "workstation",
+      "name": "deploy"
+    }
+  },
+  "log_facets": {
+    "authors": [
+      "dev@workstation"
+    ],
+    "harnesses": [
+      "claude"
+    ],
+    "machines": [
+      "laptop"
+    ]
+  },
+  "log_query": {
+    "author": "dev@workstation",
+    "before": 51,
+    "harness": "claude",
+    "item": "deploy",
+    "limit": 50,
+    "machine": "laptop"
+  },
+  "orphans_pruned": {
+    "entries": [
+      {
+        "after": null,
+        "at": 1760000000,
+        "author": "dev@workstation",
+        "before": true,
+        "cause": {
+          "type": "orphan_pruned"
+        },
+        "harness": "claude",
+        "id": 121,
+        "item_id": "01J0DEPLOY",
+        "kind": "skill",
+        "machine": "workstation",
+        "name": "deploy"
+      }
+    ]
+  },
+  "orphans_view": {
+    "orphans": [
+      {
+        "harness": "claude",
+        "item_id": "01J0GONE",
+        "kind": "skill",
+        "machine": "laptop",
+        "name": "old-skill"
+      },
+      {
+        "harness": "claude",
+        "item_id": "01J0GONE2",
+        "kind": "rule",
+        "machine": "laptop",
+        "name": null
+      }
+    ]
+  },
+  "scope": {
+    "fleet": "fleet",
+    "self": "self"
+  },
+  "toggle_kind": {
+    "new_rules_default": {
+      "enabled": false,
+      "harness": "claude",
+      "kind": "new_rules_default"
+    },
+    "new_skills_default": {
+      "enabled": false,
+      "harness": "claude",
+      "kind": "new_skills_default"
+    },
+    "rule": {
+      "enabled": null,
+      "harness": "claude",
+      "item_id": "01J0DEPLOY",
+      "kind": "rule",
+      "name": "deploy"
+    },
+    "skill": {
+      "enabled": true,
+      "harness": "claude",
+      "item_id": "01J0DEPLOY",
+      "kind": "skill",
+      "name": "deploy"
+    }
+  }
+}

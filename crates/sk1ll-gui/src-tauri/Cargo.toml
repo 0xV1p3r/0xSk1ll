@@ -34,4 +34,6 @@ custom-protocol = ["tauri/custom-protocol"]
 default = ["custom-protocol"]
 
 [target.'cfg(unix)'.dev-dependencies]
+sk1ll-core.workspace = true
+sk1ll-proto = { path = "../../sk1ll-proto" }
 tauri = { version = "2", features = ["test"] }

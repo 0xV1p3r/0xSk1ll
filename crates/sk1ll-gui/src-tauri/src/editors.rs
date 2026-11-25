@@ -8,14 +8,14 @@ use std::{
     sync::Mutex,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EditorKind {
     Gui,
     Terminal,
     System,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EditorView {
     pub id: String,
     pub name: String,
@@ -29,7 +29,7 @@ pub(crate) struct Editor {
 }
 #[derive(Default)]
 pub struct EditorCache(pub(crate) Mutex<Option<Vec<Editor>>>);
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct EditorsView {
     pub editors: Vec<EditorView>,
     pub preferred_editor: String,

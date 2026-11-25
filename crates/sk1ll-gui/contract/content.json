@@ -1,0 +1,147 @@
+{
+  "content_query": {
+    "harness": "claude",
+    "hash": "sha256:one",
+    "item": "unmanaged:notes"
+  },
+  "content_type": {
+    "import": {
+      "clashes_with_repo": false,
+      "description": "Collect notes.",
+      "draft": "modified",
+      "enabled_harnesses": [
+        "claude"
+      ],
+      "id": "01J0NOTES",
+      "in_baseline": true,
+      "item": "skill:notes",
+      "name": "notes",
+      "path": "/home/dev/skills/personal/notes",
+      "type": "import",
+      "variants": []
+    },
+    "personal": {
+      "clashes_with_repo": false,
+      "description": "Collect notes.",
+      "draft": "modified",
+      "enabled_harnesses": [
+        "claude"
+      ],
+      "id": "01J0NOTES",
+      "in_baseline": true,
+      "item": "skill:notes",
+      "name": "notes",
+      "path": "/home/dev/skills/personal/notes",
+      "type": "personal",
+      "variants": []
+    },
+    "rule": {
+      "clashes_with_repo": false,
+      "description": "Collect notes.",
+      "draft": "modified",
+      "enabled_harnesses": [
+        "claude"
+      ],
+      "id": "01J0NOTES",
+      "in_baseline": true,
+      "item": "skill:notes",
+      "name": "notes",
+      "path": "/home/dev/skills/personal/notes",
+      "type": "rule",
+      "variants": []
+    },
+    "unmanaged": {
+      "clashes_with_repo": true,
+      "description": "Collect notes.",
+      "draft": null,
+      "enabled_harnesses": [
+        "claude"
+      ],
+      "id": null,
+      "in_baseline": false,
+      "item": null,
+      "name": "notes",
+      "path": null,
+      "type": "unmanaged",
+      "variants": [
+        {
+          "description": null,
+          "hash": "sha256:one",
+          "locations": [
+            {
+              "harness": "claude",
+              "path": "/home/dev/.claude/skills/notes"
+            }
+          ],
+          "resumable": true
+        }
+      ]
+    }
+  },
+  "create_item_request": {
+    "description": "Sorts issues.",
+    "kind": "skill",
+    "name": "triage"
+  },
+  "delete_item_request": {
+    "kind": "rule",
+    "name": "style"
+  },
+  "file_content": [
+    {
+      "binary": false,
+      "fingerprint": "mock-file",
+      "path": "SKILL.md",
+      "size": 7,
+      "text": "# Notes",
+      "too_large": false
+    },
+    {
+      "binary": true,
+      "fingerprint": null,
+      "path": "logo.png",
+      "size": 2048,
+      "text": null,
+      "too_large": false
+    }
+  ],
+  "file_kind": {
+    "directory": {
+      "kind": "directory",
+      "path": "references",
+      "size": 120
+    },
+    "file": {
+      "kind": "file",
+      "path": "references",
+      "size": 120
+    },
+    "symlink": {
+      "kind": "symlink",
+      "path": "references",
+      "size": 120
+    }
+  },
+  "file_query": {
+    "harness": "claude",
+    "hash": "sha256:one",
+    "item": "unmanaged:notes",
+    "path": "SKILL.md"
+  },
+  "rename_item_request": {
+    "kind": "skill",
+    "name": "deploy",
+    "to": "ship"
+  },
+  "rename_item_response": {
+    "item": "skill:ship"
+  },
+  "write_file_request": {
+    "content": "# Notes",
+    "expected": "mock-file",
+    "harness": "claude",
+    "hash": "sha256:one",
+    "item": "unmanaged:notes",
+    "path": "SKILL.md"
+  }
+}

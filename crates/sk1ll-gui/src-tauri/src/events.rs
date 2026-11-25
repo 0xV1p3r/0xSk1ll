@@ -1,7 +1,7 @@
 //! One SSE subscription; only connection attempts are retried, never commands.
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sk1ll_daemon::client::Client;
 use tokio::time::{Instant, sleep, timeout};
@@ -9,11 +9,12 @@ use tokio::time::{Instant, sleep, timeout};
 const MIN_DELAY: Duration = Duration::from_millis(500);
 const MAX_DELAY: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Clone, Serialize)]
-struct ConnectionEvent {
-    reachable: bool,
-    message: Option<String>,
-    retry_in_ms: u64,
+/// The `daemon-connection` event: whether the Daemon's event stream is up, and when it is retried.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectionEvent {
+    pub reachable: bool,
+    pub message: Option<String>,
+    pub retry_in_ms: u64,
 }
 
 #[derive(Default)]
