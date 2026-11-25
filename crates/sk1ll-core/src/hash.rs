@@ -668,26 +668,3 @@ pub(crate) fn hash_bytes(bytes: &[u8]) -> String {
 pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
-
-#[cfg(test)]
-pub(crate) mod tests {
-    use std::path::Path;
-
-    /// Called once a file's length is taken and before its bytes are read, to
-    /// simulate a concurrent write deterministically.
-    pub(crate) fn with_read_hook<T>(mut hook: impl FnMut(&Path) + 'static, run: impl FnOnce() -> T) -> T {
-        let _hook = crate::failpoints::observe(move |point, path| {
-            if point == crate::failpoints::Point::HashMidRead {
-                hook(path)
-            }
-        });
-        run()
-    }
-
-    /// Called once, after a payload removal matched the fingerprint and
-    /// before it unlinks anything.
-    pub(crate) fn with_removal_hook<T>(hook: impl FnOnce(&Path) + 'static, run: impl FnOnce() -> T) -> T {
-        let _hook = crate::failpoints::once(crate::failpoints::Point::HashBeforeRemoval, hook);
-        run()
-    }
-}

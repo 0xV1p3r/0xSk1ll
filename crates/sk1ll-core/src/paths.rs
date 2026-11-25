@@ -33,20 +33,7 @@ fn configured() -> Option<Dirs> {
     if let Some(dirs) = crate::failpoints::thread_dirs() {
         return Some(dirs);
     }
-    let dirs = DIRS.read().unwrap_or_else(|e| e.into_inner()).clone();
-    #[cfg(test)]
-    return dirs.or_else(|| Some(test_dirs()));
-    #[cfg(not(test))]
-    dirs
-}
-
-/// Core's own tests never reach the real home directory: unless a test
-/// says otherwise, both directories are in one temporary directory.
-#[cfg(test)]
-fn test_dirs() -> Dirs {
-    static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-    let root = ROOT.get_or_init(|| tempfile::tempdir().expect("a temporary directory")).path();
-    Dirs { state: root.join("state"), cache: root.join("cache") }
+    DIRS.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 fn var(name: &str) -> Option<PathBuf> {

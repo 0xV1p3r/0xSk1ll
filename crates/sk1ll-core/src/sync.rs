@@ -2415,14 +2415,6 @@ pub mod displaced {
     /// `$XDG_STATE_HOME/sk1ll` by default): the index of all entries, and
     /// entries older versions kept here.
     pub fn root() -> Result<PathBuf> {
-        #[cfg(test)]
-        if crate::failpoints::thread_dirs().is_none() {
-            // Inline core tests outside sync still share paths' default state directory.
-            thread_local! {
-                static ROOT: tempfile::TempDir = tempfile::tempdir().expect("test recovery directory");
-            }
-            return Ok(ROOT.with(|dir| dir.path().to_path_buf()));
-        }
         Ok(crate::paths::state_dir()?.join("displaced"))
     }
 
