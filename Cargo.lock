@@ -3783,6 +3783,7 @@ dependencies = [
  "sk1ll-core",
  "sk1ll-daemon",
  "sk1ll-proto",
+ "sk1ll-testkit",
  "tempfile",
  "tokio",
 ]
@@ -3799,6 +3800,7 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "sha2 0.11.1",
+ "sk1ll-testkit",
  "tempfile",
  "thiserror 2.0.21",
  "toml 1.2.1+spec-1.1.0",
@@ -3830,6 +3832,7 @@ dependencies = [
  "sk1ll-core",
  "sk1ll-proto",
  "sk1ll-server",
+ "sk1ll-testkit",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -3884,6 +3887,7 @@ dependencies = [
  "sha2 0.11.1",
  "sk1ll-core",
  "sk1ll-proto",
+ "sk1ll-testkit",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -3893,6 +3897,20 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "sk1ll-testkit"
+version = "0.1.0"
+dependencies = [
+ "reqwest 0.12.28",
+ "serde",
+ "sk1ll-core",
+ "sk1ll-daemon",
+ "sk1ll-proto",
+ "sk1ll-server",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

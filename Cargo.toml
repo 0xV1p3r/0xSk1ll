@@ -6,6 +6,7 @@ members = [
     "crates/sk1ll-daemon",
     "crates/sk1ll-server",
     "crates/sk1ll-proto",
+    "crates/sk1ll-testkit",
     "crates/sk1ll-gui/src-tauri",
 ]
 
@@ -19,6 +20,7 @@ publish = false
 
 [workspace.dependencies]
 sk1ll-core = { path = "crates/sk1ll-core" }
+sk1ll-testkit = { path = "crates/sk1ll-testkit" }
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
