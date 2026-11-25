@@ -1,6 +1,31 @@
-// Development-only fake Daemon for rendering the GUI in a plain browser (`?mock=<scenario>`).
+// Development-only fake Daemon for rendering the GUI in a plain browser (`?mock=<scenario>`), and the backend of
+// the UI flow tests (`src/flows`), which drive the real App against it.
 import { mockIPC } from '@tauri-apps/api/mocks';
 import type * as T from '../types';
+
+export interface MockOptions {
+  // Multiplies every simulated Daemon latency; tests pass 0.
+  latency?: number;
+  // A newer app release; without it the build can't update itself.
+  update?: T.AvailableUpdate;
+}
+type Args = Record<string, unknown>;
+// What a test can see and change of the fake Daemon while the App runs against it.
+export interface MockDaemon {
+  status: T.StatusView; machines: T.MachineRow[]; items: T.ItemView[]; content: T.ContentEntry[];
+  assignments: Record<string, T.AssignmentSnapshot>; draft: T.DraftEntry[]; diffs: Record<string, string>;
+  conflicts: T.ConflictView[]; recovered: T.ConflictView[]; log: T.LogEntry[]; imports: T.ImportsView & { imports: T.ImportEntry[] };
+  setupHarnesses: T.HarnessChoice[];
+  // Whether the Daemon answers, and whether the next sync would change anything.
+  running: boolean; syncPending: boolean;
+  // Every command the App sent, in order, without the event plugin's.
+  calls: { cmd: string; args: Args }[];
+  // The arguments of each call of one command.
+  sent(cmd: string): Args[];
+  // Answers `cmd` with `handler` instead (until `restore(cmd)`); return `undefined` to fall through to the mock.
+  override(cmd: string, handler: (args: Args) => unknown): void;
+  restore(cmd: string): void;
+}
 
 const now = Math.floor(Date.now() / 1000);
 const report = (overrides: Partial<T.MachineReport> = {}): T.MachineReport => ({
@@ -10,7 +35,7 @@ const report = (overrides: Partial<T.MachineReport> = {}): T.MachineReport => ({
 const harness = (skills: Record<string, boolean> = {}, rules: Record<string, boolean> = {}): T.HarnessAssignment =>
   ({ new_skills_default: true, new_rules_default: false, skills, rules });
 
-export function installMock(scenario: string) {
+export function installMock(scenario: string, options: MockOptions = {}): MockDaemon {
   let standalone = scenario.startsWith('standalone');
   const empty = scenario === 'empty' || scenario === 'standalone-first-run';
   const local = report({ drafts: empty ? [] : ['skill:release-notes', 'rule:style'], unpushed: empty ? [] : ['skill:release-notes'],
@@ -45,13 +70,13 @@ export function installMock(scenario: string) {
   const content: T.ContentEntry[] = empty ? [] : [
     ...items.map((item): T.ContentEntry => {
       const [kind, name] = item.item.split(':');
-      return { name, item: item.item, type: kind === 'rule' ? 'rule' : 'personal', description: item.description,
+      return { name, item: item.item, id: item.id, type: kind === 'rule' ? 'rule' : 'personal', description: item.description,
         draft: item.draft, in_baseline: item.in_baseline, path: `${status.repo}/${kind === 'rule' ? `instructions/${name}.md` : `personal/${name}`}`,
         enabled_harnesses: ['claude', 'codex'], clashes_with_repo: false, variants: [] };
     }),
-    { name: 'pdf', item: 'skill:pdf', type: 'import', description: 'Work with PDFs.', draft: null, in_baseline: true,
+    { name: 'pdf', item: 'skill:pdf', id: 'id-pdf', type: 'import', description: 'Work with PDFs.', draft: null, in_baseline: true,
       path: `${status.repo}/imported/pdf`, enabled_harnesses: ['claude'], clashes_with_repo: false, variants: [] },
-    { name: 'notes', item: null, type: 'unmanaged', description: 'Collect notes.', draft: null, in_baseline: false,
+    { name: 'notes', item: null, id: null, type: 'unmanaged', description: 'Collect notes.', draft: null, in_baseline: false,
       path: null, enabled_harnesses: [], clashes_with_repo: false, variants: [
         { hash: 'sha256:one', description: 'Collect notes.', locations: [{ harness: 'claude', path: '/home/dev/.claude/skills/notes' }] },
         { hash: 'sha256:two', description: 'Collect detailed notes.', locations: [{ harness: 'codex', path: '/home/dev/.codex/skills/notes' }] },
@@ -126,32 +151,61 @@ export function installMock(scenario: string) {
   };
   const editedFiles = new Map<string, { text: string; fingerprint: string }>();
   let fileRevision = 0;
-  let running = scenario !== 'unreachable';
-  const delay = <V,>(value: V, ms = 250) => new Promise<V>(resolve => setTimeout(() => resolve(value), ms));
-  let syncPending = !empty;
+  const latency = options.latency ?? 1;
+  // Answers are copies, as if they crossed the wire: later changes to the mock's state don't reach what the App holds.
+  const delay = <V,>(value: V, ms = 250) => new Promise<V>(resolve => setTimeout(() => resolve(structuredClone(value)), ms * latency));
+  const overrides = new Map<string, (args: Args) => unknown>();
+  const daemon: MockDaemon = {
+    status, machines, items, content, assignments, draft, diffs, conflicts, recovered, log, imports, setupHarnesses,
+    running: scenario !== 'unreachable', syncPending: !empty, calls: [],
+    sent: cmd => daemon.calls.filter(call => call.cmd === cmd).map(call => call.args),
+    override: (cmd, handler) => { overrides.set(cmd, handler); },
+    restore: cmd => { overrides.delete(cmd); },
+  };
+  // Drops Draft entries once committed or restored, as the Daemon's next Draft scan would.
+  const settle = (done: string[], committed: boolean) => {
+    for (let i = draft.length - 1; i >= 0; i--) if (done.includes(draft[i].item)) draft.splice(i, 1);
+    local.drafts = local.drafts.filter(item => !done.includes(item));
+    for (let i = items.length - 1; i >= 0; i--) {
+      const item = items[i];
+      if (!done.includes(item.item)) continue;
+      if (!committed && item.draft === 'added') items.splice(i, 1);
+      else Object.assign(item, { draft: null, in_baseline: committed ? item.draft !== 'deleted' : item.in_baseline });
+    }
+    for (const entry of content) if (entry.item && done.includes(entry.item)) Object.assign(entry, { draft: null, in_baseline: true });
+  };
   mockIPC((cmd, args) => {
+    if (!cmd.startsWith('plugin:')) daemon.calls.push({ cmd, args: (args ?? {}) as Args });
+    const override = overrides.get(cmd);
+    if (override) {
+      const answer = override((args ?? {}) as Args);
+      if (answer !== undefined) return answer;
+    }
     if (cmd === 'render_instructions') {
       if (empty) return [];
       const { name } = args as { name: string };
       const path = name === 'claude' ? '/home/dev/.claude/CLAUDE.md' : '/home/dev/.codex/AGENTS.md';
       const content = 'Use two spaces for indentation.\n';
       const diff = '--- on-disk\n+++ next-sync\n@@ -1 +1 @@\n-Use tabs for indentation.\n+Use two spaces for indentation.';
-      return [{ path, format: 'block', content, next_content: content, differs: syncPending, diff: syncPending ? diff : '' }] satisfies T.InstructionPreview[];
+      return [{ path, format: 'block', content, next_content: content, differs: daemon.syncPending, diff: daemon.syncPending ? diff : '' }] satisfies T.InstructionPreview[];
     }
-    const syncPreview = (): T.SyncResult => ({ fingerprint: JSON.stringify([syncPending, conflicts]), conflicts, actions: syncPending ? [
+    const syncPreview = (): T.SyncResult => ({ fingerprint: JSON.stringify([daemon.syncPending, conflicts]), conflicts, actions: daemon.syncPending ? [
       { harness: 'claude', kind: 'update', item: 'instructions', name: 'style', dest: '/home/dev/.claude/CLAUDE.md', reason: null },
       { harness: 'codex', kind: 'conflict', item: 'skill', name: 'code-review', dest: '/home/dev/.codex/skills/code-review', reason: conflicts[0]?.reason ?? null },
     ] : [] });
     if (cmd === 'preview_sync') return syncPreview();
     if (cmd === 'sync_now') {
       if ((args as { fingerprint: string }).fingerprint !== syncPreview().fingerprint) return syncPreview();
-      syncPending = false;
+      daemon.syncPending = false;
       return { conflicts } satisfies T.SyncResult;
     }
     const a = (args ?? {}) as Record<string, unknown>;
     if (cmd === 'daemon_service') return delay({ default_socket: true, binary: '/home/dev/.cargo/bin/sk1ll', manager: 'systemd', available: true, active: false, restartable: false, unit: null });
-    if (cmd === 'start_daemon') { setTimeout(() => { running = true; }, 1500); return delay('systemd', 600); }
-    if (!running && cmd !== 'connection_info' && !cmd.startsWith('plugin:'))
+    if (cmd === 'start_daemon') { setTimeout(() => { daemon.running = true; }, 1500 * latency); return delay('systemd', 600); }
+    if (cmd === 'updater_available') return delay(!!options.update, 10);
+    if (cmd === 'check_update') return delay(options.update ?? null);
+    if (cmd === 'install_update') return delay(undefined);
+    if (!daemon.running && cmd !== 'connection_info' && !cmd.startsWith('plugin:'))
       return Promise.reject({ message: 'connect ECONNREFUSED /run/user/1000/sk1ll/daemon.sock', status: null, unreachable: true });
     if (standalone && ['fleet', 'log', 'log_facets', 'undo', 'join_code', 'remove_machine'].includes(cmd)) return Promise.reject({ message: 'Unavailable in standalone mode', status: 409, unreachable: false });
     if (standalone && !status.has_origin && ['push', 'pull'].includes(cmd)) return Promise.reject({ message: 'Repository has no origin remote', status: 409, unreachable: false });
@@ -171,8 +225,9 @@ export function installMock(scenario: string) {
         const item = `${r.kind}:${r.name}`;
         if (content.some(e => e.item === item)) return Promise.reject({ message: 'Name is taken' });
         const path = r.kind === 'skill' ? `personal/${r.name}/SKILL.md` : `instructions/${r.name}.md`;
-        content.push({ name: r.name, item, type: r.kind === 'skill' ? 'personal' : 'rule', description: r.description ?? null, draft: 'added', in_baseline: false, path: `${status.repo}/${path}`, enabled_harnesses: [], clashes_with_repo: false, variants: [] });
-        items.push({ item, id: newId(), in_baseline: false, draft: 'added', unpushed: false, description: r.description ?? null });
+        const id = newId();
+        content.push({ name: r.name, item, id, type: r.kind === 'skill' ? 'personal' : 'rule', description: r.description ?? null, draft: 'added', in_baseline: false, path: `${status.repo}/${path}`, enabled_harnesses: [], clashes_with_repo: false, variants: [] });
+        items.push({ item, id, in_baseline: false, draft: 'added', unpushed: false, description: r.description ?? null });
         draft.push({ item, change: 'added', paths: [path], fingerprint: `created-${r.name}` }); local.drafts.push(item);
         return delay(undefined);
       }
@@ -358,7 +413,8 @@ export function installMock(scenario: string) {
             }
           }
         }
-        if (cmd === 'preview_assignment_copy') return delay({ count: entries.length, target: current, source: from });
+        if (cmd === 'preview_assignment_copy') return delay({ count: entries.length, target: current, source: from,
+          changes: entries.map(({ harness, kind, item_id, name, before, after }) => ({ harness, kind, item_id: item_id ?? undefined, name: name ?? undefined, before, after })) } satisfies T.AssignmentCopyPreview);
         target.harnesses = next;
         if (entries.length) {
           target.revision++;
@@ -389,17 +445,38 @@ export function installMock(scenario: string) {
       case 'commit_message': return delay({ items: a.items, message: `Commit ${(a.items as string[]).join(', ')}` });
       case 'commit': {
         const request = a.request as T.CommitRequest;
+        settle(request.items, true);
         if (standalone) {
-          for (let i = draft.length - 1; i >= 0; i--) if (request.items.includes(draft[i].item)) draft.splice(i, 1);
-          local.drafts = local.drafts.filter(item => !request.items.includes(item));
           local.unpushed = [...new Set([...local.unpushed, ...request.items])];
-          content.filter(entry => entry.item && request.items.includes(entry.item)).forEach(entry => { entry.draft = null; entry.in_baseline = true; });
-          items.filter(entry => request.items.includes(entry.item)).forEach(entry => { entry.draft = null; entry.unpushed = true; entry.in_baseline = true; });
+          items.filter(entry => request.items.includes(entry.item)).forEach(entry => { entry.unpushed = true; });
         }
         return delay({ sha: '7d1e9a0b3c5f8e2d', items: request.items, message: request.message ?? '', pushed: !standalone, push_error: null }, 600);
       }
-      case 'restore': return delay({ discarded: [] });
-      case 'pull': return delay({ state: 'up_to_date' }, 500);
+      case 'restore': {
+        const request = a.request as T.RestoreRequest;
+        const discarded = request.all ? draft.map(entry => entry.item) : request.items.filter(item => draft.some(entry => entry.item === item));
+        settle(discarded, false);
+        return delay({ discarded } satisfies T.RestoreResponse);
+      }
+      case 'pull': {
+        if (!local.blocked) { local.behind = false; return delay({ state: 'up_to_date' }, 500); }
+        return delay({ state: 'blocked', baseline: status.server_baseline ?? '', items: local.clashes } satisfies T.PullResult, 500);
+      }
+      // The whole file of each kept item wins over the new Baseline; the pull goes through once nothing clashes.
+      case 'pull_keep': {
+        const request = a.request as T.PullKeepRequest;
+        const kept = request.all ? local.clashes : local.clashes.filter(item => request.items.includes(item));
+        local.clashes = local.clashes.filter(item => !kept.includes(item));
+        if (local.clashes.length) return delay({ pull: { state: 'blocked', baseline: status.server_baseline ?? '', items: local.clashes } } satisfies T.PullKeepResult);
+        local.blocked = false; local.behind = false;
+        const from = local.baseline; local.baseline = status.server_baseline;
+        return delay({ pull: { state: 'updated', from, to: local.baseline ?? '' }, kept } satisfies T.PullKeepResult);
+      }
+      case 'dismiss_keep_notes': {
+        const notes = (status.keep_report ?? []).filter(unkept => unkept.entry === null).length;
+        status.keep_report = status.keep_report?.filter(unkept => unkept.entry !== null);
+        return delay(notes);
+      }
       case 'conflicts': return delay(conflicts);
       case 'recovered': return delay(recovered);
       case 'harnesses': return delay(harnesses);
@@ -413,9 +490,11 @@ export function installMock(scenario: string) {
       case 'set_notifications': notificationsEnabled = Boolean(a.enabled); return delay(notificationsEnabled);
       case 'harness_settings': return delay({ path: machineConfig, harnesses: setupHarnesses });
       case 'preview_harness': return delay(harnessPreview((a.request as T.HarnessChangeRequest).change), 400);
-      case 'apply_harness': {
+      // Take out first turns the Harness's items off, so sync removes what it placed, then applies the change.
+      case 'apply_harness': case 'take_out_harness': {
         const { change, fingerprint } = a.request as T.HarnessChangeRequest;
-        if (fingerprint !== harnessPreview(change).fingerprint)
+        const preview = harnessPreview(change);
+        if (fingerprint !== preview.fingerprint)
           return Promise.reject({ status: 409, message: 'machine.toml changed since the preview — preview again' });
         const index = setupHarnesses.findIndex(h => h.name === change.name);
         if (change.op === 'set') {
@@ -423,6 +502,8 @@ export function installMock(scenario: string) {
           else Object.assign(setupHarnesses[index], { harness: change.harness, configured: true });
         } else if (change.op === 'remove' && index >= 0 && !setupHarnesses[index].preset) setupHarnesses.splice(index, 1);
         else if (index >= 0) Object.assign(setupHarnesses[index], change.op === 'remove' ? { configured: false, enabled: setupHarnesses[index].installed } : { enabled: change.op === 'enable', configured: true, available: change.op === 'enable' ? false : setupHarnesses[index].available });
+        if (cmd === 'take_out_harness')
+          return delay({ applied: true, taken_out: preview.placed.filter(p => p.kind === 'remove'), harnesses: setupHarnesses, errors: [] } satisfies T.HarnessTakenOut, 600);
         return delay({ harnesses: setupHarnesses, errors: [] }, 600);
       }
       case 'open_fleet_deployment_docs':
@@ -434,16 +515,17 @@ export function installMock(scenario: string) {
         const request = a.request as T.ResolveRequest;
         const single = /\/(tree|blob)\//.test(request.link);
         return delay({ source: 'github:example/skills', git_ref: request.ref ?? 'main', commit: 'c0ffee1234567890',
-          candidates: (single ? ['pdf'] : ['pdf', 'writing']).map(name => ({ path: request.path ?? `skills/${name}`, total_bytes: 2048,
-            warnings: name === 'pdf' ? [{ path: 'scripts/check.py', kinds: ['script', 'executable'] }] : [], default_name: name, description: `Tools for ${name}.`, taken: items.some(i => i.item === `skill:${name}`) })) });
+          candidates: (single ? ['pdf'] : ['pdf', 'writing']).map(name => ({ path: request.path || `skills/${name}`, total_bytes: 2048,
+            warnings: name === 'pdf' ? [{ path: 'scripts/check.py', kinds: ['script', 'executable'] }] : [], default_name: name, description: `Tools for ${name}.`, taken: items.some(i => i.item === `skill:${name}` && i.draft !== 'deleted') })) });
       }
       case 'add_import': {
         const request = a.request as T.AddImportRequest;
-        if (items.some(i => i.item === `skill:${request.name}`))
+        if (items.some(i => i.item === `skill:${request.name}` && i.draft !== 'deleted'))
           return Promise.reject({ message: 'Import name already exists', status: 409, unreachable: false });
         imports.imports.push({ name: request.name, source: request.source, ref: request.ref, path: request.path, locked: request.commit ?? 'c0ffee1234567890' });
-        content.push({ name: request.name, item: `skill:${request.name}`, type: 'import', description: null, draft: 'added', in_baseline: false, path: `${status.repo}/imported/${request.name}`, enabled_harnesses: [], clashes_with_repo: false, variants: [] });
-        items.push({ item: `skill:${request.name}`, id: newId(), in_baseline: false, draft: 'added', unpushed: false, description: null });
+        const id = newId();
+        content.push({ name: request.name, item: `skill:${request.name}`, id, type: 'import', description: null, draft: 'added', in_baseline: false, path: `${status.repo}/imported/${request.name}`, enabled_harnesses: [], clashes_with_repo: false, variants: [] });
+        items.push({ item: `skill:${request.name}`, id, in_baseline: false, draft: 'added', unpushed: false, description: null });
         draft.push({ item: `skill:${request.name}`, change: 'added', paths: [`imported/${request.name}/SKILL.md`], fingerprint: 'new' });
         return delay({ name: request.name, old_commit: null, new_commit: 'c0ffee1234567890', changed: true });
       }
@@ -461,8 +543,45 @@ export function installMock(scenario: string) {
       }
       case 'join_code': return delay({ code: 'sk1ll-join-7Q2M-XK9P-44RD-ZT8W', expires_at: Math.floor(Date.now() / 1000) + 86400, scope: (a as { scope?: T.Scope }).scope ?? 'fleet' });
       case 'connection_info': return delay('/run/user/1000/sk1ll/daemon.sock', 10);
-      case 'adopt': case 'overwrite': case 'adopt_displaced': case 'discard_displaced': case 'undo':
-      case 'remove_machine': return delay(undefined, 500);
+      case 'adopt': case 'overwrite': {
+        const target = a.target as T.ConflictTarget;
+        const index = conflicts.findIndex(c => c.harness === target.harness && c.name === target.name);
+        if (index < 0) return Promise.reject({ message: 'Conflict no longer exists' });
+        const [resolved] = conflicts.splice(index, 1);
+        local.conflicts = local.conflicts.filter(c => !(c.harness === resolved.harness && resolved.items.includes(c.item)));
+        if (cmd === 'adopt') for (const item of resolved.items) if (!draft.some(entry => entry.item === item)) {
+          draft.push({ item, change: 'modified', paths: [`personal/${resolved.name}/SKILL.md`], fingerprint: 'adopted' }); local.drafts.push(item);
+        }
+        status.headline = local.conflicts.length ? 'conflict' : 'drafting';
+        return delay(undefined, 500);
+      }
+      case 'adopt_displaced': case 'discard_displaced': {
+        const index = recovered.findIndex(r => r.id === a.id);
+        if (index < 0) return Promise.reject({ message: 'Recovered content no longer exists' });
+        const [entry] = recovered.splice(index, 1);
+        return delay(cmd === 'adopt_displaced' ? `skill:${entry.name}` : undefined, 500);
+      }
+      case 'undo': {
+        const entry = log.find(e => e.id === a.entry);
+        if (!entry) return Promise.reject({ status: 404, message: 'No such log entry' });
+        const snapshot = assignments[entry.machine];
+        const h = snapshot.harnesses[entry.harness] ??= harness();
+        if (entry.kind === 'skill' || entry.kind === 'rule') {
+          const map = entry.kind === 'skill' ? h.skills : h.rules;
+          if (entry.before === null) delete map[entry.item_id!]; else map[entry.item_id!] = entry.before;
+        } else h[entry.kind] = !!entry.before;
+        snapshot.revision++;
+        const restored: T.LogEntry = { ...entry, id: Math.max(...log.map(e => e.id)) + 1, at: Math.floor(Date.now() / 1000), author: status.machine_id,
+          before: entry.after, after: entry.before, cause: { type: 'undo', entry: entry.id } };
+        log.unshift(restored);
+        const { revision, ...assignment } = snapshot;
+        return delay({ revision, assignment: structuredClone(assignment), entries: [restored] } satisfies T.AssignmentUpdate, 500);
+      }
+      case 'remove_machine': {
+        const index = machines.findIndex(m => m.id === a.machine);
+        if (index >= 0) machines.splice(index, 1);
+        return delay(undefined, 500);
+      }
       case 'join':
         if (standalone && content.length) return Promise.reject({ message: 'Cannot join a Fleet while the local repo has content.', status: 409, unreachable: false });
         standalone = false; status.mode = 'joined'; status.connection = 'connected'; status.has_origin = true; status.repo_ready = true;
@@ -471,4 +590,5 @@ export function installMock(scenario: string) {
       default: return Promise.reject({ message: `Unhandled mock command: ${cmd}` });
     }
   }, { shouldMockEvents: true });
+  return daemon;
 }

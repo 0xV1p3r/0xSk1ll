@@ -55,6 +55,8 @@ No test may write under the real home directory: tests get temporary directories
 
 A few tests need a case-insensitive filesystem and return early elsewhere, such as restoring both sides of a case-only rename; on a case-sensitive filesystem only the pieces they are built from run (the respelling move, the alias check).
 
+The UI's tests (`ui/src/flows`) render the whole app in jsdom against the dev mock Daemon (`ui/src/dev/mock.ts`, the same one `?mock=<scenario>` runs in a browser) and drive it by roles and labels, one user flow per test. The local API's JSON is pinned in `crates/sk1ll-gui/contract/*.json`: `cargo test -p sk1ll-gui --test api_contract` fails when the Rust types serialize differently (after an intended change, rerun it with `SK1LL_BLESS=1` and review the diff), and `pnpm tsc --noEmit` fails when `ui/src/types.ts` no longer fits those files (`ui/src/apiContract.ts`).
+
 The automated tests don't drive the desktop app. Test interactive GUI flows by hand against the dev fleet.
 
 Time sync planning with `cargo test -p sk1ll-core sync_plan_no_change -- --ignored --nocapture`.
