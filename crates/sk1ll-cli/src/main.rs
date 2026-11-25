@@ -247,7 +247,7 @@ enum Cmd {
         #[arg(long)]
         copy_from: Option<String>,
     },
-    /// Run the daemon in the foreground (what systemd or launchd runs)
+    /// Run the daemon in the foreground (what systemd runs)
     Daemon,
     /// Show every machine in the fleet or administer it through the daemon
     Fleet {

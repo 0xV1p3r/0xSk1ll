@@ -26,13 +26,10 @@ You need Git 2.40 or newer on `PATH`. Download the latest version from the [rele
 | Debian, Ubuntu | `0xSk1ll_<version>_amd64.deb` (desktop app and CLI), then `sudo apt install ./0xSk1ll_<version>_amd64.deb`. Needs GTK 3 and WebKitGTK 4.1. |
 | Other Linux (x86_64) | `sk1ll-<version>-x86_64-linux.tar.gz`: the CLI `sk1ll`, the app `sk1ll-gui` and the server. Copy the binaries to `~/.local/bin`. |
 | Linux (ARM) | `sk1ll-<version>-aarch64-linux.tar.gz`: CLI and server, no app. |
-| macOS (Apple silicon) | `sk1ll-<version>-aarch64-macos.tar.gz`: copy `0xSk1ll.app` to Applications and `sk1ll` to your `PATH`. |
 
-`SHA256SUMS` on the release page lists the checksums. Check a download with `sha256sum --check --ignore-missing SHA256SUMS` (`shasum -a 256 -c` on macOS).
+`SHA256SUMS` on the release page lists the checksums. Check a download with `sha256sum --check --ignore-missing SHA256SUMS`.
 
-The macOS app is not signed or notarized, and macOS builds have had no manual testing. If Gatekeeper blocks it, open it once, then choose *Open Anyway* in System Settings → Privacy & Security.
-
-To build from source, run `cargo install --path crates/sk1ll-cli`. Windows is not supported.
+To build from source, run `cargo install --path crates/sk1ll-cli`. sk1ll needs Linux; macOS and Windows are not supported.
 
 ## First run
 

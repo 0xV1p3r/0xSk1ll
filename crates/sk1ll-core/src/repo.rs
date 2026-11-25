@@ -923,7 +923,7 @@ mod create_tests {
         assert!(repo.draft().unwrap().is_empty());
     }
 
-    /// Whether `dir`'s filesystem folds case (macOS's default APFS does).
+    /// Whether `dir`'s filesystem folds case (such as an ext4 casefold directory, or vfat).
     fn folds_case(dir: &Path) -> bool {
         let probe = dir.join("case-probe");
         fs::write(&probe, "").unwrap();
@@ -970,7 +970,7 @@ mod create_tests {
 
     /// Restoring both sides of `pdf` -> `PDF` puts the Baseline's spelling
     /// back even when the directory holds an ignored file, which keeps
-    /// restore from removing it. Only a case-insensitive filesystem (macOS)
+    /// restore from removing it. Only a case-insensitive filesystem
     /// gets there; elsewhere the two spellings are two directories.
     #[test]
     fn restoring_a_case_only_rename_restores_the_spelling() {

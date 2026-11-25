@@ -39,27 +39,26 @@ pub(crate) struct Preferences {
     pub preferred_editor: Option<String>,
 }
 
-type KnownEditor = (&'static str, &'static str, EditorKind, &'static [&'static str], &'static str);
+type KnownEditor = (&'static str, &'static str, EditorKind, &'static [&'static str]);
 const KNOWN: &[KnownEditor] = &[
-    ("code", "VS Code", EditorKind::Gui, &["code"], "Visual Studio Code"),
-    ("cursor", "Cursor", EditorKind::Gui, &["cursor"], "Cursor"),
-    ("zed", "Zed", EditorKind::Gui, &["zed", "zeditor"], "Zed"),
-    ("subl", "Sublime Text", EditorKind::Gui, &["subl"], "Sublime Text"),
-    ("idea", "IntelliJ IDEA", EditorKind::Gui, &["idea"], "IntelliJ IDEA"),
-    ("pycharm", "PyCharm", EditorKind::Gui, &["pycharm"], "PyCharm"),
-    ("webstorm", "WebStorm", EditorKind::Gui, &["webstorm"], "WebStorm"),
-    ("rustrover", "RustRover", EditorKind::Gui, &["rustrover"], "RustRover"),
-    ("clion", "CLion", EditorKind::Gui, &["clion"], "CLion"),
-    ("goland", "GoLand", EditorKind::Gui, &["goland"], "GoLand"),
-    ("nvim", "Neovim", EditorKind::Terminal, &["nvim"], ""),
-    ("vim", "Vim", EditorKind::Terminal, &["vim"], ""),
-    ("hx", "Helix", EditorKind::Terminal, &["hx"], ""),
-    ("nano", "nano", EditorKind::Terminal, &["nano"], ""),
+    ("code", "VS Code", EditorKind::Gui, &["code"]),
+    ("cursor", "Cursor", EditorKind::Gui, &["cursor"]),
+    ("zed", "Zed", EditorKind::Gui, &["zed", "zeditor"]),
+    ("subl", "Sublime Text", EditorKind::Gui, &["subl"]),
+    ("idea", "IntelliJ IDEA", EditorKind::Gui, &["idea"]),
+    ("pycharm", "PyCharm", EditorKind::Gui, &["pycharm"]),
+    ("webstorm", "WebStorm", EditorKind::Gui, &["webstorm"]),
+    ("rustrover", "RustRover", EditorKind::Gui, &["rustrover"]),
+    ("clion", "CLion", EditorKind::Gui, &["clion"]),
+    ("goland", "GoLand", EditorKind::Gui, &["goland"]),
+    ("nvim", "Neovim", EditorKind::Terminal, &["nvim"]),
+    ("vim", "Vim", EditorKind::Terminal, &["vim"]),
+    ("hx", "Helix", EditorKind::Terminal, &["hx"]),
+    ("nano", "nano", EditorKind::Terminal, &["nano"]),
 ];
 pub(crate) struct Discovery {
     pub path: Vec<PathBuf>,
     pub data: Vec<PathBuf>,
-    pub apps: Vec<PathBuf>,
     pub terminal: Option<String>,
 }
 impl Discovery {
@@ -77,16 +76,7 @@ impl Discovery {
         data.extend(std::env::split_paths(
             &std::env::var_os("XDG_DATA_DIRS").unwrap_or_else(|| "/usr/local/share:/usr/share".into()),
         ));
-        Self {
-            path,
-            data,
-            apps: if cfg!(target_os = "macos") {
-                vec!["/Applications".into(), home.join("Applications")]
-            } else {
-                vec![]
-            },
-            terminal: std::env::var("TERMINAL").ok(),
-        }
+        Self { path, data, terminal: std::env::var("TERMINAL").ok() }
     }
     fn executable(&self, name: &str) -> Option<PathBuf> {
         let candidates = if Path::new(name).is_absolute() {
@@ -106,12 +96,9 @@ impl Discovery {
                 let path = self.executable(name)?;
                 let kind = path.file_name()?.to_str()?.to_owned();
                 Some((path, kind))
-            })
-            .or_else(|| {
-                cfg!(target_os = "macos").then(|| (PathBuf::from("/usr/bin/osascript"), "Terminal.app".to_owned()))
             });
         let mut result = Vec::new();
-        for &(id, name, kind, commands, bundle) in KNOWN {
+        for &(id, name, kind, commands) in KNOWN {
             if kind == EditorKind::Terminal && terminal.is_none() {
                 continue;
             }
@@ -119,13 +106,6 @@ impl Discovery {
                 .iter()
                 .find_map(|c| self.executable(c))
                 .map(|p| (p, vec![]))
-                .or_else(|| {
-                    self.apps
-                        .iter()
-                        .map(|p| p.join(format!("{bundle}.app")))
-                        .find(|p| p.is_dir())
-                        .map(|p| (PathBuf::from("/usr/bin/open"), vec!["-a".into(), p.into_os_string()]))
-                })
                 .or_else(|| if kind == EditorKind::Gui { self.desktop(commands) } else { None });
             if let Some((program, args)) = found {
                 let mut editor = Editor { view: EditorView { id: id.into(), name: name.into(), kind }, program, args };
@@ -141,11 +121,7 @@ impl Discovery {
         for (id, name) in [("file-manager", "File manager"), ("default-app", "Default app")] {
             result.push(Editor {
                 view: EditorView { id: id.into(), name: name.into(), kind: EditorKind::System },
-                program: if cfg!(target_os = "macos") {
-                    "/usr/bin/open".into()
-                } else {
-                    self.executable("xdg-open").unwrap_or_else(|| "xdg-open".into())
-                },
+                program: self.executable("xdg-open").unwrap_or_else(|| "xdg-open".into()),
                 args: vec![],
             });
         }
@@ -221,21 +197,8 @@ fn desktop_words(input: &str) -> Option<Vec<String>> {
     }
     Some(words)
 }
-// Pass argv through osascript's run handler. AppleScript quotes each argument
-// for Terminal's shell, including paths containing quotes or shell operators.
-const MAC_TERMINAL_SCRIPT: &str = r#"on run argv
-    set shellCommand to ""
-    repeat with argument in argv
-        set shellCommand to shellCommand & quoted form of (argument as text) & " "
-    end repeat
-    tell application "Terminal"
-        activate
-        do script shellCommand
-    end tell
-end run"#;
 pub(crate) fn terminal_prefix(kind: &str) -> Vec<OsString> {
     match kind {
-        "Terminal.app" => vec!["-e", MAC_TERMINAL_SCRIPT, "--"],
         "wezterm" => vec!["start", "--"],
         "gnome-terminal" => vec!["--"],
         "kitty" => vec!["--"],

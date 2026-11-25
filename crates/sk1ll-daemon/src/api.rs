@@ -182,7 +182,7 @@ pub(crate) async fn bind(path: &Path) -> anyhow::Result<PeerChecked> {
     Ok(PeerChecked(listener))
 }
 
-/// `sockaddr_un.sun_path` holds the path and its NUL: 108 bytes on Linux, 104 on macOS.
+/// `sockaddr_un.sun_path` holds the path and its NUL: 108 bytes on Linux.
 fn fits_sun_path(path: &Path) -> bool {
     // SAFETY: sockaddr_un is plain data, for which all zeroes is valid.
     let addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
@@ -744,7 +744,7 @@ mod tests {
         let err = bind(&deep.join("daemon.sock")).await.err().expect("a 120-byte directory name is too long");
         assert!(err.to_string().contains("SK1LL_DAEMON_SOCKET"), "{err}");
         assert!(!deep.exists());
-        assert!(fits_sun_path(Path::new("/Users/someone/Library/Application Support/sk1ll/run/daemon.sock")));
+        assert!(fits_sun_path(Path::new("/home/someone/.config/sk1ll/run/daemon.sock")));
     }
 
     #[tokio::test]

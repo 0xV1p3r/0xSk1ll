@@ -51,13 +51,13 @@ The CLI's command tests run the `sk1ll` binary, each with its own `HOME` and XDG
 
 No test may write under the real home directory: tests get temporary directories, and in-process engines in the daemon's and core's own tests default every path (core's state and cache directories included) to one. `scripts/check-test-home.sh` runs `cargo test --workspace` with `HOME` set to an empty directory and the XDG variables unset, and fails if anything appears there.
 
-A few tests need a case-insensitive filesystem (macOS's default APFS) and return early elsewhere, such as restoring both sides of a case-only rename; on Linux only the pieces they are built from run (the respelling move, the alias check). The macOS CI job runs them.
+A few tests need a case-insensitive filesystem and return early elsewhere, such as restoring both sides of a case-only rename; on a case-sensitive filesystem only the pieces they are built from run (the respelling move, the alias check).
 
 The automated tests don't drive the desktop app. Test interactive GUI flows by hand against the dev fleet.
 
 Time sync planning with `cargo test -p sk1ll-core sync_plan_no_change -- --ignored --nocapture`.
 
-CI (`.github/workflows/ci.yml`) runs the same checks on Linux, plus `scripts/check-version.sh` and `gh actions-lock --verify`. The arm64 macOS job builds the UI and runs the workspace build, tests and clippy.
+CI (`.github/workflows/ci.yml`) runs the same checks on Linux, plus `scripts/check-version.sh` and `gh actions-lock --verify`.
 
 ## Workflow actions
 

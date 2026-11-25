@@ -11,8 +11,7 @@ fn recover_list_shows_displaced_content() {
     let _cleanup = Cleanup(root.clone());
     let repo = root.join("repo");
     sk1ll_core::Repo::init(&repo).unwrap();
-    let state = if cfg!(target_os = "macos") { "Library/Application Support" } else { "state" };
-    let entry = root.join(state).join("sk1ll/displaced/test-entry");
+    let entry = root.join("state").join("sk1ll/displaced/test-entry");
     std::fs::create_dir_all(&entry).unwrap();
     std::fs::write(entry.join("content"), "edited rule").unwrap();
     std::fs::write(

@@ -115,7 +115,7 @@ export interface HarnessApplied { harnesses: HarnessChoice[]; errors: string[] }
 // `left`: managed content still placed, so machine.toml was not changed (`applied` false) and the items stay off.
 export interface HarnessTakenOut { applied: boolean; taken_out: PlacementView[]; left?: PlacementView[]; harnesses: HarnessChoice[]; errors: string[] }
 // How the app can start the Daemon itself; not a Daemon type.
-export type ServiceManager = 'systemd' | 'launchd';
+export type ServiceManager = 'systemd';
 export interface ServiceInfo { default_socket: boolean; binary: string | null; manager: ServiceManager; available: boolean; active: boolean; restartable: boolean; unit: string | null }
 export type DaemonStarted = ServiceManager | 'process';
 export interface ImportUpdate { name: string; source: string; ref: string; locked: string; upstream: string }

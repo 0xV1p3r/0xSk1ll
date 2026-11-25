@@ -69,7 +69,7 @@ fn hash_dir_buffered(dir: &Path, exclude: Exclusion, buf: &mut [u8]) -> Result<S
 }
 
 /// Fingerprints the entire recovery payload, including directory entries,
-/// their mode bits and (on Linux and macOS) extended attributes. Skill hash
+/// their mode bits and (on Linux) extended attributes. Skill hash
 /// exclusions do not apply here.
 pub(crate) fn hash_payload(path: &Path) -> Result<String> {
     Ok(Payload::of(path, None)?.hash)
@@ -231,12 +231,9 @@ pub(crate) fn remove_payload(path: &Path, expected: &str) -> Result<bool> {
 
 /// Feeds the extended attributes of `path` (not following a symlink), sorted
 /// by name, to `hasher`. ACLs are among them on Linux.
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn hash_xattrs(hasher: &mut Sha256, path: &Path) -> std::io::Result<()> {
     use rustix::io::Errno;
-    #[cfg(target_os = "macos")]
-    const MISSING: Errno = Errno::NOATTR;
-    #[cfg(not(target_os = "macos"))]
     const MISSING: Errno = Errno::NODATA;
     // A size query, then the read; a value that grew meanwhile is asked again.
     fn read(
@@ -285,7 +282,7 @@ fn hash_xattrs(hasher: &mut Sha256, path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn hash_xattrs(_: &mut Sha256, _: &Path) -> std::io::Result<()> {
     Ok(())
 }
@@ -883,7 +880,7 @@ pub(crate) mod tests {
         assert!(!dir.exists());
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn extended_attributes_are_part_of_the_payload() {
         use rustix::fs::{XattrFlags, lsetxattr};

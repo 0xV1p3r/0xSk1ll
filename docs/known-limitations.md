@@ -111,9 +111,8 @@ writes can see a file it is about to write and one it has written already.
 
 ## Directory placement without a no-replace rename
 
-On Linux, directories are placed with `renameat2(RENAME_NOREPLACE)`. On macOS
-they use `renamex_np(RENAME_EXCL)`. On other platforms, or filesystems that
-reject those calls, sync checks the destination and then renames. In that case
+On Linux, directories are placed with `renameat2(RENAME_NOREPLACE)`. On other
+platforms, or filesystems that reject that call, sync checks the destination and then renames. In that case
 an *empty* directory created in the gap can be replaced. A directory with
 content in it is never replaced. Files and symlinks fall back to a hard link
 or a new symlink at the destination, which never replaces anything. The old
@@ -262,9 +261,9 @@ Machine that never connects, until it is removed from the Fleet.
 ## Extended attributes and alternate data streams
 
 The fingerprint that decides whether placed content is unchanged includes
-extended attributes (and with them, ACLs) on Linux and macOS. A change to
+extended attributes (and with them, ACLs) on Linux. A change to
 an attribute therefore counts as an edit, including one the system adds
-by itself, such as a relabel or a macOS provenance attribute. On Windows
+by itself, such as a relabel. On Windows
 alternate data streams are not covered, and on other Unix systems neither are
 extended attributes. A change to either alone can be lost when sync replaces
 or prunes the file.
