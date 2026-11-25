@@ -608,15 +608,6 @@ impl HashCache {
         self.hash(path, Tree::Payload, || Stamp::of(path, None, false), || hash_payload(path))
     }
 
-    /// Makes `path`'s payload, as it is now, hash to `hash`: a stale entry,
-    /// to show what a plan with one does.
-    #[cfg(test)]
-    pub(crate) fn remember_payload(&self, path: &Path, hash: &str) {
-        let stamp = Stamp::of(path, None, false).unwrap().digest;
-        let mut entries = self.entries.lock().unwrap();
-        entries.insert((path.to_path_buf(), Tree::Payload), Cached { stamp, hash: hash.into(), used: true });
-    }
-
     /// How many trees were read and hashed, rather than found unchanged.
     pub fn hashed(&self) -> u64 {
         self.hashed.load(std::sync::atomic::Ordering::Relaxed)

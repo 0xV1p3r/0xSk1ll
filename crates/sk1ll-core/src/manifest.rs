@@ -146,17 +146,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn old_manifest_explains_what_moved() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(MANIFEST_FILE);
-        fs::write(&path, "[targets.claude]\nskills = \"~/.claude/skills\"\n[profiles.default]\nskills = [\"*\"]\n")
-            .unwrap();
-        let Err(Error::Invalid(msg)) = Manifest::load(dir.path()) else { panic!("expected Error::Invalid") };
-        assert!(msg.contains("machine.toml") && msg.contains("assignment"), "{msg}");
+    fn manifest_imports_round_trip_and_default_to_the_source_root_and_head() {
+        let path = Path::new(MANIFEST_FILE);
+        let golden = b"[import.pdf]\nsource = 'github:o/r'\n[import.docs]\nsource = '../repo'\npath = 'skills/docs'\nref = 'main'\nid = 'docs-id'\n";
+        let parsed = Manifest::parse(golden, path).unwrap();
+        let pdf = &parsed.import["pdf"];
+        assert_eq!((&*pdf.source, &*pdf.path, &*pdf.git_ref, &pdf.id), ("github:o/r", "", "HEAD", &None));
+        let docs = &parsed.import["docs"];
+        assert_eq!((&*docs.source, &*docs.path, &*docs.git_ref), ("../repo", "skills/docs", "main"));
+        assert_eq!(docs.id.as_ref().unwrap().to_string(), "docs-id");
+        let serialized = toml::to_string(&parsed).unwrap();
+        assert_eq!(Manifest::parse(serialized.as_bytes(), path).unwrap().import, parsed.import);
+    }
 
-        fs::write(&path, "[import.pdf]\nsource = \"github:o/r\"\n").unwrap();
-        assert_eq!(Manifest::load(dir.path()).unwrap().import["pdf"].source, "github:o/r");
-        fs::write(&path, "bogus = 1\n").unwrap();
-        assert!(matches!(Manifest::load(dir.path()), Err(Error::Parse { .. })));
+    #[test]
+    fn old_manifest_explains_what_moved() {
+        let path = Path::new(MANIFEST_FILE);
+        for (legacy, expected) in [
+            ("[targets.claude]\nskills = '~/.claude/skills'\n", "machine.toml"),
+            ("[profiles.default]\nskills = ['*']\n", "assignment"),
+        ] {
+            assert!(
+                matches!(Manifest::parse(legacy.as_bytes(), path), Err(Error::Invalid(msg)) if msg.contains(expected))
+            );
+        }
+        for malformed in ["bogus = 1", "[import.pdf]\nref = 'main'", "[import.pdf]\nsource = 1"] {
+            assert!(matches!(Manifest::parse(malformed.as_bytes(), path), Err(Error::Parse { .. })));
+        }
     }
 }
