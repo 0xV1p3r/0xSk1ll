@@ -516,7 +516,13 @@ fn a_full_reconcile_rehashes_the_same_files_after_the_interval() {
         let settled = hashes.load(Ordering::Relaxed);
         assert!(settled > 0);
         c.items_fresh().await.unwrap();
-        assert_eq!(hashes.load(Ordering::Relaxed), settled, "rehashed {:?} after the start", started.elapsed());
+        // The interval is wall-clock: on a machine loaded enough that the
+        // reads above outlasted it, this reconcile was a full one by design.
+        if started.elapsed() < cfg.full_reconcile_every {
+            assert_eq!(hashes.load(Ordering::Relaxed), settled, "rehashed {:?} after the start", started.elapsed());
+        } else {
+            eprintln!("skipped the cached-read check: the first reads took {:?}", started.elapsed());
+        }
 
         tokio::time::sleep(cfg.full_reconcile_every).await;
         c.items_fresh().await.unwrap();
