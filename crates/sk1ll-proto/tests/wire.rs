@@ -269,28 +269,32 @@ fn every_enum_variant_has_its_wire_name() {
     }
 }
 
+/// REST bodies the GUI reads too have one sample each in `wire.json`, which
+/// `crates/sk1ll-gui/ui/src/apiContract.ts` checks against `types.ts`. Each
+/// reads back to exactly its sample.
+#[test]
+fn shared_rest_bodies_match_their_samples() {
+    fn same<T: Serialize + DeserializeOwned>(samples: &mut serde_json::Map<String, Value>, key: &str) {
+        let sample = samples.remove(key).unwrap_or_else(|| panic!("no sample of `{key}`"));
+        let value: T = serde_json::from_value(sample.clone()).unwrap_or_else(|e| panic!("{key}: {e}"));
+        assert_eq!(serde_json::to_value(value).unwrap(), sample, "{key}");
+    }
+    let Value::Object(mut samples) = serde_json::from_str(include_str!("wire.json")).unwrap() else { panic!() };
+    same::<FleetView>(&mut samples, "fleet_view");
+    same::<AssignmentChanges>(&mut samples, "assignment_changes");
+    same::<AssignmentUpdate>(&mut samples, "assignment_update");
+    same::<AssignmentCopyPreview>(&mut samples, "assignment_copy_preview");
+    same::<OrphansView>(&mut samples, "orphans_view");
+    same::<OrphansPruned>(&mut samples, "orphans_pruned");
+    same::<LogFacets>(&mut samples, "log_facets");
+    same::<JoinCode>(&mut samples, "join_code");
+    assert!(samples.is_empty(), "unchecked samples: {:?}", samples.keys().collect::<Vec<_>>());
+}
+
+/// The other bodies, and the shared ones where fields are left out.
 #[test]
 fn rest_bodies_have_golden_json() {
     let (a, a_json) = assignment();
-    golden(
-        FleetView {
-            baseline: Some("head".into()),
-            machines: vec![MachineRow {
-                id: "ws".into(),
-                status: MachineStatus::InSync,
-                connected: true,
-                joined_at: 10,
-                last_seen: Some(20),
-                report: None,
-                scope: Scope::SelfOnly,
-                registration: "reg".into(),
-            }],
-        },
-        json!({"baseline": "head", "machines": [{
-            "id": "ws", "status": "in_sync", "connected": true, "joined_at": 10, "last_seen": 20,
-            "report": null, "scope": "self", "registration": "reg",
-        }]}),
-    );
     golden(FleetView { baseline: None, machines: vec![] }, json!({"baseline": null, "machines": []}));
     golden(
         AssignmentChanges {
@@ -342,27 +346,8 @@ fn rest_bodies_have_golden_json() {
         AssignmentUpdate { assignment: a.clone(), revision: 5, entries: vec![], errors: vec![] },
         json!({"assignment": a_json, "revision": 5, "entries": []}),
     );
-    let orphan = Orphan {
-        machine: "ws".into(),
-        harness: "claude".into(),
-        kind: ToggleKind::Skill,
-        item_id: id("gone"),
-        name: None,
-    };
-    golden(
-        OrphansView { orphans: vec![orphan] },
-        json!({"orphans": [{"machine": "ws", "harness": "claude", "kind": "skill", "item_id": "gone", "name": null}]}),
-    );
     golden(PruneOrphans { machine: None }, json!({}));
     golden(PruneOrphans { machine: Some("ws".into()) }, json!({"machine": "ws"}));
-    golden(
-        OrphansPruned { entries: vec![entry(LogCause::OrphanPruned)] },
-        json!({"entries": [entry_json(json!({"type": "orphan_pruned"}))]}),
-    );
-    golden(
-        LogFacets { machines: vec!["ws".into()], harnesses: vec!["claude".into()], authors: vec!["admin".into()] },
-        json!({"machines": ["ws"], "harnesses": ["claude"], "authors": ["admin"]}),
-    );
     golden(
         JoinRequest { code: "C".into(), machine_id: "ws".into(), harnesses: vec!["claude".into()], copy_from: None },
         json!({"code": "C", "machine_id": "ws", "harnesses": ["claude"], "copy_from": null}),
@@ -378,10 +363,6 @@ fn rest_bodies_have_golden_json() {
         json!({"machine_id": "ws", "token": "t", "repo_path": "/git/repo.git", "assignment": a_json, "revision": 1}),
     );
     golden(JoinCodeRequest { scope: Scope::SelfOnly }, json!({"scope": "self"}));
-    golden(
-        JoinCode { code: "ABCDE-FGHJK".into(), expires_at: 100, scope: Scope::Fleet },
-        json!({"code": "ABCDE-FGHJK", "expires_at": 100, "scope": "fleet"}),
-    );
     golden(
         ImportsView {
             checked_at: Some(9),
