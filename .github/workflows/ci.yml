@@ -53,9 +53,10 @@ jobs:
           pnpm build
 
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo build --workspace --locked
-      # The tests, failing if any of them writes under HOME.
+      # The tests, failpoint tests included (--all-features), failing if any
+      # of them writes under HOME.
       - run: scripts/check-test-home.sh --locked
       # dev-fleet.sh builds only server + daemon, which unifies features
       # differently from --workspace; prebuild so the test's startup deadline
