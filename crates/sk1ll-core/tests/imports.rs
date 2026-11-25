@@ -903,7 +903,8 @@ fn an_import_interrupted_at_any_failpoint_keeps_the_draft_and_one_whole_version(
 ///   update records it.
 ///
 /// The only failpoint in that window is the `HashMidRead` of hashing the
-/// published tree for the lock. See docs/test-map/pB-core.md.
+/// published tree for the lock. When this gap is fixed, turn this test
+/// around to assert the recovered state.
 #[test]
 fn known_gap_an_import_interrupted_after_publication_is_left_with_stale_or_missing_metadata() {
     for update in [false, true] {
