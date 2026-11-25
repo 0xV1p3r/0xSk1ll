@@ -1,0 +1,177 @@
+{
+  "command_error": [
+    {
+      "message": "Assignment changed",
+      "status": 409,
+      "unreachable": false
+    },
+    {
+      "message": "connection refused",
+      "status": null,
+      "unreachable": true
+    }
+  ],
+  "connection": {
+    "auth_rejected": "auth_rejected",
+    "connected": "connected",
+    "connecting": "connecting",
+    "incompatible": "incompatible",
+    "offline": "offline",
+    "revoked": "revoked",
+    "standalone": "standalone"
+  },
+  "daemon_connection": [
+    {
+      "message": null,
+      "reachable": true,
+      "retry_in_ms": 0
+    },
+    {
+      "message": "connection refused",
+      "reachable": false,
+      "retry_in_ms": 2000
+    }
+  ],
+  "daemon_mode": {
+    "joined": "joined",
+    "standalone": "standalone"
+  },
+  "event": {
+    "assignment": {
+      "revision": 43,
+      "type": "assignment"
+    },
+    "draft": {
+      "type": "draft"
+    },
+    "fleet": {
+      "type": "fleet"
+    },
+    "imports": {
+      "type": "imports",
+      "updates": [
+        {
+          "locked": "4e5f6a7b8c9d",
+          "name": "pdf",
+          "ref": "main",
+          "source": "github:example/skills",
+          "upstream": "c0ffee123456"
+        }
+      ]
+    },
+    "status": {
+      "type": "status"
+    }
+  },
+  "machine_status": {
+    "behind": "behind",
+    "blocked": "blocked",
+    "conflict": "conflict",
+    "drafting": "drafting",
+    "in_sync": "in_sync",
+    "offline": "offline"
+  },
+  "status_view": {
+    "joined": {
+      "assignment_revision": 42,
+      "auth_rejected_since": 1760000000,
+      "awaiting_assignment": true,
+      "connection": "auth_rejected",
+      "has_origin": true,
+      "headline": "conflict",
+      "keep_report": [
+        {
+          "entry": "k-1",
+          "error": "the Draft changed",
+          "item": "skill:deploy"
+        },
+        {
+          "entry": null,
+          "error": "deleted in the Draft",
+          "item": "rule:style"
+        }
+      ],
+      "last_error": "Server returned 401 Unauthorized",
+      "machine_id": "workstation",
+      "mode": "joined",
+      "protocol": 2,
+      "repo": "/home/dev/.local/share/sk1ll/repo",
+      "repo_ready": true,
+      "report": {
+        "baseline": "9f3c2a17d4e1",
+        "behind": true,
+        "blocked": true,
+        "clashes": [
+          "skill:deploy"
+        ],
+        "conflicts": [
+          {
+            "harness": "codex",
+            "item": "skill:code-review"
+          }
+        ],
+        "drafts": [
+          "skill:release-notes",
+          "rule:style"
+        ],
+        "harnesses": [
+          "claude",
+          "codex"
+        ],
+        "inventory_complete": false,
+        "inventory_error": "could not read ~/.codex/skills",
+        "items": [
+          {
+            "id": "01J0DEPLOY",
+            "item": "skill:deploy"
+          }
+        ],
+        "push_refused": "the Server refused the push",
+        "seq": 7,
+        "unpushed": [
+          "skill:release-notes"
+        ]
+      },
+      "revoked": false,
+      "server": {
+        "protocol": 1,
+        "version": "0.1.0"
+      },
+      "server_baseline": "9f3c2a17d4e1",
+      "server_url": "https://skills.example.com",
+      "version": "0.2.0 (abc1234567)"
+    },
+    "standalone": {
+      "assignment_revision": 0,
+      "auth_rejected_since": null,
+      "awaiting_assignment": false,
+      "connection": "standalone",
+      "has_origin": false,
+      "headline": "in_sync",
+      "last_error": null,
+      "machine_id": "laptop",
+      "mode": "standalone",
+      "protocol": 2,
+      "repo": "/home/dev/skills",
+      "repo_ready": false,
+      "report": {
+        "baseline": null,
+        "behind": false,
+        "blocked": false,
+        "clashes": [],
+        "conflicts": [],
+        "drafts": [],
+        "harnesses": [],
+        "inventory_complete": false,
+        "items": [],
+        "seq": 0,
+        "unpushed": []
+      },
+      "revoked": false,
+      "server": null,
+      "server_baseline": null,
+      "server_url": null,
+      "version": ""
+    }
+  }
+}

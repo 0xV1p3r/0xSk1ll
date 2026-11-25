@@ -8,7 +8,7 @@
 use std::sync::Mutex;
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
@@ -20,7 +20,7 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub const PROGRESS_EVENT: &str = "app-update-progress";
 
 /// The release a check found, as the app shows it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AvailableUpdate {
     pub version: String,
     pub current_version: String,
@@ -30,7 +30,7 @@ pub struct AvailableUpdate {
     pub date: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "stage", rename_all = "snake_case")]
 pub enum Progress {
     /// `percent`: `None` while the size is unknown.

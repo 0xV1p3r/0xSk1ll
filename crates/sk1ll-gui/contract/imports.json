@@ -1,0 +1,99 @@
+{
+  "add_import_request": {
+    "commit": "c0ffee1234567890",
+    "name": "pdf",
+    "path": "skills/pdf",
+    "ref": "main",
+    "source": "github:example/skills"
+  },
+  "import_changes": {
+    "commits": [
+      {
+        "date": "2026-11-01",
+        "sha": "c0ffee1",
+        "subject": "Fix PDF tables"
+      }
+    ],
+    "files": [
+      "SKILL.md"
+    ],
+    "locked": "4e5f6a7b8c9d",
+    "truncated": false,
+    "upstream": "c0ffee123456"
+  },
+  "import_updated": {
+    "changed": true,
+    "name": "pdf",
+    "new_commit": "c0ffee123456",
+    "old_commit": "4e5f6a7b8c9d"
+  },
+  "imports_view": {
+    "checked_at": 1760000000,
+    "errors": [
+      {
+        "message": "git fetch failed",
+        "name": "internal-skills"
+      }
+    ],
+    "imports": [
+      {
+        "locked": "4e5f6a7b8c9d",
+        "name": "pdf",
+        "path": "skills/pdf",
+        "ref": "main",
+        "source": "github:example/skills"
+      }
+    ],
+    "skipped": [
+      {
+        "name": "private",
+        "reason": "not allowed by the Server"
+      }
+    ],
+    "updates": [
+      {
+        "locked": "4e5f6a7b8c9d",
+        "name": "pdf",
+        "ref": "main",
+        "source": "github:example/skills",
+        "upstream": "c0ffee123456"
+      }
+    ]
+  },
+  "resolve_request": {
+    "link": "https://github.com/example/skills",
+    "path": "skills/pdf",
+    "ref": "v2"
+  },
+  "resolved_source": {
+    "candidates": [
+      {
+        "default_name": "pdf",
+        "description": "Tools for pdf.",
+        "path": "skills/pdf",
+        "taken": false,
+        "total_bytes": 2048,
+        "warnings": [
+          {
+            "kinds": [
+              "executable",
+              "script",
+              "binary",
+              "large"
+            ],
+            "path": "scripts/check.py"
+          }
+        ]
+      }
+    ],
+    "commit": "c0ffee1234567890",
+    "git_ref": "main",
+    "source": "github:example/skills"
+  },
+  "warning_kind": {
+    "binary": "binary",
+    "executable": "executable",
+    "large": "large",
+    "script": "script"
+  }
+}

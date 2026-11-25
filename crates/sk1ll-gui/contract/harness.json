@@ -1,0 +1,366 @@
+{
+  "conflict_target": {
+    "harness": "codex",
+    "name": "code-review"
+  },
+  "conflict_view": {
+    "displaced": {
+      "adoptable": true,
+      "dest": "/home/dev/.claude/skills/notes",
+      "displaced_at": 1760000000,
+      "harness": "claude",
+      "id": "d-1",
+      "items": [],
+      "kind": "displaced",
+      "name": "notes",
+      "path": "/home/dev/.local/share/sk1ll/recovered/d-1",
+      "reason": "Unmanaged directory replaced by an assigned Skill."
+    },
+    "harness": {
+      "adoptable": true,
+      "dest": "/home/dev/.codex/skills/code-review",
+      "detected_at": 1760000000,
+      "harness": "codex",
+      "item": "skill:code-review",
+      "items": [
+        "skill:code-review"
+      ],
+      "name": "code-review",
+      "reason": "SKILL.md was edited in the Harness after the last sync."
+    }
+  },
+  "harness_applied": {
+    "errors": [
+      "sync ~/.kiro/skills: permission denied"
+    ],
+    "harnesses": [
+      {
+        "available": true,
+        "configured": true,
+        "enabled": false,
+        "harness": {
+          "instructions": "~/.kiro/steering",
+          "instructions_format": "rules",
+          "mode": "copy",
+          "skills": "~/.kiro/skills"
+        },
+        "installed": true,
+        "name": "kiro",
+        "preset": true,
+        "setup_warning": "~/.kiro is not a directory"
+      }
+    ]
+  },
+  "harness_change": {
+    "disable": {
+      "name": "claude",
+      "op": "disable"
+    },
+    "enable": {
+      "name": "kiro",
+      "op": "enable"
+    },
+    "remove": {
+      "name": "agents",
+      "op": "remove"
+    },
+    "set": {
+      "harness": {
+        "instructions": null,
+        "instructions_format": "block",
+        "mode": "copy",
+        "skills": "/opt/tool/skills"
+      },
+      "name": "tool",
+      "op": "set"
+    }
+  },
+  "harness_change_request": {
+    "change": {
+      "name": "claude",
+      "op": "disable"
+    },
+    "fingerprint": "f-1"
+  },
+  "harness_preview": {
+    "after": null,
+    "awaiting_assignment": false,
+    "before": {
+      "instructions": "~/.claude/CLAUDE.md",
+      "instructions_format": "block",
+      "mode": "symlink",
+      "skills": "~/.claude/skills"
+    },
+    "fingerprint": "f-1",
+    "name": "claude",
+    "path": "/home/dev/.config/sk1ll/machine.toml",
+    "placed": [
+      {
+        "dest": "/home/dev/.claude/skills/code-review",
+        "harness": "claude",
+        "item": "skill",
+        "kind": "remove",
+        "name": "code-review",
+        "reason": null
+      },
+      {
+        "dest": "/home/dev/.claude/skills/code-review",
+        "harness": "claude",
+        "item": "skill",
+        "kind": "conflict",
+        "name": "code-review",
+        "reason": "edited"
+      }
+    ],
+    "sync": [],
+    "warnings": [
+      "~/.claude is a symlink"
+    ]
+  },
+  "harness_settings": {
+    "harnesses": [
+      {
+        "available": true,
+        "configured": true,
+        "enabled": false,
+        "harness": {
+          "instructions": "~/.kiro/steering",
+          "instructions_format": "rules",
+          "mode": "copy",
+          "skills": "~/.kiro/skills"
+        },
+        "installed": true,
+        "name": "kiro",
+        "preset": true,
+        "setup_warning": "~/.kiro is not a directory"
+      },
+      {
+        "available": false,
+        "configured": false,
+        "enabled": true,
+        "harness": {
+          "instructions": "~/.claude/CLAUDE.md",
+          "instructions_format": "block",
+          "mode": "symlink",
+          "skills": null
+        },
+        "installed": true,
+        "name": "claude",
+        "preset": false
+      }
+    ],
+    "path": "/home/dev/.config/sk1ll/machine.toml"
+  },
+  "harness_taken_out": {
+    "applied": false,
+    "errors": [
+      "remove ~/.claude/skills/code-review: permission denied"
+    ],
+    "harnesses": [
+      {
+        "available": true,
+        "configured": true,
+        "enabled": false,
+        "harness": {
+          "instructions": "~/.kiro/steering",
+          "instructions_format": "rules",
+          "mode": "copy",
+          "skills": "~/.kiro/skills"
+        },
+        "installed": true,
+        "name": "kiro",
+        "preset": true,
+        "setup_warning": "~/.kiro is not a directory"
+      }
+    ],
+    "left": [
+      {
+        "dest": "/home/dev/.claude/skills/code-review",
+        "harness": "claude",
+        "item": "skill",
+        "kind": "remove",
+        "name": "code-review",
+        "reason": null
+      }
+    ],
+    "taken_out": [
+      {
+        "dest": "/home/dev/.claude/skills/code-review",
+        "harness": "claude",
+        "item": "skill",
+        "kind": "remove",
+        "name": "code-review",
+        "reason": null
+      }
+    ]
+  },
+  "harness_view": {
+    "harness": {
+      "instructions": "~/.claude/CLAUDE.md",
+      "instructions_format": "block",
+      "mode": "symlink",
+      "skills": "~/.claude/skills"
+    },
+    "name": "claude",
+    "origin": "detected"
+  },
+  "instruction_preview": {
+    "block": {
+      "content": "Use two spaces for indentation.\n",
+      "diff": "@@ -1 +1 @@",
+      "differs": true,
+      "format": "block",
+      "next_content": "# Mine\nUse two spaces for indentation.\n",
+      "path": "/home/dev/.claude/CLAUDE.md"
+    },
+    "rules": {
+      "content": "Use two spaces for indentation.\n",
+      "diff": "@@ -1 +1 @@",
+      "differs": true,
+      "format": "rules",
+      "next_content": "# Mine\nUse two spaces for indentation.\n",
+      "path": "/home/dev/.claude/CLAUDE.md"
+    }
+  },
+  "instructions_format": {
+    "block": {
+      "instructions": "~/.claude/CLAUDE.md",
+      "instructions_format": "block",
+      "mode": "symlink",
+      "skills": "~/.claude/skills"
+    },
+    "rules": {
+      "instructions": "~/.claude/CLAUDE.md",
+      "instructions_format": "rules",
+      "mode": "symlink",
+      "skills": "~/.claude/skills"
+    }
+  },
+  "link_mode": {
+    "copy": {
+      "instructions": "~/.claude/CLAUDE.md",
+      "instructions_format": "block",
+      "mode": "copy",
+      "skills": "~/.claude/skills"
+    },
+    "symlink": {
+      "instructions": "~/.claude/CLAUDE.md",
+      "instructions_format": "block",
+      "mode": "symlink",
+      "skills": "~/.claude/skills"
+    }
+  },
+  "placement_item": {
+    "instructions": {
+      "dest": "/home/dev/.claude/skills/code-review",
+      "harness": "claude",
+      "item": "instructions",
+      "kind": "create",
+      "name": "code-review",
+      "reason": null
+    },
+    "rule": {
+      "dest": "/home/dev/.claude/skills/code-review",
+      "harness": "claude",
+      "item": "rule",
+      "kind": "create",
+      "name": "code-review",
+      "reason": null
+    },
+    "skill": {
+      "dest": "/home/dev/.claude/skills/code-review",
+      "harness": "claude",
+      "item": "skill",
+      "kind": "create",
+      "name": "code-review",
+      "reason": null
+    }
+  },
+  "placement_kind": {
+    "conflict": {
+      "dest": "/home/dev/.claude/skills/code-review",
+      "harness": "claude",
+      "item": "skill",
+      "kind": "conflict",
+      "name": "code-review",
+      "reason": "edited"
+    },
+    "create": {
+      "dest": "/home/dev/.claude/skills/code-review",
+      "harness": "claude",
+      "item": "skill",
+      "kind": "create",
+      "name": "code-review",
+      "reason": null
+    },
+    "remove": {
+      "dest": "/home/dev/.claude/skills/code-review",
+      "harness": "claude",
+      "item": "skill",
+      "kind": "remove",
+      "name": "code-review",
+      "reason": null
+    },
+    "update": {
+      "dest": "/home/dev/.claude/skills/code-review",
+      "harness": "claude",
+      "item": "skill",
+      "kind": "update",
+      "name": "code-review",
+      "reason": null
+    }
+  },
+  "sync_result": [
+    {
+      "actions": [
+        {
+          "dest": "/home/dev/.claude/skills/code-review",
+          "harness": "claude",
+          "item": "skill",
+          "kind": "update",
+          "name": "code-review",
+          "reason": null
+        }
+      ],
+      "changed": {
+        "dest": "/home/dev/.claude/skills/code-review",
+        "harness": "claude",
+        "item": "skill",
+        "kind": "update",
+        "name": "code-review",
+        "reason": null
+      },
+      "completed": [
+        {
+          "dest": "/home/dev/.claude/skills/code-review",
+          "harness": "claude",
+          "item": "skill",
+          "kind": "create",
+          "name": "code-review",
+          "reason": null
+        }
+      ],
+      "conflicts": [
+        {
+          "adoptable": true,
+          "dest": "/home/dev/.codex/skills/code-review",
+          "detected_at": 1760000000,
+          "harness": "codex",
+          "item": "skill:code-review",
+          "items": [
+            "skill:code-review"
+          ],
+          "name": "code-review",
+          "reason": "SKILL.md was edited in the Harness after the last sync."
+        }
+      ],
+      "errors": [
+        "Could not place notes"
+      ],
+      "fingerprint": "s-1"
+    },
+    {
+      "conflicts": []
+    }
+  ]
+}

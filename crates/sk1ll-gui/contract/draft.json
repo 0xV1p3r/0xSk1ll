@@ -1,0 +1,131 @@
+{
+  "commit_message": {
+    "items": [
+      "skill:deploy"
+    ],
+    "message": "commit skill:deploy from workstation"
+  },
+  "commit_request": {
+    "author": "Dev <dev@example.com>",
+    "items": [
+      "skill:deploy"
+    ],
+    "message": "Ship faster"
+  },
+  "commit_response": {
+    "items": [
+      "skill:deploy"
+    ],
+    "message": "Ship faster",
+    "push_error": "connection refused",
+    "pushed": false,
+    "sha": "7d1e9a0b3c5f8e2d"
+  },
+  "diff_view": [
+    {
+      "diff": "@@ -1 +1 @@",
+      "item": "rule:style",
+      "target": "instructions/style.md"
+    },
+    {
+      "diff": "",
+      "item": "skill:deploy"
+    }
+  ],
+  "draft_entry": {
+    "added": {
+      "change": "added",
+      "fingerprint": "a1b2c3",
+      "item": "skill:release-notes",
+      "paths": [
+        "personal/release-notes/SKILL.md"
+      ]
+    },
+    "deleted": {
+      "change": "deleted",
+      "fingerprint": "a1b2c3",
+      "item": "skill:release-notes",
+      "paths": [
+        "personal/release-notes/SKILL.md"
+      ]
+    },
+    "modified": {
+      "change": "modified",
+      "fingerprint": "a1b2c3",
+      "item": "skill:release-notes",
+      "paths": [
+        "personal/release-notes/SKILL.md"
+      ]
+    }
+  },
+  "item_view": [
+    {
+      "description": "Builds and ships the server container.",
+      "draft": "modified",
+      "id": "01J0DEPLOY",
+      "in_baseline": true,
+      "item": "skill:deploy",
+      "unpushed": false
+    },
+    {
+      "description": null,
+      "draft": null,
+      "id": null,
+      "in_baseline": true,
+      "item": "skill:deploy",
+      "unpushed": false
+    }
+  ],
+  "pull_keep_request": {
+    "all": true,
+    "items": []
+  },
+  "pull_keep_result": {
+    "kept": [
+      "skill:deploy"
+    ],
+    "pull": {
+      "from": null,
+      "state": "updated",
+      "to": "9f3c2a17d4e1"
+    }
+  },
+  "pull_result": {
+    "blocked": {
+      "baseline": "9f3c2a17d4e1",
+      "items": [
+        "skill:deploy"
+      ],
+      "pending": true,
+      "state": "blocked",
+      "uncommitted": [
+        "7d1e9a0 Ship faster"
+      ]
+    },
+    "up_to_date": {
+      "state": "up_to_date"
+    },
+    "updated": {
+      "from": null,
+      "state": "updated",
+      "to": "9f3c2a17d4e1"
+    }
+  },
+  "push_result": {
+    "pushed": true
+  },
+  "restore_request": {
+    "all": false,
+    "items": [
+      "skill:deploy"
+    ]
+  },
+  "restore_response": {
+    "discarded": [
+      "skill:deploy"
+    ],
+    "kept": [
+      "k-1"
+    ]
+  }
+}

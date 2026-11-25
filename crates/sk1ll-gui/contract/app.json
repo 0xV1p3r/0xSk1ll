@@ -1,0 +1,86 @@
+{
+  "available_update": [
+    {
+      "current_version": "0.1.0",
+      "date": "2026-11-01T00:00:00Z",
+      "notes": "### Added",
+      "version": "0.2.0"
+    },
+    {
+      "current_version": "0.1.0",
+      "date": null,
+      "notes": null,
+      "version": "0.2.0"
+    }
+  ],
+  "daemon_started": {
+    "launchd": "launchd",
+    "process": "process",
+    "systemd": "systemd"
+  },
+  "editor_kind": {
+    "gui": {
+      "id": "code",
+      "kind": "gui",
+      "name": "VS Code"
+    },
+    "system": {
+      "id": "code",
+      "kind": "system",
+      "name": "VS Code"
+    },
+    "terminal": {
+      "id": "code",
+      "kind": "terminal",
+      "name": "VS Code"
+    }
+  },
+  "editors_view": {
+    "editors": [
+      {
+        "id": "gui",
+        "kind": "gui",
+        "name": "Gui"
+      },
+      {
+        "id": "terminal",
+        "kind": "terminal",
+        "name": "Terminal"
+      },
+      {
+        "id": "system",
+        "kind": "system",
+        "name": "System"
+      }
+    ],
+    "preferred_editor": "code"
+  },
+  "service_info": {
+    "active": false,
+    "available": true,
+    "binary": "/home/dev/.cargo/bin/sk1ll",
+    "default_socket": true,
+    "manager": "systemd",
+    "restartable": false,
+    "unit": "sk1ll-daemon.service"
+  },
+  "service_manager": {
+    "launchd": "launchd",
+    "systemd": "systemd"
+  },
+  "update_progress": {
+    "downloading": {
+      "percent": 40,
+      "stage": "downloading"
+    },
+    "installing": {
+      "stage": "installing"
+    },
+    "relaunching": {
+      "stage": "relaunching"
+    },
+    "restarting_daemon": {
+      "stage": "restarting_daemon"
+    }
+  }
+}
