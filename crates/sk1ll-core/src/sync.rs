@@ -2878,7 +2878,15 @@ pub mod displaced {
     /// unchanged ones left, however young. Changed entries are never pruned.
     /// Returns the ids removed. Sync runs this whenever it displaces something new.
     pub fn prune() -> Result<Vec<String>> {
-        prune_with(GRACE, max_size())
+        prune_retaining(GRACE, max_size())
+    }
+
+    /// [`prune`] with its retention overridden: entries are old enough at
+    /// `age`, and unchanged ones go while all take more than `max` bytes.
+    /// Only for tests (the `failpoints` feature), which can't wait out [`GRACE`].
+    #[cfg(any(test, feature = "failpoints"))]
+    pub fn prune_with(age: Duration, max: u64) -> Result<Vec<String>> {
+        prune_retaining(age, max)
     }
 
     /// `SK1LL_DISPLACED_MAX`: bytes, or a number with `K`, `M`, `G` or `T`
@@ -2904,7 +2912,7 @@ pub mod displaced {
 
     /// Prunes recovery entries with an explicit retention age and byte cap.
     /// Entries with user changes and entries still in use are always kept.
-    pub fn prune_with(age: Duration, max: u64) -> Result<Vec<String>> {
+    fn prune_retaining(age: Duration, max: u64) -> Result<Vec<String>> {
         let root = root()?;
         let now = now();
         let old = |since: u64| now.saturating_sub(since) >= age.as_secs();
