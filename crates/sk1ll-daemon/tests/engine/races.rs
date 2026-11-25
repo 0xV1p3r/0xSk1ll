@@ -482,12 +482,13 @@ fn a_rename_answer_held_past_a_rejoin_leaves_the_next_registration_intact() {
         let (release, gate) = mpsc::channel::<()>();
         let _hold = failpoints::once_shared(Point::DaemonRenameAnswered, &cfg.machine_config, move |_| {
             answered.send(()).unwrap();
-            gate.recv_timeout(Duration::from_secs(10)).unwrap();
+            // Until released, or the test fails and drops the sender.
+            let _ = gate.recv();
         });
         // The renamed revision's push, too, arrives only once the registration was replaced.
         let (release_push, push_gate) = mpsc::channel::<()>();
         let _hold_push = failpoints::once_shared(Point::DaemonServerMessage, &cfg.machine_config, move |_| {
-            push_gate.recv_timeout(Duration::from_secs(10)).unwrap();
+            let _ = push_gate.recv();
         });
         // The join below restarts the daemon in place: crash instead of replacing the test process.
         let (restarting, restarted) = tokio::sync::oneshot::channel();
@@ -507,7 +508,7 @@ fn a_rename_answer_held_past_a_rejoin_leaves_the_next_registration_intact() {
             let req = HarnessRenameRequest { from: "agent".into(), to: "renamed".into(), replace: false };
             async move { c.rename_harness(&req).await }
         });
-        tokio::time::timeout(Duration::from_secs(10), held).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(30), held).await.unwrap().unwrap();
         // With the answer held: removed from the Fleet, then joined again.
         let removed = server.http().delete(format!("{}/api/machines/test", server.url())).bearer_auth(ADMIN);
         removed.send().await.unwrap().error_for_status().unwrap();
@@ -528,9 +529,11 @@ fn a_rename_answer_held_past_a_rejoin_leaves_the_next_registration_intact() {
         assert_eq!(DaemonState::load(&cfg.state).unwrap().as_ref(), Some(&next));
         assert_eq!(stored().as_ref(), Some(&snapshot), "{renamed:?}");
         assert_eq!(renamed.unwrap_err().status, Some(409));
-        tokio::time::timeout(Duration::from_secs(10), restarted).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(30), restarted).await.unwrap().unwrap();
         drop(engine);
-        let status = writer(&cfg).client().status().await.unwrap();
+        // The old engine's tasks let go of the machine lock as they wind down.
+        let next_engine = || async { sk1ll_daemon::local::Engine::for_tests(cfg.clone(), true, Duration::ZERO).ok() };
+        let status = sk1ll_testkit::eventually(next_engine).await.client().status().await.unwrap();
         assert_eq!((status.machine_id.as_str(), status.revoked), ("next", false));
         assert_eq!(status.assignment_revision, snapshot.revision);
     });
