@@ -88,14 +88,6 @@ pub(crate) trait AssignmentStore: Send + Sync {
     fn get<'a>(&'a self, d: &'a Arc<Daemon>) -> BoxFuture<'a, Result<AssignmentSnapshot>>;
 }
 
-#[cfg(test)]
-thread_local! {
-    /// The next machine-local store made on this thread starts with it as
-    /// its [`LocalAssignment::before_swap`], so a test reaches the swap a
-    /// daemon makes as it starts.
-    pub(crate) static BEFORE_FIRST_SWAP: std::cell::Cell<Option<Box<dyn FnOnce() + Send>>> = Default::default();
-}
-
 /// The store for `cfg`: the server's for a joined Machine, else the file.
 pub(crate) fn for_machine(cfg: &Config, joined: Option<&DaemonState>) -> Box<dyn AssignmentStore> {
     match joined {
@@ -109,8 +101,6 @@ pub(crate) fn for_machine(cfg: &Config, joined: Option<&DaemonState>) -> Box<dyn
             revisions: cfg.standalone_assignment_path(),
             machine_config: cfg.machine_config.clone(),
             state_dir: cfg.state_dir.clone(),
-            #[cfg(test)]
-            before_swap: std::sync::Mutex::new(BEFORE_FIRST_SWAP.take()),
         }),
     }
 }
@@ -210,9 +200,6 @@ pub(crate) struct LocalAssignment {
     machine_config: PathBuf,
     /// sk1ll's state directory, where a pending Harness rename is kept.
     state_dir: PathBuf,
-    /// Runs in [`LocalAssignment::swap`] before it checks the file.
-    #[cfg(test)]
-    pub(crate) before_swap: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl AssignmentStore for LocalAssignment {
@@ -396,10 +383,7 @@ impl LocalAssignment {
     /// that is newer than its record, which the next load counts as one more.
     pub(crate) fn swap(&self, base: &Observed, next: &AssignmentSnapshot) -> Result<bool> {
         // A hand edit landing after `base` was read.
-        #[cfg(test)]
-        if let Some(edit) = self.before_swap.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            edit();
-        }
+        sk1ll_core::failpoint!(DaemonStoreBeforeSwap, &self.file);
         if state::read_snapshot(&self.revisions)? != base.record {
             return Ok(false);
         }

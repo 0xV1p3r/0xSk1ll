@@ -740,12 +740,11 @@ async fn cgi(server: Arc<Server>, caller: Caller, path_info: String, req: Reques
             let stopped = child.kill().await.map_err(anyhow::Error::from);
             // Exercise the unconfirmed-cleanup path without leaking a real
             // backend or changing process-wide state in parallel tests.
-            #[cfg(test)]
             let stopped = stopped.and_then(|()| {
-                if server.fail_cleanup_confirmation.load(Ordering::SeqCst) {
-                    bail!("forced cleanup confirmation failure");
+                match sk1ll_core::failpoint_error!(ServerCleanupConfirmation, &server.config.repo_dir()) {
+                    Some(e) => Err(anyhow::Error::from(e).context("forced cleanup confirmation failure")),
+                    None => Ok(()),
                 }
-                Ok(())
             });
             if let Err(e) = stopped {
                 errors.abort();
@@ -842,7 +841,15 @@ mod tests {
         config.admin_token = Some("test".into());
         config.push_idle = Duration::from_millis(200);
         let server = Server::open(config).await.unwrap();
-        server.fail_cleanup_confirmation.store(true, Ordering::SeqCst);
+        let _unconfirmed = sk1ll_core::failpoints::install_shared({
+            let repo = server.config.repo_dir();
+            move |point, path| match point {
+                sk1ll_core::failpoints::Point::ServerCleanupConfirmation if path == repo => {
+                    sk1ll_core::failpoints::Action::Fail(std::io::ErrorKind::Other)
+                }
+                _ => sk1ll_core::failpoints::Action::Continue,
+            }
+        });
         let push_path = "/repo.git/git-receive-pack";
         let stalled = tokio::spawn({
             let server = server.clone();

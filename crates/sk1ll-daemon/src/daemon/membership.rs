@@ -168,15 +168,9 @@ impl Daemon {
     pub(crate) async fn rejoin(self: &Arc<Self>, reg: Registered, world: World) -> Result<Result<Joined>> {
         let stored = self
             .blocking(move |d, eng| {
-                #[cfg(test)]
-                let hook = eng.before_rejoin_persist.take();
-                #[cfg(not(test))]
                 let _ = eng;
                 let checked = d.halt_for_rejoin(world, || {
-                    #[cfg(test)]
-                    if let Some(hook) = hook {
-                        hook();
-                    }
+                    sk1ll_core::failpoint!(DaemonBeforeRejoinPersist, &d.cfg.machine_config);
                     reg.persist(&d.cfg)
                 })?;
                 Ok(match checked {

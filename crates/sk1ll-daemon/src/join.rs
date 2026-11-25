@@ -246,17 +246,6 @@ async fn register_inner(
     })
 }
 
-#[cfg(test)]
-type PersistHook = Box<dyn FnOnce() -> anyhow::Result<()>>;
-
-#[cfg(test)]
-thread_local! {
-    static BEFORE_CREDENTIALS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
-    /// Runs in [`Registered::persist`] between the snapshot and the
-    /// credentials: an error stands for the process stopping there.
-    static AFTER_SNAPSHOT: std::cell::RefCell<Option<PersistHook>> = Default::default();
-}
-
 impl Registered {
     #[cfg(test)]
     pub(crate) fn for_test(state: DaemonState, snapshot: AssignmentSnapshot) -> Self {
@@ -290,8 +279,9 @@ impl Registered {
     /// new credentials with the old registration's snapshot.
     pub(crate) fn persist(&self, cfg: &Config) -> anyhow::Result<()> {
         state::save_snapshot(&cfg.snapshot_path(), &self.snapshot, Some(&self.state.registration_key()))?;
-        #[cfg(test)]
-        AFTER_SNAPSHOT.with_borrow_mut(|hook| hook.take().map_or(Ok(()), |hook| hook()))?;
+        if let Some(e) = sk1ll_core::failpoint_error!(DaemonJoinAfterSnapshot, &cfg.state) {
+            return Err(e.into());
+        }
         self.state.save(&cfg.state)?;
         // The CLI's read-only commands read the cache; it is only a mirror.
         if let Err(e) = self.snapshot.assignment.save(&cfg.assignment) {
@@ -361,13 +351,8 @@ impl Registered {
             ActivationFile::stage(cfg.state.clone(), &self.state, false)?,
         ];
         for i in 0..files.len() {
-            #[cfg(test)]
             if i == files.len() - 1 {
-                BEFORE_CREDENTIALS.with_borrow_mut(|hook| {
-                    if let Some(hook) = hook.take() {
-                        hook();
-                    }
-                });
+                sk1ll_core::failpoint!(DaemonJoinBeforeCredentials, &cfg.state);
             }
             if let Err(error) = files[i].publish() {
                 let mut recovery = Vec::new();
@@ -611,16 +596,15 @@ mod tests {
         let state = cfg.state.clone();
         let snapshot = cfg.snapshot_path();
         let assignment = cfg.assignment.clone();
-        BEFORE_CREDENTIALS.with_borrow_mut(|hook| {
-            *hook = Some(Box::new(move || {
+        let _hook =
+            sk1ll_core::failpoints::once(sk1ll_core::failpoints::Point::DaemonJoinBeforeCredentials, move |_| {
                 let snap: AssignmentSnapshot = serde_json::from_slice(&std::fs::read(snapshot).unwrap()).unwrap();
                 assert_eq!(snap.revision, 42);
                 assert!(serde_json::from_slice::<sk1ll_core::Assignment>(&std::fs::read(assignment).unwrap()).is_ok());
                 assert!(!state.exists());
                 std::fs::create_dir(&state).unwrap();
                 std::fs::write(state.join("notes"), "private").unwrap();
-            }))
-        });
+            });
         assert!(reg.persist_standalone(&cfg).is_err());
         assert_eq!(std::fs::read(cfg.snapshot_path()).unwrap(), b"original snapshot");
         assert_eq!(std::fs::read(&cfg.assignment).unwrap(), b"original local assignment");
@@ -647,8 +631,12 @@ mod tests {
         let mut reg = registration(tmp.path());
         reg.state.token = "new".into();
         reg.snapshot = AssignmentSnapshot { revision: 7, ..Default::default() };
-        AFTER_SNAPSHOT.with_borrow_mut(|hook| *hook = Some(Box::new(|| anyhow::bail!("the process stopped"))));
+        let stop = sk1ll_core::failpoints::fail_once(
+            sk1ll_core::failpoints::Point::DaemonJoinAfterSnapshot,
+            std::io::ErrorKind::Other,
+        );
         assert!(reg.persist(&cfg).is_err());
+        drop(stop);
         let stored = DaemonState::load(&cfg.state).unwrap().unwrap();
         assert_eq!(stored.token, "old", "the old credentials are still there");
         let snapshot = state::load_snapshot(&cfg.snapshot_path(), Some(&stored.registration_key())).unwrap();

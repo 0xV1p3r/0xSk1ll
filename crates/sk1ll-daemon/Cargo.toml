@@ -11,6 +11,11 @@ publish.workspace = true
 name = "sk1ll-daemon"
 path = "src/main.rs"
 
+[features]
+# Fault injection for integration tests: sk1ll-core's `failpoints`, with the
+# daemon's own points (`sk1ll_core::failpoints::Point::Daemon*`).
+failpoints = ["sk1ll-core/failpoints"]
+
 [dependencies]
 sk1ll-core.workspace = true
 sk1ll-proto = { path = "../sk1ll-proto" }
@@ -38,4 +43,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+sk1ll-core = { workspace = true, features = ["failpoints"] }
 sk1ll-server = { path = "../sk1ll-server" }

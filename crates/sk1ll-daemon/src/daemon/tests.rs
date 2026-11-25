@@ -232,10 +232,14 @@ async fn reviewed_sync_reports_partial_progress_and_stops_on_digest_mismatch() {
     let client = Client::new(&cfg.socket);
     let listener = tokio::net::UnixListener::bind(&cfg.socket).unwrap();
     let daemon = Daemon::standalone(cfg).unwrap();
-    lock(&daemon.engine).after_sync_review = Some(Box::new(move || {
-        std::fs::remove_dir_all(failing_source).unwrap();
-        std::fs::write(source, "changed after the fingerprint matched").unwrap();
-    }));
+    let _hook = sk1ll_core::failpoints::once_shared(
+        sk1ll_core::failpoints::Point::DaemonAfterSyncReview,
+        &daemon.cfg.machine_config,
+        move |_| {
+            std::fs::remove_dir_all(failing_source).unwrap();
+            std::fs::write(source, "changed after the fingerprint matched").unwrap();
+        },
+    );
     let mut events = daemon.subscribe_events();
     let served = daemon.clone();
     let server = tokio::spawn(async move {
@@ -976,14 +980,18 @@ async fn a_rejoin_checks_and_halts_in_one_step() {
     let reg = crate::join::Registered::for_test(next, AssignmentSnapshot { revision: 9, ..Default::default() });
     let session = d.clone();
     let (tx, connected) = std::sync::mpsc::channel();
-    lock(&d.engine).before_rejoin_persist = Some(Box::new(move || {
-        std::thread::spawn(move || {
-            session.set_link(Link::Connected);
-            let _ = tx.send(());
-        });
-        // Gives the session every chance to connect inside the window.
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }));
+    let _hook = sk1ll_core::failpoints::once_shared(
+        sk1ll_core::failpoints::Point::DaemonBeforeRejoinPersist,
+        &d.cfg.machine_config,
+        move |_| {
+            std::thread::spawn(move || {
+                session.set_link(Link::Connected);
+                let _ = tx.send(());
+            });
+            // Gives the session every chance to connect inside the window.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        },
+    );
     d.rejoin(reg, world).await.unwrap().ok();
     connected.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
     assert!(d.lifecycle().halted());
@@ -1478,11 +1486,12 @@ async fn a_toggle_racing_a_hand_edit_keeps_both() {
     let base = d.applied().unwrap().revision;
     let file = d.cfg.assignment.clone();
     let edit = file.clone();
-    *d.store.local().unwrap().before_swap.lock().unwrap() = Some(Box::new(move || {
-        let mut hand = sk1ll_core::Assignment::load(&edit).unwrap();
-        hand.set_harness("g", false);
-        hand.save(&edit).unwrap();
-    }));
+    let _hook =
+        sk1ll_core::failpoints::once_shared(sk1ll_core::failpoints::Point::DaemonStoreBeforeSwap, &file, move |_| {
+            let mut hand = sk1ll_core::Assignment::load(&edit).unwrap();
+            hand.set_harness("g", false);
+            hand.save(&edit).unwrap();
+        });
     let update = d.write_assignment(harness_toggle(false)).await.unwrap();
     let saved = sk1ll_core::Assignment::load(&file).unwrap();
     assert!(!saved.harness("h").new_skills_default, "the toggle is saved");
@@ -1630,7 +1639,11 @@ async fn taking_up_a_hand_edit_never_replaces_a_newer_one() {
     let base = d.applied().unwrap().revision;
     let file = d.cfg.assignment.clone();
     hand_edit(&file, "h")();
-    *d.store.local().unwrap().before_swap.lock().unwrap() = Some(Box::new(hand_edit(&file, "g")));
+    let edit = hand_edit(&file, "g");
+    let _hook =
+        sk1ll_core::failpoints::once_shared(sk1ll_core::failpoints::Point::DaemonStoreBeforeSwap, &file, move |_| {
+            edit()
+        });
     d.blocking(|d, _| d.refresh_assignment()).await.unwrap();
     let saved = sk1ll_core::Assignment::load(&file).unwrap();
     assert!(!saved.harness("h").new_skills_default && !saved.harness("g").new_skills_default, "both edits kept");
@@ -1660,7 +1673,12 @@ async fn a_starting_daemon_writes_back_nothing_it_loaded() {
     drop(d);
 
     hand_edit(&cfg.assignment, "h")();
-    crate::store::BEFORE_FIRST_SWAP.set(Some(Box::new(hand_edit(&cfg.assignment, "g"))));
+    let edit = hand_edit(&cfg.assignment, "g");
+    let _hook = sk1ll_core::failpoints::once_shared(
+        sk1ll_core::failpoints::Point::DaemonStoreBeforeSwap,
+        &cfg.assignment,
+        move |_| edit(),
+    );
     let d = Daemon::standalone(cfg.clone()).unwrap();
     let saved = sk1ll_core::Assignment::load(&cfg.assignment).unwrap();
     assert!(!saved.harness("h").new_skills_default && !saved.harness("g").new_skills_default, "both edits kept");
@@ -1770,10 +1788,14 @@ async fn take_out_reports_what_it_did_when_machine_toml_changed_meanwhile() {
     let dir = tempfile::tempdir().unwrap();
     let (d, skills, request) = placed_in_h(dir.path()).await;
     let config = d.cfg.machine_config.clone();
-    lock(&d.engine).before_take_out_apply = Some(Box::new(move || {
-        let text = std::fs::read_to_string(&config).unwrap();
-        std::fs::write(&config, format!("{text}\n# edited by hand\n")).unwrap();
-    }));
+    let _hook = sk1ll_core::failpoints::once_shared(
+        sk1ll_core::failpoints::Point::DaemonBeforeTakeOutApply,
+        &config.clone(),
+        move |_| {
+            let text = std::fs::read_to_string(&config).unwrap();
+            std::fs::write(&config, format!("{text}\n# edited by hand\n")).unwrap();
+        },
+    );
     let done = d.take_out_harness(request).await.unwrap();
     assert!(!done.applied && done.left.is_empty(), "{done:?}");
     assert_eq!(done.taken_out.len(), 1);
@@ -1794,16 +1816,28 @@ async fn harness_changes_wait_for_a_take_out() {
     let dir = tempfile::tempdir().unwrap();
     let (d, _, request) = placed_in_h(dir.path()).await;
     let (entered_tx, entered) = tokio::sync::oneshot::channel();
-    let (proceed, proceed_rx) = tokio::sync::oneshot::channel();
-    *lock(&d.take_out_entered) = Some(entered_tx);
-    *lock(&d.take_out_proceed) = Some(proceed_rx);
+    let (proceed, proceed_rx) = std::sync::mpsc::channel::<()>();
+    let _entered = sk1ll_core::failpoints::once_shared(
+        sk1ll_core::failpoints::Point::DaemonTakeOutEntered,
+        &d.cfg.machine_config,
+        move |_| {
+            let _ = entered_tx.send(());
+            let _ = proceed_rx.recv();
+        },
+    );
     let taking_out = tokio::spawn({
         let (d, request) = (d.clone(), request.clone());
         async move { d.take_out_harness(request).await }
     });
     entered.await.unwrap();
     let (applied_tx, applied) = std::sync::mpsc::channel();
-    *lock(&d.apply_entered) = Some(applied_tx);
+    let _applied = sk1ll_core::failpoints::once_shared(
+        sk1ll_core::failpoints::Point::DaemonApplyEntered,
+        &d.cfg.machine_config,
+        move |_| {
+            let _ = applied_tx.send(());
+        },
+    );
     let mut applying = std::pin::pin!(d.apply_harness_serialized(request));
     tokio::select! {
         biased;
@@ -1826,7 +1860,11 @@ async fn take_out_writes_only_from_a_complete_scan_of_its_own() {
     let (d, skills, request) = placed_in_h(dir.path()).await;
     // Another skill is placed, then its index entry made unreadable, after the last check.
     let index = skills.join(".sk1ll-state/index.json");
-    lock(&d.engine).before_take_out_write = Some(Box::new(move || std::fs::write(&index, "not an index").unwrap()));
+    let _hook = sk1ll_core::failpoints::once_shared(
+        sk1ll_core::failpoints::Point::DaemonBeforeTakeOutWrite,
+        &d.cfg.machine_config,
+        move |_| std::fs::write(&index, "not an index").unwrap(),
+    );
     let done = d.take_out_harness(request).await.unwrap();
     assert!(!done.applied, "{done:?}");
     assert!(done.errors.iter().any(|e| e.contains("machine.toml was not changed")), "{done:?}");
@@ -1845,12 +1883,16 @@ async fn take_out_reports_what_it_did_when_the_harness_went_meanwhile() {
     let dir = tempfile::tempdir().unwrap();
     let (d, _, request) = placed_in_h(dir.path()).await;
     let config = d.cfg.machine_config.clone();
-    lock(&d.engine).before_take_out_apply = Some(Box::new(move || {
-        let text = std::fs::read_to_string(&config).unwrap();
-        let start = text.find("[harnesses.h]").unwrap();
-        let end = text[start + 1..].find("\n[").map_or(text.len(), |i| start + 1 + i + 1);
-        std::fs::write(&config, format!("{}{}", &text[..start], &text[end..])).unwrap();
-    }));
+    let _hook = sk1ll_core::failpoints::once_shared(
+        sk1ll_core::failpoints::Point::DaemonBeforeTakeOutApply,
+        &config.clone(),
+        move |_| {
+            let text = std::fs::read_to_string(&config).unwrap();
+            let start = text.find("[harnesses.h]").unwrap();
+            let end = text[start + 1..].find("\n[").map_or(text.len(), |i| start + 1 + i + 1);
+            std::fs::write(&config, format!("{}{}", &text[..start], &text[end..])).unwrap();
+        },
+    );
     let done = d.take_out_harness(request).await.unwrap();
     assert!(!done.applied, "{done:?}");
     assert_eq!(
@@ -1870,10 +1912,14 @@ async fn take_out_reports_a_harness_turned_off_by_hand_meanwhile() {
     let dir = tempfile::tempdir().unwrap();
     let (d, _, request) = placed_in_h(dir.path()).await;
     let config = d.cfg.machine_config.clone();
-    lock(&d.engine).before_take_out_apply = Some(Box::new(move || {
-        let text = std::fs::read_to_string(&config).unwrap();
-        std::fs::write(&config, text.replace("[harnesses.h]\n", "[harnesses.h]\nenabled = false\n")).unwrap();
-    }));
+    let _hook = sk1ll_core::failpoints::once_shared(
+        sk1ll_core::failpoints::Point::DaemonBeforeTakeOutApply,
+        &config.clone(),
+        move |_| {
+            let text = std::fs::read_to_string(&config).unwrap();
+            std::fs::write(&config, text.replace("[harnesses.h]\n", "[harnesses.h]\nenabled = false\n")).unwrap();
+        },
+    );
     let done = d.take_out_harness(request).await.unwrap();
     assert!(!done.applied, "{done:?}");
     assert_eq!(
