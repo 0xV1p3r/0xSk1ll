@@ -585,9 +585,3 @@ fn unkept_error(what: &str, unkept: &[Unkept]) -> Error {
 fn names(items: &[ItemRef]) -> String {
     items.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
 }
-
-/// Whether a run left its journal, for tests.
-#[cfg(test)]
-pub(super) fn journal_exists(repo: &Repo) -> bool {
-    Journal::path(repo).is_ok_and(|path| path.exists())
-}
