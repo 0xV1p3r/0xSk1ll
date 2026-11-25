@@ -11,6 +11,8 @@ pub mod config_file;
 pub mod content;
 pub mod draft;
 pub mod engine;
+#[cfg(any(test, feature = "failpoints"))]
+pub mod failpoints;
 pub mod git;
 pub mod harness_change;
 pub mod harness_rename;
@@ -31,6 +33,52 @@ pub mod source;
 pub mod sync;
 
 use std::path::{Path, PathBuf};
+
+/// Reaches a [`failpoints::Point`] (by its variant name) about `path`. A
+/// statement; compiles to nothing without the `failpoints` feature.
+#[cfg(any(test, feature = "failpoints"))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! failpoint {
+    ($point:ident, $path:expr) => {{
+        let _ = $crate::failpoints::hit($crate::failpoints::Point::$point, $path);
+    }};
+}
+
+#[cfg(not(any(test, feature = "failpoints")))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! failpoint {
+    ($point:ident, $path:expr) => {{
+        if false {
+            let _ = $path;
+        }
+    }};
+}
+
+/// Reaches a [`failpoints::Point`] that [can fail](failpoints::Point::can_fail):
+/// the `std::io::Error` a test injects there, if any. Always `None` without
+/// the `failpoints` feature.
+#[cfg(any(test, feature = "failpoints"))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! failpoint_error {
+    ($point:ident, $path:expr) => {
+        $crate::failpoints::hit($crate::failpoints::Point::$point, $path)
+    };
+}
+
+#[cfg(not(any(test, feature = "failpoints")))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! failpoint_error {
+    ($point:ident, $path:expr) => {{
+        if false {
+            let _ = $path;
+        }
+        None::<::std::io::Error>
+    }};
+}
 
 /// This build's version and commit, e.g. `0.1.0 (1a2b3c4d5e)`.
 pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("SK1LL_COMMIT"), ")");

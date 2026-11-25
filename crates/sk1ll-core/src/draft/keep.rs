@@ -128,30 +128,6 @@ pub(super) enum Event {
     Published(PathBuf),
 }
 
-/// Where a test can stop a run, as a crash would.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Step {
-    /// The journal is written; the restore is next.
-    Restore,
-    /// Inside the restore: this file's recovery entry is journaled, and the
-    /// file has yet to move into it.
-    Recorded(PathBuf),
-    /// Inside the restore: this path's staging is journaled as the
-    /// operation's own, and its index entry is reset next.
-    Owned(PathBuf),
-    /// Inside the restore: this file is in recovery, and the Baseline's
-    /// version of it (if any) is not in place yet.
-    Moved(PathBuf),
-    /// Inside the restore: a Baseline file is staged, not published yet.
-    Staged,
-    /// Inside the restore: the Baseline's file is in at this path.
-    Published(PathBuf),
-    /// The kept files are in recovery; the pull is next.
-    Pull,
-    /// The pull went through; the kept files go back next.
-    Settle,
-}
-
 struct Journal {
     path: PathBuf,
     phase: Phase,
@@ -227,19 +203,14 @@ impl Journal {
     }
 }
 
-/// See [`Repo::pull_keeping`]; `step` is called at each [`Step`].
+/// See [`Repo::pull_keeping`].
 ///
 /// A Blocked pull names only the clashes it found first: Draft changes,
 /// then (once those are out of the way) unpushed commits it turns back into
 /// Draft. So each Blocked outcome whose items `keep` covers is restored in
 /// turn, into the same journal, and the pull tried again; one with an item
 /// `keep` doesn't cover puts everything back and stays Blocked on all of them.
-pub(super) fn run(
-    repo: &Repo,
-    lock: &crate::EngineLock,
-    keep: &Keep,
-    step: &mut dyn FnMut(Step) -> Result<()>,
-) -> Result<KeptPull> {
+pub(super) fn run(repo: &Repo, lock: &crate::EngineLock, keep: &Keep) -> Result<KeptPull> {
     // An earlier run's journal becomes its report, which stays until acted on.
     finish(repo)?;
     // What can clash: the Draft, and what unpushed commits change (a pull
@@ -269,7 +240,7 @@ pub(super) fn run(
         if let Some(journal) = &mut journal {
             journal.phase = Phase::Pulling;
             journal.save()?;
-            step(Step::Pull)?;
+            crate::failpoint!(KeepPull, repo.root());
         }
         let pulled = repo.pull_fetched(lock);
         let pending = repo.pull_pending()?;
@@ -287,35 +258,44 @@ pub(super) fn run(
                         None => {
                             let started = Journal::new(repo)?;
                             started.save()?;
-                            step(Step::Restore)?;
+                            crate::failpoint!(KeepRestore, repo.root());
                             journal.insert(started)
                         }
                     };
                     journal.phase = Phase::Restoring;
                     journal.save()?;
                     let set: BTreeSet<ItemRef> = items.iter().cloned().collect();
-                    // A step's error stops the run right there, as a crash would.
-                    let (mut stopped, mut moved) = (false, false);
+                    let mut moved = false;
                     let restored = repo.restore_recording(&items, &set, Some(&user_staged), &mut |event| match event {
                         Event::Staged(item, dest, entry) => {
                             journal.staged.push((item, dest.clone(), entry));
                             journal.save()?;
-                            step(Step::Owned(dest)).inspect_err(|_| stopped = true)
+                            crate::failpoint!(KeepOwned, &dest);
+                            Ok(())
                         }
                         Event::Kept(kept) => {
                             moved = true;
                             let dest = kept.dest.clone();
                             journal.kept.push(kept);
                             journal.save()?;
-                            step(Step::Recorded(dest)).inspect_err(|_| stopped = true)
+                            crate::failpoint!(KeepRecorded, &dest);
+                            Ok(())
                         }
-                        Event::Moved(path) => step(Step::Moved(path)).inspect_err(|_| stopped = true),
-                        Event::Placing => step(Step::Staged).inspect_err(|_| stopped = true),
-                        Event::Published(path) => step(Step::Published(path)).inspect_err(|_| stopped = true),
+                        Event::Moved(path) => {
+                            crate::failpoint!(KeepMoved, &path);
+                            Ok(())
+                        }
+                        Event::Placing => {
+                            crate::failpoint!(KeepStaged, repo.root());
+                            Ok(())
+                        }
+                        Event::Published(path) => {
+                            crate::failpoint!(KeepPublished, &path);
+                            Ok(())
+                        }
                     });
                     match restored {
                         Ok(_) => {}
-                        Err(e) if stopped => return Err(e),
                         // Refused before this round moved anything: the run puts back what earlier rounds kept.
                         Err(e) if !moved => {
                             return Err(rolled_back(repo, &format!("can't keep {}: {e}", names(&items))));
@@ -357,7 +337,7 @@ pub(super) fn run(
     let Some(mut journal) = journal else { return Ok(KeptPull { outcome, kept: Vec::new() }) };
     journal.phase = Phase::Settling;
     journal.save()?;
-    step(Step::Settle)?;
+    crate::failpoint!(KeepSettle, repo.root());
     let unkept = settle(repo, &journal)?;
     if !unkept.is_empty() {
         return Err(unkept_error("pulled onto the new baseline", &unkept));

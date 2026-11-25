@@ -352,16 +352,14 @@ impl Snapshot {
         set_mode(&file, mode).at(&self.target)?;
         file.sync_all().at(&self.target)?;
         drop(file);
-        #[cfg(test)]
-        hook(Point::BeforeCheck);
+        crate::failpoint!(ConfigBeforeCheck, &self.path);
         // Still the same link to the same target, and that still exactly the file read.
         if resolve(&self.path).ok() != Some((self.linked, self.target.clone()))
             || !read(&self.target).is_ok_and(|seen| seen == self.seen)
         {
             return Err(self.changed());
         }
-        #[cfg(test)]
-        hook(Point::BeforePublish);
+        crate::failpoint!(ConfigBeforePublish, &self.path);
         match &self.seen {
             Some(_) => staged.replace(),
             None if staged.place_new()? => Ok(()),
@@ -411,53 +409,22 @@ fn read(path: &Path) -> Result<Option<Seen>> {
     Ok(Some(Seen { id, mode, owner, bytes }))
 }
 
-/// Where a test runs its hook in [`Snapshot::replace`].
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Point {
-    /// The new text is staged; the last check is next.
-    BeforeCheck,
-    /// Right before the new text is renamed in, after the last check.
-    BeforePublish,
-}
-
-#[cfg(test)]
-type HookFn = Box<dyn Fn(Point)>;
-
-#[cfg(test)]
-thread_local! {
-    static HOOK: std::cell::RefCell<Option<HookFn>> = const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-fn hook(point: Point) {
-    HOOK.with(|h| {
-        if let Some(h) = h.borrow().as_ref() {
-            h(point);
-        }
-    });
-}
-
-/// Runs `f` with `hook` set at `point`.
-#[cfg(test)]
-fn with_hook<T>(point: Point, hook: impl Fn() + 'static, f: impl FnOnce() -> T) -> T {
-    HOOK.with(|h| {
-        *h.borrow_mut() = Some(Box::new(move |p| {
-            if p == point {
-                hook()
-            }
-        }))
-    });
-    let out = f();
-    HOOK.with(|h| *h.borrow_mut() = None);
-    out
-}
-
 #[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+    use crate::failpoints::Point;
+
+    /// Runs `f` with `hook` set at `point`.
+    fn with_hook<T>(point: Point, hook: impl Fn() + 'static, f: impl FnOnce() -> T) -> T {
+        let _hook = crate::failpoints::observe(move |p, _| {
+            if p == point {
+                hook()
+            }
+        });
+        f()
+    }
 
     fn names(dir: &Path) -> Vec<String> {
         let mut names: Vec<_> =
@@ -492,7 +459,7 @@ mod tests {
         let link = path.clone();
         let newer = second.clone();
         let result = with_hook(
-            Point::BeforeCheck,
+            Point::ConfigBeforeCheck,
             move || {
                 fs::remove_file(&link).unwrap();
                 symlink(&newer, &link).unwrap();
@@ -590,8 +557,11 @@ mod tests {
         let missing = tmp.path().join("new.toml");
         let snap = Snapshot::take(&missing).unwrap();
         let m = missing.clone();
-        let result =
-            with_hook(Point::BeforePublish, move || fs::write(&m, "theirs\n").unwrap(), || snap.replace("ours\n"));
+        let result = with_hook(
+            Point::ConfigBeforePublish,
+            move || fs::write(&m, "theirs\n").unwrap(),
+            || snap.replace("ours\n"),
+        );
         assert!(matches!(result, Err(Error::Changed(_))), "{result:?}");
         assert_eq!(fs::read_to_string(&missing).unwrap(), "theirs\n");
         assert_eq!(names(tmp.path()), ["machine.toml", "new.toml"]);

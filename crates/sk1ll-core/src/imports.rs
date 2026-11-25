@@ -675,7 +675,7 @@ mod tests {
     /// `skills/web/nested`, on `main` and a slashed branch `feature/x`.
     struct Source {
         tmp: tempfile::TempDir,
-        _cache: source::TestCache,
+        _cache: crate::failpoints::Guard,
     }
 
     impl Source {
@@ -1000,7 +1000,7 @@ mod tests {
     }
 
     fn smudge(command: &str) -> impl Drop + use<> {
-        crate::git::test_env(&[
+        crate::failpoints::git_env(&[
             ("GIT_CONFIG_COUNT", "2"),
             ("GIT_CONFIG_KEY_0", "filter.probe.smudge"),
             ("GIT_CONFIG_VALUE_0", command),
@@ -1161,8 +1161,10 @@ mod tests {
         fs::write(origin.join("skills/pdf/SKILL.md"), "---\ndescription: v2\n---\n").unwrap();
         commit_all(&origin);
 
-        source::FAIL_INSTALL.set(true);
+        let fail =
+            crate::failpoints::fail_once(crate::failpoints::Point::SourceInstall, std::io::ErrorKind::CrossesDevices);
         assert!(repo.update(Some("pdf"), false).is_err());
+        drop(fail);
         assert_eq!(fs::read_to_string(repo.imported_dir().join("pdf/SKILL.md")).unwrap(), before.0);
         assert_eq!(repo.lock.skills, before.1.skills);
         assert_eq!(Repo::open(repo.root()).unwrap().import_status().unwrap()[0].state, ImportState::Clean);
@@ -1266,11 +1268,17 @@ mod tests {
         fs::write(origin.join("skills/pdf/SKILL.md"), "---\ndescription: v2\n---\n").unwrap();
         commit_all(&origin);
 
-        source::FAIL_INSTALL.set(true);
-        source::FAIL_RESTORE.set(true);
+        let fail = (
+            crate::failpoints::fail_once(crate::failpoints::Point::SourceInstall, std::io::ErrorKind::CrossesDevices),
+            crate::failpoints::fail_once(crate::failpoints::Point::SourceRestore, std::io::ErrorKind::Other),
+        );
         let err = repo.update(Some("pdf"), false).unwrap_err().to_string();
+        drop(fail);
         let backup = repo.imported_dir().join(".sk1ll-stage-old-pdf");
-        assert!(err.contains(&backup.display().to_string()) && err.contains("injected restore failure"), "{err}");
+        assert!(
+            err.contains(&backup.display().to_string()) && err.contains("injected at failpoint SourceRestore"),
+            "{err}"
+        );
         assert!(!repo.imported_dir().join("pdf").exists() && backup.is_dir());
 
         assert_eq!(repo.recover_imports().unwrap(), ["pdf"]);

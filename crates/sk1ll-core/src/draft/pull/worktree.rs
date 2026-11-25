@@ -69,8 +69,8 @@ mod unix {
     use rustix::fs::{self as fd, AtFlags, CWD, FileType, Mode, OFlags};
     use rustix::io::Errno;
 
+    use super::super::Change;
     use super::super::journal::{Inode, Operation};
-    use super::super::{Before, Change, Hook};
     use super::{Content, Kind, Node, Outcome};
     use crate::placement::Directory;
     use crate::sync::displaced::{self, Displacing, Entry, PULL, leaf_fingerprint};
@@ -251,7 +251,6 @@ mod unix {
             path: &Path,
             node: &Node,
             operation: &Operation,
-            hook: Hook,
         ) -> Result<Outcome> {
             let dest = self.root.join(path);
             let (parent, name) = match self.dir.parent(path, matches!(operation, Operation::Add)) {
@@ -280,14 +279,14 @@ mod unix {
                     }
                     match operation {
                         Operation::Remove { .. } => {
-                            hook(Before::Remove)?;
+                            crate::failpoint!(PullRemove, &dest);
                             if !held.take_at(&parent, &name)? {
                                 return Ok(Outcome::Changed);
                             }
                             Ok(())
                         }
                         _ => {
-                            hook(Before::Swap)?;
+                            crate::failpoint!(PullSwap, &dest);
                             exchange(&slot, &parent, &name)
                         }
                     }
@@ -298,7 +297,7 @@ mod unix {
                 Err(Errno::NOENT | Errno::EXIST | Errno::NOTDIR | Errno::ISDIR) => return Ok(Outcome::Changed),
                 Err(e) => return Err(io::Error::from(e)).at(&dest),
             }
-            hook(Before::Published)?;
+            crate::failpoint!(PullPublished, &dest);
             self.completed(i, operation)?
                 .ok_or_else(|| Error::Invalid("pull's operation left no completion record".into()))
         }
@@ -453,9 +452,8 @@ mod unix {
     }
 
     fn exchange(staged: &Path, parent: &OwnedFd, name: &OsStr) -> std::result::Result<(), Errno> {
-        #[cfg(test)]
-        if NO_EXCHANGE.with(std::cell::Cell::get) {
-            return Err(Errno::OPNOTSUPP);
+        if let Some(e) = crate::failpoint_error!(PullExchange, staged) {
+            return Err(Errno::from_io_error(&e).unwrap_or(Errno::OPNOTSUPP));
         }
         #[cfg(any(target_os = "linux", target_os = "android"))]
         return fd::renameat_with(CWD, staged, parent, name, fd::RenameFlags::EXCHANGE);
@@ -474,11 +472,6 @@ mod unix {
             let _ = (staged, parent, name);
             Err(Errno::OPNOTSUPP)
         }
-    }
-
-    #[cfg(test)]
-    thread_local! {
-        pub(in crate::draft) static NO_EXCHANGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     fn fingerprint(node: &Node) -> String {
@@ -593,12 +586,9 @@ mod unix {
     }
 }
 
-#[cfg(all(test, unix))]
-pub(in crate::draft) use unix::NO_EXCHANGE;
-
 #[cfg(not(unix))]
 mod other {
-    use super::super::{Change, Hook, journal::Operation};
+    use super::super::{Change, journal::Operation};
     use super::{Content, Node, Outcome};
     use crate::sync::displaced::Entry;
     use crate::{Error, Result};
@@ -629,7 +619,7 @@ mod other {
         pub(in super::super) fn completed(&self, _: usize, _: &Operation) -> Result<Option<Outcome>> {
             unreachable!()
         }
-        pub(in super::super) fn apply(&self, _: usize, _: &Path, _: &Node, _: &Operation, _: Hook) -> Result<Outcome> {
+        pub(in super::super) fn apply(&self, _: usize, _: &Path, _: &Node, _: &Operation) -> Result<Outcome> {
             unreachable!()
         }
         pub(in super::super) fn adopt(&self, _: &Path, _: &Node, _: &Entry) -> Result<()> {

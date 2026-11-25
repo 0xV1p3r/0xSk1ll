@@ -462,8 +462,7 @@ fn plan_skills(
             }
             Existing::ManagedCopy(rec) => {
                 let changed = recorded.is_some_and(|entry| seen.edited(entry));
-                #[cfg(test)]
-                hook(Hook::PlanSource, &dest);
+                crate::failpoint!(PlanSource, &dest);
                 let want = sel.source_hash(skill)?;
                 if changed && !opts.force {
                     edited()
@@ -880,14 +879,12 @@ fn remove_created_block(
     let payload = Some(created.payload.as_str());
     let mut held =
         displaced::Displacing::begin(Some(repo), kind, harness, dest, Some(&created.written), payload, holder)?;
-    #[cfg(test)]
-    hook(Hook::BeforeSwap, dest);
+    crate::failpoint!(BeforeSwap, dest);
     if let Err(e) = held.take(dest) {
         held.abandon();
         return Err(e);
     }
-    #[cfg(test)]
-    hook(Hook::AfterAside, dest);
+    crate::failpoint!(AfterAside, dest);
     if !created.is(&held.content())? {
         held.put_back()?;
         return Err(changed_since_plan(dest));
@@ -983,8 +980,7 @@ fn apply_skill(repo: &Repo, action: &Action, adopted: bool, reviewed_digest: Opt
                 && expected_index.is_none()
                 && matches!(&existing, Existing::ManagedLink(to) if *to == canonical)
             {
-                #[cfg(test)]
-                hook(Hook::BeforeSwap, dest);
+                crate::failpoint!(BeforeSwap, dest);
                 if observe_skill(dest)?.state.as_deref() != expected
                     || !matches!(classify(repo.root(), dest, source, expected_index.as_ref())?,
                         Existing::ManagedLink(to) if to == canonical)
@@ -1007,8 +1003,7 @@ fn apply_skill(repo: &Repo, action: &Action, adopted: bool, reviewed_digest: Opt
                     Ok(IndexEntry::Link { hash, target: canonical, payload: hash_payload(&stage)? })
                 }
                 LinkMode::Copy => {
-                    #[cfg(test)]
-                    hook(Hook::BeforeCopy, src);
+                    crate::failpoint!(BeforeCopy, src);
                     refuse_source_marker(src)?;
                     copy_dir(src, &stage, source_exclusion(src))?;
                     refuse_source_marker(src)?;
@@ -1220,13 +1215,11 @@ fn swap_in(stage: Option<&Path>, dest: &Path, displace: Displace, intent: Option
         if let (Some(ownership), Some(intent)) = (displace.ownership, intent) {
             ownership.begin(intent.with_recovery(held.as_ref().map(|entry| entry.id().to_owned())))?;
         }
-        #[cfg(test)]
-        hook(Hook::BeforeSwap, dest);
+        crate::failpoint!(BeforeSwap, dest);
         if stage.is_some() && displaced::fingerprint(displace.kind, dest)?.as_deref() != displace.expected {
             return Err(changed_since_plan(dest));
         }
-        #[cfg(test)]
-        hook(Hook::AfterCheck, dest);
+        crate::failpoint!(AfterCheck, dest);
         displace.check_ownership()
     };
     if let Err(e) = setup() {
@@ -1236,8 +1229,7 @@ fn swap_in(stage: Option<&Path>, dest: &Path, displace: Displace, intent: Option
         return Err(e);
     }
     let backup = held.as_ref().map(displaced::Displacing::content);
-    #[cfg(test)]
-    if let Some(error) = backup.as_deref().and_then(displaced::forced_failure) {
+    if let Some(error) = backup.as_deref().and_then(|backup| crate::failpoint_error!(RecoveryRename, backup)) {
         if let Some(held) = held {
             held.abandon();
         }
@@ -1245,12 +1237,10 @@ fn swap_in(stage: Option<&Path>, dest: &Path, displace: Displace, intent: Option
     }
     let swapped = crate::placement::swap_managed(stage, dest, backup.as_deref(), || {
         if let Some(held) = &mut held {
-            #[cfg(test)]
-            hook(Hook::AfterRename, dest);
+            crate::failpoint!(AfterRename, dest);
             held.mark_moved(dest)?;
             let intact = held.intact();
-            #[cfg(test)]
-            hook(Hook::AfterAside, dest);
+            crate::failpoint!(AfterAside, dest);
             if !intact? {
                 return Err(changed_since_plan(dest));
             }
@@ -1273,8 +1263,7 @@ fn swap_in(stage: Option<&Path>, dest: &Path, displace: Displace, intent: Option
         }
         return Err(e);
     }
-    #[cfg(test)]
-    hook(Hook::AfterSwap, dest);
+    crate::failpoint!(AfterSwap, dest);
     held.map_or(Ok(None), |held| held.finish(displace.ownership.is_some()))
 }
 
@@ -1359,13 +1348,11 @@ fn replace_file_published(
         (Err(e), _) | (_, Err(e)) => return fail(e),
         _ => None,
     };
-    #[cfg(test)]
-    hook(Hook::BeforeSwap, path);
+    crate::failpoint!(BeforeSwap, path);
     if let Err(e) = unchanged() {
         return fail(e);
     }
-    #[cfg(test)]
-    hook(Hook::AfterCheck, path);
+    crate::failpoint!(AfterCheck, path);
     let Displace { repo, kind, harness, expected, .. } = displace;
     let mut held = match displaced::Displacing::begin(Some(repo), kind, harness, path, expected, None, holder) {
         Ok(held) => held,
@@ -1390,8 +1377,7 @@ fn replace_file_published(
             return fail(verdict.err().unwrap_or_else(|| changed_since_plan(path)));
         }
     };
-    #[cfg(test)]
-    hook(Hook::AfterAside, path);
+    crate::failpoint!(AfterAside, path);
     let swapped = displace.check_ownership().and_then(|()| match held {
         // The old file is held in recovery under a second name: replacing it loses nothing.
         Some(_) => fs::rename(&tmp, &real).at(&real),
@@ -1403,8 +1389,7 @@ fn replace_file_published(
         }
         return fail(e);
     }
-    #[cfg(test)]
-    hook(Hook::AfterSwap, path);
+    crate::failpoint!(AfterSwap, path);
     let Some(held) = held else { return Ok((None, published)) };
     let displaced = match old {
         OldCopy::Keep => held.finish(false),
@@ -2949,8 +2934,7 @@ pub mod displaced {
                     if protected(&id, &meta) || differs(&meta, &path)? {
                         total += size;
                     } else if old(meta.displaced_at) {
-                        #[cfg(test)]
-                        hook(Hook::BeforePrune, &path);
+                        crate::failpoint!(BeforePrune, &path);
                         let Some((meta, path)) = load(&dir)? else { continue };
                         if protected(&id, &meta) || differs(&meta, &path)? || !retire(&root, &id, &dir, &meta)? {
                             total += size;
@@ -2992,8 +2976,7 @@ pub mod displaced {
             if total <= max {
                 break;
             }
-            #[cfg(test)]
-            hook(Hook::BeforePrune, &dir.join(CONTENT));
+            crate::failpoint!(BeforePrune, &dir.join(CONTENT));
             let Some((meta, path)) = load(&dir)? else { continue };
             if protected(&id, &meta) || differs(&meta, &path)? || !retire(&root, &id, &dir, &meta)? {
                 continue;
@@ -3629,38 +3612,23 @@ pub mod displaced {
     }
 
     fn rename(from: &Path, to: &Path) -> std::io::Result<()> {
-        #[cfg(test)]
-        if let Some(e) = forced_failure(to) {
+        if let Some(e) = crate::failpoint_error!(RecoveryRename, to) {
             return Err(e);
         }
         fs::rename(from, to)
     }
 
     fn hard_link(from: &Path, to: &Path) -> std::io::Result<()> {
-        #[cfg(test)]
-        if let Some(e) = forced_failure(to) {
+        if let Some(e) = crate::failpoint_error!(RecoveryLink, to) {
             return Err(e);
         }
         fs::hard_link(from, to)
-    }
-
-    /// The failure a test asked for: everything across filesystems, or
-    /// just what goes into the state directory.
-    #[cfg(test)]
-    pub(super) fn forced_failure(to: &Path) -> Option<std::io::Error> {
-        let elsewhere = STATE_ON_OTHER_FS.get() && root().is_ok_and(|root| to.starts_with(root));
-        (FORCE_EXDEV.get() || elsewhere).then(|| std::io::ErrorKind::CrossesDevices.into())
     }
 
     #[cfg(test)]
     thread_local! {
         static DEFAULT_TEST_ROOT: tempfile::TempDir = tempfile::tempdir().expect("test recovery root");
         static TEST_ROOT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
-        /// Acts as if the state directory were on another filesystem than the harnesses.
-        pub(super) static STATE_ON_OTHER_FS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-        /// Acts as if every move or link into an entry crossed filesystems,
-        /// which in-directory ones never should.
-        pub(super) static FORCE_EXDEV: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// Puts this test thread's recovery area at `root` until the guard drops.
@@ -3670,8 +3638,6 @@ pub mod displaced {
         impl Drop for Guard {
             fn drop(&mut self) {
                 TEST_ROOT.with_borrow_mut(|r| *r = None);
-                STATE_ON_OTHER_FS.set(false);
-                FORCE_EXDEV.set(false);
             }
         }
         TEST_ROOT.with_borrow_mut(|r| *r = Some(root.to_path_buf()));
@@ -3691,49 +3657,6 @@ pub mod displaced {
             assert_eq!(parse_size("lots"), None);
             assert_eq!(parse_size("1X"), None);
         }
-    }
-}
-
-/// Points where a test can step in, to simulate a concurrent harness edit
-/// deterministically.
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Hook {
-    BeforeCopy,
-    CopyEntry,
-    /// While planning a skill, after observing the destination and before
-    /// hashing the source (the slow part with a large skill), or before
-    /// reusing the hash an earlier harness of the same plan took.
-    PlanSource,
-    /// While applying, right before the destination is replaced.
-    BeforeSwap,
-    /// While replacing a skill or file, after the last check of the
-    /// destination and before it is moved or linked into the recovery area.
-    AfterCheck,
-    /// After the content was moved (or a file hard-linked) into the
-    /// recovery area and checked there, before the replacement goes in.
-    AfterAside,
-    /// Right after the replacement went in (or the removal happened),
-    /// before the displaced content is checked one last time.
-    AfterSwap,
-    AfterRename,
-    BeforePrune,
-    IndexBeforeMove,
-}
-
-#[cfg(test)]
-type HookFn = Box<dyn FnMut(Hook, &Path)>;
-
-#[cfg(test)]
-thread_local! {
-    static HOOK: std::cell::RefCell<Option<HookFn>> = const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-fn hook(point: Hook, dest: &Path) {
-    if let Some(mut f) = HOOK.with_borrow_mut(Option::take) {
-        f(point, dest);
-        HOOK.with_borrow_mut(|h| *h = Some(f));
     }
 }
 
@@ -3885,8 +3808,7 @@ fn copy_dir(src: &Path, dest: &Path, exclude: Exclusion) -> Result<()> {
         let entry = entry.map_err(std::io::Error::from).at(src)?;
         let rel = entry.path().strip_prefix(src).unwrap_or(entry.path());
         let out = dest.join(rel);
-        #[cfg(test)]
-        hook(Hook::CopyEntry, entry.path());
+        crate::failpoint!(CopyEntry, entry.path());
         if entry.file_type().is_dir() {
             fs::create_dir_all(&out).at(&out)?;
         } else if entry.file_type().is_symlink() {
@@ -3919,6 +3841,7 @@ fn copy_entry(dest: &Path) -> IndexEntry {
 
 #[cfg(test)]
 mod tests {
+    use crate::failpoints::{self, Point};
     use std::time::Duration;
 
     use super::*;
@@ -4194,7 +4117,7 @@ mod tests {
     #[test]
     fn stale_index_entries_refuse_skill_and_rule_updates() {
         for case in ["skill update", "skill removal", "rule update", "rule removal"] {
-            for point in [None, Some(Hook::BeforeSwap), Some(Hook::AfterAside)] {
+            for point in [None, Some(Point::BeforeSwap), Some(Point::AfterAside)] {
                 let d = Displacement::new(case);
                 let _root = displaced::test_root(&d.tmp.path().join("recovery"));
                 let action = d.action();
@@ -4234,7 +4157,7 @@ mod tests {
     }
 
     /// Stop after the selected hook, before any caller can settle the intent.
-    fn interrupt(repo: &Repo, action: &Action, point: Hook) {
+    fn interrupt(repo: &Repo, action: &Action, point: Point) {
         let failure = std::panic::catch_unwind(|| {
             with_hook(point, |_| std::panic::panic_any("interrupted sync"), || apply(repo, action))
         })
@@ -4262,7 +4185,7 @@ mod tests {
             let actions = plan_now();
             assert_eq!(actions.len(), 1);
             assert_eq!(actions[0].kind, kind);
-            interrupt(&repo, &actions[0], Hook::AfterSwap);
+            interrupt(&repo, &actions[0], Point::AfterSwap);
             assert!(load_index(&dir).unwrap().pending.contains_key("pdf"));
             assert_eq!(fs::read_to_string(dest.join("SKILL.md")).unwrap(), text);
             let before = fs::read(dir.join(INDEX_PATH)).unwrap();
@@ -4288,14 +4211,14 @@ mod tests {
         let (_tmp, repo, harnesses, dir) = instructions_setup(InstructionsFormat::Rules);
         let assignment = Assignment::default();
         let plan_now = || plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
-        for point in [Hook::AfterSwap, Hook::BeforeSwap, Hook::AfterSwap] {
-            if point == Hook::BeforeSwap {
+        for point in [Point::AfterSwap, Point::BeforeSwap, Point::AfterSwap] {
+            if point == Point::BeforeSwap {
                 write(&repo.root().join("instructions/git.md"), "New rule.\n");
             }
             interrupt(&repo, &plan_now()[0], point);
             let index = load_index(&dir).unwrap();
             assert!(index.pending.contains_key("git.md"));
-            let expected = if point == Hook::BeforeSwap {
+            let expected = if point == Point::BeforeSwap {
                 assert!(dir.join(".sk1ll-state/staging/stage-git.md").exists());
                 assert_eq!(plan_now()[0].kind, ActionKind::Update);
                 index.entries["git.md"].clone()
@@ -4329,7 +4252,7 @@ mod tests {
                 let removal = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
                 assert_eq!(removal[0].kind, ActionKind::Remove);
                 if interrupted {
-                    interrupt(&repo, &removal[0], Hook::AfterSwap);
+                    interrupt(&repo, &removal[0], Point::AfterSwap);
                     assert!(matches!(
                         load_index(dir).unwrap().pending.get("pdf"),
                         Some(Intent::Remove { recovery: Some(_) })
@@ -4419,7 +4342,7 @@ mod tests {
             let mut assignment = Assignment::default();
             let initial = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
             if interrupted {
-                interrupt(&repo, &initial[0], Hook::AfterSwap);
+                interrupt(&repo, &initial[0], Point::AfterSwap);
             } else {
                 apply(&repo, &initial[0]).unwrap();
             }
@@ -4474,13 +4397,13 @@ mod tests {
             write(&edit, "Editor save.\n");
             fs::rename(&edit, dest).unwrap();
         };
-        for point in [Hook::AfterCheck, Hook::AfterAside] {
+        for point in [Point::AfterCheck, Point::AfterAside] {
             let d = Displacement::new("rule update");
             let _root = displaced::test_root(&d.tmp.path().join("recovery"));
             let action = d.action();
             let result = with_hook(point, save, || apply(&d.repo, &action));
             assert_eq!(fs::read_to_string(&d.dest).unwrap(), "Editor save.\n");
-            if point == Hook::AfterAside {
+            if point == Point::AfterAside {
                 let entry = reported(result);
                 assert_eq!(fs::read_to_string(entry.path).unwrap(), "Use CC.\n");
             } else {
@@ -4503,7 +4426,7 @@ mod tests {
             match case {
                 "queued write" => {
                     let removed = with_hook(
-                        Hook::BeforePrune,
+                        Point::BeforePrune,
                         move |_| open.write_all(b"Late edit.\n").unwrap(),
                         || displaced::prune_with(displaced::GRACE, 0),
                     )
@@ -4594,7 +4517,7 @@ mod tests {
             },
             || {
                 with_hook(
-                    Hook::BeforePrune,
+                    Point::BeforePrune,
                     move |_| at_deletion_check.set(true),
                     || displaced::prune_with(displaced::GRACE, 0),
                 )
@@ -4623,7 +4546,7 @@ mod tests {
             let _root = displaced::test_root(&dir.join("recovery"));
             let repo = Repo::open(dir.join("repo")).unwrap();
             let actions = plan(&repo, &harnesses(&dir), &Assignment::default(), PlanOptions::default()).unwrap();
-            with_hook(Hook::AfterRename, |_| std::process::exit(78), || apply(&repo, &actions[0])).unwrap();
+            with_hook(Point::AfterRename, |_| std::process::exit(78), || apply(&repo, &actions[0])).unwrap();
             panic!("the child reached the end of the swap");
         }
 
@@ -4685,7 +4608,7 @@ mod tests {
         let actions = plan(&d.repo, &d.harnesses, &d.assignment, PlanOptions { force: true }).unwrap();
         let stopped = std::panic::catch_unwind(|| {
             with_hook(
-                Hook::AfterAside,
+                Point::AfterAside,
                 |dest| {
                     write(&dest.join("SKILL.md"), "Newcomer.\n");
                     std::panic::panic_any("interrupted sync");
@@ -4721,7 +4644,7 @@ mod tests {
             let (resume, wait) = mpsc::channel();
             let first = threads.spawn(|| {
                 with_hook(
-                    Hook::BeforeSwap,
+                    Point::BeforeSwap,
                     move |_| {
                         staged.send(()).unwrap();
                         wait.recv().unwrap();
@@ -4763,7 +4686,7 @@ mod tests {
         let initial = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
         let dest = &initial[0].dest;
         let result = with_hook(
-            Hook::AfterSwap,
+            Point::AfterSwap,
             |dest| save_index(dest.parent().unwrap(), &Index::default()).unwrap(),
             || apply(&repo, &initial[0]),
         );
@@ -4803,7 +4726,7 @@ mod tests {
         );
         let edit = changed.clone();
         let result = with_hook(
-            Hook::BeforeSwap,
+            Point::BeforeSwap,
             move |dest| save_index(dest.parent().unwrap(), &edit).unwrap(),
             || apply(&repo, &actions[0]),
         );
@@ -4925,7 +4848,7 @@ mod tests {
 
     #[test]
     fn reviewed_copies_reject_source_edits_before_and_during_staging() {
-        for point in [Hook::BeforeCopy, Hook::CopyEntry] {
+        for point in [Point::BeforeCopy, Point::CopyEntry] {
             let (_tmp, repo, harnesses) = skill_setup(LinkMode::Copy);
             let src = repo.personal_dir().join("pdf");
             let file = src.join("SKILL.md");
@@ -4934,7 +4857,7 @@ mod tests {
             let digest = hash_dir(&src).unwrap();
             let error = with_hooks(
                 move |at, path| {
-                    if at == point && path == if point == Hook::BeforeCopy { &src } else { &file } {
+                    if at == point && path == if point == Point::BeforeCopy { &src } else { &file } {
                         write(&file, "Edited since review.\n");
                     }
                 },
@@ -4977,21 +4900,25 @@ mod tests {
         }
     }
 
-    /// Runs `f` with `edit` hooked in at `point`, once.
-    pub(super) fn with_hook<T>(point: Hook, edit: impl FnOnce(&Path) + 'static, f: impl FnOnce() -> T) -> T {
-        let mut edit = Some(edit);
-        HOOK.with_borrow_mut(|h| {
-            *h = Some(Box::new(move |at, dest| {
-                if at == point
-                    && let Some(edit) = edit.take()
+    /// Acts, while the guard lives, as if the recovery area were on another
+    /// file system than the harnesses.
+    fn state_on_other_fs(on: bool) -> Option<crate::failpoints::Guard> {
+        on.then(|| {
+            crate::failpoints::install(|point, to| match point {
+                Point::RecoveryRename | Point::RecoveryLink
+                    if displaced::root().is_ok_and(|root| to.starts_with(root)) =>
                 {
-                    edit(dest)
+                    failpoints::Action::Fail(std::io::ErrorKind::CrossesDevices)
                 }
-            }))
-        });
-        let out = f();
-        HOOK.with_borrow_mut(|h| *h = None);
-        out
+                _ => failpoints::Action::Continue,
+            })
+        })
+    }
+
+    /// Runs `f` with `edit` hooked in at `point`, once.
+    pub(super) fn with_hook<T>(point: Point, edit: impl FnOnce(&Path) + 'static, f: impl FnOnce() -> T) -> T {
+        let _hook = crate::failpoints::once(point, edit);
+        f()
     }
 
     #[test]
@@ -5011,16 +4938,14 @@ mod tests {
         // the second is judged against the same observation, not a newer one.
         let source = repo.personal_dir().join("pdf/SKILL.md");
         let mut calls = 0;
-        HOOK.with_borrow_mut(|h| {
-            *h = Some(Box::new(move |at, _| {
-                calls += usize::from(at == Hook::PlanSource);
-                if calls == 2 {
-                    write(&source, "Updated source.\n");
-                }
-            }))
+        let hook = crate::failpoints::observe(move |at, _| {
+            calls += usize::from(at == Point::PlanSource);
+            if calls == 2 {
+                write(&source, "Updated source.\n");
+            }
         });
         let actions = plan(&repo, &harnesses, &assignment, PlanOptions::default());
-        HOOK.with_borrow_mut(|h| *h = None);
+        drop(hook);
         assert!(actions.unwrap().is_empty());
         // The next plan sees the edit, for both harnesses.
         let actions = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
@@ -5032,16 +4957,14 @@ mod tests {
         // judged by `apply` against what the plan observed.
         let dest = tmp.path().join("skills2/pdf");
         let mut calls = 0;
-        HOOK.with_borrow_mut(|h| {
-            *h = Some(Box::new(move |at, dest| {
-                calls += usize::from(at == Hook::PlanSource);
-                if calls == 2 {
-                    write(&dest.join("SKILL.md"), "Late harness edit.\n");
-                }
-            }))
+        let hook = crate::failpoints::observe(move |at, dest| {
+            calls += usize::from(at == Point::PlanSource);
+            if calls == 2 {
+                write(&dest.join("SKILL.md"), "Late harness edit.\n");
+            }
         });
         let actions = plan(&repo, &harnesses, &assignment, PlanOptions::default());
-        HOOK.with_borrow_mut(|h| *h = None);
+        drop(hook);
         let actions = actions.unwrap();
         assert_eq!(actions.len(), 2);
         apply(&repo, &actions[0]).unwrap();
@@ -5058,7 +4981,7 @@ mod tests {
             write(&repo.personal_dir().join("pdf/SKILL.md"), "Updated source.\n");
             let dest = tmp.path().join("skills/pdf");
             let edit = |dest: &Path| write(&dest.join("SKILL.md"), "Edited while the source was hashed.\n");
-            let actions = with_hook(Hook::PlanSource, edit, || {
+            let actions = with_hook(Point::PlanSource, edit, || {
                 plan(&repo, &harnesses, &assignment, PlanOptions { force }).unwrap()
             });
             // Whatever the plan says, applying it must not lose the edit:
@@ -5075,11 +4998,11 @@ mod tests {
     #[test]
     fn harness_edit_while_applying_is_never_overwritten() {
         let cases = [
-            (Hook::BeforeSwap, LinkMode::Copy, false),
-            (Hook::BeforeSwap, LinkMode::Copy, true),
-            (Hook::BeforeSwap, LinkMode::Symlink, false),
-            (Hook::AfterCheck, LinkMode::Copy, false),
-            (Hook::AfterCheck, LinkMode::Symlink, false),
+            (Point::BeforeSwap, LinkMode::Copy, false),
+            (Point::BeforeSwap, LinkMode::Copy, true),
+            (Point::BeforeSwap, LinkMode::Symlink, false),
+            (Point::AfterCheck, LinkMode::Copy, false),
+            (Point::AfterCheck, LinkMode::Symlink, false),
         ];
         for (point, mode, remove) in cases {
             let (tmp, repo, mut harnesses) = skill_setup(LinkMode::Copy);
@@ -5145,7 +5068,7 @@ mod tests {
                     write(&file, &format!("{text}Late edit.\n"));
                 }
             };
-            let result = with_hook(Hook::BeforeSwap, late, || apply(&repo, &actions[0]));
+            let result = with_hook(Point::BeforeSwap, late, || apply(&repo, &actions[0]));
             assert!(result.is_err(), "{format:?}: {result:?}");
             assert!(fs::read_to_string(&file).unwrap().ends_with("Late edit.\n"), "{format:?}");
             let stray: Vec<_> = fs::read_dir(file.parent().unwrap())
@@ -5302,7 +5225,7 @@ mod tests {
                 fs::rename(&mine, &dest).unwrap();
             }
         };
-        assert!(with_hook(Hook::BeforeSwap, swap, || apply(&repo, &actions[0])).is_err());
+        assert!(with_hook(Point::BeforeSwap, swap, || apply(&repo, &actions[0])).is_err());
         assert!(dest.exists(), "put back");
         assert!(displaced::list().unwrap().is_empty(), "{:?}", displaced::list().unwrap());
     }
@@ -5322,7 +5245,7 @@ mod tests {
             let dest = dest.clone();
             move |_: &Path| write(&dest, "Late edit.\n")
         };
-        assert!(with_hook(Hook::BeforeSwap, late, || apply(&repo, &actions[0])).is_err());
+        assert!(with_hook(Point::BeforeSwap, late, || apply(&repo, &actions[0])).is_err());
         assert_eq!(fs::read_to_string(&dest).unwrap(), "Late edit.\n", "left where it was");
         assert!(displaced::created_block(&dest).unwrap().is_some(), "not forgotten: nothing was removed");
     }
@@ -6000,7 +5923,7 @@ mod tests {
         use std::io::Write;
         let formats = [(Rules, false), (Block, false), (Block, true)];
         for (format, linked) in formats {
-            for point in [Hook::AfterAside, Hook::AfterSwap] {
+            for point in [Point::AfterAside, Point::AfterSwap] {
                 for fallback in [false, true] {
                     let case = format!("{format:?} linked={linked} {point:?} state elsewhere={fallback}");
                     let (tmp, repo, harnesses, dest) = instructions_setup(format);
@@ -6017,8 +5940,8 @@ mod tests {
                     assert_eq!(actions[0].kind, ActionKind::Update, "{case}: {actions:?}");
                     let file = if format == InstructionsFormat::Rules { dest.join("git.md") } else { dest.clone() };
                     let real = fs::canonicalize(&file).unwrap();
-                    displaced::STATE_ON_OTHER_FS.set(fallback);
-                    let result = if point == Hook::AfterAside && format == Block {
+                    let _elsewhere = state_on_other_fs(fallback);
+                    let result = if point == Point::AfterAside && format == Block {
                         // A block swap still has the original at its live name.
                         let late = {
                             let file = file.clone();
@@ -6070,7 +5993,7 @@ mod tests {
     fn writers_with_open_skill_files_never_lose_edits() {
         use std::io::Write;
         for remove in [false, true] {
-            for point in [Hook::AfterAside, Hook::AfterSwap] {
+            for point in [Point::AfterAside, Point::AfterSwap] {
                 for fallback in [false, true] {
                     let case = format!("remove={remove} {point:?} state elsewhere={fallback}");
                     let (tmp, repo, harnesses) = skill_setup(LinkMode::Copy);
@@ -6090,7 +6013,7 @@ mod tests {
                     let actions = plan(&repo, &harnesses, &assignment, PlanOptions { force: true }).unwrap();
                     // Opened before sync starts; written after every check.
                     let mut open = fs::OpenOptions::new().append(true).open(dest.join("SKILL.md")).unwrap();
-                    displaced::STATE_ON_OTHER_FS.set(fallback);
+                    let _elsewhere = state_on_other_fs(fallback);
                     let late = move |_: &Path| open.write_all(b"Written through an open file.\n").unwrap();
                     let entry = reported(with_hook(point, late, || apply(&repo, &actions[0])));
                     let kept = fs::read_to_string(entry.path.join("SKILL.md")).unwrap();
@@ -6343,7 +6266,7 @@ mod tests {
                 let _root = displaced::test_root(&d.tmp.path().join("state/displaced"));
                 let action = d.action();
                 let mut open = fs::OpenOptions::new().append(true).open(&d.file).unwrap();
-                displaced::STATE_ON_OTHER_FS.set(state_elsewhere);
+                let _elsewhere = state_on_other_fs(state_elsewhere);
                 apply(&d.repo, &action).unwrap();
                 open.write_all(b"Written after sync returned.\n").unwrap();
                 drop(open);
@@ -6379,7 +6302,7 @@ mod tests {
             let actions = plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
             assert_eq!(actions[0].kind, ActionKind::Create, "{case}: {actions:?}");
             let newcomer = |dest: &Path| write(dest, "Newcomer.\n");
-            let result = with_hook(Hook::AfterCheck, newcomer, || apply(&repo, &actions[0]));
+            let result = with_hook(Point::AfterCheck, newcomer, || apply(&repo, &actions[0]));
             assert!(result.is_err(), "{case}: {result:?}");
             assert!(fs::symlink_metadata(&dest).unwrap().is_file(), "{case}");
             assert_eq!(fs::read_to_string(&dest).unwrap(), "Newcomer.\n", "{case}");
@@ -6393,11 +6316,9 @@ mod tests {
     }
 
     /// Runs `f` with `edit` hooked in at every point.
-    fn with_hooks<T>(edit: impl FnMut(Hook, &Path) + 'static, f: impl FnOnce() -> T) -> T {
-        HOOK.with_borrow_mut(|h| *h = Some(Box::new(edit)));
-        let out = f();
-        HOOK.with_borrow_mut(|h| *h = None);
-        out
+    fn with_hooks<T>(edit: impl FnMut(Point, &Path) + 'static, f: impl FnOnce() -> T) -> T {
+        let _hook = crate::failpoints::observe(edit);
+        f()
     }
 
     /// When a swap is called off, the displaced content only goes back if
@@ -6414,15 +6335,15 @@ mod tests {
             // A removal is called off by an edit made right before the content
             // is moved into recovery; the update fails on the newcomer itself.
             let mut open = fs::OpenOptions::new().append(true).open(&d.file).ok();
-            let hooks = move |point: Hook, dest: &Path| match point {
-                Hook::BeforeSwap if case.starts_with("link") => {
+            let hooks = move |point: Point, dest: &Path| match point {
+                Point::BeforeSwap if case.starts_with("link") => {
                     fs::remove_file(dest).unwrap();
                     std::os::unix::fs::symlink("/elsewhere", dest).unwrap();
                 }
-                Hook::BeforeSwap if case.ends_with("removal") => {
+                Point::BeforeSwap if case.ends_with("removal") => {
                     open.take().unwrap().write_all(b"Late edit.\n").unwrap()
                 }
-                Hook::AfterAside => write(dest, "Newcomer.\n"),
+                Point::AfterAside => write(dest, "Newcomer.\n"),
                 _ => {}
             };
             let entry = reported(with_hooks(hooks, || apply(&d.repo, &action)));
@@ -6453,7 +6374,7 @@ mod tests {
         let action = d.action();
         let mut open = fs::OpenOptions::new().append(true).open(&d.dest).unwrap();
         let late = move |_: &Path| open.write_all(b"Outside note.\n").unwrap();
-        let entry = reported(with_hook(Hook::AfterSwap, late, || apply(&d.repo, &action)));
+        let entry = reported(with_hook(Point::AfterSwap, late, || apply(&d.repo, &action)));
         let synced = fs::read_to_string(&d.dest).unwrap();
         let edited = synced.replace("Use CC always.", "Use CC always, edited by hand.");
         assert_ne!(edited, synced);
@@ -6518,7 +6439,14 @@ mod tests {
             let _root = displaced::test_root(&d.tmp.path().join("state/displaced"));
             let action = d.action();
             let (before, inode) = (fs::read(&d.file).unwrap(), fs::metadata(&d.file).unwrap().ino());
-            displaced::FORCE_EXDEV.set(true);
+            // Every move or link into an entry crosses file systems, which
+            // in-directory ones never should.
+            let _exdev = crate::failpoints::install(|point, _| match point {
+                Point::RecoveryRename | Point::RecoveryLink => {
+                    failpoints::Action::Fail(std::io::ErrorKind::CrossesDevices)
+                }
+                _ => failpoints::Action::Continue,
+            });
             let result = apply(&d.repo, &action);
             assert!(result.is_err(), "{case}: {result:?}");
             assert_eq!(fs::read(&d.file).unwrap(), before, "{case}");
@@ -6642,7 +6570,7 @@ mod tests {
     #[test]
     fn adopting_swaps_the_repo_version_into_recovery() {
         use std::io::Write;
-        for point in [None, Some(Hook::BeforeSwap), Some(Hook::AfterAside)] {
+        for point in [None, Some(Point::BeforeSwap), Some(Point::AfterAside)] {
             let (tmp, repo, harnesses) = skill_setup(LinkMode::Copy);
             let _root = displaced::test_root(&tmp.path().join("recovery"));
             let (dest, conflict) = adoptable(&tmp, &repo, &harnesses);
@@ -6660,7 +6588,7 @@ mod tests {
                 .collect();
             assert!(stages.is_empty(), "{point:?}: {stages:?}");
             match point {
-                Some(Hook::BeforeSwap) => {
+                Some(Point::BeforeSwap) => {
                     let expected = changed_since_plan(&repo.personal_dir().join("pdf"));
                     assert_eq!(result.unwrap_err().to_string(), expected.to_string());
                     assert_eq!(fs::read_to_string(&source).unwrap(), "PDFs.\nRepo edit.\n");
@@ -6685,7 +6613,7 @@ mod tests {
                     assert!(!repo.personal_dir().join(TMP_DIR).exists());
                 }
             }
-            if point != Some(Hook::BeforeSwap) {
+            if point != Some(Point::BeforeSwap) {
                 assert!(plan(&repo, &harnesses, &Assignment::default(), PlanOptions::default()).unwrap().is_empty());
                 assert_eq!(fs::read_to_string(dest.join("SKILL.md")).unwrap(), "Edited in the harness.\n");
             }
@@ -6700,7 +6628,7 @@ mod tests {
         let _root = displaced::test_root(&tmp.path().join("recovery"));
         let (dest, conflict) = adoptable(&tmp, &repo, &harnesses);
         let failure = std::panic::catch_unwind(|| {
-            with_hook(Hook::AfterRename, |_| std::panic::panic_any("interrupted adopt"), || adopt(&repo, &conflict))
+            with_hook(Point::AfterRename, |_| std::panic::panic_any("interrupted adopt"), || adopt(&repo, &conflict))
         })
         .expect_err("adopt reached the interruption point");
         assert_eq!(failure.downcast_ref::<&str>(), Some(&"interrupted adopt"));
@@ -6733,7 +6661,7 @@ mod tests {
             let before = fs::read_to_string(&rule).unwrap();
             let result = if edit_repo {
                 let at = rule.clone();
-                with_hook(Hook::BeforeSwap, move |_| write(&at, "Repo edit.\n"), || adopt(&repo, &conflict))
+                with_hook(Point::BeforeSwap, move |_| write(&at, "Repo edit.\n"), || adopt(&repo, &conflict))
             } else {
                 adopt(&repo, &conflict)
             };
@@ -6773,7 +6701,7 @@ mod tests {
 
         let at = dest.clone();
         let during =
-            with_hook(Hook::CopyEntry, move |_| write(&at.join("late.md"), "Late.\n"), || adopt(&repo, &conflict));
+            with_hook(Point::CopyEntry, move |_| write(&at.join("late.md"), "Late.\n"), || adopt(&repo, &conflict));
         assert!(matches!(during, Err(Error::Changed(_))), "{during:?}");
         assert_eq!(fs::read_to_string(source.join("SKILL.md")).unwrap(), "PDFs.\n");
         assert!(displaced::list().unwrap().is_empty());

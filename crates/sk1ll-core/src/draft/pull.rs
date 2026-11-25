@@ -46,49 +46,14 @@ use crate::{Error, IoExt, Repo, Result, machine};
 mod journal;
 mod worktree;
 
-#[cfg(all(test, unix))]
-pub(super) use worktree::NO_EXCHANGE;
-
 use journal::Journal;
 use worktree::{Content, Node, Outcome, Worktree};
 
-/// Where tests can step in during a pull.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Before {
-    /// Unpushed commits are replayed; the last checks against the draft are next.
-    Checks,
-    /// The branch moved back from unpushed commits that conflict; what the
-    /// un-commit staged is recorded next.
-    Uncommitted,
-    /// The last checks passed; the journal is written next.
-    Journal,
-    /// The journal is written; the `n`th path, in the order pull goes
-    /// through them, is next. `File(0)` comes before any file.
-    File(usize),
-    /// Inside a file's replacement: what was there is held in the recovery
-    /// area and checked, and the new content goes in next.
-    Swap,
-    /// Inside a removal, after checking the tracked leaf.
-    Remove,
-    /// A filesystem operation ran, before its completion is read.
-    Published,
-    /// Every path is done; the index is next.
-    Index,
-    /// The index is updated; the branch moves next.
-    UpdateRef,
-    /// The branch moved; the journal is removed next.
-    Done,
-}
-
-/// Called at each [`Before`]. An error stops the pull right there, as a
-/// crash would: whatever it changed stays, journal included.
-pub(super) type Hook<'a> = &'a mut dyn FnMut(Before) -> Result<()>;
-
 /// `fetch`: fetch [`REMOTE`] first. Without it, the pull moves onto the
 /// baseline fetched last (see [`fetch`]).
-pub(super) fn run(repo: &Repo, fetch: bool, hook: Hook) -> Result<PullOutcome> {
+pub(super) fn run(repo: &Repo, fetch: bool) -> Result<PullOutcome> {
     let _ = crate::sync::displaced::prune();
-    with_pull(repo, |pull| pull.run(fetch, hook))
+    with_pull(repo, |pull| pull.run(fetch))
 }
 
 /// Fetches every branch of [`REMOTE`] into `refs/remotes`, pruning the ones
@@ -99,14 +64,14 @@ pub(super) fn fetch(repo: &Repo) -> Result<()> {
 }
 
 /// Finishes a pull that stopped half-way, if there is one, without fetching.
-pub(super) fn finish(repo: &Repo, hook: Hook) -> Result<Option<PullOutcome>> {
+pub(super) fn finish(repo: &Repo) -> Result<Option<PullOutcome>> {
     if !pending(repo)? {
         return Ok(None);
     }
     let _ = crate::sync::displaced::prune();
     with_pull(repo, |pull| {
         let Some(mut journal) = Journal::load(pull)? else { return Ok(None) };
-        match pull.finish(&Worktree::open(&pull.root, &pull.git_dir)?, &mut journal, false, hook)? {
+        match pull.finish(&Worktree::open(&pull.root, &pull.git_dir)?, &mut journal, false)? {
             Finished::Blocked(items) => Ok(Some(PullOutcome::Blocked {
                 baseline: journal.baseline,
                 items: items.into_iter().collect(),
@@ -414,11 +379,11 @@ impl Pull<'_> {
     }
 
     /// Finishes a pull that stopped half-way first, then pulls.
-    fn run(&self, fetch: bool, hook: Hook) -> Result<PullOutcome> {
+    fn run(&self, fetch: bool) -> Result<PullOutcome> {
         let resumed = match Journal::load(self)? {
             Some(mut journal) => {
                 let baseline = journal.baseline.clone();
-                match self.finish(&Worktree::open(&self.root, &self.git_dir)?, &mut journal, false, hook)? {
+                match self.finish(&Worktree::open(&self.root, &self.git_dir)?, &mut journal, false)? {
                     Finished::Blocked(items) => {
                         return Ok(PullOutcome::Blocked {
                             baseline,
@@ -434,7 +399,7 @@ impl Pull<'_> {
                 None
             }
         };
-        let (outcome, displaced) = self.update(fetch, hook)?;
+        let (outcome, displaced) = self.update(fetch)?;
         let (outcome, displaced) = match resumed {
             None => (outcome, displaced),
             Some((from, earlier)) => {
@@ -453,7 +418,7 @@ impl Pull<'_> {
     }
 
     /// Fetches (if `fetch`) and moves onto the new baseline.
-    fn update(&self, fetch: bool, hook: Hook) -> Result<(PullOutcome, Option<Error>)> {
+    fn update(&self, fetch: bool) -> Result<(PullOutcome, Option<Error>)> {
         let branch = on_fleet_branch(self.git(), self.repo)?;
         // Submodules are refused, in HEAD or only in the index, before anything else.
         let head = rev(self.git(), "HEAD")?;
@@ -509,7 +474,7 @@ impl Pull<'_> {
         } else {
             let target = match self.replay(&head, &base, &remote)? {
                 Ok(tip) => tip,
-                Err(clash) => return self.uncommit(&branch, &head, clash, hook),
+                Err(clash) => return self.uncommit(&branch, &head, clash),
             };
             let (ours, changes) = (self.changes(&base, &target)?, self.changes(&head, &target)?);
             (target, ours, changes)
@@ -517,7 +482,7 @@ impl Pull<'_> {
 
         // The draft may have changed meanwhile; a replayed rename can also
         // bring an upstream change to a different path.
-        hook(Before::Checks)?;
+        crate::failpoint!(PullChecks, self.repo);
         on_fleet_branch(self.git(), self.repo)?;
         if rev(self.git(), "HEAD")?.as_deref() != Some(&head) {
             return Err(Error::Invalid("HEAD changed during pull; try again".into()));
@@ -551,9 +516,9 @@ impl Pull<'_> {
             operations: BTreeMap::new(),
         };
         self.attributes_from(&journal, &journal.old)?;
-        hook(Before::Journal)?;
+        crate::failpoint!(PullJournal, self.repo);
         journal.write(self)?;
-        match self.finish(&tree, &mut journal, true, hook)? {
+        match self.finish(&tree, &mut journal, true)? {
             Finished::Updated { to, displaced, .. } => Ok((PullOutcome::Updated { from: head, to }, displaced)),
             Finished::Blocked(items) => blocked(items),
         }
@@ -566,7 +531,7 @@ impl Pull<'_> {
     /// nothing is lost and `git status` shows those commits' changes (staged)
     /// with the Draft that was on top of them. The commits before it are
     /// replayed as usual.
-    fn uncommit(&self, branch: &str, head: &str, clash: Clash, hook: Hook) -> Result<(PullOutcome, Option<Error>)> {
+    fn uncommit(&self, branch: &str, head: &str, clash: Clash) -> Result<(PullOutcome, Option<Error>)> {
         let range = format!("{}..{head}", clash.parent);
         let log = self.git().args(["log", "--reverse", "--no-show-signature", "--format=%h %s", &range]).text()?;
         let commits: Vec<String> = log.lines().map(str::to_string).collect();
@@ -584,9 +549,9 @@ impl Pull<'_> {
             staged.0.insert(super::quote_path(&crate::git::path_bytes(&self.root.join(path))), index_fields(&out));
         }
         self.git().args(["update-ref", "--no-deref", "-m", message, &reference, &clash.parent, head]).run()?;
-        hook(Before::Uncommitted)?;
+        crate::failpoint!(PullUncommitted, self.repo);
         staged.save(&self.git_dir)?;
-        let (outcome, displaced) = self.update(false, hook)?;
+        let (outcome, displaced) = self.update(false)?;
         let outcome = match outcome {
             PullOutcome::Blocked { baseline, mut items, uncommitted } => {
                 items.extend(clash.items.iter().filter(|item| !items.contains(item)).cloned().collect::<Vec<_>>());
@@ -604,7 +569,7 @@ impl Pull<'_> {
     /// Never goes back: whatever stops it leaves the journal, for the next
     /// call to go on from there. Only a `fresh` journal that nothing was
     /// done for yet is removed again when a clash stops it.
-    fn finish(&self, tree: &Worktree, journal: &mut Journal, fresh: bool, hook: Hook) -> Result<Finished> {
+    fn finish(&self, tree: &Worktree, journal: &mut Journal, fresh: bool) -> Result<Finished> {
         let branch = format!("refs/heads/{}", journal.branch);
         self.require_attached(&branch, journal)?;
         match rev(self.git(), &branch)? {
@@ -636,14 +601,14 @@ impl Pull<'_> {
             Ok(Finished::Blocked(items))
         };
         let mut pruned = false;
-        for (n, i) in journal.order().into_iter().enumerate() {
+        for i in journal.order() {
             if !pruned && journal.changes[i].new.is_some() {
                 tree.prune(journal.changes.iter().filter(|c| c.new.is_none()).map(|c| c.path.as_path()));
                 pruned = true;
             }
-            hook(Before::File(n))?;
+            crate::failpoint!(PullFile, &self.root.join(&journal.changes[i].path));
             self.require_attached(&branch, journal)?;
-            match self.update_path(tree, &convert, journal, i, hook)? {
+            match self.update_path(tree, &convert, journal, i)? {
                 Outcome::Done(d) => {
                     wrote = true;
                     displaced = displaced.or(d);
@@ -660,7 +625,7 @@ impl Pull<'_> {
             tree.prune(journal.changes.iter().filter(|c| c.new.is_none()).map(|c| c.path.as_path()));
         }
 
-        hook(Before::Index)?;
+        crate::failpoint!(PullIndex, self.repo);
         // Two-way read-tree carries staged Draft entries through paths that
         // agree on both sides. Make those sides agree if a path was staged
         // since our initial check, including after a previous index update.
@@ -685,10 +650,10 @@ impl Pull<'_> {
         // files again; it changes no entry, so it may fail.
         let _ = self.git().args(["update-index", "-q", "--refresh"]).output();
 
-        hook(Before::UpdateRef)?;
+        crate::failpoint!(PullUpdateRef, self.repo);
         self.require_attached(&branch, journal)?;
         self.update_branch(&branch, &journal.target, &journal.old)?;
-        hook(Before::Done)?;
+        crate::failpoint!(PullDone, self.repo);
         journal.remove(self)?;
         tree.clear();
         let to = rev(self.git(), "HEAD")?.ok_or_else(|| Error::Invalid("HEAD is missing".into()))?;
@@ -733,14 +698,7 @@ impl Pull<'_> {
 
     /// Brings one path from the journal's `old` to its `target`, if it is
     /// still at `old`; `i` is its place in the journal.
-    fn update_path(
-        &self,
-        tree: &Worktree,
-        convert: &Convert,
-        journal: &mut Journal,
-        i: usize,
-        hook: Hook,
-    ) -> Result<Outcome> {
+    fn update_path(&self, tree: &Worktree, convert: &Convert, journal: &mut Journal, i: usize) -> Result<Outcome> {
         if let Some(operation) = journal.operations.get(&i)
             && let Some(outcome) = tree.completed(i, operation)?
         {
@@ -759,7 +717,7 @@ impl Pull<'_> {
             let operation = tree.prepare(i, &change.path, &node, content.as_ref(), keep_mode)?;
             journal.record(self, i, operation)?;
         }
-        tree.apply(i, &journal.changes[i].path, &node, &journal.operations[&i], hook)
+        tree.apply(i, &journal.changes[i].path, &node, &journal.operations[&i])
     }
 
     /// The exact leaf at `path`, without interpreting it as a Git pathspec.

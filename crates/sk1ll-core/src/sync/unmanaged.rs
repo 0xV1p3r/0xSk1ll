@@ -224,8 +224,7 @@ pub fn publish(repo: &Repo, adoption: &Adoption) -> Result<()> {
         repo.new_item_id()?.write_skill(&stage)?;
         // Persist the complete copy before making it visible in the draft.
         durable_tree(&stage)?;
-        #[cfg(test)]
-        hook(Hook::BeforeSwap, &dest);
+        crate::failpoint!(BeforeSwap, &dest);
         rename_noreplace(&stage, &dest).at(&dest)?;
         #[cfg(unix)]
         fs::File::open(&parent).at(&parent)?.sync_all().at(&parent)?;
@@ -373,6 +372,7 @@ pub fn complete(repo: &Repo, harnesses: &BTreeMap<String, Harness>, adoption: &A
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::failpoints::Point;
 
     #[test]
     fn a_user_marker_is_refused_before_grouping_and_after_selection() {
@@ -548,12 +548,10 @@ mod tests {
         let (tmp, repo, hs) = setup();
         write(&tmp.path().join("a/pdf/SKILL.md"), "unmanaged");
         let dest = repo.personal_dir().join("pdf");
-        HOOK.with_borrow_mut(|hook| {
-            *hook = Some(Box::new(move |point, at| {
-                if point == Hook::BeforeSwap && at == dest {
-                    write(&at.join("SKILL.md"), "created meanwhile");
-                }
-            }))
+        let _hook = crate::failpoints::observe(move |point, at| {
+            if point == Point::BeforeSwap && at == dest {
+                write(&at.join("SKILL.md"), "created meanwhile");
+            }
         });
         assert!(prepare(&repo, &hs, "a", "pdf").is_err());
         assert_eq!(fs::read_to_string(repo.personal_dir().join("pdf/SKILL.md")).unwrap(), "created meanwhile");
