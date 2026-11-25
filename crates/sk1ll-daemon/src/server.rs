@@ -344,6 +344,12 @@ async fn send_report(
 /// Handles server messages in the order they arrived.
 async fn inbox(d: Arc<Daemon>, mut rx: mpsc::UnboundedReceiver<ServerMessage>) {
     while let Some(m) = rx.recv().await {
+        // Off the runtime: a test's callback may hold the message here.
+        #[cfg(feature = "failpoints")]
+        {
+            let config = d.cfg.machine_config.clone();
+            let _ = tokio::task::spawn_blocking(move || sk1ll_core::failpoint!(DaemonServerMessage, &config)).await;
+        }
         let result = match m {
             ServerMessage::AssignmentResult { .. } => Ok(()),
             ServerMessage::Assignment(snap) => d.blocking(move |d, eng| d.apply_assignment(eng, snap).map(drop)).await,

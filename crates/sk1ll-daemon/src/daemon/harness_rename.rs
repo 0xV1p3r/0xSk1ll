@@ -59,6 +59,12 @@ impl Daemon {
             })
             .await?;
         let result = self.store.send(self, rename_write(&intent)).await;
+        // Off the runtime: a test's callback may hold the answer here.
+        #[cfg(feature = "failpoints")]
+        {
+            let config = self.cfg.machine_config.clone();
+            let _ = tokio::task::spawn_blocking(move || sk1ll_core::failpoint!(DaemonRenameAnswered, &config)).await;
+        }
         let routed_rules = intent.routed_rules.clone();
         match self.blocking(move |d, eng| d.finish_harness_rename(eng, world, intent, result)).await {
             Ok(update) => Ok(crate::client::HarnessRenameResult { update, routed_rules }),

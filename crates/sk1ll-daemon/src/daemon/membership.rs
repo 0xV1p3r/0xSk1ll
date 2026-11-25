@@ -198,6 +198,7 @@ impl Daemon {
     /// service manager restarts it.
     pub(crate) fn restart(&self) -> ! {
         use std::os::unix::process::CommandExt;
+        sk1ll_core::failpoint!(DaemonRestart, &self.cfg.state);
         let _engine = lock(&self.engine);
         tracing::info!("restarting to use the new credentials");
         let _ = std::fs::remove_file(&self.cfg.socket);
