@@ -230,6 +230,17 @@ points! {
     /// Joining: before the last of the credential files is written. Path:
     /// that file.
     DaemonJoinBeforeCredentials,
+    /// A Harness rename sent to the server: its answer is in, not applied
+    /// yet. A callback may block here; the daemon calls it off its async
+    /// runtime.
+    DaemonRenameAnswered,
+    /// The session's inbox: before a message from the server is handled. A
+    /// callback may block here; the daemon calls it off its async runtime.
+    DaemonServerMessage,
+    /// Before the daemon replaces itself with a fresh copy, as it does after
+    /// `POST /join`. Path: the daemon state file. A test's in-process engine
+    /// answers [`Action::Crash`] here, or the test process would be replaced.
+    DaemonRestart,
 
     // Server (sk1ll-server's `failpoints` feature).
     /// Confirming that a repo cleanup's git processes stopped. Path: the

@@ -459,6 +459,84 @@ fn interrupted_join_activation_keeps_credentials_and_toggles_from_the_same_regis
 }
 
 #[test]
+fn a_rename_answer_held_past_a_rejoin_leaves_the_next_registration_intact() {
+    use sk1ll_daemon::client::{HarnessRenameRequest, JoinApiRequest};
+    use sk1ll_daemon::{DaemonState, JoinOptions, join};
+    use sk1ll_testkit::server::{ADMIN, Server};
+
+    let (m, cfg) = fixture();
+    let _home = m.home.enter();
+    let repo = m.repo.root();
+    std::fs::remove_dir_all(repo).unwrap();
+    runtime(m.home.dirs()).block_on(async {
+        let server = Server::start().await;
+        let code = server.join_code().await;
+        let (server_url, machine_id) = (server.url(), Some("test".into()));
+        let opts = JoinOptions { server_url, code, admin_token: None, machine_id, copy_from: None, repo: repo.into() };
+        join(&cfg, opts).await.unwrap();
+        let engine = writer(&cfg);
+        let c = engine.client();
+        // Connected first: a session that connects for the rename would replay it and finish it itself.
+        c.set_harness_assignment("other", false).await.unwrap();
+        let (answered, held) = tokio::sync::oneshot::channel();
+        let (release, gate) = mpsc::channel::<()>();
+        let _hold = failpoints::once_shared(Point::DaemonRenameAnswered, &cfg.machine_config, move |_| {
+            answered.send(()).unwrap();
+            gate.recv_timeout(Duration::from_secs(10)).unwrap();
+        });
+        // The renamed revision's push, too, arrives only once the registration was replaced.
+        let (release_push, push_gate) = mpsc::channel::<()>();
+        let _hold_push = failpoints::once_shared(Point::DaemonServerMessage, &cfg.machine_config, move |_| {
+            push_gate.recv_timeout(Duration::from_secs(10)).unwrap();
+        });
+        // The join below restarts the daemon in place: crash instead of replacing the test process.
+        let (restarting, restarted) = tokio::sync::oneshot::channel();
+        let restarting = std::sync::Mutex::new(Some(restarting));
+        let state_file = cfg.state.clone();
+        let _no_exec = failpoints::install_shared(move |point, path| {
+            if point != Point::DaemonRestart || path != state_file {
+                return Action::Continue;
+            }
+            if let Some(restarting) = restarting.lock().unwrap().take() {
+                let _ = restarting.send(());
+            }
+            Action::Crash
+        });
+        let renaming = tokio::spawn({
+            let c = c.clone();
+            let req = HarnessRenameRequest { from: "agent".into(), to: "renamed".into(), replace: false };
+            async move { c.rename_harness(&req).await }
+        });
+        tokio::time::timeout(Duration::from_secs(10), held).await.unwrap().unwrap();
+        // With the answer held: removed from the Fleet, then joined again.
+        let removed = server.http().delete(format!("{}/api/machines/test", server.url())).bearer_auth(ADMIN);
+        removed.send().await.unwrap().error_for_status().unwrap();
+        sk1ll_testkit::eventually(|| async { c.status().await.unwrap().revoked.then_some(()) }).await;
+        let code = server.join_code().await;
+        let (server_url, machine_id) = (server.url(), Some("next".into()));
+        let req = JoinApiRequest { server_url, code, admin_token: None, machine_id, copy_from: None, repo: None };
+        let joined = c.join(&req).await.unwrap();
+        let next = DaemonState::load(&cfg.state).unwrap().unwrap();
+        assert_eq!(next.machine_id, "next");
+        let stored = || state::load_snapshot(&cfg.snapshot_path(), Some(&next.registration_key())).unwrap();
+        let snapshot = stored().unwrap();
+        assert_eq!(snapshot.revision, joined.revision);
+
+        release.send(()).unwrap();
+        release_push.send(()).unwrap();
+        let renamed = renaming.await.unwrap();
+        assert_eq!(DaemonState::load(&cfg.state).unwrap().as_ref(), Some(&next));
+        assert_eq!(stored().as_ref(), Some(&snapshot), "{renamed:?}");
+        assert_eq!(renamed.unwrap_err().status, Some(409));
+        tokio::time::timeout(Duration::from_secs(10), restarted).await.unwrap().unwrap();
+        drop(engine);
+        let status = writer(&cfg).client().status().await.unwrap();
+        assert_eq!((status.machine_id.as_str(), status.revoked), ("next", false));
+        assert_eq!(status.assignment_revision, snapshot.revision);
+    });
+}
+
+#[test]
 fn a_credentials_collision_restores_the_original_and_saves_edits_to_the_replacement() {
     use sk1ll_daemon::client::{DaemonMode, JoinApiRequest};
     use sk1ll_testkit::server::Server;
