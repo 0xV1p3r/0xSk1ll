@@ -1,0 +1,101 @@
+# Coverage baseline: main at a1b9f4e, before the test-suite overhaul
+# cargo llvm-cov --workspace --all-features --summary-only (HOME empty, XDG unset)
+# Rust tests: 683 listed by `cargo test --workspace -- --list | grep -c ": test"`; a run reports 683 passed, 1 ignored
+# Vitest (crates/sk1ll-gui/ui, pnpm test): 319 tests in 19 files, 5.7 s
+# Wall time of cargo test --workspace (built beforehand): 67 s
+
+Filename                                      Regions    Missed Regions     Cover   Functions  Missed Functions  Executed       Lines      Missed Lines     Cover    Branches   Missed Branches     Cover
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+sk1ll-cli/src/fleet.rs                            579               162    72.02%          42                 8    80.95%         384                88    77.08%           0                 0         -
+sk1ll-cli/src/harnesses.rs                        424                58    86.32%          36                 2    94.44%         274                28    89.78%           0                 0         -
+sk1ll-cli/src/main.rs                            1480               325    78.04%          95                10    89.47%         855               158    81.52%           0                 0         -
+sk1ll-cli/src/release_check.rs                    114                49    57.02%          11                 4    63.64%          61                32    47.54%           0                 0         -
+sk1ll-cli/src/setup.rs                            462               189    59.09%          37                15    59.46%         314               112    64.33%           0                 0         -
+sk1ll-core/src/assignment.rs                      319                11    96.55%          33                 2    93.94%         175                 3    98.29%           0                 0         -
+sk1ll-core/src/baseline_check.rs                  100                16    84.00%           9                 1    88.89%          54                 2    96.30%           0                 0         -
+sk1ll-core/src/bundled.rs                          49                 0   100.00%           7                 0   100.00%          28                 0   100.00%           0                 0         -
+sk1ll-core/src/config_file.rs                     574                52    90.94%          54                 5    90.74%         375                22    94.13%           0                 0         -
+sk1ll-core/src/content.rs                         975               128    86.87%          92                13    85.87%         619                72    88.37%           0                 0         -
+sk1ll-core/src/content/pinned.rs                  178                41    76.97%          14                 2    85.71%         117                13    88.89%           0                 0         -
+sk1ll-core/src/draft.rs                          6220               279    95.51%         405                15    96.30%        3205                95    97.04%           0                 0         -
+sk1ll-core/src/draft/keep.rs                      520               118    77.31%          56                 6    89.29%         348                43    87.64%           0                 0         -
+sk1ll-core/src/draft/pull.rs                     1519               254    83.28%         162                15    90.74%         985                90    90.86%           0                 0         -
+sk1ll-core/src/draft/pull/journal.rs              127                21    83.46%          21                 3    85.71%          93                 9    90.32%           0                 0         -
+sk1ll-core/src/draft/pull/worktree.rs             565               134    76.28%          37                 3    91.89%         376                69    81.65%           0                 0         -
+sk1ll-core/src/engine.rs                           97                18    81.44%          13                 2    84.62%          74                 7    90.54%           0                 0         -
+sk1ll-core/src/git/config_env.rs                   21                 3    85.71%           4                 0   100.00%          13                 1    92.31%           0                 0         -
+sk1ll-core/src/git/filters.rs                     237                 4    98.31%          24                 0   100.00%         154                 1    99.35%           0                 0         -
+sk1ll-core/src/git/mod.rs                         513                74    85.58%          66                 8    87.88%         366                37    89.89%           0                 0         -
+sk1ll-core/src/git/plumbing.rs                   1404               197    85.97%          77                 9    88.31%         741                78    89.47%           0                 0         -
+sk1ll-core/src/harness_change.rs                  373                20    94.64%          28                 0   100.00%         248                 6    97.58%           0                 0         -
+sk1ll-core/src/harness_rename.rs                  166                49    70.48%          18                 3    83.33%         128                25    80.47%           0                 0         -
+sk1ll-core/src/hash.rs                            898                69    92.32%         104                 6    94.23%         611                27    95.58%           0                 0         -
+sk1ll-core/src/imports.rs                        1766               120    93.20%         110                 9    91.82%         986                50    94.93%           0                 0         -
+sk1ll-core/src/instructions.rs                    929                77    91.71%          71                 8    88.73%         608                26    95.72%           0                 0         -
+sk1ll-core/src/item_id.rs                        1037               116    88.81%         115                 6    94.78%         707                47    93.35%           0                 0         -
+sk1ll-core/src/lib.rs                              14                 2    85.71%           4                 1    75.00%          11                 1    90.91%           0                 0         -
+sk1ll-core/src/lock.rs                             23                 8    65.22%           4                 2    50.00%          15                 2    86.67%           0                 0         -
+sk1ll-core/src/machine.rs                        1448               135    90.68%         146                16    89.04%         930                45    95.16%           0                 0         -
+sk1ll-core/src/manifest.rs                        157                23    85.35%          23                 4    82.61%         110                 9    91.82%           0                 0         -
+sk1ll-core/src/paths.rs                            43                 5    88.37%          17                 5    70.59%          37                 5    86.49%           0                 0         -
+sk1ll-core/src/placement.rs                       231                33    85.71%          16                 1    93.75%         136                12    91.18%           0                 0         -
+sk1ll-core/src/real_path.rs                        90                 7    92.22%           6                 0   100.00%          50                 3    94.00%           0                 0         -
+sk1ll-core/src/redact.rs                           65                 1    98.46%           5                 0   100.00%          43                 1    97.67%           0                 0         -
+sk1ll-core/src/repo.rs                           1233               129    89.54%          95                 4    95.79%         722                69    90.44%           0                 0         -
+sk1ll-core/src/skill.rs                           125                14    88.80%          15                 1    93.33%          73                 6    91.78%           0                 0         -
+sk1ll-core/src/source.rs                         1115                58    94.80%          97                 1    98.97%         672                18    97.32%           0                 0         -
+sk1ll-core/src/sync.rs                           8483               761    91.03%         624                48    92.31%        4947               277    94.40%           0                 0         -
+sk1ll-core/src/sync/ownership.rs                  715               115    83.92%          73                 5    93.15%         479                33    93.11%           0                 0         -
+sk1ll-core/src/sync/unmanaged.rs                  779                86    88.96%          59                 3    94.92%         458                26    94.32%           0                 0         -
+sk1ll-daemon/src/api.rs                           969               340    64.91%         202                71    64.85%         655               219    66.56%           0                 0         -
+sk1ll-daemon/src/auth.rs                           75                 0   100.00%          13                 0   100.00%          54                 0   100.00%           0                 0         -
+sk1ll-daemon/src/client.rs                        941                87    90.75%         195                13    93.33%         602                50    91.69%           0                 0         -
+sk1ll-daemon/src/config.rs                        206                33    83.98%          23                 2    91.30%         160                 9    94.38%           0                 0         -
+sk1ll-daemon/src/daemon/adopt.rs                  287                95    66.90%          28                 6    78.57%         184                36    80.43%           0                 0         -
+sk1ll-daemon/src/daemon/assignment.rs             173                33    80.92%          21                 3    85.71%         135                12    91.11%           0                 0         -
+sk1ll-daemon/src/daemon/content.rs                142                61    57.04%          12                 2    83.33%          89                24    73.03%           0                 0         -
+sk1ll-daemon/src/daemon/harness_rename.rs         198               105    46.97%          17                 8    52.94%         155                65    58.06%           0                 0         -
+sk1ll-daemon/src/daemon/harnesses.rs              283                48    83.04%          30                 4    86.67%         208                19    90.87%           0                 0         -
+sk1ll-daemon/src/daemon/import.rs                 275               131    52.36%          42                18    57.14%         199                91    54.27%           0                 0         -
+sk1ll-daemon/src/daemon/membership.rs             178               107    39.89%          29                16    44.83%         156                87    44.23%           0                 0         -
+sk1ll-daemon/src/daemon/mod.rs                    499                93    81.36%          80                10    87.50%         431                54    87.47%           0                 0         -
+sk1ll-daemon/src/daemon/placement.rs              198                66    66.67%          16                 3    81.25%         141                30    78.72%           0                 0         -
+sk1ll-daemon/src/daemon/pull.rs                   457               178    61.05%          61                15    75.41%         337               101    70.03%           0                 0         -
+sk1ll-daemon/src/daemon/read.rs                   587               184    68.65%          70                12    82.86%         373                90    75.87%           0                 0         -
+sk1ll-daemon/src/daemon/reconcile.rs              617               121    80.39%          54                 8    85.19%         425                64    84.94%           0                 0         -
+sk1ll-daemon/src/daemon/snapshot.rs                40                 1    97.50%          10                 0   100.00%          37                 0   100.00%           0                 0         -
+sk1ll-daemon/src/daemon/views.rs                  121                30    75.21%          11                 2    81.82%         107                17    84.11%           0                 0         -
+sk1ll-daemon/src/error.rs                          45                 6    86.67%           4                 0   100.00%          44                 5    88.64%           0                 0         -
+sk1ll-daemon/src/join.rs                          782               237    69.69%          69                20    71.01%         527               121    77.04%           0                 0         -
+sk1ll-daemon/src/lib.rs                            99                57    42.42%          10                 5    50.00%          64                34    46.88%           0                 0         -
+sk1ll-daemon/src/lifecycle.rs                     260                 3    98.85%          29                 1    96.55%         201                 3    98.51%           0                 0         -
+sk1ll-daemon/src/local.rs                          48                 9    81.25%          10                 3    70.00%          33                 6    81.82%           0                 0         -
+sk1ll-daemon/src/machine_lock.rs                  236                19    91.95%          22                 3    86.36%         176                 9    94.89%           0                 0         -
+sk1ll-daemon/src/main.rs                           33                 4    87.88%           1                 0   100.00%          24                 0   100.00%           0                 0         -
+sk1ll-daemon/src/notifications.rs                 439               202    53.99%          39                21    46.15%         260               138    46.92%           0                 0         -
+sk1ll-daemon/src/remote.rs                        109                77    29.36%          23                14    39.13%          91                62    31.87%           0                 0         -
+sk1ll-daemon/src/server.rs                        513               235    54.19%          77                36    53.25%         369               163    55.83%           0                 0         -
+sk1ll-daemon/src/service.rs                       696               260    62.64%          95                43    54.74%         457               185    59.52%           0                 0         -
+sk1ll-daemon/src/state.rs                         436                31    92.89%          38                 6    84.21%         263                14    94.68%           0                 0         -
+sk1ll-daemon/src/store.rs                         362                91    74.86%          44                 8    81.82%         261                52    80.08%           0                 0         -
+sk1ll-daemon/src/watch.rs                         261               152    41.76%          27                18    33.33%         178               115    35.39%           0                 0         -
+sk1ll-gui/src-tauri/src/commands.rs               340               225    33.82%          86                64    25.58%         270               174    35.56%           0                 0         -
+sk1ll-gui/src-tauri/src/editors.rs                334                88    73.65%          52                17    67.31%         249                59    76.31%           0                 0         -
+sk1ll-gui/src-tauri/src/events.rs                  77                 3    96.10%           8                 0   100.00%          44                 3    93.18%           0                 0         -
+sk1ll-gui/src-tauri/src/lib.rs                     28                28     0.00%           5                 5     0.00%          25                25     0.00%           0                 0         -
+sk1ll-gui/src-tauri/src/main.rs                     3                 3     0.00%           1                 1     0.00%           3                 3     0.00%           0                 0         -
+sk1ll-gui/src-tauri/src/service.rs                 74                74     0.00%          11                11     0.00%          60                60     0.00%           0                 0         -
+sk1ll-gui/src-tauri/src/updates.rs                100               100     0.00%          25                25     0.00%          81                81     0.00%           0                 0         -
+sk1ll-proto/src/lib.rs                            240                 2    99.17%          14                 0   100.00%         154                 1    99.35%           0                 0         -
+sk1ll-server/src/api.rs                          1296                98    92.44%         141                 7    95.04%         733                17    97.68%           0                 0         -
+sk1ll-server/src/assign.rs                        520                75    85.58%          63                 9    85.71%         395                25    93.67%           0                 0         -
+sk1ll-server/src/config.rs                        222                81    63.51%          27                13    51.85%         145                47    67.59%           0                 0         -
+sk1ll-server/src/db.rs                            663                81    87.78%          64                 2    96.88%         384                10    97.40%           0                 0         -
+sk1ll-server/src/error.rs                          21                 4    80.95%           3                 0   100.00%          19                 3    84.21%           0                 0         -
+sk1ll-server/src/git.rs                          1767               150    91.51%         143                 4    97.20%        1083                36    96.68%           0                 0         -
+sk1ll-server/src/imports.rs                       315                23    92.70%          26                 2    92.31%         239                10    95.82%           0                 0         -
+sk1ll-server/src/lib.rs                           621                63    89.86%          92                 7    92.39%         434                25    94.24%           0                 0         -
+sk1ll-server/src/main.rs                           63                52    17.46%           5                 3    40.00%          43                34    20.93%           0                 0         -
+sk1ll-server/src/ws.rs                            856                81    90.54%          72                 3    95.83%         574                38    93.38%           0                 0         -
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+TOTAL                                           54272              8288    84.73%        5165               790    84.70%       33913              4174    87.69%           0                 0         -
