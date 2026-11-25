@@ -14,19 +14,6 @@ use crate::git::Git;
 use crate::sync::unmanaged::{self, Variant};
 use crate::{Assignment, Change, Error, Harness, IoExt, ItemId, ItemRef, Origin, Repo, Result};
 
-#[cfg(test)]
-thread_local! {
-    static BEFORE_ACCESS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
-}
-#[cfg(test)]
-fn before_access() {
-    BEFORE_ACCESS.with_borrow_mut(|h| {
-        if let Some(h) = h.take() {
-            h();
-        }
-    });
-}
-
 pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -384,8 +371,7 @@ pub fn tree(repo: &Repo, harnesses: &BTreeMap<String, Harness>, query: &ContentQ
         #[cfg(unix)]
         Source::Disk(root) => {
             let pinned = pinned::Item::open(&root, query.item.starts_with("rule:"))?;
-            #[cfg(test)]
-            before_access();
+            crate::failpoint!(ContentAccess, &root);
             pinned.tree()
         }
         #[cfg(not(unix))]
@@ -396,8 +382,7 @@ pub fn tree(repo: &Repo, harnesses: &BTreeMap<String, Harness>, query: &ContentQ
                 .sort_by_file_name()
                 .into_iter()
                 .filter_entry(|e| e.depth() == 0 || !reserved_name(e.depth(), e.file_name()));
-            #[cfg(test)]
-            before_access();
+            crate::failpoint!(ContentAccess, &root);
             for entry in walker {
                 let entry = entry.map_err(std::io::Error::from).at(&root)?;
                 if entry.path() == base {
@@ -477,8 +462,7 @@ pub fn file(repo: &Repo, harnesses: &BTreeMap<String, Harness>, query: &FileQuer
         #[cfg(unix)]
         Source::Disk(root) => {
             let pinned = pinned::Item::open(&root, query.content.item.starts_with("rule:"))?;
-            #[cfg(test)]
-            before_access();
+            crate::failpoint!(ContentAccess, &root);
             let file = pinned.file(rel)?;
             let meta = file.metadata().at(&root)?;
             if !meta.is_file() {
@@ -499,8 +483,7 @@ pub fn file(repo: &Repo, harnesses: &BTreeMap<String, Harness>, query: &FileQuer
             if !canonical.starts_with(&root) || (root.is_file() && canonical != root) {
                 return Err(Error::Invalid("file path escapes the item".into()));
             }
-            #[cfg(test)]
-            before_access();
+            crate::failpoint!(ContentAccess, &root);
             let mut options = fs::OpenOptions::new();
             options.read(true);
             #[cfg(unix)]
@@ -858,11 +841,9 @@ mod tests {
             write(&outside.join("docs/data"), "secret");
             write(&outside.join("secret"), "secret");
             let swap = root.clone();
-            BEFORE_ACCESS.with_borrow_mut(|h| {
-                *h = Some(Box::new(move || {
-                    fs::rename(&swap, swap.with_file_name("old-pdf")).unwrap();
-                    std::os::unix::fs::symlink(outside, swap).unwrap();
-                }))
+            let _access = crate::failpoints::once(crate::failpoints::Point::ContentAccess, move |_| {
+                fs::rename(&swap, swap.with_file_name("old-pdf")).unwrap();
+                std::os::unix::fs::symlink(outside, swap).unwrap();
             });
             if listing {
                 let result = tree(&repo, &BTreeMap::new(), &query("skill:pdf"));

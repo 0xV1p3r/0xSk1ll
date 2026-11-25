@@ -5,7 +5,9 @@
 //! ([`use_dirs`], which the daemon and the CLI call with their `Config`),
 //! else `SK1LL_STATE_DIR` / `SK1LL_CACHE_DIR`, else the platform's default.
 //! An empty variable counts as unset. Tests point them at temporary
-//! directories, so no test reaches the real home directory.
+//! directories, so no test reaches the real home directory: core's own
+//! tests by default, integration tests per thread with
+//! `failpoints::dirs` (the `failpoints` feature).
 
 use std::path::PathBuf;
 use std::sync::RwLock;
@@ -27,6 +29,10 @@ pub fn use_dirs(dirs: Dirs) {
 }
 
 fn configured() -> Option<Dirs> {
+    #[cfg(any(test, feature = "failpoints"))]
+    if let Some(dirs) = crate::failpoints::thread_dirs() {
+        return Some(dirs);
+    }
     let dirs = DIRS.read().unwrap_or_else(|e| e.into_inner()).clone();
     #[cfg(test)]
     return dirs.or_else(|| Some(test_dirs()));

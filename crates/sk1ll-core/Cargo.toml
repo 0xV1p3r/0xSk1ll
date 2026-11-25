@@ -6,6 +6,11 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# Fault injection for integration tests (`sk1ll_core::failpoints`). Off by
+# default; a build without it has no failpoints at all.
+failpoints = []
+
 [dependencies]
 thiserror.workspace = true
 serde.workspace = true

@@ -376,8 +376,7 @@ fn write_index(dir: &Path, index: &Index, unchanged: impl FnOnce() -> Result<()>
         let metadata = serde_json::to_vec(&meta).map_err(|e| Error::Invalid(e.to_string()))?;
         config_file::replace_private(&rollback.join(BACKUP_META), &metadata)?;
     }
-    #[cfg(test)]
-    hook(Hook::IndexBeforeMove, &path);
+    crate::failpoint!(IndexBeforeMove, &path);
     let swap = crate::placement::swap_managed(
         stage.as_ref().map(config_file::Staged::path),
         &path,
@@ -604,6 +603,7 @@ impl Scratch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::failpoints::Point;
 
     #[test]
     fn independent_opens_contend_on_the_same_directory_lock() {
@@ -638,7 +638,7 @@ mod tests {
             edit.set("another", Some(link("editor")), None);
             let expected = edit.clone();
             let replaced = super::super::tests::with_hook(
-                Hook::IndexBeforeMove,
+                Point::IndexBeforeMove,
                 move |path| {
                     let staged = path.with_extension("editor");
                     fs::write(&staged, serde_json::to_vec(&edit).unwrap()).unwrap();

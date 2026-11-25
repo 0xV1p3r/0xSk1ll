@@ -201,11 +201,6 @@ pub enum FirstBaseline {
     Blocked { baseline: String, items: Vec<ItemRef> },
 }
 
-#[cfg(test)]
-thread_local! {
-    static BEFORE_BASELINE_PUBLICATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
-}
-
 /// Adopts an empty clone's first baseline, keeping the generated init files
 /// as draft. Every checkout destination is checked before HEAD or the index
 /// moves. Ignored files and symlinks are checked directly on disk too.
@@ -273,12 +268,7 @@ pub fn adopt_first_baseline(dir: &Path) -> Result<FirstBaseline> {
     if !blocked.is_empty() {
         return Ok(FirstBaseline::Blocked { baseline: remote, items: blocked.into_iter().collect() });
     }
-    #[cfg(test)]
-    BEFORE_BASELINE_PUBLICATION.with_borrow_mut(|hook| {
-        if let Some(hook) = hook.take() {
-            hook();
-        }
-    });
+    crate::failpoint!(BaselinePublish, dir);
     let directory = crate::placement::Directory::open(dir, false).at(dir)?;
     for (path, mode, oid) in missing {
         let blob = output(dir, &["cat-file", "blob", &oid], &[])?;
@@ -765,22 +755,20 @@ mod tests {
             let ancestor = clone.join("personal/pdf");
             let target = ancestor.join("SKILL.md");
             let (a, t, o) = (ancestor.clone(), target.clone(), outside.clone());
-            BEFORE_BASELINE_PUBLICATION.with_borrow_mut(|hook| {
-                *hook = Some(Box::new(move || {
-                    if scenario.starts_with("target") {
-                        std::fs::create_dir(&a).unwrap();
+            let _hook = crate::failpoints::once(crate::failpoints::Point::BaselinePublish, move |_| {
+                if scenario.starts_with("target") {
+                    std::fs::create_dir(&a).unwrap();
+                }
+                match scenario {
+                    "ancestor-file" => std::fs::write(a, "private").unwrap(),
+                    "ancestor-symlink" => std::os::unix::fs::symlink(o, a).unwrap(),
+                    "target-file" => std::fs::write(t, "private").unwrap(),
+                    "target-directory" => {
+                        std::fs::create_dir(&t).unwrap();
+                        std::fs::write(t.join("notes"), "private").unwrap();
                     }
-                    match scenario {
-                        "ancestor-file" => std::fs::write(a, "private").unwrap(),
-                        "ancestor-symlink" => std::os::unix::fs::symlink(o, a).unwrap(),
-                        "target-file" => std::fs::write(t, "private").unwrap(),
-                        "target-directory" => {
-                            std::fs::create_dir(&t).unwrap();
-                            std::fs::write(t.join("notes"), "private").unwrap();
-                        }
-                        _ => std::os::unix::fs::symlink(o.join("SKILL.md"), t).unwrap(),
-                    }
-                }))
+                    _ => std::os::unix::fs::symlink(o.join("SKILL.md"), t).unwrap(),
+                }
             });
             assert!(
                 matches!(fetched(&clone, adopt_first_baseline).unwrap(), FirstBaseline::Blocked { items, .. }

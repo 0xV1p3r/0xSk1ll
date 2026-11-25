@@ -196,8 +196,7 @@ pub(crate) fn remove_payload(path: &Path, expected: &str) -> Result<bool> {
     if payload.hash != expected {
         return Ok(false);
     }
-    #[cfg(test)]
-    tests::before_removal(path);
+    crate::failpoint!(HashBeforeRemoval, path);
     for (at, dir, before) in payload.entries.iter().rev() {
         let removed = if *dir {
             fs::remove_dir(at)
@@ -365,8 +364,7 @@ fn hash_file(hasher: &mut Sha256, path: &Path, buf: &mut [u8]) -> std::io::Resul
     let mut streamed = hasher.clone();
     streamed.update(len.to_le_bytes());
     let mut read = 0u64;
-    #[cfg(test)]
-    tests::mid_read(path);
+    crate::failpoint!(HashMidRead, path);
     // Reading stops past `len`: a file that grew is not read to its end twice.
     while read <= len {
         match file.read(buf) {
@@ -712,47 +710,22 @@ pub(crate) mod tests {
         format!("sha256:{}", hex(&hasher.finalize()))
     }
 
-    type MidRead = Box<dyn FnMut(&Path)>;
-
-    thread_local! {
-        static MID_READ: std::cell::RefCell<Option<MidRead>> = const { std::cell::RefCell::new(None) };
-    }
-
     /// Called once a file's length is taken and before its bytes are read, to
     /// simulate a concurrent write deterministically.
-    pub(crate) fn with_read_hook<T>(hook: impl FnMut(&Path) + 'static, run: impl FnOnce() -> T) -> T {
-        MID_READ.with_borrow_mut(|slot| *slot = Some(Box::new(hook)));
-        let result = run();
-        MID_READ.with_borrow_mut(|slot| *slot = None);
-        result
-    }
-
-    type Removal = Box<dyn FnOnce(&Path)>;
-
-    thread_local! {
-        static BEFORE_REMOVAL: std::cell::RefCell<Option<Removal>> = const { std::cell::RefCell::new(None) };
+    pub(crate) fn with_read_hook<T>(mut hook: impl FnMut(&Path) + 'static, run: impl FnOnce() -> T) -> T {
+        let _hook = crate::failpoints::observe(move |point, path| {
+            if point == crate::failpoints::Point::HashMidRead {
+                hook(path)
+            }
+        });
+        run()
     }
 
     /// Called once, after a payload removal matched the fingerprint and
     /// before it unlinks anything.
     pub(crate) fn with_removal_hook<T>(hook: impl FnOnce(&Path) + 'static, run: impl FnOnce() -> T) -> T {
-        BEFORE_REMOVAL.with_borrow_mut(|slot| *slot = Some(Box::new(hook)));
-        let result = run();
-        BEFORE_REMOVAL.with_borrow_mut(|slot| *slot = None);
-        result
-    }
-
-    pub(super) fn before_removal(path: &Path) {
-        if let Some(f) = BEFORE_REMOVAL.with_borrow_mut(Option::take) {
-            f(path);
-        }
-    }
-
-    pub(super) fn mid_read(path: &Path) {
-        if let Some(mut f) = MID_READ.with_borrow_mut(Option::take) {
-            f(path);
-            MID_READ.with_borrow_mut(|h| *h = Some(f));
-        }
+        let _hook = crate::failpoints::once(crate::failpoints::Point::HashBeforeRemoval, hook);
+        run()
     }
 
     fn write(path: &Path, text: &str) {
@@ -828,16 +801,15 @@ pub(crate) mod tests {
             fs::write(dir.join("b.md"), "untouched\n").unwrap();
             let before = legacy_hash_dir(&dir);
             let (content, mut once) = (after.to_vec(), true);
-            MID_READ.with_borrow_mut(|h| {
-                *h = Some(Box::new(move |path| {
+            let hash = with_read_hook(
+                move |path| {
                     if std::mem::take(&mut once) {
                         assert!(path.ends_with("a.bin"));
                         fs::write(path, &content).unwrap();
                     }
-                }))
-            });
-            let hash = hash_dir(&dir);
-            MID_READ.with_borrow_mut(|h| *h = None);
+                },
+                || hash_dir(&dir),
+            );
             // The hash is that of the tree as rewritten, the only content
             // read; not the old length in front of the new bytes.
             assert_eq!(hash.unwrap(), legacy_hash_dir(&dir), "{case}");

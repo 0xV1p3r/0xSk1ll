@@ -498,14 +498,6 @@ pub(crate) struct Staged {
     sub: String,
 }
 
-#[cfg(test)]
-thread_local! {
-    /// Makes this test thread's next install rename fail, like EXDEV would.
-    pub(crate) static FAIL_INSTALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Makes this test thread's next restore after a failed install fail too.
-    pub(crate) static FAIL_RESTORE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 impl Staged {
     fn content(&self) -> PathBuf {
         let tree = self.dir.join("tree");
@@ -514,9 +506,8 @@ impl Staged {
 
     /// Moves the staged content to `dest`, never replacing anything there.
     fn place(&self, dest: &Path) -> Result<()> {
-        #[cfg(test)]
-        if FAIL_INSTALL.replace(false) {
-            return Err(std::io::Error::from(std::io::ErrorKind::CrossesDevices)).at(dest);
+        if let Some(e) = crate::failpoint_error!(SourceInstall, dest) {
+            return Err(e).at(dest);
         }
         crate::sync::rename_noreplace(&self.content(), dest).at(dest)
     }
@@ -545,14 +536,10 @@ impl Staged {
         }
         fs::rename(dest, &aside).at(dest)?;
         if let Err(e) = self.place(dest) {
-            #[cfg(test)]
-            let restored = if FAIL_RESTORE.replace(false) {
-                Err(std::io::Error::other("injected restore failure"))
-            } else {
-                fs::rename(&aside, dest)
+            let restored = match crate::failpoint_error!(SourceRestore, dest) {
+                Some(e) => Err(e),
+                None => fs::rename(&aside, dest),
             };
-            #[cfg(not(test))]
-            let restored = fs::rename(&aside, dest);
             if let Err(r) = restored {
                 return Err(Error::Invalid(format!(
                     "installing {} failed ({e}), and so did putting the previous version back ({r}); it is kept \
@@ -695,10 +682,6 @@ pub(crate) fn resolve_commit(repo: &Path, git_ref: &str) -> Result<String> {
 
 fn cache_dir_for(url: &str) -> PathBuf {
     let digest = hex(&Sha256::digest(url.as_bytes()));
-    #[cfg(test)]
-    if let Some(root) = TEST_CACHE.with_borrow(Clone::clone) {
-        return root.join(&digest[..16]);
-    }
     crate::paths::cache_dir().unwrap_or_else(|_| std::env::temp_dir().join("sk1ll")).join("git").join(&digest[..16])
 }
 
@@ -706,27 +689,12 @@ fn git(dir: &Path, args: &[&str], env: &[(&str, &Path)]) -> Result<String> {
     env.iter().fold(Git::new(dir).args(args), |g, (k, v)| g.env(k, v)).text()
 }
 
+/// Keeps this test thread's cache directory (the import cache's) in `root`
+/// instead of the user's, until the guard is dropped.
 #[cfg(test)]
-thread_local! {
-    static TEST_CACHE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
-}
-
-/// Keeps this test thread's import cache in `root` instead of the user's
-/// cache directory, until the guard is dropped.
-#[cfg(test)]
-pub(crate) fn test_cache(root: &Path) -> TestCache {
-    TEST_CACHE.with_borrow_mut(|c| *c = Some(root.to_path_buf()));
-    TestCache
-}
-
-#[cfg(test)]
-pub(crate) struct TestCache;
-
-#[cfg(test)]
-impl Drop for TestCache {
-    fn drop(&mut self) {
-        TEST_CACHE.with_borrow_mut(|c| *c = None);
-    }
+pub(crate) fn test_cache(root: &Path) -> crate::failpoints::Guard {
+    let state = crate::paths::state_dir().expect("core's tests have a state directory");
+    crate::failpoints::dirs(crate::paths::Dirs { state, cache: root.to_path_buf() })
 }
 
 #[cfg(test)]

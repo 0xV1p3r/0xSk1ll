@@ -922,7 +922,7 @@ impl Repo {
     /// repo supports none. No pull, nor finishing one, runs a filter driver.
     pub fn pull(&self, lock: &crate::EngineLock) -> Result<PullOutcome> {
         lock.check_for(self.root())?;
-        let pulled = pull::run(self, true, &mut |_| Ok(()));
+        let pulled = pull::run(self, true);
         self.check_pulled_ids(pulled)
     }
 
@@ -938,7 +938,7 @@ impl Repo {
     /// last, without talking to [`REMOTE`]: the local half of a pull.
     pub fn pull_fetched(&self, lock: &crate::EngineLock) -> Result<PullOutcome> {
         lock.check_for(self.root())?;
-        let pulled = pull::run(self, false, &mut |_| Ok(()));
+        let pulled = pull::run(self, false);
         self.check_pulled_ids(pulled)
     }
 
@@ -999,7 +999,7 @@ impl Repo {
     /// replayed commits and Draft checked for duplicate Item IDs.
     pub fn finish_pull(&self, lock: &crate::EngineLock) -> Result<Option<PullOutcome>> {
         lock.check_for(self.root())?;
-        match pull::finish(self, &mut |_| Ok(())) {
+        match pull::finish(self) {
             Ok(None) => Ok(None),
             Ok(Some(outcome)) => self.check_pulled_ids(Ok(outcome)).map(Some),
             Err(e) => self.check_pulled_ids(Err(e)).map(Some),
@@ -1015,7 +1015,7 @@ impl Repo {
     /// the command that finishes by hand.
     pub fn pull_keeping(&self, lock: &crate::EngineLock, keep: &Keep) -> Result<KeptPull> {
         lock.check_for(self.root())?;
-        keep::run(self, lock, keep, &mut |_| Ok(()))
+        keep::run(self, lock, keep)
     }
 
     /// Reports a [`pull_keeping`](Self::pull_keeping) that was interrupted,
@@ -1043,39 +1043,6 @@ impl Repo {
     /// entries with no recovery id); returns how many there were.
     pub fn dismiss_keep_notes(&self) -> Result<usize> {
         keep::dismiss_notes(self)
-    }
-
-    /// [`pull_keeping`](Self::pull_keeping), calling `step` at each step:
-    /// an error stops it there, as a crash would.
-    #[cfg(test)]
-    fn pull_keeping_with(&self, keep: &Keep, step: &mut dyn FnMut(keep::Step) -> Result<()>) -> Result<KeptPull> {
-        let lock = crate::EngineLock::acquire(self.root())?;
-        keep::run(self, &lock, keep, step)
-    }
-
-    /// [`pull`](Self::pull), running `f` once when it reaches `point`.
-    #[cfg(test)]
-    fn pull_at(&self, point: pull::Before, f: impl FnOnce()) -> Result<PullOutcome> {
-        let _lock = crate::EngineLock::acquire(self.root())?;
-        let mut f = Some(f);
-        pull::run(self, true, &mut |at| {
-            if at == point
-                && let Some(f) = f.take()
-            {
-                f();
-            }
-            Ok(())
-        })
-    }
-
-    /// [`pull`](Self::pull), stopping at `point` as a crash would.
-    #[cfg(test)]
-    fn pull_crashing_at(&self, point: pull::Before) -> Result<PullOutcome> {
-        let _lock = crate::EngineLock::acquire(self.root())?;
-        pull::run(self, true, &mut |at| match at == point {
-            true => Err(Error::Invalid(format!("crashed at {at:?}"))),
-            false => Ok(()),
-        })
     }
 
     /// Whether git has a configured `user.name` and `user.email`.
@@ -1491,8 +1458,122 @@ fn prune_empty_parents(root: &Path, rel: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::pull::Before;
     use super::*;
+    use crate::failpoints::{self, Action, Point};
+
+    /// Where a test steps into a pull: a pull failpoint, `File(n)` the
+    /// `n`th path it goes through (from 0).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Before {
+        Checks,
+        Uncommitted,
+        Journal,
+        File(usize),
+        Swap,
+        Remove,
+        Published,
+        Index,
+        UpdateRef,
+        Done,
+    }
+
+    impl Before {
+        /// The failpoint, and which of its hits.
+        fn hit(self) -> (Point, usize) {
+            match self {
+                Before::Checks => (Point::PullChecks, 0),
+                Before::Uncommitted => (Point::PullUncommitted, 0),
+                Before::Journal => (Point::PullJournal, 0),
+                Before::File(n) => (Point::PullFile, n),
+                Before::Swap => (Point::PullSwap, 0),
+                Before::Remove => (Point::PullRemove, 0),
+                Before::Published => (Point::PullPublished, 0),
+                Before::Index => (Point::PullIndex, 0),
+                Before::UpdateRef => (Point::PullUpdateRef, 0),
+                Before::Done => (Point::PullDone, 0),
+            }
+        }
+    }
+
+    /// A keep failpoint, as the tests match on it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Step {
+        Restore,
+        Recorded(PathBuf),
+        Owned(PathBuf),
+        Moved(PathBuf),
+        Staged,
+        Published(PathBuf),
+        Pull,
+        Settle,
+    }
+
+    impl Step {
+        fn at(point: Point, path: &Path) -> Option<Step> {
+            Some(match point {
+                Point::KeepRestore => Step::Restore,
+                Point::KeepRecorded => Step::Recorded(path.to_path_buf()),
+                Point::KeepOwned => Step::Owned(path.to_path_buf()),
+                Point::KeepMoved => Step::Moved(path.to_path_buf()),
+                Point::KeepStaged => Step::Staged,
+                Point::KeepPublished => Step::Published(path.to_path_buf()),
+                Point::KeepPull => Step::Pull,
+                Point::KeepSettle => Step::Settle,
+                _ => return None,
+            })
+        }
+    }
+
+    impl Repo {
+        /// [`pull`](Self::pull), running `f` once when it reaches `point`.
+        fn pull_at(&self, point: Before, f: impl FnOnce()) -> Result<PullOutcome> {
+            let _lock = crate::EngineLock::acquire(self.root())?;
+            let ((want, nth), mut seen, mut f) = (point.hit(), 0, Some(f));
+            let at = |at: Point, _: &Path| {
+                if at == want {
+                    if seen == nth
+                        && let Some(f) = f.take()
+                    {
+                        f();
+                    }
+                    seen += 1;
+                }
+                Action::Continue
+            };
+            failpoints::scoped(at, || pull::run(self, true))
+        }
+
+        /// [`pull`](Self::pull), crashing at `point`: an error says where.
+        fn pull_crashing_at(&self, point: Before) -> Result<PullOutcome> {
+            let _lock = crate::EngineLock::acquire(self.root())?;
+            let ((want, nth), mut seen) = (point.hit(), 0);
+            let at = |at: Point, _: &Path| {
+                if at != want {
+                    return Action::Continue;
+                }
+                seen += 1;
+                if seen == nth + 1 { Action::Crash } else { Action::Continue }
+            };
+            failpoints::scoped(at, || failpoints::catch(|| pull::run(self, true)))
+                .unwrap_or_else(|crash| Err(Error::Invalid(format!("crashed at {:?}", crash.point))))
+        }
+
+        /// [`pull_keeping`](Self::pull_keeping), calling `step` at each keep
+        /// failpoint: an error crashes it there, and is what it returns.
+        fn pull_keeping_with(&self, keep: &Keep, step: &mut dyn FnMut(Step) -> Result<()>) -> Result<KeptPull> {
+            let lock = crate::EngineLock::acquire(self.root())?;
+            let mut stopped = None;
+            let at = |point: Point, path: &Path| match Step::at(point, path).map(&mut *step) {
+                Some(Err(e)) => {
+                    stopped = Some(e);
+                    Action::Crash
+                }
+                _ => Action::Continue,
+            };
+            let out = failpoints::scoped(at, || failpoints::catch(|| keep::run(self, &lock, keep)));
+            out.unwrap_or_else(|crash| Err(stopped.unwrap_or_else(|| panic!("crashed at {crash:?}"))))
+        }
+    }
 
     fn git(dir: &Path, args: &[&str]) -> String {
         Git::new(dir).args(args).text().unwrap()
@@ -2295,7 +2376,7 @@ mod tests {
         let skill = f.b.join("personal/pdf/SKILL.md");
         let err = b
             .pull_keeping_with(&Keep::All, &mut |step| {
-                if step == keep::Step::Settle {
+                if step == Step::Settle {
                     write(&skill, "written meanwhile\n");
                 }
                 Ok(())
@@ -2333,7 +2414,7 @@ mod tests {
         let (skill, notes) = (f.b.join("personal/pdf/SKILL.md"), f.b.join("personal/pdf/notes.md"));
         let err = b
             .pull_keeping_with(&Keep::All, &mut |at| {
-                if let keep::Step::Moved(path) = at {
+                if let Step::Moved(path) = at {
                     assert!(!path.exists(), "moved into recovery");
                     if path.ends_with("SKILL.md") {
                         write(&skill, "saved again\n");
@@ -2360,7 +2441,7 @@ mod tests {
 
     /// [`Repo::pull_keeping_with`], stopping at the first step `stop` picks, as a crash would.
     #[cfg(unix)]
-    fn keep_stopping(b: &Repo, stop: impl Fn(&keep::Step) -> bool) {
+    fn keep_stopping(b: &Repo, stop: impl Fn(&Step) -> bool) {
         let crashed = b.pull_keeping_with(&Keep::All, &mut |at| match stop(&at) {
             true => Err(Error::Invalid(format!("crashed at {at:?}"))),
             false => Ok(()),
@@ -2369,10 +2450,10 @@ mod tests {
         assert!(keep::journal_exists(b));
     }
 
-    fn at_skill(published: bool) -> impl Fn(&keep::Step) -> bool {
+    fn at_skill(published: bool) -> impl Fn(&Step) -> bool {
         move |at| match at {
-            keep::Step::Moved(path) if !published => path.ends_with("personal/pdf/SKILL.md"),
-            keep::Step::Published(path) if published => path.ends_with("personal/pdf/SKILL.md"),
+            Step::Moved(path) if !published => path.ends_with("personal/pdf/SKILL.md"),
+            Step::Published(path) if published => path.ends_with("personal/pdf/SKILL.md"),
             _ => false,
         }
     }
@@ -2445,26 +2526,23 @@ mod tests {
     /// Where an interrupted keep stops: each step a crash can fall on.
     #[cfg(unix)]
     #[cfg(unix)]
-    type StopPoint = (&'static str, Box<dyn Fn(&keep::Step) -> bool>);
+    type StopPoint = (&'static str, Box<dyn Fn(&Step) -> bool>);
 
     #[cfg(unix)]
     fn stop_points() -> Vec<StopPoint> {
-        let first = |step: keep::Step| move |at: &keep::Step| *at == step;
+        let first = |step: Step| move |at: &Step| *at == step;
         vec![
-            ("journal written", Box::new(first(keep::Step::Restore))),
+            ("journal written", Box::new(first(Step::Restore))),
             (
                 "recovery entry journaled",
-                Box::new(|at: &keep::Step| matches!(at, keep::Step::Recorded(p) if p.ends_with("SKILL.md"))),
+                Box::new(|at: &Step| matches!(at, Step::Recorded(p) if p.ends_with("SKILL.md"))),
             ),
-            (
-                "new file moved",
-                Box::new(|at: &keep::Step| matches!(at, keep::Step::Moved(p) if p.ends_with("notes.md"))),
-            ),
+            ("new file moved", Box::new(|at: &Step| matches!(at, Step::Moved(p) if p.ends_with("notes.md")))),
             ("tracked file moved", Box::new(at_skill(false))),
-            ("baseline file staged", Box::new(first(keep::Step::Staged))),
+            ("baseline file staged", Box::new(first(Step::Staged))),
             ("baseline file published", Box::new(at_skill(true))),
-            ("before the pull", Box::new(first(keep::Step::Pull))),
-            ("after the pull", Box::new(first(keep::Step::Settle))),
+            ("before the pull", Box::new(first(Step::Pull))),
+            ("after the pull", Box::new(first(Step::Settle))),
         ]
     }
 
@@ -2522,7 +2600,7 @@ mod tests {
         let f = Fleet::new();
         let b = repo(&f.b);
         let (_, remote) = kept_clash(&f);
-        keep_stopping(&b, |at| *at == keep::Step::Settle);
+        keep_stopping(&b, |at| *at == Step::Settle);
         let report = finish_keeping_now(&b).unwrap();
         assert_eq!(git(&f.b, &["rev-parse", "HEAD"]), remote, "the pull side is done");
         let lock = crate::EngineLock::acquire(b.root()).unwrap();
@@ -2553,7 +2631,7 @@ mod tests {
             b.commit(&[item("skill:pdf")], "b", None).unwrap();
             b.fetch().unwrap();
             match journaled {
-                true => keep_stopping(&b, |at| matches!(at, keep::Step::Owned(p) if p.ends_with("SKILL.md"))),
+                true => keep_stopping(&b, |at| matches!(at, Step::Owned(p) if p.ends_with("SKILL.md"))),
                 false => keep_stopping(&b, at_skill(false)),
             }
             let staged = || git(&f.b, &["diff", "--cached", "--name-only"]);
@@ -2624,7 +2702,7 @@ mod tests {
         a.push().unwrap();
         write(&f.b.join("personal/pdf/SKILL.md"), "b's edit\n");
         b.commit(&[item("skill:pdf")], "b", None).unwrap();
-        assert!(b.pull_crashing_at(pull::Before::Uncommitted).is_err());
+        assert!(b.pull_crashing_at(Before::Uncommitted).is_err());
         assert!(!f.b.join(".git/sk1ll-uncommitted.json").exists(), "recorded only once the branch moved");
         let err = b.pull_keeping_with(&Keep::All, &mut |_| Ok(())).unwrap_err().to_string();
         assert!(err.contains("has a staged change"), "{err}");
@@ -2641,7 +2719,7 @@ mod tests {
         let f = Fleet::new();
         let b = repo(&f.b);
         kept_clash(&f);
-        keep_stopping(&b, |at| *at == keep::Step::Settle);
+        keep_stopping(&b, |at| *at == Step::Settle);
         let report = finish_keeping_now(&b).unwrap();
         let ids: Vec<String> = report.iter().filter_map(|u| u.entry.clone()).collect();
         assert_eq!(ids.len(), 2, "{report:?}");
@@ -2677,7 +2755,7 @@ mod tests {
         let f = Fleet::new();
         let b = repo(&f.b);
         kept_clash(&f);
-        keep_stopping(&b, |at| *at == keep::Step::Settle);
+        keep_stopping(&b, |at| *at == Step::Settle);
         let report = finish_keeping_now(&b).unwrap();
         let id = report.iter().find_map(|u| u.entry.clone()).unwrap();
         let listed = || b.keep_report().unwrap().iter().any(|u| u.entry.as_ref() == Some(&id));
@@ -2707,7 +2785,7 @@ mod tests {
         let f = Fleet::new();
         let b = repo(&f.b);
         kept_clash(&f);
-        keep_stopping(&b, |at| *at == keep::Step::Settle);
+        keep_stopping(&b, |at| *at == Step::Settle);
         let report = finish_keeping_now(&b).unwrap();
         let notes = report.iter().filter(|u| u.entry.is_none()).count();
         assert_eq!(notes, 1, "ref.md, which the Draft deleted: {report:?}");
@@ -2985,7 +3063,7 @@ mod tests {
         let f = Fleet::new();
         let (a, b) = (repo(&f.a), repo(&f.b));
         {
-            let _date = crate::git::test_env(&[("GIT_AUTHOR_DATE", "1700000000 +0230")]);
+            let _date = crate::failpoints::git_env(&[("GIT_AUTHOR_DATE", "1700000000 +0230")]);
             write(&f.b.join("instructions/style.md"), "b committed\n");
             b.commit(&[item("rule:style")], "Style\n\nKeep this body.\n", Some("Éditor <editor@example.com>")).unwrap();
             write(&f.b.join("personal/local/SKILL.md"), "b committed too\n");
@@ -4007,9 +4085,10 @@ mod tests {
         commit_all(&f.a, "replace a rule");
         a.push().unwrap();
         let before = snapshot(&f.b);
-        pull::NO_EXCHANGE.set(true);
+        let no_exchange =
+            crate::failpoints::fail(crate::failpoints::Point::PullExchange, std::io::ErrorKind::Unsupported);
         let result = pull_now(&b);
-        pull::NO_EXCHANGE.set(false);
+        drop(no_exchange);
         assert!(invalid(result).contains("atomic file exchange"));
         assert!(!pending(&b));
         assert_eq!(snapshot(&f.b), before);

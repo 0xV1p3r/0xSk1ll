@@ -84,9 +84,9 @@ impl Git {
             // Unit tests must not depend on the developer's own git config.
             let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
             cmd.env("GIT_CONFIG_GLOBAL", null).env("GIT_CONFIG_NOSYSTEM", "1");
-            #[cfg(test)]
-            TEST_ENV.with_borrow(|vars| cmd.envs(vars.iter().map(|(k, v)| (k, v))));
         }
+        #[cfg(any(test, feature = "failpoints"))]
+        crate::failpoints::thread_git_env(&mut cmd);
         cmd.env("LC_ALL", "C").env("LANGUAGE", "C");
         Self { cmd, args: Vec::new(), stdin: None, timeout: None }
     }
@@ -424,26 +424,6 @@ fn signal_group(child: &Child, signal: libc::c_int) {
     }
 }
 
-#[cfg(test)]
-thread_local! {
-    static TEST_ENV: std::cell::RefCell<Vec<(String, String)>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Sets extra environment for every git command this test thread runs (each
-/// test has its own thread), until the guard is dropped. Unlike
-/// `std::env::set_var`, this can't leak into tests running in parallel.
-#[cfg(test)]
-pub(crate) fn test_env(vars: &[(&str, &str)]) -> impl Drop + use<> {
-    struct Guard;
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            TEST_ENV.with_borrow_mut(Vec::clear);
-        }
-    }
-    TEST_ENV.with_borrow_mut(|env| env.extend(vars.iter().map(|(k, v)| (k.to_string(), v.to_string()))));
-    Guard
-}
-
 /// NUL-separated paths, as `--stdin -z` expects.
 pub(crate) fn nul_list<P: AsRef<Path>>(paths: &[P]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -495,7 +475,7 @@ mod tests {
 
     #[test]
     fn locale_is_pinned() {
-        let _env = test_env(&[("LANG", "de_DE.UTF-8"), ("LANGUAGE", "de")]);
+        let _env = crate::failpoints::git_env(&[("LANG", "de_DE.UTF-8"), ("LANGUAGE", "de")]);
         let git = Git::new(Path::new(".")).arg("not-a-git-command");
         let env: std::collections::HashMap<_, _> = git.cmd.get_envs().collect();
         assert_eq!(env.get(OsStr::new("LC_ALL")), Some(&Some(OsStr::new("C"))));
@@ -519,7 +499,7 @@ mod tests {
         let pidfile = tmp.path().join("ssh.pid");
         // A fake ssh that hangs (and records its pid) instead of connecting.
         let ssh = format!("sleep 30 & echo $! > '{}'; wait; :", pidfile.display());
-        let _env = test_env(&[("GIT_SSH_COMMAND", &ssh), ("GIT_SSH_VARIANT", "simple")]);
+        let _env = crate::failpoints::git_env(&[("GIT_SSH_COMMAND", &ssh), ("GIT_SSH_VARIANT", "simple")]);
         let start = Instant::now();
         let result = Git::new(tmp.path())
             .args(["ls-remote", "ssh://sk1ll.invalid/repo.git"])
