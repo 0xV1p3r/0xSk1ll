@@ -325,62 +325,75 @@ fn an_un_commit_stopped_before_recording_its_staging_counts_as_the_user_s() {
 }
 
 /// An interrupted keep's report stays until the user acts: each version
-/// adopted (which brings it back) or discarded drops out, and the report
-/// goes with the last.
+/// adopted (which brings back exactly what the user had) or discarded
+/// drops out, and the report goes with the last.
 /// A recovery entry that can't be read stays listed, to check again.
 #[test]
 fn an_interrupted_keep_s_report_stays_until_each_version_is_acted_on() {
-    let f = Fleet::new();
-    let b = f.b();
-    let (_, remote) = kept_clash(&f);
-    interrupt_keep(&b, Point::KeepSettle, None);
-    let report = finish_keeping_now(&b).unwrap();
-    assert_eq!(git(&f.b, &["rev-parse", "HEAD"]), remote, "the pull side is done");
-    let ids: Vec<String> = report.iter().filter_map(|u| u.entry.clone()).collect();
-    assert_eq!(ids.len(), 2, "{report:?}");
-    let saved = f.b.join(".git/sk1ll-keep-report.json");
-    assert!(saved.exists());
-    assert_eq!(b.keep_report().unwrap(), report, "read again, still there");
     use std::os::unix::fs::PermissionsExt;
-    let id = &ids[0];
-    let listed = || b.keep_report().unwrap().iter().any(|u| u.entry.as_ref() == Some(id));
-    let entry = displaced::get(id).unwrap();
-    let dir = entry.path.parent().unwrap();
-    let index = displaced::root().unwrap().join(".index").join(id);
-    for file in [dir.join("entry.json"), index.clone()] {
-        let bytes = fs::read(&file).unwrap();
-        write(&file, "invalid json");
-        assert!(listed(), "{file:?}");
-        fs::write(file, bytes).unwrap();
+    for adopt_both in [true, false] {
+        let f = Fleet::new();
+        let b = f.b();
+        let (_, remote) = kept_clash(&f);
+        interrupt_keep(&b, Point::KeepSettle, None);
+        let report = finish_keeping_now(&b).unwrap();
+        assert_eq!(git(&f.b, &["rev-parse", "HEAD"]), remote, "the pull side is done");
+        let ids: Vec<String> = report.iter().filter_map(|u| u.entry.clone()).collect();
+        assert_eq!(ids.len(), 2, "{report:?}");
+        let saved = f.b.join(".git/sk1ll-keep-report.json");
+        assert!(saved.exists());
+        assert_eq!(b.keep_report().unwrap(), report, "read again, still there");
+        let listed = |id: &String| b.keep_report().unwrap().iter().any(|u| u.entry.as_ref() == Some(id));
+        if !adopt_both {
+            let id = &ids[0];
+            let entry = displaced::get(id).unwrap();
+            let dir = entry.path.parent().unwrap();
+            let index = displaced::root().unwrap().join(".index").join(id);
+            for file in [dir.join("entry.json"), index.clone()] {
+                let bytes = fs::read(&file).unwrap();
+                write(&file, "invalid json");
+                assert!(listed(id), "{file:?}");
+                fs::write(file, bytes).unwrap();
+            }
+            for path in [&index, dir] {
+                let permissions = fs::metadata(path).unwrap().permissions();
+                fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+                let retained = listed(id);
+                fs::set_permissions(path, permissions).unwrap();
+                assert!(retained, "{path:?}");
+            }
+        }
+        // Each kept version comes back with `recover adopt`, as it was.
+        let originals = [("personal/pdf/SKILL.md", "b's edit\n"), ("personal/pdf/notes.md", "b's notes\n")];
+        let adopted = if adopt_both { &ids[..] } else { &ids[..1] };
+        let lock = EngineLock::acquire(b.root()).unwrap();
+        let mut dests = Vec::new();
+        for id in adopted {
+            let dest = displaced::get(id).unwrap().dest;
+            let rel = dest.strip_prefix(&f.b).unwrap().to_str().unwrap().to_owned();
+            let (_, original) = originals.iter().find(|(path, _)| *path == rel).expect("a kept file");
+            displaced::adopt(&b, id, &lock).unwrap();
+            assert_eq!(read(&dest), *original, "{rel}");
+            dests.push(rel);
+        }
+        drop(lock);
+        if adopt_both {
+            dests.sort();
+            assert_eq!(dests, originals.map(|(path, _)| path), "each kept file is adopted once");
+        } else {
+            assert!(!listed(&ids[0]) && listed(&ids[1]));
+            displaced::discard(&ids[1]).unwrap();
+        }
+        for _ in 0..2 {
+            let notes = b.keep_report().unwrap();
+            assert_eq!(notes.len(), 1, "{notes:?}");
+            assert!(notes[0].entry.is_none() && notes[0].error.contains("ref.md"));
+        }
+        assert_eq!(b.dismiss_keep_notes().unwrap(), 1);
+        assert!(b.keep_report().unwrap().is_empty());
+        assert_eq!(b.dismiss_keep_notes().unwrap(), 0);
+        assert!(!saved.exists());
     }
-    for path in [&index, dir] {
-        let permissions = fs::metadata(path).unwrap().permissions();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
-        let retained = listed();
-        fs::set_permissions(path, permissions).unwrap();
-        assert!(retained, "{path:?}");
-    }
-    // Each kept version comes back with `recover adopt`.
-    let lock = EngineLock::acquire(b.root()).unwrap();
-    let kept = read(&entry.path);
-    displaced::adopt(&b, &ids[0], &lock).unwrap();
-    assert_eq!(read(&entry.dest), kept);
-    drop(lock);
-    let left = b.keep_report().unwrap();
-    assert!(
-        left.iter().all(|u| u.entry.as_ref() != Some(&ids[0]))
-            && left.iter().any(|u| u.entry.as_ref() == Some(&ids[1]))
-    );
-    displaced::discard(&ids[1]).unwrap();
-    for _ in 0..2 {
-        let notes = b.keep_report().unwrap();
-        assert_eq!(notes.len(), 1, "{notes:?}");
-        assert!(notes[0].entry.is_none() && notes[0].error.contains("ref.md"));
-    }
-    assert_eq!(b.dismiss_keep_notes().unwrap(), 1);
-    assert!(b.keep_report().unwrap().is_empty());
-    assert_eq!(b.dismiss_keep_notes().unwrap(), 0);
-    assert!(!saved.exists());
 }
 
 /// Staging the user did at a kept path is refused before anything

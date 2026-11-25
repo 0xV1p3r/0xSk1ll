@@ -14,7 +14,7 @@ fn stale_index_entries_refuse_skill_and_rule_updates() {
     for case in ["skill update", "skill removal", "rule update", "rule removal"] {
         for point in [None, Some(Point::BeforeSwap), Some(Point::AfterAside)] {
             let d = Displacement::new(case);
-            let _home = d.tmp.enter();
+            let _home = d.home.enter();
             let action = d.action();
             let before = fs::read(&d.file).unwrap();
             let holder = d.holder.clone();
@@ -40,7 +40,7 @@ fn stale_index_entries_refuse_skill_and_rule_updates() {
 #[test]
 fn a_partially_written_index_invalidates_the_plan() {
     let d = Displacement::new("skill update");
-    let _home = d.tmp.enter();
+    let _home = d.home.enter();
     let action = d.action();
     write(&d.holder.join(INDEX_PATH), "{");
     assert_changed(apply(&d.repo, &action), &d.dest);
@@ -117,7 +117,7 @@ fn rename_never_replaces_an_occupied_slot() {
 fn an_index_save_preserves_an_editor_replacement() {
     for operation in ["skill update", "skill removal"] {
         let d = Displacement::new(operation);
-        let _home = d.tmp.enter();
+        let _home = d.home.enter();
         let action = d.action();
         let mut edited = read_index(&d.holder);
         edited["entries"]["other"] = edited["entries"]["pdf"].clone();
@@ -136,7 +136,7 @@ fn an_index_save_preserves_an_editor_replacement() {
 #[test]
 fn recovery_can_read_an_index_whose_publication_was_interrupted() {
     let d = Displacement::new("skill removal");
-    let _home = d.tmp.enter();
+    let _home = d.home.enter();
     let index = d.holder.join(INDEX_PATH);
     let backup = d.holder.join(".sk1ll-state/index-rollback/previous");
     fs::create_dir_all(backup.parent().unwrap()).unwrap();
@@ -154,7 +154,7 @@ fn recovery_can_read_an_index_whose_publication_was_interrupted() {
 fn an_open_index_descriptor_keeps_late_writes_in_the_archive() {
     use std::io::Write;
     let d = Displacement::new("skill update");
-    let _home = d.tmp.enter();
+    let _home = d.home.enter();
     let index = d.holder.join(INDEX_PATH);
     let mut open = fs::OpenOptions::new().append(true).open(&index).unwrap();
     apply(&d.repo, &d.action()).unwrap();

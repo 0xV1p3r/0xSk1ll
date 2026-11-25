@@ -2,26 +2,25 @@
 
 mod sync_common;
 
-use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::symlink;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::time::Duration;
 
 use sk1ll_core::failpoints::{self, Action as Fault, Hit, Point};
 use sk1ll_core::sync::{self, IndexEntry, PLACEMENT_MARKER, displaced};
-use sk1ll_core::{
-    ActionKind, Assignment, EngineLock, Harness, InstructionsFormat, LinkMode, PlanOptions, Repo, Result,
-};
-use sk1ll_testkit::{Home, child, read, write};
+use sk1ll_core::{ActionKind, Assignment, EngineLock, InstructionsFormat, LinkMode, PlanOptions, Repo, Result};
+use sk1ll_testkit::{child, read, write};
 
 use sync_common::{
-    edit_rule_body, inode, instructions_harness, instructions_setup, read_index, rule_id, skill_id, skill_setup,
+    Placed, Target, assert_changed, inode, instructions_harness, read_index, reported, sk1ll_leftovers, with_hook,
 };
 
 const HARNESS_EDIT: &str = "Hand edit in the harness.";
 const REPO_EDIT: &str = "Unpublished repo edit.";
 const CONCURRENT_EDIT: &str = "Concurrent editor save.";
+const UPDATED: &str = "Updated in the repo.\n";
 
 #[derive(Clone, Copy, Debug)]
 enum Shape {
@@ -36,6 +35,7 @@ enum Shape {
     AdoptSkill,
     AdoptRule,
     BlockCreate,
+    BlockAppend,
     BlockUpdate,
     LinkedBlockUpdate,
     BlockRemove,
@@ -65,74 +65,58 @@ impl Shape {
     }
 
     fn is_block(self) -> bool {
-        matches!(self, Self::BlockCreate | Self::BlockUpdate | Self::LinkedBlockUpdate | Self::BlockRemove)
+        matches!(
+            self,
+            Self::BlockCreate | Self::BlockAppend | Self::BlockUpdate | Self::LinkedBlockUpdate | Self::BlockRemove
+        )
     }
 }
 
 struct Scenario {
     shape: Shape,
-    home: Home,
-    repo: Repo,
-    harnesses: BTreeMap<String, Harness>,
-    assignment: Assignment,
-    dest: PathBuf,
-    source: PathBuf,
+    placed: Placed,
+}
+
+impl std::ops::Deref for Scenario {
+    type Target = Placed;
+    fn deref(&self) -> &Placed {
+        &self.placed
+    }
 }
 
 impl Scenario {
     fn new(shape: Shape) -> Self {
         use Shape::*;
-        let (home, repo, mut harnesses, dest, source) = if shape.is_skill() {
-            let mode =
-                if matches!(shape, FirstLink | LinkToCopy | RemoveLink) { LinkMode::Symlink } else { LinkMode::Copy };
-            let (home, repo, harnesses) = skill_setup(mode);
-            let dest = home.path().join("skills/pdf");
-            let source = repo.personal_dir().join("pdf");
-            (home, repo, harnesses, dest, source)
-        } else {
-            let format = if shape.is_block() { InstructionsFormat::Block } else { InstructionsFormat::Rules };
-            let (home, repo, harnesses, location) = instructions_setup(format);
-            let dest = if shape.is_block() { location } else { location.join("git.md") };
-            let source = repo.root().join("instructions/git.md");
-            (home, repo, harnesses, dest, source)
+        let target = match shape {
+            FirstLink | LinkToCopy | RemoveLink => Target::Link,
+            shape if shape.is_skill() => Target::Copy,
+            shape if shape.is_block() => Target::Block,
+            _ => Target::Rules,
         };
-        let _home = home.enter();
-        let mut assignment = Assignment::default();
-
-        if matches!(shape, BlockCreate) {
-            write(&dest, "# User instructions\n");
+        let mut placed = Placed::new(target);
+        let _home = placed.home.enter();
+        if matches!(shape, BlockAppend) {
+            write(&placed.dest, "# User instructions\n");
         } else if matches!(shape, LinkedBlockUpdate) {
-            let target = home.path().join("dotfiles/AGENTS.md");
+            let target = placed.home.path().join("dotfiles/AGENTS.md");
             write(&target, "# User instructions\n");
-            symlink(target, &dest).unwrap();
+            symlink(target, &placed.dest).unwrap();
         }
-        if !matches!(shape, FirstCopy | FirstLink | RuleCreate | BlockCreate) {
-            let actions = sync::plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap();
-            assert_eq!(actions.len(), 1);
-            sync::apply(&repo, &actions[0]).unwrap();
+        if !matches!(shape, FirstCopy | FirstLink | RuleCreate | BlockCreate | BlockAppend) {
+            placed.sync();
         }
         match shape {
-            CopyToLink => harnesses.get_mut("h").unwrap().mode = LinkMode::Symlink,
-            LinkToCopy => harnesses.get_mut("h").unwrap().mode = LinkMode::Copy,
-            Update => write(&source.join("SKILL.md"), "Updated PDF skill.\n"),
-            Remove | RemoveLink => assignment.set_skill("h", &skill_id(&repo, "pdf"), false),
-            RuleRemove | BlockRemove => assignment.set_rule("h", &rule_id(&repo, "git"), false),
-            RuleUpdate | BlockUpdate | LinkedBlockUpdate => edit_rule_body(&source, "Updated Git rule.\n"),
-            Force | AdoptSkill => {
-                write(&dest.join("SKILL.md"), &format!("{HARNESS_EDIT}\n"));
-                write(&source.join("SKILL.md"), &format!("{REPO_EDIT}\n"));
+            CopyToLink => placed.harnesses.get_mut("h").unwrap().mode = LinkMode::Symlink,
+            LinkToCopy => placed.harnesses.get_mut("h").unwrap().mode = LinkMode::Copy,
+            Update | RuleUpdate | BlockUpdate | LinkedBlockUpdate => placed.update(UPDATED),
+            Remove | RemoveLink | RuleRemove | BlockRemove => placed.unassign(),
+            Force | AdoptSkill | AdoptRule => {
+                write(&placed.file(&placed.dest), &format!("{HARNESS_EDIT}\n"));
+                placed.update(&format!("{REPO_EDIT}\n"));
             }
-            AdoptRule => {
-                write(&dest, &format!("{HARNESS_EDIT}\n"));
-                edit_rule_body(&source, &format!("{REPO_EDIT}\n"));
-            }
-            FirstCopy | FirstLink | RuleCreate | BlockCreate => {}
+            FirstCopy | FirstLink | RuleCreate | BlockCreate | BlockAppend => {}
         }
-        Self { shape, home, repo, harnesses, assignment, dest, source }
-    }
-
-    fn file(&self, path: &Path) -> PathBuf {
-        if self.shape.is_skill() { path.join("SKILL.md") } else { path.to_path_buf() }
+        Self { shape, placed }
     }
 
     fn plan(&self, repo: &Repo, force: bool) -> Result<Vec<sk1ll_core::Action>> {
@@ -188,7 +172,7 @@ impl Scenario {
             }
             shape => {
                 let expected = match shape {
-                    RuleUpdate | BlockUpdate | LinkedBlockUpdate => "Updated Git rule.",
+                    RuleUpdate | BlockUpdate | LinkedBlockUpdate => UPDATED,
                     AdoptRule => HARNESS_EDIT,
                     _ => "Use CC.",
                 };
@@ -247,7 +231,7 @@ impl Scenario {
             self.assert_preserved(HARNESS_EDIT, label);
             self.assert_preserved(REPO_EDIT, label);
         }
-        if matches!(self.shape, Shape::BlockCreate | Shape::LinkedBlockUpdate) {
+        if matches!(self.shape, Shape::BlockAppend | Shape::LinkedBlockUpdate) {
             self.assert_preserved("# User instructions", label);
         }
     }
@@ -298,12 +282,21 @@ fn crash_sweep(shapes: &[Shape]) {
             let case = Scenario::new(shape);
             let _home = case.home.enter();
             let label = format!("{shape:?}, hit {n} {}", hit.point.name());
+            let repo_version = fs::read(case.file(&case.source)).ok();
             let crash = {
                 let _fault = failpoints::crash_at(n);
                 failpoints::catch(|| case.run()).unwrap_err()
             };
             assert_eq!(crash.point, hit.point, "{label}");
             case.assert_original_edits(&label);
+            if shape.is_adopt() && hit.point == Point::AfterRename {
+                // The repo version, moved aside for the adoption: owned by
+                // the repo, for its own path, and never pruned meanwhile.
+                let [entry] = &displaced::list().unwrap()[..] else { panic!("{label}: one entry") };
+                assert_eq!((entry.harness.as_str(), &entry.dest), ("repo", &case.source), "{label}");
+                assert!(!displaced::prune_with(Duration::ZERO, u64::MAX).unwrap().contains(&entry.id), "{label}");
+                assert_eq!(fs::read(case.file(&entry.path)).ok(), repo_version, "{label}");
+            }
             let backups: Vec<_> = displaced::list()
                 .unwrap()
                 .into_iter()
@@ -355,7 +348,7 @@ use Shape::*;
 
 const SKILLS: &[Shape] = &[FirstCopy, FirstLink, Update, CopyToLink, LinkToCopy, Remove, RemoveLink, Force];
 const INSTRUCTIONS: &[Shape] =
-    &[BlockCreate, BlockUpdate, LinkedBlockUpdate, BlockRemove, RuleCreate, RuleUpdate, RuleRemove];
+    &[BlockCreate, BlockAppend, BlockUpdate, LinkedBlockUpdate, BlockRemove, RuleCreate, RuleUpdate, RuleRemove];
 const ADOPT: &[Shape] = &[AdoptSkill, AdoptRule];
 
 #[test]
@@ -386,6 +379,47 @@ fn an_edit_at_any_instructions_step_survives_sync_and_retry() {
 #[test]
 fn an_edit_at_any_adopt_step_survives_adopt_and_retry() {
     edit_sweep(ADOPT);
+}
+
+/// An editor's atomic save over a managed rule, or a regular file that
+/// appears at a vacant rule, block or skill link destination, after sync's
+/// last check stays live byte for byte, and sync stops with a conflict.
+#[test]
+fn an_atomic_save_or_newcomer_after_the_last_check_stays_live() {
+    let save = |dest: &Path| {
+        let stage = dest.with_extension("editor");
+        write(&stage, "Editor save.\n");
+        fs::rename(stage, dest).unwrap();
+    };
+    let cases = [
+        (RuleUpdate, Point::AfterCheck),
+        (RuleUpdate, Point::AfterAside),
+        (RuleCreate, Point::AfterCheck),
+        (BlockCreate, Point::AfterCheck),
+        (FirstLink, Point::AfterCheck),
+    ];
+    for (shape, point) in cases {
+        let case = Scenario::new(shape);
+        let _home = case.home.enter();
+        let label = format!("{shape:?} at {}", point.name());
+        let before = fs::read(&case.dest).ok();
+        let result = with_hook(point, save, || case.run());
+        assert!(fs::symlink_metadata(&case.dest).unwrap().is_file(), "{label}");
+        assert_eq!(read(&case.dest), "Editor save.\n", "{label}");
+        if point == Point::AfterAside {
+            let entry = reported(result);
+            assert_eq!((&entry.dest, fs::read(&entry.path).ok()), (&case.dest, before), "{label}");
+        } else {
+            assert_changed(result, &case.dest);
+            assert!(displaced::list().unwrap().is_empty(), "{label}");
+        }
+        let parent = case.dest.parent().unwrap();
+        assert!(sk1ll_leftovers(parent).is_empty(), "{label}: {:?}", sk1ll_leftovers(parent));
+        if !shape.is_block() {
+            let kinds: Vec<_> = case.plan(&case.repo, false).unwrap().into_iter().map(|a| (a.dest, a.kind)).collect();
+            assert_eq!(kinds, [(case.dest.clone(), ActionKind::Conflict)], "{label}");
+        }
+    }
 }
 
 #[test]

@@ -14,7 +14,7 @@ use sync_common::*;
 #[test]
 fn the_recovery_stamp_covers_payloads_beside_instructions() {
     let d = Displacement::new("block update");
-    let _home = d.tmp.enter();
+    let _home = d.home.enter();
     // Only a block edited by hand leaves an entry when it is rewritten (forced).
     let text = fs::read_to_string(&d.dest).unwrap();
     write(&d.dest, &text.replace("Use CC.", "Use CC by hand."));
@@ -34,7 +34,7 @@ fn pruning_rechecks_queued_entries_and_includes_git_and_modes() {
     use std::io::Write;
     for case in ["queued write", "git metadata", "empty directory", "mode"] {
         let d = Displacement::new("skill update");
-        let _home = d.tmp.enter();
+        let _home = d.home.enter();
         let mut open = fs::OpenOptions::new().append(true).open(&d.file).unwrap();
         apply(&d.repo, &d.action()).unwrap();
         let entry = d.entry();
@@ -77,7 +77,7 @@ fn edits_since_placement_conflict_and_forced_swaps_keep_the_backup() {
     use std::os::unix::fs::PermissionsExt;
     for case in ["git init", "mode", "empty directory"] {
         let d = Displacement::new("skill update");
-        let _home = d.tmp.enter();
+        let _home = d.home.enter();
         match case {
             "git init" => {
                 sk1ll_testkit::git::git(&d.dest, &["init", "-q"]);
@@ -175,7 +175,7 @@ fn recovery_refuses_a_symlinked_scratch_root() {
 #[test]
 fn a_forced_swap_interrupted_after_detach_preserves_the_edited_backup() {
     let d = Displacement::new("skill update");
-    let _home = d.tmp.enter();
+    let _home = d.home.enter();
     write(&d.file, "Hand-edited original.\n");
     let actions = plan(&d.repo, &d.harnesses, &d.assignment, PlanOptions { force: true }).unwrap();
     let stopped = std::panic::catch_unwind(|| {
@@ -462,7 +462,7 @@ fn late_writes_after_sync_reach_the_recovery_copy() {
     use std::io::Write;
     for case in ["skill update", "skill removal", "rule update", "rule removal"] {
         let d = Displacement::new(case);
-        let _home = d.tmp.enter();
+        let _home = d.home.enter();
         let mut open = fs::OpenOptions::new().append(true).open(&d.file).unwrap();
         apply(&d.repo, &d.action()).unwrap();
         open.write_all(b"Written after sync returned.\n").unwrap();
@@ -479,7 +479,7 @@ fn displaced_content_never_goes_back_over_what_appeared_meanwhile() {
     use std::io::Write;
     for case in ["rule removal", "skill removal", "link removal", "skill update"] {
         let d = Displacement::new(case);
-        let _home = d.tmp.enter();
+        let _home = d.home.enter();
         let action = d.action();
         // A removal is called off by an edit made right before the content
         // is moved into recovery; the update fails on the newcomer itself.
@@ -514,7 +514,7 @@ fn displaced_content_never_goes_back_over_what_appeared_meanwhile() {
 fn adopting_a_block_entry_is_refused_while_the_managed_block_is_edited_by_hand() {
     use std::io::Write;
     let d = Displacement::new("block update");
-    let _home = d.tmp.enter();
+    let _home = d.home.enter();
     let action = d.action();
     let mut open = fs::OpenOptions::new().append(true).open(&d.dest).unwrap();
     let late = move |_: &Path| open.write_all(b"Outside note.\n").unwrap();
@@ -574,7 +574,7 @@ fn displacing_fails_closed_if_the_move_crosses_filesystems() {
     use std::os::unix::fs::MetadataExt;
     for case in ["skill update", "skill removal", "rule update", "rule removal", "block update"] {
         let d = Displacement::new(case);
-        let _home = d.tmp.enter();
+        let _home = d.home.enter();
         let action = d.action();
         let (before, inode) = (fs::read(&d.file).unwrap(), fs::metadata(&d.file).unwrap().ino());
         // Every move or link into an entry crosses file systems, which
@@ -596,7 +596,7 @@ fn displacing_fails_closed_if_the_move_crosses_filesystems() {
 #[test]
 fn recovery_entries_are_found_wherever_they_are() {
     let d = Displacement::new("rule update");
-    let _home = d.tmp.enter();
+    let _home = d.home.enter();
     let state = displaced::root().unwrap();
 
     apply(&d.repo, &d.action()).unwrap();
@@ -633,7 +633,7 @@ fn recovery_entries_are_found_wherever_they_are() {
     assert_eq!(displaced::list().unwrap(), [displaced::get("0000000000001-h-old.md").unwrap(), entry.clone()]);
 
     // A record pointing anywhere else is never followed.
-    let victim = d.tmp.path().join("victim");
+    let victim = d.home.path().join("victim");
     write(&victim.join("content"), "Not sk1ll's.\n");
     write(&victim.join("entry.json"), &meta);
     write(&state.join(".index/victim"), &serde_json::to_string(&victim).unwrap());
@@ -649,7 +649,7 @@ fn recovery_entries_are_found_wherever_they_are() {
 #[test]
 fn recover_adopt_keeps_an_entry_whose_copy_left_something_out() {
     let d = Displacement::new("skill update");
-    let _home = d.tmp.enter();
+    let _home = d.home.enter();
     write(&d.dest.join(".git/HEAD"), "git\n");
     let forced = plan(&d.repo, &d.harnesses, &d.assignment, PlanOptions { force: true }).unwrap();
     apply(&d.repo, &forced[0]).unwrap();
@@ -669,12 +669,12 @@ fn recover_adopt_keeps_an_entry_whose_copy_left_something_out() {
 fn pruning_never_deletes_recursively() {
     for case in ["new file", "new directory", "edited file", "renamed away"] {
         let d = Displacement::new("skill update");
-        let _home = d.tmp.enter();
+        let _home = d.home.enter();
         apply(&d.repo, &d.action()).unwrap();
         let entry = d.entry();
         assert!(!entry.changed);
         let content = entry.path.clone();
-        let outside = d.tmp.path().join("moved.md");
+        let outside = d.home.path().join("moved.md");
         let target = outside.clone();
         let pruned = with_hook(
             Point::HashBeforeRemoval,
@@ -784,7 +784,7 @@ fn adopting_recovered_skill_bytes_keeps_harness_only_sidecars() {
 
     for remove in [false, true] {
         let d = Displacement::new("skill update");
-        let _home = d.tmp.enter();
+        let _home = d.home.enter();
         let id = skill_id(&d.repo, "pdf");
         write(&d.dest.join(ID_FILE), "harness-sidecar\n");
         if remove {
