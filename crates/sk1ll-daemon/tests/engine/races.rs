@@ -169,9 +169,16 @@ async fn take_out_request(c: &sk1ll_daemon::client::Client) -> HarnessChangeRequ
 
 #[test]
 fn take_out_only_disables_a_harness_after_a_complete_scan_and_preserves_concurrent_edits() {
-    for scenario in
-        ["stale preview", "first scan", "second scan", "config edit", "removed by hand", "disabled by hand", "clean"]
-    {
+    for scenario in [
+        "stale preview",
+        "first scan",
+        "removal fails",
+        "second scan",
+        "config edit",
+        "removed by hand",
+        "disabled by hand",
+        "clean",
+    ] {
         let (m, cfg) = fixture();
         let _home = m.home.enter();
         m.repo.skill(Skill::new("pdf").id("pdf"));
@@ -192,6 +199,16 @@ fn take_out_only_disables_a_harness_after_a_complete_scan_and_preserves_concurre
             if scenario == "first scan" {
                 write(&index, "corrupt");
             }
+            // The copy can't be moved aside, so it stays, and so does a readable index.
+            let skills = m.root().join("skills");
+            let blocked = (scenario == "removal fails").then(|| {
+                failpoints::install_shared(move |point, path| match point {
+                    Point::RecoveryRename if path.starts_with(&skills) => {
+                        Action::Fail(std::io::ErrorKind::PermissionDenied)
+                    }
+                    _ => Action::Continue,
+                })
+            });
             let point = if scenario == "second scan" {
                 Point::DaemonBeforeTakeOutWrite
             } else {
@@ -214,6 +231,12 @@ fn take_out_only_disables_a_harness_after_a_complete_scan_and_preserves_concurre
                 assert_eq!(read(&cfg.machine_config), before);
                 assert!(placed(&m, "pdf").exists());
                 assert!(result.taken_out.is_empty());
+            } else if scenario == "removal fails" {
+                assert_eq!(read(&cfg.machine_config), before);
+                assert!(placed(&m, "pdf").exists());
+                assert!(result.taken_out.is_empty(), "{result:?}");
+                let left: Vec<_> = result.left.iter().map(|p| (p.kind.as_str(), p.name.as_str())).collect();
+                assert_eq!(left, [("remove", "pdf")], "{result:?}");
             } else {
                 assert_eq!(
                     result.taken_out.len(),
@@ -224,6 +247,7 @@ fn take_out_only_disables_a_harness_after_a_complete_scan_and_preserves_concurre
                 assert!(!placed(&m, "pdf").exists());
             }
             let message = match scenario {
+                "removal fails" => "1 placed item is still there",
                 "second scan" => "machine.toml was not changed",
                 "config edit" => "agent is still on",
                 "removed by hand" => "agent is no longer in machine.toml",
@@ -233,10 +257,18 @@ fn take_out_only_disables_a_harness_after_a_complete_scan_and_preserves_concurre
             if !message.is_empty() {
                 assert!(result.errors.iter().any(|e| e.contains(message)), "{result:?}");
             }
-            let enabled = ["first scan", "second scan", "config edit"].contains(&scenario);
+            let enabled = ["first scan", "removal fails", "second scan", "config edit"].contains(&scenario);
             assert_eq!(c.harnesses().await.unwrap().iter().any(|h| h.name == "agent"), enabled);
             if scenario == "config edit" {
                 assert!(read(&cfg.machine_config).ends_with("# edited by hand\n"));
+            }
+            if scenario == "removal fails" {
+                drop(blocked);
+                let retried = c.take_out_harness(&req).await.unwrap();
+                assert!(retried.applied && retried.left.is_empty(), "{retried:?}");
+                assert_eq!(retried.taken_out.len(), 1, "{retried:?}");
+                assert!(!placed(&m, "pdf").exists());
+                assert!(!c.harnesses().await.unwrap().iter().any(|h| h.name == "agent"));
             }
         });
     }

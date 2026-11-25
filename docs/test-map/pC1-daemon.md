@@ -50,7 +50,7 @@ error-to-status contract on a private type.
 - previews_through_the_daemon_never_reconcile -> previews_leave_a_pending_rename_for_the_writer_even_through_a_second_config_link (engine/main.rs)
 - taking_up_a_hand_edit_never_replaces_a_newer_one -> assignment_store_retries_on_a_newer_hand_edit_and_keeps_the_record_in_step (engine/races.rs, "startup", "refresh")
 - a_starting_daemon_writes_back_nothing_it_loaded -> assignment_store_retries_on_a_newer_hand_edit_and_keeps_the_record_in_step (engine/races.rs, "startup without edits")
-- take_out_disables_a_harness_only_once_its_placements_are_gone -> take_out_only_disables_a_harness_after_a_complete_scan_and_preserves_concurrent_edits (engine/races.rs, "clean")
+- take_out_disables_a_harness_only_once_its_placements_are_gone -> take_out_only_disables_a_harness_after_a_complete_scan_and_preserves_concurrent_edits (engine/races.rs, "removal fails": a removal failed at RecoveryRename leaves the index readable, `left` names the copy, machine.toml stays on, the items stay off, and the same reviewed request succeeds once the fault clears; "clean")
 - a_blocked_reconcile_without_a_keep_leaves_the_draft_alone -> blocked_pull_reports_clashes_and_keeps_files (daemon.rs, the clashing draft survives reconciles and a restart while blocked)
 - take_out_needs_a_complete_scan_before_it_changes_machine_toml -> take_out_only_disables_a_harness_after_a_complete_scan_and_preserves_concurrent_edits (engine/races.rs, "first scan")
 - take_out_reports_what_it_did_when_machine_toml_changed_meanwhile -> take_out_only_disables_a_harness_after_a_complete_scan_and_preserves_concurrent_edits (engine/races.rs, "config edit")
