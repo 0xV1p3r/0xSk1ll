@@ -626,14 +626,29 @@ async fn a_401_is_not_a_revocation() {
     let mut m = solo("solo", &server.url(), Some(snapshot(1, &["x"])));
     m.start().await;
 
+    // Every status a client is told about shows the rejection whole: the
+    // state, since when, and why, published together.
+    let mut events = m.client.events().await.unwrap();
     server.refuse_401().await;
-    let s = eventually(|| async {
-        let s = m.status().await;
-        (s.connection == Connection::AuthRejected && s.last_error.as_deref().is_some_and(|error| error.contains("401")))
-            .then_some(s)
+    let s = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match events.next().await {
+                Some(Ok(Event::Status)) => {
+                    let s = m.status().await;
+                    if s.connection == Connection::AuthRejected {
+                        assert!(s.auth_rejected_since.is_some(), "{s:?}");
+                        assert!(s.last_error.as_deref().is_some_and(|error| error.contains("401")), "{s:?}");
+                        break s;
+                    }
+                }
+                Some(Ok(_)) => {}
+                other => panic!("event stream ended: {other:?}"),
+            }
+        }
     })
-    .await;
-    assert!(!s.revoked && s.auth_rejected_since.is_some(), "{s:?}");
+    .await
+    .expect("no status showed the rejection");
+    assert!(!s.revoked, "{s:?}");
     assert!(!m.state().revoked, "not stored as revoked");
 
     // Still managing the harnesses.

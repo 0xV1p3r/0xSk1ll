@@ -71,27 +71,27 @@ impl Home {
 
     /// sk1ll's config directory as a binary run with this HOME finds it.
     pub fn config_dir(&self) -> PathBuf {
-        self.platform(".config", "Library/Application Support").join("sk1ll")
+        self.path().join(".config").join("sk1ll")
     }
 
     /// sk1ll's data directory (where the default repo is).
     pub fn data_dir(&self) -> PathBuf {
-        self.platform(".local/share", "Library/Application Support").join("sk1ll")
+        self.path().join(".local/share").join("sk1ll")
     }
 
     /// sk1ll's state directory (the recovery area is in it).
     pub fn state_dir(&self) -> PathBuf {
-        self.platform(".local/state", "Library/Application Support").join("sk1ll")
+        self.path().join(".local/state").join("sk1ll")
     }
 
     /// sk1ll's cache directory.
     pub fn cache_dir(&self) -> PathBuf {
-        self.platform(".cache", "Library/Caches").join("sk1ll")
+        self.path().join(".cache").join("sk1ll")
     }
 
     /// The daemon's default socket.
     pub fn socket(&self) -> PathBuf {
-        self.platform("run/sk1ll", "Library/Application Support/sk1ll/run").join("daemon.sock")
+        self.path().join("run/sk1ll").join("daemon.sock")
     }
 
     /// sk1ll's default repo for a binary run with this HOME.
@@ -111,10 +111,6 @@ impl Home {
     /// [`sk1ll_core::paths::use_dirs`] instead.
     pub fn enter(&self) -> Entered {
         Entered { _dirs: failpoints::dirs(self.dirs()), _git: failpoints::git_env(crate::git::ENV) }
-    }
-
-    fn platform(&self, unix: &str, macos: &str) -> PathBuf {
-        self.path().join(if cfg!(target_os = "macos") { macos } else { unix })
     }
 }
 

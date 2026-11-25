@@ -853,7 +853,7 @@ fn a_save_during_a_file_swap_is_kept_in_recovery() {
         }),
     )];
     // A new file renamed into place: only an exchange brings it back.
-    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     saves.push((
         "saved by rename\n",
         Box::new(|| {

@@ -200,5 +200,3 @@ fn systemctl(args: &[&str]) -> anyhow::Result<()> {
     }
     Ok(())
 }
-
-}

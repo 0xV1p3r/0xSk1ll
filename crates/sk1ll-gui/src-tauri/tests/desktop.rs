@@ -367,7 +367,7 @@ async fn editors_use_daemon_paths_and_keep_names_in_one_argument() {
         home.apply(&mut cmd)
             .current_dir(root)
             .env("PATH", root.join("bin"))
-            .env("TERMINAL", if cfg!(target_os = "macos") { "Terminal.app" } else { "kitty" })
+            .env("TERMINAL", "kitty")
             .env("XDG_DATA_DIRS", root.join("empty"))
             .env("SK1LL_EDITOR_HOME", root.join("user"))
             .env("SK1LL_EDITOR_XDG_CONFIG_HOME", root.join("user/config"))
@@ -423,7 +423,7 @@ async fn editors_use_daemon_paths_and_keep_names_in_one_argument() {
     let desktop = Desktop::new(&daemon.socket, &root.join("webview"));
 
     let code = root.join("My editor/bin/code");
-    let terminal = root.join(if cfg!(target_os = "macos") { "bin/Terminal.app" } else { "bin/kitty" });
+    let terminal = root.join("bin/kitty");
     for editor in [&code, &terminal, &root.join("bin/xdg-open"), &root.join("bin/nvim")] {
         write(
             editor,
@@ -438,9 +438,6 @@ printf '%s\0' "$HOME" "$XDG_CONFIG_HOME" "${XDG_CACHE_HOME-unset}" "${SK1LL_EDIT
         &root.join("user/data/applications/code.desktop"),
         &format!("[Desktop Entry]\nExec=\"{}\" --new-window %F\n", code.display()),
     );
-    if cfg!(target_os = "macos") {
-        fs::create_dir_all(root.join("user/Applications/Cursor.app")).unwrap();
-    }
 
     let editors = desktop.invoke("editors", json!({}));
     assert_eq!(editors["editors"][0], json!({"id":"code","name":"VS Code","kind":"gui"}));
@@ -452,9 +449,6 @@ printf '%s\0' "$HOME" "$XDG_CONFIG_HOME" "${XDG_CACHE_HOME-unset}" "${SK1LL_EDIT
             .iter()
             .any(|e| e == &json!({"id":"nvim","name":"Neovim","kind":"terminal"}))
     );
-    if cfg!(target_os = "macos") {
-        assert!(editors["editors"].as_array().unwrap().contains(&json!({"id":"cursor","name":"Cursor","kind":"gui"})));
-    }
     desktop.invoke("set_preferred_editor", json!({"editorId":"nvim"}));
     assert_eq!(desktop.invoke("editors", json!({"refresh":true}))["preferred_editor"], "nvim");
 
@@ -492,19 +486,10 @@ printf '%s\0' "$HOME" "$XDG_CONFIG_HOME" "${XDG_CACHE_HOME-unset}" "${SK1LL_EDIT
         let file = file.to_str().unwrap();
         let nvim = root.join("bin/nvim");
         let nvim = nvim.to_str().unwrap();
-        if cfg!(target_os = "macos") {
-            assert_eq!(args.len(), 5);
-            assert_eq!(&args[2..], ["--", nvim, file]);
-            assert_eq!(args[0], "-e");
-            assert!(args[1].contains("quoted form of (argument as text)"));
-            #[cfg(target_os = "macos")]
-            assert_mac_shell_round_trip(&args);
-        } else {
-            assert_eq!(args, ["--", nvim, file]);
-            for (editor, destination) in [("file-manager", folder.to_str().unwrap()), ("default-app", file)] {
-                desktop.invoke("open_in_editor", json!({"editorId":editor,"item":skill}));
-                assert_eq!(editor_arguments(&root), [destination]);
-            }
+        assert_eq!(args, ["--", nvim, file]);
+        for (editor, destination) in [("file-manager", folder.to_str().unwrap()), ("default-app", file)] {
+            desktop.invoke("open_in_editor", json!({"editorId":editor,"item":skill}));
+            assert_eq!(editor_arguments(&root), [destination]);
         }
     }
     desktop.invoke("open_in_editor", json!({"editorId":"code","item":"rule:git"}));
@@ -556,19 +541,4 @@ fn editor_arguments(root: &Path) -> Vec<String> {
     assert_eq!(args.next(), Some("unset"), "the sandbox cache path was removed");
     assert_eq!(args.next(), Some("unset"), "editor override variables were removed");
     args.map(str::to_owned).collect()
-}
-
-#[cfg(target_os = "macos")]
-fn assert_mac_shell_round_trip(args: &[String]) {
-    use std::process::Command;
-    let script = args[1].replace(
-        "    tell application \"Terminal\"\n        activate\n        do script shellCommand\n    end tell",
-        "    return shellCommand",
-    );
-    let path = &args[4];
-    let result =
-        Command::new("/usr/bin/osascript").args(["-e", &script, "--", "/usr/bin/printf", "%s", path]).output().unwrap();
-    let shell = outcome(result).unwrap();
-    let output = Command::new("/bin/sh").args(["-c", shell.trim_end()]).output().unwrap();
-    assert_eq!(outcome(output).unwrap(), *path);
 }

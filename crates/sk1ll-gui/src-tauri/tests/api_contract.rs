@@ -626,10 +626,10 @@ fn app_golden() -> Value {
         Progress::Downloading { .. } | Progress::Installing | Progress::RestartingDaemon | Progress::Relaunching => (),
     };
     let _every = |s: Started| match s {
-        Started::Systemd | Started::Launchd | Started::Process => (),
+        Started::Systemd | Started::Process => (),
     };
     let _every = |m: Manager| match m {
-        Manager::Systemd | Manager::Launchd => (),
+        Manager::Systemd => (),
     };
     let editors = EditorsView {
         preferred_editor: "code".into(),
@@ -651,8 +651,8 @@ fn app_golden() -> Value {
         "editors_view": sample(editors),
         "editor_kind": by_tag("kind", kinds.map(|kind| EditorView { id: "code".into(), name: "VS Code".into(), kind })),
         "service_info": written(service),
-        "service_manager": keyed([Manager::Systemd, Manager::Launchd].map(written), None),
-        "daemon_started": keyed([Started::Systemd, Started::Launchd, Started::Process].map(written), None),
+        "service_manager": keyed([Manager::Systemd].map(written), None),
+        "daemon_started": keyed([Started::Systemd, Started::Process].map(written), None),
         "available_update": [
             sample(AvailableUpdate { version: "0.2.0".into(), current_version: "0.1.0".into(), notes: Some("### Added".into()), date: Some("2026-11-01T00:00:00Z".into()) }),
             sample(AvailableUpdate { version: "0.2.0".into(), current_version: "0.1.0".into(), notes: None, date: None }),
