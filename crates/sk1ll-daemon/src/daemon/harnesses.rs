@@ -124,7 +124,7 @@ impl Daemon {
             .ok_or_else(|| Error::BadRequest("this client is older than the daemon; update it".into()))?;
         let _harnesses = self.harness_changes.lock().await;
         // Off the runtime: a test's callback may hold the take-out here.
-        #[cfg(any(test, feature = "failpoints"))]
+        #[cfg(feature = "failpoints")]
         {
             let config = self.cfg.machine_config.clone();
             let _ = tokio::task::spawn_blocking(move || sk1ll_core::failpoint!(DaemonTakeOutEntered, &config)).await;

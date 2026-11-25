@@ -2,7 +2,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-#[cfg(not(test))]
 use sk1ll_core::{Assignment, MachineConfig};
 
 /// How often a full reconcile runs by default (see [`Config::full_reconcile_every`]).
@@ -60,24 +59,8 @@ pub struct Config {
 }
 
 impl Config {
-    /// Defaults from the platform's config, cache and runtime dirs. In this
-    /// crate's own tests, from a temporary directory instead, which core's
-    /// state and cache directories follow too: no test reaches the real
-    /// home directory.
+    /// Defaults from the platform's config, cache and runtime directories.
     pub fn new() -> anyhow::Result<Self> {
-        #[cfg(test)]
-        {
-            let home = test_home();
-            Ok(Self::with_paths(
-                home.join("config/daemon.json"),
-                home.join("config/machine.toml"),
-                home.join("cache/assignment.json"),
-                home.join("state"),
-                home.join("cache"),
-                home.join("run/daemon.sock"),
-            ))
-        }
-        #[cfg(not(test))]
         Ok(Self::with_paths(
             config_dir()?.join("daemon.json"),
             MachineConfig::default_path()?,
@@ -206,19 +189,6 @@ impl Config {
     }
 }
 
-/// The temporary home of this crate's tests (see [`Config::new`]).
-#[cfg(test)]
-pub(crate) fn test_home() -> &'static std::path::Path {
-    static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-    HOME.get_or_init(|| {
-        let home = tempfile::tempdir().expect("a temporary directory");
-        let dirs = sk1ll_core::paths::Dirs { state: home.path().join("state"), cache: home.path().join("cache") };
-        sk1ll_core::paths::use_dirs(dirs);
-        home
-    })
-    .path()
-}
-
 fn config_dir() -> anyhow::Result<PathBuf> {
     dirs::config_dir().map(|d| d.join("sk1ll")).context("cannot determine the config directory")
 }
@@ -255,18 +225,4 @@ pub fn locate_repo(explicit: Option<&std::path::Path>, git_only: bool) -> anyhow
         }
     };
     Ok(std::path::absolute(path)?)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn durations() {
-        assert_eq!(parse_duration("250ms").unwrap(), Duration::from_millis(250));
-        assert_eq!(parse_duration("90").unwrap(), Duration::from_secs(90));
-        assert_eq!(parse_duration("5m").unwrap(), Duration::from_secs(300));
-        assert!(parse_duration("0s").is_err());
-        assert!(parse_duration("3w").is_err());
-    }
 }

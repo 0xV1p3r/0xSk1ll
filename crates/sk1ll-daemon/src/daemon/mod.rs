@@ -87,7 +87,7 @@ mod snapshot;
 mod views;
 
 pub(crate) use harness_rename::rename_write;
-pub(crate) use reconcile::run as reconcile_loop;
+pub(crate) use reconcile::{RACY_WINDOW, run as reconcile_loop};
 pub(crate) use snapshot::Snapshot;
 use {placement::*, reconcile::*, views::*};
 
@@ -198,8 +198,6 @@ pub(crate) struct Daemon {
     wakeups: Notify,
     /// The hashes of trees planning found unchanged (see [`HashCache`]).
     hashes: sk1ll_core::hash::HashCache,
-    /// How many reconciles planned a sync, for tests.
-    plans: std::sync::atomic::AtomicU64,
     /// The Draft changed since a stopped pull was last tried again (see
     /// [`Daemon::retry_stopped_pull`]).
     draft_moved: AtomicBool,
@@ -217,23 +215,11 @@ pub(crate) struct Engine {
     /// `None` until one succeeds, so the first one after startup is full.
     full_at: Option<std::time::Instant>,
     /// How long an Input must have been left alone to be recorded
-    /// ([`reconcile::RACY_WINDOW`]; tests widen it).
+    /// ([`reconcile::RACY_WINDOW`], or the window set by an integration test).
     racy: std::time::Duration,
 }
 
 impl Daemon {
-    #[cfg(test)]
-    pub(crate) fn new(cfg: Config, state: DaemonState) -> anyhow::Result<Arc<Self>> {
-        let lock = MachineLock::acquire(&cfg)?;
-        Self::for_machine(cfg, Some(state), Access::Daemon(lock))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn standalone(cfg: Config) -> anyhow::Result<Arc<Self>> {
-        let lock = MachineLock::acquire(&cfg)?;
-        Self::for_machine(cfg, None, Access::Daemon(lock))
-    }
-
     /// The daemon for `cfg`'s Machine. It takes the machine lock before it
     /// reads anything of the Machine, waiting up to `patience` for a
     /// command's engine to end, so it starts from what that engine saved,
@@ -242,12 +228,19 @@ impl Daemon {
         use anyhow::Context;
         let machine = MachineLock::wait(&cfg, patience).await.context("not starting")?;
         let state = DaemonState::load(&cfg.state)?;
-        Self::for_machine(cfg, state, Access::Daemon(machine))
+        Self::for_machine(cfg, state, Access::Daemon(machine), reconcile::RACY_WINDOW)
     }
 
     /// The engine for `cfg`'s Machine: joined if `state` says so. The
     /// caller took the machine lock `access` carries before it read `state`.
-    pub(crate) fn for_machine(cfg: Config, state: Option<DaemonState>, access: Access) -> anyhow::Result<Arc<Self>> {
+    /// `racy`: how long an Input must have been left alone to be recorded
+    /// ([`reconcile::RACY_WINDOW`], unless a test says otherwise).
+    pub(crate) fn for_machine(
+        cfg: Config,
+        state: Option<DaemonState>,
+        access: Access,
+        racy: std::time::Duration,
+    ) -> anyhow::Result<Arc<Self>> {
         let mode = match state {
             Some(state) => Mode::Joined(state),
             None => {
@@ -256,10 +249,10 @@ impl Daemon {
                 Mode::Standalone { machine_id: machine.id, repo }
             }
         };
-        Self::with_mode(cfg, mode, access)
+        Self::with_mode(cfg, mode, access, racy)
     }
 
-    fn with_mode(cfg: Config, state: Mode, access: Access) -> anyhow::Result<Arc<Self>> {
+    fn with_mode(cfg: Config, state: Mode, access: Access, racy: std::time::Duration) -> anyhow::Result<Arc<Self>> {
         let (on_demand, machine_lock) = match access {
             Access::Daemon(lock) => (false, Some(lock)),
             Access::OnDemand(lock) => (true, Some(lock)),
@@ -325,7 +318,7 @@ impl Daemon {
             net: tokio::sync::Mutex::new(()),
             assignment_writes: tokio::sync::Mutex::new(()),
             harness_changes: tokio::sync::Mutex::new(()),
-            engine: Mutex::new(Engine { lock: None, reconciled: None, full_at: None, racy: reconcile::RACY_WINDOW }),
+            engine: Mutex::new(Engine { lock: None, reconciled: None, full_at: None, racy }),
             view: watch::channel(view).0,
             events: broadcast::channel(256).0,
             assignment_session: watch::channel(None).0,
@@ -333,13 +326,7 @@ impl Daemon {
             roots: watch::channel(Vec::new()).0,
             http: crate::server::http_client().build().context("building the HTTP client")?,
             wakeups: Notify::new(),
-            // Tests reconcile trees they wrote a moment ago.
-            hashes: if cfg!(test) {
-                sk1ll_core::hash::HashCache::with_racy_window(std::time::Duration::ZERO)
-            } else {
-                sk1ll_core::hash::HashCache::new()
-            },
-            plans: Default::default(),
+            hashes: sk1ll_core::hash::HashCache::with_racy_window(racy),
             draft_moved: AtomicBool::new(false),
         }))
     }
@@ -766,6 +753,3 @@ fn unix_now() -> i64 {
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
-
-#[cfg(test)]
-mod tests;

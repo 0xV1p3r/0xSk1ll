@@ -181,15 +181,6 @@ pub(crate) async fn run(d: Arc<Daemon>) {
 
 /// A random delay in [d/2, d].
 fn jitter(d: Duration) -> Duration {
-    #[cfg(test)]
-    {
-        for duration in [Duration::ZERO, Duration::from_nanos(1), Duration::from_secs(60)] {
-            let micros =
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |t| t.subsec_micros());
-            let value = duration / 2 + duration.mul_f64(f64::from(micros % 1000) / 2000.0);
-            assert!(value >= duration / 2 && value <= duration);
-        }
-    }
     let micros = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |t| t.subsec_micros());
     let frac = f64::from(micros % 1000) / 1000.0;
     d / 2 + d.mul_f64(frac / 2.0)
