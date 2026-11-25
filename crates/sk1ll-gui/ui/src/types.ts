@@ -150,7 +150,7 @@ export interface ContentVariant {
   hash: string; description: string | null; locations: { harness: string; path: string }[]; resumable?: boolean;
 }
 export interface ContentEntry {
-  name: string; item: ItemRef | null; type: ContentType; description: string | null;
+  name: string; item: ItemRef | null; id: ItemId | null; type: ContentType; description: string | null;
   draft: DraftEntry['change'] | null; in_baseline: boolean; path: string | null;
   enabled_harnesses: string[]; clashes_with_repo: boolean; variants: ContentVariant[];
 }
@@ -177,7 +177,9 @@ export interface MachineAssignmentCopy {
   expected?: Expected;
   source_expected?: Expected;
 }
-export interface AssignmentCopyPreview { count: number; target: Expected; source: Expected }
+// `changes`: what the copy would toggle on the target.
+export interface CopyChange { harness: string; kind: ToggleKind; item_id?: ItemId; name?: string; before: boolean | null; after: boolean | null }
+export interface AssignmentCopyPreview { count: number; changes: CopyChange[]; target: Expected; source: Expected }
 // A newer app release (sk1ll-gui/src-tauri/src/updates.rs). `notes`: its CHANGELOG section; `date`: RFC 3339.
 export interface AvailableUpdate { version: string; current_version: string; notes: string | null; date: string | null }
 export type UpdateProgress = { stage: 'downloading'; percent: number | null } | { stage: 'installing' | 'restarting_daemon' | 'relaunching' };

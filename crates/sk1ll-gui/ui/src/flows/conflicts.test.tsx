@@ -1,0 +1,67 @@
+// Resolving what a Harness edit or a replaced file left: Harness conflicts and recovered content.
+import { expect, it } from 'vitest';
+import { screen, waitFor } from '@testing-library/react';
+import { dialog, heading, launch, nav } from './harness';
+
+it('resolves a Harness conflict from the Library banner and discards recovered content only after confirming', async () => {
+  const { daemon, user } = launch('fleet', { hash: '#/library' });
+  await heading('Library');
+  expect(await screen.findByText('This Machine has a Conflict')).toBeTruthy();
+  expect(screen.getByText('code-review', { selector: 'code' }).parentElement?.textContent).toContain('was edited in codex after the last sync.');
+  expect(await nav().findByLabelText('1 Conflict to resolve, 1 recovered item to review')).toBeTruthy();
+  await user.click(screen.getByRole('button', { name: 'Resolve' }));
+  const title = await heading('Conflicts');
+  await waitFor(() => expect(document.activeElement).toBe(title));
+  expect(screen.queryByRole('button', { name: 'Resolve' })).toBeNull();
+
+  // Up to three entries open their diffs; only the Harness conflict says when it was edited.
+  expect(screen.getByRole('heading', { name: 'Harness conflicts', level: 2 })).toBeTruthy();
+  expect(screen.getByRole('heading', { name: 'Recovered content', level: 2 })).toBeTruthy();
+  expect(screen.getAllByRole('button', { name: 'Hide diff' })).toHaveLength(2);
+  expect((await screen.findAllByLabelText('Conflict diff'))[0].textContent).toContain('-Harness content');
+  expect(screen.getAllByText(/^Edited/)).toHaveLength(1);
+  expect(screen.getByText('/home/dev/.local/share/sk1ll/recovered/d-1')).toBeTruthy();
+  expect(document.querySelector('time')?.getAttribute('tabindex')).toBe('0');
+  expect(daemon.sent('conflict_diff')).toEqual(expect.arrayContaining([{ request: { harness: 'codex', name: 'code-review' } }, { request: { id: 'd-1' } }]));
+
+  await user.click(screen.getByRole('button', { name: 'Overwrite code-review in codex' }));
+  let confirm = await dialog('Overwrite code-review in codex?');
+  expect(confirm.getByText('/home/dev/.codex/skills/code-review')).toBeTruthy();
+  await user.click(confirm.getByRole('button', { name: 'Cancel' }));
+  expect(daemon.sent('overwrite')).toEqual([]);
+
+  await user.click(screen.getByRole('button', { name: 'Adopt code-review from codex' }));
+  confirm = await dialog('Adopt code-review into the Draft?');
+  await user.click(confirm.getByRole('button', { name: 'Adopt into Draft' }));
+  expect(await screen.findByText('code-review is in the Draft')).toBeTruthy();
+  await waitFor(() => expect(screen.queryByRole('heading', { name: 'Harness conflicts' })).toBeNull());
+  expect(daemon.sent('adopt')).toEqual([{ target: { harness: 'codex', name: 'code-review' } }]);
+
+  await user.click(screen.getByRole('button', { name: 'Discard notes in claude' }));
+  confirm = await dialog('Discard notes in claude?');
+  expect(confirm.getByText(/Permanently remove recovered content for notes/)).toBeTruthy();
+  await user.click(confirm.getByRole('button', { name: 'Discard' }));
+  expect(await screen.findByText('No Conflicts')).toBeTruthy();
+  expect(screen.getByText("Every Harness matches this Machine's Draft.")).toBeTruthy();
+  expect(daemon.sent('discard_displaced')).toEqual([{ id: 'd-1' }]);
+
+  await user.click(screen.getByRole('button', { name: 'Review Draft' }));
+  await heading('Draft');
+  expect(await screen.findByRole('checkbox', { name: 'Select skill:code-review' })).toBeTruthy();
+});
+
+it('keeps diffs closed when four or more entries need review, loading each on demand', async () => {
+  const { daemon, user } = launch('fleet', { hash: '#/conflicts', setup: daemon => {
+    daemon.conflicts.push(...['pdf', 'deploy'].map(name => ({ ...daemon.conflicts[0], name, items: [`skill:${name}`], detected_at: null })));
+    daemon.recovered.push({ ...daemon.recovered[0], id: 'd-2', name: 'scratch' });
+  } });
+  await heading('Conflicts');
+  const toggles = await screen.findAllByRole('button', { name: 'Show diff' });
+  expect(toggles).toHaveLength(5);
+  expect(toggles[0].getAttribute('aria-expanded')).toBe('false');
+  expect(daemon.sent('conflict_diff')).toEqual([]);
+  await user.click(toggles[4]);
+  expect(await screen.findByLabelText('Conflict diff')).toBeTruthy();
+  expect(daemon.sent('conflict_diff')).toEqual([{ request: { id: 'd-2' } }]);
+  expect(screen.getAllByText(/^Edited/)).toHaveLength(1);
+});
