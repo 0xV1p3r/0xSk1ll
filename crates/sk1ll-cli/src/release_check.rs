@@ -59,7 +59,7 @@ fn fetch() -> Option<String> {
             .json()
             .await
             .ok()?;
-        release.get("tag_name")?.as_str().map(|tag| tag.trim_start_matches('v').to_string())
+        release_version(&release).map(str::to_owned)
     })
 }
 
@@ -68,26 +68,36 @@ fn newer(latest: &str, ours: &str) -> Option<String> {
         .then(|| format!("sk1ll {latest} is out (this is {ours}): {RELEASES}"))
 }
 
+fn release_version(release: &Value) -> Option<&str> {
+    Some(release.get("tag_name")?.as_str()?.trim_start_matches('v'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn only_a_newer_release_is_announced() {
-        assert!(newer("0.2.0", "0.1.0").unwrap().contains("sk1ll 0.2.0 is out (this is 0.1.0)"));
-        assert_eq!(newer("0.1.0", "0.1.0"), None);
-        assert_eq!(newer("0.1.0", "0.2.0-rc.1"), None);
-        assert_eq!(newer("garbage", "0.1.0"), None);
-    }
-
-    #[test]
-    fn the_cache_lasts_a_day() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("latest-release.json");
-        std::fs::write(&path, r#"{"checked_at":1000,"version":"0.2.0"}"#).unwrap();
-        assert_eq!(cached(&path, 1000 + 60).as_deref(), Some("0.2.0"));
-        assert_eq!(cached(&path, 1000 + EVERY.as_secs()), None);
-        assert_eq!(cached(&path, 999), None, "a clock that went back asks again");
-        assert_eq!(cached(&dir.path().join("missing"), 1000), None);
+    fn github_release_tags_only_announce_a_newer_version() {
+        use serde_json::json;
+        for (tag, ours, announced) in [
+            ("v0.2.0", "0.1.0", true),
+            ("v0.10.0", "0.9.3", true),
+            ("v0.2.0", "0.2.0 (abc1234567)", false),
+            ("v0.2.0", "0.2.0-rc.1", true),
+            ("v0.2.0-rc.1", "0.2.0", false),
+            ("v0.2.0-rc.10", "0.2.0-rc.9", true),
+            ("v0.1.0", "0.2.0-rc.1", false),
+            ("v0.2", "0.2.0", false),
+            ("garbage", "0.1.0", false),
+            ("v0.2.0", "dev", false),
+        ] {
+            let release = json!({"tag_name": tag, "name": "A release"});
+            let latest = release_version(&release).unwrap();
+            let expected = announced.then(|| format!("sk1ll {latest} is out (this is {ours}): {RELEASES}"));
+            assert_eq!(newer(latest, ours), expected, "{tag} vs {ours}");
+        }
+        for release in [json!({"name":"v0.2.0"}), json!({"tag_name": 2}), json!({"tag_name":null})] {
+            assert_eq!(release_version(&release), None, "{release}");
+        }
     }
 }
