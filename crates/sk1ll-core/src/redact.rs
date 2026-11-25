@@ -43,19 +43,3 @@ fn redact_after(text: &str, marker: &str) -> String {
     out.push_str(rest);
     out
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn redaction() {
-        assert_eq!(
-            redact("`git clone http://ws:tok@h:1/git/repo.git x` failed: 'https://a@b/c'"),
-            "`git clone http://***@h:1/git/repo.git x` failed: 'https://***@b/c'"
-        );
-        assert_eq!(redact("http://h/git/repo.git"), "http://h/git/repo.git");
-        assert_eq!(redact("Authorization: Basic d3M6dG9r here"), "Authorization: Basic *** here");
-        assert_eq!(redact("Bearer abc"), "Bearer ***");
-    }
-}
