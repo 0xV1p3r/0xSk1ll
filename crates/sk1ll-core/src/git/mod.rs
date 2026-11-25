@@ -80,11 +80,6 @@ impl Git {
         if let Some(dir) = dir {
             cmd.arg("-C").arg(dir);
         }
-        if cfg!(test) {
-            // Unit tests must not depend on the developer's own git config.
-            let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
-            cmd.env("GIT_CONFIG_GLOBAL", null).env("GIT_CONFIG_NOSYSTEM", "1");
-        }
         #[cfg(any(test, feature = "failpoints"))]
         crate::failpoints::thread_git_env(&mut cmd);
         cmd.env("LC_ALL", "C").env("LANGUAGE", "C");

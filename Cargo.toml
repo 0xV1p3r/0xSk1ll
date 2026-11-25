@@ -20,7 +20,7 @@ publish = false
 
 [workspace.dependencies]
 sk1ll-core = { path = "crates/sk1ll-core" }
-sk1ll-testkit = { path = "crates/sk1ll-testkit" }
+sk1ll-testkit = { path = "crates/sk1ll-testkit", features = ["failpoints"] }
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
