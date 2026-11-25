@@ -11,7 +11,6 @@ The daemon and the CLI need Unix.
 ## Deploy the server
 
 ```sh
-docker login ghcr.io                                      # the image is private for now
 export SK1LL_SERVER_ADMIN_TOKEN=$(openssl rand -hex 32)   # or put it in deploy/.env
 docker compose -f deploy/docker-compose.server.yml up -d
 ```

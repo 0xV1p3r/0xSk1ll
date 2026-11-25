@@ -1,5 +1,5 @@
 # docker compose -f deploy/docker-compose.server.yml up -d
-# Pulls the release image (the package is private: `docker login ghcr.io` first).
+# Pulls the release image from GHCR.
 # SK1LL_SERVER_VERSION picks the release (default: the one this file shipped with);
 # `docker compose -f deploy/docker-compose.server.yml up -d --build` builds from source instead.
 # Set SK1LL_SERVER_ADMIN_TOKEN (e.g. in deploy/.env) to bootstrap the first join code:
