@@ -670,3 +670,98 @@ fn empty_variables_use_defaults_and_missing_repos_name_the_path() {
     assert!(error.contains("no such directory") && error.contains("nowhere"), "{error}");
     assert!(!error.contains("POST") && !error.contains("/init"), "{error}");
 }
+
+/// Runs `command` with its standard output on a terminal (a pty), as a person would.
+fn on_a_terminal(mut command: std::process::Command) -> String {
+    use std::io::Read;
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let (mut master, mut slave) = (0, 0);
+    let (name, termios, size) = (std::ptr::null_mut(), std::ptr::null(), std::ptr::null());
+    // SAFETY: openpty writes two new descriptors, which are owned from here on.
+    assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, name, termios, size) }, 0);
+    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    let child = command.stdin(std::process::Stdio::null()).stdout(slave).stderr(std::process::Stdio::piped()).spawn();
+    // The command holds the terminal's other end: the read below ends once the child's copy closes.
+    drop(command);
+    let child = child.unwrap();
+    let mut shown = Vec::new();
+    // Linux reports EIO, not EOF, once the other end is closed.
+    let _ = std::fs::File::from(master).read_to_end(&mut shown);
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", text(&output));
+    String::from_utf8(shown).unwrap().replace("\r\n", "\n")
+}
+
+/// Answers the next request `stub` gets with `release` as GitHub's latest one.
+fn answer(stub: &std::net::TcpListener, release: &str) -> std::thread::JoinHandle<()> {
+    use std::io::{Read, Write};
+    let stub = stub.try_clone().unwrap();
+    let release = release.to_string();
+    std::thread::spawn(move || {
+        let (mut conn, _) = stub.accept().unwrap();
+        let (mut request, mut buf) = (Vec::new(), [0; 1024]);
+        while !request.ends_with(b"\r\n\r\n") {
+            let n = conn.read(&mut buf).unwrap();
+            assert!(n > 0, "the request ended early");
+            request.extend_from_slice(&buf[..n]);
+        }
+        let head = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close";
+        write!(conn, "{head}\r\ncontent-length: {}\r\n\r\n{release}", release.len()).unwrap();
+    })
+}
+
+#[test]
+fn status_on_a_terminal_announces_a_newer_release_checked_at_most_daily() {
+    let repo = with_pdf();
+    let stub = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/releases/latest", stub.local_addr().unwrap());
+    let status = || {
+        let mut command = command(&repo, &["status"]);
+        command.env("SK1LL_RELEASE_URL", &url).env("NO_PROXY", "127.0.0.1").env_remove("SK1LL_NO_UPDATE_CHECK");
+        command
+    };
+    let ours = env!("CARGO_PKG_VERSION");
+    let notice = |latest: &str| {
+        format!("sk1ll {latest} is out (this is {ours}): https://github.com/0xV1p3r/0xSk1ll/releases/latest")
+    };
+    let cache = repo.home.cache_dir().join("latest-release.json");
+    let asked = || {
+        stub.set_nonblocking(true).unwrap();
+        let asked = stub.accept().is_ok();
+        stub.set_nonblocking(false).unwrap();
+        asked
+    };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+
+    // Piped (a script): never asks.
+    assert!(!outcome(status().output().unwrap()).unwrap().contains("is out"));
+    assert!(!asked() && !cache.exists());
+    for (tag, announced) in [
+        (r#""v99.0.0""#.to_string(), Some("99.0.0")),
+        (format!(r#""v{ours}""#), None),
+        (format!(r#""v{ours}-rc.1""#), None),
+        (r#""v0.0.1""#.into(), None),
+        (r#""garbage""#.into(), None),
+        ("2".into(), None),
+    ] {
+        // A day-old answer is asked again.
+        write(&cache, &format!(r#"{{"checked_at":{},"version":"99.0.0"}}"#, now - 24 * 60 * 60));
+        let served = answer(&stub, &format!(r#"{{"tag_name":{tag},"name":"A release"}}"#));
+        let shown = on_a_terminal(status());
+        served.join().unwrap();
+        assert_eq!(
+            shown.lines().find(|line| line.contains("is out")),
+            announced.map(notice).as_deref(),
+            "{tag}: {shown}"
+        );
+    }
+    let served = answer(&stub, r#"{"tag_name":"v99.0.0"}"#);
+    on_a_terminal(status());
+    served.join().unwrap();
+    // Asked today: the cached answer, without asking again.
+    assert!(on_a_terminal(status()).contains(&notice("99.0.0")));
+    assert!(!asked());
+    let mut off = status();
+    off.env("SK1LL_NO_UPDATE_CHECK", "1");
+    assert!(!on_a_terminal(off).contains("is out"));
+}

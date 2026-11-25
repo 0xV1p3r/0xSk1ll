@@ -49,7 +49,7 @@ python3 crates/sk1ll-gui/tests/test_dev_fleet.py
 
 `--all-features` turns on the `failpoints` feature of sk1ll-core (and of the daemon and server, which forward to it): `sk1ll_core::failpoints` lets integration tests step into sync, pull and the daemon at named points, to edit files as a concurrent writer would or to crash there, and a build without the feature has none of it. Integration tests share their fixtures (isolated git, a seeded skills repo, `machine.toml` with presets off, an isolated HOME, a restartable server and daemon processes) through the dev-only `sk1ll-testkit` crate.
 
-The CLI's command tests run the `sk1ll` binary, each with its own `HOME` and XDG directories: every command runs the engine, which reconciles, and would otherwise find your own harnesses through the presets.
+The CLI's command tests run the `sk1ll` binary, each with its own `HOME` and XDG directories: every command runs the engine, which reconciles, and would otherwise find your own harnesses through the presets. No test reaches GitHub: the release notice of `sk1ll status` asks only when standard output is a terminal, and its test runs it on a pty with `SK1LL_RELEASE_URL` pointing at a local stub of GitHub's latest-release API.
 
 No test may write under the real home directory: tests get temporary directories, and in-process engines in the daemon's and core's own tests default every path (core's state and cache directories included) to one. `scripts/check-test-home.sh` runs `cargo test --workspace` with `HOME` set to an empty directory and the XDG variables unset, and fails if anything appears there.
 

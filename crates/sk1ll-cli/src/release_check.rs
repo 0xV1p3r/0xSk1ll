@@ -3,7 +3,8 @@
 //!
 //! It asks GitHub at most once a day, and only when standard output is a terminal, so scripts
 //! and tests never reach the network. `SK1LL_NO_UPDATE_CHECK=1` turns it off. The answer is
-//! cached in the cache directory; any failure just means no notice.
+//! cached in the cache directory; any failure just means no notice. `SK1LL_RELEASE_URL`
+//! replaces GitHub's latest-release API URL: tests point it at a stub.
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -49,7 +50,7 @@ fn fetch() -> Option<String> {
     rt.block_on(async {
         let client = reqwest::Client::builder().timeout(TIMEOUT).user_agent("sk1ll-cli").build().ok()?;
         let release: Value = client
-            .get(LATEST)
+            .get(std::env::var("SK1LL_RELEASE_URL").ok().filter(|url| !url.is_empty()).as_deref().unwrap_or(LATEST))
             .header("Accept", "application/vnd.github+json")
             .send()
             .await
@@ -70,34 +71,4 @@ fn newer(latest: &str, ours: &str) -> Option<String> {
 
 fn release_version(release: &Value) -> Option<&str> {
     Some(release.get("tag_name")?.as_str()?.trim_start_matches('v'))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn github_release_tags_only_announce_a_newer_version() {
-        use serde_json::json;
-        for (tag, ours, announced) in [
-            ("v0.2.0", "0.1.0", true),
-            ("v0.10.0", "0.9.3", true),
-            ("v0.2.0", "0.2.0 (abc1234567)", false),
-            ("v0.2.0", "0.2.0-rc.1", true),
-            ("v0.2.0-rc.1", "0.2.0", false),
-            ("v0.2.0-rc.10", "0.2.0-rc.9", true),
-            ("v0.1.0", "0.2.0-rc.1", false),
-            ("v0.2", "0.2.0", false),
-            ("garbage", "0.1.0", false),
-            ("v0.2.0", "dev", false),
-        ] {
-            let release = json!({"tag_name": tag, "name": "A release"});
-            let latest = release_version(&release).unwrap();
-            let expected = announced.then(|| format!("sk1ll {latest} is out (this is {ours}): {RELEASES}"));
-            assert_eq!(newer(latest, ours), expected, "{tag} vs {ours}");
-        }
-        for release in [json!({"name":"v0.2.0"}), json!({"tag_name": 2}), json!({"tag_name":null})] {
-            assert_eq!(release_version(&release), None, "{release}");
-        }
-    }
 }

@@ -22,7 +22,7 @@ Line coverage (`cargo llvm-cov -p sk1ll-cli -p sk1ll-gui --all-features --summar
 | sk1ll-cli/src/fleet.rs | 77.08% (88) | 84.10% (59) |
 | sk1ll-cli/src/harnesses.rs | 89.78% (28) | 87.68% (26) |
 | sk1ll-cli/src/main.rs | 81.52% (158) | 87.07% (112) |
-| sk1ll-cli/src/release_check.rs | 47.54% (32) | 46.38% (37) |
+| sk1ll-cli/src/release_check.rs | 47.54% (32) | 91.67% (4) |
 | sk1ll-cli/src/setup.rs | 64.33% (112) | 73.17% (77) |
 | sk1ll-gui/src-tauri/src/commands.rs | 35.56% (174) | 64.71% (96) |
 | sk1ll-gui/src-tauri/src/editors.rs | 76.31% (59) | 84.34% (39) |
@@ -30,7 +30,7 @@ Line coverage (`cargo llvm-cov -p sk1ll-cli -p sk1ll-gui --all-features --summar
 | sk1ll-gui/src-tauri/src/lib.rs | 0.00% (25) | 77.23% (23) |
 
 - `harnesses.rs`: the percentage falls only because the deleted inline tests no longer count as covered lines. Fewer production lines are missed (28 to 26).
-- `release_check.rs`: 5 more lines are missed: the cache read in `cached()`, which only the dropped `the_cache_lasts_a_day` reached. Tests never contact GitHub, so the check is not reachable end to end. The version comparison against the release JSON shape is still unit tested.
+- `release_check.rs`: `sk1ll status` runs on a pty against a local stub of GitHub's latest-release API (`SK1LL_RELEASE_URL`), so the check runs end to end; the 4 missed lines are failure exits (no cache directory, no clock, no runtime or HTTP client).
 - `events.rs`: the two missed lines are the 5 s subscription timeout and the backoff reset after a connection that lasted 30 s. Covering them would add at least 5 s and 30 s of wall time. Paused Tokio time would fire the timeout while real socket I/O is in flight, which makes the test flaky. The baseline missed these same lines plus the malformed-event path, which the event test now covers.
 
 
@@ -48,7 +48,7 @@ Line coverage (`cargo llvm-cov -p sk1ll-cli -p sk1ll-gui --all-features --summar
 
 ### `crates/sk1ll-cli/src/main.rs`
 
-- `releases_order_by_number_then_pre_release` -> `github_release_tags_only_announce_a_newer_version` (`crates/sk1ll-cli/src/release_check.rs`)
+- `releases_order_by_number_then_pre_release` -> `status_on_a_terminal_announces_a_newer_release_checked_at_most_daily` (`crates/sk1ll-cli/tests/lifecycle.rs`; newer, equal, pre-release of this build, older and unparsable tags against this build's version)
 - `import_dry_run_requires_a_name_and_rejects_force` -> `argument_errors_and_help_have_stable_exit_codes` (`crates/sk1ll-cli/tests/lifecycle.rs`)
 - `only_a_failed_fetch_of_the_bundled_link_falls_back` -> `add_uses_the_bundle_only_when_the_requested_source_cannot_be_fetched` (`crates/sk1ll-cli/tests/lifecycle.rs`)
 - `conflict_reasons_name_the_command_for_an_edit_by_hand` -> `previews_explain_which_harness_edits_can_be_adopted` (`crates/sk1ll-cli/tests/recovery.rs`)
@@ -56,8 +56,9 @@ Line coverage (`cargo llvm-cov -p sk1ll-cli -p sk1ll-gui --all-features --summar
 
 ### `crates/sk1ll-cli/src/release_check.rs`
 
-- `only_a_newer_release_is_announced` -> `github_release_tags_only_announce_a_newer_version` (`crates/sk1ll-cli/src/release_check.rs`)
-- `the_cache_lasts_a_day` dropped: the release-check cache TTL and clock handling are private scheduling details.
+- `only_a_newer_release_is_announced` -> `status_on_a_terminal_announces_a_newer_release_checked_at_most_daily` (`crates/sk1ll-cli/tests/lifecycle.rs`)
+- `github_release_tags_only_announce_a_newer_version` (the inline test that replaced the two above) -> `status_on_a_terminal_announces_a_newer_release_checked_at_most_daily` (`crates/sk1ll-cli/tests/lifecycle.rs`; a `tag_name` that isn't a string is no notice)
+- `the_cache_lasts_a_day` -> `status_on_a_terminal_announces_a_newer_release_checked_at_most_daily` (`crates/sk1ll-cli/tests/lifecycle.rs`; a day-old answer is asked again, today's is not; a cache from the future is not pinned)
 
 ### `crates/sk1ll-cli/src/setup.rs`
 
