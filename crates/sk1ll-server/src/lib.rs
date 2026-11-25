@@ -185,9 +185,7 @@ impl Server {
         F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
     {
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || f(&mut lock(&db)))
-            .await
-            .map_err(|e| ApiError::Internal(anyhow::anyhow!("database task failed: {e}")))?
+        blocking(move || f(&mut lock(&db))).await
     }
 
     /// HEAD as last read; `None` while the repo is empty.
@@ -318,13 +316,16 @@ impl Server {
     /// refused, or finishes before the machine goes. The
     /// session is revoked under the DB lock that sessions register under, and
     /// only if it holds the removed token.
-    /// The guard moves into the database work, so dropping this future (a
-    /// caller that disconnects) can't let a push in before the removal commits.
+    /// The guard moves onto the database work's thread before that waits
+    /// for the database, so dropping this future (a caller that disconnects)
+    /// can't let a push in before the removal commits.
     async fn remove_machine(self: &Arc<Self>, caller: Caller, machine: String) -> Result<()> {
-        let push = self.push_lock.clone().lock_owned().await;
+        let push = self.lock_push().await;
         let (server, author, now) = (self.clone(), caller.author().to_string(), now());
-        self.db(move |conn| {
+        blocking(move || {
             let _push = push;
+            sk1ll_core::failpoint!(ServerRemovalEntered, &server.config.repo_dir());
+            let conn = &mut lock(&server.db);
             caller.current(conn)?.require_machine(&machine)?;
             let token_hash = db::token_hash(conn, &machine)?;
             assign::remove_machine(conn, &machine, &author, now)?;
@@ -387,13 +388,37 @@ impl Server {
         Ok(())
     }
 
+    /// Waits for the push lock, in line behind earlier waiters.
+    async fn lock_push(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        let acquire = self.push_lock.clone().lock_owned();
+        // Tests order requests on the lock by when each joins the line,
+        // which is after the first poll that finds it held.
+        #[cfg(feature = "failpoints")]
+        let acquire = async {
+            let mut acquire = std::pin::pin!(acquire);
+            if let std::task::Poll::Ready(guard) = futures_util::poll!(acquire.as_mut()) {
+                return guard;
+            }
+            sk1ll_core::failpoint!(ServerPushLockQueued, &self.config.repo_dir());
+            acquire.await
+        };
+        acquire.await
+    }
+
     async fn inventory_lock(&self) -> Result<tokio::sync::OwnedMutexGuard<()>> {
-        let push = self.push_lock.clone().lock_owned().await;
+        let push = self.lock_push().await;
         if self.push_degraded.load(Ordering::SeqCst) {
             return Err(ApiError::Unavailable("git push state is degraded; restart the Server".into()));
         }
         Ok(push)
     }
+}
+
+/// Runs `f` on a blocking thread.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("database task failed: {e}")))?
 }
 
 /// Refuses an `/api` request from a peer that speaks another protocol version
