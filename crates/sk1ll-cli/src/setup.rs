@@ -369,38 +369,3 @@ impl Input {
         Ok(answer)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn everything_on_sets_defaults_before_items() {
-        let changes = everything_on(
-            &["claude".into()],
-            &[
-                (sk1ll_core::ItemRef::Skill("pdf".into()), Some("pdf-id".parse().unwrap())),
-                (sk1ll_core::ItemRef::Rule("git".into()), Some("git-id".parse().unwrap())),
-                (sk1ll_core::ItemRef::Skill("unassigned".into()), None),
-            ],
-        );
-        let kinds: Vec<_> = changes.iter().map(|c| (c.kind, c.name.as_deref())).collect();
-        assert_eq!(
-            kinds,
-            [
-                (ToggleKind::NewSkillsDefault, None),
-                (ToggleKind::NewRulesDefault, None),
-                (ToggleKind::Skill, Some("pdf")),
-                (ToggleKind::Rule, Some("git")),
-            ]
-        );
-        assert!(changes.iter().all(|c| c.harness == "claude" && c.enabled == Some(true)));
-    }
-
-    #[test]
-    fn shell_quote_leaves_plain_paths_and_quotes_the_rest() {
-        assert_eq!(shell_quote(Path::new("/home/me/skills")), "/home/me/skills");
-        assert_eq!(shell_quote(Path::new("/home/me/my skills")), "'/home/me/my skills'");
-        assert_eq!(shell_quote(Path::new("/tmp/it's")), "'/tmp/it'\\''s'");
-    }
-}

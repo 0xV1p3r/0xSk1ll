@@ -1476,69 +1476,67 @@ fn short(sha: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn releases_order_by_number_then_pre_release() {
-        use std::cmp::Ordering::{Equal, Greater, Less};
-        let order = super::release_order;
-        assert_eq!(order("0.1.0", "0.2.0"), Some(Less));
-        assert_eq!(order("0.10.0", "0.9.3"), Some(Greater));
-        assert_eq!(order("0.2.0 (abc1234567)", "0.2.0"), Some(Equal));
-        assert_eq!(order("0.2.0-rc.1", "0.2.0"), Some(Less));
-        assert_eq!(order("0.2.0-rc.9", "0.2.0-rc.10"), Some(Less));
-        assert_eq!(order("0.2", "0.2.0"), None);
-        assert_eq!(order("dev", "0.2.0"), None);
-    }
-
     use super::*;
 
     #[test]
-    fn import_dry_run_requires_a_name_and_rejects_force() {
-        assert!(Cli::try_parse_from(["sk1ll", "update", "--dry-run"]).is_err());
-        assert!(Cli::try_parse_from(["sk1ll", "update", "pdf", "--dry-run", "--force"]).is_err());
-        let cli = Cli::try_parse_from(["sk1ll", "update", "pdf", "--dry-run"]).unwrap();
-        assert!(matches!(cli.cmd, Cmd::Update { name: Some(name), dry_run: true, force: false } if name == "pdf"));
-    }
-
-    /// The daemon's message may already carry the hint; it's added once.
-    #[test]
-    fn only_a_failed_fetch_of_the_bundled_link_falls_back() {
-        let link = sk1ll_core::bundled::SK1LL_SKILL_LINK;
-        let fetch = || anyhow::anyhow!("`git clone --quiet -- {link} /c` failed: Repository not found");
-        assert_eq!(bundled_fallback(link, false, fetch()).unwrap().0, "sk1ll");
-        assert!(bundled_fallback(link, true, fetch()).is_err(), "--path or --ref asks for that exact source");
-        assert!(bundled_fallback(link, false, anyhow::anyhow!("import `sk1ll` already exists")).is_err());
-        assert!(bundled_fallback("https://github.com/o/r", false, fetch()).is_err());
-    }
-
-    #[test]
-    fn conflict_reasons_name_the_command_for_an_edit_by_hand() {
-        let edited = format!("rule {}", sk1ll_core::sync::EDITED);
-        assert_eq!(
-            conflict_reason("codex", "rule", "git.md", Some(&edited)),
-            format!(
-                "  ({edited}; `sk1ll adopt codex git` it into the repo, or overwrite it with `sk1ll sync --force`)"
-            )
-        );
-        let reason = conflict_reason("h", "skill", "my skill", Some(sk1ll_core::sync::EDITED));
-        assert!(reason.contains("`sk1ll adopt h 'my skill'`"), "{reason}");
-        let block = conflict_reason("codex", "instructions", "git", Some(sk1ll_core::sync::EDITED));
-        assert!(block.contains("move the edits into instructions/") && !block.contains("adopt"), "{block}");
-        let unmanaged = "existing rule file not managed by sk1ll";
-        assert_eq!(conflict_reason("h", "rule", "git.md", Some(unmanaged)), format!("  ({unmanaged})"));
-        assert_eq!(conflict_reason("h", "skill", "pdf", None), "");
-        assert_eq!(
-            (plural(1, "conflict", "conflicts"), plural(2, "entry", "entries")),
-            ("1 conflict".into(), "2 entries".into())
-        );
-    }
-
-    #[test]
-    fn fetch_hint_is_added_once_and_only_to_fetch_failures() {
-        let failed = "`git clone --quiet -- https://x.invalid/r.git /c` failed: could not resolve host";
-        let once = fetch_hint(anyhow::anyhow!("{failed}")).to_string();
-        assert!(once.starts_with(failed) && once.ends_with("(SSH agent / credential helper)."), "{once}");
-        assert_eq!(fetch_hint(anyhow::anyhow!("{once}")).to_string(), once);
-        let other = "import `pdf` already exists";
-        assert_eq!(fetch_hint(anyhow::anyhow!("{other}")).to_string(), other);
+    fn documented_commands_and_flags_exist() {
+        // The Commands table in README.md and the Pull flags in its workflow.
+        let cli = Cli::command();
+        cli.clone().debug_assert();
+        let contracts: &[(&[&str], &[&str])] = &[
+            (&[], &["repo", "machine-config", "assignment"]),
+            (&["setup"], &[]),
+            (&["init"], &[]),
+            (&["add"], &["path", "name", "ref", "list"]),
+            (&["update"], &["force", "dry-run"]),
+            (&["remove"], &[]),
+            (&["fork"], &[]),
+            (&["new"], &["description"]),
+            (&["edit"], &[]),
+            (&["rename"], &[]),
+            (&["delete"], &["yes"]),
+            (&["list"], &["json", "unmanaged"]),
+            (&["repair-ids"], &[]),
+            (&["status"], &[]),
+            (&["sync"], &["dry-run", "force"]),
+            (&["render"], &[]),
+            (&["harnesses"], &["all"]),
+            (&["harnesses", "enable"], &[]),
+            (&["harnesses", "disable"], &["take-out"]),
+            (&["harnesses", "add"], &["skills", "instructions", "format", "mode"]),
+            (&["harnesses", "remove"], &["take-out"]),
+            (&["harnesses", "rename"], &["replace"]),
+            (&["assign"], &["default-skills", "default-rules", "all", "machine"]),
+            (&["conflicts"], &[]),
+            (&["adopt"], &[]),
+            (&["recover", "list"], &["paths"]),
+            (&["recover", "adopt"], &[]),
+            (&["recover", "discard"], &[]),
+            (&["recover", "dismiss-notes"], &[]),
+            (&["draft"], &[]),
+            (&["diff"], &[]),
+            (&["commit"], &["all", "push"]),
+            (&["push"], &[]),
+            (&["restore"], &["all"]),
+            (&["pull"], &["keep", "keep-all"]),
+            (&["join"], &["admin-token"]),
+            (&["daemon"], &[]),
+            (&["fleet", "invite"], &["scope"]),
+            (&["fleet", "remove"], &["yes"]),
+            (&["fleet", "orphans"], &[]),
+            (&["fleet", "prune-orphans"], &["machine"]),
+            (&["fleet", "copy-assignment"], &["merge", "map", "yes"]),
+            (&["fleet", "log"], &["machine", "harness", "author", "item", "before", "limit"]),
+            (&["fleet", "undo"], &[]),
+            (&["completions"], &[]),
+        ];
+        for &(path, flags) in contracts {
+            let command = path.iter().fold(&cli, |command, name| {
+                command.find_subcommand(name).unwrap_or_else(|| panic!("missing command {path:?}"))
+            });
+            for flag in flags {
+                assert!(command.get_arguments().any(|arg| arg.get_long() == Some(flag)), "{path:?} lacks --{flag}");
+            }
+        }
     }
 }

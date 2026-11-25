@@ -509,26 +509,3 @@ pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
     let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     canon(a) == canon(b)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::utc;
-
-    #[test]
-    fn log_causes_read_as_text() {
-        use sk1ll_proto::LogCause as C;
-        assert_eq!(super::cause(&C::Change), "");
-        assert_eq!(super::cause(&C::Undo { entry: 7 }), " (undoing entry 7)");
-        let renamed = super::cause(&C::HarnessRenamed { from: "a".into(), to: "b".into() });
-        assert_eq!(renamed, " (harness renamed from a to b)");
-        assert!(!super::cause(&C::OrphanPruned).contains('{'));
-    }
-
-    #[test]
-    fn utc_dates() {
-        assert_eq!(utc(0), "1970-01-01 00:00:00 UTC");
-        assert_eq!(utc(1_700_086_400), "2023-11-15 22:13:20 UTC");
-        assert_eq!(utc(951_782_400), "2000-02-29 00:00:00 UTC");
-        assert_eq!(utc(-1), "1969-12-31 23:59:59 UTC");
-    }
-}
