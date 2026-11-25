@@ -457,9 +457,9 @@ mod unix {
         if NO_EXCHANGE.with(std::cell::Cell::get) {
             return Err(Errno::OPNOTSUPP);
         }
-        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         return fd::renameat_with(CWD, staged, parent, name, fd::RenameFlags::EXCHANGE);
-        #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
             let _ = (staged, parent, name);
             Err(Errno::OPNOTSUPP)
@@ -467,9 +467,9 @@ mod unix {
     }
 
     fn publish(staged: &Path, parent: &OwnedFd, name: &OsStr) -> std::result::Result<(), Errno> {
-        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         return fd::renameat_with(CWD, staged, parent, name, fd::RenameFlags::NOREPLACE);
-        #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
             let _ = (staged, parent, name);
             Err(Errno::OPNOTSUPP)

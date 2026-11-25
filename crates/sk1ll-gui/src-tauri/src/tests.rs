@@ -347,8 +347,8 @@ fn editor_detection_and_terminal_arguments() {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     };
     executable("nvim");
-    let discovery = Discovery { path: vec![bin.clone()], data: vec![temp.path().into()], apps: vec![], terminal: None };
-    assert_eq!(discovery.detect().len(), if cfg!(target_os = "macos") { 3 } else { 2 });
+    let discovery = Discovery { path: vec![bin.clone()], data: vec![temp.path().into()], terminal: None };
+    assert_eq!(discovery.detect().len(), 2);
     executable("kitty");
     executable("zeditor");
     let found = discovery.detect();
@@ -391,7 +391,7 @@ fn editor_targets_reject_escapes_and_imports() {
     std::fs::create_dir_all(&skill).unwrap();
     std::fs::write(skill.join("SKILL.md"), "pdf").unwrap();
     let target = validate_target(repo, &skill, false).unwrap();
-    let discovery = Discovery { path: vec![], data: vec![], apps: vec![], terminal: None };
+    let discovery = Discovery { path: vec![], data: vec![], terminal: None };
     let mut editor = discovery.detect().remove(0);
     assert_eq!(target_path(&editor, &target), target.folder);
     editor.view.id = "default-app".into();
@@ -461,14 +461,17 @@ async fn editor_resolution_uses_daemon_repo_and_rejects_item_paths() {
 }
 
 #[test]
-fn editor_bundle_detection_and_json_contract() {
+fn editor_json_contract() {
     use crate::editors::*;
+    use std::os::unix::fs::PermissionsExt;
     let temp = tempfile::tempdir().unwrap();
-    std::fs::create_dir(temp.path().join("Cursor.app")).unwrap();
-    let discovery = Discovery { path: vec![], data: vec![], apps: vec![temp.path().into()], terminal: None };
+    let cursor = temp.path().join("cursor");
+    std::fs::write(&cursor, "not executed").unwrap();
+    std::fs::set_permissions(&cursor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let discovery = Discovery { path: vec![temp.path().into()], data: vec![], terminal: None };
     let found = discovery.detect();
-    assert_eq!(found[0].program, std::path::Path::new("/usr/bin/open"));
-    assert_eq!(found[0].args, [std::ffi::OsString::from("-a"), temp.path().join("Cursor.app").into_os_string()]);
+    assert_eq!(found[0].program, cursor);
+    assert!(found[0].args.is_empty());
     let view = EditorsView { editors: found.into_iter().map(|e| e.view).collect(), preferred_editor: "cursor".into() };
     let value = serde_json::to_value(view).unwrap();
     assert_eq!(value["editors"][0], json!({"id":"cursor", "name":"Cursor", "kind":"gui"}));
@@ -637,23 +640,12 @@ fn every_editor_launch_keeps_unusual_paths_in_one_argument() {
     for name in ["my notes", "résumé", "a'\"b", "semi;colon", "$(touch nope)", "line\nbreak", "a\\b"] {
         let folder = directory.path().join(name);
         let target = Target { file: folder.join("SKILL.md"), folder, rule: false };
-        for kind in [
-            "Terminal.app",
-            "wezterm",
-            "gnome-terminal",
-            "kitty",
-            "konsole",
-            "ghostty",
-            "alacritty",
-            "xterm",
-            "open",
-            "xdg-open",
-        ] {
-            let args = if matches!(kind, "open" | "xdg-open") {
+        for kind in ["wezterm", "gnome-terminal", "kitty", "konsole", "ghostty", "alacritty", "xterm", "xdg-open"] {
+            let args = if kind == "xdg-open" {
                 vec![]
             } else {
                 let mut args = terminal_prefix(kind);
-                args.push(OsString::from("/Applications/My editor's/bin/nvim"));
+                args.push(OsString::from("/opt/My editor's/bin/nvim"));
                 args
             };
             let editor = Editor {
@@ -668,31 +660,7 @@ fn every_editor_launch_keeps_unusual_paths_in_one_argument() {
             let mut expected = expected.join(&0);
             expected.push(0);
             assert_eq!(output.stdout, expected, "{kind} {name:?}");
-            if kind == "Terminal.app" {
-                assert!(!args[1].to_str().unwrap().contains(name));
-                assert!(args[1].to_str().unwrap().contains("quoted form of (argument as text)"));
-            }
         }
-    }
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn mac_terminal_script_shell_quoting_round_trips_unusual_paths() {
-    use std::process::Command;
-    let script = crate::editors::terminal_prefix("Terminal.app")[1].to_str().unwrap().replace(
-        "    tell application \"Terminal\"\n        activate\n        do script shellCommand\n    end tell",
-        "    return shellCommand",
-    );
-    for path in ["my notes", "résumé", "a'\"b", "semi;colon", "$(touch nope)", "line\nbreak", "a\\b"] {
-        let result = Command::new("/usr/bin/osascript")
-            .args(["-e", &script, "--", "/usr/bin/printf", "%s", path])
-            .output()
-            .unwrap();
-        assert!(result.status.success());
-        let shell = String::from_utf8(result.stdout).unwrap();
-        let output = Command::new("/bin/sh").args(["-c", shell.trim_end()]).output().unwrap();
-        assert_eq!(output.stdout, path.as_bytes());
     }
 }
 

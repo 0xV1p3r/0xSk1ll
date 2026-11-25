@@ -240,34 +240,7 @@ it('shows terminal restart instructions when the service manager query fails', a
   vi.mocked(api.daemonService).mockRejectedValue(new Error('service info unavailable'));
   render(<App />);
   expect(await screen.findByRole('button', { name: 'Copy sk1ll daemon' })).toBeTruthy();
-  expect(screen.queryByRole('button', { name: /Copy (systemctl|launchctl)/ })).toBeNull();
-});
-
-it('offers a complete one-line start command for an installed launch agent', async () => {
-  vi.mocked(api.status).mockRejectedValue({ message: 'cannot reach the daemon', status: null, unreachable: true });
-  vi.mocked(api.daemonService).mockResolvedValue({ default_socket: true, binary: null, manager: 'launchd', available: true, active: false, restartable: false, unit: '/Users/me/Library/LaunchAgents/app.v1p3r.sk1ll.daemon.plist' });
-  render(<App />);
-  const target = 'gui/$(id -u)/app.v1p3r.sk1ll.daemon';
-  const command = `mkdir -p ~/Library/Logs/sk1ll && launchctl enable ${target} && (launchctl print ${target} >/dev/null 2>&1 || launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/app.v1p3r.sk1ll.daemon.plist) && launchctl kickstart ${target}`;
-  expect(await screen.findByRole('button', { name: `Copy ${command}` })).toBeTruthy();
-});
-
-it('shows launchd commands on macOS', async () => {
-  vi.mocked(api.status).mockRejectedValue({ message: 'local API mismatch', status: 426, unreachable: false });
-  vi.mocked(api.daemonService).mockResolvedValue({ default_socket: true, binary: null, manager: 'launchd', available: true, active: false, restartable: false, unit: null });
-  render(<App />);
-  expect(await screen.findByRole('button', { name: 'Copy launchctl kickstart -k gui/$(id -u)/app.v1p3r.sk1ll.daemon' })).toBeTruthy();
-  expect(screen.queryByText(/systemctl/)).toBeNull();
-});
-
-it('installs the launch agent from the connection screen on macOS', async () => {
-  vi.mocked(api.status).mockRejectedValue({ message: 'cannot reach the daemon', status: null, unreachable: true });
-  vi.mocked(api.daemonService).mockResolvedValue({ default_socket: true, binary: '/Applications/0xSk1ll.app/Contents/MacOS/sk1ll', manager: 'launchd', available: true, active: false, restartable: false, unit: null });
-  render(<App />);
-  expect(await screen.findByText(/Installs the app.v1p3r.sk1ll.daemon launch agent/)).toBeTruthy();
-  fireEvent.click(screen.getByRole('button', { name: 'Start it yourself' }));
-  expect(await screen.findByRole('button', { name: 'Copy sk1ll daemon' })).toBeTruthy();
-  expect(screen.queryByRole('button', { name: /Copy launchctl/ })).toBeNull();
+  expect(screen.queryByRole('button', { name: /Copy systemctl/ })).toBeNull();
 });
 
 it('opens the selected Machine from the command palette', async () => {

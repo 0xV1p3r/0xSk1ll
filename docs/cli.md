@@ -2,7 +2,7 @@
 
 ## The skills repo
 
-The repo lives in `~/.local/share/sk1ll/repo` (`$XDG_DATA_HOME/sk1ll/repo`) on Linux and in `~/Library/Application Support/sk1ll/repo` on macOS unless you pass `--repo` or set `SK1LL_REPO`. `sk1ll` commands run inside another skills repo use that one. A new repo starts with one commit holding its starter files, so Draft starts empty. If you later add an `origin` with its own history, the first Pull through the daemon replaces that commit with the remote's baseline. It looks like this:
+The repo lives in `~/.local/share/sk1ll/repo` (`$XDG_DATA_HOME/sk1ll/repo`) unless you pass `--repo` or set `SK1LL_REPO`. `sk1ll` commands run inside another skills repo use that one. A new repo starts with one commit holding its starter files, so Draft starts empty. If you later add an `origin` with its own history, the first Pull through the daemon replaces that commit with the remote's baseline. It looks like this:
 
 ```
 ~/.local/share/sk1ll/repo/
@@ -49,7 +49,7 @@ while a pending Pull holds the IDs up.
 If copying an item duplicates its ID, run `sk1ll repair-ids` and commit the
 repaired items.
 
-Pull requires Git 2.40 or later, and 2.42 when the new Baseline changes a `.gitattributes` file. It updates only the working-tree paths the new Baseline changes, one at a time, and leaves the Draft where it is. Replayed commits get this Machine as their committer and lose their signatures. Pull drops commits that become empty and keeps commits that started empty. Pull refuses unpushed merge commits, submodules and sparse checkouts. File changes need atomic filesystem operations on Linux or macOS. Pull checks for support before it starts changing files.
+Pull requires Git 2.40 or later, and 2.42 when the new Baseline changes a `.gitattributes` file. It updates only the working-tree paths the new Baseline changes, one at a time, and leaves the Draft where it is. Replayed commits get this Machine as their committer and lose their signatures. Pull drops commits that become empty and keeps commits that started empty. Pull refuses unpushed merge commits, submodules and sparse checkouts. File changes need atomic filesystem operations on Linux. Pull checks for support before it starts changing files.
 
 If Pull stops partway through, the next `sk1ll pull` or Daemon reconcile resumes it. Edits to paths it already updated stay as Draft on the new Baseline. While Pull is pending, `git status` shows the partially updated tree, and `sk1ll commit`, `sk1ll sync`, `sk1ll push` and `sk1ll repair-ids` refuse to run. A harness change is saved but syncs once the Pull finishes. Restoring an item a Pull is Blocked on, or that blocks a pending Pull, keeps your version in recovery. Pull recovery entries stay until you adopt or discard them. Pull and `sk1ll recover adopt` also keep each file they replace, a committed version: `sk1ll recover list` marks your version `changed` and those `unchanged`, safe to discard. `sk1ll status` counts the changed entries.
 

@@ -51,7 +51,6 @@ const screenHash = (screen: Screen) => `#/${screen.toLowerCase().replaceAll(' ',
 export const screenFromHash = (hash: string): Screen => (Object.keys(screens) as Screen[]).find(screen => screenHash(screen) === hash) ?? 'Fleet';
 const visibleScreens = (status: StatusView) => (Object.keys(screens) as Screen[]).filter(name => status.mode !== 'standalone' || (name !== 'Fleet' && name !== 'Assignment log'));
 const screenLabel = (name: Screen, status: StatusView) => status.mode === 'standalone' && name === 'Assignment matrix' ? 'Assignment' : name;
-const paletteShortcut = /Mac|iPhone|iPad|iPod/i.test(navigator.platform + navigator.userAgent) ? '⌘K' : 'Ctrl K';
 const connectionLabel = (connection: StatusView['connection']) => { const text = connection.replaceAll('_', ' '); return text.charAt(0).toUpperCase() + text.slice(1); };
 const sidebarKey = 'sk1ll-sidebar-open';
 function storedSidebar() {
@@ -262,7 +261,7 @@ export function App() {
         <Separator orientation="vertical" className="data-vertical:h-4 data-vertical:self-auto" />
         <span className="hidden min-w-0 truncate text-xs text-muted-foreground md:block">{status.machine_id}{!standalone && ` → ${server}`}</span>
         <Button variant="search" className="ml-auto h-8 min-w-0 gap-2 lg:w-full lg:max-w-72" aria-label="Open command palette" onClick={() => setPaletteOpen(true)}>
-          <Search data-icon="inline-start" /><span className="hidden truncate lg:inline">Jump to machine, skill, action…</span><kbd className="ml-auto rounded border px-1 font-mono text-[10px]">{paletteShortcut}</kbd>
+          <Search data-icon="inline-start" /><span className="hidden truncate lg:inline">Jump to machine, skill, action…</span><kbd className="ml-auto rounded border px-1 font-mono text-[10px]">Ctrl K</kbd>
         </Button>
         <span className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground" role="status" aria-label={`${standalone ? '' : 'Server '}${connectionLabel(standalone ? 'standalone' : status.connection)}`}>
           <span className={cn('size-2 shrink-0 rounded-full', standalone || serverConnected ? 'bg-success' : 'bg-warning')} aria-hidden />

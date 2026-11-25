@@ -99,7 +99,7 @@ sk1ll join http://server:7878 <code>                  # clones the repo into ~/.
 sk1ll join http://server:7878 <code> --copy-from laptop   # start from laptop's assignment
 ```
 
-A new machine starts with everything off unless you pass `--copy-from`. `--id` sets the machine id, which otherwise comes from `machine.toml` or the hostname. The daemon stores the machine token in `daemon.json` with mode 0600. On Linux the file is under `$XDG_CONFIG_HOME/sk1ll`, which defaults to `~/.config/sk1ll`. On macOS it is under `~/Library/Application Support/sk1ll`. The server can revoke each machine’s token.
+A new machine starts with everything off unless you pass `--copy-from`. `--id` sets the machine id, which otherwise comes from `machine.toml` or the hostname. The daemon stores the machine token in `daemon.json` with mode 0600. The file is under `$XDG_CONFIG_HOME/sk1ll`, which defaults to `~/.config/sk1ll`. The server can revoke each machine’s token.
 
 ## Copy an Assignment after joining
 
@@ -135,7 +135,7 @@ If the repo does not exist, the daemon still starts and the GUI offers Init. Fle
 
 A refusal **after registration** consumes the single-use join code and reserves the machine id on the server. Credentials remain in a private `daemon-pending-join-*.json` file next to `daemon.json`, without activating joined mode. Correct the local problem, then repeat the original join command or POST `/join` request with the same server URL, machine id and repo. The daemon reuses those pending credentials, so the consumed code can be supplied again and no new code is needed. Keep that pending file private. If you abandon the registration, remove the reserved machine on the server before registering that id again. If the pending file is lost, remove the reserved machine and obtain a new join code.
 
-On Linux, install the systemd user unit:
+Install the systemd user unit:
 
 ```sh
 cp deploy/sk1ll-daemon.service ~/.config/systemd/user/
@@ -147,24 +147,9 @@ journalctl --user -u sk1ll-daemon  # logs; set RUST_LOG=debug for more
 
 The unit runs `~/.local/bin/sk1ll daemon`, where the release archive installs it. Edit `ExecStart` for `~/.cargo/bin/sk1ll` after `cargo install`, or `/usr/bin/sk1ll` from the `.deb`. `sk1ll setup` and the app write the unit with the path of the `sk1ll` they found, so they need no edit.
 
-On macOS, run `sk1ll setup` or start the daemon in the app while logged in to the desktop. Either creates `~/Library/LaunchAgents/app.v1p3r.sk1ll.daemon.plist` if needed, loads it into your GUI login session and starts it. If you move the app, starting the daemon again updates the binary path in a generated plist and reloads the agent. If you customized the plist, follow the startup error to update it by hand. The shipped agent starts at login, keeps the daemon running and logs to `~/Library/Logs/sk1ll/daemon.log`. If you install the plist by hand, create the log directory and set `ProgramArguments` to the absolute path of your `sk1ll` binary followed by `daemon`.
-
-```sh
-mkdir -p ~/Library/Logs/sk1ll
-launchctl enable "gui/$(id -u)/app.v1p3r.sk1ll.daemon" &&
-  (launchctl print "gui/$(id -u)/app.v1p3r.sk1ll.daemon" >/dev/null 2>&1 ||
-    launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/app.v1p3r.sk1ll.daemon.plist) &&
-  launchctl kickstart "gui/$(id -u)/app.v1p3r.sk1ll.daemon"
-tail -n 50 ~/Library/Logs/sk1ll/daemon.log
-```
-
-The LaunchAgent has its own `PATH`. When setup or the app creates the plist, it looks up `git` on its current `PATH` and prepends Git's directory if the agent's default list lacks it. To change the agent's search path, edit `EnvironmentVariables` → `PATH` in the plist. Run `launchctl bootout "gui/$(id -u)/app.v1p3r.sk1ll.daemon"` if the agent is loaded, then run the start commands above to load the change.
-
 While it runs, the daemon holds the repo's engine lock. CLI commands that change the repo go through the daemon, and the daemon refuses to start while another sk1ll process holds the lock. A slow or unreachable server holds up only the request waiting for it: the daemon fetches, pushes, clones and waits for the server to confirm an Assignment change without blocking its other work, so status, reads, syncs and local edits keep answering. Running `sk1ll join` again after the machine was removed also goes through the daemon, which then restarts itself with the new credentials.
 
-On Linux, the local API socket is `$XDG_RUNTIME_DIR/sk1ll/daemon.sock`, with a fallback to `~/.config/sk1ll/run/daemon.sock` when there is no runtime directory. On macOS it is `~/Library/Application Support/sk1ll/run/daemon.sock`. The socket has mode 0600 and its directory must belong to the user and have mode 0700. On macOS the socket path can be at most 103 bytes. If it is too long, set `SK1LL_DAEMON_SOCKET` to a shorter path in a private directory for the daemon and its clients.
-
-The table lists Linux paths. On macOS, config and data use `~/Library/Application Support/sk1ll/` and cache uses `~/Library/Caches/sk1ll/`. This also applies to the repo, machine token and assignment paths above.
+The local API socket is `$XDG_RUNTIME_DIR/sk1ll/daemon.sock`, with a fallback to `~/.config/sk1ll/run/daemon.sock` when there is no runtime directory. The socket has mode 0600 and its directory must belong to the user and have mode 0700. The socket path can be at most 107 bytes. If it is too long, set `SK1LL_DAEMON_SOCKET` to a shorter path in a private directory for the daemon and its clients.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -172,7 +157,7 @@ The table lists Linux paths. On macOS, config and data use `~/Library/Applicatio
 | `SK1LL_DAEMON_SOCKET` | `$XDG_RUNTIME_DIR/sk1ll/daemon.sock` | Local API socket |
 | `SK1LL_MACHINE_CONFIG` | `~/.config/sk1ll/machine.toml` | Harness configuration |
 | `SK1LL_ASSIGNMENT` | `~/.cache/sk1ll/assignment.json` | Local assignment in standalone; server mirror when joined |
-| `SK1LL_STATE_DIR` | `~/.local/state/sk1ll` (`$XDG_STATE_HOME/sk1ll`; on macOS the data directory's `sk1ll`) | The machine lock's files (`locks/`) and a pending Harness rename (`harness-rename/`), each named by a hash of the real path of the file it is about, and the recovery area's index (`displaced/`) |
+| `SK1LL_STATE_DIR` | `~/.local/state/sk1ll` (`$XDG_STATE_HOME/sk1ll`) | The machine lock's files (`locks/`) and a pending Harness rename (`harness-rename/`), each named by a hash of the real path of the file it is about, and the recovery area's index (`displaced/`) |
 | `SK1LL_CACHE_DIR` | `~/.cache/sk1ll` (`$XDG_CACHE_HOME/sk1ll`) | Import sources fetched into `git/` |
 | `SK1LL_REPO` | nearest skills repo, else `~/.local/share/sk1ll/repo` | Standalone repo path; joined machines use `daemon.json` |
 | `SK1LL_PULL_INTERVAL` | `5m` | Fallback pull interval while connected |

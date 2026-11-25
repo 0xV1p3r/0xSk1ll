@@ -3564,7 +3564,7 @@ mod tests {
             }),
         )];
         // A new file renamed into place: only an exchange brings it back.
-        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         saves.push((
             "saved by rename\n",
             Box::new(|| {

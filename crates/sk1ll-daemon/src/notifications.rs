@@ -233,37 +233,17 @@ fn body(items: &Items) -> String {
     format!("{}. Open 0xSk1ll to resolve.", names.join(", "))
 }
 
-#[cfg(any(test, target_os = "macos"))]
-fn applescript(title: &str, body: &str) -> String {
-    fn escape(text: &str) -> String {
-        text.replace('\\', "\\\\").replace('"', "\\\"").replace('\r', "\\r").replace('\n', "\\n")
-    }
-    format!("display notification \"{}\" with title \"{}\"", escape(body), escape(title))
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 async fn deliver(title: &str, body: &str) -> anyhow::Result<()> {
-    use tokio::process::Command;
-
-    #[cfg(target_os = "linux")]
-    let mut command = {
-        let mut command = Command::new("notify-send");
-        let body = body.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
-        command.args(["--app-name=0xSk1ll", "--", title, &body]);
-        command
-    };
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = Command::new("/usr/bin/osascript");
-        command.args(["-e", &applescript(title, body)]);
-        command
-    };
+    let mut command = tokio::process::Command::new("notify-send");
+    let body = body.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    command.args(["--app-name=0xSk1ll", "--", title, &body]);
     let output = tokio::time::timeout(Duration::from_secs(5), command.kill_on_drop(true).output()).await??;
     anyhow::ensure!(output.status.success(), "desktop notification command exited with {}", output.status);
     Ok(())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(target_os = "linux"))]
 async fn deliver(_: &str, _: &str) -> anyhow::Result<()> {
     Ok(())
 }
@@ -358,13 +338,5 @@ mod tests {
         assert_eq!(alert.sent_at, Some(now));
         alert.delivered(now + 600, false);
         assert_eq!(alert.retry_at, Some(now + 660));
-    }
-
-    #[test]
-    fn escapes_applescript_string_literals() {
-        assert_eq!(
-            applescript("a\\b", "say \"hi\"\r\nnext"),
-            r#"display notification "say \"hi\"\r\nnext" with title "a\\b""#,
-        );
     }
 }

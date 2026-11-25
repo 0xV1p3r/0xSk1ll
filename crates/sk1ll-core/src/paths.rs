@@ -48,7 +48,7 @@ fn var(name: &str) -> Option<PathBuf> {
 }
 
 /// sk1ll's state directory: `$XDG_STATE_HOME/sk1ll` by default (the data
-/// directory's `sk1ll` where there is no state directory, as on macOS).
+/// directory's `sk1ll` where there is no state directory).
 pub fn state_dir() -> Result<PathBuf> {
     if let Some(dirs) = configured() {
         return Ok(dirs.state);

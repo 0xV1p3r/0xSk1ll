@@ -1432,11 +1432,11 @@ fn place_at(from: &Path, to: &Path) -> Result<()> {
 ///   its old name is removed: still the same inode, so a writer holding it
 ///   open loses nothing.
 /// - A symlink is made anew at `to` (`symlink(2)` never replaces either).
-/// - A directory is renamed with `renameat2(RENAME_NOREPLACE)` on Linux, or
-///   `renamex_np(RENAME_EXCL)` on macOS. Elsewhere, or on a filesystem that
-///   refuses the flag, it is checked to be free and renamed: a directory can
-///   only ever be renamed over an empty directory (rename fails on anything
-///   else), so that fallback can't lose content either.
+/// - A directory is renamed with `renameat2(RENAME_NOREPLACE)` on Linux.
+///   Elsewhere, or on a filesystem that refuses the flag, it is checked to be
+///   free and renamed: a directory can only ever be renamed over an empty
+///   directory (rename fails on anything else), so that fallback can't lose
+///   content either.
 fn place(from: &Path, to: &Path) -> std::io::Result<()> {
     let meta = fs::symlink_metadata(from)?;
     if meta.file_type().is_symlink() {
@@ -1462,13 +1462,12 @@ fn place(from: &Path, to: &Path) -> std::io::Result<()> {
 
 /// `rename`, failing with `AlreadyExists` instead of replacing; see [`place`].
 pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         use std::os::unix::ffi::OsStrExt;
         let from_c = std::ffi::CString::new(from.as_os_str().as_bytes())?;
         let to_c = std::ffi::CString::new(to.as_os_str().as_bytes())?;
         // SAFETY: both arguments are valid NUL-terminated paths that outlive the call.
-        #[cfg(any(target_os = "linux", target_os = "android"))]
         let r = unsafe {
             libc::syscall(
                 libc::SYS_renameat2,
@@ -1479,9 +1478,6 @@ pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
                 libc::RENAME_NOREPLACE as libc::c_long,
             )
         };
-        // SAFETY: as above.
-        #[cfg(target_os = "macos")]
-        let r = unsafe { libc::renamex_np(from_c.as_ptr(), to_c.as_ptr(), libc::RENAME_EXCL) };
         if r == 0 {
             return Ok(());
         }

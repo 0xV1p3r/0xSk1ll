@@ -50,8 +50,6 @@ break compatibility.
   command palette.
 - Desktop notifications for Machine states that need attention, with an opt-out
   in Settings and `machine.toml`.
-- macOS arm64 builds in CI and release archives with the unsigned desktop app,
-  CLI and server. Setup and the desktop app can start the daemon through launchd.
 - Create a Rule from the desktop getting-started checklist and reopen the
   checklist from the command palette.
 - Copy diagnostics and ready-to-paste join commands from the desktop app.
@@ -233,9 +231,6 @@ break compatibility.
 
 - When local edits prevent an Import update, the desktop app offers to fork
   the Import or overwrite the edits after confirmation.
-- Starting the macOS daemon recreates its log directory and repairs generated
-  LaunchAgents after the app moves. New agents include the Git directory found
-  on PATH, and the desktop app shows start commands for the detected manager.
 - Machine entries in the desktop command palette open the selected Machine.
 - Desktop messages identify origin for standalone pushes, explain when Fleet
   deletions reach other Machines, and clarify how to join as the first Machine.

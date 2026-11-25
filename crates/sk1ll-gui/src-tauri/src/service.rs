@@ -9,7 +9,7 @@ pub struct ServiceInfo {
     pub default_socket: bool,
     /// The `sk1ll` executable that runs the Daemon.
     pub binary: Option<PathBuf>,
-    /// This platform's user service manager: launchd on macOS, systemd elsewhere.
+    /// This platform's user service manager: systemd.
     pub manager: Manager,
     /// That manager is running for this user, so starting installs the user service.
     pub available: bool,
@@ -18,7 +18,7 @@ pub struct ServiceInfo {
     /// The Daemon on the app's socket is the user service's main process, so restarting the
     /// service restarts the Daemon the app talks to.
     pub restartable: bool,
-    /// The systemd user unit or launchd agent, if it is installed.
+    /// The systemd user unit, if it is installed.
     pub unit: Option<PathBuf>,
 }
 
@@ -63,18 +63,8 @@ fn peer_pid(fd: std::os::fd::RawFd) -> Option<u32> {
     (rc == 0 && cred.pid > 0).then_some(cred.pid as u32)
 }
 
-#[cfg(target_os = "macos")]
-fn peer_pid(fd: std::os::fd::RawFd) -> Option<u32> {
-    let mut pid: libc::pid_t = 0;
-    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
-    // SAFETY: `pid` and `len` are valid for writes and describe a `pid_t`, which is what
-    // LOCAL_PEERPID fills in.
-    let rc = unsafe { libc::getsockopt(fd, libc::SOL_LOCAL, libc::LOCAL_PEERPID, (&raw mut pid).cast(), &mut len) };
-    (rc == 0 && pid > 0).then_some(pid as u32)
-}
-
 // Without the peer's pid the owner can't be established, so the app shows the commands instead.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(target_os = "linux"))]
 fn peer_pid(_fd: std::os::fd::RawFd) -> Option<u32> {
     None
 }
@@ -84,10 +74,7 @@ pub fn restart() -> Result<(), String> {
         return Err("This app uses a custom Daemon socket (SK1LL_DAEMON_SOCKET). Restart that Daemon yourself.".into());
     }
     let manager = Manager::platform();
-    let name = match manager {
-        Manager::Systemd => "the sk1ll-daemon user service",
-        Manager::Launchd => "the app.v1p3r.sk1ll.daemon launch agent",
-    };
+    let name = "the sk1ll-daemon user service";
     if Manager::running().is_none() || !manager.active() {
         return Err(format!("{name} isn't running."));
     }

@@ -137,14 +137,10 @@ impl Drop for Server {
 // ---------------------------------------------------------------------------
 // Machines
 
-const CONFIG_DIR: &str = if cfg!(target_os = "macos") { "Library/Application Support" } else { ".config" };
-const DATA_DIR: &str = if cfg!(target_os = "macos") { CONFIG_DIR } else { ".local/share" };
-const CACHE_DIR: &str = if cfg!(target_os = "macos") { "Library/Caches" } else { ".cache" };
-const SOCKET_PATH: &str = if cfg!(target_os = "macos") {
-    "Library/Application Support/sk1ll/run/daemon.sock"
-} else {
-    "run/sk1ll/daemon.sock"
-};
+const CONFIG_DIR: &str = ".config";
+const DATA_DIR: &str = ".local/share";
+const CACHE_DIR: &str = ".cache";
+const SOCKET_PATH: &str = "run/sk1ll/daemon.sock";
 
 struct Machine {
     id: String,
@@ -1430,7 +1426,7 @@ async fn the_startup_clone_gives_up_at_the_git_deadline() {
 async fn displaced_conflicts_report_to_server_and_resolve() {
     let server = FakeServer::new().await;
     let mut m = solo("solo", &server.url(), Some(snapshot(1, &["x"])));
-    let state = m.home.path().join(if cfg!(target_os = "macos") { DATA_DIR } else { "state" });
+    let state = m.home.path().join("state");
     m = m.with_env("XDG_STATE_HOME", state.to_str().unwrap());
     m.start().await;
     let (mut ws, _) = server.accept().await;

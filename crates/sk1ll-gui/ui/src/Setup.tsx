@@ -40,14 +40,10 @@ function Frame({ title, description, step, children, wide = false }: { title: st
   </main>;
 }
 
-const agent = 'gui/$(id -u)/app.v1p3r.sk1ll.daemon';
-const bootstrap = 'launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/app.v1p3r.sk1ll.daemon.plist';
 // What to run by hand for each platform's user service; the background process logs to the cache dir.
 const serviceCommands: Record<ServiceManager, { name: string; start: string; restart: string; log: string; processLog: string }> = {
   systemd: { name: 'systemd user service', start: 'systemctl --user start sk1ll-daemon', restart: 'systemctl --user restart sk1ll-daemon',
     log: 'journalctl --user -u sk1ll-daemon -n 50', processLog: 'tail -n 50 ~/.cache/sk1ll/daemon.log' },
-  launchd: { name: 'launchd agent', start: `mkdir -p ~/Library/Logs/sk1ll && launchctl enable ${agent} && (launchctl print ${agent} >/dev/null 2>&1 || ${bootstrap}) && launchctl kickstart ${agent}`, restart: `launchctl kickstart -k ${agent}`,
-    log: 'tail -n 50 ~/Library/Logs/sk1ll/daemon.log', processLog: 'tail -n 50 ~/Library/Caches/sk1ll/daemon.log' },
 };
 
 export function ConnectionPage({ socket, error, apiMismatch = false }: { socket: string; error: string; apiMismatch?: boolean }) {
@@ -60,8 +56,8 @@ export function ConnectionPage({ socket, error, apiMismatch = false }: { socket:
   useEffect(() => { if (!started) return; const timer = setTimeout(() => setSlow(true), 15000); return () => clearTimeout(timer); }, [started]);
   const info = service.data;
   const commands = info && serviceCommands[info.manager];
-  const serviceName = info?.manager === 'launchd' ? 'app.v1p3r.sk1ll.daemon launch agent' : 'sk1ll-daemon user service';
-  const how = !info?.binary ? '' : info.available ? info.unit ? `${info.manager === 'launchd' ? 'Loads' : 'Enables'} and starts the ${serviceName}.`
+  const serviceName = 'sk1ll-daemon user service';
+  const how = !info?.binary ? '' : info.available ? info.unit ? `Enables and starts the ${serviceName}.`
     : `Installs the ${serviceName} and starts it. It starts again whenever you log in.`
     : 'Runs the Daemon in the background until you log out.';
   const log = started === 'process' ? commands?.processLog : commands?.log;
@@ -83,7 +79,7 @@ export function ConnectionPage({ socket, error, apiMismatch = false }: { socket:
     <Collapsible defaultOpen={!info || !info.default_socket || !info.binary} key={String(!!info)}>
       <CollapsibleTrigger render={<Button variant="ghost" size="sm" className="-ml-2" />}>Start it yourself</CollapsibleTrigger>
       <CollapsibleContent className="flex flex-col gap-3 pt-2">
-        {info && commands && (info.manager !== 'launchd' || info.unit) && <div className="flex flex-col gap-2"><span className="text-muted-foreground">Start the service</span>
+        {info && commands && <div className="flex flex-col gap-2"><span className="text-muted-foreground">Start the service</span>
           <CopyCommand command={commands.start} /></div>}
         <div className="flex flex-col gap-2"><span className="text-muted-foreground">Or run it in a terminal</span>
           <CopyCommand command="sk1ll daemon" /></div>

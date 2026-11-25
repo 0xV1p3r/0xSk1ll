@@ -6,7 +6,6 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use sk1ll_daemon::client::{Client, StatusView};
-use sk1ll_daemon::service::Manager;
 use sk1ll_daemon::{Config, DaemonState};
 use sk1ll_proto::{LogQuery, Scope, ToggleKind};
 
@@ -99,11 +98,7 @@ fn join(cli: Cli) -> Result<()> {
     if via_daemon {
         println!("the running daemon restarts with the new credentials and manages this machine again");
     } else {
-        let example = match Manager::platform() {
-            Manager::Systemd => "the systemd user unit in deploy/sk1ll-daemon.service",
-            Manager::Launchd => "the launchd agent in deploy/app.v1p3r.sk1ll.daemon.plist",
-        };
-        println!("now run `sk1ll daemon` (e.g. as {example})");
+        println!("now run `sk1ll daemon` (e.g. as the systemd user unit in deploy/sk1ll-daemon.service)");
     }
     Ok(())
 }

@@ -43,7 +43,7 @@ Several tools also read other tools' directories. Cursor reads `~/.claude/skills
 
 ## machine.toml
 
-`~/.config/sk1ll/machine.toml` on Linux and `~/Library/Application Support/sk1ll/machine.toml` on macOS adjusts the presets and adds harnesses. Override its location with `--machine-config` or `SK1LL_MACHINE_CONFIG`.
+`~/.config/sk1ll/machine.toml` adjusts the presets and adds harnesses. Override its location with `--machine-config` or `SK1LL_MACHINE_CONFIG`.
 
 An entry named after a preset from 0.1.0 changes only the keys it sets, and includes the preset even when its directory wasn't detected. Any other name adds a new harness.
 
@@ -83,13 +83,12 @@ enabled = false
 ```
 
 Set `SK1LL_NOTIFICATIONS=0` in the Daemon's environment to disable alerts on
-headless Machines or in CI. On Linux, install `notify-send` and run the Daemon
-in a user session with a desktop notification service. On macOS, the Daemon
-uses `osascript` in the GUI login session. Live delivery is unverified.
+headless Machines or in CI. Install `notify-send` and run the Daemon
+in a user session with a desktop notification service.
 
 ### Paths with `..`
 
-sk1ll refuses a path with `..` when a change turns a harness on, because after a symlink `..` means the target's parent, not the parent as written. An entry written before keeps working until you change it. To change it, use the destination the path resolves to in the filesystem: `realpath -m <path>` prints it (on macOS, `realpath` without `-m` for a path that exists). For example, if `~/tools` is a symlink to `/opt/tools`, `~/tools/../agents/skills` resolves to `/opt/agents/skills`, not `~/agents/skills`. Write that resolved path in `machine.toml`, or pass it to `sk1ll harnesses add <name> --skills /opt/agents/skills`.
+sk1ll refuses a path with `..` when a change turns a harness on, because after a symlink `..` means the target's parent, not the parent as written. An entry written before keeps working until you change it. To change it, use the destination the path resolves to in the filesystem: `realpath -m <path>` prints it. For example, if `~/tools` is a symlink to `/opt/tools`, `~/tools/../agents/skills` resolves to `/opt/agents/skills`, not `~/agents/skills`. Write that resolved path in `machine.toml`, or pass it to `sk1ll harnesses add <name> --skills /opt/agents/skills`.
 
 ## Changing harnesses
 
@@ -209,6 +208,6 @@ An `assignment.json` file has this shape. The keys under `skills` and `rules` ar
 }
 ```
 
-A standalone machine keeps assignment in `~/.cache/sk1ll/assignment.json` on Linux or `~/Library/Caches/sk1ll/assignment.json` on macOS (override with `--assignment` or `SK1LL_ASSIGNMENT`). The daemon watches this file and applies changes from either the GUI or CLI. Standalone Machines have no Assignment log. The desktop Assignment matrix offers revision-guarded Undo for bulk changes. [ADR 0004](adr/0004-standalone-assignment-is-machine-local.md) records this choice. A joined machine sends every change to the server, which keeps a log with per-entry undo. [ADR 0001](adr/0001-assignment-is-server-state.md) explains why assignment isn't stored in the repo.
+A standalone machine keeps assignment in `~/.cache/sk1ll/assignment.json` (override with `--assignment` or `SK1LL_ASSIGNMENT`). The daemon watches this file and applies changes from either the GUI or CLI. Standalone Machines have no Assignment log. The desktop Assignment matrix offers revision-guarded Undo for bulk changes. [ADR 0004](adr/0004-standalone-assignment-is-machine-local.md) records this choice. A joined machine sends every change to the server, which keeps a log with per-entry undo. [ADR 0001](adr/0001-assignment-is-server-state.md) explains why assignment isn't stored in the repo.
 
 Join codes expire after `SK1LL_SERVER_JOIN_CODE_TTL` (default `24h`), using the server duration syntax.
