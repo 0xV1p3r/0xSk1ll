@@ -45,3 +45,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 sk1ll-core = { workspace = true, features = ["failpoints"] }
 sk1ll-server = { path = "../sk1ll-server" }
+sk1ll-testkit = { workspace = true, features = ["daemon"] }

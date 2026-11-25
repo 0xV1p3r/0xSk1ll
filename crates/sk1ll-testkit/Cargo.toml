@@ -1,0 +1,28 @@
+[package]
+name = "sk1ll-testkit"
+description = "Shared fixtures for the sk1ll crates' integration tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+# A real sk1ll-server on a runtime of its own (`server::Server`).
+server = ["dep:sk1ll-server", "dep:sk1ll-proto", "dep:reqwest", "dep:tokio", "dep:serde"]
+# A `sk1ll-daemon` process per Machine (`daemon::DaemonMachine`).
+daemon = ["server", "dep:sk1ll-daemon"]
+
+[dependencies]
+# Fault injection is on wherever the testkit is: tests may install callbacks.
+sk1ll-core = { workspace = true, features = ["failpoints"] }
+tempfile.workspace = true
+serde = { workspace = true, optional = true }
+sk1ll-server = { path = "../sk1ll-server", optional = true }
+sk1ll-daemon = { path = "../sk1ll-daemon", optional = true }
+sk1ll-proto = { path = "../sk1ll-proto", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
