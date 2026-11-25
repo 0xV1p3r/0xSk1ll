@@ -26,3 +26,4 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time"] }
 sk1ll-testkit = { workspace = true, features = ["server"] }
 tempfile.workspace = true
 axum = "0.8"
+libc = "0.2"
