@@ -22,6 +22,7 @@
 //!   restarted on the same port.
 //! - `daemon` (feature `daemon`): a `sk1ll-daemon` process per Machine.
 //! - `eventually` (with either feature): polls until a condition holds.
+#![cfg(feature = "failpoints")]
 
 pub mod child;
 pub mod git;

@@ -8,15 +8,18 @@ repository.workspace = true
 publish = false
 
 [features]
+# Every user turns this on (the workspace dependency does). Off, the crate is
+# empty, so a plain `cargo build --workspace` compiles no failpoints into
+# sk1ll-core.
+failpoints = ["dep:sk1ll-core", "sk1ll-core/failpoints", "dep:tempfile"]
 # A real sk1ll-server on a runtime of its own (`server::Server`).
-server = ["dep:sk1ll-server", "dep:sk1ll-proto", "dep:reqwest", "dep:tokio", "dep:serde"]
+server = ["failpoints", "dep:sk1ll-server", "dep:sk1ll-proto", "dep:reqwest", "dep:tokio", "dep:serde"]
 # A `sk1ll-daemon` process per Machine (`daemon::DaemonMachine`).
 daemon = ["server", "dep:sk1ll-daemon"]
 
 [dependencies]
-# Fault injection is on wherever the testkit is: tests may install callbacks.
-sk1ll-core = { workspace = true, features = ["failpoints"] }
-tempfile.workspace = true
+sk1ll-core = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 sk1ll-server = { path = "../sk1ll-server", optional = true }
 sk1ll-daemon = { path = "../sk1ll-daemon", optional = true }
