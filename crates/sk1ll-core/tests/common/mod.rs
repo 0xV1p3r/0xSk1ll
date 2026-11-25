@@ -82,24 +82,24 @@ impl Fleet {
         let entered: Box<dyn std::fmt::Debug> = Box::new(home.enter());
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
-        let origin = root.join("origin.git");
-        sk1ll_testkit::git::init_bare(&origin);
         let a = root.join("a");
-        fs::create_dir(&a).unwrap();
-        git(&a, &["init", "--quiet", "-b", "main"]);
-        git(&a, &["config", "user.name", "Machine A"]);
-        git(&a, &["config", "user.email", "a@example.com"]);
-        git(&a, &["config", "commit.gpgsign", "false"]);
-        write(&a.join("sk1ll.toml"), "");
-        write(&a.join("sk1ll.lock"), "");
-        write(&a.join("personal/pdf/SKILL.md"), SEED_PDF);
-        write(&a.join("personal/pdf/ref.md"), "reference\n");
-        write(&a.join("imported/web/SKILL.md"), "---\nname: web\n---\nWeb.\n");
-        write(&a.join("instructions/git.md"), SEED_GIT);
-        write(&a.join("instructions/style.md"), "Be terse.\n");
-        commit_all(&a, "seed");
-        git(&a, &["remote", "add", "origin", origin.to_str().unwrap()]);
-        git(&a, &["push", "--quiet", "-u", "origin", "main"]);
+        let seed = SkillsRepo::init(&a);
+        for (rel, text) in [
+            ("sk1ll.toml", ""),
+            ("sk1ll.lock", ""),
+            ("personal/pdf/SKILL.md", SEED_PDF),
+            ("personal/pdf/ref.md", "reference\n"),
+            ("imported/web/SKILL.md", "---\nname: web\n---\nWeb.\n"),
+            ("instructions/git.md", SEED_GIT),
+            ("instructions/style.md", "Be terse.\n"),
+        ] {
+            seed.write(rel, text);
+        }
+        seed.commit_all("seed");
+        seed.git(&["config", "user.name", "Machine A"]);
+        seed.git(&["config", "user.email", "a@example.com"]);
+        let origin = root.join("origin.git");
+        seed.push_to_new_origin(&origin);
         let b = root.join("b");
         let clone = SkillsRepo::clone_from(&origin, &b);
         for key in ["user.name", "user.email"] {

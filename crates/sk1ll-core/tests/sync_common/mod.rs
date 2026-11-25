@@ -98,19 +98,99 @@ pub fn sk1ll_leftovers(dir: &Path) -> Vec<String> {
     found
 }
 
-/// What one displacement test works on: a harness set up and synced
-/// once, then a plan that displaces `dest`.
-pub struct Displacement {
-    pub tmp: Home,
+/// What a harness places in a [`Placed`] fixture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    /// Skill `pdf`, copied.
+    Copy,
+    /// Skill `pdf`, linked.
+    Link,
+    /// Rule `git`, as a rules-directory file.
+    Rules,
+    /// Rule `git`, as a block in `AGENTS.md`.
+    Block,
+}
+
+/// One harness `h` set up for a [`Target`], nothing placed yet.
+pub struct Placed {
+    pub home: Home,
     pub repo: Repo,
     pub harnesses: BTreeMap<String, Harness>,
     pub assignment: Assignment,
-    /// The planned destination.
+    pub target: Target,
+    /// Where the harness places the item.
     pub dest: PathBuf,
+    /// The item in the repo.
+    pub source: PathBuf,
+}
+
+impl Placed {
+    pub fn new(target: Target) -> Self {
+        let (home, repo, harnesses, dest, source) = match target {
+            Target::Copy | Target::Link => {
+                let mode = if target == Target::Link { LinkMode::Symlink } else { LinkMode::Copy };
+                let (home, repo, harnesses) = skill_setup(mode);
+                let (dest, source) = (home.path().join("skills/pdf"), repo.personal_dir().join("pdf"));
+                (home, repo, harnesses, dest, source)
+            }
+            Target::Rules | Target::Block => {
+                let format =
+                    if target == Target::Block { InstructionsFormat::Block } else { InstructionsFormat::Rules };
+                let (home, repo, harnesses, location) = instructions_setup(format);
+                let dest = if target == Target::Block { location } else { location.join("git.md") };
+                let source = repo.root().join("instructions/git.md");
+                (home, repo, harnesses, dest, source)
+            }
+        };
+        Self { home, repo, harnesses, assignment: Assignment::default(), target, dest, source }
+    }
+
+    pub fn is_skill(&self) -> bool {
+        matches!(self.target, Target::Copy | Target::Link)
+    }
+
+    /// The file holding the item's text at `path` (a placement or the source).
+    pub fn file(&self, path: &Path) -> PathBuf {
+        if self.is_skill() { path.join("SKILL.md") } else { path.to_path_buf() }
+    }
+
+    /// Applies the whole plan.
+    pub fn sync(&self) {
+        for a in plan(&self.repo, &self.harnesses, &self.assignment, PlanOptions::default()).unwrap() {
+            apply(&self.repo, &a).unwrap();
+        }
+    }
+
+    /// Changes the repo item's body (a rule keeps its front matter).
+    pub fn update(&self, body: &str) {
+        if self.is_skill() { write(&self.file(&self.source), body) } else { edit_rule_body(&self.source, body) }
+    }
+
+    /// Takes the item off the harness.
+    pub fn unassign(&mut self) {
+        if self.is_skill() {
+            self.assignment.set_skill("h", &skill_id(&self.repo, "pdf"), false);
+        } else {
+            self.assignment.set_rule("h", &rule_id(&self.repo, "git"), false);
+        }
+    }
+}
+
+/// What one displacement test works on: a harness set up and synced
+/// once, then a plan that displaces `dest`.
+pub struct Displacement {
+    placed: Placed,
     /// A file of the displaced content, that writers may hold open.
     pub file: PathBuf,
     /// The directory whose `.sk1ll-tmp/displaced` must hold the entry.
     pub holder: PathBuf,
+}
+
+impl std::ops::Deref for Displacement {
+    type Target = Placed;
+    fn deref(&self) -> &Placed {
+        &self.placed
+    }
 }
 
 impl Displacement {
@@ -118,37 +198,21 @@ impl Displacement {
     /// update", "rule removal" or "block update".
     pub fn new(case: &str) -> Self {
         let (kind, change) = case.split_once(' ').unwrap();
-        let remove = change == "removal";
-        let mut assignment = Assignment::default();
-        let synced = |repo: &Repo, harnesses: &BTreeMap<String, Harness>, assignment: &Assignment| {
-            for a in plan(repo, harnesses, assignment, PlanOptions::default()).unwrap() {
-                apply(repo, &a).unwrap();
-            }
+        let target = match kind {
+            "skill" => Target::Copy,
+            "link" => Target::Link,
+            "rule" => Target::Rules,
+            _ => Target::Block,
         };
-        match kind {
-            "skill" | "link" => {
-                let mode = if kind == "link" { LinkMode::Symlink } else { LinkMode::Copy };
-                let (tmp, repo, harnesses) = skill_setup(mode);
-                let _home = tmp.enter();
-                synced(&repo, &harnesses, &assignment);
-                write(&repo.personal_dir().join("pdf/SKILL.md"), "Updated source.\n");
-                assignment.set_skill("h", &skill_id(&repo, "pdf"), !remove);
-                let dest = tmp.path().join("skills/pdf");
-                let (file, holder) = (dest.join("SKILL.md"), tmp.path().join("skills"));
-                Self { tmp, repo, harnesses, assignment, dest, file, holder }
-            }
-            _ => {
-                let format = if kind == "rule" { InstructionsFormat::Rules } else { InstructionsFormat::Block };
-                let (tmp, repo, harnesses, path) = instructions_setup(format);
-                let _home = tmp.enter();
-                synced(&repo, &harnesses, &assignment);
-                edit_rule_body(&repo.root().join("instructions/git.md"), "Use CC always.\n");
-                assignment.set_rule("h", &rule_id(&repo, "git"), !remove);
-                let dest = if kind == "rule" { path.join("git.md") } else { path.clone() };
-                let holder = dest.parent().unwrap().to_path_buf();
-                Self { tmp, repo, harnesses, assignment, file: dest.clone(), dest, holder }
-            }
+        let mut placed = Placed::new(target);
+        let _home = placed.home.enter();
+        placed.sync();
+        placed.update(if placed.is_skill() { "Updated source.\n" } else { "Use CC always.\n" });
+        if change == "removal" {
+            placed.unassign();
         }
+        let (file, holder) = (placed.file(&placed.dest), placed.dest.parent().unwrap().to_path_buf());
+        Self { placed, file, holder }
     }
 
     pub fn action(&self) -> Action {

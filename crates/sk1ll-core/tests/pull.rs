@@ -1535,29 +1535,44 @@ fn a_pull_restarts_at_every_checkpoint_without_losing_draft_or_staged_changes() 
         pull(&Repo::open(root).unwrap()).unwrap();
         panic!("pull missed the index checkpoint");
     }
-    for rebase in [false, true] {
-        let f = Fleet::new();
-        let upstream = half_way_setup(&f);
-        if rebase {
-            write(&f.b.join("sk1ll.toml"), "# b committed\n");
-            f.b().commit(&[item("manifest")], "manifest from b", None).unwrap();
-        }
-        let old = head(&f.b);
-        let draft = f.b().draft().unwrap();
-        let probe = f.copy_b();
-        let hits = {
-            let record = failpoints::record();
-            assert!(matches!(pull(&probe.repo()).unwrap(), PullOutcome::Updated { .. }));
-            record.hits()
-        };
-        for expected in [Point::PullJournal, Point::PullRemove, Point::PullSwap, Point::PullIndex, Point::PullDone] {
-            assert!(hits.iter().any(|hit| hit.point == expected), "{expected:?}");
-        }
+    // Each takes a while: fast-forward and rebase run side by side.
+    std::thread::scope(|s| {
+        s.spawn(|| restart_sweep(false));
+        restart_sweep(true);
+    });
+}
 
-        for (n, hit) in hits.iter().enumerate() {
+/// The body of [`a_pull_restarts_at_every_checkpoint_without_losing_draft_or_staged_changes`].
+fn restart_sweep(rebase: bool) {
+    use sk1ll_testkit::child;
+    let f = Fleet::new();
+    let upstream = half_way_setup(&f);
+    if rebase {
+        write(&f.b.join("sk1ll.toml"), "# b committed\n");
+        f.b().commit(&[item("manifest")], "manifest from b", None).unwrap();
+    }
+    let old = head(&f.b);
+    let draft = f.b().draft().unwrap();
+    let probe = f.copy_b();
+    let hits = {
+        let record = failpoints::record();
+        assert!(matches!(pull(&probe.repo()).unwrap(), PullOutcome::Updated { .. }));
+        record.hits()
+    };
+    for expected in [Point::PullJournal, Point::PullRemove, Point::PullSwap, Point::PullIndex, Point::PullDone] {
+        assert!(hits.iter().any(|hit| hit.point == expected), "{expected:?}");
+    }
+
+    // From the journal on, every stop leaves it and the target's anchor,
+    // and the next pull or a refresh (`finish_pull`) finishes it.
+    let journal = hits.iter().position(|hit| hit.point == Point::PullJournal).unwrap();
+    for (n, hit) in hits.iter().enumerate() {
+        let journaled = n > journal;
+        for by_pull in [true, false].into_iter().take(if journaled { 2 } else { 1 }) {
             let copy = f.copy_b();
             let root = copy.b.as_path();
-            let case = format!("rebase={rebase}, hit {n} ({:?})", hit.point);
+            let by = if by_pull { "pull" } else { "refresh" };
+            let case = format!("rebase={rebase}, hit {n} ({:?}), finished by {by}", hit.point);
             if !rebase && hit.point == Point::PullIndex {
                 let name = "a_pull_restarts_at_every_checkpoint_without_losing_draft_or_staged_changes";
                 let out = copy.home.apply(&mut child::command(name, root)).output().unwrap();
@@ -1571,14 +1586,12 @@ fn a_pull_restarts_at_every_checkpoint_without_losing_draft_or_staged_changes() 
             }
             let repo = copy.repo();
             assert_eq!(head_ref(root), "refs/heads/main", "{case}");
-            let pending = repo.pull_pending().unwrap();
-            let anchor = pending.then(|| git(root, &["rev-parse", "refs/worktree/sk1ll-pull"]));
-            let outcome = if pending && (n % 2 == 0) { finish(&repo).unwrap().unwrap() } else { pull(&repo).unwrap() };
+            assert_eq!(repo.pull_pending().unwrap(), journaled, "{case}");
+            let anchor = journaled.then(|| git(root, &["rev-parse", "refs/worktree/sk1ll-pull"]));
+            let outcome = if by_pull { pull(&repo).unwrap() } else { finish(&repo).unwrap().unwrap() };
             let target = head(root);
             assert_eq!(outcome, PullOutcome::Updated { from: old.clone(), to: target.clone() }, "{case}");
-            if let Some(anchor) = anchor {
-                assert_eq!(anchor, target, "{case}");
-            }
+            assert_eq!(anchor.unwrap_or_else(|| target.clone()), target, "{case}: the anchor kept the target");
             assert_eq!(git(root, &["rev-parse", if rebase { "HEAD~1" } else { "HEAD" }]), upstream, "{case}");
             assert!(!repo.pull_pending().unwrap(), "{case}");
             assert_eq!(repo.draft().unwrap(), draft, "{case}");
