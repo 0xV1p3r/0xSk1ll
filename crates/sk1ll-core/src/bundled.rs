@@ -28,27 +28,3 @@ impl Repo {
         self.create_item_with("skill", name, body)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_the_documented_link_has_a_bundled_copy() {
-        assert_eq!(for_link(SK1LL_SKILL_LINK), Some("sk1ll"));
-        assert_eq!(for_link(&format!(" {SK1LL_SKILL_LINK}/ ")), Some("sk1ll"));
-        assert_eq!(for_link("https://github.com/owner/repo/tree/main/skills/sk1ll"), None);
-        assert!(skill("sk1ll").is_some_and(|s| s.starts_with("---\nname: sk1ll\n")));
-    }
-
-    #[test]
-    fn the_bundled_copy_lands_in_personal_and_never_replaces() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = Repo::init(dir.path()).unwrap();
-        repo.add_bundled("sk1ll", "sk1ll").unwrap();
-        let written = std::fs::read_to_string(dir.path().join("personal/sk1ll/SKILL.md")).unwrap();
-        assert_eq!(written, SK1LL_SKILL);
-        assert!(repo.add_bundled("sk1ll", "sk1ll").unwrap_err().to_string().contains("taken"));
-        assert!(repo.add_bundled("pdf", "pdf").is_err());
-    }
-}

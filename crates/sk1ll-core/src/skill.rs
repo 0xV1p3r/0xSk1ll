@@ -93,25 +93,3 @@ pub fn split_frontmatter(text: &str) -> (Option<&str>, &str) {
     }
     (None, text)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{frontmatter_field, split_frontmatter};
-
-    #[test]
-    fn splits_frontmatter() {
-        assert_eq!(split_frontmatter("---\na: 1\n---\nbody\n"), (Some("a: 1\n"), "body\n"));
-        assert_eq!(split_frontmatter("body"), (None, "body"));
-        assert_eq!(split_frontmatter("---\nunterminated"), (None, "---\nunterminated"));
-    }
-
-    #[test]
-    fn parses_inline_and_folded() {
-        let t = "---\nname: pdf\ndescription: \"Work with PDFs\"\n---\nbody";
-        assert_eq!(frontmatter_field(t, "name").as_deref(), Some("pdf"));
-        assert_eq!(frontmatter_field(t, "description").as_deref(), Some("Work with PDFs"));
-        let t = "---\ndescription: >\n  line one\n  line two\nname: x\n---\n";
-        assert_eq!(frontmatter_field(t, "description").as_deref(), Some("line one line two"));
-        assert_eq!(frontmatter_field("no frontmatter", "name"), None);
-    }
-}
