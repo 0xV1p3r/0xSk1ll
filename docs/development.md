@@ -33,6 +33,8 @@ Ctrl-C stops every process in the fleet, git hooks included. It waits five secon
 
 ## Checks
 
+Unit tests pin only the contracts between public interfaces: the wire protocol (`crates/sk1ll-proto/tests/wire.rs`), the local API's JSON (below), and the files users and other components read: `machine.toml`, the skills repo's manifest and lock, the ownership index and placement markers, Item IDs. Everything else is tested through a real boundary, in each crate's `tests/`: core's public API on real temporary repos and git, the daemon's in-process engine (`sk1ll_daemon::local`) and its processes against a real server, the server over HTTP, WebSocket and git, the CLI through the `sk1ll` binary. Crash recovery and races are simulations over failpoints: a sweep records the points an operation reaches, then crashes (or edits files) at each one in turn and checks that a fresh engine converges without losing anyone's edit. Prefer adding a row to such a sweep or table over a new one-off test.
+
 ```sh
 cd crates/sk1ll-gui/ui
 pnpm tsc --noEmit
@@ -51,7 +53,7 @@ python3 crates/sk1ll-gui/tests/test_dev_fleet.py
 
 The CLI's command tests run the `sk1ll` binary, each with its own `HOME` and XDG directories: every command runs the engine, which reconciles, and would otherwise find your own harnesses through the presets. No test reaches GitHub: the release notice of `sk1ll status` asks only when standard output is a terminal, and its test runs it on a pty with `SK1LL_RELEASE_URL` pointing at a local stub of GitHub's latest-release API.
 
-No test may write under the real home directory: tests get temporary directories, and in-process engines in the daemon's and core's own tests default every path (core's state and cache directories included) to one. `scripts/check-test-home.sh` runs `cargo test --workspace` with `HOME` set to an empty directory and the XDG variables unset, and fails if anything appears there.
+No test may write under the real home directory: tests get temporary directories, and an in-process engine gets its HOME, state and cache directories and git environment from `sk1ll_testkit::Home::enter` (or `failpoints::dirs`). `scripts/check-test-home.sh` runs `cargo test --workspace` with `HOME` set to an empty directory and the XDG variables unset, and fails if anything appears there.
 
 A few tests need a case-insensitive filesystem and return early elsewhere, such as restoring both sides of a case-only rename; on a case-sensitive filesystem only the pieces they are built from run (the respelling move, the alias check).
 
