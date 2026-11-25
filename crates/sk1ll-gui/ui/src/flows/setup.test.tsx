@@ -111,7 +111,6 @@ it('starts a new Fleet as its first Machine with the admin token, keeping the wi
 
 const service = (overrides: Partial<ServiceInfo>): ServiceInfo => ({ default_socket: true, binary: '/home/dev/.cargo/bin/sk1ll', manager: 'systemd', available: true, active: false, restartable: false, unit: null, ...overrides });
 const mismatch = { message: 'local API mismatch', status: 426, unreachable: false };
-const launchd = 'gui/$(id -u)/app.v1p3r.sk1ll.daemon';
 it.each<{ name: string; mismatch?: boolean; info: ServiceInfo | 'fails'; check: (user: UserEvent, daemon: MockDaemon) => Promise<void> }>([
   { name: 'starts a stopped Daemon as its systemd user service', info: service({}), check: async (user, daemon) => {
     expect(screen.getByText(/Installs the sk1ll-daemon user service/)).toBeTruthy();
@@ -124,15 +123,6 @@ it.each<{ name: string; mismatch?: boolean; info: ServiceInfo | 'fails'; check: 
     expect(screen.queryByRole('button', { name: 'Start the Daemon' })).toBeNull();
     expect(screen.getByRole('button', { name: 'Copy sk1ll daemon' })).toBeTruthy();
   } },
-  { name: 'gives one complete command for an installed launch agent', info: service({ binary: null, manager: 'launchd', unit: '/Users/me/Library/LaunchAgents/app.v1p3r.sk1ll.daemon.plist' }), check: async () => {
-    expect(screen.getByRole('button', { name: `Copy mkdir -p ~/Library/Logs/sk1ll && launchctl enable ${launchd} && (launchctl print ${launchd} >/dev/null 2>&1 || launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/app.v1p3r.sk1ll.daemon.plist) && launchctl kickstart ${launchd}` })).toBeTruthy();
-  } },
-  { name: 'installs the launch agent on macOS, or runs it in a terminal', info: service({ binary: '/Applications/0xSk1ll.app/Contents/MacOS/sk1ll', manager: 'launchd' }), check: async user => {
-    expect(screen.getByText(/Installs the app.v1p3r.sk1ll.daemon launch agent/)).toBeTruthy();
-    await user.click(screen.getByRole('button', { name: 'Start it yourself' }));
-    expect(await screen.findByRole('button', { name: 'Copy sk1ll daemon' })).toBeTruthy();
-    expect(screen.queryByRole('button', { name: /Copy launchctl/ })).toBeNull();
-  } },
   { name: 'restarts an incompatible Daemon run by an active service', mismatch: true, info: service({ active: true, restartable: true, unit: '/user/sk1ll-daemon.service' }), check: async (user, daemon) => {
     await user.click(screen.getByRole('button', { name: 'Restart daemon' }));
     await waitFor(() => expect(daemon.sent('restart_daemon')).toHaveLength(1));
@@ -141,13 +131,9 @@ it.each<{ name: string; mismatch?: boolean; info: ServiceInfo | 'fails'; check: 
     expect(screen.getByRole('button', { name: 'Copy systemctl --user restart sk1ll-daemon' })).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Restart daemon' })).toBeNull();
   } },
-  { name: 'gives the launchd restart command on macOS', mismatch: true, info: service({ binary: null, manager: 'launchd' }), check: async () => {
-    expect(screen.getByRole('button', { name: `Copy launchctl kickstart -k ${launchd}` })).toBeTruthy();
-    expect(screen.queryByText(/systemctl/)).toBeNull();
-  } },
   { name: 'falls back to the terminal command when the service manager cannot be asked', mismatch: true, info: 'fails', check: async () => {
     expect(screen.getByRole('button', { name: 'Copy sk1ll daemon' })).toBeTruthy();
-    expect(screen.queryByRole('button', { name: /Copy (systemctl|launchctl)/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Copy systemctl/ })).toBeNull();
   } },
 ])('connection screen $name', async ({ mismatch: incompatible, info, check }) => {
   const { daemon, user } = launch(incompatible ? 'fleet' : 'unreachable', { setup: daemon => {

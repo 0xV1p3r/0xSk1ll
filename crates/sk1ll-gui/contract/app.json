@@ -14,7 +14,6 @@
     }
   ],
   "daemon_started": {
-    "launchd": "launchd",
     "process": "process",
     "systemd": "systemd"
   },
@@ -65,7 +64,6 @@
     "unit": "sk1ll-daemon.service"
   },
   "service_manager": {
-    "launchd": "launchd",
     "systemd": "systemd"
   },
   "update_progress": {

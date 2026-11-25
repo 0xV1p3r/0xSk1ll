@@ -140,7 +140,7 @@ fn recovery_discovery_recognises_a_skills_repo_by_layout_and_history() {
     assert_eq!(Repo::locate_git(&top), Repo::default_location());
 }
 
-/// Whether `dir`'s filesystem folds case (macOS's default APFS does).
+/// Whether `dir`'s filesystem folds case (such as an ext4 casefold directory, or vfat).
 fn folds_case(dir: &Path) -> bool {
     let probe = dir.join("case-probe");
     fs::write(&probe, "").unwrap();
@@ -361,7 +361,7 @@ fn a_case_only_rename_keeps_the_id_and_uses_the_requested_spelling() {
 
 /// Restoring both sides of `pdf` -> `PDF` puts the Baseline's spelling
 /// back even when the directory holds an ignored file, which keeps
-/// restore from removing it. Only a case-insensitive filesystem (macOS)
+/// restore from removing it. Only a case-insensitive filesystem
 /// gets there; elsewhere the two spellings are two directories.
 #[test]
 fn restoring_a_case_only_rename_restores_the_spelling() {
