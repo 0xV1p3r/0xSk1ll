@@ -77,7 +77,7 @@ Workflows name actions by version tag, and `.github/workflows/actions.lock` pins
 4. `.github/workflows/release.yml` builds the Linux x86_64 and aarch64 archives and the Linux `.deb`. The `sign` job waits for your approval of the `release` environment, then signs the `.deb` for the app's updater. The workflow opens a draft release with `SHA256SUMS`, the changelog section, the `.deb.sig` and `latest.json`. A tag that isn't `vX.Y.Z` opens a pre-release. Review it and publish it.
 5. Publishing it runs `.github/workflows/server-image.yml`, which pushes the server image for the tag, and `:latest` unless it's a pre-release. A published stable release is also what installed apps update to: they read `releases/latest/download/latest.json`, which skips drafts and pre-releases.
 
-Both workflows attest the build provenance of what they ship: `gh attestation verify <file> --repo 0xV1p3r/0xSk1ll`.
+Both workflows attest the build provenance of what they ship: `gh attestation verify <file> --repo 0xV1p3r/0xSk1ll`. 0.1.0 shipped while the repo was private, so it has no attestations.
 
 ### App updates
 
