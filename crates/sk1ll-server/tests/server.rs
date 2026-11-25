@@ -25,9 +25,25 @@ fn id(s: &str) -> ItemId {
     s.parse().unwrap()
 }
 
-enum TestServer {
-    Shared(Server),
-    Bounded { port: u16, dir: tempfile::TempDir, http: reqwest::Client },
+/// A testkit [`Server`] that checks pushes with this crate's binary, with
+/// this file's API helpers.
+struct TestServer(Server);
+
+impl std::ops::Deref for TestServer {
+    type Target = Server;
+    fn deref(&self) -> &Server {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for TestServer {
+    fn deref_mut(&mut self) -> &mut Server {
+        &mut self.0
+    }
+}
+
+fn builder() -> sk1ll_testkit::server::Builder {
+    Server::builder().config(|config| config.push_check = Some(env!("CARGO_BIN_EXE_sk1ll-server").into()))
 }
 
 async fn start() -> TestServer {
@@ -35,86 +51,42 @@ async fn start() -> TestServer {
 }
 
 async fn start_with(tune: impl Fn(&mut Config) + Send + Sync + 'static) -> TestServer {
-    TestServer::Shared(
-        Server::start_with(move |config| {
-            config.push_check = Some(env!("CARGO_BIN_EXE_sk1ll-server").into());
-            tune(config);
-        })
-        .await,
-    )
+    TestServer(builder().config(tune).start().await)
+}
+
+/// A server whose sends to a client that doesn't read soon fill its tiny
+/// send buffer.
+async fn small_send_buffer(tune: impl Fn(&mut Config) + Send + Sync + 'static) -> TestServer {
+    TestServer(builder().socket(|s| s.set_send_buffer_size(4096).unwrap()).config(tune).start().await)
+}
+
+/// A server on the test's own runtime and clock.
+async fn on_test_runtime() -> TestServer {
+    TestServer(builder().on_caller_runtime().start().await)
 }
 
 impl TestServer {
-    // These cases need a full server send buffer before the client reads.
-    async fn bounded(tune: impl FnOnce(&mut Config)) -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let mut config = Config::new(dir.path());
-        config.admin_token = Some(ADMIN.into());
-        config.push_check = Some(env!("CARGO_BIN_EXE_sk1ll-server").into());
-        tune(&mut config);
-        let socket = tokio::net::TcpSocket::new_v4().unwrap();
-        socket.set_send_buffer_size(4096).unwrap();
-        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let listener = socket.listen(128).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move { sk1ll_server::serve(config, listener).await.unwrap() });
-        let server = Self::Bounded { port, dir, http: reqwest::Client::new() };
-        eventually(|| async { server.http().get(format!("{}/healthz", server.url())).send().await.ok() }).await;
-        server
-    }
-
-    fn port(&self) -> u16 {
-        match self {
-            Self::Shared(server) => server.port(),
-            Self::Bounded { port, .. } => *port,
-        }
-    }
-
-    fn url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port())
-    }
-
-    fn data(&self) -> &Path {
-        match self {
-            Self::Shared(server) => server.data(),
-            Self::Bounded { dir, .. } => dir.path(),
-        }
-    }
-
-    fn http(&self) -> &reqwest::Client {
-        match self {
-            Self::Shared(server) => server.http(),
-            Self::Bounded { http, .. } => http,
-        }
-    }
-
-    async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> T {
-        match self {
-            Self::Shared(server) => server.get(path).await,
-            Self::Bounded { .. } => self.get_json(ADMIN, path).await,
-        }
-    }
-
-    async fn row(&self, id: &str) -> Option<sk1ll_proto::MachineRow> {
-        match self {
-            Self::Shared(server) => server.row(id).await,
-            Self::Bounded { .. } => self.get::<FleetView>("/fleet").await.machines.into_iter().find(|m| m.id == id),
-        }
-    }
-
-    async fn join_code(&self) -> String {
-        match self {
-            Self::Shared(server) => server.join_code().await,
-            Self::Bounded { .. } => self.scoped_code(ADMIN, "fleet").await.code,
-        }
-    }
-
     fn api(&self, path: &str) -> String {
         format!("{}/api{path}", self.url())
     }
 
+    /// A request to `/api<path>` as `token`.
+    fn request(&self, method: reqwest::Method, token: &str, path: &str) -> reqwest::RequestBuilder {
+        self.http().request(method, self.api(path)).bearer_auth(token)
+    }
+
     async fn get_as(&self, token: &str, path: &str) -> reqwest::Response {
-        self.http().get(self.api(path)).bearer_auth(token).send().await.unwrap()
+        self.request(reqwest::Method::GET, token, path).send().await.unwrap()
+    }
+
+    /// `DELETE /machines/<machine>` as `token`.
+    async fn remove(&self, token: &str, machine: &str) -> reqwest::Response {
+        self.request(reqwest::Method::DELETE, token, &format!("/machines/{machine}")).send().await.unwrap()
+    }
+
+    /// Undoes log entry `entry` as `token`.
+    async fn undo(&self, token: &str, entry: impl std::fmt::Display) -> reqwest::Response {
+        self.request(reqwest::Method::POST, token, &format!("/log/{entry}/undo")).send().await.unwrap()
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, token: &str, path: &str) -> T {
@@ -141,10 +113,7 @@ impl TestServer {
 
     /// Joins `id` with a code of `scope` and returns its token.
     async fn join_scoped(&self, id: &str, harnesses: &[&str], scope: Scope) -> String {
-        let code = match self {
-            Self::Shared(server) => server.join_code_for(scope).await.code,
-            Self::Bounded { .. } => self.scoped_code(ADMIN, scope.as_str()).await.code,
-        };
+        let code = self.join_code_for(scope).await.code;
         let resp = self.try_join(&code, id, harnesses).await;
         assert_eq!(resp.status(), StatusCode::CREATED);
         resp.json::<JoinResponse>().await.unwrap().token
@@ -298,6 +267,11 @@ fn write_item(repo: &Path, path: &str, text: &str) {
     } else {
         write(&repo.join(path), text);
     }
+}
+
+/// A change of `claude`'s toggle for skill `id`, named after it.
+fn skill_toggle(id: &str, enabled: bool) -> Value {
+    json!({"harness":"claude", "kind":"skill", "item_id":id, "name":id, "enabled":enabled})
 }
 
 /// Long draft skill names, so that an assignment enabling them all is big.
@@ -594,8 +568,7 @@ async fn an_expected_revision_and_registration_guard_a_write() {
     assert!(resp.text().await.unwrap().contains("changed since revision"));
 
     // A new join of the same id is another registration, even within the second.
-    let resp = server.http().delete(server.api("/machines/ws")).bearer_auth(ADMIN).send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(server.remove(ADMIN, "ws").await.status(), StatusCode::NO_CONTENT);
     server.join("ws", &["claude"]).await;
     let again: AssignmentSnapshot = server.get("/machines/ws/assignment").await;
     assert_ne!(again.registration.as_ref(), Some(&registration));
@@ -646,7 +619,7 @@ async fn assignment_changes_are_logged_and_undoable() {
     assert_eq!(log.len(), 2);
     assert_eq!(log[1], *e, "newest first");
 
-    let resp = server.http().post(server.api(&format!("/log/{}/undo", e.id))).bearer_auth(ADMIN).send().await.unwrap();
+    let resp = server.undo(ADMIN, e.id).await;
     let undo: AssignmentUpdate = resp.json().await.unwrap();
     let u = &undo.entries[0];
     assert_eq!((u.author.as_str(), u.before, u.after), ("admin", Some(true), None));
@@ -655,7 +628,7 @@ async fn assignment_changes_are_logged_and_undoable() {
     assert!(!a.harness("claude").skills.contains_key(&id("pdf")));
     assert!(a.harness("claude").new_rules_default);
 
-    let again = server.http().post(server.api(&format!("/log/{}/undo", e.id))).bearer_auth(ADMIN).send().await.unwrap();
+    let again = server.undo(ADMIN, e.id).await;
     assert!(again.json::<AssignmentUpdate>().await.unwrap().entries.is_empty());
     assert_eq!(server.get_as(&token, "/machines/nope/assignment").await.status(), StatusCode::NOT_FOUND);
 }
@@ -796,8 +769,7 @@ async fn removing_a_machine_revokes_it() {
     assert!(matches!(ws_next(&mut ws).await, ServerMessage::Assignment(_)));
     assert!(matches!(ws_next(&mut ws).await, ServerMessage::Nudge { .. }));
 
-    let resp = server.http().delete(server.api("/machines/a")).bearer_auth(&b_token).send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(server.remove(&b_token, "a").await.status(), StatusCode::NO_CONTENT);
     assert_eq!(ws_next(&mut ws).await, ServerMessage::Revoked);
 
     assert_eq!(server.get_as(&a_token, "/fleet").await.status(), StatusCode::UNAUTHORIZED);
@@ -811,8 +783,7 @@ async fn removing_a_machine_revokes_it() {
     let removed: Vec<_> = log.iter().filter(|e| e.cause == LogCause::MachineRemoved).collect();
     assert_eq!(removed.len(), 3, "two defaults and one toggle");
     assert!(removed.iter().all(|e| e.author == "b" && e.after.is_none()));
-    let undo = server.http().post(server.api(&format!("/log/{}/undo", removed[0].id))).bearer_auth(&b_token);
-    assert_eq!(undo.send().await.unwrap().status(), StatusCode::CONFLICT);
+    assert_eq!(server.undo(&b_token, removed[0].id).await.status(), StatusCode::CONFLICT);
 
     let fleet: FleetView = server.get_json(&b_token, "/fleet").await;
     assert_eq!(fleet.machines.len(), 1);
@@ -1217,36 +1188,30 @@ async fn self_scoped_machines_manage_only_themselves() {
         .await;
 
     // Undo: entries for itself (whoever wrote them), not for others.
-    let undo = |token: String, id: i64| {
-        let req = server.http().post(server.api(&format!("/log/{id}/undo"))).bearer_auth(token);
-        async move { req.send().await.unwrap() }
-    };
-    assert_eq!(undo(me.clone(), mine.entries[0].id).await.status(), StatusCode::OK);
-    assert_eq!(undo(me.clone(), by_other.entries[0].id).await.status(), StatusCode::OK);
-    forbidden(undo(me.clone(), theirs.entries[0].id).await).await;
-    assert_eq!(undo(me.clone(), 9999).await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(server.undo(&me, mine.entries[0].id).await.status(), StatusCode::OK);
+    assert_eq!(server.undo(&me, by_other.entries[0].id).await.status(), StatusCode::OK);
+    forbidden(server.undo(&me, theirs.entries[0].id).await).await;
+    assert_eq!(server.undo(&me, 9999).await.status(), StatusCode::NOT_FOUND);
 
     // Removing others is refused; removing itself is allowed.
-    let remove =
-        |token: &str, id: &str| server.http().delete(server.api(&format!("/machines/{id}"))).bearer_auth(token).send();
-    forbidden(remove(&me, "other").await.unwrap()).await;
-    forbidden(remove(&me, "ghost").await.unwrap()).await;
+    forbidden(server.remove(&me, "other").await).await;
+    forbidden(server.remove(&me, "ghost").await).await;
     assert!(server.row("other").await.is_some());
-    assert_eq!(remove(&me, "me").await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert_eq!(server.remove(&me, "me").await.status(), StatusCode::NO_CONTENT);
     assert_eq!(server.get_as(&me, "/fleet").await.status(), StatusCode::UNAUTHORIZED);
 
     // Rejoining takes the new code's scope.
     let me = server.join_scoped("me", &["claude"], Scope::Fleet).await;
     assert_eq!(server.row("me").await.unwrap().scope, Scope::Fleet);
     assert_eq!(server.create_code(&me, None).await.status(), StatusCode::CREATED);
-    assert_eq!(remove(&me, "other").await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert_eq!(server.remove(&me, "other").await.status(), StatusCode::NO_CONTENT);
     server.join_scoped("other", &[], Scope::SelfOnly).await;
     assert_eq!(server.row("other").await.unwrap().scope, Scope::SelfOnly);
 }
 
 #[tokio::test]
 async fn replaced_socket_cannot_report_after_revocation() {
-    let server = TestServer::bounded(|c| c.send_timeout = Duration::from_secs(120)).await;
+    let server = small_send_buffer(|c| c.send_timeout = Duration::from_secs(120)).await;
     let old_token = server.join("ws", &["claude"]).await;
     let mut old = ws_connect_small(&server, &old_token).await;
     // From here on `old` doesn't read, so the server's send of the big
@@ -1255,8 +1220,7 @@ async fn replaced_socket_cannot_report_after_revocation() {
 
     let mut replacement = ws_connect(&server, &old_token).await;
     ws_assignment(&mut replacement).await;
-    let resp = server.http().delete(server.api("/machines/ws")).bearer_auth(ADMIN).send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(server.remove(ADMIN, "ws").await.status(), StatusCode::NO_CONTENT);
     while ws_next(&mut replacement).await != ServerMessage::Revoked {}
 
     let token = server.join("ws", &["claude"]).await;
@@ -1282,7 +1246,7 @@ async fn replaced_socket_cannot_report_after_revocation() {
 /// Review finding: an unread socket queued a full snapshot per change.
 #[tokio::test]
 async fn stalled_daemon_gets_only_the_latest_assignment() {
-    let server = TestServer::bounded(|c| c.send_timeout = Duration::from_secs(120)).await;
+    let server = small_send_buffer(|c| c.send_timeout = Duration::from_secs(120)).await;
     let token = server.join("ws", &["claude"]).await;
     let mut ws = ws_connect_small(&server, &token).await;
     fatten(&server, &mut ws, "ws").await;
@@ -1310,7 +1274,7 @@ async fn stalled_daemon_gets_only_the_latest_assignment() {
 /// Review finding: a consumer that never reads must be disconnected.
 #[tokio::test]
 async fn daemon_that_misses_the_send_deadline_is_disconnected() {
-    let server = TestServer::bounded(|c| c.send_timeout = Duration::from_millis(300)).await;
+    let server = small_send_buffer(|c| c.send_timeout = Duration::from_millis(300)).await;
     let token = server.join("ws", &["claude"]).await;
     let mut ws = ws_connect_small(&server, &token).await;
     fatten(&server, &mut ws, "ws").await;
@@ -1321,13 +1285,12 @@ async fn daemon_that_misses_the_send_deadline_is_disconnected() {
 /// still tell it it was revoked, last, before the socket closes.
 #[tokio::test]
 async fn a_daemon_removed_mid_send_still_hears_it_was_revoked() {
-    let server = TestServer::bounded(|c| c.send_timeout = Duration::from_secs(120)).await;
+    let server = small_send_buffer(|c| c.send_timeout = Duration::from_secs(120)).await;
     let token = server.join("ws", &["claude"]).await;
     let mut ws = ws_connect_small(&server, &token).await;
     // From here on the server's send of the big assignment stalls.
     fatten(&server, &mut ws, "ws").await;
-    let resp = server.http().delete(server.api("/machines/ws")).bearer_auth(ADMIN).send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(server.remove(ADMIN, "ws").await.status(), StatusCode::NO_CONTENT);
     let mut last = None;
     let drained = tokio::time::timeout(Duration::from_secs(20), async {
         while let Some(Ok(msg)) = ws.next().await {
@@ -1637,7 +1600,7 @@ async fn push_timeout_runs_follow_up(hook_body: &str, idle: Duration, max: Durat
     use std::os::unix::fs::PermissionsExt;
     use tokio::io::AsyncWriteExt;
 
-    let server = TestServer::bounded(|c| {
+    let server = start_with(move |c| {
         c.push_idle = idle;
         c.push_max = max;
     })
@@ -1859,8 +1822,7 @@ async fn defaults_and_undo_materialize_destination_drafts_and_unpushed() {
         ws_send(&mut ws, &DaemonMessage::Status(report.clone())).await;
         server.reported("alpha", &report).await;
         let entry = update.entries.last().unwrap();
-        let response =
-            server.http().post(server.api(&format!("/log/{}/undo", entry.id))).bearer_auth(&beta).send().await.unwrap();
+        let response = server.undo(&beta, entry.id).await;
         assert_eq!(response.status(), StatusCode::OK);
         let undone: AssignmentUpdate = response.json().await.unwrap();
         assert_eq!(undone.entries.len(), 2);
@@ -2209,18 +2171,7 @@ async fn materializing_defaults_and_undo_read_the_current_baseline() {
     assert_eq!(update.assignment.harness("claude").rules.get(&id("first-id")), Some(&false));
     push_unannounced("later", "second-id");
     let undo_id = update.entries.last().unwrap().id;
-    let undo: AssignmentUpdate = server
-        .http()
-        .post(server.api(&format!("/log/{undo_id}/undo")))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let undo: AssignmentUpdate = server.undo(&token, undo_id).await.error_for_status().unwrap().json().await.unwrap();
     assert_eq!(undo.assignment.harness("claude").rules.get(&id("second-id")), Some(&true));
     assert!(!undo.assignment.harness("claude").new_rules_default);
 }
@@ -2241,6 +2192,55 @@ async fn hold_receive_pack(server: &TestServer, token: &str) -> tokio::net::TcpS
     tcp
 }
 
+/// A bodyless receive-pack POST as `id`.
+fn receive_pack(server: &TestServer, id: &str, token: &str) -> reqwest::RequestBuilder {
+    server
+        .http()
+        .post(format!("{}/git/repo.git/git-receive-pack", server.url()))
+        .basic_auth(id, Some(token))
+        .header("content-type", "application/x-git-receive-pack-request")
+        .timeout(Duration::from_secs(5))
+}
+
+/// What happens at one server's push lock, through its failpoints: each
+/// request that gets in line for it, and each removal that starts its
+/// database work there and then waits for [`release`](Self::release).
+#[cfg(feature = "failpoints")]
+struct PushLock {
+    events: tokio::sync::mpsc::UnboundedReceiver<sk1ll_core::failpoints::Point>,
+    release: Option<std::sync::mpsc::Sender<()>>,
+    _watch: sk1ll_core::failpoints::Guard,
+}
+
+#[cfg(feature = "failpoints")]
+impl PushLock {
+    fn watch(server: &TestServer) -> Self {
+        use sk1ll_core::failpoints::{self, Action, Point};
+        let (tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (repo, released) = (server.data().join("repo.git"), std::sync::Mutex::new(released));
+        let _watch = failpoints::install_shared(move |point, path| {
+            if path == repo && matches!(point, Point::ServerPushLockQueued | Point::ServerRemovalEntered) {
+                tx.send(point).unwrap();
+                if point == Point::ServerRemovalEntered {
+                    let _ = released.lock().unwrap().recv();
+                }
+            }
+            Action::Continue
+        });
+        Self { events, release: Some(release), _watch }
+    }
+
+    async fn next(&mut self) -> sk1ll_core::failpoints::Point {
+        tokio::time::timeout(Duration::from_secs(10), self.events.recv()).await.expect("no push lock event").unwrap()
+    }
+
+    /// Lets removals waiting in their database work, and later ones, go on.
+    fn release(&mut self) {
+        self.release = None;
+    }
+}
+
 #[cfg(feature = "failpoints")]
 #[tokio::test]
 async fn unconfirmed_cleanup_refuses_pushes_and_prune_until_restart() {
@@ -2250,15 +2250,7 @@ async fn unconfirmed_cleanup_refuses_pushes_and_prune_until_restart() {
     let token = server.join("writer", &["claude"]).await;
     let (dir, head) = seed(&server, "writer", &token, &["README.md"]).await;
     let repo = dir.path().join("repo");
-    let update = server
-        .put_assignment(
-            &token,
-            "writer",
-            json!([
-                {"harness":"claude", "kind":"skill", "item_id":"gone", "name":"gone", "enabled":true},
-            ]),
-        )
-        .await;
+    let update = server.put_assignment(&token, "writer", json!([skill_toggle("gone", true)])).await;
     let bare = server.data().join("repo.git");
     let failed = failpoints::install_shared(move |point, path| {
         if point == Point::ServerCleanupConfirmation && path == bare {
@@ -2267,26 +2259,17 @@ async fn unconfirmed_cleanup_refuses_pushes_and_prune_until_restart() {
             Action::Continue
         }
     });
+    let mut lock = PushLock::watch(&server);
     let stalled = hold_receive_pack(&server, &token).await;
-    let receive = |path: &str, method| {
-        server
-            .http()
-            .request(method, format!("{}{path}", server.url()))
-            .basic_auth("writer", Some(&token))
-            .header("content-type", "application/x-git-receive-pack-request")
-            .timeout(Duration::from_secs(5))
-            .send()
-    };
-    let mut queued = Box::pin(receive("/git/repo.git/git-receive-pack", reqwest::Method::POST));
-    tokio::select! {
-        response = &mut queued => panic!("receive-pack overtook the first request: {response:?}"),
-        () = tokio::time::sleep(Duration::from_millis(100)) => {}
-    }
+    // In line before the cleanup fails, so it is refused after the wait.
+    let queued = tokio::spawn(receive_pack(&server, "writer", &token).send());
+    assert_eq!(lock.next().await, Point::ServerPushLockQueued);
     drop(stalled);
+    let discovery = format!("{}/git/repo.git/info/refs?service=git-receive-pack", server.url());
     for response in [
-        queued.await.unwrap(),
-        receive("/git/repo.git/git-receive-pack", reqwest::Method::POST).await.unwrap(),
-        receive("/git/repo.git/info/refs?service=git-receive-pack", reqwest::Method::GET).await.unwrap(),
+        queued.await.unwrap().unwrap(),
+        receive_pack(&server, "writer", &token).send().await.unwrap(),
+        server.http().get(discovery).basic_auth("writer", Some(&token)).send().await.unwrap(),
     ] {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(response.text().await.unwrap().contains("unconfirmed backend cleanup"));
@@ -2307,8 +2290,7 @@ async fn unconfirmed_cleanup_refuses_pushes_and_prune_until_restart() {
     assert_eq!(git(&fetched.path().join("repo"), &["rev-parse", "HEAD"]), head);
 
     drop(failed);
-    let TestServer::Shared(shared) = &mut server else { unreachable!() };
-    shared.restart().await;
+    server.restart().await;
     let snapshot: AssignmentSnapshot = server.get("/machines/writer/assignment").await;
     assert_eq!((snapshot.revision, snapshot.assignment), (update.revision, update.assignment));
     assert_eq!(server.get::<FleetView>("/fleet").await.baseline.as_deref(), Some(head.as_str()));
@@ -2341,8 +2323,7 @@ async fn a_restart_mid_push_keeps_assignments_and_serves_the_current_head() {
     let moved = git(&repo, &["rev-parse", "HEAD"]);
     assert_ne!(server.get::<FleetView>("/fleet").await.baseline.as_deref(), Some(moved.as_str()));
 
-    let TestServer::Shared(shared) = &mut server else { unreachable!() };
-    shared.restart().await;
+    server.restart().await;
     drop(stalled);
     assert_eq!(server.get::<FleetView>("/fleet").await.baseline.as_deref(), Some(moved.as_str()));
     let health: Value =
@@ -2438,71 +2419,45 @@ async fn concurrent_assignment_writes_commit_once_per_revision() {
     assert_eq!(log.len(), items + CLIENTS);
 }
 
-/// A removal waits for the running push, and a push queued behind the
-/// removal checks its machine's registration again and is refused.
+/// A removal waits for the running push. A push that gets in line behind
+/// it checks its Machine's registration again once it has the lock and is
+/// refused, even when the removal's caller disconnected while the removal
+/// ran: the removal keeps the lock until its database work commits.
+#[cfg(feature = "failpoints")]
 #[tokio::test]
-async fn a_push_checks_registration_again_after_waiting_for_removal() {
+async fn a_push_queued_behind_a_removal_checks_registration_again() {
+    use sk1ll_core::failpoints::Point;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     let server = start().await;
     let old = server.join("old", &[]).await;
     let writer = server.join("writer", &[]).await;
+    let mut lock = PushLock::watch(&server);
     let active = hold_receive_pack(&server, &writer).await;
-    let mut remove = Box::pin(server.http().delete(server.api("/machines/old")).bearer_auth(ADMIN).send());
-    tokio::select! {
-        response = &mut remove => panic!("removal overtook a running push: {response:?}"),
-        () = tokio::time::sleep(Duration::from_millis(100)) => {}
-    }
-    let mut pending = Box::pin(
-        server
-            .http()
-            .post(format!("{}/git/repo.git/git-receive-pack", server.url()))
-            .basic_auth("old", Some(&old))
-            .header("content-type", "application/x-git-receive-pack-request")
-            .timeout(Duration::from_secs(5))
-            .send(),
-    );
-    tokio::select! {
-        response = &mut pending => panic!("second push overtook the first: {response:?}"),
-        () = tokio::time::sleep(Duration::from_millis(100)) => {}
-    }
+    let mut remover = tokio::net::TcpStream::connect(("127.0.0.1", server.port())).await.unwrap();
+    let delete =
+        format!("DELETE /api/machines/old HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {ADMIN}\r\n\r\n");
+    remover.write_all(delete.as_bytes()).await.unwrap();
+    assert_eq!(lock.next().await, Point::ServerPushLockQueued);
+    assert!(server.row("old").await.is_some(), "the removal waits for the running push");
     drop(active);
-    assert_eq!(remove.await.unwrap().status(), StatusCode::NO_CONTENT);
-    assert_eq!(pending.await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(lock.next().await, Point::ServerRemovalEntered);
+    // The server drops the request, and closes, once it reads EOF.
+    remover.shutdown().await.unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(10), remover.read_to_end(&mut Vec::new())).await;
+    assert!(closed.is_ok(), "the server kept the removal's request");
+    let pending = tokio::spawn(receive_pack(&server, "old", &old).send());
+    assert_eq!(lock.next().await, Point::ServerPushLockQueued);
+    lock.release();
+    assert_eq!(pending.await.unwrap().unwrap().status(), StatusCode::UNAUTHORIZED);
     assert!(server.row("old").await.is_none());
 }
 
 #[tokio::test]
 async fn a_database_reopens_current_data_and_resets_an_old_schema() {
-    let mut server = Server::start().await;
-    let code = server.join_code().await;
-    let token = server
-        .http()
-        .post(format!("{}/api/join", server.url()))
-        .json(&json!({"code":code,"machine_id":"writer","harnesses":["claude"]}))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json::<JoinResponse>()
-        .await
-        .unwrap()
-        .token;
-    let path = format!("{}/api/machines/writer/assignment", server.url());
-    let updated = server
-        .http()
-        .put(&path)
-        .bearer_auth(&token)
-        .json(&json!({
-            "changes":[{"harness":"claude","kind":"skill","item_id":"pdf","name":"pdf","enabled":true}],
-        }))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json::<AssignmentUpdate>()
-        .await
-        .unwrap();
+    let mut server = start().await;
+    let token = server.join("writer", &["claude"]).await;
+    let updated = server.put_assignment(&token, "writer", json!([skill_toggle("pdf", true)])).await;
     server.restart().await;
     assert_eq!(server.get::<Vec<LogEntry>>("/log?author=writer").await, updated.entries);
     assert_eq!(server.get::<AssignmentSnapshot>("/machines/writer/assignment").await.assignment, updated.assignment);
@@ -2514,13 +2469,9 @@ async fn a_database_reopens_current_data_and_resets_an_old_schema() {
     drop(db);
     server.restart().await;
     assert_eq!(server.head(), head);
-    assert_eq!(server.http().get(&path).bearer_auth(&token).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(server.get_as(&token, "/machines/writer/assignment").await.status(), StatusCode::UNAUTHORIZED);
     assert!(server.get::<FleetView>("/fleet").await.machines.is_empty());
     assert!(server.get::<Vec<LogEntry>>("/log").await.is_empty());
-}
-
-fn skill_toggle(id: &str, enabled: bool) -> Value {
-    json!({"harness":"claude", "kind":"skill", "item_id":id, "name":id, "enabled":enabled})
 }
 
 #[tokio::test]
@@ -2760,8 +2711,7 @@ async fn a_baseline_inventory_ignores_local_replacement_refs() {
 
     // A restart turns the repo's own setting off again and still ignores them.
     git(&bare, &["config", "--unset", "core.useReplaceRefs"]);
-    let TestServer::Shared(shared) = &mut server else { unreachable!() };
-    shared.restart().await;
+    server.restart().await;
     assert_eq!(git(&bare, &["config", "core.useReplaceRefs"]), "false");
     assert!(server.get::<sk1ll_proto::OrphansView>("/assignment/orphans").await.orphans.is_empty());
     assert_eq!(server.get::<FleetView>("/fleet").await.baseline.as_deref(), Some(with.as_str()));
@@ -2812,15 +2762,14 @@ async fn removing_and_rejoining_revokes_requests_that_already_authenticated() {
         conn.read_line(&mut line).await.unwrap();
         assert_eq!(line, "\r\n");
 
-        let remove = server.http().delete(server.api("/machines/writer")).bearer_auth(ADMIN);
-        assert_eq!(remove.try_clone().unwrap().send().await.unwrap().status(), StatusCode::NO_CONTENT);
+        assert_eq!(server.remove(ADMIN, "writer").await.status(), StatusCode::NO_CONTENT);
         let fresh = server.join_scoped("writer", &["claude"], Scope::SelfOnly).await;
         assert_ne!(old, fresh);
         conn.write_all(body.as_bytes()).await.unwrap();
         line.clear();
         tokio::time::timeout(Duration::from_secs(5), conn.read_line(&mut line)).await.unwrap().unwrap();
         read_line(&line, 401);
-        assert_eq!(remove.send().await.unwrap().status(), StatusCode::NO_CONTENT);
+        assert_eq!(server.remove(ADMIN, "writer").await.status(), StatusCode::NO_CONTENT);
     }
     assert_eq!(server.get_json::<AssignmentSnapshot>(&target, "/machines/other/assignment").await, before);
 }
@@ -2862,7 +2811,7 @@ async fn a_push_retries_its_head_read_and_nudges_when_the_ref_recovers() {
 
 #[tokio::test]
 async fn a_blocked_database_write_leaves_health_requests_responsive() {
-    let server = TestServer::bounded(|_| {}).await;
+    let server = on_test_runtime().await;
     let db = rusqlite::Connection::open(server.data().join("server.db")).unwrap();
     let tx = db.unchecked_transaction().unwrap();
     tx.execute("UPDATE counters SET value = value", []).unwrap();
@@ -2886,7 +2835,7 @@ async fn a_failed_or_cancelled_baseline_read_stops_its_child_processes() {
     const TEST: &str = "a_failed_or_cancelled_baseline_read_stops_its_child_processes";
     if let Some(dir) = child::dir() {
         let fixture = std::env::var("BASELINE_READ_CASE").unwrap();
-        let server = TestServer::bounded(|_| {}).await;
+        let server = on_test_runtime().await;
         let token = server.join("writer", &[]).await;
         let marker = dir.join("mode");
         let pid_file = dir.join("child-pid");

@@ -588,7 +588,7 @@ async fn cgi(server: Arc<Server>, caller: Caller, path_info: String, req: Reques
     // takes the lock too: a push queued behind a removal of its machine is
     // refused here, and a running one finishes first.
     let push = if is_push {
-        let guard = server.push_lock.clone().lock_owned().await;
+        let guard = server.lock_push().await;
         // Cleanup may have failed while this request was queued.
         if server.push_degraded.load(Ordering::SeqCst) {
             return Ok(degraded_response());

@@ -17,10 +17,10 @@ Tests in `tests/server.rs` that kept their name are not listed. `server.rs`, `wi
 
 ## sk1ll-server/src/git.rs (inline)
 
-- unconfirmed_cleanup_rejects_queued_and_new_pushes_but_allows_fetch -> unconfirmed_cleanup_refuses_pushes_and_prune_until_restart (server.rs)
-- a_push_queued_behind_its_machines_removal_is_refused -> a_push_checks_registration_again_after_waiting_for_removal (server.rs)
-- a_removal_waits_for_its_machines_running_push -> a_push_checks_registration_again_after_waiting_for_removal (server.rs)
-- a_dropped_removal_keeps_queued_pushes_out_until_it_commits -> dropped: not reachable over HTTP. The window is the removal's database work after its caller disconnects. Stalling that work from outside with an external SQLite write lock makes the removal fail with 500 at once rather than wait, and every other path through the one database mutex orders the push's recheck after the removal anyway. A failpoint would need a new `Point` in sk1ll-core (out of C2's scope). The guard moving into the DB closure stays documented on `Server::remove_machine`.
+- unconfirmed_cleanup_rejects_queued_and_new_pushes_but_allows_fetch -> unconfirmed_cleanup_refuses_pushes_and_prune_until_restart (server.rs; the queued push is in line, per the `ServerPushLockQueued` failpoint, before the cleanup fails)
+- a_push_queued_behind_its_machines_removal_is_refused -> a_push_queued_behind_a_removal_checks_registration_again (server.rs; the push is in line behind the removal, per `ServerPushLockQueued`, before the removal commits)
+- a_removal_waits_for_its_machines_running_push -> a_push_queued_behind_a_removal_checks_registration_again (server.rs)
+- a_dropped_removal_keeps_queued_pushes_out_until_it_commits -> a_push_queued_behind_a_removal_checks_registration_again (server.rs; the removal pauses at `ServerRemovalEntered`, on its blocking thread before it locks the database, its caller disconnects and the server closes the request, then the push must get in line)
 - replacement_refs_do_not_change_what_the_server_reads -> a_baseline_inventory_ignores_local_replacement_refs, pushes_to_refs_outside_the_baseline_branch_are_refused (server.rs)
 - a_stuck_git_read_times_out_and_is_stopped_with_its_children -> a_failed_or_cancelled_baseline_read_stops_its_child_processes, case `timeout` (server.rs)
 - a_read_past_its_output_cap_fails_and_is_stopped -> a_failed_or_cancelled_baseline_read_stops_its_child_processes, case `output-cap` (server.rs)
@@ -92,6 +92,7 @@ Tests in `tests/server.rs` that kept their name are not listed. `server.rs`, `wi
 - competing_pushes_land_one_at_a_time_and_losers_rebase_onto_the_shared_root: three machines push at once until all land
 - a_restart_mid_push_keeps_assignments_and_serves_the_current_head: stop with the push lock held and an unannounced HEAD
 - unconfirmed_cleanup_refuses_pushes_and_prune_until_restart: the `ServerCleanupConfirmation` failpoint, then restart
+- a_push_queued_behind_a_removal_checks_registration_again: the `ServerPushLockQueued` and `ServerRemovalEntered` failpoints (sk1ll-core) order a running push, a removal whose caller disconnects, and a push queued behind it
 
 ## Coverage
 

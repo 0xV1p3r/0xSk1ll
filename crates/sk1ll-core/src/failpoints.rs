@@ -235,6 +235,14 @@ points! {
     /// Confirming that a repo cleanup's git processes stopped. Path: the
     /// repo. Failing it reports the cleanup unconfirmed.
     ServerCleanupConfirmation => fault,
+    /// A request (a push, a Machine removal, an inventory read) found the
+    /// push lock held and is now in line for it: the lock hands over in
+    /// that order. Path: the repo.
+    ServerPushLockQueued,
+    /// A Machine removal: holding the push lock, on the blocking thread of
+    /// its database work, before it locks the database. Path: the repo. A
+    /// callback may block here.
+    ServerRemovalEntered,
 }
 
 /// What a callback has the operation do at a point.
