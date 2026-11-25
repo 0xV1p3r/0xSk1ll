@@ -64,7 +64,7 @@ New tests, by alias (all in `crates/sk1ll-gui/ui/src/flows/`):
 | versions:3 | checks only on demand once the startup check is off, and says when this build can't update itself (versions.test.tsx) |
 | versions:4 | says which side to upgrade when the Server speaks another protocol, and offers this app's update when it is the older one (versions.test.tsx) |
 | versions:5 | offers to restart a Daemon older than the app, and hides an older Server once dismissed, across launches (versions.test.tsx) |
-| contract | every_api_type_the_gui_consumes_matches_its_golden_json_and_round_trips (crates/sk1ll-gui/src-tauri/tests/api_contract.rs) plus `ui/src/apiContract.ts` under `pnpm tsc --noEmit` |
+| contract | every_api_type_the_gui_consumes_matches_its_golden_json_and_round_trips (crates/sk1ll-gui/src-tauri/tests/api_contract.rs), shared_rest_bodies_match_their_samples (crates/sk1ll-proto/tests/wire.rs, for the Server bodies in `wire.json`) plus `ui/src/apiContract.ts` under `pnpm tsc --noEmit` |
 
 ## App.test.tsx
 
@@ -402,5 +402,8 @@ Not a replacement for a deleted test. `contract` pins the JSON of every local AP
 (sk1ll-daemon `client` types, sk1ll-proto types they re-export, and the GUI bridge's own: `CommandError`,
 `ReviewDraftEntry`, `ConnectionEvent`, `EditorsView`, `ServiceInfo`, `AvailableUpdate`, `Progress`), every enum
 variant at least once. `ServiceInfo`, `Manager` and `Started` (sk1ll-daemon, another phase's crate) only derive
-`Serialize`, so they are compared with the golden file but not read back. `ConflictDiffRequest` is left out: the GUI
-sends one of two shapes, and the Rust struct serializes both fields as null.
+`Serialize`, so they are compared with the golden file but not read back. The Server's bodies the Daemon passes
+through (`FleetView`, `AssignmentChanges`, `AssignmentUpdate`, `AssignmentCopyPreview`, `OrphansView`,
+`OrphansPruned`, `LogFacets`, `JoinCode`) have one sample each in `crates/sk1ll-proto/tests/wire.json`, read by
+sk1ll-proto's `wire.rs` and by `apiContract.ts`, not a copy here. `ConflictDiffRequest` is left out: the GUI sends
+one of two shapes, and the Rust struct serializes both fields as null.

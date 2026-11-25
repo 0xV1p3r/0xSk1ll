@@ -1,6 +1,7 @@
 // The contract between the Rust API types and `types.ts`, checked by `pnpm tsc --noEmit`; nothing imports it.
 // The golden files are written by crates/sk1ll-gui/src-tauri/tests/api_contract.rs, which fails when the Rust
-// types serialize differently. Here each sample must fit its `types.ts` type, so tsc fails when this side drifts:
+// types serialize differently; the wire bodies the Daemon passes through from the Server come from
+// crates/sk1ll-proto/tests/wire.json, which crates/sk1ll-proto/tests/wire.rs checks the same way. Here each sample must fit its `types.ts` type, so tsc fails when this side drifts:
 // a field missing, renamed or of another type, a field types.ts doesn't know, or an enum variant added or removed.
 import app from '../../contract/app.json';
 import content from '../../contract/content.json';
@@ -9,6 +10,7 @@ import fleet from '../../contract/fleet.json';
 import harness from '../../contract/harness.json';
 import imports from '../../contract/imports.json';
 import status from '../../contract/status.json';
+import wire from '../../../sk1ll-proto/tests/wire.json';
 import type * as T from './types';
 
 // A JSON import types every string as `string`, so samples are compared with literal unions widened. The variant
@@ -47,23 +49,23 @@ export const contract = [
   value<T.DaemonConnection[]>()(status.daemon_connection),
   value<T.CommandError[]>()(status.command_error),
 
-  value<T.FleetView>()(fleet.fleet_view),
+  value<T.FleetView>()(wire.fleet_view),
   names<T.Scope>()(fleet.scope),
   value<T.AssignmentSnapshot>()(fleet.assignment_snapshot),
   tagged<T.ToggleChange, 'kind'>()(fleet.toggle_kind),
-  value<T.AssignmentChanges>()(fleet.assignment_changes),
-  value<T.AssignmentUpdate>()(fleet.assignment_update),
+  value<T.AssignmentChanges>()(wire.assignment_changes),
+  value<T.AssignmentUpdate>()(wire.assignment_update),
   tagged<T.LogCause, 'type'>()(fleet.log_cause),
   tagged<T.LogEntry, 'kind'>()(fleet.log_entry),
   value<T.LogQuery>()(fleet.log_query),
-  value<T.LogFacets>()(fleet.log_facets),
-  value<T.OrphansView>()(fleet.orphans_view),
-  value<T.OrphansPruned>()(fleet.orphans_pruned),
+  value<T.LogFacets>()(wire.log_facets),
+  value<T.OrphansView>()(wire.orphans_view),
+  value<T.OrphansPruned>()(wire.orphans_pruned),
   tagged<T.MachineAssignmentCopy, 'mode'>()(fleet.copy_mode),
-  value<T.AssignmentCopyPreview>()(fleet.assignment_copy_preview),
+  value<T.AssignmentCopyPreview>()(wire.assignment_copy_preview),
   value<{ code: T.JoinApiRequest; admin: T.JoinApiRequest }>()(fleet.join_api_request),
   tagged<T.Joined, 'setup'>()(fleet.joined),
-  value<T.JoinCode>()(fleet.join_code),
+  value<T.JoinCode>()(wire.join_code),
 
   value<T.ItemView[]>()(draft.item_view),
   tagged<T.DraftEntry, 'change'>()(draft.draft_entry),

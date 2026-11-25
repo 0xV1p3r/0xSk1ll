@@ -1,7 +1,9 @@
 //! The contract between the local API types the GUI consumes and `ui/src/types.ts`.
 //!
 //! Representative values of every type (and every enum variant) are serialized and compared with the golden files
-//! in `crates/sk1ll-gui/contract/`, then read back to prove they round-trip. `ui/src/apiContract.ts` assigns the
+//! in `crates/sk1ll-gui/contract/`, then read back to prove they round-trip. Wire bodies the Daemon passes through
+//! from the Server (`FleetView`, Assignment changes and updates, copy previews, orphans, log facets, join codes)
+//! have their sample in `crates/sk1ll-proto/tests/wire.json` instead, checked by that crate's `wire.rs`. `ui/src/apiContract.ts` assigns the
 //! same files to the `types.ts` types, so `pnpm tsc` fails when the two sides drift apart.
 //!
 //! Enums are written as objects keyed by their serialized name (a tagged enum by its tag), so the TypeScript side
@@ -28,8 +30,7 @@ use sk1ll_gui::events::ConnectionEvent;
 use sk1ll_gui::service::ServiceInfo;
 use sk1ll_gui::updates::{AvailableUpdate, Progress};
 use sk1ll_proto::{
-    ConflictRef, CopyChange, CopyMode, Expected, HarnessMapping, ImportError, LogCause, MachineRow, Orphan,
-    ReportedItem, ToggleChange, ToggleKind,
+    ConflictRef, CopyMode, Expected, HarnessMapping, ImportError, LogCause, ReportedItem, ToggleChange, ToggleKind,
 };
 
 /// `value` as JSON, after checking that the JSON reads back as the same value.
@@ -301,16 +302,6 @@ fn fleet_golden() -> Value {
     let _every = |s: Setup| match s {
         Setup::Cloned | Setup::Adopted => (),
     };
-    let machine = |id: &str, status, report: Option<MachineReport>| MachineRow {
-        id: id.into(),
-        status,
-        connected: report.is_some(),
-        joined_at: 1_757_000_000,
-        last_seen: report.as_ref().map(|_| 1_760_000_000),
-        report,
-        scope: Scope::Fleet,
-        registration: format!("reg-{id}"),
-    };
     let toggles = [Skill, Rule, NewSkillsDefault, NewRulesDefault].map(|kind| ToggleChange {
         harness: "claude".into(),
         kind,
@@ -345,20 +336,9 @@ fn fleet_golden() -> Value {
         revision: 1,
     };
     json!({
-        "fleet_view": sample(FleetView { baseline: Some("9f3c2a17d4e1".into()), machines: vec![
-            machine("workstation", MachineStatus::Blocked, Some(report())),
-            MachineRow { scope: Scope::SelfOnly, ..machine("ci-runner", MachineStatus::Offline, None) },
-        ] }),
         "scope": by_name([Scope::Fleet, Scope::SelfOnly]),
         "assignment_snapshot": sample(AssignmentSnapshot { revision: 42, assignment: assignment(), registration: Some("reg-workstation".into()) }),
         "toggle_kind": by_tag("kind", toggles.clone()),
-        "assignment_changes": sample(AssignmentChanges { changes: toggles.to_vec(), expected: Some(expected(42)) }),
-        "assignment_update": sample(AssignmentUpdate {
-            assignment: assignment(),
-            revision: 43,
-            entries: vec![log_entry(120, Skill, LogCause::Change)],
-            errors: vec!["could not reach laptop".into()],
-        }),
         "log_cause": by_tag("type", causes),
         "log_entry": by_tag("kind", [Skill, Rule, NewSkillsDefault, NewRulesDefault].map(|kind| log_entry(120, kind, LogCause::Change))),
         "log_query": sample(LogQuery {
@@ -369,22 +349,9 @@ fn fleet_golden() -> Value {
             before: Some(51),
             limit: Some(50),
         }),
-        "log_facets": sample(LogFacets { machines: vec!["laptop".into()], harnesses: vec!["claude".into()], authors: vec!["dev@workstation".into()] }),
-        "orphans_view": sample(OrphansView { orphans: vec![
-            Orphan { machine: "laptop".into(), harness: "claude".into(), kind: Skill, item_id: id("01J0GONE"), name: Some("old-skill".into()) },
-            Orphan { machine: "laptop".into(), harness: "claude".into(), kind: Rule, item_id: id("01J0GONE2"), name: None },
-        ] }),
-        "orphans_pruned": sample(OrphansPruned { entries: vec![log_entry(121, Skill, LogCause::OrphanPruned)] }),
         "copy_mode": by_tag("mode", [CopyMode::Replace, CopyMode::Merge].map(|mode| MachineAssignmentCopy { mode, ..copy.clone() })),
-        "assignment_copy_preview": sample(AssignmentCopyPreview {
-            count: 1,
-            changes: vec![CopyChange { harness: "codex".into(), kind: Skill, item_id: Some(id("01J0DEPLOY")), name: Some("deploy".into()), before: None, after: Some(false) }],
-            target: expected(42),
-            source: expected(17),
-        }),
         "join_api_request": { "code": sample(join("sk1ll-join-7Q2M", None)), "admin": sample(join("", Some("adm"))) },
         "joined": by_tag("setup", [Setup::Cloned, Setup::Adopted].map(joined)),
-        "join_code": sample(JoinCode { code: "sk1ll-join-7Q2M".into(), expires_at: 1_760_086_400, scope: Scope::SelfOnly }),
     })
 }
 
