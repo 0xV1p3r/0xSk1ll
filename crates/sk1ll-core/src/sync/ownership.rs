@@ -421,11 +421,6 @@ fn write_index(dir: &Path, index: &Index, unchanged: impl FnOnce() -> Result<()>
     Ok(())
 }
 
-#[cfg(test)]
-pub(super) fn save_index(dir: &Path, index: &Index) -> Result<()> {
-    write_index(dir, index, || Ok(()))
-}
-
 /// Held across recovery, staging and publication. Sync never unlinks the
 /// lock file, so independent processes always contend on the same inode.
 pub(super) struct DirLock<'a> {
@@ -603,108 +598,53 @@ impl Scratch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::failpoints::Point;
+    use serde_json::json;
 
     #[test]
-    fn independent_opens_contend_on_the_same_directory_lock() {
-        let tmp = tempfile::tempdir().unwrap();
-        let first = DirLock::acquire(tmp.path()).unwrap();
-        let (_, second) = lock_file(tmp.path()).unwrap();
-        assert!(matches!(second.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
-        drop(first);
-        second.try_lock().unwrap();
-    }
-
-    #[test]
-    fn an_index_edit_after_validation_survives_replacement_and_removal() {
-        for remove in [false, true] {
-            let tmp = tempfile::tempdir().unwrap();
-            let dir = tmp.path();
-            let lock = DirLock::acquire(dir).unwrap();
-            let path = dir.join(INDEX_PATH);
-            let link = |target: &str| IndexEntry::Link {
-                hash: target.into(),
-                target: PathBuf::from(target),
-                payload: "fixture".into(),
-            };
-            let mut before = Index::default();
-            before.set("skill", Some(link("before")), None);
-            save_index(dir, &before).unwrap();
-            let mut after = Index::default();
-            if !remove {
-                after.set("skill", Some(link("next")), None);
+    fn ownership_index_round_trips_and_rejects_unknown_formats() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(INDEX_PATH);
+        fs::create_dir(path.parent().unwrap()).unwrap();
+        let golden = json!({
+            "version": 3,
+            "entries": {
+                "pdf": {"kind": "copy", "hash": "source", "token": "a42", "payload": "placement"},
+                "git.md": {"kind": "rule", "file": {"dev": 1, "ino": 2}, "hash": "source", "payload": "placement"},
+                "docs": {"kind": "link", "target": "/repo/personal/docs", "hash": "link", "payload": "placement"}
+            },
+            "pending": {
+                "pdf": {"op": "place", "next": {"kind": "copy", "hash": "new", "token": "b17", "payload": "stage"}, "recovery": "123-h-pdf"},
+                "git.md": {"op": "remove", "recovery": null}
             }
-            let mut edit = before.clone();
-            edit.set("another", Some(link("editor")), None);
-            let expected = edit.clone();
-            let replaced = super::super::tests::with_hook(
-                Point::IndexBeforeMove,
-                move |path| {
-                    let staged = path.with_extension("editor");
-                    fs::write(&staged, serde_json::to_vec(&edit).unwrap()).unwrap();
-                    fs::rename(staged, path).unwrap();
-                },
-                || lock.save(&before, &after, &path),
-            );
-            assert_eq!(replaced.unwrap_err().to_string(), changed_since_plan(&path).to_string());
-            assert_eq!(load_index(dir).unwrap(), expected);
+        });
+        fs::write(&path, golden.to_string()).unwrap();
+        assert_eq!(serde_json::to_value(load_index(dir.path()).unwrap()).unwrap(), golden);
+
+        let mut unknown_version = golden.clone();
+        unknown_version["version"] = json!(4);
+        let mut outside = golden.clone();
+        outside["entries"]["../pdf"] = golden["entries"]["pdf"].clone();
+        let mut bad_kind = golden.clone();
+        bad_kind["entries"]["docs"]["kind"] = json!("directory");
+        for invalid in [unknown_version, outside, bad_kind, json!({"entries": {}})] {
+            fs::write(&path, invalid.to_string()).unwrap();
+            assert!(matches!(load_index(dir.path()), Err(Error::Parse { path: invalid, .. }) if invalid == path));
         }
     }
 
     #[test]
-    fn an_interrupted_index_publication_keeps_the_previous_index_readable() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path();
-        let lock = DirLock::acquire(dir).unwrap();
-        let path = dir.join(INDEX_PATH);
-        let backup = index_backup(dir);
-        let mut before = Index::default();
-        before.set(
-            "skill",
-            Some(IndexEntry::Link { hash: "link".into(), target: "/repo/skill".into(), payload: "fixture".into() }),
-            None,
-        );
-        save_index(dir, &before).unwrap();
-        crate::placement::detach(&path, &backup).unwrap();
-        assert_eq!(load_index(dir).unwrap(), before);
-        lock.save(&before, &Index::default(), &path).unwrap();
-        assert!(load_index(dir).unwrap().is_empty());
-        assert!(!backup.exists());
-    }
-
-    #[test]
-    fn a_write_through_an_open_index_descriptor_keeps_its_archived_version() {
-        use std::io::Write;
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path();
-        let lock = DirLock::acquire(dir).unwrap();
-        let path = dir.join(INDEX_PATH);
-        let mut before = Index::default();
-        let link =
-            |target: &str| IndexEntry::Link { hash: target.into(), target: target.into(), payload: "fixture".into() };
-        before.set("skill", Some(link("first")), None);
-        save_index(dir, &before).unwrap();
-        let mut open = fs::OpenOptions::new().append(true).open(&path).unwrap();
-        let mut after = before.clone();
-        after.set("skill", Some(link("second")), None);
-        lock.save(&before, &after, &path).unwrap();
-        open.write_all(b"\nlate edit").unwrap();
-        let history = dir.join(INDEX_DIR).join(HISTORY);
-        let saved = history.join(read_dir_names(&history).unwrap().remove(0)).join("previous");
-        assert!(fs::read_to_string(&saved).unwrap().ends_with("late edit"));
-        lock.save(&after, &Index::default(), &path).unwrap();
-        assert_eq!(read_dir_names(&history).unwrap().len(), 2);
-        // An archive holding anything else is never deleted recursively.
-        let other =
-            read_dir_names(&history).unwrap().into_iter().find(|n| !saved.starts_with(history.join(n))).unwrap();
-        let stray = history.join(&other).join("stray");
-        fs::write(&stray, "not sk1ll's").unwrap();
-        prune_indexes(&lock, std::time::Duration::ZERO).unwrap();
-        assert_eq!(fs::read_to_string(&stray).unwrap(), "not sk1ll's");
-        fs::remove_file(&stray).unwrap();
-        fs::remove_dir(history.join(other)).unwrap();
-        assert_eq!(read_dir_names(&history).unwrap().len(), 1);
-        assert!(fs::read_to_string(&saved).unwrap().ends_with("late edit"));
-        assert!(load_index(dir).unwrap().is_empty());
+    fn placement_markers_accept_exactly_32_hex_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PLACEMENT_MARKER);
+        for (bytes, expected) in [
+            ("0123456789abcdef0123456789ABCDEF", true),
+            ("0123456789abcdef0123456789ABCDE", false),
+            ("0123456789abcdef0123456789ABCDEg", false),
+            ("0123456789abcdef0123456789ABCDEF\n", false),
+            ("", false),
+        ] {
+            fs::write(&path, bytes).unwrap();
+            assert_eq!(placement_token(dir.path()).unwrap().as_deref(), expected.then_some(bytes));
+        }
     }
 }

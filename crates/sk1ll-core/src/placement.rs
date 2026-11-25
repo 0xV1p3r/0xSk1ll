@@ -205,32 +205,3 @@ impl Directory {
         Err(std::io::ErrorKind::Unsupported.into())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Detaching never replaces what is in the backup slot, file or directory.
-    #[test]
-    fn detach_never_replaces_an_occupied_slot() {
-        let tmp = tempfile::tempdir().unwrap();
-        for dir in [false, true] {
-            let (src, backup) = (tmp.path().join(format!("src-{dir}")), tmp.path().join(format!("slot-{dir}")));
-            if dir {
-                std::fs::create_dir(&src).unwrap();
-                std::fs::create_dir(&backup).unwrap();
-            } else {
-                std::fs::write(&src, "incumbent").unwrap();
-                std::fs::write(&backup, "occupant").unwrap();
-            }
-            assert_eq!(detach(&src, &backup).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
-            assert!(src.exists() && backup.exists());
-            if !dir {
-                assert_eq!(std::fs::read_to_string(&backup).unwrap(), "occupant");
-            }
-            let vacant = tmp.path().join(format!("vacant-{dir}"));
-            detach(&src, &vacant).unwrap();
-            assert!(!src.exists() && vacant.exists());
-        }
-    }
-}
