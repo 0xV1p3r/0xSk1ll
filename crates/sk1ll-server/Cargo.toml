@@ -11,6 +11,11 @@ publish.workspace = true
 name = "sk1ll-server"
 path = "src/main.rs"
 
+[features]
+# Fault injection for integration tests: sk1ll-core's `failpoints`, with the
+# server's own points (`sk1ll_core::failpoints::Point::Server*`).
+failpoints = ["sk1ll-core/failpoints"]
+
 [dependencies]
 sk1ll-core.workspace = true
 sk1ll-proto = { path = "../sk1ll-proto" }
@@ -36,6 +41,7 @@ tempfile.workspace = true
 libc = "0.2"
 
 [dev-dependencies]
+sk1ll-core = { workspace = true, features = ["failpoints"] }
 tokio = { version = "1", features = ["test-util"] }
 tokio-tungstenite = "0.30"
 reqwest = { version = "0.12", default-features = false, features = ["json"] }

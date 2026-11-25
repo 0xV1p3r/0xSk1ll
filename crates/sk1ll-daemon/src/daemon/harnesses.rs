@@ -96,10 +96,7 @@ impl Daemon {
         req: HarnessChangeRequest,
     ) -> Result<HarnessApplied> {
         let _harnesses = self.harness_changes.lock().await;
-        #[cfg(test)]
-        if let Some(entered) = lock(&self.apply_entered).take() {
-            let _ = entered.send(());
-        }
+        sk1ll_core::failpoint!(DaemonApplyEntered, &self.cfg.machine_config);
         self.blocking(move |d, eng| d.apply_harness(eng, req)).await
     }
 
@@ -126,15 +123,11 @@ impl Daemon {
             .clone()
             .ok_or_else(|| Error::BadRequest("this client is older than the daemon; update it".into()))?;
         let _harnesses = self.harness_changes.lock().await;
-        #[cfg(test)]
+        // Off the runtime: a test's callback may hold the take-out here.
+        #[cfg(any(test, feature = "failpoints"))]
         {
-            if let Some(entered) = lock(&self.take_out_entered).take() {
-                let _ = entered.send(());
-            }
-            let proceed = lock(&self.take_out_proceed).take();
-            if let Some(proceed) = proceed {
-                let _ = proceed.await;
-            }
+            let config = self.cfg.machine_config.clone();
+            let _ = tokio::task::spawn_blocking(move || sk1ll_core::failpoint!(DaemonTakeOutEntered, &config)).await;
         }
         let change = req.change.clone();
         let expected = fingerprint.clone();
@@ -159,10 +152,7 @@ impl Daemon {
             if let Err(e) = d.reconcile(eng).map(|failed| errors.extend(failed)) {
                 errors.push(format!("sync: {e}"));
             }
-            #[cfg(test)]
-            if let Some(hook) = eng.before_take_out_apply.take() {
-                hook();
-            }
+            sk1ll_core::failpoint!(DaemonBeforeTakeOutApply, &d.cfg.machine_config);
             // What machine.toml says now, read fresh for each report.
             let config = || MachineConfig::load(&d.cfg.machine_config).map(|c| c.choices());
             // Every report states what is known: the Assignment change, what a complete scan
@@ -224,10 +214,7 @@ impl Daemon {
                     "machine.toml changed since the preview".into(),
                 );
             }
-            #[cfg(test)]
-            if let Some(hook) = eng.before_take_out_write.take() {
-                hook();
-            }
+            sk1ll_core::failpoint!(DaemonBeforeTakeOutWrite, &d.cfg.machine_config);
             // The write's own plan scans again, and refuses what this one would.
             let written = (|| -> Result<()> {
                 d.ensure_managed()?;

@@ -54,8 +54,6 @@ pub struct Server {
     push_lock: Arc<tokio::sync::Mutex<()>>,
     /// Reject pushes until restart if a backend may still be writing refs.
     push_degraded: AtomicBool,
-    #[cfg(test)]
-    fail_cleanup_confirmation: AtomicBool,
     imports: Mutex<ImportsView>,
     imports_due: Notify,
 }
@@ -165,8 +163,6 @@ impl Server {
             baseline: Mutex::new(baseline),
             push_lock: Arc::default(),
             push_degraded: AtomicBool::new(false),
-            #[cfg(test)]
-            fail_cleanup_confirmation: AtomicBool::new(false),
             imports: Mutex::default(),
             imports_due: Notify::new(),
         }))

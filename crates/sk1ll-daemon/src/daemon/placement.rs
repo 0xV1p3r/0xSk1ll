@@ -148,10 +148,7 @@ impl Daemon {
             if preview.fingerprint.as_deref() != Some(fingerprint) {
                 return Ok(preview);
             }
-            #[cfg(test)]
-            if let Some(after_review) = eng.after_sync_review.take() {
-                after_review();
-            }
+            sk1ll_core::failpoint!(DaemonAfterSyncReview, &self.cfg.machine_config);
             Some((repo, actions.into_iter().zip(sources).collect()))
         } else {
             None

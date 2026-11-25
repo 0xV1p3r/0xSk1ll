@@ -181,15 +181,6 @@ pub(crate) struct Daemon {
     /// it from its preview check to the change, across its Assignment
     /// write; taken before [`Daemon::assignment_writes`] where both are.
     pub(crate) harness_changes: tokio::sync::Mutex<()>,
-    /// Tests synchronize on the harness-change lock: told when a take-out
-    /// holds it, a take-out then waits for `take_out_proceed`; an apply
-    /// tells `apply_entered` once it holds it.
-    #[cfg(test)]
-    pub(super) take_out_entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-    #[cfg(test)]
-    pub(super) take_out_proceed: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
-    #[cfg(test)]
-    pub(super) apply_entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     /// The applied assignment. `None` when it was lost (or never stored):
     /// harnesses are left alone until the server sends one. Replaced only
     /// with the engine mutex held ([`Daemon::apply_assignment`]); read by
@@ -228,18 +219,6 @@ pub(crate) struct Engine {
     /// How long an Input must have been left alone to be recorded
     /// ([`reconcile::RACY_WINDOW`]; tests widen it).
     racy: std::time::Duration,
-    #[cfg(test)]
-    after_sync_review: Option<Box<dyn FnOnce() + Send>>,
-    /// Runs in [`Daemon::rejoin`] once the old registration was found
-    /// replaceable, before the new one is stored.
-    #[cfg(test)]
-    before_rejoin_persist: Option<Box<dyn FnOnce() + Send>>,
-    /// Runs inside a take-out, after the sync and before `machine.toml` changes.
-    #[cfg(test)]
-    pub(super) before_take_out_apply: Option<Box<dyn FnOnce() + Send>>,
-    /// Runs inside a take-out, after its last check and before the write.
-    #[cfg(test)]
-    pub(super) before_take_out_write: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl Daemon {
@@ -346,26 +325,7 @@ impl Daemon {
             net: tokio::sync::Mutex::new(()),
             assignment_writes: tokio::sync::Mutex::new(()),
             harness_changes: tokio::sync::Mutex::new(()),
-            #[cfg(test)]
-            take_out_entered: Mutex::new(None),
-            #[cfg(test)]
-            take_out_proceed: Mutex::new(None),
-            #[cfg(test)]
-            apply_entered: Mutex::new(None),
-            engine: Mutex::new(Engine {
-                lock: None,
-                reconciled: None,
-                full_at: None,
-                racy: reconcile::RACY_WINDOW,
-                #[cfg(test)]
-                after_sync_review: None,
-                #[cfg(test)]
-                before_rejoin_persist: None,
-                #[cfg(test)]
-                before_take_out_apply: None,
-                #[cfg(test)]
-                before_take_out_write: None,
-            }),
+            engine: Mutex::new(Engine { lock: None, reconciled: None, full_at: None, racy: reconcile::RACY_WINDOW }),
             view: watch::channel(view).0,
             events: broadcast::channel(256).0,
             assignment_session: watch::channel(None).0,
