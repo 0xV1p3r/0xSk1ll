@@ -24,8 +24,8 @@ tauri-plugin-updater = "2.14"
 tokio = { version = "1", features = ["time", "macros", "sync"] }
 
 [dev-dependencies]
+sk1ll-testkit.workspace = true
 axum = "0.8"
-futures-util = "0.3"
 tempfile.workspace = true
 tokio = { version = "1", features = ["test-util", "net", "rt-multi-thread"] }
 

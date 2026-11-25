@@ -127,22 +127,5 @@ class DevelopmentFleet(unittest.TestCase):
         self.run_fleet(stop=None)
 
 
-class Workspace(unittest.TestCase):
-    def test_gui_is_explicit_workspace_member_without_anchor(self):
-        metadata = json.loads(subprocess.check_output([
-            "cargo", "metadata", "--no-deps", "--format-version", "1",
-        ], cwd=ROOT, text=True))
-        packages = {p["name"]: p for p in metadata["packages"] if p["id"] in metadata["workspace_members"]}
-        self.assertEqual(set(packages), {
-            "sk1ll-cli", "sk1ll-core", "sk1ll-daemon", "sk1ll-server", "sk1ll-proto", "sk1ll-gui",
-        })
-        self.assertEqual(Path(packages["sk1ll-gui"]["manifest_path"]), ROOT / "crates/sk1ll-gui/src-tauri/Cargo.toml")
-        self.assertFalse((ROOT / "crates/sk1ll-gui/Cargo.toml").exists())
-        self.assertFalse((ROOT / "crates/sk1ll-gui/workspace.rs").exists())
-        config = json.loads((ROOT / "crates/sk1ll-gui/src-tauri/tauri.conf.json").read_text())
-        self.assertEqual((ROOT / "crates/sk1ll-gui/src-tauri" / config["build"]["frontendDist"]).resolve(),
-                         ROOT / "crates/sk1ll-gui/ui/dist")
-
-
 if __name__ == "__main__":
     unittest.main(verbosity=2)

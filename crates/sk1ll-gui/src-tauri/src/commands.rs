@@ -32,7 +32,7 @@ impl Bridge {
     }
 }
 
-// Both the IPC handler and the tests call exactly the same forwarding method.
+// Tauri commands and the bridge use the same daemon response types.
 macro_rules! command {
     ($name:ident ($($arg:ident: $ty:ty),*) -> $out:ty, $client:ident ($($value:expr),*)) => {
         impl Bridge {
@@ -132,7 +132,7 @@ pub struct ReviewDraftEntry {
 }
 
 /// Textual diffs do not distinguish successive edits to binary files or symlinks.
-pub(crate) fn draft_fingerprint(repo: &Path, paths: &[PathBuf]) -> std::io::Result<String> {
+fn draft_fingerprint(repo: &Path, paths: &[PathBuf]) -> std::io::Result<String> {
     let mut hash = Sha256::new();
     let mut paths = paths.to_vec();
     paths.sort();
@@ -216,20 +216,22 @@ pub async fn start_daemon() -> Result<sk1ll_daemon::service::Started> {
 
 /// Not a Daemon call: whether this build can update itself (see [`crate::updates`]).
 #[tauri::command]
-pub fn updater_available(app: tauri::AppHandle) -> bool {
+pub fn updater_available<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> bool {
     crate::updates::available(&app)
 }
 
 /// Not a Daemon call: asks the releases for a newer app.
 #[tauri::command]
-pub async fn check_update(app: tauri::AppHandle) -> Result<Option<crate::updates::AvailableUpdate>> {
+pub async fn check_update<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+) -> Result<Option<crate::updates::AvailableUpdate>> {
     crate::updates::check(&app).await.map_err(local_error)
 }
 
 /// Not a Daemon call: installs `version`, the update the last check found, restarts the
 /// Daemon and relaunches. Progress arrives as [`crate::updates::PROGRESS_EVENT`].
 #[tauri::command]
-pub async fn install_update(app: tauri::AppHandle, version: String) -> Result<()> {
+pub async fn install_update<R: tauri::Runtime>(app: tauri::AppHandle<R>, version: String) -> Result<()> {
     crate::updates::install(&app, &version).await.map_err(local_error)
 }
 
@@ -313,8 +315,8 @@ fn preference_path<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<PathB
 }
 
 #[tauri::command]
-pub fn editors(
-    app: tauri::AppHandle,
+pub fn editors<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     cache: State<'_, crate::editors::EditorCache>,
     refresh: Option<bool>,
 ) -> Result<crate::editors::EditorsView> {
@@ -333,8 +335,8 @@ pub fn editors(
 }
 
 #[tauri::command]
-pub async fn open_in_editor(
-    app: tauri::AppHandle,
+pub async fn open_in_editor<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     bridge: State<'_, Bridge>,
     cache: State<'_, crate::editors::EditorCache>,
     editor_id: String,
@@ -388,8 +390,8 @@ command!(remove_import(name: String) -> (), remove_import(&name));
 command!(conflict_diff(request: ConflictDiffRequest) -> DiffView, conflict_diff(&request));
 
 #[tauri::command]
-pub fn set_preferred_editor(
-    app: tauri::AppHandle,
+pub fn set_preferred_editor<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     cache: State<'_, crate::editors::EditorCache>,
     editor_id: String,
 ) -> Result<()> {

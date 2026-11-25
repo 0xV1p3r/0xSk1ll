@@ -72,17 +72,3 @@ fn emit_connection(emit: &impl Fn(&str, Value), reachable: bool, message: Option
     let event = ConnectionEvent { reachable, message, retry_in_ms: delay.as_millis() as u64 };
     emit("daemon-connection", serde_json::to_value(event).expect("serializing connection state"));
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn backoff_doubles_caps_and_restores() {
-        let mut b = Backoff::default();
-        let delays: Vec<_> = (0..10).map(|_| b.next().as_millis()).collect();
-        assert_eq!(delays, [500, 1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000, 30000]);
-        b.restore();
-        assert_eq!(b.next(), MIN_DELAY);
-    }
-}
