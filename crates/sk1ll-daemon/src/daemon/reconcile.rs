@@ -37,10 +37,8 @@ use crate::watch::WatchRoot;
 use sk1ll_core::git::plumbing;
 
 /// How long an input must have been left alone before its stamp proves it
-/// unchanged ([`Engine::racy`]); tests write their trees just before
-/// reconciling.
-pub(super) const RACY_WINDOW: std::time::Duration =
-    if cfg!(test) { std::time::Duration::ZERO } else { HashCache::RACY_WINDOW };
+/// unchanged ([`Engine::racy`]).
+pub(crate) const RACY_WINDOW: std::time::Duration = HashCache::RACY_WINDOW;
 
 /// What a reconcile reads, each part as a cheap fingerprint: equal Inputs
 /// plan and apply the same.
@@ -95,8 +93,7 @@ impl Inputs {
                     Ok((name.clone(), settled(&format_args!("harness {name}"), sync::harness_fingerprint(harness)?)))
                 })
                 .collect::<sk1ll_core::Result<_>>()?,
-            // Unit tests share one recovery area, which they write at any time.
-            displaced: if cfg!(test) { String::new() } else { settled(&"recovery area", sync::displaced::stamp()?) },
+            displaced: settled(&"recovery area", sync::displaced::stamp()?),
         };
         Ok((inputs, racy))
     }
@@ -346,7 +343,6 @@ impl Daemon {
             && let Some(snap) = &snapshot
         {
             let plan = |repo: &Repo| {
-                self.plans.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 sync::plan_cached(repo, &harnesses, &snap.assignment, PlanOptions::default(), &self.hashes)
             };
             let planned = reviewed.map(Ok).unwrap_or_else(|| {

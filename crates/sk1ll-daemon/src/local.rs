@@ -47,10 +47,28 @@ impl Engine {
         Self::with(cfg, false)
     }
 
+    /// An engine for this crate's integration tests (the `failpoints`
+    /// feature), as [`Engine::start`] or [`Engine::read_only`] makes it but
+    /// without [`crate::prepare_process`], whose process-wide environment
+    /// parallel tests can't share: the caller gives the runtime's threads
+    /// what it would (core's state and cache directories, git's
+    /// environment, through `sk1ll_core::failpoints::dirs` and `git_env`).
+    /// `racy_window`: how long an Input must have been left alone to count
+    /// as unchanged, which is two seconds otherwise; tests that write a tree
+    /// just before they reconcile shrink it.
+    #[cfg(feature = "failpoints")]
+    pub fn for_tests(cfg: Config, writer: bool, racy_window: std::time::Duration) -> anyhow::Result<Self> {
+        Self::build(cfg, writer, racy_window)
+    }
+
     fn with(cfg: Config, writer: bool) -> anyhow::Result<Self> {
         if !PREPARED.load(Ordering::SeqCst) {
             bail!("sk1ll_daemon::prepare_process must run before an engine starts");
         }
+        Self::build(cfg, writer, crate::daemon::RACY_WINDOW)
+    }
+
+    fn build(cfg: Config, writer: bool, racy: std::time::Duration) -> anyhow::Result<Self> {
         sk1ll_core::git::require_git(sk1ll_core::git::MIN_VERSION)?;
         // Before anything of the Machine is read.
         let access = if writer { Access::OnDemand(MachineLock::acquire(&cfg)?) } else { Access::ReadOnly };
@@ -63,7 +81,7 @@ impl Engine {
         if !writer && state.as_ref().is_some_and(|s| cfg.repo.as_deref().is_some_and(|repo| !same(repo, &s.repo))) {
             state = None;
         }
-        let daemon = Daemon::for_machine(cfg, state, access)?;
+        let daemon = Daemon::for_machine(cfg, state, access, racy)?;
         let client = Client::in_process(api::router(daemon.clone()));
         Ok(Self { daemon, client })
     }

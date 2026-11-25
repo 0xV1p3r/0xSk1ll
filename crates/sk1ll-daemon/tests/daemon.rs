@@ -3,307 +3,53 @@
 //! machine, each with its own HOME and XDG dirs and no global git config,
 //! driven through the daemon's local API.
 
-use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::path::Path;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use sk1ll_daemon::DaemonState;
 use sk1ll_daemon::client::{
     AddImportRequest, Client, CommitRequest, CommitResponse, Connection, Event, PullKeepRequest, PullResult,
-    ResolveImportRequest, RestoreRequest, StatusView,
+    ResolveImportRequest, RestoreRequest,
 };
 use sk1ll_daemon::state::PullState;
 use sk1ll_proto::{
-    Assignment, AssignmentChanges, AssignmentSnapshot, DaemonMessage, FleetView, HarnessAssignment, ItemRef, LogEntry,
+    Assignment, AssignmentChanges, AssignmentSnapshot, DaemonMessage, HarnessAssignment, ItemRef, LogEntry,
     MachineStatus, ServerMessage, ToggleChange, ToggleKind,
 };
 use tokio_tungstenite::tungstenite::Message;
 
-const ADMIN: &str = "admin-secret";
-const HARNESS: &str = "agent";
+use sk1ll_testkit::daemon::{DaemonMachine, HARNESS};
+use sk1ll_testkit::eventually;
+use sk1ll_testkit::git::git;
+use sk1ll_testkit::server::{ADMIN, Server};
 
-// ---------------------------------------------------------------------------
-// Server
-
-struct Server {
-    port: u16,
-    data: PathBuf,
-    _dir: tempfile::TempDir,
-    stop: Option<tokio::sync::oneshot::Sender<()>>,
-    thread: Option<std::thread::JoinHandle<()>>,
-    http: reqwest::Client,
+fn machine(id: &str) -> DaemonMachine {
+    DaemonMachine::new(id, env!("CARGO_BIN_EXE_sk1ll-daemon"))
+        .with_env("TOKIO_WORKER_THREADS", "2")
+        .with_env("SK1LL_NOTIFICATIONS", "0")
 }
 
-impl Server {
-    async fn start() -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let data = dir.path().join("data");
-        let mut server = Self { port: 0, data, _dir: dir, stop: None, thread: None, http: reqwest::Client::new() };
-        server.launch().await;
-        server
-    }
-
-    /// Serves on `self.port` (0: any) on a runtime of its own; dropping that
-    /// runtime closes every connection, like a crashed server.
-    async fn launch(&mut self) {
-        let (port_tx, port_rx) = std::sync::mpsc::channel();
-        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-        let (data, port) = (self.data.clone(), self.port);
-        let thread = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
-            rt.block_on(async move {
-                let socket = tokio::net::TcpSocket::new_v4().unwrap();
-                socket.set_reuseaddr(true).unwrap();
-                socket.bind(SocketAddr::from(([127, 0, 0, 1], port))).unwrap();
-                let listener = socket.listen(128).unwrap();
-                port_tx.send(listener.local_addr().unwrap().port()).unwrap();
-                let mut config = sk1ll_server::Config::new(data);
-                config.admin_token = Some(ADMIN.into());
-                tokio::select! {
-                    r = sk1ll_server::serve(config, listener) => r.unwrap(),
-                    _ = stop_rx => {}
-                }
-            });
-            rt.shutdown_timeout(Duration::from_secs(2));
-        });
-        self.port = port_rx.recv().unwrap();
-        self.stop = Some(stop_tx);
-        self.thread = Some(thread);
-        eventually(|| async { self.http.get(format!("{}/healthz", self.url())).send().await.ok().map(drop) }).await;
-    }
-
-    fn stop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        if let Some(t) = self.thread.take() {
-            t.join().unwrap();
-        }
-    }
-
-    fn url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
-    }
-
-    async fn join_code(&self) -> String {
-        let resp = self.http.post(format!("{}/api/join-codes", self.url())).bearer_auth(ADMIN).send().await.unwrap();
-        assert!(resp.status().is_success());
-        resp.json::<sk1ll_proto::JoinCode>().await.unwrap().code
-    }
-
-    /// A join code for a Machine that may manage only itself.
-    async fn self_join_code(&self) -> String {
-        let url = format!("{}/api/join-codes", self.url());
-        let body = serde_json::json!({ "scope": "self" });
-        let resp = self.http.post(url).bearer_auth(ADMIN).json(&body).send().await.unwrap();
-        assert!(resp.status().is_success());
-        let code = resp.json::<sk1ll_proto::JoinCode>().await.unwrap();
-        assert_eq!(code.scope, sk1ll_proto::Scope::SelfOnly);
-        code.code
-    }
-
-    async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> T {
-        let resp = self.http.get(format!("{}/api{path}", self.url())).bearer_auth(ADMIN).send().await.unwrap();
-        assert!(resp.status().is_success(), "GET {path}: {}", resp.status());
-        resp.json().await.unwrap()
-    }
-
-    async fn row(&self, id: &str) -> Option<sk1ll_proto::MachineRow> {
-        self.get::<FleetView>("/fleet").await.machines.into_iter().find(|m| m.id == id)
-    }
-
-    /// The bare repo's HEAD, read directly.
-    fn head(&self) -> Option<String> {
-        let out = Command::new("git")
-            .arg("--git-dir")
-            .arg(self.data.join("repo.git"))
-            .args(["rev-parse", "--verify", "--quiet", "HEAD"])
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .output()
-            .unwrap();
-        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
-    }
+trait MachineExt {
+    fn snapshot(&self) -> Option<AssignmentSnapshot>;
+    fn write_repo(&self, rel: &str, body: &str);
+    fn harness_skill(&self, name: &str) -> Option<String>;
+    async fn commit_all(&self) -> CommitResponse;
+    async fn commit(&self, items: &[&str]) -> CommitResponse;
+    fn head(&self) -> String;
 }
 
-impl Drop for Server {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Machines
-
-const CONFIG_DIR: &str = ".config";
-const DATA_DIR: &str = ".local/share";
-const CACHE_DIR: &str = ".cache";
-const SOCKET_PATH: &str = "run/sk1ll/daemon.sock";
-
-struct Machine {
-    id: String,
-    home: tempfile::TempDir,
-    child: Option<Child>,
-    client: Client,
-    /// Extra environment for the daemon (overrides the defaults).
-    env: Vec<(String, String)>,
-}
-
-impl Machine {
-    fn machine_config(home: &std::path::Path) -> std::path::PathBuf {
-        home.join(CONFIG_DIR).join("sk1ll/machine.toml")
-    }
-
-    /// A machine with one harness, `agent`, under its temp HOME (copy mode,
-    /// rules-format instructions). No presets exist in that HOME.
-    fn new(id: &str) -> Self {
-        let home = tempfile::tempdir().unwrap();
-        let h = home.path();
-        let cfg = format!(
-            "id = \"{id}\"\n[harnesses.{HARNESS}]\nskills = \"{}\"\ninstructions = \"{}\"\n\
-             instructions_format = \"rules\"\nmode = \"copy\"\n",
-            h.join("agent/skills").display(),
-            h.join("agent/rules").display()
-        );
-        let config = Self::machine_config(h);
-        write(config.parent().unwrap(), "machine.toml", &cfg);
-        let client = Client::new(h.join(SOCKET_PATH));
-        Self { id: id.into(), home, child: None, client, env: Vec::new() }
-    }
-
-    fn with_env(mut self, k: &str, v: &str) -> Self {
-        self.env.push((k.into(), v.into()));
-        self
-    }
-
-    fn command(&self) -> Command {
-        let h = self.home.path();
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_sk1ll-daemon"));
-        for k in [
-            "SK1LL_DAEMON_SOCKET",
-            "SK1LL_DAEMON_STATE",
-            "SK1LL_MACHINE_CONFIG",
-            "SK1LL_ASSIGNMENT",
-            "SK1LL_REPO",
-            "SK1LL_STATE_DIR",
-        ] {
-            cmd.env_remove(k);
-        }
-        cmd.env("HOME", h)
-            .env("XDG_CONFIG_HOME", h.join(".config"))
-            .env("XDG_CACHE_HOME", h.join(".cache"))
-            .env("XDG_DATA_HOME", h.join(".local/share"))
-            .env("XDG_STATE_HOME", h.join(".local/state"))
-            .env("XDG_RUNTIME_DIR", h.join("run"))
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("SK1LL_DEBOUNCE", "100ms")
-            .env("SK1LL_RECONNECT_MAX", "1s")
-            .env("RUST_LOG", "info");
-        for (k, v) in &self.env {
-            cmd.env(k, v);
-        }
-        cmd
-    }
-
-    fn repo(&self) -> PathBuf {
-        self.home.path().join(DATA_DIR).join("sk1ll/repo")
-    }
-
-    fn skills(&self) -> PathBuf {
-        self.home.path().join("agent/skills")
-    }
-
-    fn state_path(&self) -> PathBuf {
-        self.home.path().join(CONFIG_DIR).join("sk1ll/daemon.json")
-    }
-
-    fn state(&self) -> DaemonState {
-        DaemonState::load(&self.state_path()).unwrap().expect("joined")
-    }
-
-    fn snapshot_path(&self) -> PathBuf {
-        self.home.path().join(CONFIG_DIR).join("sk1ll/daemon-assignment.json")
-    }
-
-    fn cache_path(&self) -> PathBuf {
-        self.home.path().join(CACHE_DIR).join("sk1ll/assignment.json")
-    }
-
+impl MachineExt for DaemonMachine {
     fn snapshot(&self) -> Option<AssignmentSnapshot> {
         let text = std::fs::read_to_string(self.snapshot_path()).ok()?;
         Some(serde_json::from_str(&text).unwrap())
     }
 
-    fn log(&self) -> String {
-        std::fs::read_to_string(self.home.path().join("daemon.log")).unwrap_or_default()
-    }
-
-    /// Joins with a fresh code; returns what the command printed.
-    async fn join(&self, server: &Server) -> String {
-        self.join_with(server, server.join_code().await).await
-    }
-
-    async fn join_with(&self, server: &Server, code: String) -> String {
-        let mut cmd = self.command();
-        cmd.args(["join", &server.url(), &code, "--id", &self.id, "--repo"]).arg(self.repo());
-        let out = tokio::task::spawn_blocking(move || cmd.output().unwrap()).await.unwrap();
-        assert!(out.status.success(), "join: {}", String::from_utf8_lossy(&out.stderr));
-        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
-    }
-
-    fn spawn(&mut self) {
-        let log =
-            std::fs::OpenOptions::new().create(true).append(true).open(self.home.path().join("daemon.log")).unwrap();
-        let child = self.command().stdout(Stdio::null()).stderr(log).spawn().unwrap();
-        self.child = Some(child);
-    }
-
-    async fn start(&mut self) {
-        self.spawn();
-        eventually(|| async { self.client.status().await.ok().map(drop) }).await;
-    }
-
-    /// For real servers: API readiness alone does not mean a commit can push.
-    async fn start_connected(&mut self) {
-        self.start().await;
-        eventually(|| async { (self.status().await.connection == Connection::Connected).then_some(()) }).await;
-    }
-
-    /// Kills the daemon (like a crash or a reboot).
-    fn stop(&mut self) {
-        if let Some(mut c) = self.child.take() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-    }
-
-    /// Starts a daemon that is expected to exit with an error.
-    async fn start_fails(&mut self) -> std::process::ExitStatus {
-        self.spawn();
-        let mut child = self.child.take().unwrap();
-        let status = eventually(|| {
-            let s = child.try_wait().unwrap();
-            async move { s }
-        })
-        .await;
-        assert!(!status.success());
-        status
-    }
-
-    async fn status(&self) -> StatusView {
-        self.client.status().await.unwrap()
-    }
-
     /// Writes `rel` in the repo. A new personal skill gets the explicit
     /// Item ID [`skill_id`] names, so tests can toggle it before a refresh
     /// would write it one; IDs are never derived from names.
-    fn write(&self, rel: &str, body: &str) {
-        let path = self.repo().join(rel);
-        write(path.parent().unwrap(), path.file_name().unwrap().to_str().unwrap(), body);
+    fn write_repo(&self, rel: &str, body: &str) {
+        let path = self.write(rel, body);
         if let Some(name) = rel.strip_prefix("personal/").and_then(|p| p.strip_suffix("/SKILL.md")) {
             let sidecar = path.parent().unwrap().join(".sk1ll-id");
             if sidecar.symlink_metadata().is_err() {
@@ -335,24 +81,6 @@ impl Machine {
     }
 }
 
-impl Drop for Machine {
-    fn drop(&mut self) {
-        if let Some(mut c) = self.child.take() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-        let log_path = self.home.path().join("daemon.log");
-        if let Some(dir) = std::env::var_os("SK1LL_TEST_LOG_DIR") {
-            let name = format!("{}-{}.log", std::thread::current().name().unwrap_or("test"), self.id);
-            let _ = std::fs::copy(&log_path, Path::new(&dir).join(name.replace("::", "-")));
-        }
-        if std::thread::panicking() {
-            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-            eprintln!("---- daemon log of {} ----\n{log}", self.id);
-        }
-    }
-}
-
 fn assert_indexed_copy(dir: &Path, name: &str) {
     let bytes = std::fs::read(dir.join(sk1ll_core::sync::INDEX_PATH)).unwrap();
     let index: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -367,24 +95,7 @@ fn assert_indexed_copy(dir: &Path, name: &str) {
 }
 
 fn write(dir: &Path, file: &str, body: &str) {
-    std::fs::create_dir_all(dir).unwrap();
-    std::fs::write(dir.join(file), body).unwrap();
-}
-
-/// Runs git without the user's global/system config.
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false"])
-        .args(args)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
+    sk1ll_testkit::write(&dir.join(file), body);
 }
 
 /// A hand-driven server endpoint: the test decides what each connection gets.
@@ -460,13 +171,13 @@ fn snapshot(revision: u64, on: &[&str]) -> AssignmentSnapshot {
 
 /// A machine whose repo has skills x, y, z (pushed to a local bare origin)
 /// and whose server is `server_url`, with `snap` stored as its assignment.
-fn solo(id: &str, server_url: &str, snap: Option<AssignmentSnapshot>) -> Machine {
-    let m = Machine::new(id);
+fn solo(id: &str, server_url: &str, snap: Option<AssignmentSnapshot>) -> DaemonMachine {
+    let m = machine(id);
     let repo = m.repo();
     let origin = m.home.path().join("origin.git");
     sk1ll_core::Repo::init(&repo).unwrap();
     for s in ["x", "y", "z"] {
-        m.write(&format!("personal/{s}/SKILL.md"), &format!("{s}\n"));
+        m.write_repo(&format!("personal/{s}/SKILL.md"), &format!("{s}\n"));
     }
     git(&repo, &["checkout", "--quiet", "-B", "main"]);
     git(&repo, &["add", "-A"]);
@@ -505,43 +216,22 @@ fn toggle(name: &str, enabled: bool) -> ToggleChange {
     }
 }
 
-async fn assign(via: &Machine, machine: &str, changes: Vec<ToggleChange>) {
+async fn assign(via: &DaemonMachine, machine: &str, changes: Vec<ToggleChange>) {
     via.client.set_assignment(machine, &AssignmentChanges { changes, ..Default::default() }).await.unwrap();
-}
-
-/// Polls `f` until it returns `Some` (up to 30 s).
-/// Polls `f` until it holds, for up to 30 seconds; a timeout names the
-/// condition by where `eventually` was called.
-#[track_caller]
-fn eventually<T, F, Fut>(mut f: F) -> impl Future<Output = T>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Option<T>>,
-{
-    let at = std::panic::Location::caller();
-    async move {
-        for _ in 0..300 {
-            if let Some(v) = f().await {
-                return v;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        panic!("the condition at {at} never held within 30s");
-    }
 }
 
 /// `alpha` joins the fresh server and commits the new repo with skill `x`;
 /// then `beta` joins and clones it. Returns both and the baseline.
-async fn fleet_of_two(server: &Server) -> (Machine, Machine, String) {
-    let mut a = Machine::new("alpha");
+async fn fleet_of_two(server: &Server) -> (DaemonMachine, DaemonMachine, String) {
+    let mut a = machine("alpha");
     a.join(server).await;
     a.start_connected().await;
-    a.write("personal/x/SKILL.md", "x v1\n");
+    a.write_repo("personal/x/SKILL.md", "x v1\n");
     let p = a.commit_all().await;
     assert!(p.pushed, "{p:?}");
     assert_eq!(server.head().as_deref(), Some(p.sha.as_str()));
 
-    let mut b = Machine::new("beta");
+    let mut b = machine("beta");
     b.join(server).await;
     b.start_connected().await;
     // Removing a machine before the server has registered its session is an
@@ -557,22 +247,9 @@ async fn fleet_of_two(server: &Server) -> (Machine, Machine, String) {
 // ---------------------------------------------------------------------------
 // Tests
 
-#[tokio::test(flavor = "multi_thread")]
-async fn harness_assignment_passes_through_to_the_fleet_and_reaches_sync() {
-    let server = Server::start().await;
-    let (_a, b, _) = fleet_of_two(&server).await;
-    let on = b.client.set_harness_assignment(HARNESS, true).await.unwrap();
-    assert!(on.assignment.skill_enabled(HARNESS, &skill_id("x")));
-    eventually(|| async { b.harness_skill("x").is_some().then_some(()) }).await;
-    let off = b.client.set_harness_assignment(HARNESS, false).await.unwrap();
-    assert!(!off.assignment.skill_enabled(HARNESS, &skill_id("x")));
-    assert!(off.entries.iter().all(|entry| entry.machine == "beta"));
-    eventually(|| async { b.harness_skill("x").is_none().then_some(()) }).await;
-}
-
 /// The per-Machine harness route: this Machine's own is written here (and
 /// syncs), another's at the server.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn machine_harness_assignment_writes_this_or_another_machine() {
     let server = Server::start().await;
     let (a, b, _) = fleet_of_two(&server).await;
@@ -583,31 +260,15 @@ async fn machine_harness_assignment_writes_this_or_another_machine() {
     let own = b.client.set_machine_harness_assignment("beta", HARNESS, false).await.unwrap();
     assert!(own.entries.iter().all(|entry| entry.machine == "beta" && entry.author == "beta"));
     eventually(|| async { b.harness_skill("x").is_none().then_some(()) }).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn standalone_harness_assignment_reaches_items_with_spaces() {
-    let mut m = Machine::new("solo");
-    sk1ll_core::Repo::init(&m.repo()).unwrap();
-    m.write("personal/pdf/SKILL.md", "valid");
-    m.write("personal/old name/SKILL.md", "legacy item");
-    m.start().await;
-
-    let result = m.client.set_harness_assignment(HARNESS, false).await.unwrap();
-    assert!(result.errors.is_empty());
-    assert!(!result.assignment.skill_enabled(HARNESS, &skill_id("pdf")));
-    assert!(!result.assignment.skill_enabled(HARNESS, &skill_id("old name")));
-}
-
-/// A Machine with `self` scope can set its own Harness Assignment through
-/// `POST /machines/{id}/assignment/harness/{harness}`, and the server
-/// refuses it another Machine's, which stays as it was.
-#[tokio::test(flavor = "multi_thread")]
-async fn machine_harness_assignment_of_another_machine_is_refused_to_self_scope() {
-    let server = Server::start().await;
-    let (a, _b, _) = fleet_of_two(&server).await;
-    let mut own = Machine::new("gamma");
-    own.join_with(&server, server.self_join_code().await).await;
+    let on = b.client.set_harness_assignment(HARNESS, true).await.unwrap();
+    assert!(on.assignment.skill_enabled(HARNESS, &skill_id("x")));
+    eventually(|| async { b.harness_skill("x").is_some().then_some(()) }).await;
+    let off = b.client.set_harness_assignment(HARNESS, false).await.unwrap();
+    assert!(!off.assignment.skill_enabled(HARNESS, &skill_id("x")));
+    assert!(off.entries.iter().all(|entry| entry.machine == "beta"));
+    eventually(|| async { b.harness_skill("x").is_none().then_some(()) }).await;
+    let mut own = machine("gamma");
+    own.join_with(&server, &server.join_code_for(sk1ll_proto::Scope::SelfOnly).await.code).await;
     own.start_connected().await;
     eventually(|| async { (server.row("gamma").await?.scope == sk1ll_proto::Scope::SelfOnly).then_some(()) }).await;
     let before = a.client.assignment("alpha").await.unwrap();
@@ -620,7 +281,7 @@ async fn machine_harness_assignment_of_another_machine_is_refused_to_self_scope(
     assert!(mine.assignment.skill_enabled(HARNESS, &skill_id("x")), "the change is there: {mine:?}");
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn join_commit_push_and_nudge_another_machine() {
     let server = Server::start().await;
     let (a, b, _) = fleet_of_two(&server).await;
@@ -634,7 +295,7 @@ async fn join_commit_push_and_nudge_another_machine() {
     assert!(b.repo().join("personal/x/SKILL.md").is_file(), "beta cloned the baseline");
 
     let mut events = b.client.events().await.unwrap();
-    a.write("personal/y/SKILL.md", "y v1\n");
+    a.write_repo("personal/y/SKILL.md", "y v1\n");
     let p = a.commit(&["y"]).await;
     assert!(p.pushed);
     assert_eq!(p.message, "commit y from alpha");
@@ -667,10 +328,10 @@ async fn join_commit_push_and_nudge_another_machine() {
     assert_eq!(fleet.machines.len(), 2);
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn join_codes_pass_their_scope_and_expiry_through() {
     let server = Server::start().await;
-    let mut a = Machine::new("alpha");
+    let mut a = machine("alpha");
     a.join(&server).await;
     a.start_connected().await;
     let code = a.client.join_code(sk1ll_proto::Scope::SelfOnly).await.unwrap();
@@ -680,7 +341,7 @@ async fn join_codes_pass_their_scope_and_expiry_through() {
     assert_eq!(fleet.machines[0].scope, sk1ll_proto::Scope::Fleet);
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn assignment_change_reaches_another_harness_without_git() {
     let server = Server::start().await;
     let (a, b, base) = fleet_of_two(&server).await;
@@ -697,17 +358,17 @@ async fn assignment_change_reaches_another_harness_without_git() {
     assert!(!snapshot.assignment.skill_enabled(HARNESS, &skill_id("x")));
     assert_eq!(b.head(), base);
     assert_eq!(git(&b.repo(), &["reflog"]), reflog, "no git operation moved anything");
-    let cached = Assignment::load(&b.home.path().join(CACHE_DIR).join("sk1ll/assignment.json")).unwrap();
+    let cached = Assignment::load(&b.cache_path()).unwrap();
     assert_eq!(cached.harness(HARNESS).skills.get(&skill_id("x")), Some(&false), "the assignment is cached");
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn offline_commits_are_queued_and_pushed_on_reconnect() {
     let mut server = Server::start().await;
-    let mut a = Machine::new("alpha");
+    let mut a = machine("alpha");
     a.join(&server).await;
     a.start_connected().await;
-    a.write("personal/v/SKILL.md", "v\n");
+    a.write_repo("personal/v/SKILL.md", "v\n");
     let first = a.commit_all().await;
     assert!(first.pushed);
 
@@ -716,7 +377,7 @@ async fn offline_commits_are_queued_and_pushed_on_reconnect() {
     let err = a.client.fleet().await.unwrap_err();
     assert_eq!(err.status, Some(503), "{err}");
 
-    a.write("personal/z/SKILL.md", "z\n");
+    a.write_repo("personal/z/SKILL.md", "z\n");
     let p = a.commit(&["z"]).await;
     assert!(!p.pushed, "nothing to push to while offline");
     let s = a.status().await;
@@ -724,7 +385,7 @@ async fn offline_commits_are_queued_and_pushed_on_reconnect() {
     assert_eq!(s.headline, MachineStatus::Offline);
     assert_eq!(server.head().as_deref(), Some(first.sha.as_str()));
 
-    server.launch().await;
+    server.restart().await;
     eventually(|| async { (server.head().as_deref() == Some(p.sha.as_str())).then_some(()) }).await;
     eventually(|| async {
         let s = a.status().await;
@@ -733,17 +394,17 @@ async fn offline_commits_are_queued_and_pushed_on_reconnect() {
     .await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn blocked_pull_reports_clashes_and_keeps_files() {
     let mut server = Server::start().await;
     let (a, mut b, base) = fleet_of_two(&server).await;
 
-    b.write("personal/x/SKILL.md", "x by beta\n");
+    b.write_repo("personal/x/SKILL.md", "x by beta\n");
     eventually(|| async {
         server.row("beta").await?.report?.drafts.contains(&ItemRef::Skill("x".into())).then_some(())
     })
     .await;
-    a.write("personal/x/SKILL.md", "x by alpha\n");
+    a.write_repo("personal/x/SKILL.md", "x by alpha\n");
     let p = a.commit(&["x"]).await;
     assert!(p.pushed);
 
@@ -771,33 +432,46 @@ async fn blocked_pull_reports_clashes_and_keeps_files() {
     assert!(s.report.blocked && s.report.behind, "{s:?}");
     assert_eq!(s.report.clashes, [ItemRef::Skill("x".into())]);
     assert_eq!(s.server_baseline.as_deref(), Some(p.sha.as_str()));
-    server.launch().await;
+    server.restart().await;
     eventually(|| async { (b.status().await.connection == Connection::Connected).then_some(()) }).await;
 
     // Restoring the clashing item is a draft change: the pull is retried.
-    b.client.restore(&RestoreRequest { items: vec!["x".into()], all: false }).await.unwrap();
+    let kept = b.client.restore(&RestoreRequest { items: vec!["x".into()], all: false }).await.unwrap().kept;
     eventually(|| async {
         let s = b.status().await;
         (!s.report.blocked && s.report.baseline.as_deref() == Some(p.sha.as_str())).then_some(())
     })
     .await;
     assert_eq!(std::fs::read_to_string(b.repo().join("personal/x/SKILL.md")).unwrap(), "x by alpha\n");
+    let id = kept.into_iter().next().expect("a recovery entry");
+    let report = serde_json::json!([{ "item": "skill:x", "entry": id, "error": "the keep stopped after its pull" }]);
+    std::fs::write(b.repo().join(".git/sk1ll-keep-report.json"), report.to_string()).unwrap();
+    // A fresh read waits for, and runs, a reconcile, which reads the report.
+    let listed = || async {
+        b.client.recovered_fresh().await.unwrap();
+        b.client.status().await.unwrap().keep_report.iter().any(|u| u.entry.as_ref() == Some(&id))
+    };
+    eventually(|| async { listed().await.then_some(()) }).await;
+    assert!(listed().await, "still there after another reconcile");
+    b.client.discard_displaced(&id).await.unwrap();
+    eventually(|| async { (!listed().await).then_some(()) }).await;
+    assert!(!b.repo().join(".git/sk1ll-keep-report.json").exists());
 }
 
 /// `POST /pull/keep` takes the new Baseline and puts the Draft's version
 /// back on top: the Machine is no longer Blocked and its version is Draft.
 /// Here, not among the library's tests: its recovery entries are in this
 /// daemon's own state directory, which no other test's reconcile lists.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn keep_mine_clears_blocked_with_the_draft_on_top() {
     let server = Server::start().await;
     let (a, b, _) = fleet_of_two(&server).await;
-    b.write("personal/x/SKILL.md", "x by beta\n");
+    b.write_repo("personal/x/SKILL.md", "x by beta\n");
     eventually(|| async {
         server.row("beta").await?.report?.drafts.contains(&ItemRef::Skill("x".into())).then_some(())
     })
     .await;
-    a.write("personal/x/SKILL.md", "x by alpha\n");
+    a.write_repo("personal/x/SKILL.md", "x by alpha\n");
     let p = a.commit(&["x"]).await;
     assert!(p.pushed);
     eventually(|| async { b.status().await.report.blocked.then_some(()) }).await;
@@ -815,38 +489,7 @@ async fn keep_mine_clears_blocked_with_the_draft_on_top() {
     assert!(s.report.drafts.contains(&ItemRef::Skill("x".into())), "{s:?}");
 }
 
-/// An interrupted keep's report lists a version in recovery in the status
-/// through later reconciles and errors, until that version is discarded.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_keep_report_stays_in_the_status_until_its_version_is_acted_on() {
-    let server = Server::start().await;
-    let (a, b, _) = fleet_of_two(&server).await;
-    b.write("personal/x/SKILL.md", "x by beta\n");
-    eventually(|| async {
-        server.row("beta").await?.report?.drafts.contains(&ItemRef::Skill("x".into())).then_some(())
-    })
-    .await;
-    a.write("personal/x/SKILL.md", "x by alpha\n");
-    assert!(a.commit(&["x"]).await.pushed);
-    eventually(|| async { b.status().await.report.blocked.then_some(()) }).await;
-    // Restoring an item the pull is Blocked on keeps its version in recovery.
-    let kept = b.client.restore(&RestoreRequest { items: vec!["x".into()], all: false }).await.unwrap().kept;
-    let id = kept.into_iter().next().expect("a recovery entry");
-    let report = serde_json::json!([{ "item": "skill:x", "entry": id, "error": "the keep stopped after its pull" }]);
-    std::fs::write(b.repo().join(".git/sk1ll-keep-report.json"), report.to_string()).unwrap();
-    // A fresh read waits for, and runs, a reconcile, which reads the report.
-    let listed = || async {
-        b.client.recovered_fresh().await.unwrap();
-        b.client.status().await.unwrap().keep_report.iter().any(|u| u.entry.as_ref() == Some(&id))
-    };
-    eventually(|| async { listed().await.then_some(()) }).await;
-    assert!(listed().await, "still there after another reconcile");
-    b.client.discard_displaced(&id).await.unwrap();
-    eventually(|| async { (!listed().await).then_some(()) }).await;
-    assert!(!b.repo().join(".git/sk1ll-keep-report.json").exists());
-}
-
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn revoked_machine_stops_managing_and_keeps_files() {
     let server = Server::start().await;
     let (a, b, _) = fleet_of_two(&server).await;
@@ -892,7 +535,7 @@ impl tokio_tungstenite::tungstenite::handshake::server::Callback for RecordAuth 
 }
 
 /// A fake server sends assignments out of order; an older revision is ignored.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn stale_assignment_revision_is_ignored() {
     let server = FakeServer::new().await;
     let mut m = solo("solo", &server.url(), Some(snapshot(1, &[])));
@@ -936,36 +579,26 @@ async fn stale_assignment_revision_is_ignored() {
 // ---------------------------------------------------------------------------
 // Review findings
 
-/// #1: the watcher is live from startup, so a repo edit reaches the harness
-/// with no other trigger (no API call, no server message), even when the
-/// harness's skills dir only appears later.
-#[tokio::test(flavor = "multi_thread")]
-async fn repo_edits_reach_the_harness_without_another_trigger() {
-    let server = Server::start().await;
-    let (a, b, _) = fleet_of_two(&server).await;
-    assign(&a, "beta", vec![toggle("x", true)]).await;
-    eventually(|| async { (b.harness_skill("x").as_deref() == Some("x v1\n")).then_some(()) }).await;
-
-    b.write("personal/x/SKILL.md", "x edited on beta\n");
-    eventually(|| async { (b.harness_skill("x").as_deref() == Some("x edited on beta\n")).then_some(()) }).await;
-}
-
 /// API readiness must include watching local edits, even if the first server
 /// handshake is still waiting for a response and cannot trigger a refresh.
-#[tokio::test(flavor = "multi_thread")]
-async fn repo_edits_before_the_first_server_connection_reach_the_harness() {
+#[tokio::test]
+async fn repo_edits_reach_the_harness_before_and_after_the_first_connection() {
     let server = FakeServer::new().await;
     let mut m = solo("solo", &server.url(), Some(snapshot(1, &["x"])));
     m.start().await;
-    m.write("personal/x/SKILL.md", "edited before connecting\n");
+    m.write_repo("personal/x/SKILL.md", "edited before connecting\n");
     eventually(|| async { (m.harness_skill("x").as_deref() == Some("edited before connecting\n")).then_some(()) })
         .await;
     assert_ne!(m.status().await.connection, Connection::Connected);
+    let (_socket, _) = server.accept().await;
+    eventually(|| async { (m.status().await.connection == Connection::Connected).then_some(()) }).await;
+    m.write_repo("personal/x/SKILL.md", "edited after connecting\n");
+    eventually(|| async { (m.harness_skill("x").as_deref() == Some("edited after connecting\n")).then_some(()) }).await;
 }
 
 /// #10: edits arriving faster than the debounce still sync within the
 /// maximum debounce.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn a_stream_of_edits_cannot_postpone_the_sync() {
     let server = FakeServer::new().await;
     let mut m = solo("solo", &server.url(), Some(snapshot(1, &["x"])))
@@ -976,7 +609,7 @@ async fn a_stream_of_edits_cannot_postpone_the_sync() {
 
     let started = std::time::Instant::now();
     for i in 0.. {
-        m.write("personal/x/SKILL.md", &format!("x {i}\n"));
+        m.write_repo("personal/x/SKILL.md", &format!("x {i}\n"));
         if m.harness_skill("x").as_deref() != Some("x\n") {
             break;
         }
@@ -987,7 +620,7 @@ async fn a_stream_of_edits_cannot_postpone_the_sync() {
 
 /// #2: a 401 (here from something in front of the server) is a recoverable
 /// state: the machine keeps being managed, retries, and is never revoked.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn a_401_is_not_a_revocation() {
     let server = FakeServer::new().await;
     let mut m = solo("solo", &server.url(), Some(snapshot(1, &["x"])));
@@ -996,15 +629,15 @@ async fn a_401_is_not_a_revocation() {
     server.refuse_401().await;
     let s = eventually(|| async {
         let s = m.status().await;
-        (s.connection == Connection::AuthRejected).then_some(s)
+        (s.connection == Connection::AuthRejected && s.last_error.as_deref().is_some_and(|error| error.contains("401")))
+            .then_some(s)
     })
     .await;
     assert!(!s.revoked && s.auth_rejected_since.is_some(), "{s:?}");
-    assert!(s.last_error.as_deref().unwrap_or_default().contains("401"), "{s:?}");
     assert!(!m.state().revoked, "not stored as revoked");
 
     // Still managing the harnesses.
-    m.write("personal/x/SKILL.md", "x while rejected\n");
+    m.write_repo("personal/x/SKILL.md", "x while rejected\n");
     eventually(|| async { (m.harness_skill("x").as_deref() == Some("x while rejected\n")).then_some(()) }).await;
 
     // Retries, and recovers once the server accepts the token.
@@ -1022,7 +655,7 @@ async fn a_401_is_not_a_revocation() {
 /// A server of another protocol version refuses the connection (426) and
 /// names its release: the status says so and which side to upgrade, the
 /// machine keeps being managed, and a later accepted connection clears it.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn a_server_of_another_protocol_is_incompatible_and_named() {
     let server = FakeServer::new().await;
     let mut m = solo("solo", &server.url(), Some(snapshot(1, &["x"])));
@@ -1057,20 +690,20 @@ async fn a_server_of_another_protocol_is_incompatible_and_named() {
 /// #3: the token is never in a remote URL, `.git/config`, or any output;
 /// push, clone and pull work with it supplied through the environment, and
 /// a URL with credentials from an older version is cleaned at startup.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn the_token_stays_out_of_git_urls_and_logs() {
     let server = Server::start().await;
-    let mut a = Machine::new("alpha");
+    let mut a = machine("alpha");
     let a_join = a.join(&server).await;
     a.start_connected().await;
-    a.write("personal/x/SKILL.md", "x\n");
+    a.write_repo("personal/x/SKILL.md", "x\n");
     assert!(a.commit_all().await.pushed, "push works");
 
-    let mut b = Machine::new("beta");
+    let mut b = machine("beta");
     let b_join = b.join(&server).await;
     b.start().await;
     assert!(b.repo().join("personal/x/SKILL.md").is_file(), "clone works");
-    a.write("personal/y/SKILL.md", "y\n");
+    a.write_repo("personal/y/SKILL.md", "y\n");
     let p = a.commit(&["y"]).await;
     eventually(|| async { (b.status().await.report.baseline.as_deref() == Some(p.sha.as_str())).then_some(()) }).await;
     assert!(b.repo().join("personal/y/SKILL.md").is_file(), "pull works");
@@ -1088,12 +721,12 @@ async fn the_token_stays_out_of_git_urls_and_logs() {
     // An older version put the token in origin's URL: startup removes it.
     b.stop();
     let token = b.state().token;
-    let old = format!("http://beta:{token}@127.0.0.1:{}/git/repo.git", server.port);
+    let old = format!("http://beta:{token}@127.0.0.1:{}/git/repo.git", server.port());
     git(&b.repo(), &["remote", "set-url", "origin", &old]);
     b.start().await;
     assert_eq!(git(&b.repo(), &["remote", "get-url", "origin"]), format!("{}/git/repo.git", server.url()));
     eventually(|| async { (b.status().await.connection == Connection::Connected).then_some(()) }).await;
-    b.write("personal/z/SKILL.md", "z\n");
+    b.write_repo("personal/z/SKILL.md", "z\n");
     assert!(b.commit(&["z"]).await.pushed, "push works after the migration");
     assert!(!b.log().contains(&token));
 }
@@ -1101,7 +734,7 @@ async fn the_token_stays_out_of_git_urls_and_logs() {
 /// #4: the assignment is stored with its revision in the state dir, so
 /// losing the cache can't enable anything; without any stored snapshot the
 /// harnesses wait for the server's, which is taken even at the same revision.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn losing_the_assignment_cache_keeps_disabled_skills_off() {
     let mut server = Server::start().await;
     let (a, mut b, _) = fleet_of_two(&server).await;
@@ -1110,7 +743,7 @@ async fn losing_the_assignment_cache_keeps_disabled_skills_off() {
     assert_eq!(b.snapshot().unwrap().revision, revision);
 
     b.stop();
-    std::fs::remove_dir_all(b.home.path().join(CACHE_DIR)).unwrap();
+    std::fs::remove_dir_all(b.home.cache_dir()).unwrap();
     b.start().await;
     eventually(|| async { (b.status().await.connection == Connection::Connected).then_some(()) }).await;
     assert_eq!(b.harness_skill("x"), None, "the disabled skill stays off");
@@ -1119,13 +752,13 @@ async fn losing_the_assignment_cache_keeps_disabled_skills_off() {
     b.stop();
     server.stop();
     std::fs::remove_file(b.snapshot_path()).unwrap();
-    std::fs::remove_dir_all(b.home.path().join(CACHE_DIR)).unwrap();
+    std::fs::remove_dir_all(b.home.cache_dir()).unwrap();
     b.start().await;
     let s = b.status().await;
     assert!(s.awaiting_assignment, "{s:?}");
     assert_eq!(b.harness_skill("x"), None, "nothing is managed without an assignment");
 
-    server.launch().await;
+    server.restart().await;
     let s = eventually(|| async {
         let s = b.status().await;
         (s.connection == Connection::Connected && !s.awaiting_assignment).then_some(s)
@@ -1139,10 +772,10 @@ async fn losing_the_assignment_cache_keeps_disabled_skills_off() {
 
 /// #5: the daemon holds core's engine lock while it runs, and refuses to
 /// start while another process holds it.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn the_daemon_holds_the_engine_lock() {
     let server = Server::start().await;
-    let mut a = Machine::new("alpha");
+    let mut a = machine("alpha");
     a.join(&server).await;
     a.start().await;
     assert!(sk1ll_core::EngineLock::try_acquire(&a.repo()).unwrap().is_none(), "held by the running daemon");
@@ -1160,7 +793,7 @@ async fn the_daemon_holds_the_engine_lock() {
 
 /// #7: on reconnecting, the first status reflects the local state now, not
 /// a report cached from before the disconnect.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn reconnecting_reports_fresh_local_state_first() {
     let server = FakeServer::new().await;
     // Neither the watcher nor the reconciliation refreshes during the test.
@@ -1176,7 +809,7 @@ async fn reconnecting_reports_fresh_local_state_first() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     drop(ws);
 
-    m.write("personal/new/SKILL.md", "new\n");
+    m.write_repo("personal/new/SKILL.md", "new\n");
     let (mut ws, _) = server.accept().await;
     let DaemonMessage::Status(report) = next_message(&mut ws).await else { panic!("status comes first") };
     assert_eq!(report.drafts, [ItemRef::Skill("new".into())]);
@@ -1186,8 +819,8 @@ async fn reconnecting_reports_fresh_local_state_first() {
 async fn reconnecting_does_not_send_status_until_refresh_succeeds() {
     let server = FakeServer::new().await;
     let mut m = solo("solo", &server.url(), Some(snapshot(1, &[]))).with_env("SK1LL_RECONCILE_INTERVAL", "1h");
-    m.write("personal/w/SKILL.md", "draft");
-    let config = Machine::machine_config(m.home.path());
+    m.write_repo("personal/w/SKILL.md", "draft");
+    let config = m.machine_toml();
     let good = std::fs::read_to_string(&config).unwrap();
     std::fs::write(&config, "[broken").unwrap();
     m.start().await;
@@ -1209,7 +842,7 @@ async fn reconnecting_does_not_send_status_until_refresh_succeeds() {
 /// Connecting costs no reconcile when nothing changed since the one at
 /// startup: not the one before the first status, not the catch-up pull that
 /// moved nothing, not the server's nudge for the baseline in use.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn connecting_costs_no_reconcile_when_nothing_changed() {
     let server = FakeServer::new().await;
     // Neither the watcher nor the reconciliation refreshes during the test.
@@ -1219,7 +852,7 @@ async fn connecting_costs_no_reconcile_when_nothing_changed() {
         .with_env("SK1LL_RECONCILE_INTERVAL", "1h")
         .with_env("RUST_LOG", "info,sk1ll_daemon=debug");
     let baseline = git(&m.repo(), &["rev-parse", "HEAD"]);
-    let refreshes = |m: &Machine| m.log().matches("reconciling: ").count();
+    let refreshes = |m: &DaemonMachine| m.log().matches("reconciling: ").count();
     // Inputs written moments ago are reconciled every time (the racy window).
     tokio::time::sleep(sk1ll_core::hash::HashCache::RACY_WINDOW).await;
     m.start().await;
@@ -1248,7 +881,7 @@ async fn connecting_costs_no_reconcile_when_nothing_changed() {
 
 /// #9: `join` while the daemon runs goes through it; it comes back
 /// connected and managing with the new credentials.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn joining_again_while_the_daemon_runs_resumes_management() {
     let server = Server::start().await;
     let (a, b, _) = fleet_of_two(&server).await;
@@ -1270,12 +903,12 @@ async fn joining_again_while_the_daemon_runs_resumes_management() {
 
     assign(&a, "beta", vec![toggle("x", true)]).await;
     eventually(|| async { b.harness_skill("x").map(drop) }).await;
-    b.write("personal/q/SKILL.md", "q\n");
+    b.write_repo("personal/q/SKILL.md", "q\n");
     assert!(b.commit(&["q"]).await.pushed, "git works with the new token");
     assert!(!b.log().contains(&state.token));
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn replacing_a_watched_skills_directory_rearms_the_watch() {
     const WAKE: &str = "file changes: waking a reconcile";
     let server = FakeServer::new().await;
@@ -1320,21 +953,21 @@ async fn replacing_a_watched_skills_directory_rearms_the_watch() {
 // Adopting an existing clone, and git deadlines
 
 /// Runs `sk1ll-daemon join` with `code`; returns whether it succeeded and its stderr.
-async fn try_join(m: &Machine, server: &Server, code: &str) -> (bool, String) {
+async fn try_join(m: &DaemonMachine, server: &Server, code: &str) -> (bool, String) {
     let mut cmd = m.command();
     cmd.args(["join", &server.url(), code, "--id", &m.id, "--repo"]).arg(m.repo());
     let out = tokio::task::spawn_blocking(move || cmd.output().unwrap()).await.unwrap();
     (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn joining_with_an_independent_clone_is_refused() {
     let server = Server::start().await;
-    let m = Machine::new("gamma");
+    let m = machine("gamma");
     let repo = m.repo();
     // `git init` on `master` with the server as origin: not a clone of the server.
     git(m.home.path(), &["init", "--quiet", "-b", "master", repo.to_str().unwrap()]);
-    m.write("sk1ll.toml", "# gamma's own\n");
+    m.write_repo("sk1ll.toml", "# gamma's own\n");
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "--quiet", "-m", "gamma root"]);
     git(&repo, &["remote", "add", "origin", &format!("{}{}", server.url(), sk1ll_proto::REPO_PATH)]);
@@ -1351,7 +984,7 @@ async fn joining_with_an_independent_clone_is_refused() {
     let (ok, err) = try_join(&m, &server, &code).await;
     assert!(!ok && err.contains("shares no history"), "{err}");
     assert_eq!(server.head(), baseline, "nothing was pushed");
-    let bare = server.data.join("repo.git");
+    let bare = server.data().join("repo.git");
     let branches = git(&bare, &["for-each-ref", "--format=%(refname)", "refs/heads/"]);
     assert_eq!(branches, "refs/heads/main");
 }
@@ -1372,7 +1005,7 @@ fn processes_mentioning(needle: &str) -> Vec<String> {
 }
 
 #[cfg(target_os = "linux")]
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn the_startup_clone_gives_up_at_the_git_deadline() {
     // A "server" that accepts connections and then never says a word.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1383,8 +1016,7 @@ async fn the_startup_clone_gives_up_at_the_git_deadline() {
             held.push(s);
         }
     });
-    let mut m =
-        Machine::new("slow").with_env("SK1LL_GIT_TIMEOUT", "100ms").with_env("SK1LL_GIT_LOCAL_TIMEOUT", "100ms");
+    let mut m = machine("slow").with_env("SK1LL_GIT_TIMEOUT", "100ms").with_env("SK1LL_GIT_LOCAL_TIMEOUT", "100ms");
     let server_url = format!("http://127.0.0.1:{port}");
     DaemonState {
         machine_id: "slow".into(),
@@ -1422,7 +1054,7 @@ async fn the_startup_clone_gives_up_at_the_git_deadline() {
     assert_eq!(processes_mentioning(&needle), Vec::<String>::new());
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn displaced_conflicts_report_to_server_and_resolve() {
     let server = FakeServer::new().await;
     let mut m = solo("solo", &server.url(), Some(snapshot(1, &["x"])));
@@ -1433,7 +1065,7 @@ async fn displaced_conflicts_report_to_server_and_resolve() {
     let DaemonMessage::Status(_) = next_message(&mut ws).await else { panic!("expected status") };
     eventually(|| async { m.harness_skill("x").map(drop) }).await;
     let mut open = std::fs::OpenOptions::new().append(true).open(m.skills().join("x/SKILL.md")).unwrap();
-    m.write("personal/x/SKILL.md", "draft v2\n");
+    m.write_repo("personal/x/SKILL.md", "draft v2\n");
     let entry =
         eventually(|| async { m.client.recovered().await.ok()?.into_iter().find(|entry| entry.name == "x") }).await;
     use std::io::Write;
@@ -1462,7 +1094,7 @@ async fn displaced_conflicts_report_to_server_and_resolve() {
 
 /// A pasted link is resolved without touching the repo, then one of its
 /// skills is added into the draft.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn imports_resolve_links_and_add_one_skill() {
     let server = FakeServer::new().await;
     let mut m = solo("solo", &server.url(), Some(snapshot(1, &["x"])));
@@ -1538,7 +1170,7 @@ async fn imports_resolve_links_and_add_one_skill() {
 /// A GitHub folder link with an explicit `ref` and an explicit root `path`
 /// (`""`, as the GUI sends it): both override the link. GitHub is a local
 /// repo here (`url.<dir>.insteadOf`).
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn an_explicit_root_path_overrides_a_folder_link() {
     let server = FakeServer::new().await;
     let gh = tempfile::tempdir().unwrap();
@@ -1579,7 +1211,7 @@ async fn an_explicit_root_path_overrides_a_folder_link() {
 /// A resolve stuck fetching (an ssh that never answers) holds up no other
 /// call, including ones that need the engine mutex, and ends at the git
 /// deadline.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn a_hanging_fetch_blocks_no_other_call() {
     let server = FakeServer::new().await;
     let probe = tempfile::tempdir().unwrap();
@@ -1616,14 +1248,19 @@ async fn a_hanging_fetch_blocks_no_other_call() {
 /// A pull's fetch waits for the server without the engine mutex, so the
 /// read-only endpoints (which never take it) and engine operations alike keep
 /// answering.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn reads_and_syncs_answer_while_a_pull_fetches() {
     use sk1ll_daemon::client::{ConflictDiffRequest, ContentQuery, FileQuery};
     // Never accepted: the daemon stays offline and pulls only when asked.
     let server = FakeServer::new().await;
     let probe = tempfile::tempdir().unwrap();
     let pidfile = probe.path().join("ssh.pid");
-    let ssh = format!("sleep 30 & echo $! > '{}'; wait; :", pidfile.display());
+    let release = probe.path().join("release");
+    let ssh = format!(
+        "echo ready > '{}'; for i in $(seq 1 250); do test -f '{}' && exit 7; sleep 0.04; done; exit 8",
+        pidfile.display(),
+        release.display()
+    );
     let mut m = solo("solo", &server.url(), Some(snapshot(1, &["x"])))
         .with_env("GIT_SSH_COMMAND", &ssh)
         .with_env("GIT_SSH_VARIANT", "simple")
@@ -1632,7 +1269,7 @@ async fn reads_and_syncs_answer_while_a_pull_fetches() {
     m.start().await;
     eventually(|| async { m.harness_skill("x").map(drop) }).await;
     // A draft change, and a conflict: a hand edit of a synced skill.
-    m.write("personal/x/SKILL.md", "x edited\n");
+    m.write_repo("personal/x/SKILL.md", "x edited\n");
     eventually(|| async { (m.harness_skill("x")? == "x edited\n").then_some(()) }).await;
     write(&m.skills().join("x"), "SKILL.md", "edited in the harness\n");
     eventually(|| async { (!m.status().await.report.conflicts.is_empty()).then_some(()) }).await;
@@ -1661,22 +1298,25 @@ async fn reads_and_syncs_answer_while_a_pull_fetches() {
     assert!(!m.client.items().await.unwrap().is_empty());
     m.client.status().await.unwrap();
     m.client.sync(&Default::default()).await.unwrap();
+    // The fetch holds the pull for 8 s (the git timeout): well under that
+    // is not waiting for it, with room for a loaded machine.
     let elapsed = started.elapsed();
-    assert!(elapsed < Duration::from_secs(3), "the calls waited {elapsed:?} for the pull");
+    assert!(elapsed < Duration::from_secs(6), "the calls waited {elapsed:?} for the pull");
     assert!(!stuck.is_finished(), "the pull was still fetching");
 
+    sk1ll_testkit::write(&release, "answered");
     let err = stuck.await.unwrap().unwrap_err();
-    assert!(err.message.contains("timed out"), "{}", err.message);
+    assert!(err.message.contains("Could not read from remote repository"), "{}", err.message);
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn skills_api_browses_content_and_adopts_only_while_connected() {
     use sk1ll_daemon::client::{ConflictTarget, ContentQuery, ContentType, FileQuery};
     let mut server = Server::start().await;
-    let mut m = Machine::new("skills");
+    let mut m = machine("skills");
     // Identical copies in two Harnesses, a differing third, and an empty
     // fourth whose new-skills default remains off.
-    let config = Machine::machine_config(m.home.path());
+    let config = m.machine_toml();
     let mut text = std::fs::read_to_string(&config).unwrap();
     for h in ["second", "different", "empty"] {
         text.push_str(&format!(
@@ -1687,10 +1327,10 @@ async fn skills_api_browses_content_and_adopts_only_while_connected() {
     std::fs::write(config, text).unwrap();
     m.join(&server).await;
     m.start_connected().await;
-    m.write("personal/baseline/SKILL.md", "---\ndescription: baseline\n---\nold");
-    m.write("instructions/git.md", "---\ndescription: Git\n---\nrule baseline");
+    m.write_repo("personal/baseline/SKILL.md", "---\ndescription: baseline\n---\nold");
+    m.write_repo("instructions/git.md", "---\ndescription: Git\n---\nrule baseline");
     assert!(m.commit_all().await.pushed);
-    m.write("personal/baseline/SKILL.md", "---\ndescription: draft\n---\nnew");
+    m.write_repo("personal/baseline/SKILL.md", "---\ndescription: draft\n---\nnew");
     std::fs::remove_file(m.repo().join("instructions/git.md")).unwrap();
     let items = m.client.skills().await.unwrap();
     let baseline = items.iter().find(|s| s.name == "baseline").unwrap();
@@ -1738,7 +1378,7 @@ async fn skills_api_browses_content_and_adopts_only_while_connected() {
     assert!(!m.repo().join("personal/pdf").exists());
     assert!(!m.skills().join(sk1ll_core::sync::INDEX_PATH).exists());
     assert!(m.harness_skill("pdf").unwrap().ends_with("same"));
-    server.launch().await;
+    server.restart().await;
     eventually(|| async { (m.status().await.connection == Connection::Connected).then_some(()) }).await;
     m.client.adopt_unmanaged(&target).await.unwrap();
     assert!(m.repo().join("personal/pdf/SKILL.md").is_file());
@@ -1788,17 +1428,17 @@ async fn skills_api_browses_content_and_adopts_only_while_connected() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn unmanaged_adoption_retries_after_crash_between_publication_and_assignment() {
     use sk1ll_daemon::client::ConflictTarget;
     let server = Server::start().await;
-    let mut m = Machine::new("adopt-retry");
+    let mut m = machine("adopt-retry");
     m.join(&server).await;
     m.start_connected().await;
     m.stop();
     write(&m.skills().join("pdf"), "SKILL.md", "original user content");
     let repo = sk1ll_core::Repo::open(m.repo()).unwrap();
-    let hs = sk1ll_core::MachineConfig::load(&Machine::machine_config(m.home.path())).unwrap().harnesses();
+    let hs = sk1ll_core::MachineConfig::load(&m.machine_toml()).unwrap().harnesses();
     // Simulate a process dying just after atomic draft publication. There is
     // no intent or startup reconciliation; the original is still unmanaged.
     sk1ll_core::sync::unmanaged::prepare(&repo, &hs, HARNESS, "pdf").unwrap();
@@ -1822,7 +1462,7 @@ async fn gui_creation_import_inventory_check_and_conflict_diff() {
     // The Import added below gets its Item ID then: the default enables it.
     snap.assignment.harnesses.get_mut(HARNESS).unwrap().new_skills_default = true;
     let mut m = solo("gui", "http://127.0.0.1:1", Some(snap));
-    m.write(
+    m.write_repo(
         "instructions/diff-rule.md",
         &format!("---\nid: diff-rule-id\nharnesses: [{HARNESS}]\npaths: [src/**]\n---\nDraft rule.\n"),
     );
@@ -1937,7 +1577,7 @@ async fn daemon_repairs_duplicate_ids_and_persists_handmade_ids_in_the_draft() {
     for file in ["SKILL.md", ".sk1ll-id"] {
         std::fs::copy(source.join(file), copy.join(file)).unwrap();
     }
-    m.write("instructions/handmade.md", "Plain rule.\n");
+    m.write_repo("instructions/handmade.md", "Plain rule.\n");
     m.start().await;
     let error = m.client.items().await.unwrap_err();
     assert!(error.message.contains("personal/copy/.sk1ll-id") && error.message.contains("personal/x/.sk1ll-id"));
@@ -1952,18 +1592,18 @@ async fn daemon_repairs_duplicate_ids_and_persists_handmade_ids_in_the_draft() {
     assert_eq!(m.client.repair_ids().await.unwrap(), 0);
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn block_conflict_diff_preserves_surrounding_notes() {
     use sk1ll_daemon::client::ConflictDiffRequest;
     let mut snap = snapshot(1, &[]);
     snap.assignment.harnesses.get_mut(HARNESS).unwrap().new_rules_default = true;
     let mut m = solo("block-diff", "http://127.0.0.1:1", Some(snap));
-    let config = Machine::machine_config(m.home.path());
+    let config = m.machine_toml();
     let cfg = std::fs::read_to_string(&config)
         .unwrap()
         .replace("instructions_format = \"rules\"", "instructions_format = \"block\"");
     std::fs::write(config, cfg).unwrap();
-    m.write("instructions/style.md", "---\ndescription: Style\n---\nExpected rule\n");
+    m.write_repo("instructions/style.md", "---\ndescription: Style\n---\nExpected rule\n");
     git(&m.repo(), &["add", "."]);
     git(&m.repo(), &["commit", "-qm", "rule"]);
     m.start().await;
@@ -1996,7 +1636,7 @@ async fn block_conflict_diff_preserves_surrounding_notes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn standalone_starts_without_a_repo_and_init_creates_it() {
     use sk1ll_daemon::client::DaemonMode;
-    let mut m = Machine::new("solo");
+    let mut m = machine("solo");
     m.start().await;
     let status = m.status().await;
     assert_eq!(status.mode, DaemonMode::Standalone);
@@ -2033,6 +1673,11 @@ async fn standalone_starts_without_a_repo_and_init_creates_it() {
         assert_eq!(error.status, Some(409));
         assert_eq!(error.message, "This Machine is standalone; join a Fleet to use this");
     }
+    m.write("notes.txt", "keep this");
+    assert_eq!(m.client.init().await.unwrap_err().status, Some(409));
+    assert_eq!(std::fs::read_to_string(m.repo().join("notes.txt")).unwrap(), "keep this");
+    assert!(!m.repo().join(".git").exists());
+    std::fs::remove_file(m.repo().join("notes.txt")).unwrap();
     m.client.init().await.unwrap();
     assert!(m.repo().join("sk1ll.toml").is_file());
     assert!(m.status().await.repo_ready);
@@ -2049,12 +1694,12 @@ async fn standalone_starts_without_a_repo_and_init_creates_it() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn standalone_syncs_and_keeps_assignment_local_across_restarts() {
-    let mut m = Machine::new("solo");
+    let mut m = machine("solo");
     sk1ll_core::Repo::init(&m.repo()).unwrap();
-    m.write("personal/pdf/SKILL.md", "original");
+    m.write_repo("personal/pdf/SKILL.md", "original");
     m.start().await;
     eventually(|| async { (m.harness_skill("pdf").as_deref() == Some("original")).then_some(()) }).await;
-    m.write("personal/pdf/SKILL.md", "edited");
+    m.write_repo("personal/pdf/SKILL.md", "edited");
     eventually(|| async { (m.harness_skill("pdf").as_deref() == Some("edited")).then_some(()) }).await;
     let original = m.client.assignment("solo").await.unwrap();
     let changes = AssignmentChanges {
@@ -2101,41 +1746,20 @@ async fn standalone_syncs_and_keeps_assignment_local_across_restarts() {
         )
         .await
         .unwrap();
-    m.write("personal/new/SKILL.md", "new skill");
+    m.write_repo("personal/new/SKILL.md", "new skill");
     m.client.sync(&Default::default()).await.unwrap();
     assert!(m.harness_skill("pdf").is_some());
     assert!(m.harness_skill("new").is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn standalone_adopts_unmanaged_skills_with_local_assignment() {
-    let mut m = Machine::new("solo");
-    sk1ll_core::Repo::init(&m.repo()).unwrap();
-    let mut assignment = Assignment::default();
-    assignment.set_new_skills_default(HARNESS, false);
-    assignment.save(&m.cache_path()).unwrap();
-    write(&m.skills().join("pdf"), "SKILL.md", "unmanaged");
-    m.start().await;
-    m.client
-        .adopt_unmanaged(&sk1ll_daemon::client::ConflictTarget { harness: HARNESS.into(), name: "pdf".into() })
-        .await
-        .unwrap();
-    assert_eq!(std::fs::read_to_string(m.repo().join("personal/pdf/SKILL.md")).unwrap(), "unmanaged");
-    assert_eq!(m.harness_skill("pdf").as_deref(), Some("unmanaged"));
-    assert_indexed_copy(&m.skills(), "pdf");
-    let pdf = sk1ll_core::Repo::open(m.repo()).unwrap().skills().unwrap()[0].id.clone().unwrap();
-    assert!(Assignment::load(&m.cache_path()).unwrap().skill_enabled(HARNESS, &pdf));
-    assert!(m.client.draft().await.unwrap().iter().any(|d| d.item == ItemRef::Skill("pdf".into())));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn standalone_commits_locally_and_pushes_and_pulls_its_own_origin() {
-    let mut m = Machine::new("solo");
+    let mut m = machine("solo");
     sk1ll_core::Repo::init(&m.repo()).unwrap();
     let bare = m.home.path().join("origin.git");
     git(m.home.path(), &["init", "--quiet", "--bare", "-b", "main", bare.to_str().unwrap()]);
     git(&m.repo(), &["remote", "add", "origin", bare.to_str().unwrap()]);
-    m.write("personal/pdf/SKILL.md", "initial");
+    m.write_repo("personal/pdf/SKILL.md", "initial");
     m.start().await;
     assert!(m.status().await.has_origin);
     let commit = m.commit_all().await;
@@ -2152,7 +1776,20 @@ async fn standalone_commits_locally_and_pushes_and_pulls_its_own_origin() {
     git(&peer, &["push", "--quiet", "origin", "main"]);
     assert!(matches!(m.client.pull().await.unwrap(), sk1ll_daemon::client::PullResult::Updated { .. }));
     assert_eq!(m.harness_skill("pdf").as_deref(), Some("remote edit"));
-    m.write("personal/pdf/SKILL.md", "local draft");
+    m.write_repo("personal/queued/SKILL.md", "local commit");
+    let local = m.commit(&["queued"]).await;
+    write(&peer, "remote-notes", "a concurrent change");
+    git(&peer, &["add", "remote-notes"]);
+    git(&peer, &["commit", "-qm", "peer won the race"]);
+    git(&peer, &["push", "--quiet", "origin", "main"]);
+    let peer_tip = git(&peer, &["rev-parse", "HEAD"]);
+    assert!(m.client.push().await.unwrap().pushed);
+    assert!(m.log().contains("push rejected"));
+    assert_ne!(m.head(), local.sha, "the rebased commit has a new parent");
+    assert_eq!(git(&m.repo(), &["rev-parse", "HEAD^"]), peer_tip);
+    assert_eq!(git(&bare, &["rev-parse", "HEAD"]), m.head());
+    git(&peer, &["pull", "--ff-only"]);
+    m.write_repo("personal/pdf/SKILL.md", "local draft");
     write(&peer.join("personal/pdf"), "SKILL.md", "another remote edit");
     git(&peer, &["add", "-A"]);
     git(&peer, &["commit", "--quiet", "-m", "another remote edit"]);
@@ -2168,7 +1805,7 @@ async fn standalone_commits_locally_and_pushes_and_pulls_its_own_origin() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pull_through_a_filter_driver_stays_blocked_and_says_why() {
-    let mut m = Machine::new("solo");
+    let mut m = machine("solo");
     sk1ll_core::Repo::init(&m.repo()).unwrap();
     let bare = m.home.path().join("origin.git");
     git(m.home.path(), &["init", "--quiet", "--bare", "-b", "main", bare.to_str().unwrap()]);
@@ -2177,7 +1814,7 @@ async fn a_pull_through_a_filter_driver_stays_blocked_and_says_why() {
     for key in ["clean", "smudge"] {
         git(&m.repo(), &["config", &format!("filter.lfs.{key}"), &format!("touch {}; cat", ran.display())]);
     }
-    m.write("personal/pdf/SKILL.md", "initial");
+    m.write_repo("personal/pdf/SKILL.md", "initial");
     m.start().await;
     m.commit_all().await;
     assert!(m.client.push().await.unwrap().pushed);
@@ -2205,12 +1842,12 @@ async fn a_pull_through_a_filter_driver_stays_blocked_and_says_why() {
 /// by hand is refused by the server for good: the push isn't retried after
 /// a pull, the error says so, and status and the fleet show it until a fix
 /// is committed on top.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn a_push_the_server_refuses_for_good_is_reported_until_fixed() {
     let server = Server::start().await;
     let (a, _b, _) = fleet_of_two(&server).await;
-    a.write(".gitattributes", "*.bin filter=lfs\n");
-    a.write("personal/x/data.bin", "data\n");
+    a.write_repo(".gitattributes", "*.bin filter=lfs\n");
+    a.write_repo("personal/x/data.bin", "data\n");
     let request = CommitRequest { items: vec!["x".into(), "other:.gitattributes".into()], ..Default::default() };
     let error = a.client.commit(&request).await.unwrap_err().to_string();
     assert!(error.contains("filter driver") && error.contains("personal/x/data.bin"), "{error}");
@@ -2219,7 +1856,7 @@ async fn a_push_the_server_refuses_for_good_is_reported_until_fixed() {
     git(&a.repo(), &["add", "-A"]);
     git(&a.repo(), &["commit", "--quiet", "-m", "by hand"]);
     // As the server binary's check does (this embedded one runs none).
-    let hook = server.data.join("repo.git/hooks/pre-receive");
+    let hook = server.data().join("repo.git/hooks/pre-receive");
     let refuse = "#!/bin/sh\nread -r old new ref\nif git cat-file -e \"$new:.gitattributes\" 2>/dev/null; then\n  \
                   echo \"sk1ll-server: refusing $new: the skills repo uses a git filter driver\" >&2\n  exit 1\nfi\n";
     std::fs::write(&hook, refuse).unwrap();
@@ -2244,12 +1881,12 @@ async fn a_push_the_server_refuses_for_good_is_reported_until_fixed() {
 async fn a_refresh_finishes_a_pull_that_stopped_half_way() {
     use sk1ll_daemon::client::{PullResult, RenameItemRequest, SyncRequest};
     use std::os::unix::fs::PermissionsExt;
-    let mut m = Machine::new("solo");
+    let mut m = machine("solo");
     sk1ll_core::Repo::init(&m.repo()).unwrap();
     let bare = m.home.path().join("origin.git");
     git(m.home.path(), &["init", "--quiet", "--bare", "-b", "main", bare.to_str().unwrap()]);
     git(&m.repo(), &["remote", "add", "origin", bare.to_str().unwrap()]);
-    m.write("personal/pdf/SKILL.md", "initial");
+    m.write_repo("personal/pdf/SKILL.md", "initial");
     m.start().await;
     m.commit_all().await;
     assert!(m.client.push().await.unwrap().pushed);
@@ -2288,7 +1925,7 @@ async fn a_refresh_finishes_a_pull_that_stopped_half_way() {
     assert!(pdf.join("SKILL.md").is_file() && !m.repo().join("personal/new-pdf").exists());
 
     // An editor can still write to a file in the read-only directory.
-    m.write("personal/pdf/SKILL.md", "saved while pull was pending");
+    m.write_repo("personal/pdf/SKILL.md", "saved while pull was pending");
     let pdf_item = ItemRef::Skill("pdf".into());
     eventually(|| async {
         let report = m.status().await.report;
@@ -2298,11 +1935,11 @@ async fn a_refresh_finishes_a_pull_that_stopped_half_way() {
     assert_eq!(m.harness_skill("pdf").as_deref(), Some("initial"));
     assert!(m.status().await.report.drafts.is_empty());
     assert!(matches!(m.client.pull().await.unwrap(), PullResult::Blocked { pending: true, .. }));
-    m.write("personal/pdf/SKILL.md", "initial");
+    m.write_repo("personal/pdf/SKILL.md", "initial");
     mode(0o755);
 
     // Any refresh finishes it; this one follows a draft edit.
-    m.write("notes.txt", "a draft");
+    m.write_repo("notes.txt", "a draft");
     eventually(|| async { (m.head() == remote && !journal.exists()).then_some(()) }).await;
     eventually(|| async { (m.harness_skill("pdf").as_deref() == Some("remote edit")).then_some(()) }).await;
     assert_eq!(git(&m.repo(), &["symbolic-ref", "HEAD"]), "refs/heads/main");
@@ -2321,15 +1958,23 @@ async fn a_refresh_finishes_a_pull_that_stopped_half_way() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn setup_chooses_harnesses_only_before_the_repo_exists() {
-    let mut m = Machine::new("solo");
+    let mut m = machine("solo");
     for d in [".claude", ".kiro", ".cursor"] {
         std::fs::create_dir_all(m.home.path().join(d)).unwrap();
     }
+    // This test asks which presets setup detects in an otherwise unconfigured HOME.
+    let config = format!(
+        "id = \"solo\"\n{}",
+        sk1ll_testkit::Harness::copy(HARNESS, m.skills())
+            .instructions(m.rules(), sk1ll_testkit::InstructionsFormat::Rules)
+            .toml()
+    );
+    sk1ll_testkit::write(&m.machine_toml(), &config);
     m.start().await;
     let enabled = |choices: &[sk1ll_daemon::client::HarnessChoice], name: &str| {
         choices.iter().find(|c| c.name == name).map(|c| (c.installed, c.enabled))
     };
-    let path = Machine::machine_config(m.home.path());
+    let path = m.machine_toml();
     let before = std::fs::read_to_string(&path).unwrap();
     let choices = m.client.setup_harnesses().await.unwrap();
     assert_eq!(enabled(&choices, "claude"), Some((true, true)));
@@ -2360,14 +2005,14 @@ async fn setup_chooses_harnesses_only_before_the_repo_exists() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn harnesses_change_after_setup_with_a_preview_of_what_stays() {
     use sk1ll_daemon::client::{HarnessChange, HarnessChangeRequest};
-    let mut m = Machine::new("solo");
+    let mut m = machine("solo");
     sk1ll_core::Repo::init(&m.repo()).unwrap();
-    m.write("personal/pdf/SKILL.md", "original");
+    m.write_repo("personal/pdf/SKILL.md", "original");
     write(&m.skills().join("mine"), "SKILL.md", "unmanaged");
     m.start().await;
     eventually(|| async { (m.harness_skill("pdf").as_deref() == Some("original")).then_some(()) }).await;
     let settings = m.client.harness_settings().await.unwrap();
-    assert_eq!(settings.path, Machine::machine_config(m.home.path()));
+    assert_eq!(settings.path, m.machine_toml());
     assert!(settings.harnesses.iter().any(|c| c.name == HARNESS && c.configured && !c.preset));
 
     let config_text = std::fs::read_to_string(&settings.path).unwrap();
@@ -2492,7 +2137,7 @@ async fn harnesses_change_after_setup_with_a_preview_of_what_stays() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn standalone_uses_the_repo_environment_override() {
-    let mut m = Machine::new("solo");
+    let mut m = machine("solo");
     let custom = m.home.path().join("custom-skills");
     m = m.with_env("SK1LL_REPO", custom.to_str().unwrap());
     m.start().await;
@@ -2503,20 +2148,10 @@ async fn standalone_uses_the_repo_environment_override() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn standalone_init_refuses_existing_user_content() {
-    let mut m = Machine::new("solo");
-    m.write("notes.txt", "keep this");
-    m.start().await;
-    assert_eq!(m.client.init().await.unwrap_err().status, Some(409));
-    assert_eq!(std::fs::read_to_string(m.repo().join("notes.txt")).unwrap(), "keep this");
-    assert!(!m.repo().join(".git").exists());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn standalone_join_refuses_a_draft_before_spending_the_code() {
-    let mut m = Machine::new("solo");
+    let mut m = machine("solo");
     sk1ll_core::Repo::init(&m.repo()).unwrap();
-    m.write("personal/pdf/SKILL.md", "user draft");
+    m.write_repo("personal/pdf/SKILL.md", "user draft");
     m.start().await;
     let error = m
         .client
@@ -2557,7 +2192,7 @@ async fn standalone_join_refuses_a_draft_before_spending_the_code() {
 async fn standalone_joins_a_new_fleet_with_the_admin_token() {
     use sk1ll_daemon::client::{DaemonMode, JoinApiRequest};
     let server = Server::start().await;
-    let mut m = Machine::new("first");
+    let mut m = machine("first");
     m.start().await;
     let request = |admin_token: &str| JoinApiRequest {
         server_url: server.url(),
@@ -2590,7 +2225,7 @@ async fn standalone_joins_a_new_fleet_with_the_admin_token() {
 async fn standalone_joins_and_restarts_from_an_untouched_init() {
     use sk1ll_daemon::client::DaemonMode;
     let server = Server::start().await;
-    let mut m = Machine::new("solo");
+    let mut m = machine("solo");
     m.start().await;
     m.client.init().await.unwrap();
     let old_manifest = std::fs::read(m.repo().join("sk1ll.toml")).unwrap();
@@ -2617,7 +2252,7 @@ async fn standalone_joins_and_restarts_from_an_untouched_init() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn standalone_first_pull_blocks_ignored_ancestor_without_changing_head_or_index() {
     use sk1ll_daemon::client::PullResult;
-    let mut m = Machine::new("solo");
+    let mut m = machine("solo");
     m.start().await;
     m.client.init().await.unwrap();
     let peer = m.home.path().join("peer");
@@ -2626,7 +2261,7 @@ async fn standalone_first_pull_blocks_ignored_ancestor_without_changing_head_or_
     git(&peer, &["add", "-A"]);
     git(&peer, &["commit", "--quiet", "-m", "baseline"]);
     git(&m.repo(), &["remote", "add", "origin", peer.to_str().unwrap()]);
-    m.write("personal/pdf", "private notes");
+    m.write_repo("personal/pdf", "private notes");
     write(&m.repo().join(".git"), "info/exclude", "personal/pdf\n");
     let head = std::fs::read(m.repo().join(".git/HEAD")).unwrap();
     let index = std::fs::read(m.repo().join(".git/index")).ok();
@@ -2645,7 +2280,7 @@ async fn standalone_first_pull_blocks_ignored_ancestor_without_changing_head_or_
 async fn standalone_join_revalidates_after_registration_and_keeps_local_authority() {
     use axum::{Json, Router, routing::post};
     use sk1ll_daemon::client::{DaemonMode, JoinApiRequest};
-    let mut m = Machine::new("solo");
+    let mut m = machine("solo");
     m.start().await;
     m.client.init().await.unwrap();
     m.client
@@ -2695,7 +2330,7 @@ async fn standalone_join_revalidates_after_registration_and_keeps_local_authorit
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    let client = Client::new(m.home.path().join(SOCKET_PATH));
+    let client = Client::new(m.home.socket());
     let joining = tokio::spawn(async move {
         client
             .join(&JoinApiRequest {
@@ -2717,7 +2352,7 @@ async fn standalone_join_revalidates_after_registration_and_keeps_local_authorit
     .await
     .expect("registration held the engine lock")
     .unwrap();
-    m.write("personal/draft/SKILL.md", "saved during registration");
+    m.write_repo("personal/draft/SKILL.md", "saved during registration");
     release.notify_one();
     let error = joining.await.unwrap().unwrap_err();
     assert_eq!(error.status, Some(409), "{}", error.message);
@@ -2764,7 +2399,7 @@ async fn standalone_join_revalidates_after_registration_and_keeps_local_authorit
 async fn standalone_join_snapshot_failure_rolls_back_and_retries_pending_registration() {
     use sk1ll_daemon::client::{DaemonMode, JoinApiRequest};
     let server = Server::start().await;
-    let mut m = Machine::new("solo");
+    let mut m = machine("solo");
     m.start().await;
     m.client.init().await.unwrap();
     m.client
@@ -2810,61 +2445,91 @@ async fn standalone_join_snapshot_failure_rolls_back_and_retries_pending_registr
     assert!(sk1ll_core::EngineLock::try_acquire(&m.repo()).unwrap().is_none());
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn clients_of_another_local_api_version_are_told_to_restart_the_daemon() {
+#[tokio::test]
+async fn the_local_api_routes_requests_and_rejects_incompatible_clients() {
+    use sk1ll_daemon::client::API_VERSION;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut m = solo("solo", "http://127.0.0.1:1", None);
+
+    let mut m = machine("api");
     m.start().await;
     assert_eq!(m.status().await.version, sk1ll_core::VERSION);
-    let request = |version: &str| {
-        format!("GET /status HTTP/1.1\r\nHost: localhost\r\nsk1ll-api: {version}\r\nConnection: close\r\n\r\n")
-    };
-    let version = sk1ll_daemon::client::API_VERSION;
-    for (version, expected) in [(version, "HTTP/1.1 200"), (version + 1, "HTTP/1.1 426")] {
+    let valid = format!("sk1ll-api: {API_VERSION}\r\n");
+    let future = format!("sk1ll-api: {}\r\n", API_VERSION + 1);
+    for (route, header, status, message) in [
+        ("GET /status", valid.as_str(), 200, Some("machine_id")),
+        ("GET /status", "", 200, Some("machine_id")),
+        ("GET /status", future.as_str(), 426, Some("restart the daemon")),
+        ("GET /status", "sk1ll-api: invalid\r\n", 426, Some("speaks invalid")),
+        ("POST /status", valid.as_str(), 405, None),
+        ("GET /skills", valid.as_str(), 409, Some("no skills repo")),
+    ] {
+        let request = format!("{route} HTTP/1.1\r\nHost: localhost\r\n{header}Connection: close\r\n\r\n");
         let mut stream = tokio::net::UnixStream::connect(m.client.socket()).await.unwrap();
-        stream.write_all(request(&version.to_string()).as_bytes()).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).await.unwrap();
-        assert!(response.starts_with(expected), "{version}: {response}");
-        if expected == "HTTP/1.1 426" {
-            assert!(response.contains("restart the daemon"), "{response}");
+        assert!(response.starts_with(&format!("HTTP/1.1 {status}")), "{route}: {response}");
+        if let Some(expected) = message {
+            let (_, body) = response.split_once("\r\n\r\n").unwrap();
+            let body: serde_json::Value = serde_json::from_str(body).unwrap();
+            if status == 200 {
+                assert_eq!(body[expected], "api");
+            } else {
+                assert!(body["error"].as_str().unwrap().contains(expected), "{route}: {body}");
+            }
         }
     }
+    m.client.init().await.unwrap();
+    assert_eq!(m.client.editable("missing skill").await.unwrap_err().status, Some(400));
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_bundled_skill_is_created_as_a_personal_draft_skill() {
-    use sk1ll_daemon::client::CreateItemRequest;
-    let mut m = solo("solo", "http://127.0.0.1:1", None);
-    m.start().await;
-    let bundled = |kind: &str, name: &str, bundled: &str| CreateItemRequest {
-        kind: kind.into(),
-        name: name.into(),
-        description: None,
-        bundled: Some(bundled.into()),
-    };
-    m.client.create_item(&bundled("skill", "sk1ll", "sk1ll")).await.unwrap();
-    let written = std::fs::read_to_string(m.repo().join("personal/sk1ll/SKILL.md")).unwrap();
-    assert_eq!(Some(written.as_str()), sk1ll_core::bundled::skill("sk1ll"));
-    for (kind, name, from) in [("skill", "other", "pdf"), ("rule", "rule", "sk1ll"), ("skill", "sk1ll", "sk1ll")] {
-        let err = m.client.create_item(&bundled(kind, name, from)).await.unwrap_err();
-        assert_eq!(err.status, Some(400), "{kind} {name} from {from}: {err:?}");
+#[tokio::test]
+async fn the_socket_requires_a_private_directory_and_refuses_overlong_paths() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let m = machine("socket");
+    let public = m.home.path().join("public");
+    std::fs::create_dir(&public).unwrap();
+    std::fs::set_permissions(&public, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let link = m.home.path().join("link");
+    symlink(&public, &link).unwrap();
+    let deep = m.home.path().join("d".repeat(120));
+    for (parent, message) in [(&public, "mode is 755"), (&link, "not a symlink"), (&deep, "too long")] {
+        let socket = parent.join("daemon.sock");
+        let output = m.command().env("SK1LL_DAEMON_SOCKET", &socket).output().unwrap();
+        assert!(!output.status.success());
+        assert!(sk1ll_testkit::text(&output).contains(message), "{}", sk1ll_testkit::text(&output));
+        assert!(!socket.exists());
     }
+    assert!(!deep.exists());
+
+    let fresh = m.home.path().join("fresh");
+    let socket = fresh.join("daemon.sock");
+    let mut m = m.with_env("SK1LL_DAEMON_SOCKET", socket.to_str().unwrap());
+    m.client = Client::new(&socket);
+    m.start().await;
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&fresh), 0o700);
+    assert_eq!(mode(&socket), 0o600);
+    assert_eq!(m.status().await.machine_id, "socket");
+    let other = machine("other");
+    let output = other.command().env("SK1LL_DAEMON_SOCKET", &socket).output().unwrap();
+    assert!(!output.status.success());
+    assert!(sk1ll_testkit::text(&output).contains("already listening"));
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn skill_file_writes_require_current_personal_or_rule_text() {
     use sk1ll_daemon::client::{ContentQuery, FileQuery, WriteFileRequest};
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     let server = Server::start().await;
-    let mut m = Machine::new("file-writes");
+    let mut m = machine("file-writes");
     m.join(&server).await;
     m.start_connected().await;
     let skill = "personal/writing/SKILL.md";
-    m.write(skill, "# Original");
-    m.write("instructions/style.md", "# Style");
-    m.write("imported/other/SKILL.md", "# Import");
+    m.write_repo(skill, "# Original");
+    m.write_repo("instructions/style.md", "# Style");
+    m.write_repo("imported/other/SKILL.md", "# Import");
     std::fs::set_permissions(m.repo().join(skill), std::fs::Permissions::from_mode(0o640)).unwrap();
 
     let file = |item: &str, path: &str| FileQuery {
@@ -2880,7 +2545,7 @@ async fn skill_file_writes_require_current_personal_or_rule_text() {
     assert!(m.client.draft().await.unwrap().iter().any(|item| item.item.to_string() == "skill:writing"));
 
     request.expected = m.client.skill_file(&request.file).await.unwrap().fingerprint.unwrap();
-    m.write(skill, "# External edit");
+    m.write_repo(skill, "# External edit");
     assert_eq!(m.client.write_skill_file(&request).await.unwrap_err().status, Some(409));
     assert_eq!(std::fs::read_to_string(m.repo().join(skill)).unwrap(), "# External edit");
 
@@ -2921,13 +2586,13 @@ async fn skill_file_writes_require_current_personal_or_rule_text() {
 async fn joined_daemon_proxies_machine_assignment_copy() {
     use sk1ll_proto::{CopyMode, MachineAssignmentCopy};
     let server = Server::start().await;
-    let mut target = Machine::new("target");
+    let mut target = machine("target");
     target.join(&server).await;
     target.start_connected().await;
-    let source = Machine::new("source");
+    let source = machine("source");
     source.join(&server).await;
     server
-        .http
+        .http()
         .put(format!("{}/api/machines/source/assignment", server.url()))
         .bearer_auth(ADMIN)
         .json(&serde_json::json!({"changes":[{"harness":HARNESS,"kind":"new_rules_default","enabled":true}]}))
@@ -2955,39 +2620,19 @@ async fn joined_daemon_proxies_machine_assignment_copy() {
     eventually(|| async { (target.status().await.assignment_revision == update.revision).then_some(()) }).await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn reviewed_sync_replans_after_recovering_an_interrupted_import() {
-    let mut m = Machine::new("preview").with_env("SK1LL_DEBOUNCE", "60s");
-    sk1ll_core::Repo::init(&m.repo()).unwrap();
-    m.write("imported/pdf/SKILL.md", "pdf");
-    m.start().await;
-    eventually(|| async { (m.harness_skill("pdf").as_deref() == Some("pdf")).then_some(()) }).await;
-    let imported = m.repo().join("imported");
-    std::fs::rename(imported.join("pdf"), imported.join(".sk1ll-stage-old-pdf")).unwrap();
-
-    let preview = m.client.preview_sync().await.unwrap();
-    assert!(preview.actions.unwrap().iter().any(|action| action.kind == "remove" && action.name == "pdf"));
-    let fresh = m.client.apply_sync_preview(preview.fingerprint.unwrap()).await.unwrap();
-
-    assert!(fresh.fingerprint.is_some(), "recovery changes the plan and requires confirmation");
-    assert!(fresh.actions.unwrap().is_empty());
-    assert!(imported.join("pdf/SKILL.md").is_file());
-    assert_eq!(m.harness_skill("pdf").as_deref(), Some("pdf"));
-}
-
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn render_and_dry_run_use_the_current_draft_without_writing() {
     use sk1ll_daemon::client::{API_VERSION, SyncResult};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let mut m = Machine::new("preview").with_env("SK1LL_DEBOUNCE", "60s");
+    let mut m = machine("preview").with_env("SK1LL_DEBOUNCE", "60s");
     let repo = sk1ll_core::Repo::init(&m.repo()).unwrap();
     m.start().await;
     let draft = "---\nharnesses: [agent]\n---\n\nKeep functions short.\n";
-    m.write("instructions/style.md", draft);
-    m.write("instructions/other.md", "---\nharnesses: [elsewhere]\n---\n\nSkip this.\n");
+    m.write_repo("instructions/style.md", draft);
+    m.write_repo("instructions/other.md", "---\nharnesses: [elsewhere]\n---\n\nSkip this.\n");
     let path = m.home.path().join("agent/rules/style.md");
-    let config = sk1ll_core::MachineConfig::load(&Machine::machine_config(m.home.path())).unwrap();
+    let config = sk1ll_core::MachineConfig::load(&m.machine_toml()).unwrap();
     let assignment = Assignment::load(&m.cache_path()).unwrap();
     let cli_files = sk1ll_core::sync::render_instructions(&repo, &config.harnesses(), &assignment, HARNESS).unwrap();
 
@@ -3018,7 +2663,7 @@ async fn render_and_dry_run_use_the_current_draft_without_writing() {
     assert!(!path.parent().unwrap().exists());
     assert_eq!(std::fs::read_to_string(m.repo().join("instructions/style.md")).unwrap(), draft);
 
-    m.write("instructions/style.md", &draft.replace("short", "readable"));
+    m.write_repo("instructions/style.md", &draft.replace("short", "readable"));
     let reviewed = plan.fingerprint.unwrap();
     let refused = m
         .client
@@ -3062,7 +2707,7 @@ async fn offline_item_rename_keeps_both_machines_assignments() {
 "
         )
     );
-    server.launch().await;
+    server.restart().await;
     eventually(|| async { (a.status().await.connection == Connection::Connected).then_some(()) }).await;
     assert!(a.commit_all().await.pushed);
     eventually(|| async { b.harness_skill("new-x").is_some().then_some(()) }).await;
@@ -3108,27 +2753,6 @@ async fn unknown_id_is_inert_and_harness_rename_moves_explicit_toggles() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn recreated_personal_skill_gets_a_new_assignment_identity() {
-    use sk1ll_daemon::client::{CreateItemRequest, DeleteItemRequest};
-    let mut m = Machine::new("solo");
-    sk1ll_core::Repo::init(&m.repo()).unwrap();
-    m.start().await;
-    let create = CreateItemRequest { kind: "skill".into(), name: "pdf".into(), description: None, bundled: None };
-    m.client.create_item(&create).await.unwrap();
-    let id = || sk1ll_core::Repo::open(m.repo()).unwrap().skills().unwrap()[0].id.clone().unwrap();
-    let old = id();
-    let mut off = toggle("pdf", false);
-    off.item_id = Some(old.clone());
-    assign(&m, "solo", vec![off]).await;
-    assert!(m.harness_skill("pdf").is_none());
-    m.client.delete_item(&DeleteItemRequest { kind: "skill".into(), name: "pdf".into() }).await.unwrap();
-    m.client.create_item(&create).await.unwrap();
-    assert_ne!(id(), old);
-    assert!(m.harness_skill("pdf").is_some());
-    assert!(!m.client.assignment("solo").await.unwrap().assignment.skill_enabled(HARNESS, &old));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reconnect_replays_harness_rename_before_first_status() {
     use sk1ll_core::harness_rename::{RenameIntent, RenameRequest};
     use sk1ll_proto::{AssignmentOutcome, AssignmentUpdate, AssignmentWrite};
@@ -3138,10 +2762,10 @@ async fn reconnect_replays_harness_rename_before_first_status() {
     let id: sk1ll_core::ItemId = "persisted-x".parse().unwrap();
     snap.assignment.set_skill(HARNESS, &id, true);
     let mut m = solo("solo", &server.url(), Some(snap.clone()));
-    m.write("personal/x/.sk1ll-id", "persisted-x");
-    let cfg = Machine::machine_config(m.home.path());
+    m.write_repo("personal/x/.sk1ll-id", "persisted-x");
+    let cfg = m.machine_toml();
     // sk1ll's state directory, as the daemon finds it from `XDG_STATE_HOME`.
-    let state = m.home.path().join(".local/state/sk1ll");
+    let state = m.home.state_dir();
     let authority = sk1ll_core::hash::hash_str(&format!("{}\0solo\0tok", server.url()));
     let intent = RenameIntent::prepare(
         &state,
@@ -3195,9 +2819,9 @@ async fn malformed_rule_reports_partial_inventory_and_still_pulls() {
     let server = Server::start().await;
     let (mut a, b, _) = fleet_of_two(&server).await;
     a.stop();
-    a.write("instructions/unreadable.md", "---\nid: [bad]\n---\nrule\n");
-    a.write("personal/ok/SKILL.md", "valid skill");
-    a.write("personal/ok/.sk1ll-id", "ok-id");
+    a.write_repo("instructions/unreadable.md", "---\nid: [bad]\n---\nrule\n");
+    a.write_repo("personal/ok/SKILL.md", "valid skill");
+    a.write_repo("personal/ok/.sk1ll-id", "ok-id");
     a.start_connected().await;
     let first = eventually(|| async {
         let report = server.row("alpha").await?.report?;
@@ -3207,14 +2831,14 @@ async fn malformed_rule_reports_partial_inventory_and_still_pulls() {
     assert!(!first.inventory_complete);
     assert!(first.items.iter().any(|item| item.id.to_string() == "ok-id"));
     let response = server
-        .http
+        .http()
         .post(format!("{}/api/assignment/orphans/prune", server.url()))
         .bearer_auth(ADMIN)
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
-    b.write("notes", "a change to pull");
+    b.write_repo("notes", "a change to pull");
     let pushed = b.commit_all().await;
     assert!(pushed.pushed);
     eventually(|| async {
@@ -3224,4 +2848,365 @@ async fn malformed_rule_reports_partial_inventory_and_still_pulls() {
     })
     .await;
     assert_eq!(std::fs::read_to_string(a.repo().join("notes")).unwrap(), "a change to pull");
+}
+
+async fn send(ws: &mut FakeWs, message: ServerMessage) {
+    ws.send(Message::text(serde_json::to_string(&message).unwrap())).await.unwrap();
+}
+
+async fn assignment_request(ws: &mut FakeWs, seq: &mut u64) -> (u64, sk1ll_proto::AssignmentWrite) {
+    loop {
+        match next_message(ws).await {
+            DaemonMessage::Status(report) => *seq = report.seq,
+            DaemonMessage::SetAssignment { req, write } => return (req, write),
+            other => panic!("expected an assignment write: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_slow_assignment_reply_leaves_the_engine_free_and_cannot_replace_a_newer_revision() {
+    use sk1ll_proto::{AssignmentOutcome, AssignmentUpdate, AssignmentWrite};
+    let server = FakeServer::new().await;
+    let mut m = solo("solo", &server.url(), Some(snapshot(1, &[])));
+    m.start().await;
+    let (mut ws, _) = server.accept().await;
+    eventually(|| async { (m.status().await.connection == Connection::Connected).then_some(()) }).await;
+    let toggle = || {
+        let c = m.client.clone();
+        tokio::spawn(async move { c.set_harness_assignment(HARNESS, true).await })
+    };
+    let write = toggle();
+    let mut seq = 0;
+    let (req, action) = assignment_request(&mut ws, &mut seq).await;
+    assert!(matches!(action, AssignmentWrite::Harness { enabled: true, .. }));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        m.client.draft().await.unwrap();
+        m.client.items_fresh().await.unwrap();
+    })
+    .await
+    .expect("the server's pending confirmation held the engine lock");
+    assert!(!write.is_finished());
+    send(&mut ws, ServerMessage::Assignment(snapshot(3, &["y"]))).await;
+    eventually(|| async { (m.status().await.assignment_revision == 3).then_some(()) }).await;
+    let stale = AssignmentUpdate {
+        revision: 2,
+        assignment: snapshot(2, &["x"]).assignment,
+        entries: Vec::new(),
+        errors: Vec::new(),
+    };
+    send(&mut ws, ServerMessage::AssignmentResult { req, seq, result: AssignmentOutcome::Applied(stale) }).await;
+    let reply = write.await.unwrap().unwrap();
+    assert_eq!(reply.revision, 3);
+    assert_eq!(reply.assignment, snapshot(3, &["y"]).assignment);
+    assert_eq!(m.snapshot(), Some(snapshot(3, &["y"])));
+    assert!(m.harness_skill("y").is_some());
+    assert!(m.harness_skill("x").is_none());
+
+    let write = toggle();
+    let (req, _) = assignment_request(&mut ws, &mut seq).await;
+    send(&mut ws, ServerMessage::Revoked).await;
+    let late = AssignmentUpdate {
+        revision: 4,
+        assignment: snapshot(4, &["z"]).assignment,
+        entries: Vec::new(),
+        errors: Vec::new(),
+    };
+    // Revocation closes the session. A response still in flight must have no effect.
+    let frame = ServerMessage::AssignmentResult { req, seq, result: AssignmentOutcome::Applied(late) };
+    let _ = ws.send(Message::text(serde_json::to_string(&frame).unwrap())).await;
+    assert!(write.await.unwrap().is_err());
+    eventually(|| async { m.status().await.revoked.then_some(()) }).await;
+    assert_eq!(m.snapshot(), Some(snapshot(3, &["y"])));
+    assert!(m.harness_skill("z").is_none());
+    m.stop();
+    m.start().await;
+    assert_eq!(m.status().await.connection, Connection::Revoked);
+}
+
+#[tokio::test]
+async fn adoption_preserves_every_copy_it_no_longer_owns_when_confirmation_arrives() {
+    use sk1ll_daemon::client::ConflictTarget;
+    use sk1ll_proto::{AssignmentOutcome, AssignmentUpdate, AssignmentWrite};
+    let server = FakeServer::new().await;
+    let mut m = solo("solo", &server.url(), Some(snapshot(1, &[])))
+        .with_env("SK1LL_DEBOUNCE", "1h")
+        .with_env("SK1LL_RECONCILE_INTERVAL", "1h");
+    m.start().await;
+    let (mut ws, _) = server.accept().await;
+    eventually(|| async { (m.status().await.connection == Connection::Connected).then_some(()) }).await;
+    let mut seq = 0;
+    for name in ["unchanged", "repo-edited", "source-edited", "committed", "reidentified", "pending-pull"] {
+        let source = m.skills().join(name).join("SKILL.md");
+        let draft = m.repo().join("personal").join(name);
+        sk1ll_testkit::write(&source, "unmanaged user content");
+        let start_adopt = || {
+            let client = m.client.clone();
+            tokio::spawn(async move {
+                client.adopt_unmanaged(&ConflictTarget { harness: HARNESS.into(), name: name.into() }).await
+            })
+        };
+        let adopting = start_adopt();
+        let (req, action) = assignment_request(&mut ws, &mut seq).await;
+        let AssignmentWrite::Changes(body) = action else { panic!("expected an adoption toggle") };
+        assert_eq!(body.changes.len(), 1);
+        let change = &body.changes[0];
+        assert_eq!(change.name.as_deref(), Some(name));
+        assert_eq!(change.enabled, Some(true));
+        match name {
+            "repo-edited" => sk1ll_testkit::write(&draft.join("SKILL.md"), "later repo edit"),
+            "source-edited" => sk1ll_testkit::write(&source, "later harness edit"),
+            "committed" => {
+                git(&m.repo(), &["add", &format!("personal/{name}")]);
+                git(&m.repo(), &["commit", "-qm", "User committed the adopted skill"]);
+            }
+            "reidentified" => sk1ll_testkit::write(&draft.join(".sk1ll-id"), "later-id\n"),
+            "pending-pull" => sk1ll_testkit::write(&m.repo().join(".git/sk1ll-pull.json"), "{}"),
+            _ => {}
+        };
+        let outcome = if name == "pending-pull" {
+            let mut assignment = snapshot(3, &[]).assignment;
+            assignment.set_skill(HARNESS, change.item_id.as_ref().unwrap(), true);
+            AssignmentOutcome::Applied(AssignmentUpdate {
+                assignment,
+                revision: 3,
+                entries: Vec::new(),
+                errors: Vec::new(),
+            })
+        } else {
+            AssignmentOutcome::Refused { status: 422, error: "Server refused".into() }
+        };
+        send(&mut ws, ServerMessage::AssignmentResult { req, seq, result: outcome }).await;
+        let error = adopting.await.unwrap().unwrap_err();
+        if name == "pending-pull" {
+            assert!(error.message.contains("pull") && error.message.contains("kept"), "{error}");
+        } else {
+            assert!(error.message.contains("Server refused"), "{name}: {error}");
+        }
+        assert_eq!(
+            sk1ll_testkit::read(&source),
+            if name == "source-edited" { "later harness edit" } else { "unmanaged user content" },
+            "{name}"
+        );
+        assert!(!source.with_file_name(sk1ll_core::sync::PLACEMENT_MARKER).exists(), "{name}");
+        if name == "unchanged" {
+            assert!(!draft.exists());
+            let retry = start_adopt();
+            let (req, action) = assignment_request(&mut ws, &mut seq).await;
+            let AssignmentWrite::Changes(body) = action else { panic!("expected an adoption toggle") };
+            let mut assignment = snapshot(2, &[]).assignment;
+            assignment.set_skill(HARNESS, body.changes[0].item_id.as_ref().unwrap(), true);
+            let update = AssignmentUpdate { assignment, revision: 2, entries: Vec::new(), errors: Vec::new() };
+            send(&mut ws, ServerMessage::AssignmentResult { req, seq, result: AssignmentOutcome::Applied(update) })
+                .await;
+            retry.await.unwrap().unwrap();
+            assert_indexed_copy(&m.skills(), name);
+        } else {
+            assert_eq!(
+                sk1ll_testkit::read(&draft.join("SKILL.md")),
+                if name == "repo-edited" { "later repo edit" } else { "unmanaged user content" },
+                "{name}"
+            );
+            if name == "reidentified" {
+                assert_eq!(sk1ll_testkit::read(&draft.join(".sk1ll-id")), "later-id\n");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_disappearing_repo_clears_the_daemons_published_inventory() {
+    use sk1ll_testkit::{SkillsRepo, read, write};
+
+    let mut m = machine("disappearing").with_env("SK1LL_RECONCILE_INTERVAL", "150ms");
+    SkillsRepo::init(m.repo());
+    m.write_repo("personal/pdf/SKILL.md", "PDFs");
+    let separate = m.home.path().join("separate.git");
+    let pointer = m.repo().join(".git");
+    std::fs::rename(&pointer, &separate).unwrap();
+    let gitdir = format!("gitdir: {}\n", separate.display());
+    write(&pointer, &gitdir);
+    m.start().await;
+    let inventory_returns = || async {
+        let view = m.status().await;
+        (view.repo_ready && view.report.items.iter().any(|item| item.item.to_string() == "skill:pdf")).then_some(())
+    };
+    eventually(inventory_returns).await;
+    let moved = m.home.path().join("moved");
+    for missing in ["work tree", "git directory", "invalid pointer"] {
+        match missing {
+            "work tree" => std::fs::rename(m.repo(), &moved).unwrap(),
+            "git directory" => std::fs::rename(&separate, &moved).unwrap(),
+            _ => write(&pointer, "this is not a git pointer"),
+        }
+        eventually(|| async { (!m.status().await.repo_ready).then_some(()) }).await;
+        assert!(m.status().await.report.items.is_empty(), "{missing}");
+        assert!(m.client.items().await.is_err(), "{missing}");
+        assert!(m.client.draft().await.is_err(), "{missing}");
+        assert!(m.client.conflicts().await.is_err(), "{missing}");
+        assert!(m.client.recovered().await.is_err(), "{missing}");
+        match missing {
+            "work tree" => std::fs::rename(&moved, m.repo()).unwrap(),
+            "git directory" => std::fs::rename(&moved, &separate).unwrap(),
+            _ => write(&pointer, &gitdir),
+        }
+        eventually(inventory_returns).await;
+    }
+
+    let config = m.machine_toml();
+    let original = read(&config);
+    write(&config, "invalid = [");
+    for _ in 0..2 {
+        assert!(m.client.items_fresh().await.is_err());
+    }
+    write(&config, &original);
+    assert!(m.client.items_fresh().await.unwrap().iter().any(|item| item.item.to_string() == "skill:pdf"));
+    assert_eq!(m.harness_skill("pdf").as_deref(), Some("PDFs"));
+}
+
+#[tokio::test]
+async fn recovering_a_connection_during_registration_keeps_the_old_registration_active() {
+    use axum::{Json, Router, routing::post};
+    use sk1ll_daemon::client::JoinApiRequest;
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+
+    let server = FakeServer::new().await;
+    let mut m = solo("solo", &server.url(), Some(snapshot(1, &["x"])));
+    let registered = Arc::new(Notify::new());
+    let finish = Arc::new(Notify::new());
+    let app = Router::new().route(
+        "/api/join",
+        post({
+            let registered = registered.clone();
+            let finish = finish.clone();
+            move || {
+                let registered = registered.clone();
+                let finish = finish.clone();
+                async move {
+                    registered.notify_one();
+                    finish.notified().await;
+                    Json(sk1ll_proto::JoinResponse {
+                        machine_id: "candidate".into(),
+                        token: "candidate-token".into(),
+                        repo_path: sk1ll_proto::REPO_PATH.into(),
+                        assignment: snapshot(9, &["z"]).assignment,
+                        revision: 9,
+                    })
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let new_origin = format!("{url}{}", sk1ll_proto::REPO_PATH);
+    git(&m.repo(), &["remote", "set-url", "origin", &new_origin]);
+    let registration = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    m.start().await;
+    server.refuse_401().await;
+    eventually(|| async { (m.status().await.connection == Connection::AuthRejected).then_some(()) }).await;
+    let old = m.state();
+    let before = std::fs::read(m.snapshot_path()).unwrap();
+    let joining = tokio::spawn({
+        let c = m.client.clone();
+        async move {
+            c.join(&JoinApiRequest {
+                server_url: url,
+                code: "once".into(),
+                admin_token: None,
+                machine_id: None,
+                copy_from: None,
+                repo: None,
+            })
+            .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), registered.notified()).await.expect("join registration did not start");
+    let (_ws, _) = server.accept().await;
+    eventually(|| async { (m.status().await.connection == Connection::Connected).then_some(()) }).await;
+    finish.notify_one();
+    let refused = joining.await.unwrap().unwrap_err();
+    assert_eq!(refused.status, Some(409));
+    assert!(refused.message.contains("works again"), "{refused}");
+    assert_eq!(m.state().registration_key(), old.registration_key());
+    assert_eq!(std::fs::read(m.snapshot_path()).unwrap(), before);
+    assert!(m.harness_skill("x").is_some());
+    assert!(m.harness_skill("z").is_none());
+    registration.abort();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn desktop_notifications_deliver_conflicts_and_remember_retries_across_restarts() {
+    use sk1ll_testkit::{SkillsRepo, read, write};
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut m = machine("alerts");
+    let root = m.home.path();
+    let command = root.join("bin/notify-send");
+    let output = root.join("delivered");
+    let failed = root.join("failed");
+    write(
+        &command,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$SK1LL_TEST_NOTIFY_OUTPUT\"\ntest ! -f \"$SK1LL_TEST_NOTIFY_FAIL\"\n",
+    );
+    std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write(&failed, "fail delivery");
+    let command_path = format!("{}:{}", command.parent().unwrap().display(), std::env::var("PATH").unwrap());
+    m = m
+        .with_env("SK1LL_NOTIFICATIONS", "1")
+        .with_env("PATH", &command_path)
+        .with_env("SK1LL_TEST_NOTIFY_OUTPUT", output.to_str().unwrap())
+        .with_env("SK1LL_TEST_NOTIFY_FAIL", failed.to_str().unwrap());
+    let history = m.state_path().with_extension("notifications.json");
+    let current =
+        || std::fs::read_to_string(&history).ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    SkillsRepo::init(m.repo());
+    m.write_repo("personal/pdf/SKILL.md", "from the draft");
+    m.start().await;
+    eventually(|| async { m.harness_skill("pdf") }).await;
+    write(&m.skills().join("pdf/SKILL.md"), "user edit");
+    let mut retries = eventually(|| async {
+        let recorded = current()?;
+        (recorded["Conflict"]["failures"] == 1).then_some(recorded)
+    })
+    .await;
+    assert_eq!(retries["Conflict"]["pending"], true);
+    assert!(retries["Conflict"]["retry_at"].is_number());
+    assert!(retries["Conflict"]["sent_at"].is_null());
+    assert_eq!(std::fs::metadata(&history).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        read(&output),
+        "--app-name=0xSk1ll\n--\nNew harness Conflicts\nskill:pdf in agent. Open 0xSk1ll to resolve.\n"
+    );
+
+    m.stop();
+    std::fs::remove_file(failed).unwrap();
+    // Resume from the stored schedule with the retry already due.
+    retries["Conflict"]["retry_at"] = serde_json::json!(0);
+    write(&history, &retries.to_string());
+    m.start().await;
+    let sent = eventually(|| async {
+        let recorded = current()?;
+        recorded["Conflict"]["sent_at"].is_number().then_some(recorded)
+    })
+    .await;
+    assert_eq!(sent["Conflict"]["failures"], 0);
+    assert_eq!(sent["Conflict"]["pending"], false);
+    assert!(sent["Conflict"]["retry_at"].is_null());
+    assert_eq!(read(&output).matches("New harness Conflicts").count(), 2);
+
+    m.stop();
+    m.start().await;
+    m.write_repo("personal/second/SKILL.md", "second skill");
+    eventually(|| async { m.harness_skill("second") }).await;
+    write(&m.skills().join("second/SKILL.md"), "second user edit");
+    eventually(|| async {
+        let recorded = current()?;
+        (recorded["Conflict"]["active"].as_array()?.len() == 2).then_some(())
+    })
+    .await;
+    let output = read(&output);
+    assert_eq!(output.matches("New harness Conflicts").count(), 3, "{output}");
+    assert!(output.contains("skill:pdf in agent, skill:second in agent"));
 }
