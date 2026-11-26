@@ -604,6 +604,10 @@ pub struct SyncResult {
     pub fingerprint: Option<String>,
     /// Conflicts left after the sync.
     pub conflicts: Vec<ConflictView>,
+    /// Recovery entries holding a change (an edit a forced sync overwrote,
+    /// a save during a swap), to adopt or discard.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kept: Vec<ConflictView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actions: Option<Vec<PlacementView>>,
     /// Placements completed before a reviewed apply stopped.

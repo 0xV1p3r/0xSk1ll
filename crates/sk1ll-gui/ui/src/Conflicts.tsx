@@ -23,25 +23,34 @@ function Conflict({ entry, displaced, changed, adopted, expanded }: {
 }) {
   const [open, setOpen] = useState(expanded);
   const target = { harness: entry.harness, name: entry.name };
+  // Recovered content needs the user only while it holds a change; Adopt is offered only where it can tell where it goes.
+  const attention = !displaced || !!entry.changed;
+  const canAdopt = !displaced || entry.adoptable;
   return <Card size="default" className="relative overflow-hidden pt-0">
-    <span aria-hidden className={`absolute inset-y-3 left-0 w-1 rounded-r-full ${displaced ? 'bg-info' : 'bg-warning'}`} />
+    <span aria-hidden className={`absolute inset-y-3 left-0 w-1 rounded-r-full ${attention ? 'bg-warning' : 'bg-info'}`} />
     <CardHeader className="border-b border-border bg-muted/40 py-3">
       <CardTitle className="flex flex-wrap items-center gap-2"><span className="font-medium">{entry.name}</span>
-        <Badge variant="outline">{entry.harness}</Badge></CardTitle>
+        <Badge variant="outline">{entry.harness}</Badge>
+        {displaced && <Badge variant={entry.changed ? 'warning' : 'secondary'}>{entry.changed ? 'Changed' : 'Unchanged'}</Badge>}</CardTitle>
       <CardDescription className="font-mono text-xs break-all">{entry.dest}</CardDescription>
       {!displaced && typeof entry.detected_at === 'number' && <p className="text-xs text-muted-foreground">Edited <When seconds={entry.detected_at} /></p>}
     </CardHeader>
     <CardContent className="flex flex-col gap-2">
       {entry.reason && <p>{entry.reason}</p>}
+      {displaced && <p className="text-xs text-muted-foreground">{entry.changed
+        ? 'It holds a change, such as a hand edit that was overwritten. Adopt it, or Discard it once you no longer need it.'
+        : 'It is as sk1ll set it aside. Discarding it is safe.'}</p>}
       {(entry.path || entry.displaced_at !== undefined) && <Details className="text-xs" rows={[
         ...entry.path ? [['Recovery path', <code className="font-mono break-all">{entry.path}</code>] as [string, ReactNode]] : [],
         ...entry.displaced_at !== undefined ? [['Recovered', <When seconds={entry.displaced_at} />] as [string, ReactNode]] : [],
       ]} />}
       <Collapsible open={open} onOpenChange={setOpen}><CollapsibleTrigger render={<Button variant="ghost" className="group/diff" />}><ChevronRight className="transition-transform group-data-panel-open/diff:rotate-90" />{open ? 'Hide diff' : 'Show diff'}</CollapsibleTrigger><CollapsibleContent>{open && <ConflictDiff entry={entry} displaced={displaced} />}</CollapsibleContent></Collapsible>
-      {!entry.adoptable && <p className="text-xs text-muted-foreground">This Harness combines Rules in one file. Move its edits into the Draft by hand before Overwrite.</p>}
+      {!entry.adoptable && <p className="text-xs text-muted-foreground">{displaced
+        ? 'sk1ll can\'t tell which item this came from, so it can\'t be adopted. Copy what you need from the recovery path by hand.'
+        : 'This Harness combines Rules in one file. Move its edits into the Draft by hand before Overwrite.'}</p>}
     </CardContent>
     <CardFooter className="flex-wrap gap-2 border-t [&_button]:h-8">
-      <Confirm label="Adopt" variant="default" triggerVariant="outline" confirmLabel="Adopt into Draft" ariaLabel={`Adopt ${entry.name} from ${entry.harness}`}
+      {canAdopt && <Confirm label="Adopt" variant="default" triggerVariant="outline" confirmLabel="Adopt into Draft" ariaLabel={`Adopt ${entry.name} from ${entry.harness}`}
         disabled={!entry.adoptable || (displaced && !entry.id)}
         title={`Adopt ${entry.name} into the Draft?`}
         description={<>{displaced ? 'The recovered content' : `The ${entry.harness} Harness edit`} at <code className="font-mono break-all">{displaced ? entry.path ?? entry.dest : entry.dest}</code> replaces
@@ -52,7 +61,7 @@ function Conflict({ entry, displaced, changed, adopted, expanded }: {
           const name = path?.split(/[/\\]/).at(-1) ?? entry.name;
           adopted(name);
           toast({ title: `${name} adopted into Draft`, description: path });
-        }} onDone={changed} />
+        }} onDone={changed} />}
       <Confirm label={displaced ? 'Discard' : 'Overwrite'} triggerVariant="outline"
         ariaLabel={`${displaced ? 'Discard' : 'Overwrite'} ${entry.name} in ${entry.harness}`} title={`${displaced ? 'Discard' : 'Overwrite'} ${entry.name} in ${entry.harness}?`}
         description={displaced ? <>Permanently remove recovered content for {entry.name} from {entry.harness} at <code className="font-mono break-all">{entry.path ?? entry.dest}</code>. The Draft is unchanged.</>
@@ -84,7 +93,7 @@ export function Conflicts({ revision, changed, reviewDraft }: { revision: number
     {ready && !!conflicts.data?.length && <Section title="Harness conflicts" description="Adopt copies a Harness edit into the Draft. Overwrite replaces it with the Draft.">
       {conflicts.data.map((entry, i) => <Conflict key={`${entry.harness}/${entry.name}/${i}`} entry={entry} expanded={total <= 3} displaced={false} changed={changed} adopted={setAdopted} />)}
     </Section>}
-    {ready && !!displaced.data?.length && <Section title="Recovered content" description="Content saved when a Harness file was replaced. Adopt copies it into the Draft. Discard permanently removes the saved content.">
+    {ready && !!displaced.data?.length && <Section title="Recovered content" description="Content saved when a Harness file was replaced. Changed content needs your decision; unchanged copies are safe to discard. Adopt copies it into the Draft. Discard permanently removes the saved content.">
       {displaced.data.map(entry => <Conflict key={entry.id} entry={entry} expanded={total <= 3} displaced changed={changed} adopted={setAdopted} />)}
     </Section>}
   </>;

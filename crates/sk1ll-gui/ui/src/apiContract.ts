@@ -80,7 +80,7 @@ export const contract = [
   value<T.PullKeepResult>()(draft.pull_keep_result),
   value<T.PushResult>()(draft.push_result),
 
-  value<{ harness: T.ConflictView; displaced: T.ConflictView }>()(harness.conflict_view),
+  value<{ harness: T.ConflictView; displaced: T.ConflictView; kept: T.ConflictView }>()(harness.conflict_view),
   value<T.ConflictTarget>()(harness.conflict_target),
   value<T.HarnessView>()(harness.harness_view),
   tagged<T.HarnessView['harness'], 'instructions_format'>()(harness.instructions_format),

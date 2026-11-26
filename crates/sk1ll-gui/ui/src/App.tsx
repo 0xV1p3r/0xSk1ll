@@ -56,16 +56,17 @@ const sidebarKey = 'sk1ll-sidebar-open';
 function storedSidebar() {
   try { const value = localStorage.getItem(sidebarKey); return value === 'true' ? true : value === 'false' ? false : null; } catch { return null; }
 }
-export function AppSidebar({ screen, setScreen, status, unmanagedCount, recoveredCount = 0, importUpdates = 0, importErrors = 0 }: { screen: Screen; setScreen: (screen: Screen) => void; status: StatusView; unmanagedCount: number; recoveredCount?: number; importUpdates?: number; importErrors?: number }) {
+export function AppSidebar({ screen, setScreen, status, unmanagedCount, importUpdates = 0, importErrors = 0 }: { screen: Screen; setScreen: (screen: Screen) => void; status: StatusView; unmanagedCount: number; importUpdates?: number; importErrors?: number }) {
   const { isMobile, setOpenMobile } = useSidebar();
-  const counts: Partial<Record<Screen, number>> = { Library: unmanagedCount, Draft: status.report.drafts.length, Conflicts: status.report.conflicts.length + recoveredCount, Imports: importUpdates + importErrors };
+  // Conflicts counts what the Fleet table counts for this Machine: Harness conflicts and recovered content holding a change.
+  const counts: Partial<Record<Screen, number>> = { Library: unmanagedCount, Draft: status.report.drafts.length, Conflicts: status.report.conflicts.length, Imports: importUpdates + importErrors };
   const item = (name: Screen) => {
     const Icon = screens[name].icon;
     return <SidebarMenuItem key={name}>
       <SidebarMenuButton isActive={screen === name} tooltip={screenLabel(name, status)} aria-current={screen === name ? 'page' : undefined}
         onClick={() => { if (isMobile) setOpenMobile(false); setScreen(name); }}><Icon /><span>{screenLabel(name, status)}</span></SidebarMenuButton>
       {!!counts[name] && <span aria-hidden className={cn('pointer-events-none absolute top-1 right-1 hidden size-2 rounded-full group-data-[collapsible=icon]:block', name === 'Conflicts' || (name === 'Imports' && importErrors > 0) ? 'bg-warning' : 'bg-brand-ink')} />}
-      {!!counts[name] && <SidebarMenuBadge className={cn(name === 'Conflicts' || (name === 'Imports' && importErrors > 0) ? 'bg-warning/13 text-warning-foreground' : 'bg-brand-soft text-brand-ink')} aria-label={name === 'Library' ? `${counts[name]} Unmanaged skill${counts[name] === 1 ? '' : 's'} to adopt` : name === 'Conflicts' ? [status.report.conflicts.length && `${plural(status.report.conflicts.length, 'Conflict')} to resolve`, recoveredCount && `${plural(recoveredCount, 'recovered item')} to review`].filter(Boolean).join(', ') : name === 'Imports' ? [importUpdates && plural(importUpdates, 'Import update'), importErrors && plural(importErrors, 'failed check')].filter(Boolean).join(', ') : plural(counts[name] ?? 0, 'Draft item')}>{counts[name]}</SidebarMenuBadge>}
+      {!!counts[name] && <SidebarMenuBadge className={cn(name === 'Conflicts' || (name === 'Imports' && importErrors > 0) ? 'bg-warning/13 text-warning-foreground' : 'bg-brand-soft text-brand-ink')} aria-label={name === 'Library' ? `${counts[name]} Unmanaged skill${counts[name] === 1 ? '' : 's'} to adopt` : name === 'Conflicts' ? `${plural(status.report.conflicts.length, 'Conflict')} to resolve` : name === 'Imports' ? [importUpdates && plural(importUpdates, 'Import update'), importErrors && plural(importErrors, 'failed check')].filter(Boolean).join(', ') : plural(counts[name] ?? 0, 'Draft item')}>{counts[name]}</SidebarMenuBadge>}
     </SidebarMenuItem>;
   };
   const group = (label: string) => visibleScreens(status).filter(name => (status.mode === 'standalone' && name === 'Assignment matrix' ? 'This Machine' : screens[name].group) === label);
@@ -134,7 +135,6 @@ export function App() {
     return () => clearTimeout(timer);
   }, [joinedAt, status?.mode]);
   const skills = useResource(api.skills, revision, undefined, ready);
-  const recovered = useResource(api.recovered, revision, undefined, ready);
   const imports = useResource(api.imports, revisions.imports, undefined, ready);
   const fleet = useResource(api.fleet, revisions.fleet, undefined, !!status && !standalone);
   const [refreshPending, setRefreshPending] = useState(false);
@@ -254,7 +254,7 @@ export function App() {
   const server = status.server_url?.replace(/^https?:\/\//, '').replace(/\/$/, '') || 'Server';
   return <ToastProvider><TooltipProvider><SidebarProvider open={sidebarOpen} onOpenChange={changeSidebar}>
     <a href="#main" onClick={event => { event.preventDefault(); document.getElementById('main')?.focus(); }} className="sr-only z-50 rounded-md bg-background px-3 py-2 text-sm shadow focus:not-sr-only focus:fixed focus:top-2 focus:left-2">Skip to content</a>
-    <AppSidebar screen={screen} setScreen={navigate} status={status} recoveredCount={recovered.data?.length ?? 0} importUpdates={imports.data?.updates.length ?? 0} importErrors={imports.data?.errors.length ?? 0} unmanagedCount={skills.data?.filter(entry => entry.type === 'unmanaged').length ?? 0} />
+    <AppSidebar screen={screen} setScreen={navigate} status={status} importUpdates={imports.data?.updates.length ?? 0} importErrors={imports.data?.errors.length ?? 0} unmanagedCount={skills.data?.filter(entry => entry.type === 'unmanaged').length ?? 0} />
     <SidebarInset className="min-w-0">
       <header className="sticky top-0 z-10 flex h-12 shrink-0 items-center gap-2 border-b bg-background px-4 md:gap-3 md:px-[18px]">
         <SidebarTrigger className="-ml-1 size-8" />

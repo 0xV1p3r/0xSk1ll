@@ -1232,13 +1232,23 @@ fn a_failed_write_rolls_forward_on_the_next_pull() {
 }
 
 /// Recovery entries of what pull replaced are in the git directory,
-/// never in the working tree, and nothing is left staged.
+/// never in the working tree, and nothing is left staged. Each holds the
+/// committed version a path had, so the finished pull drops them all: a
+/// clean pull leaves nothing that looks like lost work.
 #[test]
 fn pull_keeps_the_working_tree_free_of_its_own_files() {
     let f = Fleet::new();
     let b = f.b();
     half_way_setup(&f);
-    assert!(matches!(pull(&b).unwrap(), PullOutcome::Updated { .. }));
+    let git_dir = f.b.join(".git").canonicalize().unwrap();
+    let mut held = 0;
+    let outcome = during_pull(&b, (Point::PullIndex, 0), || {
+        let entries = sk1ll_core::sync::displaced::list().unwrap();
+        assert!(entries.iter().all(|e| e.path.starts_with(&git_dir) && !e.changed), "{entries:?}");
+        held = entries.len();
+    });
+    assert!(matches!(outcome.unwrap(), PullOutcome::Updated { .. }));
+    assert!(held > 0);
     let names: Vec<String> = WalkDir::new(&f.b)
         .into_iter()
         .filter_entry(|e| e.file_name() != ".git")
@@ -1246,11 +1256,9 @@ fn pull_keeps_the_working_tree_free_of_its_own_files() {
         .map(|e| e.file_name().to_string_lossy().into())
         .collect();
     assert!(names.iter().all(|n| !n.starts_with(".sk1ll")), "{names:?}");
-    let entries = sk1ll_core::sync::displaced::list().unwrap();
-    assert!(
-        !entries.is_empty() && entries.iter().all(|e| e.path.starts_with(f.b.join(".git").canonicalize().unwrap()))
-    );
+    assert_eq!(sk1ll_core::sync::displaced::list().unwrap(), []);
     assert!(!f.b.join(".git/sk1ll-pull-stage").exists());
+    assert!(!sk1ll_core::sync::displaced::area(&git_dir).exists());
 }
 
 #[cfg(unix)]
@@ -1324,8 +1332,16 @@ fn draft_adoption_refuses_an_ignored_destination_absent_from_head() {
     fs::remove_file(f.a.join(rel)).unwrap();
     commit_all(&f.a, "remove the rule");
     a.push().unwrap();
-    assert!(matches!(pull(&b).unwrap(), PullOutcome::Updated { .. }));
-    let entry = displaced::list().unwrap().into_iter().find(|e| e.dest == f.b.join(rel)).unwrap();
+    // A save during the removal keeps its entry: a pull drops only those
+    // that hold just the committed version.
+    let dest = f.b.join(rel);
+    let result = during_pull(&b, (Point::PullRemove, 0), || {
+        use std::io::Write;
+        fs::OpenOptions::new().append(true).open(&dest).unwrap().write_all(b"Saved during the pull.\n").unwrap();
+    });
+    let Err(Error::Displaced { id, .. }) = result else { panic!("expected the save kept, got {result:?}") };
+    let entry = displaced::get(&id).unwrap();
+    assert!(entry.changed);
     write(&f.b.join(".git/info/exclude"), &format!("/{rel}\n"));
     write(&f.b.join(rel), "private replacement\n");
     assert!(b.draft().unwrap().is_empty());
@@ -1333,10 +1349,11 @@ fn draft_adoption_refuses_an_ignored_destination_absent_from_head() {
     let before = snapshot(&f.b);
     assert!(invalid(displaced::adopt(&b, &entry.id, &lock)).contains("local content"));
     assert_eq!(snapshot(&f.b), before);
-    assert_eq!(read(&entry.path), "Use Conventional Commits.\n");
+    let kept = "Use Conventional Commits.\nSaved during the pull.\n";
+    assert_eq!(read(&entry.path), kept);
     fs::remove_file(f.b.join(rel)).unwrap();
     displaced::adopt(&b, &entry.id, &lock).unwrap();
-    assert_eq!(read(&f.b.join(rel)), "Use Conventional Commits.\n");
+    assert_eq!(read(&f.b.join(rel)), kept);
 }
 
 #[cfg(unix)]
@@ -1451,16 +1468,19 @@ fn pull_recovers_byte_paths_and_full_length_leaf_names() {
     }
     commit_all(&f.a, "replace unusual paths");
     a.push().unwrap();
-    interrupt_pull(&b, Point::PullPublished, 0);
-    finish(&f.b()).unwrap();
+    interrupt_pull(&b, Point::PullIndex, 0);
+    // The stopped pull's entries, until it finishes and drops them.
     for path in names {
-        assert_eq!(read(&f.b.join(path)), "new\n");
         let entry =
             sk1ll_core::sync::displaced::list().unwrap().into_iter().find(|e| e.dest == f.b.join(path)).unwrap();
         assert!(entry.id.len() < 255);
-        assert_eq!(read(&entry.path), "old\n");
         assert!(serde_json::to_vec(&entry).is_ok());
     }
+    finish(&f.b()).unwrap();
+    for path in names {
+        assert_eq!(read(&f.b.join(path)), "new\n");
+    }
+    assert_eq!(sk1ll_core::sync::displaced::list().unwrap(), []);
 }
 
 #[cfg(unix)]
@@ -1564,10 +1584,13 @@ fn restart_sweep(rebase: bool) {
     }
 
     // From the journal on, every stop leaves it and the target's anchor,
-    // and the next pull or a refresh (`finish_pull`) finishes it.
+    // and the next pull or a refresh (`finish_pull`) finishes it. A stop
+    // once it is gone (dropping the entries of what the pull replaced)
+    // finds the pull done.
     let journal = hits.iter().position(|hit| hit.point == Point::PullJournal).unwrap();
+    let done = hits.iter().rposition(|hit| hit.point == Point::PullDone).unwrap();
     for (n, hit) in hits.iter().enumerate() {
-        let journaled = n > journal;
+        let (journaled, finished) = (n > journal && n <= done, n > done);
         for by_pull in [true, false].into_iter().take(if journaled { 2 } else { 1 }) {
             let copy = f.copy_b();
             let root = copy.b.as_path();
@@ -1590,7 +1613,11 @@ fn restart_sweep(rebase: bool) {
             let anchor = journaled.then(|| git(root, &["rev-parse", "refs/worktree/sk1ll-pull"]));
             let outcome = if by_pull { pull(&repo).unwrap() } else { finish(&repo).unwrap().unwrap() };
             let target = head(root);
-            assert_eq!(outcome, PullOutcome::Updated { from: old.clone(), to: target.clone() }, "{case}");
+            let expected = match finished {
+                true => PullOutcome::UpToDate,
+                false => PullOutcome::Updated { from: old.clone(), to: target.clone() },
+            };
+            assert_eq!(outcome, expected, "{case}");
             assert_eq!(anchor.unwrap_or_else(|| target.clone()), target, "{case}: the anchor kept the target");
             assert_eq!(git(root, &["rev-parse", if rebase { "HEAD~1" } else { "HEAD" }]), upstream, "{case}");
             assert!(!repo.pull_pending().unwrap(), "{case}");

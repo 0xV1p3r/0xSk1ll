@@ -18,7 +18,7 @@ pub(crate) struct Snapshot {
     pub(crate) generation: u64,
     pub(crate) draft: Part<Vec<DraftEntry>>,
     pub(crate) items: Part<Vec<ItemView>>,
-    /// The plan's conflicts and the recovery entries written to since.
+    /// The plan's conflicts: Harness content that differs from the Draft.
     pub(crate) conflicts: Part<Vec<ConflictView>>,
     /// Every recovery entry.
     pub(crate) recovered: Part<Vec<ConflictView>>,
