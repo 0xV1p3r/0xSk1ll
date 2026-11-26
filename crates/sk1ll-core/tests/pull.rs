@@ -1232,23 +1232,13 @@ fn a_failed_write_rolls_forward_on_the_next_pull() {
 }
 
 /// Recovery entries of what pull replaced are in the git directory,
-/// never in the working tree, and nothing is left staged. Each holds the
-/// committed version a path had, so the finished pull drops them all: a
-/// clean pull leaves nothing that looks like lost work.
+/// never in the working tree, and nothing is left staged.
 #[test]
 fn pull_keeps_the_working_tree_free_of_its_own_files() {
     let f = Fleet::new();
     let b = f.b();
     half_way_setup(&f);
-    let git_dir = f.b.join(".git").canonicalize().unwrap();
-    let mut held = 0;
-    let outcome = during_pull(&b, (Point::PullIndex, 0), || {
-        let entries = sk1ll_core::sync::displaced::list().unwrap();
-        assert!(entries.iter().all(|e| e.path.starts_with(&git_dir) && !e.changed), "{entries:?}");
-        held = entries.len();
-    });
-    assert!(matches!(outcome.unwrap(), PullOutcome::Updated { .. }));
-    assert!(held > 0);
+    assert!(matches!(pull(&b).unwrap(), PullOutcome::Updated { .. }));
     let names: Vec<String> = WalkDir::new(&f.b)
         .into_iter()
         .filter_entry(|e| e.file_name() != ".git")
@@ -1256,9 +1246,54 @@ fn pull_keeps_the_working_tree_free_of_its_own_files() {
         .map(|e| e.file_name().to_string_lossy().into())
         .collect();
     assert!(names.iter().all(|n| !n.starts_with(".sk1ll")), "{names:?}");
-    assert_eq!(sk1ll_core::sync::displaced::list().unwrap(), []);
+    let entries = sk1ll_core::sync::displaced::list().unwrap();
+    assert!(
+        !entries.is_empty() && entries.iter().all(|e| e.path.starts_with(f.b.join(".git").canonicalize().unwrap()))
+    );
     assert!(!f.b.join(".git/sk1ll-pull-stage").exists());
-    assert!(!sk1ll_core::sync::displaced::area(&git_dir).exists());
+    // Each holds just the committed version: a routine copy, kept for the
+    // grace period and then pruned like one.
+    assert!(entries.iter().all(|e| !e.changed), "{entries:?}");
+    use sk1ll_core::sync::displaced;
+    assert!(displaced::prune().unwrap().is_empty());
+    assert_eq!(displaced::prune_with(std::time::Duration::ZERO, displaced::max_size()).unwrap().len(), entries.len());
+    assert_eq!(displaced::list().unwrap(), []);
+}
+
+/// What a clean pull replaced is kept as long as it may hold something Git
+/// doesn't: a write through a descriptor opened before the pull, landing
+/// after it, or a local extended attribute.
+#[cfg(unix)]
+#[test]
+fn pull_entries_keep_late_writes_and_local_metadata() {
+    use sk1ll_core::sync::displaced;
+    use std::io::Write;
+    let f = Fleet::new();
+    let (a, b) = (f.a(), f.b());
+    let (git_md, style_md) = ("instructions/git.md", "instructions/style.md");
+    write(&f.a.join(git_md), "new rule\n");
+    write(&f.a.join(style_md), "new style\n");
+    commit_all(&f.a, "replace both rules");
+    a.push().unwrap();
+    let mut open = fs::OpenOptions::new().append(true).open(f.b.join(git_md)).unwrap();
+    // Only where the file system takes user attributes.
+    let xattr = rustix::fs::setxattr(f.b.join(style_md), "user.note", b"local", rustix::fs::XattrFlags::empty())
+        .is_ok()
+        && cfg!(target_os = "linux");
+    assert!(b.draft().unwrap().is_empty());
+    assert!(matches!(pull(&b).unwrap(), PullOutcome::Updated { .. }));
+    open.write_all(b"saved after the pull\n").unwrap();
+    drop(open);
+    displaced::prune_with(std::time::Duration::ZERO, displaced::max_size()).unwrap();
+    let kept = displaced::list().unwrap();
+    let at = |rel: &str| kept.iter().find(|e| e.dest == f.b.join(rel));
+    let written = at(git_md).expect("the late write is kept");
+    assert!(written.changed && read(&written.path).ends_with("saved after the pull\n"), "{written:?}");
+    assert_eq!(read(&f.b.join(git_md)), "new rule\n");
+    if xattr {
+        let marked = at(style_md).expect("the local attribute is kept");
+        assert!(marked.changed, "{marked:?}");
+    }
 }
 
 #[cfg(unix)]
@@ -1332,16 +1367,8 @@ fn draft_adoption_refuses_an_ignored_destination_absent_from_head() {
     fs::remove_file(f.a.join(rel)).unwrap();
     commit_all(&f.a, "remove the rule");
     a.push().unwrap();
-    // A save during the removal keeps its entry: a pull drops only those
-    // that hold just the committed version.
-    let dest = f.b.join(rel);
-    let result = during_pull(&b, (Point::PullRemove, 0), || {
-        use std::io::Write;
-        fs::OpenOptions::new().append(true).open(&dest).unwrap().write_all(b"Saved during the pull.\n").unwrap();
-    });
-    let Err(Error::Displaced { id, .. }) = result else { panic!("expected the save kept, got {result:?}") };
-    let entry = displaced::get(&id).unwrap();
-    assert!(entry.changed);
+    assert!(matches!(pull(&b).unwrap(), PullOutcome::Updated { .. }));
+    let entry = displaced::list().unwrap().into_iter().find(|e| e.dest == f.b.join(rel)).unwrap();
     write(&f.b.join(".git/info/exclude"), &format!("/{rel}\n"));
     write(&f.b.join(rel), "private replacement\n");
     assert!(b.draft().unwrap().is_empty());
@@ -1349,11 +1376,10 @@ fn draft_adoption_refuses_an_ignored_destination_absent_from_head() {
     let before = snapshot(&f.b);
     assert!(invalid(displaced::adopt(&b, &entry.id, &lock)).contains("local content"));
     assert_eq!(snapshot(&f.b), before);
-    let kept = "Use Conventional Commits.\nSaved during the pull.\n";
-    assert_eq!(read(&entry.path), kept);
+    assert_eq!(read(&entry.path), "Use Conventional Commits.\n");
     fs::remove_file(f.b.join(rel)).unwrap();
     displaced::adopt(&b, &entry.id, &lock).unwrap();
-    assert_eq!(read(&f.b.join(rel)), kept);
+    assert_eq!(read(&f.b.join(rel)), "Use Conventional Commits.\n");
 }
 
 #[cfg(unix)]
@@ -1468,19 +1494,16 @@ fn pull_recovers_byte_paths_and_full_length_leaf_names() {
     }
     commit_all(&f.a, "replace unusual paths");
     a.push().unwrap();
-    interrupt_pull(&b, Point::PullIndex, 0);
-    // The stopped pull's entries, until it finishes and drops them.
-    for path in names {
-        let entry =
-            sk1ll_core::sync::displaced::list().unwrap().into_iter().find(|e| e.dest == f.b.join(path)).unwrap();
-        assert!(entry.id.len() < 255);
-        assert!(serde_json::to_vec(&entry).is_ok());
-    }
+    interrupt_pull(&b, Point::PullPublished, 0);
     finish(&f.b()).unwrap();
     for path in names {
         assert_eq!(read(&f.b.join(path)), "new\n");
+        let entry =
+            sk1ll_core::sync::displaced::list().unwrap().into_iter().find(|e| e.dest == f.b.join(path)).unwrap();
+        assert!(entry.id.len() < 255);
+        assert_eq!(read(&entry.path), "old\n");
+        assert!(serde_json::to_vec(&entry).is_ok());
     }
-    assert_eq!(sk1ll_core::sync::displaced::list().unwrap(), []);
 }
 
 #[cfg(unix)]
@@ -1584,13 +1607,10 @@ fn restart_sweep(rebase: bool) {
     }
 
     // From the journal on, every stop leaves it and the target's anchor,
-    // and the next pull or a refresh (`finish_pull`) finishes it. A stop
-    // once it is gone (dropping the entries of what the pull replaced)
-    // finds the pull done.
+    // and the next pull or a refresh (`finish_pull`) finishes it.
     let journal = hits.iter().position(|hit| hit.point == Point::PullJournal).unwrap();
-    let done = hits.iter().rposition(|hit| hit.point == Point::PullDone).unwrap();
     for (n, hit) in hits.iter().enumerate() {
-        let (journaled, finished) = (n > journal && n <= done, n > done);
+        let journaled = n > journal;
         for by_pull in [true, false].into_iter().take(if journaled { 2 } else { 1 }) {
             let copy = f.copy_b();
             let root = copy.b.as_path();
@@ -1613,11 +1633,7 @@ fn restart_sweep(rebase: bool) {
             let anchor = journaled.then(|| git(root, &["rev-parse", "refs/worktree/sk1ll-pull"]));
             let outcome = if by_pull { pull(&repo).unwrap() } else { finish(&repo).unwrap().unwrap() };
             let target = head(root);
-            let expected = match finished {
-                true => PullOutcome::UpToDate,
-                false => PullOutcome::Updated { from: old.clone(), to: target.clone() },
-            };
-            assert_eq!(outcome, expected, "{case}");
+            assert_eq!(outcome, PullOutcome::Updated { from: old.clone(), to: target.clone() }, "{case}");
             assert_eq!(anchor.unwrap_or_else(|| target.clone()), target, "{case}: the anchor kept the target");
             assert_eq!(git(root, &["rev-parse", if rebase { "HEAD~1" } else { "HEAD" }]), upstream, "{case}");
             assert!(!repo.pull_pending().unwrap(), "{case}");
@@ -1625,6 +1641,12 @@ fn restart_sweep(rebase: bool) {
             assert_at_upstream(root);
             assert_eq!(finish(&copy.repo()).unwrap(), None, "{case}");
             assert_eq!(pull(&copy.repo()).unwrap(), PullOutcome::UpToDate, "{case}");
+            // However it stopped, what it replaced ends up routine copies,
+            // which pruning takes once they are old enough.
+            use sk1ll_core::sync::displaced;
+            assert!(displaced::list().unwrap().iter().all(|e| !e.changed), "{case}");
+            displaced::prune_with(std::time::Duration::ZERO, displaced::max_size()).unwrap();
+            assert_eq!(displaced::list().unwrap(), [], "{case}");
         }
     }
 }

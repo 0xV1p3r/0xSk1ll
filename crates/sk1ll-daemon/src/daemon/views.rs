@@ -1,8 +1,8 @@
 use super::*;
 use std::path::Path;
 
-use sk1ll_core::ItemRef;
 use sk1ll_core::sync::{self, Action, ActionKind, Item};
+use sk1ll_core::{ItemRef, Repo};
 
 use crate::client::{ConflictTarget, ConflictView, PlacementView};
 
@@ -18,9 +18,11 @@ pub(super) fn conflict_items(a: &Action) -> Vec<ItemRef> {
     }
 }
 
-pub(super) fn displaced_view(entry: sync::displaced::Entry, root: &Path) -> ConflictView {
+/// `repo`: the skills repo at `root`, which tells whether Adopt can place
+/// the entry (none: it can't).
+pub(super) fn displaced_view(entry: sync::displaced::Entry, root: &Path, repo: Option<&Repo>) -> ConflictView {
     let item = displaced_item(&entry, root);
-    let adoptable = entry.adoptable();
+    let adoptable = repo.is_some_and(|repo| sync::displaced::adoptable(repo, &entry));
     ConflictView {
         kind: Some("displaced".into()),
         id: Some(entry.id),

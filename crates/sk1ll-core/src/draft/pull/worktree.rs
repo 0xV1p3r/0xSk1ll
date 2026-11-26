@@ -242,7 +242,7 @@ mod unix {
                     held
                 }
             };
-            Ok(Some(Outcome::Done(completed.finish(false)?)))
+            Ok(Some(Outcome::Done(completed.finish_committed()?)))
         }
 
         pub(in super::super) fn apply(

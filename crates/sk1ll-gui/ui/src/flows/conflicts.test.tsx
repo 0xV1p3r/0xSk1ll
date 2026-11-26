@@ -76,7 +76,7 @@ it('marks recovered content changed or unchanged and offers Adopt only where it 
   expect(unchanged.getAttribute('aria-label')).toBe('Discard notes in claude');
   expect(kept.getAttribute('aria-label')).toBe('Discard linked in claude');
   expect(screen.getByText('Unchanged')).toBeTruthy();
-  expect(screen.getByText('It is as sk1ll set it aside. Discarding it is safe.')).toBeTruthy();
+  expect(screen.getByText('Unchanged since sk1ll set it aside. A routine copy is removed on its own after a while.')).toBeTruthy();
   expect(screen.getByText('Changed')).toBeTruthy();
   expect(screen.getByText(/can't tell which item this came from/)).toBeTruthy();
   expect(screen.getByRole('button', { name: 'Adopt notes from claude' })).toBeTruthy();

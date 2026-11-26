@@ -154,14 +154,16 @@ break compatibility.
 - Recovered content: the original of an adopted unmanaged skill can be
   adopted (back into that skill) and its diff shows, where both failed for
   want of a target. Content Adopt can't place is reported as not adoptable,
-  and the app offers only Discard and a diff against nothing.
+  and the app offers only Discard and a diff against nothing. An original
+  holding what the copy left out (a `.git`) stays as changed content.
 - After **Overwrite** of a hand-edited block, the kept copy is listed only
   as recovered content: `GET /conflicts` lists Harness conflicts alone, and
   `POST /sync` returns changed recovery entries as `kept`.
 - A clean pull no longer leaves a permanent recovery entry for each file it
-  replaced: an entry that holds only the committed version is dropped once
-  the pull finishes. The app marks recovered content **Changed** or
-  **Unchanged**.
+  replaced: an entry that holds only the committed version is a routine
+  copy, pruned after the grace period once the pull is finished. A write
+  since, or an extended attribute Git can't restore, keeps it, changed. The
+  app marks recovered content **Changed** or **Unchanged**.
 - The app's Conflicts badge counts what the Fleet table's Conflicts column
   counts: Harness conflicts and recovered content holding a change, not
   routine copies.

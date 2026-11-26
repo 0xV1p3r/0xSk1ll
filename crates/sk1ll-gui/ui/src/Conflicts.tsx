@@ -39,7 +39,7 @@ function Conflict({ entry, displaced, changed, adopted, expanded }: {
       {entry.reason && <p>{entry.reason}</p>}
       {displaced && <p className="text-xs text-muted-foreground">{entry.changed
         ? 'It holds a change, such as a hand edit that was overwritten. Adopt it, or Discard it once you no longer need it.'
-        : 'It is as sk1ll set it aside. Discarding it is safe.'}</p>}
+        : 'Unchanged since sk1ll set it aside. A routine copy is removed on its own after a while.'}</p>}
       {(entry.path || entry.displaced_at !== undefined) && <Details className="text-xs" rows={[
         ...entry.path ? [['Recovery path', <code className="font-mono break-all">{entry.path}</code>] as [string, ReactNode]] : [],
         ...entry.displaced_at !== undefined ? [['Recovered', <When seconds={entry.displaced_at} />] as [string, ReactNode]] : [],
@@ -93,7 +93,7 @@ export function Conflicts({ revision, changed, reviewDraft }: { revision: number
     {ready && !!conflicts.data?.length && <Section title="Harness conflicts" description="Adopt copies a Harness edit into the Draft. Overwrite replaces it with the Draft.">
       {conflicts.data.map((entry, i) => <Conflict key={`${entry.harness}/${entry.name}/${i}`} entry={entry} expanded={total <= 3} displaced={false} changed={changed} adopted={setAdopted} />)}
     </Section>}
-    {ready && !!displaced.data?.length && <Section title="Recovered content" description="Content saved when a Harness file was replaced. Changed content needs your decision; unchanged copies are safe to discard. Adopt copies it into the Draft. Discard permanently removes the saved content.">
+    {ready && !!displaced.data?.length && <Section title="Recovered content" description="Content saved when a Harness file was replaced. Changed content needs your decision. Adopt copies it into the Draft. Discard permanently removes the saved content.">
       {displaced.data.map(entry => <Conflict key={entry.id} entry={entry} expanded={total <= 3} displaced changed={changed} adopted={setAdopted} />)}
     </Section>}
   </>;
