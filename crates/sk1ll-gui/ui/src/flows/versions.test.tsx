@@ -1,6 +1,7 @@
 // Versions: the app updating itself, and the header's warnings when the app, Daemon and Server run different releases.
-// The app itself is 0.1.0 (package.json).
+// The app's own release comes from package.json; the samples below are pinned relative to 0.1.0.
 import { expect, it } from 'vitest';
+import { version as appVersion } from '../../package.json';
 import { screen, waitFor, within } from '@testing-library/react';
 import { heading, launch } from './harness';
 import { resetAppUpdate } from '../updateStore';
@@ -85,7 +86,7 @@ it('offers to restart a Daemon older than the app, and hides an older Server onc
   await waitFor(() => expect(first.daemon.sent('restart_daemon')).toEqual([{}]));
 
   relaunch(first.view);
-  const server = versions({ connection: 'connected', version: '0.1.0 (abc1234567)', protocol: 2, server: { version: '0.0.9', protocol: 2 } });
+  const server = versions({ connection: 'connected', version: `${appVersion} (abc1234567)`, protocol: 2, server: { version: '0.0.9', protocol: 2 } });
   const second = launch('fleet', server);
   expect(await screen.findByText('The Server runs an older release')).toBeTruthy();
   expect(screen.queryByText(/The Daemon still runs/)).toBeNull();

@@ -6,7 +6,7 @@
 #   curl -X POST -H "Authorization: Bearer $SK1LL_SERVER_ADMIN_TOKEN" http://server:7878/api/join-codes
 services:
   server:
-    image: ghcr.io/0xv1p3r/sk1ll-server:${SK1LL_SERVER_VERSION:-0.1.0}
+    image: ghcr.io/0xv1p3r/sk1ll-server:${SK1LL_SERVER_VERSION:-0.2.0}
     build:
       context: ..
       dockerfile: Dockerfile.server

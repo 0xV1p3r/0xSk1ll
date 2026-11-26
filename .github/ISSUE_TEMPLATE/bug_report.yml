@@ -14,7 +14,7 @@ body:
     attributes:
       label: Version
       description: The output of `sk1ll --version` (and `sk1ll-server --version` for fleet issues)
-      placeholder: sk1ll 0.1.0 (1a2b3c4d5e)
+      placeholder: sk1ll 0.2.0 (1a2b3c4d5e)
     validations:
       required: true
   - type: dropdown

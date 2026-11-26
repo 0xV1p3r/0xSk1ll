@@ -92,6 +92,8 @@ These live on GitHub, not in the repo. To recreate them, use `gh api` with the s
 - Ruleset **Protect main** (`~DEFAULT_BRANCH`, no bypass): no deletion, no force-push, and the `check` and `actions-lock` checks from GitHub Actions must pass.
 - Ruleset **Release tags** (`refs/tags/v*`, repository admins bypass): no creation, update, deletion or force-push. Only an admin can push a release tag.
 - Environment **release**: deployable from `v*` tags only, with the owner as required reviewer. It holds `TAURI_SIGNING_PRIVATE_KEY`.
+- Security: private vulnerability reporting (which `SECURITY.md` links to), secret scanning with push protection, and Dependabot alerts and security updates are on.
+- The `sk1ll-server` package on GHCR is public, so `docker pull` works without logging in.
 
 Builds read the commit for `--version` from git, or from `SK1LL_COMMIT` where there is no `.git` (the server image takes it as a build argument). The toolchain is pinned in `rust-toolchain.toml`.
 
