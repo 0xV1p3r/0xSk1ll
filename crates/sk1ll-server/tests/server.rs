@@ -706,8 +706,15 @@ async fn websocket_gets_assignment_nudge_and_status() {
     // `codex` was new, so the server adds it all off and pushes the assignment.
     let ServerMessage::Assignment(b) = ws_next(&mut ws).await else { panic!("expected assignment") };
     let codex = b.assignment.harness("codex");
+    assert!(b.assignment.harnesses.contains_key("codex"), "it has an entry of its own");
     assert!(!codex.new_skills_default && !codex.new_rules_default);
     assert!(b.revision > a.revision);
+    // Registering it is logged, but there is nothing earlier to restore.
+    let log: Vec<LogEntry> = server.get("/log?machine=ws").await;
+    let added: Vec<_> = log.iter().filter(|e| e.cause == LogCause::HarnessAdded).collect();
+    assert_eq!(added.len(), 2, "{log:?}");
+    assert!(added.iter().all(|e| e.harness == "codex" && e.before.is_none() && e.after == Some(false)));
+    assert_eq!(server.undo(ADMIN, added[0].id).await.status(), StatusCode::CONFLICT);
 
     let dir = clone(&server, "ws", &token).await;
     let repo = dir.path().join("repo");
@@ -1496,6 +1503,32 @@ async fn silent_connections_go_offline() {
 }
 
 /// Review follow-up: changing a default must not flip existing items.
+/// A harness the Server has no entry for yet has the defaults of a new
+/// harness, both off: a change to it is logged against them, so it can be
+/// undone, and one that sets what it already has changes nothing.
+#[tokio::test]
+async fn a_harness_without_an_entry_changes_from_all_off() {
+    let server = start().await;
+    let token = server.join("ws", &["claude"]).await;
+    seed(&server, "ws", &token, &["personal/a/SKILL.md"]).await;
+    let set = |enabled: bool| json!([{"harness": "codex", "kind": "new_skills_default", "enabled": enabled}]);
+
+    let update = server.put_assignment(&token, "ws", set(false)).await;
+    assert!(update.entries.is_empty(), "{:?}", update.entries);
+    assert!(!update.assignment.harnesses.contains_key("codex"), "no toggles restating the default");
+
+    let update = server.put_assignment(&token, "ws", set(true)).await;
+    let kinds: Vec<_> = update.entries.iter().map(|e| (e.kind, e.before, e.after)).collect();
+    assert_eq!(
+        kinds,
+        [(ToggleKind::Skill, None, Some(false)), (ToggleKind::NewSkillsDefault, Some(false), Some(true))]
+    );
+    let resp = server.undo(ADMIN, update.entries[1].id).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let a = server.get_json::<AssignmentSnapshot>(&token, "/machines/ws/assignment").await.assignment;
+    assert!(!a.harness("codex").new_skills_default);
+}
+
 #[tokio::test]
 async fn changing_a_default_keeps_existing_items() {
     let server = start().await;

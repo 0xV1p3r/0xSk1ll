@@ -241,11 +241,16 @@ pub fn apply(
         })
         .collect();
     let mut a = snapshot.assignment;
-    // A harness without an entry gets one from a change to its defaults,
-    // even one that sets what it already has (a reported harness starting
-    // all off), logged with no earlier value: what it had was nobody's.
-    let fresh: BTreeSet<String> =
-        changes.iter().map(|c| c.harness.clone()).filter(|h| !a.harnesses.contains_key(h)).collect();
+    // Registering a reported harness ([`new_harness_changes`]) adds its
+    // entry even though it sets what the harness already had without one,
+    // and logs it with no earlier value, so it can't be undone. A user's
+    // change to a harness without an entry is an ordinary one: its earlier
+    // value is the one it had (the all-off defaults of a new harness).
+    let registered: BTreeSet<String> = changes
+        .iter()
+        .filter(|c| c.cause == LogCause::HarnessAdded && !a.harnesses.contains_key(&c.harness))
+        .map(|c| c.harness.clone())
+        .collect();
     let mut entries = Vec::new();
     let mut log = |a: &mut Assignment, c: Change, before: Option<bool>| -> Result<()> {
         set(a, &c.harness, c.kind, c.item_id.as_ref(), c.after);
@@ -274,7 +279,7 @@ pub fn apply(
         Ok(())
     };
     for c in changes {
-        let before = match fresh.contains(&c.harness) && !c.kind.has_item() {
+        let before = match c.cause == LogCause::HarnessAdded && registered.contains(&c.harness) {
             true => None,
             false => get(&a, &c.harness, c.kind, c.item_id.as_ref()),
         };
