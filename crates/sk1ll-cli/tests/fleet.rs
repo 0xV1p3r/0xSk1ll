@@ -313,7 +313,7 @@ async fn respond(State((requests, replies)): State<(Requests, Replies)>, request
 fn status(machine: &Machine, mode: &str) -> Value {
     json!({"machine_id":"work", "server_url":"https://fleet.example", "mode":mode,
         "has_origin":true, "repo_ready":true, "repo":machine.repo.root(), "headline":"offline",
-        "connection":"offline", "revoked":false, "assignment_revision":2, "report":{}})
+        "connection":"offline", "revoked":false, "assignment_revision":2, "report":{}, "draft_commit_complete":false})
 }
 
 #[test]

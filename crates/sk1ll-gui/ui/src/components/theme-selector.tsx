@@ -42,9 +42,9 @@ export function ThemeSelector({ variant = 'outline' }: { variant?: 'outline' | '
     </DropdownMenuTrigger>
     <DropdownMenuContent align="end" className="w-32">
       <DropdownMenuRadioGroup value={mode} onValueChange={value => setMode(value as Mode)}>
-        <DropdownMenuRadioItem value="light">Light</DropdownMenuRadioItem>
-        <DropdownMenuRadioItem value="dark">Dark</DropdownMenuRadioItem>
-        <DropdownMenuRadioItem value="system">System</DropdownMenuRadioItem>
+        <DropdownMenuRadioItem value="light" closeOnClick>Light</DropdownMenuRadioItem>
+        <DropdownMenuRadioItem value="dark" closeOnClick>Dark</DropdownMenuRadioItem>
+        <DropdownMenuRadioItem value="system" closeOnClick>System</DropdownMenuRadioItem>
       </DropdownMenuRadioGroup>
     </DropdownMenuContent>
   </DropdownMenu>;

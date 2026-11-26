@@ -25,7 +25,7 @@ import { Skills, type SkillsHandoff } from './Skills';
 import { canLeaveFile, type FileEditState } from './SkillFile';
 import { useResource } from './hooks';
 import { eventTopics } from './invalidation';
-import { plural } from './model';
+import { plural, pullToast } from './model';
 import { SyncDialog } from './SyncDialogs';
 import { Settings, ownScope } from './Settings';
 import { VersionNotices } from './VersionNotices';
@@ -135,6 +135,13 @@ export function App() {
     return () => clearTimeout(timer);
   }, [joinedAt, status?.mode]);
   const skills = useResource(api.skills, revision, undefined, ready);
+  const refreshSkills = skills.refresh;
+  useEffect(() => {
+    if (!ready || screen !== 'Library' || reachable === false || apiMismatch) return;
+    // Unmanaged skills can change without changing any daemon status fields.
+    const timer = setInterval(() => void refreshSkills(), 15000);
+    return () => clearInterval(timer);
+  }, [ready, screen, reachable, apiMismatch, refreshSkills]);
   const imports = useResource(api.imports, revisions.imports, undefined, ready);
   const fleet = useResource(api.fleet, revisions.fleet, undefined, !!status && !standalone);
   const [refreshPending, setRefreshPending] = useState(false);
@@ -154,7 +161,18 @@ export function App() {
   const fileEditState = useRef<FileEditState>('clean');
   // Once per run, unless turned off in Settings; builds that can't update themselves skip it.
   useEffect(() => { checkAtStartup(); }, []);
-  const navigate = useCallback((next: Screen, machine?: string) => { if (!canLeaveFile(fileEditState.current)) return false; navigated.current = true; setMatrixTarget(undefined); setFleetTarget(previous => machine ? { id: machine, visit: (previous?.visit ?? 0) + 1 } : undefined); setOpenAdd(0); setSkillsHandoff({}); setScreen(next); window.location.hash = screenHash(next); return true; }, []);
+  const navigate = useCallback((next: Screen, machine?: string) => {
+    if (!canLeaveFile(fileEditState.current)) return false;
+    navigated.current = true;
+    setMatrixTarget(undefined);
+    setFleetTarget(previous => machine ? { id: machine, visit: (previous?.visit ?? 0) + 1 } : undefined);
+    setOpenAdd(0);
+    setSkillsHandoff({});
+    setScreen(next);
+    window.location.hash = screenHash(next);
+    if (next === 'Library' && ready) void refreshSkills();
+    return true;
+  }, [ready, refreshSkills]);
   useEffect(() => {
     const hashchange = () => { const next = screenFromHash(window.location.hash); if (next !== screen && !navigate(next)) window.history.replaceState(null, '', screenHash(screen)); };
     window.addEventListener('hashchange', hashchange);
@@ -310,7 +328,7 @@ export function App() {
     <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} commands={[
       ...visibleScreens(status).map(name => ({ id: `screen-${name.replaceAll(' ', '-')}`, label: `Go to: ${screenLabel(name, status)}`, select: () => navigate(name) })),
       ...(!standalone ? fleet.data?.machines ?? [] : []).map(machine => ({ id: `machine-${machine.id}`, label: `Machine: ${machine.id}`, select: () => navigate('Fleet', machine.id) })),
-      ...(!standalone || status.has_origin ? [{ id: 'action-pull', background: true, label: 'Action: Pull Baseline', select: () => void runAction(async () => { const result = await api.pull(); return { title: result.state === 'blocked' ? 'Pull blocked' : result.state === 'up_to_date' ? 'Baseline is up to date' : 'Pull complete' }; }) },
+      ...(!standalone || status.has_origin ? [{ id: 'action-pull', background: true, label: 'Action: Pull Baseline', select: () => void runAction(async () => pullToast(await api.pull())) },
       { id: 'action-push', background: true, label: 'Action: Push', select: () => void runAction(async () => { const result = await api.push(); return { title: result.pushed ? 'Push complete' : standalone ? 'Push did not reach origin' : 'Push did not reach the Server', tone: result.pushed ? undefined : 'destructive' }; }) },
       ] : []),
       ...(canSync ? [{ id: 'action-sync', label: 'Action: Sync now', select: () => setSyncOpen(true) }] : []),

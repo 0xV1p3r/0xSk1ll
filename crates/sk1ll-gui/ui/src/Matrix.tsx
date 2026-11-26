@@ -148,10 +148,15 @@ function AuthorityMatrix({ revision, status, target, openLog }: MatrixProps) {
     && (kindFilter === 'all' || splitItem(i.item).kind === kindFilter)
     && `${splitItem(i.item).name} ${i.description ?? ''}`.toLowerCase().includes(search.toLowerCase()));
   const selected = data.fleet.machines.filter(machine => standalone || machines === null || machines.includes(machine.id));
+  // Assignment keys keep settings for disabled or removed Harnesses. The report lists which ones are active.
+  const activeHarnesses = (machine: MachineRow) => [...(machine.id === status.machine_id ? status.report.harnesses : machine.report?.harnesses ?? [])].sort();
   // A Machine whose Assignment failed to load has no columns, only its error; nothing reads or writes its Assignment.
-  const groups = selected.map(machine => ({ machine, loaded: !!own(data.assignments, machine.id), harnesses: [...new Set([
-    ...(machine.report?.harnesses ?? []), ...Object.keys(own(data.assignments, machine.id)?.assignment.harnesses ?? {}),
-  ])].sort(), collapsed: collapsed.includes(machine.id), offline: !machine.connected || machine.status === 'offline' })).filter(g => g.harnesses.length || !g.loaded);
+  const groups = selected.map(machine => ({ machine, loaded: !!own(data.assignments, machine.id), harnesses: activeHarnesses(machine),
+    collapsed: collapsed.includes(machine.id), offline: !machine.connected || machine.status === 'offline' })).filter(g => g.harnesses.length || !g.loaded);
+  const copyHarnesses = (machine: MachineRow) => {
+    const harnesses = own(data.assignments, machine.id)?.assignment.harnesses ?? {};
+    return activeHarnesses(machine).filter(harness => Object.hasOwn(harnesses, harness));
+  };
   const offline = new Set(groups.filter(g => g.offline).map(g => g.machine.id));
   const columns = groups.flatMap(({ machine, harnesses, collapsed, loaded }) => collapsed || !loaded ? [] : harnesses.map(harness => ({ machine: machine.id, harness })));
   // A collapsed or unloaded Machine keeps one summary column so it can be expanded or retried.
@@ -195,17 +200,16 @@ function AuthorityMatrix({ revision, status, target, openLog }: MatrixProps) {
   // Writes once per Machine, then announces what the Server accepted.
   const bulk = async (selected: ItemView[], selectedColumns: typeof columns, enabled: boolean | null, title: (changes: number) => string) => {
     const accepted = await Promise.all(groups.filter(g => g.loaded).map(async ({ machine }) => {
-      const changes: ToggleChange[] = selectedColumns.filter(c => c.machine === machine.id).flatMap(c =>
-        selected.filter(item => available(item, machine.id)).map(item => {
-          const { kind, name } = splitItem(reportedName(item, machine.id) ?? item.item);
-          return { harness: c.harness, kind: kind as 'skill' | 'rule', item_id: item.id!, name, enabled };
-        }));
-      // The values shown, at the revision shown: the write applies only to that revision, so they are what Undo restores.
+      // The revision check makes the shown values safe to use for skipping no-ops and recording Undo.
       const shown = own(data.assignments, machine.id)!;
-      const previous = changes.map(change => {
-        const state = cellState(shown.assignment, change.harness, `${change.kind}:${change.name}`, change.item_id);
-        return { ...change, enabled: state.explicit ? state.enabled : null };
-      });
+      const previous: ToggleChange[] = selectedColumns.filter(c => c.machine === machine.id).flatMap(c =>
+        selected.filter(item => available(item, machine.id)).flatMap(item => {
+          const { kind, name } = splitItem(reportedName(item, machine.id) ?? item.item);
+          const state = cellState(shown.assignment, c.harness, item.item, item.id);
+          const before = state.explicit ? state.enabled : null;
+          return before === enabled ? [] : [{ harness: c.harness, kind: kind as 'skill' | 'rule', item_id: item.id!, name, enabled: before }];
+        }));
+      const changes = previous.map(change => ({ ...change, enabled }));
       const expected = expectedFor(machine.id);
       const snapshot = await write(machine.id, changes, { expected });
       return snapshot ? { machine: machine.id, registration: registrationOf(machine), changes: changes.length, previous, snapshot } : null;
@@ -265,10 +269,10 @@ function AuthorityMatrix({ revision, status, target, openLog }: MatrixProps) {
     <Panel>
     {copyTarget && <CopyAssignment target={copyTarget.id}
       expected={{ revision: copyTarget.snapshot.revision, registration: copyTarget.snapshot.registration }}
-      targetHarnesses={Object.keys(copyTarget.snapshot.assignment.harnesses).sort()}
+      targetHarnesses={data.fleet.machines.filter(machine => machine.id === copyTarget.id).flatMap(copyHarnesses)}
       sources={data.fleet.machines.flatMap(machine => {
         const snapshot = own(data.assignments, machine.id);
-        return machine.id !== copyTarget.id && snapshot ? [{ id: machine.id, harnesses: Object.keys(snapshot.assignment.harnesses).sort() }] : [];
+        return machine.id !== copyTarget.id && snapshot ? [{ id: machine.id, harnesses: copyHarnesses(machine) }] : [];
       })}
       close={() => setCopyTarget(undefined)}
       refreshed={resource.refresh}

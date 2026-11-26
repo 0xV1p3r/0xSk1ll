@@ -2,7 +2,7 @@
 import { expect, it } from 'vitest';
 import { screen, waitFor, within } from '@testing-library/react';
 import type { UserEvent } from '@testing-library/user-event';
-import { checked, heading, isDisabled, launch } from './harness';
+import { checked, dialog, heading, isDisabled, launch, nav } from './harness';
 import type { MockDaemon } from '../dev/mock';
 import type { ServiceInfo } from '../types';
 
@@ -55,6 +55,24 @@ it('sets up a standalone Machine: chooses Harnesses before anything syncs, creat
   expect(screen.queryByRole('region', { name: 'Getting started' })).toBeNull();
   expect(localStorage.getItem('sk1ll-getting-started')).toBeNull();
   expect(daemon.sent('fleet')).toEqual([]);
+});
+
+it('marks the checklist commit step done after pushing part of the Draft', async () => {
+  localStorage.setItem('sk1ll-getting-started', 'show');
+  const { daemon, user } = launch('fleet', { hash: '#/library', setup: daemon => daemon.machines.splice(1) });
+  const step = () => within(screen.getByText(/^Commit your Draft to the Fleet/).closest('li')!);
+  await screen.findByRole('region', { name: 'Getting started' });
+  expect(step().getByText(', to do')).toBeTruthy();
+
+  await user.click(step().getByRole('button', { name: 'Review Draft' }));
+  await user.click(await screen.findByRole('checkbox', { name: 'Select rule:style' }));
+  await user.click(screen.getByRole('button', { name: 'Commit (1)' }));
+  await user.click((await dialog('Commit to Baseline')).getByRole('button', { name: 'Commit' }));
+  await screen.findByText('Pushed to the Server.');
+  expect(daemon.status.report.drafts).toEqual(['rule:style']);
+
+  await user.click(nav().getByRole('button', { name: 'Library' }));
+  expect(await step().findByText(', done')).toBeTruthy();
 });
 
 it('joins a Fleet: warns about plain HTTP, waits out the Daemon restart, then turns everything on and reports what failed', async () => {

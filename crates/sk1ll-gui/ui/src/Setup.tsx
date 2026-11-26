@@ -236,10 +236,9 @@ export function GettingStarted({ status, entries, machines, scope, addImport, ne
   const standalone = status.mode === 'standalone';
   const unmanaged = entries?.filter(entry => entry.type === 'unmanaged').length ?? 0;
   const added = !!entries?.some(entry => entry.type !== 'unmanaged');
-  const { baseline, drafts, unpushed, blocked, clashes } = status.report;
-  // Standalone, the starter commit already makes a Baseline; in a Fleet the commit must also reach the Server.
-  const waiting = standalone ? '' : blocked || clashes.length ? 'Blocked by the new Baseline' : unpushed.length ? `${plural(unpushed.length, 'item')} not pushed` : '';
-  const committed = added && baseline !== null && drafts.length === 0 && !waiting;
+  const { unpushed, blocked, clashes } = status.report;
+  const committed = status.draft_commit_complete;
+  const waiting = standalone || committed ? '' : blocked || clashes.length ? 'Blocked by the new Baseline' : unpushed.length ? `${plural(unpushed.length, 'item')} not pushed` : '';
   // Optional steps never keep the checklist open: some Unmanaged skills are meant to stay that way.
   const steps: { title: string; done: boolean; optional?: boolean; note?: string; action?: ReactNode }[] = [
     { title: 'Add a Skill or Rule', done: added,

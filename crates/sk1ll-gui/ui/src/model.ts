@@ -1,4 +1,4 @@
-import type { Assignment, StatusView, CachedAssignmentSnapshot as AssignmentSnapshot, HarnessAssignment, ItemId, ItemRef, ItemView, MachineReport, MachineRow, MachineStatus, ToggleChange } from './types';
+import type { Assignment, StatusView, CachedAssignmentSnapshot as AssignmentSnapshot, HarnessAssignment, ItemId, ItemRef, ItemView, MachineReport, MachineRow, MachineStatus, PullResult, ToggleChange } from './types';
 
 export const statusOrder: MachineStatus[] = ['offline', 'blocked', 'conflict', 'behind', 'drafting', 'in_sync'];
 export const statusLabels: Record<MachineStatus, string> = {
@@ -9,6 +9,12 @@ export const statusTone: Record<MachineStatus, 'secondary' | 'destructive' | 'wa
   offline: 'secondary', blocked: 'destructive', conflict: 'warning', behind: 'info', drafting: 'drafting', in_sync: 'success',
 };
 export const plural = (count: number, one: string, many = `${one}s`) => `${count} ${count === 1 ? one : many}`;
+export function pullToast(result: PullResult) {
+  if (result.state !== 'blocked') return { title: result.state === 'up_to_date' ? 'Baseline is up to date' : 'Pull complete' };
+  const description = result.items.length ? `The new Baseline also changes ${result.items.join(', ')} in this Machine's Draft.`
+    : result.pending ? 'An interrupted pull still needs to finish.' : "The new Baseline clashes with this Machine's Draft.";
+  return { title: 'Pull blocked', description };
+}
 // Shared vocabulary so every screen names the same things the same way.
 export const terms = { explicit: 'Explicit', inherited: 'Inherited', inheritedLong: 'Inherited from the Harness default', search: 'Search Skills and Rules' } as const;
 export function headline(offline: boolean, report: MachineReport | null, baseline: string | null): MachineStatus {

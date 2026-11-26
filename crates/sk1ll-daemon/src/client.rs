@@ -178,6 +178,8 @@ pub struct StatusView {
     pub auth_rejected_since: Option<i64>,
     /// What the daemon reports to the server.
     pub report: MachineReport,
+    /// A Draft was committed here (and pushed to the server when joined).
+    pub draft_commit_complete: bool,
     /// The daemon's build ([`sk1ll_core::VERSION`]).
     #[serde(default)]
     pub version: String,

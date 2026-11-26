@@ -14,7 +14,7 @@
 
 `sk1ll setup` asks the same questions on the command line. It goes through the daemon if one is running, otherwise through the engine it runs itself, and at the end it offers to install and start the service. Answers come from standard input, so it can be scripted.
 
-After the wizard, the Library shows a getting-started checklist: add a skill or rule, adopt unmanaged skills (optional), commit the draft and, on a fleet, add another machine. On a fleet, the commit step is done once the commit is pushed and the machine isn't Blocked. It goes away when every required step is done or you dismiss it. Choose **Show getting started** in the command palette to bring it back, including on Machines set up before the checklist existed.
+After the wizard, the Library shows a getting-started checklist: add a skill or rule, adopt unmanaged skills (optional), commit the draft and, on a fleet, add another machine. The commit step is done once this Machine commits a Draft in standalone mode or pushes a commit to the fleet. It goes away when every required step is done or you dismiss it. Choose **Show getting started** in the command palette to bring it back, including on Machines set up before the checklist existed.
 
 ## Screens
 

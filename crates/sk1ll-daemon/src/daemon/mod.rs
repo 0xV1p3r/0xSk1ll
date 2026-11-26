@@ -296,6 +296,7 @@ impl Daemon {
                 .unwrap_or_default(),
             awaiting_assignment: snapshot.is_none(),
             auth_rejected_since: None,
+            draft_commit_complete: false,
             // Before the first reconcile (a read-only engine never runs
             // one), behind is judged against the Baseline the repo is on.
             report: MachineReport {

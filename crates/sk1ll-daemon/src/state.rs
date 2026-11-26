@@ -6,7 +6,8 @@
 //! It also keeps what a restart must not forget about the server's Baseline
 //! ([`PullRecord`]): the Baseline last known and whether the Machine is
 //! Blocked on it. A standalone daemon has no state file and keeps that record
-//! in [`standalone_record_path`].
+//! in [`standalone_record_path`]. The record also tracks whether this Machine
+//! has completed its first Draft commit.
 //!
 //! Next to it, also private: the last assignment snapshot the server sent
 //! (revision and content together, so they can't disagree), tagged with the
@@ -40,7 +41,7 @@ pub enum PullState {
     Pending { baseline: String, items: Vec<ItemRef> },
 }
 
-/// What the daemon remembers about the server's Baseline across restarts.
+/// What the daemon remembers about the Baseline and first Draft commit across restarts.
 ///
 /// Only a hint: a field that can't be read (written by another version, say)
 /// is dropped with a warning rather than keep the daemon from starting. The
@@ -57,6 +58,9 @@ pub struct PullRecord {
     /// The server refused to take `commit` for good, until `HEAD` moves on.
     #[serde(default, deserialize_with = "or_default", skip_serializing_if = "Option::is_none")]
     pub push_refused: Option<PushRefusal>,
+    /// This Machine has committed a Draft locally, or pushed one when joined.
+    #[serde(default, deserialize_with = "or_default", skip_serializing_if = "std::ops::Not::not")]
+    pub draft_commit_complete: bool,
 }
 
 /// A push the server refused for good (see [`PullRecord::push_refused`]).

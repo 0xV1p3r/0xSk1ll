@@ -64,7 +64,7 @@ it('restores only the reviewed items, even when an edit or a new item arrives wh
 
   await user.click(trigger);
   const restore = await dialog('Restore all Draft items?');
-  expect(restore.getByText('Return skill:release-notes, rule:style to Baseline. Their Draft changes will be lost.')).toBeTruthy();
+  expect(restore.getByText('Return skill:release-notes, rule:style to Baseline. Draft changes to these items will be lost.')).toBeTruthy();
   // A binary edit changes only the fingerprint; a new item appears.
   daemon.draft.find(entry => entry.item === 'rule:style')!.fingerprint = 'binary-edit';
   daemon.draft.push({ item: 'skill:new', change: 'added', paths: ['personal/new/SKILL.md'], fingerprint: 'n1' });
@@ -101,10 +101,13 @@ it('gets past a Blocked pull by keeping this Machine\'s version, one item or all
   } });
   await heading('Draft');
   const clashes = within(await screen.findByRole('list', { name: 'Clashing items' }));
+  await user.click(screen.getByRole('button', { name: 'Pull Baseline' }));
+  expect(await screen.findByText('Pull blocked')).toBeTruthy();
+  expect(screen.getByText("The new Baseline also changes rule:style, skill:release-notes, skill:deploy in this Machine's Draft.")).toBeTruthy();
   // Restore takes the Baseline instead, for items that are in this Draft.
   expect(isDisabled(clashes.getByRole('button', { name: 'Restore skill:deploy' }))).toBe(true);
   await user.click(clashes.getByRole('button', { name: 'Restore rule:style' }));
-  await dialog('Restore 1 selected items?');
+  await dialog('Restore 1 selected item?');
   await user.click(screen.getByRole('button', { name: 'Cancel' }));
 
   await user.click(clashes.getByRole('button', { name: 'Keep mine: rule:style' }));

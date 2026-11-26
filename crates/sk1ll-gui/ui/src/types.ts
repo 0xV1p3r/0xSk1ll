@@ -19,6 +19,7 @@ export interface StatusView {
   machine_id: string; server_url: string | null; repo: string; headline: MachineStatus; connection: Connection;
   last_error: string | null; revoked: boolean; server_baseline: string | null; assignment_revision: number;
   awaiting_assignment: boolean; auth_rejected_since: number | null; report: MachineReport;
+  draft_commit_complete: boolean;
   version?: string;
   // The Daemon's protocol version, and what the Server last said about its versions.
   protocol?: number; server?: ServerVersion | null;

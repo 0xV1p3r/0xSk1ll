@@ -1,7 +1,7 @@
 // Choosing what each Machine's Harnesses get in the Assignment matrix.
 import { expect, it } from 'vitest';
 import { screen, waitFor, within } from '@testing-library/react';
-import { checked, dialog, heading, isDisabled, launch, toastButton } from './harness';
+import { checked, dialog, heading, isDisabled, launch, notify, toastButton } from './harness';
 
 const cell = (item: string, column: string, state: 'explicit' | 'inherited') => screen.getByRole('checkbox', { name: `${item} in ${column}, ${state}` });
 const expected = (machine: string, revision: number) => ({ revision, registration: `reg-${machine}` });
@@ -54,18 +54,17 @@ it('bulk-changes rows and filtered columns once per Machine, and Undo restores w
   await screen.findByRole('checkbox', { name: 'rule:security in workstation / codex, explicit' });
   await user.click(screen.getByRole('button', { name: 'Actions for rule:security' }));
   await user.click(await screen.findByRole('menuitem', { name: 'Enable in all visible Harnesses' }));
-  expect(await screen.findByText('Enabled security in 4 Harnesses')).toBeTruthy();
+  expect(await screen.findByText('Enabled security in 3 Harnesses')).toBeTruthy();
   expect(screen.getByText('Applies when ci-runner reconnects.')).toBeTruthy();
   expect(await screen.findByText('build-box: build-box rejected')).toBeTruthy();
   expect(daemon.sent('set_assignment').map(args => args.machine).sort()).toEqual(['build-box', 'ci-runner', 'laptop', 'workstation']);
   expect(daemon.sent('set_assignment').find(args => args.machine === 'workstation')).toEqual({ machine: 'workstation', changes: { changes: [
     { harness: 'claude', kind: 'rule', item_id: 'id-security', name: 'security', enabled: true },
-    { harness: 'codex', kind: 'rule', item_id: 'id-security', name: 'security', enabled: true },
   ], expected: expected('workstation', 42) } });
   await waitFor(() => expect(checked(cell('rule:security', 'workstation / claude', 'explicit'))).toBe(true));
 
   await user.click(toastButton('Undo'));
-  expect(await screen.findByText('Restored 4 Assignments')).toBeTruthy();
+  expect(await screen.findByText('Restored 3 Assignments')).toBeTruthy();
   await waitFor(() => expect(checked(cell('rule:security', 'workstation / claude', 'inherited'))).toBe(false));
   expect(checked(cell('rule:security', 'workstation / codex', 'explicit'))).toBe(true);
   expect(daemon.assignments.workstation.harnesses.claude.rules).not.toHaveProperty('id-security');
@@ -84,10 +83,10 @@ it('bulk-changes rows and filtered columns once per Machine, and Undo restores w
   await waitFor(() => expect(screen.queryByText('code-review')).toBeNull());
   const before = daemon.sent('set_assignment').length;
   await user.click(screen.getByRole('button', { name: 'Actions for workstation / claude' }));
-  await user.click(await screen.findByRole('menuitem', { name: 'Disable all visible items' }));
-  expect(await screen.findByText('Disabled 1 item in workstation / claude')).toBeTruthy();
+  await user.click(await screen.findByRole('menuitem', { name: 'Enable all visible items' }));
+  expect(await screen.findByText('Enabled 1 item in workstation / claude')).toBeTruthy();
   expect(daemon.sent('set_assignment').slice(before)).toEqual([{ machine: 'workstation', changes: {
-    changes: [{ harness: 'claude', kind: 'skill', item_id: 'id-deploy', name: 'deploy', enabled: false }], expected: expected('workstation', 44) } }]);
+    changes: [{ harness: 'claude', kind: 'skill', item_id: 'id-deploy', name: 'deploy', enabled: true }], expected: expected('workstation', 44) } }]);
   await user.clear(screen.getByRole('textbox', { name: 'Search items' }));
   await user.selectOptions(screen.getByRole('combobox', { name: 'Item kind' }), 'rule');
   expect(screen.queryByText('deploy')).toBeNull();
@@ -96,6 +95,33 @@ it('bulk-changes rows and filtered columns once per Machine, and Undo restores w
   await user.click(await screen.findByRole('menuitem', { name: 'Only this Machine' }));
   await waitFor(() => expect(screen.queryByRole('checkbox', { name: /in ci-runner \// })).toBeNull());
   expect(localStorage.getItem('assignment-matrix-machines')).toBe('["workstation"]');
+});
+
+it('drops inactive Harnesses from editable columns and copy options while keeping their saved Assignments', async () => {
+  const { daemon, user } = launch('fleet', { hash: '#/assignment-matrix', setup: daemon => {
+    daemon.status.report.harnesses.push('myagent');
+    daemon.assignments.workstation.harnesses.myagent = structuredClone(daemon.assignments.workstation.harnesses.codex);
+  } });
+  await screen.findByRole('button', { name: 'Actions for workstation / myagent' });
+  await screen.findByRole('button', { name: 'Actions for build-box / codex' });
+
+  daemon.machines[0].report = { ...daemon.status.report }; // The server still has the old local report.
+  daemon.status.report.harnesses = ['claude', 'codex'];
+  daemon.machines.find(machine => machine.id === 'build-box')!.report!.harnesses = ['claude'];
+  await notify('assignment');
+  await waitFor(() => {
+    expect(screen.queryByRole('button', { name: 'Actions for workstation / myagent' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Actions for build-box / codex' })).toBeNull();
+  });
+  expect(daemon.assignments.workstation.harnesses).toHaveProperty('myagent');
+  expect(daemon.assignments['build-box'].harnesses).toHaveProperty('codex');
+
+  await user.click(screen.getByRole('button', { name: 'Actions for workstation' }));
+  await user.click(await screen.findByRole('menuitem', { name: 'Copy Assignment from…' }));
+  const copy = await dialog('Copy Assignment from…');
+  await user.selectOptions(copy.getByLabelText('Source Machine'), 'build-box');
+  expect(copy.queryByLabelText('Source Harness for myagent')).toBeNull();
+  expect(within(copy.getByLabelText('Source Harness for codex')).queryByRole('option', { name: 'codex' })).toBeNull();
 });
 
 it('copies another Machine\'s Assignment after previewing it, and previews again when the target changed', async () => {
