@@ -13,7 +13,7 @@ it('shows this Machine\'s details in order, copies diagnostics as text, and save
   const { daemon, user } = launch('fleet', { hash: '#/settings' });
   await heading('Settings');
   await screen.findByLabelText('Preferred editor');
-  expect(screen.getAllByRole('heading', { level: 2 }).map(node => node.textContent)).toEqual(['This machine', 'Fleet membership', 'Editor', 'App updates', 'Diagnostics']);
+  expect(screen.getAllByRole('heading', { level: 2 }).map(node => node.textContent)).toEqual(['This Machine', 'Fleet membership', 'Editor', 'App updates', 'Diagnostics']);
   // Inactive diagnostics stay hidden.
   expect(screen.queryByText('Auth rejected since')).toBeNull();
   expect(screen.getByText('/run/user/1000/sk1ll/daemon.sock')).toBeTruthy();

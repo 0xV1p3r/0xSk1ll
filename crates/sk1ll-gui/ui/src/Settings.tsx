@@ -29,24 +29,27 @@ export const ownScope = (fleet: FleetView | undefined, machineId: string): Scope
 };
 
 // Creates a single-use join code of the chosen scope and shows it once. A self-only Machine can't create codes.
-export function JoinCodeButton({ label, serverUrl, variant = 'outline', scope: own }: { label: string; serverUrl: string | null; variant?: 'outline' | 'default'; scope?: Scope }) {
+// `compact` fits a toolbar: the scope's meaning moves into the select's hint and the join-code dialog.
+export function JoinCodeButton({ label, serverUrl, variant = 'outline', scope: own, compact = false }: { label: string; serverUrl: string | null; variant?: 'outline' | 'default'; scope?: Scope; compact?: boolean }) {
   const [joinCode, setJoinCode] = useState<JoinCode>();
   const [scope, setScope] = useState<Scope>('fleet');
   const quote = (arg: string) => /^[a-zA-Z0-9_:/.-]+$/.test(arg) ? arg : "'" + arg.replaceAll("'", "'\\''") + "'";
   const command = serverUrl && joinCode ? `sk1ll join ${quote(serverUrl)} ${quote(joinCode.code)}` : null;
   const createCode = useMutation();
   const trigger = useRef<HTMLButtonElement>(null);
+  const selfOnly = 'This Machine joined with a Self-only join code, so it can manage only itself and cannot create join codes. Ask a Machine with Fleet scope, or the Server admin.';
+  if (own === 'self' && compact) return <p className="max-w-sm text-right text-xs text-muted-foreground">{selfOnly}</p>;
   if (own === 'self') return <p className="text-xs text-muted-foreground">This Machine joined with a Self-only join code, so it can manage only itself and cannot create join codes. Ask a Machine with Fleet scope, or the Server admin.</p>;
   const id = `join-scope-${label.replaceAll(' ', '-').toLowerCase()}`;
-  return <div className="flex flex-col items-start gap-3">
+  return <div className={compact ? 'flex flex-col items-end gap-2' : 'flex flex-col items-start gap-3'}>
     <div className="flex flex-wrap items-center gap-2">
-      <NativeSelect id={id} aria-label="New Machine may manage" value={scope} disabled={createCode.pending} onChange={e => setScope(e.target.value as Scope)}>
+      <NativeSelect id={id} aria-label="New Machine may manage" title={compact ? `${scope === 'fleet' ? 'Whole Fleet' : 'Only itself'}: the new Machine ${scopeSummary[scope].charAt(0).toLowerCase() + scopeSummary[scope].slice(1)}` : undefined} value={scope} disabled={createCode.pending} onChange={e => setScope(e.target.value as Scope)}>
         <option value="fleet">Whole Fleet</option><option value="self">Only itself</option></NativeSelect>
       <Button ref={trigger} variant={variant} className="relative" aria-label={label} aria-busy={createCode.pending} disabled={createCode.pending} onClick={() => void createCode.run(() => api.joinCode(scope), setJoinCode)}>
         {/* Keep the label's width while pending so the header doesn't reflow. */}
         <span className={createCode.pending ? 'invisible' : undefined}>{label}</span>
         {createCode.pending && <LoaderCircle aria-hidden className="absolute inset-0 m-auto animate-spin" />}</Button></div><ErrorNotice error={createCode.error} />
-    <p className="text-xs text-muted-foreground">{scope === 'fleet' ? 'Whole Fleet' : 'Only itself'}: the new Machine {scopeSummary[scope].charAt(0).toLowerCase() + scopeSummary[scope].slice(1)}</p>
+    {!compact && <p className="text-xs text-muted-foreground">{scope === 'fleet' ? 'Whole Fleet' : 'Only itself'}: the new Machine {scopeSummary[scope].charAt(0).toLowerCase() + scopeSummary[scope].slice(1)}</p>}
     <Dialog open={joinCode !== undefined} onOpenChange={open => { if (!open) setJoinCode(undefined); }}>
       <DialogContent finalFocus={trigger}><DialogHeader><DialogTitle>Join code</DialogTitle>
         <DialogDescription>Copy this single-use code now. It cannot be shown again{joinCode && <> and expires {time(joinCode.expires_at)}.</>}
@@ -96,7 +99,7 @@ export function Settings({ revision, fleetRevision = revision, status, socket, c
   const join = useMutation(changed);
   const connection = status.connection.replaceAll('_', ' ');
   return <>
-    <Panel label="This machine"><PanelToolbar><SectionTitle>This machine</SectionTitle></PanelToolbar>
+    <Panel label="This Machine"><PanelToolbar><SectionTitle>This Machine</SectionTitle></PanelToolbar>
       <div className="p-3.5"><Details rows={[
         ['Machine id', status.machine_id], ['Server', status.server_url || 'Not configured'], ['Connection', <span className="capitalize">{connection}</span>],
         ['Repo', <Path value={status.repo} />],
@@ -169,9 +172,9 @@ export function Settings({ revision, fleetRevision = revision, status, socket, c
       <div className="p-3.5"><AppUpdateSettings canLeave={canLeave} /></div>
     </Panel>
     <Panel label="Diagnostics"><PanelToolbar><SectionTitle>Diagnostics</SectionTitle>
-      <Action className="ml-auto" label="Copy diagnostics" doneLabel="Copied" action={() => navigator.clipboard.writeText(
+      <div className="ml-auto"><Action label="Copy diagnostics" doneLabel="Copied" action={() => navigator.clipboard.writeText(
         [...diagnostics, ...(status.last_error ? [['Last error', status.last_error]] : [])].map(([label, value]) => `${label}: ${value}`).join('\n')
-      )} /></PanelToolbar><div className="p-3.5"><Details rows={diagnostics.map(([label, value]) => [label,
+      )} /></div></PanelToolbar><div className="p-3.5"><Details rows={diagnostics.map(([label, value]) => [label,
         label === 'Socket' ? <code className="font-mono text-xs break-all">{value}</code>
           : label === 'Auth rejected since' ? <When seconds={status.auth_rejected_since} /> : value,
       ])} />{status.last_error && <div className="mt-3"><ErrorNotice error={status.last_error} /></div>}</div></Panel>

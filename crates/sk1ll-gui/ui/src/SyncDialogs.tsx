@@ -4,7 +4,7 @@ import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { api, errorMessage } from './api';
 import { useMutation, useResource } from './hooks';
-import { DiffLines, ErrorNotice, Loading, Pending } from './shared';
+import { DiffView, ErrorNotice, Loading, Pending } from './shared';
 import { toast } from './toast';
 
 export function InstructionsDialog({ harness, onClose }: { harness: string; onClose: () => void }) {
@@ -27,9 +27,9 @@ export function InstructionsDialog({ harness, onClose }: { harness: string; onCl
         {preview.data.map(file => <Tabs.Panel key={file.path} value={file.path} className="space-y-3 pt-3">
           <p className="break-all font-mono text-xs text-muted-foreground">{file.path}</p>
           <h3 className="font-medium">Rendered file</h3>
-          <pre className="max-h-64 overflow-auto rounded-md border bg-muted/40 p-3 text-xs">{file.next_content}</pre>
+          <pre className="max-h-64 overflow-auto rounded-md border bg-card p-3 font-mono text-xs leading-5">{file.next_content}</pre>
           <h3 className="font-medium">On disk vs next sync</h3>
-          {file.differs ? <div tabIndex={0} aria-label="Instruction diff" className="diff max-h-64 overflow-auto whitespace-pre rounded-md border bg-muted/40 p-3 font-mono text-xs"><DiffLines diff={file.diff} /></div>
+          {file.differs ? <DiffView diff={file.diff} label="Instruction diff" className="max-h-64" />
             : <p className="text-muted-foreground">Matches the file on disk.</p>}
         </Tabs.Panel>)}
       </Tabs.Root>}

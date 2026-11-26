@@ -139,10 +139,22 @@
   *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
 
-/* Unified diff line colours; everything else is Tailwind utilities. */
-.diff [data-kind="add"] { color: var(--success-foreground); background: color-mix(in oklch, var(--success) 12%, transparent); }
-.diff [data-kind="delete"] { color: var(--destructive-foreground); background: color-mix(in oklch, var(--destructive) 10%, transparent); }
-.diff [data-kind="hunk"] { color: var(--info-foreground); }
+/* Unified diff rows: a line-number gutter, a sign column, then the text. Colours tint the row; the text stays readable. */
+.diff > div > div { padding-right: 0.75rem; white-space: pre; }
+.diff [data-n] { display: inline-block; box-sizing: content-box; width: var(--diff-gutter, 2ch); padding: 0 0.5rem; text-align: right; color: var(--muted-foreground); opacity: 0.7; user-select: none; }
+.diff [data-n]::before { content: attr(data-n); }
+.diff [data-n] + [data-n] { border-right: 1px solid var(--border); margin-right: 0.5rem; }
+.diff [data-kind="add"] { background: color-mix(in oklch, var(--success) 10%, transparent); }
+.diff [data-kind="add"] { color: color-mix(in oklch, var(--success-foreground) 55%, var(--foreground)); }
+.diff [data-kind="add"] [data-n] { color: var(--success-foreground); opacity: 1; }
+.diff [data-kind="delete"] { background: color-mix(in oklch, var(--destructive) 9%, transparent); }
+.diff [data-kind="delete"] { color: color-mix(in oklch, var(--destructive-foreground) 55%, var(--foreground)); }
+.diff [data-kind="delete"] [data-n] { color: var(--destructive-foreground); opacity: 1; }
+.diff [data-kind="note"] { color: var(--muted-foreground); }
+.diff [data-kind="hunk"], .diff [data-kind="file"] { padding: 0.125rem 0.75rem; color: var(--muted-foreground); background: var(--muted); border-block: 1px solid var(--border); }
+.diff [data-kind="file"] { font-family: var(--font-sans); font-weight: 500; color: var(--foreground); }
+.diff > div > :first-child:is([data-kind="hunk"], [data-kind="file"]) { border-top: 0; }
+.diff [data-kind="file"] + [data-kind="hunk"] { border-top: 0; }
 
 .skill-markdown { overflow-wrap: anywhere; line-height: 1.7; }
 .skill-markdown > * + * { margin-top: 0.75rem; }

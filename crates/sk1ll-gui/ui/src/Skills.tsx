@@ -12,7 +12,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { toast } from './toast';
 import { api } from './api';
 import { useMutation, useResource } from './hooks';
-import { ChangeBadge, Confirm, DiffLines, ErrorNotice, Loading, Nothing, Notice, Panel, PanelToolbar, Pending, SectionTitle } from './shared';
+import { ChangeBadge, Confirm, DiffView, ErrorNotice, Loading, Nothing, Notice, Panel, PanelToolbar, Pending } from './shared';
 import { terms } from './model';
 import { SkillFile, canLeaveFile, type FileEditState } from './SkillFile';
 import { unifiedDiff } from './textDiff';
@@ -73,8 +73,7 @@ export function Skills({ fileEditState, entries, revision, changed, reviewDraft,
     .sort((a, b) => ((sort.column === 'type' ? typeLabels[a.type].localeCompare(typeLabels[b.type]) : 0) || a.name.localeCompare(b.name)) * (sort.descending ? -1 : 1));
   const sortBy = (column: 'name' | 'type') => setSort(previous => ({ column, descending: previous.column === column && !previous.descending }));
   return <div className="flex min-w-0 flex-col gap-4">
-    <SectionTitle>Library</SectionTitle>
-    {(handoff.filter === 'unmanaged' || unmanagedCount > 0) && <Notice title="Unmanaged skills">{unmanagedCount} unmanaged {unmanagedCount === 1 ? 'skill found' : 'skills found'} in your Harnesses. Adopt {unmanagedCount === 1 ? 'it' : 'them'} to manage {unmanagedCount === 1 ? 'it' : 'them'} with 0xSk1ll. <Button variant="outline" size="sm" onClick={() => { setFilter(filter === 'unmanaged' ? 'all' : 'unmanaged'); setSearch(''); }}>{filter === 'unmanaged' ? 'Show all' : 'Show Unmanaged'}</Button></Notice>}
+    {(handoff.filter === 'unmanaged' || unmanagedCount > 0) && <Notice title="Unmanaged skills" action={<Button variant="outline" size="sm" onClick={() => { setFilter(filter === 'unmanaged' ? 'all' : 'unmanaged'); setSearch(''); }}>{filter === 'unmanaged' ? 'Show all' : 'Show Unmanaged'}</Button>}>{unmanagedCount} unmanaged {unmanagedCount === 1 ? 'skill found' : 'skills found'} in your Harnesses. Adopt {unmanagedCount === 1 ? 'it' : 'them'} to manage {unmanagedCount === 1 ? 'it' : 'them'} with 0xSk1ll.</Notice>}
     <Panel label="Library contents"><PanelToolbar>
       <Field className="min-w-40 flex-1 sm:max-w-xs"><FieldLabel className="sr-only" htmlFor="skill-search">Search by name</FieldLabel>
         <Input id="skill-search" type="search" value={search} onChange={event => setSearch(event.target.value)} placeholder={terms.search} /></Field>
@@ -85,9 +84,9 @@ export function Skills({ fileEditState, entries, revision, changed, reviewDraft,
       <DropdownMenu><DropdownMenuTrigger render={<Button className="ml-auto" />}>New</DropdownMenuTrigger><DropdownMenuContent><DropdownMenuGroup><DropdownMenuItem onClick={() => startCreate('skill')}>New Skill</DropdownMenuItem><DropdownMenuItem onClick={() => startCreate('rule')}>New Rule</DropdownMenuItem></DropdownMenuGroup></DropdownMenuContent></DropdownMenu>
     </PanelToolbar>
     {visible.length ? <Table aria-label="Skills" stickyFirstColumn>
-      <TableHeader><TableRow className="bg-muted hover:bg-muted">{(['name', 'type'] as const).map(column => <TableHead key={column}
+      <TableHeader><TableRow>{(['name', 'type'] as const).map(column => <TableHead key={column}
         aria-sort={sort.column === column ? sort.descending ? 'descending' : 'ascending' : 'none'}>
-        <Button variant="ghost" size="default" className="-ml-2.5" onClick={() => sortBy(column)}>{column === 'name' ? 'Name' : 'Type'}
+        <Button variant="ghost" size="sm" className="-ml-2.5 text-xs font-medium text-muted-foreground hover:text-foreground" onClick={() => sortBy(column)}>{column === 'name' ? 'Name' : 'Type'}
           {sort.column === column && (sort.descending ? <ArrowDown data-icon="inline-end" /> : <ArrowUp data-icon="inline-end" />)}</Button>
       </TableHead>)}<TableHead>Draft state</TableHead><TableHead>Harnesses</TableHead></TableRow></TableHeader>
       <TableBody>{visible.map(value => {
@@ -188,8 +187,7 @@ function VariantCompare({ item, base, variants, revision }: { item: string; base
       </NativeSelect></Field>
     <p className="text-xs text-muted-foreground"><span className="text-destructive-foreground">−</span> lines are only in {baseLabel}; <span className="text-success-foreground">+</span> lines are only in {other ? variantLabel(other) : 'the other variant'}.</p>
     <ErrorNotice error={diff.error} />
-    {diff.loading && diff.data === undefined ? <Loading rows={2} /> : diff.data !== undefined && <pre tabIndex={0} aria-label="Variant diff" className="diff min-w-0 max-w-full overflow-auto rounded-md border bg-muted/40 p-3 font-mono text-xs leading-relaxed outline-none [tab-size:4] focus-visible:ring-3 focus-visible:ring-ring">
-      {diff.data ? <DiffLines diff={diff.data} /> : <span className="text-muted-foreground">No textual differences.</span>}</pre>}
+    {diff.loading && diff.data === undefined ? <Loading rows={2} /> : diff.data !== undefined && <DiffView diff={diff.data} label="Variant diff" empty="No textual differences." />}
   </div>;
 }
 

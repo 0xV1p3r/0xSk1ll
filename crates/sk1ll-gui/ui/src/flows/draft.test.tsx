@@ -21,7 +21,7 @@ it('commits the reviewed selection and refuses to commit once the Draft changed 
   const trigger = screen.getByRole('button', { name: 'Commit (2)' });
   await user.click(trigger);
   let commit = await dialog('Commit to Baseline');
-  expect((commit.getByRole('textbox', { name: 'Message' }) as HTMLTextAreaElement).value).toBe('Commit skill:release-notes, rule:style');
+  expect((commit.getByRole('textbox', { name: 'Message' }) as HTMLTextAreaElement).value).toBe('commit release-notes, style from workstation');
   await user.keyboard('{Escape}');
   await waitFor(() => expect(document.activeElement).toBe(trigger));
 
@@ -39,8 +39,8 @@ it('commits the reviewed selection and refuses to commit once the Draft changed 
   daemon.diffs['rule:style'] += '\n+Prefer early returns.';
   daemon.draft.splice(daemon.draft.findIndex(entry => entry.item === 'skill:release-notes'), 1);
   await notify('draft');
-  await commit.findByText('rule:style: Draft content changed');
-  expect(commit.getByText('skill:release-notes: no longer in Draft')).toBeTruthy();
+  await commit.findByText('style: Draft content changed');
+  expect(commit.getByText('release-notes: no longer in Draft')).toBeTruthy();
   expect(isDisabled(commit.getByRole('button', { name: 'Commit' }))).toBe(true);
   await user.click(commit.getByRole('button', { name: 'Review updated Draft' }));
   expect((commit.getByRole('textbox', { name: 'Message' }) as HTMLTextAreaElement).value).toBe('Tighten the style rule');
@@ -64,13 +64,13 @@ it('restores only the reviewed items, even when an edit or a new item arrives wh
 
   await user.click(trigger);
   const restore = await dialog('Restore all Draft items?');
-  expect(restore.getByText('Return skill:release-notes, rule:style to Baseline. Draft changes to these items will be lost.')).toBeTruthy();
+  expect(restore.getByText('Return release-notes, style to Baseline. Draft changes to these items will be lost.')).toBeTruthy();
   // A binary edit changes only the fingerprint; a new item appears.
   daemon.draft.find(entry => entry.item === 'rule:style')!.fingerprint = 'binary-edit';
   daemon.draft.push({ item: 'skill:new', change: 'added', paths: ['personal/new/SKILL.md'], fingerprint: 'n1' });
   await notify('draft');
-  await restore.findByText('skill:new: added to Draft');
-  expect(restore.getByText('rule:style: Draft content changed')).toBeTruthy();
+  await restore.findByText('new: added to Draft');
+  expect(restore.getByText('style: Draft content changed')).toBeTruthy();
   expect(isDisabled(restore.getByRole('button', { name: 'Restore all' }))).toBe(true);
   // Going back to the reviewed bytes doesn't undo the need to review.
   daemon.draft.find(entry => entry.item === 'rule:style')!.fingerprint = 'b2';
@@ -103,7 +103,7 @@ it('gets past a Blocked pull by keeping this Machine\'s version, one item or all
   const clashes = within(await screen.findByRole('list', { name: 'Clashing items' }));
   await user.click(screen.getByRole('button', { name: 'Pull Baseline' }));
   expect(await screen.findByText('Pull blocked')).toBeTruthy();
-  expect(screen.getByText("The new Baseline also changes rule:style, skill:release-notes, skill:deploy in this Machine's Draft.")).toBeTruthy();
+  expect(screen.getByText("The new Baseline also changes style, release-notes, deploy in this Machine's Draft.")).toBeTruthy();
   // Restore takes the Baseline instead, for items that are in this Draft.
   expect(isDisabled(clashes.getByRole('button', { name: 'Restore skill:deploy' }))).toBe(true);
   await user.click(clashes.getByRole('button', { name: 'Restore rule:style' }));
@@ -111,7 +111,7 @@ it('gets past a Blocked pull by keeping this Machine\'s version, one item or all
   await user.click(screen.getByRole('button', { name: 'Cancel' }));
 
   await user.click(clashes.getByRole('button', { name: 'Keep mine: rule:style' }));
-  let keep = await dialog('Keep your version of rule:style?');
+  let keep = await dialog('Keep your version of style?');
   expect(keep.getByText(/The whole file wins: the other Machine's change to this item is overwritten/)).toBeTruthy();
   expect(keep.getByText('sk1ll diff')).toBeTruthy();
   expect(daemon.sent('pull_keep')).toEqual([]);
@@ -124,7 +124,7 @@ it('gets past a Blocked pull by keeping this Machine\'s version, one item or all
   keep = await dialog('Keep your version of every clashing item?');
   expect(keep.getByText(/change to these items is overwritten/)).toBeTruthy();
   await user.click(keep.getByRole('button', { name: 'Keep mine' }));
-  const notice = await screen.findByText(/Your version of skill:release-notes, skill:deploy is back on top of Baseline b4se11ne0000/);
+  const notice = await screen.findByText(/Your version of release-notes, deploy is back on top of Baseline b4se11ne0000/);
   expect(notice.textContent).toMatch(/replacing the other Machine's change/);
   expect(screen.getByText('sk1ll diff skill:release-notes skill:deploy')).toBeTruthy();
   expect(screen.getByRole('button', { name: 'Diff for skill:release-notes' }).getAttribute('aria-expanded')).toBe('true');

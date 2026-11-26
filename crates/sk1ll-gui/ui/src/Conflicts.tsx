@@ -7,16 +7,17 @@ import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle }
 import { toast } from './toast';
 import { api } from './api';
 import { useResource } from './hooks';
-import { Confirm, Details, DiffLines, ErrorNotice, Loading, Nothing, Notice, SectionTitle, When } from './shared';
+import { itemNames } from './model';
+import { Confirm, Details, DiffView, ErrorNotice, Loading, Nothing, Notice, SectionTitle, When } from './shared';
 import type { ConflictView } from './types';
 
 function ConflictDiff({ entry, displaced }: { entry: ConflictView; displaced: boolean }) {
   const load = useCallback(() => api.conflictDiff(displaced ? { id: entry.id! } : { harness: entry.harness, name: entry.name }), [entry.id, entry.harness, entry.name, displaced]);
   const { data, error, loading } = useResource(load, 0);
-  return <><p className="text-xs text-muted-foreground">− {displaced ? 'Recovered content' : 'Harness edit'} / + Draft</p>
+  return <div className="mt-1.5 flex flex-col gap-1.5"><p className="text-xs text-muted-foreground">− {displaced ? 'Recovered content' : 'Harness edit'} / + Draft</p>
     <ErrorNotice error={error} />{loading && <Loading rows={2} />}
     {data?.target && <p className="text-xs break-all">Draft destination <code className="font-mono">{data.target}</code></p>}
-    {data && <pre className="diff max-h-[32rem] overflow-auto rounded-lg border border-border bg-muted/40 p-3 font-mono text-xs" aria-label="Conflict diff">{data.diff ? <DiffLines diff={data.diff} /> : 'No differences.'}</pre>}</>;
+    {data && <DiffView diff={data.diff} label="Conflict diff" />}</div>;
 }
 function Conflict({ entry, displaced, changed, adopted, expanded }: {
   entry: ConflictView; displaced: boolean; expanded: boolean; changed: () => void; adopted: (name: string) => void;
@@ -57,7 +58,7 @@ function Conflict({ entry, displaced, changed, adopted, expanded }: {
         disabled={!entry.adoptable || (displaced && !entry.id)}
         title={`Adopt ${entry.name} into the Draft?`}
         description={<>{displaced ? 'The recovered content' : `The ${entry.harness} Harness edit`} at <code className="font-mono break-all">{displaced ? entry.path ?? entry.dest : entry.dest}</code> replaces
-          this item in this Machine's Draft. Any existing Draft changes to {entry.items.length ? entry.items.join(', ') : entry.name} are overwritten.</>}
+          this item in this Machine's Draft. Any existing Draft changes to {entry.items.length ? itemNames(entry.items) : entry.name} are overwritten.</>}
         action={async () => {
           const path = displaced ? await api.adoptDisplaced(entry.id!) : undefined;
           if (!displaced) await api.adopt(target);

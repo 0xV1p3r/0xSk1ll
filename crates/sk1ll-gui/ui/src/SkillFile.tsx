@@ -7,7 +7,7 @@ import { Textarea } from '@/components/ui/textarea';
 import { Field, FieldLabel } from '@/components/ui/field';
 import { api, errorStatus } from './api';
 import { useMutation } from './hooks';
-import { Details, DiffLines, ErrorNotice, Notice } from './shared';
+import { Details, DiffView, ErrorNotice, Notice } from './shared';
 import { unifiedDiff } from './textDiff';
 import type { ContentQuery, FileContent } from './types';
 
@@ -120,7 +120,7 @@ function FileEditor({ file, query, changed, guard, reload, exit, setEditing: set
     </div>
     {conflict && <Notice title="File changed on disk">
       {disk?.text != null && <><p>Changes that Overwrite will apply to the file on disk</p>
-        <pre className="max-h-64 overflow-auto whitespace-pre-wrap"><DiffLines diff={unifiedDiff(file.path, disk.text, text) || (disk.text === text ? 'No differences.' : 'The final newline differs.')} /></pre></>}
+        <DiffView diff={unifiedDiff(file.path, disk.text, text)} label="Changes on disk" empty={disk.text === text ? 'No differences.' : 'The final newline differs.'} className="max-h-64" /></>}
       <div className="flex gap-2">
         <Button type="button" variant="outline" disabled={mutation.pending} onClick={() => {
           if (disk) applyDisk(disk);
