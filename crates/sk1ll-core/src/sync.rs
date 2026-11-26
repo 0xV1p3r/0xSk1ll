@@ -860,13 +860,19 @@ fn apply_instructions(repo: &Repo, action: &Action, content: Option<&str>, expec
         false => OldCopy::DropIfIntact,
         true => OldCopy::KeepMarked,
     };
-    let (displaced, published) = replace_file_published(dest, &spliced, unchanged, displace, old)?;
+    let (displaced, published, replaced) = replace_file_published(dest, &spliced, unchanged, displace, old)?;
+    // Sync's file stays sync's only if the file the write replaced was
+    // still that one: checking it before the swap isn't enough, as another
+    // file (the user's) can be put in its place in between.
+    let carried = (owned || block_edited) && replaced.is_some() && replaced == created.as_ref().map(|c| c.file);
     // Recorded after the write: a crash in between leaves no record, and
     // the file stays, as one that sync didn't create would.
-    if (existing.is_none() || owned || block_edited) && !is_symlink(dest) {
+    if (existing.is_none() || carried) && !is_symlink(dest) {
         let created =
             published.map(|(file, payload)| displaced::CreatedBlock { written: hash_str(&spliced), file, payload });
         displaced::record_created_block(dest, created.as_ref())?;
+    } else if created.is_some() {
+        displaced::record_created_block(dest, None)?;
     }
     displaced.map_or(Ok(()), Err)
 }
@@ -1381,21 +1387,24 @@ fn replace_file(
     displace: Displace,
     old: OldCopy,
 ) -> Result<Option<Error>> {
-    replace_file_published(path, text, unchanged, displace, old).map(|(displaced, _)| displaced)
+    replace_file_published(path, text, unchanged, displace, old).map(|(displaced, ..)| displaced)
 }
 
 /// The identity and payload fingerprint of a file sync published.
 type Published = (FileId, String);
 
 /// [`replace_file`], also returning the identity and payload fingerprint
-/// of the file it published, read from the staged file before the rename.
+/// of the file it published, read from the staged file before the rename,
+/// and the identity of the file it replaced (`None`: there was none), read
+/// from the link to it held in recovery: the very file the swap replaced,
+/// whatever was checked before.
 fn replace_file_published(
     path: &Path,
     text: &str,
     unchanged: impl FnOnce() -> Result<()>,
     displace: Displace,
     old: OldCopy,
-) -> Result<(Option<Error>, Option<Published>)> {
+) -> Result<(Option<Error>, Option<Published>, Option<FileId>)> {
     let real = match fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_symlink() => fs::canonicalize(path).at(path)?,
         _ => path.to_path_buf(),
@@ -1432,12 +1441,18 @@ fn replace_file_published(
         Ok(false) => Ok(None),
         Err(e) => Err(e),
     };
-    let held = match verdict {
-        Ok(Some(true)) => Some(held),
+    let (held, replaced) = match verdict {
+        Ok(Some(true)) => match rule_identity(&held.content()) {
+            Ok(replaced) => (Some(held), replaced),
+            Err(e) => {
+                held.abandon();
+                return fail(e);
+            }
+        },
         // Nothing there (a create): nothing to displace.
         Ok(None) => {
             held.abandon();
-            None
+            (None, None)
         }
         // Edited (or, for a create, made) since the check: left as it is.
         verdict => {
@@ -1458,13 +1473,13 @@ fn replace_file_published(
         return fail(e);
     }
     crate::failpoint!(AfterSwap, path);
-    let Some(held) = held else { return Ok((None, published)) };
+    let Some(held) = held else { return Ok((None, published, None)) };
     let displaced = match old {
         OldCopy::Keep => held.finish(false),
         OldCopy::DropIfIntact => held.finish_owned(),
         OldCopy::KeepMarked => held.finish_kept().map(|()| None),
     }?;
-    Ok((displaced, published))
+    Ok((displaced, published, replaced))
 }
 
 /// [`place`], with something at `to` reported as a change since the plan.
