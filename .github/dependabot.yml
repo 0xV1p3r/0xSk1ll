@@ -11,8 +11,14 @@ updates:
     cooldown:
       default-days: 7
     groups:
-      actions-minor-and-patch:
-        update-types: [minor, patch]
+      actions:
+        patterns: ["*"]
+
+  # A toolchain bump also needs Dockerfile.server's rust tag bumped in the same PR.
+  - package-ecosystem: rust-toolchain
+    directory: /
+    schedule:
+      interval: weekly
 
   - package-ecosystem: cargo
     directory: /
@@ -42,6 +48,6 @@ updates:
     cooldown:
       default-days: 7
     ignore:
-      # The Rust version follows rust-toolchain.toml, bumped by hand.
+      # The Rust version follows rust-toolchain.toml; bump it in the toolchain PR.
       - dependency-name: rust
         update-types: [version-update:semver-major, version-update:semver-minor]
