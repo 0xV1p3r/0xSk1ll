@@ -173,7 +173,7 @@ it('keeps Push and Pull off without an origin, and never commits once every revi
   expect(isDisabled(await screen.findByRole('button', { name: 'Push' }))).toBe(true);
   expect(isDisabled(screen.getByRole('button', { name: 'Pull' }))).toBe(true);
   expect(screen.getByText('Push and Pull require an origin git remote.')).toBeTruthy();
-  await user.click(screen.getByRole('button', { name: 'Commit (2)' }));
+  await user.click(await screen.findByRole('button', { name: 'Commit (2)' }));
   const commit = await dialog('Commit to local repository');
   expect(commit.queryByRole('checkbox', { name: 'Push after commit' })).toBeNull();
   daemon.draft.splice(0);
