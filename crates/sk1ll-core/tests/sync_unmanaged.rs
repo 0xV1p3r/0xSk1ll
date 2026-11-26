@@ -289,7 +289,7 @@ fn rollback_removes_only_the_uncommitted_copy_whose_source_still_matches() {
         }
         if edit == "unchanged" {
             let backup = displaced::list().unwrap().remove(0);
-            assert!(displaced::prune_with(std::time::Duration::ZERO, 0).unwrap().is_empty());
+            assert!(displaced::prune_with(std::time::Duration::ZERO).unwrap().is_empty());
             assert_eq!(sk1ll_testkit::read(&backup.path.join("SKILL.md")), "Original.\n");
             // It goes back where it was while that is free; once a retried
             // Adopt is there, nothing says where it would go.
@@ -338,4 +338,29 @@ fn publishing_a_selected_variant_refuses_a_late_edit_to_either_side() {
     write(&draft, "Created in draft.\n");
     assert!(publish(&repo, &adoption).unwrap_err().to_string().contains("destination changed"));
     assert_eq!(sk1ll_testkit::read(&draft), "Created in draft.\n");
+}
+
+/// The copy into the Draft takes no extended attributes, so an original
+/// with one is the only full copy: changed, and kept through Recover Adopt.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_adopted_original_with_extended_attributes_stays_changed() {
+    use rustix::fs::{XattrFlags, lgetxattr, lsetxattr};
+    let (tmp, repo, hs) = setup();
+    let _home = tmp.enter();
+    let skill = tmp.path().join("a/pdf/SKILL.md");
+    write(&skill, "noted");
+    if lsetxattr(&skill, "user.note", b"local", XattrFlags::empty()).is_err() {
+        return;
+    }
+    let adoption = prepare(&repo, &hs, "a", "pdf").unwrap();
+    complete(&repo, &hs, &adoption).unwrap();
+    let entry = displaced::list().unwrap().remove(0);
+    assert!(entry.changed && displaced::adoptable(&repo, &entry), "{entry:?}");
+    let lock = sk1ll_core::EngineLock::acquire(repo.root()).unwrap();
+    displaced::adopt(&repo, &entry.id, &lock).unwrap();
+    assert!(displaced::get(&entry.id).unwrap().changed);
+    let mut value = [0; 5];
+    assert_eq!(lgetxattr(entry.path.join("SKILL.md"), "user.note", &mut value).unwrap(), 5);
+    assert_eq!(&value, b"local");
 }

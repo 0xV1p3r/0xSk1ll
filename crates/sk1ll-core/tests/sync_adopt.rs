@@ -248,7 +248,7 @@ fn adopt_owns_only_what_it_copied_and_keeps_what_it_left_out() {
     assert!(fs::symlink_metadata(&dest).is_err());
     let entry = displaced::list().unwrap().into_iter().find(|e| e.dest == dest).unwrap();
     assert!(entry.changed);
-    assert!(displaced::prune_with(Duration::ZERO, u64::MAX).unwrap().is_empty());
+    assert!(displaced::prune_with(Duration::ZERO).unwrap().is_empty());
     assert_eq!(fs::read_to_string(entry.path.join(".git/HEAD")).unwrap(), "harness git\n");
     assert_eq!(fs::read_to_string(repo_entry.path.join(".git/HEAD")).unwrap(), "repo git\n");
 }

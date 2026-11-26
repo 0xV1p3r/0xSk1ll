@@ -294,7 +294,7 @@ fn crash_sweep(shapes: &[Shape]) {
                 // the repo, for its own path, and never pruned meanwhile.
                 let [entry] = &displaced::list().unwrap()[..] else { panic!("{label}: one entry") };
                 assert_eq!((entry.harness.as_str(), &entry.dest), ("repo", &case.source), "{label}");
-                assert!(!displaced::prune_with(Duration::ZERO, u64::MAX).unwrap().contains(&entry.id), "{label}");
+                assert!(!displaced::prune_with(Duration::ZERO).unwrap().contains(&entry.id), "{label}");
                 assert_eq!(fs::read(case.file(&entry.path)).ok(), repo_version, "{label}");
             }
             let backups: Vec<_> = displaced::list()

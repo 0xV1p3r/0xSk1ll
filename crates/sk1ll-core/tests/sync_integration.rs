@@ -173,7 +173,7 @@ fn a_copy_replaced_between_syncs_or_after_an_interrupted_removal_stays_unmanaged
                 assert_eq!(actions[0].kind, ActionKind::Conflict);
                 apply(&repo, &actions[0]).unwrap();
             }
-            displaced::prune_with(Duration::ZERO, u64::MAX).unwrap();
+            displaced::prune_with(Duration::ZERO).unwrap();
             assert_eq!(fs::read_to_string(dest.join("SKILL.md")).unwrap(), newcomer);
             assert!(!dest.join(PLACEMENT_MARKER).exists());
         }

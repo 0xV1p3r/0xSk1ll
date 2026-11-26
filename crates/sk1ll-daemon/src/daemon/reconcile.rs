@@ -425,7 +425,8 @@ impl Daemon {
             conflicts: conflict_views,
             recovered: Ok({
                 let repo = Repo::open_git_only(&root).ok();
-                displaced.into_iter().map(|entry| displaced_view(entry, &root, repo.as_ref())).collect()
+                let resolver = repo.as_ref().map(sync::displaced::Resolver::new);
+                displaced.into_iter().map(|entry| displaced_view(entry, &root, resolver.as_ref())).collect()
             }),
         }));
         // A refused push stands until `HEAD` moves on (a fix committed, or
