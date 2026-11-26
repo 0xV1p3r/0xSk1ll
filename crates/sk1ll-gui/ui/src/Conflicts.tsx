@@ -23,23 +23,26 @@ function Conflict({ entry, displaced, changed, adopted, expanded }: {
 }) {
   const [open, setOpen] = useState(expanded);
   const target = { harness: entry.harness, name: entry.name };
-  // Recovered content needs the user only while it holds a change; Adopt is offered only where it can tell where it goes.
-  const attention = !displaced || !!entry.changed;
+  // Recovered content needs the user only while it holds a change they didn't choose to overwrite;
+  // Adopt is offered only where it can tell where it goes.
+  const attention = !displaced || (!!entry.changed && !entry.overwritten);
   const canAdopt = !displaced || entry.adoptable;
   return <Card size="default" className="relative overflow-hidden pt-0">
     <span aria-hidden className={`absolute inset-y-3 left-0 w-1 rounded-r-full ${attention ? 'bg-warning' : 'bg-info'}`} />
     <CardHeader className="border-b border-border bg-muted/40 py-3">
       <CardTitle className="flex flex-wrap items-center gap-2"><span className="font-medium">{entry.name}</span>
         <Badge variant="outline">{entry.harness}</Badge>
-        {displaced && <Badge variant={entry.changed ? 'warning' : 'secondary'}>{entry.changed ? 'Changed' : 'Unchanged'}</Badge>}</CardTitle>
+        {displaced && <Badge variant={entry.overwritten ? 'info' : entry.changed ? 'warning' : 'secondary'}>{entry.overwritten ? 'Overwritten' : entry.changed ? 'Changed' : 'Unchanged'}</Badge>}</CardTitle>
       <CardDescription className="font-mono text-xs break-all">{entry.dest}</CardDescription>
       {!displaced && typeof entry.detected_at === 'number' && <p className="text-xs text-muted-foreground">Edited <When seconds={entry.detected_at} /></p>}
     </CardHeader>
     <CardContent className="flex flex-col gap-2">
       {entry.reason && <p>{entry.reason}</p>}
-      {displaced && <p className="text-xs text-muted-foreground">{entry.changed
-        ? 'It holds a change, such as a hand edit that was overwritten. Adopt it, or Discard it once you no longer need it.'
-        : 'Unchanged since sk1ll set it aside. A routine copy is removed on its own after a while.'}</p>}
+      {displaced && <p className="text-xs text-muted-foreground">{entry.overwritten
+        ? 'Overwritten: your edit is kept here. Adopt it to bring it back into the Draft, or Discard it once you no longer need it.'
+        : entry.changed
+          ? 'It holds a change no other copy may have. Adopt it, or Discard it once you no longer need it.'
+          : 'Unchanged since sk1ll set it aside. A routine copy is removed on its own after a while.'}</p>}
       {(entry.path || entry.displaced_at !== undefined) && <Details className="text-xs" rows={[
         ...entry.path ? [['Recovery path', <code className="font-mono break-all">{entry.path}</code>] as [string, ReactNode]] : [],
         ...entry.displaced_at !== undefined ? [['Recovered', <When seconds={entry.displaced_at} />] as [string, ReactNode]] : [],
@@ -93,7 +96,7 @@ export function Conflicts({ revision, changed, reviewDraft }: { revision: number
     {ready && !!conflicts.data?.length && <Section title="Harness conflicts" description="Adopt copies a Harness edit into the Draft. Overwrite replaces it with the Draft.">
       {conflicts.data.map((entry, i) => <Conflict key={`${entry.harness}/${entry.name}/${i}`} entry={entry} expanded={total <= 3} displaced={false} changed={changed} adopted={setAdopted} />)}
     </Section>}
-    {ready && !!displaced.data?.length && <Section title="Recovered content" description="Content saved when a Harness file was replaced. Changed content needs your decision. Adopt copies it into the Draft. Discard permanently removes the saved content.">
+    {ready && !!displaced.data?.length && <Section title="Recovered content" description="Content saved when a Harness file was replaced. Changed content needs your decision; an edit you overwrote waits here until you adopt or discard it. Adopt copies it into the Draft. Discard permanently removes the saved content.">
       {displaced.data.map(entry => <Conflict key={entry.id} entry={entry} expanded={total <= 3} displaced changed={changed} adopted={setAdopted} />)}
     </Section>}
   </>;

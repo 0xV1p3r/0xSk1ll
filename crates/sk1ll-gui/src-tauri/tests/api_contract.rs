@@ -170,6 +170,7 @@ fn conflict() -> ConflictView {
         reason: Some("SKILL.md was edited in the Harness after the last sync.".into()),
         adoptable: true,
         changed: false,
+        overwritten: false,
     }
 }
 
@@ -461,9 +462,16 @@ fn harness_golden() -> Value {
         reason: Some("Unmanaged directory replaced by an assigned Skill.".into()),
         adoptable: true,
         changed: false,
+        overwritten: false,
     };
-    // An overwritten hand edit: it needs the user, and Adopt can't place a skill link.
-    let kept = ConflictView { id: Some("d-2".into()), adoptable: false, changed: true, ..displaced.clone() };
+    // An overwritten hand edit: kept, but no Conflict; Adopt can't place a skill link.
+    let kept = ConflictView {
+        id: Some("d-2".into()),
+        adoptable: false,
+        changed: true,
+        overwritten: true,
+        ..displaced.clone()
+    };
     json!({
         "conflict_view": { "harness": sample(conflict()), "displaced": sample(displaced), "kept": sample(kept.clone()) },
         "conflict_target": sample(ConflictTarget { harness: "codex".into(), name: "code-review".into() }),

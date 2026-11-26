@@ -88,3 +88,16 @@ it('marks recovered content changed or unchanged and offers Adopt only where it 
   await user.click((await dialog('Discard linked in claude?')).getByRole('button', { name: 'Discard' }));
   await waitFor(() => expect(daemon.sent('discard_displaced')).toEqual([{ id: 'd-2' }]));
 });
+
+it('labels an edit the user overwrote apart from content that needs them, and keeps it adoptable', async () => {
+  const { daemon, user } = launch('fleet', { hash: '#/conflicts', setup: daemon => {
+    daemon.recovered.push({ ...daemon.recovered[0], id: 'd-3', name: 'AGENTS.md', reason: null, changed: true, overwritten: true });
+  } });
+  await heading('Conflicts');
+  expect(await screen.findByText('Overwritten')).toBeTruthy();
+  expect(screen.queryByText('Changed')).toBeNull();
+  expect(screen.getByText(/^Overwritten: your edit is kept here\./)).toBeTruthy();
+  await user.click(screen.getByRole('button', { name: 'Adopt AGENTS.md from claude' }));
+  await user.click((await dialog('Adopt AGENTS.md into the Draft?')).getByRole('button', { name: 'Adopt into Draft' }));
+  await waitFor(() => expect(daemon.sent('adopt_displaced')).toEqual([{ id: 'd-3' }]));
+});

@@ -157,9 +157,12 @@ break compatibility.
   and the app offers only Discard and a diff against nothing. An original
   holding what the copy left out (a `.git`, extended attributes) stays as
   changed content, and Recover Adopt keeps it.
-- After **Overwrite** of a hand-edited block, the kept copy is listed only
-  as recovered content: `GET /conflicts` lists Harness conflicts alone, and
-  `POST /sync` returns changed recovery entries as `kept`.
+- After **Overwrite** (or `sync --force`) of a hand edit, the kept copy is
+  listed only as recovered content: `GET /conflicts` lists Harness
+  conflicts alone, and `POST /sync` returns changed recovery entries as
+  `kept`. It is marked `overwritten` and **Overwritten** in the app: it
+  stays until adopted or discarded, but no longer makes the Machine a
+  Conflict, in its status, the Fleet's count or the badge.
 - A clean pull no longer leaves a permanent recovery entry for each file it
   replaced: an entry for a file that held exactly what checking out the old
   commit writes is a routine copy, pruned after the grace period once the

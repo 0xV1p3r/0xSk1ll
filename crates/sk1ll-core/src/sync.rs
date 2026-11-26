@@ -735,6 +735,11 @@ fn apply_rule(repo: &Repo, action: &Action) -> Result<()> {
     {
         return Err(changed_since_plan(dest));
     }
+    // A hand edit to the file sk1ll placed: only a forced plan replaces it.
+    let overwritten = match (&current, expected_index) {
+        (Some(_), Some(entry)) => hash_payload(dest)? != entry.payload(),
+        _ => false,
+    };
     if *metadata_only {
         // Only the placement's Item ID record changes: the file must be the one sk1ll placed.
         if current.is_none() {
@@ -759,6 +764,7 @@ fn apply_rule(repo: &Repo, action: &Action) -> Result<()> {
         baseline: None,
         adopting: None,
         keep: false,
+        overwritten,
     };
     let outcome = match content {
         Some(content) => {
@@ -817,6 +823,7 @@ fn apply_instructions(repo: &Repo, action: &Action, content: Option<&str>, expec
         baseline: None,
         adopting: None,
         keep: false,
+        overwritten: false,
     };
     let spliced = instructions::splice(&text, block.as_ref(), content);
     // A file sync created stays sync's only while it holds exactly what
@@ -965,9 +972,12 @@ fn apply_skill(repo: &Repo, action: &Action, adopted: bool, reviewed_digest: Opt
     recover_dir(&lock, &action.harness, DirectoryKind::Skills)?;
     let ownership = Ownership::new(&lock, dest, name, expected_index.as_ref());
     ownership.check()?;
-    if observe_skill(dest)?.state.as_deref() != expected {
+    let observed = observe_skill(dest)?;
+    if observed.state.as_deref() != expected {
         return Err(changed_since_plan(dest));
     }
+    // A hand edit to what sk1ll placed: only a forced plan replaces it.
+    let overwritten = expected_index.as_ref().is_some_and(|entry| observed.edited(entry));
     let existing = classify(repo.root(), dest, source, expected_index.as_ref())?;
     let managed = match &existing {
         Existing::Unmanaged(_) if adopted => true,
@@ -1005,6 +1015,7 @@ fn apply_skill(repo: &Repo, action: &Action, adopted: bool, reviewed_digest: Opt
             _ => None,
         },
         keep: false,
+        overwritten,
     };
     let outcome = match action.kind {
         ActionKind::Conflict => unreachable!(),
@@ -1265,7 +1276,11 @@ fn swap_in(stage: Option<&Path>, dest: &Path, displace: Displace, intent: Option
         }
         (Some(entry), None) if displace.keep => entry.mark_kept(),
         _ => Ok(()),
-    };
+    }
+    .and_then(|()| match &held {
+        Some(entry) if displace.overwritten => entry.mark_overwritten(),
+        _ => Ok(()),
+    });
     if let Err(e) = recorded {
         if let Some(held) = held {
             held.abandon();
@@ -1358,6 +1373,10 @@ struct Displace<'a> {
     /// The replaced content may be the only copy of what it holds: its
     /// recovery entry is kept, changed, until adopted or discarded.
     keep: bool,
+    /// The replaced content is a hand edit the user chose to overwrite (a
+    /// forced sync): its entry is kept, changed, but needs no one (see
+    /// [`displaced::Entry::overwritten`]).
+    overwritten: bool,
 }
 
 /// Whether the repo item at `path` (a skill directory or a rule file) is
@@ -2170,6 +2189,7 @@ fn copy_into_repo(
             // The version replaced is that item: Recover Adopt puts it back.
             adopting: existing.then_some((dest.as_path(), target.skill_id.as_ref(), false)),
             keep,
+            overwritten: false,
         };
         let displaced = swap_in(Some(&stage), dest, displace, None)?;
         Ok((hash, payload, displaced))
@@ -2338,6 +2358,7 @@ fn rule_into_repo(
                 .is_some()
                 .then(|| (dest.as_path(), target.rule.as_ref().and_then(|rule| rule.id.as_ref()), false)),
             keep,
+            overwritten: false,
         };
         swap_in(Some(&stage), dest, displace, None)
     });
@@ -2540,6 +2561,9 @@ pub mod displaced {
         /// process is gone.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         held_by: Option<u32>,
+        /// A hand edit the user chose to overwrite (see [`Entry::overwritten`]).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        overwritten: bool,
     }
 
     mod stored_path {
@@ -2619,6 +2643,11 @@ pub mod displaced {
         /// It differs from what sync expected to displace: someone wrote to
         /// it during (or after) the swap. Never pruned.
         pub changed: bool,
+        /// It is a hand edit the user chose to overwrite (a forced sync),
+        /// just as it was: kept, changed, until adopted or discarded, but it
+        /// needs no one, so it is no Conflict. A write to it since makes it
+        /// one again.
+        pub overwritten: bool,
     }
 
     /// `displaced` in sk1ll's state directory ([`crate::paths::state_dir`],
@@ -3181,6 +3210,7 @@ pub mod displaced {
             baseline: None,
             adopting: None,
             keep: false,
+            overwritten: false,
         };
         replace_file(dest, &text, unchanged, displace, OldCopy::Keep)
     }
@@ -3475,8 +3505,11 @@ pub mod displaced {
 
     fn entry(id: String, meta: Meta, path: PathBuf) -> Result<Entry> {
         let changed = differs(&meta, &path)?;
+        let overwritten = meta.overwritten
+            && !meta.expected.is_empty()
+            && fingerprint(meta.kind, &path).ok().flatten().as_deref() == Some(meta.expected.as_str());
         let Meta { harness, kind, item_id, provenance, dest, displaced_at, .. } = meta;
-        Ok(Entry { id, harness, kind, item_id, provenance, dest, path, displaced_at, changed })
+        Ok(Entry { id, harness, kind, item_id, provenance, dest, path, displaced_at, changed, overwritten })
     }
 
     fn differs(meta: &Meta, path: &Path) -> Result<bool> {
@@ -3732,6 +3765,7 @@ pub mod displaced {
                 payload: payload.map(str::to_owned),
                 committed: false,
                 held_by: None,
+                overwritten: false,
             };
             let expected = meta.expected.clone();
             let held = Self { id, root, dir, kind, dest: dest.to_path_buf(), expected, held: None };
@@ -3969,10 +4003,19 @@ pub mod displaced {
         }
 
         /// [`finish`](Self::finish) for a hand edit sk1ll was told to
-        /// overwrite: the entry is kept, marked changed, so it is listed as
-        /// a conflict until adopted or discarded.
+        /// overwrite: the entry is kept, marked changed, until adopted or
+        /// discarded; it is no Conflict (see [`Entry::overwritten`]).
         pub(super) fn finish_kept(self) -> Result<()> {
+            self.mark_overwritten()?;
             settle(&self.id, &self.dest, true)
+        }
+
+        /// Marks this entry as the hand edit the user chose to overwrite.
+        pub(super) fn mark_overwritten(&self) -> Result<()> {
+            let mut meta = read_meta(&self.dir)
+                .ok_or_else(|| Error::Invalid(format!("cannot read recovery entry at {}", self.dir.display())))?;
+            meta.overwritten = true;
+            self.write_meta(&meta)
         }
 
         fn displaced_error(&self) -> Error {
