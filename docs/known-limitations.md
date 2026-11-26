@@ -285,10 +285,18 @@ still match their placement fingerprints, whatever all backups take: there
 is no size cap that prunes earlier. A backup with changes or without a
 placement fingerprint stays until explicit discard. So does a Draft recovery
 entry from Pull, except one for a file that held exactly what checking out
-the old commit writes, with no extended attributes beyond its SELinux label:
-that one is pruned like a backup, once the Pull is finished. Pruning
-rechecks the payload and then every entry's metadata. A write through a
-still-open file descriptor after that last check can be lost.
+the old commit writes, with the mode checkout gives (Git records only the
+executable bit) and no extended attributes beyond its SELinux label: that
+one is pruned like a backup, once the Pull is finished. The repo version an
+Adopt replaces is kept the same way unless it is exactly its committed
+version, so a Draft edit there is never pruned. An entry is never pruned
+while Adopt is using it. Pruning rechecks the payload and then every entry's
+metadata. A write through a still-open file descriptor after that last
+check can be lost.
+
+Adopt refuses a recovered rule or block instructions file that isn't UTF-8
+text, since writing it back as text would change its bytes. It stays in
+recovery.
 
 Superseded ownership indexes are saved under `.sk1ll-state/index-history/`.
 Directory recovery checks them after the same grace period and keeps any

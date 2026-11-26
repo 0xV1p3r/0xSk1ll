@@ -1258,12 +1258,20 @@ impl<'a> Convert<'a> {
     /// byte what checking `entry` out at `path` writes, so the old commit
     /// gives it back exactly. [`holds`](Self::holds) compares through the
     /// clean side (`ident`, end-of-line conversion), which can hide local
-    /// bytes: an edit inside an expanded `$Id: … $`, say.
+    /// bytes: an edit inside an expanded `$Id: … $`, say. A file's mode
+    /// must be the one checkout gives too (see
+    /// [`crate::hash::checkout_mode`]): Git records only the executable bit.
     fn verbatim(&self, node: &Node, entry: Option<&Entry>, path: &Path) -> Result<bool> {
         let (Some(entry), Node::File { bytes, .. } | Node::Link(bytes)) = (entry, node) else { return Ok(false) };
         if entry.mode == SYMLINK {
             // `holds` compared it with no filters already.
             return Ok(true);
+        }
+        #[cfg(unix)]
+        if let Node::File { mode, .. } = node
+            && *mode != crate::hash::checkout_mode(entry.mode == "100755")
+        {
+            return Ok(false);
         }
         let git = self.git(Side::Old).args(["cat-file", "--filters"]).arg(path_option(path)).arg(&entry.oid);
         Ok(git.run()? == *bytes)

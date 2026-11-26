@@ -252,3 +252,41 @@ fn adopt_owns_only_what_it_copied_and_keeps_what_it_left_out() {
     assert_eq!(fs::read_to_string(entry.path.join(".git/HEAD")).unwrap(), "harness git\n");
     assert_eq!(fs::read_to_string(repo_entry.path.join(".git/HEAD")).unwrap(), "repo git\n");
 }
+
+/// Adopt keeps the repo version it replaces as changed unless that is
+/// exactly the committed version: a Draft edit there may be in no other copy.
+#[test]
+fn adopt_keeps_a_replaced_draft_edit_and_lets_a_committed_version_go() {
+    for draft in [false, true] {
+        let (tmp, repo, mut harnesses) = skill_setup(LinkMode::Copy);
+        let _home = tmp.enter();
+        let config = harnesses.get_mut("h").unwrap();
+        config.instructions = Some(tmp.path().join("rules").display().to_string());
+        config.instructions_format = InstructionsFormat::Rules;
+        let rule = repo.root().join("instructions/git.md");
+        write(&rule, "---\nid: git-id\nharnesses: [h]\n---\nCommitted.\n");
+        sk1ll_testkit::git::git(repo.root(), &["add", "."]);
+        sk1ll_testkit::git::git(repo.root(), &["commit", "-qm", "rule"]);
+        let plan_now = || plan(&repo, &harnesses, &Assignment::default(), PlanOptions::default()).unwrap();
+        for action in plan_now() {
+            apply(&repo, &action).unwrap();
+        }
+        write(&tmp.path().join("skills/pdf/SKILL.md"), "Harness edit.\n");
+        edit_rule_body(&tmp.path().join("rules/git.md"), "Harness edit.\n");
+        if draft {
+            write(&repo.personal_dir().join("pdf/SKILL.md"), "Draft edit.\n");
+            edit_rule_body(&rule, "Draft edit.\n");
+        }
+        let conflicts: Vec<_> = plan_now().into_iter().filter(|a| a.kind == ActionKind::Conflict).collect();
+        assert_eq!(conflicts.len(), 2, "{conflicts:?}");
+        for conflict in &conflicts {
+            adopt(&repo, conflict).unwrap();
+        }
+        let replaced: Vec<_> = displaced::list().unwrap().into_iter().filter(|e| e.harness == "repo").collect();
+        assert_eq!(replaced.len(), 2, "{replaced:?}");
+        assert!(replaced.iter().all(|e| e.changed == draft), "draft {draft}: {replaced:?}");
+        displaced::prune_with(Duration::ZERO).unwrap();
+        let left = displaced::list().unwrap().into_iter().filter(|e| e.harness == "repo").count();
+        assert_eq!(left, if draft { 2 } else { 0 }, "draft {draft}");
+    }
+}

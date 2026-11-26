@@ -812,3 +812,48 @@ fn adopting_recovered_skill_bytes_keeps_harness_only_sidecars() {
         assert_eq!(sk1ll_testkit::read(&kept.path.join(ID_FILE)), "harness-sidecar\n");
     }
 }
+
+/// Recover Adopt of an unchanged copy past its grace period: the prune its
+/// own swap runs leaves its input alone, and the Draft version it replaces,
+/// an edit no other copy holds, is kept, changed, through any prune.
+#[test]
+fn recover_adopt_keeps_its_input_and_the_draft_edit_it_replaces() {
+    let d = Displacement::new("skill update");
+    let _home = d.home.enter();
+    apply(&d.repo, &d.action()).unwrap();
+    let entry = d.entry();
+    assert!(!entry.changed);
+    let original = fs::read_to_string(entry.path.join("SKILL.md")).unwrap();
+    let meta = entry.path.with_file_name("entry.json");
+    let mut json: serde_json::Value = serde_json::from_str(&fs::read_to_string(&meta).unwrap()).unwrap();
+    json["displaced_at"] = 0.into();
+    fs::write(&meta, json.to_string()).unwrap();
+    let to = adopt_test_entry(&d.repo, &entry.id).unwrap();
+    assert_eq!(fs::read_to_string(to.join("SKILL.md")).unwrap(), original);
+    assert!(displaced::get(&entry.id).is_err());
+    let draft = displaced::list().unwrap().into_iter().find(|e| e.harness == "repo").unwrap();
+    assert!(draft.changed, "{draft:?}");
+    assert!(displaced::prune_with(Duration::ZERO).unwrap().is_empty());
+    assert!(fs::read_to_string(draft.path.join("SKILL.md")).unwrap().contains("Updated source."));
+}
+
+/// A rule Adopt can't read as UTF-8 is refused, and stays as it was: its
+/// bytes would not survive as text.
+#[test]
+fn recover_adopt_refuses_a_rule_that_isnt_utf8() {
+    let d = Displacement::new("rule update");
+    let _home = d.home.enter();
+    let bytes = b"---\ndescription: Git\n---\nCaf\xe9 au lait.\n";
+    fs::write(&d.dest, bytes).unwrap();
+    let source = d.repo.root().join("instructions/git.md");
+    for action in plan(&d.repo, &d.harnesses, &d.assignment, PlanOptions { force: true }).unwrap() {
+        apply(&d.repo, &action).unwrap();
+    }
+    let entry = d.entry();
+    let before = fs::read(&source).unwrap();
+    let error = adopt_test_entry(&d.repo, &entry.id).unwrap_err();
+    assert!(error.to_string().contains("isn't UTF-8"), "{error}");
+    assert_eq!(fs::read(&entry.path).unwrap(), bytes);
+    assert!(displaced::get(&entry.id).unwrap().changed);
+    assert_eq!(fs::read(&source).unwrap(), before);
+}
