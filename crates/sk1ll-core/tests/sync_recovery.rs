@@ -835,6 +835,35 @@ fn recover_adopt_keeps_its_input_and_the_draft_edit_it_replaces() {
     assert!(draft.changed, "{draft:?}");
     assert!(displaced::prune_with(Duration::ZERO).unwrap().is_empty());
     assert!(fs::read_to_string(draft.path.join("SKILL.md")).unwrap().contains("Updated source."));
+    // It goes back into the skill it was, by that skill's Item ID.
+    assert_eq!(draft.item_id, Some(skill_id(&d.repo, "pdf")));
+    assert!(displaced::adoptable(&d.repo, &draft));
+    assert_eq!(adopt_test_entry(&d.repo, &draft.id).unwrap(), to);
+    assert!(fs::read_to_string(to.join("SKILL.md")).unwrap().contains("Updated source."));
+}
+
+/// Adopt holds its entry for as long as its process runs: a hold a crashed
+/// Adopt left keeps nothing from being pruned, adopted or discarded.
+#[cfg(unix)]
+#[test]
+fn a_hold_a_crashed_adopt_left_lapses() {
+    let d = Displacement::new("skill update");
+    let _home = d.home.enter();
+    apply(&d.repo, &d.action()).unwrap();
+    let entry = d.entry();
+    let meta = entry.path.with_file_name("entry.json");
+    let hold = |pid: u32| {
+        let mut json: serde_json::Value = serde_json::from_str(&fs::read_to_string(&meta).unwrap()).unwrap();
+        json["held_by"] = pid.into();
+        fs::write(&meta, json.to_string()).unwrap();
+    };
+    hold(std::process::id());
+    assert!(displaced::prune_with(Duration::ZERO).unwrap().is_empty(), "held by a running process");
+    let mut gone = std::process::Command::new("true").spawn().unwrap();
+    let pid = gone.id();
+    gone.wait().unwrap();
+    hold(pid);
+    assert_eq!(displaced::prune_with(Duration::ZERO).unwrap(), std::slice::from_ref(&entry.id));
 }
 
 /// A rule Adopt can't read as UTF-8 is refused, and stays as it was: its

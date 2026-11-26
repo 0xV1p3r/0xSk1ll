@@ -168,8 +168,9 @@ break compatibility.
   changed.
   The app marks recovered content **Changed** or **Unchanged**.
 - Adopt keeps the repo version it replaces as changed recovery content
-  unless that was exactly the committed version, so a Draft edit it
-  replaces is never pruned. It no longer prunes its own input on the way,
+  unless that was exactly the committed version (of a skills repo in a Git
+  subdirectory too), so a Draft edit or deletion it replaces is never
+  pruned, and Recover Adopt puts it back into its item. It no longer prunes its own input on the way,
   and refuses a recovered rule or instructions file that isn't UTF-8
   instead of rewriting it with replacement characters.
 - The recovery grace period runs from when a displacement completed, and no
