@@ -12,6 +12,7 @@
         }
       }
     },
+    "new_harnesses_default": false,
     "registration": "reg-workstation",
     "revision": 42
   },

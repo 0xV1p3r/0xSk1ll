@@ -8,6 +8,11 @@
 //! The fleet-wide assignment lives on the server (ADR 0001); this is one
 //! machine's slice of it, keyed by harness name and kept as a local file. A
 //! missing file means everything is enabled everywhere.
+//!
+//! A harness without an entry follows [`Assignment::new_harnesses_default`]:
+//! everything enabled on a standalone Machine, everything off in a Fleet,
+//! where the server gives every harness a Machine reports an all-off entry.
+//! A Machine waiting for that entry plans with what it will get.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -20,10 +25,21 @@ use crate::{Error, ItemId, Result};
 pub const ASSIGNMENT_FILE: &str = "assignment.json";
 
 /// Assignment for this machine, by harness name.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Assignment {
     #[serde(default)]
     pub harnesses: BTreeMap<String, HarnessAssignment>,
+    /// What a harness without an entry has: everything enabled (`true`,
+    /// the standalone default) or everything off (`false`, a Fleet's).
+    #[serde(default = "yes")]
+    pub new_harnesses_default: bool,
+}
+
+/// The standalone Assignment: nothing set, everything enabled everywhere.
+impl Default for Assignment {
+    fn default() -> Self {
+        Self { harnesses: BTreeMap::new(), new_harnesses_default: true }
+    }
 }
 
 /// One harness's toggles. An item is enabled if explicitly toggled on, or if
@@ -44,15 +60,23 @@ fn yes() -> bool {
     true
 }
 
-static ALL_ENABLED: HarnessAssignment = HarnessAssignment::ALL_ENABLED;
+static ALL_ENABLED: HarnessAssignment = HarnessAssignment::uniform(true);
+static ALL_OFF: HarnessAssignment = HarnessAssignment::uniform(false);
 
 impl HarnessAssignment {
-    const ALL_ENABLED: Self =
-        Self { new_skills_default: true, new_rules_default: true, skills: BTreeMap::new(), rules: BTreeMap::new() };
+    /// A harness without toggles whose defaults are both `enabled`.
+    pub const fn uniform(enabled: bool) -> Self {
+        Self {
+            new_skills_default: enabled,
+            new_rules_default: enabled,
+            skills: BTreeMap::new(),
+            rules: BTreeMap::new(),
+        }
+    }
 
     /// A harness that starts with nothing enabled.
     pub fn all_off() -> Self {
-        Self { new_skills_default: false, new_rules_default: false, ..Self::ALL_ENABLED }
+        Self::uniform(false)
     }
 
     pub fn skill_enabled(&self, id: &ItemId) -> bool {
@@ -64,13 +88,13 @@ impl HarnessAssignment {
     }
 }
 
-impl Default for HarnessAssignment {
-    fn default() -> Self {
-        Self::ALL_ENABLED
-    }
-}
-
 impl Assignment {
+    /// A Fleet Machine's Assignment before anything is set: every harness
+    /// starts all off.
+    pub fn fleet() -> Self {
+        Self { new_harnesses_default: false, ..Self::default() }
+    }
+
     /// `assignment.json` in sk1ll's cache directory ([`crate::paths::cache_dir`],
     /// `$XDG_CACHE_HOME/sk1ll` by default).
     pub fn default_path() -> Result<PathBuf> {
@@ -116,9 +140,10 @@ impl Assignment {
         write_file(path, &format!("{body}\n"))
     }
 
-    /// A harness's toggles; all-enabled if it has none.
+    /// A harness's toggles; [`Self::new_harnesses_default`] if it has none.
     pub fn harness(&self, harness: &str) -> &HarnessAssignment {
-        self.harnesses.get(harness).unwrap_or(&ALL_ENABLED)
+        let unset = if self.new_harnesses_default { &ALL_ENABLED } else { &ALL_OFF };
+        self.harnesses.get(harness).unwrap_or(unset)
     }
 
     pub fn skill_enabled(&self, harness: &str, id: &ItemId) -> bool {
@@ -173,7 +198,8 @@ impl Assignment {
     }
 
     /// Moves `from`'s toggles and defaults to `to`, replacing any `to` had.
-    /// `false` if `from` has no entry (it was all-enabled; so is `to` then).
+    /// `false` if `from` has no entry (`to` then has none either, so it
+    /// follows [`Self::new_harnesses_default`] as `from` did).
     pub fn rename_harness(&mut self, from: &str, to: &str) -> bool {
         match self.harnesses.remove(from) {
             Some(a) => {
@@ -187,7 +213,9 @@ impl Assignment {
         }
     }
 
-    fn entry(&mut self, harness: &str) -> &mut HarnessAssignment {
-        self.harnesses.entry(harness.to_string()).or_default()
+    /// `harness`'s entry, added with the values it has without one.
+    pub fn entry(&mut self, harness: &str) -> &mut HarnessAssignment {
+        let unset = HarnessAssignment::uniform(self.new_harnesses_default);
+        self.harnesses.entry(harness.to_string()).or_insert(unset)
     }
 }

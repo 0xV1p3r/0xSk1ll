@@ -51,7 +51,8 @@ impl Change {
 }
 
 /// Current value of a toggle. Defaults are always `Some` (a harness without
-/// an entry has the all-enabled defaults); item toggles are `None` when unset.
+/// an entry has the defaults of a new harness, both off); item toggles are
+/// `None` when unset.
 pub fn get(a: &Assignment, harness: &str, kind: ToggleKind, id: Option<&ItemId>) -> Option<bool> {
     let h = a.harnesses.get(harness);
     match kind {
@@ -240,6 +241,11 @@ pub fn apply(
         })
         .collect();
     let mut a = snapshot.assignment;
+    // A harness without an entry gets one from a change to its defaults,
+    // even one that sets what it already has (a reported harness starting
+    // all off), logged with no earlier value: what it had was nobody's.
+    let fresh: BTreeSet<String> =
+        changes.iter().map(|c| c.harness.clone()).filter(|h| !a.harnesses.contains_key(h)).collect();
     let mut entries = Vec::new();
     let mut log = |a: &mut Assignment, c: Change, before: Option<bool>| -> Result<()> {
         set(a, &c.harness, c.kind, c.item_id.as_ref(), c.after);
@@ -268,7 +274,10 @@ pub fn apply(
         Ok(())
     };
     for c in changes {
-        let before = get(&a, &c.harness, c.kind, c.item_id.as_ref());
+        let before = match fresh.contains(&c.harness) && !c.kind.has_item() {
+            true => None,
+            false => get(&a, &c.harness, c.kind, c.item_id.as_ref()),
+        };
         if before == c.after {
             continue;
         }

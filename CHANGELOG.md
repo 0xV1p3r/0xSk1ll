@@ -165,6 +165,13 @@ break compatibility.
 - The app's Conflicts badge counts what the Fleet table's Conflicts column
   counts: Harness conflicts and recovered content holding a change, not
   routine copies.
+- A harness enabled on a joined Machine starts all off, as the Server
+  assigns it. Before, the first sync placed every item in it and took them
+  all out into recovery once the Server's column arrived, and the Settings
+  preview listed everything as placed.
+- Taking out a harness whose instructions file sk1ll created no longer
+  leaves an empty file behind after an Overwrite of a hand edit to its
+  block.
 - CLI messages: `sk1ll status` says when the Machine is Blocked (and how
   to clear it), behind, or had a push refused; `sync` exits non-zero while
   it leaves conflicts alone and `sync --force` says which recovery entry

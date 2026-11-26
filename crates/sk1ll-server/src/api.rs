@@ -144,7 +144,7 @@ async fn join(State(server): ServerState, Json(req): Json<JoinRequest>) -> Resul
             let mut assignment = match &req.copy_from {
                 Some(src) => db::assignment(&tx, src)?
                     .ok_or_else(|| ApiError::BadRequest(format!("copy_from: no machine `{src}`")))?,
-                None => Assignment::default(),
+                None => Assignment::fleet(),
             };
             for h in &req.harnesses {
                 assignment.harnesses.entry(h.clone()).or_insert_with(HarnessAssignment::all_off);

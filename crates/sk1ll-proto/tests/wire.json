@@ -65,7 +65,8 @@
             "01J0DEPLOY": false
           }
         }
-      }
+      },
+      "new_harnesses_default": false
     },
     "entries": [
       {
