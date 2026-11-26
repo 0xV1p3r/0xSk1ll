@@ -86,11 +86,11 @@ export function Imports({ revision, changed, reviewDraft, openAdd = false }: { r
         return <TableRow className="h-14" key={entry.name}><TableCell className="whitespace-normal"><div className="flex flex-wrap items-center gap-2"><span className="font-medium">{entry.name}</span>{failure ? <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1"><Badge variant="destructive">Check failed</Badge><span className="break-words text-xs text-muted-foreground" title={failure.message}>{failure.message}</span></div>
             : update ? <div className="flex flex-wrap items-center gap-x-2 gap-y-1"><Badge variant="info">Update available</Badge><code className="font-mono text-xs text-muted-foreground">{shortSha(update.locked)} → {shortSha(update.upstream)}</code></div>
             : skipped ? <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1"><Badge variant="secondary">Not checked by Server</Badge><span className="break-words text-xs text-muted-foreground" title={skipped.reason}>{skipped.reason}. Check now checks it from this Machine.</span></div>
-            : <span className="text-muted-foreground">{data.checked_at === null ? 'Not checked' : 'Up to date'}</span>}</div>
+            : <Badge variant={data.checked_at === null ? 'secondary' : 'success'}>{data.checked_at === null ? 'Not checked' : 'Up to date'}</Badge>}</div>
           <p className="mt-1 break-all text-xs text-muted-foreground">Source: {entry.source} · Ref: {entry.ref} · Path: <code>{entry.path || '—'}</code> · Locked commit: <code title={entry.locked ?? undefined}>{shortSha(entry.locked)}</code></p>
           {update && <UpstreamChanges key={`${update.locked}:${update.upstream}`} update={update} />}
           {refusal && <p role="alert" className="mt-1 text-sm text-destructive">This Import has local edits. Fork it to keep them, or overwrite them with the upstream version.</p>}</TableCell>
-          <TableCell><div className="flex justify-end gap-2 [&_button]:h-8">{update && !refusal && <Action disabled={batchPending} label="Update into Draft" ariaLabel={`Update ${entry.name} into Draft`} action={async () => {
+          <TableCell className="align-top"><div className="flex justify-end gap-2 [&_button]:h-8">{update && !refusal && <Action disabled={batchPending} label="Update into Draft" ariaLabel={`Update ${entry.name} into Draft`} action={async () => {
               try { await updateReviewed(entry.name, update.upstream); done(); toast({ title: `${entry.name} updated into Draft` }); }
               catch (e) {
                 if (!localEdits(errorMessage(e))) throw e;

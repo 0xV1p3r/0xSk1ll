@@ -48,7 +48,7 @@ export function HarnessPanel({ revision, editorId, changed, actions }: {
         <Button size="sm" onClick={() => setEditing({ name: '', existing: false, harness: { skills: null, instructions: null, instructions_format: 'block', mode: 'symlink' } })}><Plus data-icon="inline-start" />Add Harness</Button></div></div>
     <ErrorNotice error={settings.error || open.error} />
     {settings.loading && !settings.data && <Loading rows={2} />}
-    {settings.data && <div className="overflow-hidden rounded-lg border"><Table aria-label="Harnesses on this Machine"><TableHeader><TableRow className="bg-muted/50 hover:bg-muted/50">
+    {settings.data && <div className="overflow-hidden rounded-lg border"><Table aria-label="Harnesses on this Machine"><TableHeader><TableRow>
       {['Sync', 'Harness', 'Skills', 'Rules', 'Mode', 'Origin', ''].map((label, i) => <TableHead key={i}>{label}</TableHead>)}
     </TableRow></TableHeader><TableBody>{visible.map(h => <TableRow key={h.name}>
       <TableCell><label className="inline-flex min-h-8 min-w-8 cursor-pointer items-center justify-center"><Checkbox checked={h.enabled} aria-label={`Sync into ${h.name}`}
@@ -59,7 +59,7 @@ export function HarnessPanel({ revision, editorId, changed, actions }: {
       <TableCell>{h.harness.mode === 'symlink' ? 'Symbolic link' : 'Copy'}</TableCell>
       <TableCell><Badge variant="secondary">{harnessOrigin(h)}</Badge>
         {h.available && <p className="text-xs text-muted-foreground">{h.enabled ? 'Its skills directory is available.' : 'Available: off until you enable it.'}</p>}</TableCell>
-      <TableCell><div className="flex justify-end gap-1">{actions?.(h)}
+      <TableCell className="whitespace-normal"><div className="flex flex-wrap justify-end gap-1">{actions?.(h)}
         {h.available && <Button variant="ghost" size="sm" aria-label={h.enabled ? `Sync ${h.name}'s skills directory too` : `Enable ${h.name}`} onClick={() => setChange({ op: 'enable', name: h.name })}>{h.enabled ? 'Add skills' : 'Enable'}</Button>}
         <Button variant="ghost" size="sm" aria-label={`Edit ${h.name}`} onClick={() => setEditing({ name: h.name, harness: h.harness, existing: true })}>Edit</Button>
         {h.configured && <Button variant="ghost" size="sm" aria-label={`${h.preset ? 'Reset' : 'Remove'} ${h.name}`} onClick={() => setChange({ op: 'remove', name: h.name })}>{h.preset ? 'Reset' : 'Remove'}</Button>}</div></TableCell>

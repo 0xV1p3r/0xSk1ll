@@ -1,4 +1,5 @@
 import { api } from './api';
+import { splitItem } from './model';
 import type { DraftEntry } from './types';
 
 export interface DraftSnapshotEntry extends DraftEntry { diff: string }
@@ -28,7 +29,7 @@ export function reconcileReview(review: DraftReview, snapshot: DraftSnapshotEntr
     ]);
     if (signature(before) === signature(after)) continue;
     const reason = !after ? 'no longer in Draft' : !before ? 'added to Draft' : 'Draft content changed';
-    const change = `${item}: ${reason}`;
+    const change = `${splitItem(item).name}: ${reason}`;
     if (!changes.includes(change)) changes.push(change);
   }
   return { ...review, snapshot, changes };

@@ -118,11 +118,10 @@ export function Fleet({ revision, machineId, initialMachine, serverUrl = null, l
               <ToggleGroup aria-label="Machine filter" value={selectedMachine ? [] : [filter ?? 'all']} onValueChange={value => { setSelectedMachine(undefined); if (value.length) setFilter(value[0] === 'all' ? null : value[0] as 'attention' | 'connected'); }} className="flex rounded-lg border bg-background p-0.5">
                 {([{ value: 'all', label: 'All', count: machines.length }, { value: 'attention', label: 'Attention', count: attention }, { value: 'connected', label: 'Connected', count: connected }] as const).map(option =>
                   <Toggle key={option.value} value={option.value} aria-label={`Filter: ${option.label}`} className="flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring aria-pressed:bg-muted aria-pressed:text-foreground"><span>{option.label}</span><span className="text-[11px] text-muted-foreground tabular-nums">{option.count}</span></Toggle>)}
-              </ToggleGroup></PanelToolbar>
-            <div className="border-b px-3.5 py-2.5"><JoinCodeButton label="Add Machine" serverUrl={serverUrl} scope={scope} /></div>
+              </ToggleGroup><div className="ml-auto"><JoinCodeButton label="Add Machine" serverUrl={serverUrl} scope={scope} compact /></div></PanelToolbar>
             <div className="min-w-0 p-0">
       {visible.length > 0 ? <Table ref={table} aria-label="Machines" className="table-fixed">
-        <TableHeader><TableRow className="hover:bg-transparent [&_th]:h-8 [&_th]:text-[11px] [&_th]:text-muted-foreground">
+        <TableHeader><TableRow>
           <TableHead className="pl-4">Machine</TableHead><TableHead className="w-24">Status</TableHead>
           <TableHead className="hidden w-22 @min-[620px]/machines:table-cell">Baseline</TableHead>
           <TableHead className="hidden w-14 text-right @min-[520px]/machines:table-cell">Draft<span className="sr-only"> items</span></TableHead>

@@ -445,7 +445,7 @@ export function installMock(scenario: string, options: MockOptions = {}): MockDa
       }
       case 'draft': return delay(draft);
       case 'diff': return delay({ item: a.item, diff: diffs[a.item as string] ?? '' }, 50);
-      case 'commit_message': return delay({ items: a.items, message: `Commit ${(a.items as string[]).join(', ')}` });
+      case 'commit_message': return delay({ items: a.items, message: `commit ${(a.items as string[]).map(item => item.slice(item.indexOf(':') + 1)).join(', ')} from ${status.machine_id}` });
       case 'commit': {
         const request = a.request as T.CommitRequest;
         settle(request.items, true);

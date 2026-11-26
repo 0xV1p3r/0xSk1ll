@@ -310,9 +310,9 @@ function AuthorityMatrix({ revision, status, target, openLog }: MatrixProps) {
     <span id="default-hint" className="sr-only">{defaultHint}</span>
     {groups.length > 0 && <div className="overflow-hidden [&_[data-slot=table-container]]:max-h-[max(24rem,calc(100svh-9rem))] [&_[data-slot=table-container]]:scroll-pt-[4.5rem]"><Table aria-label="Assignment matrix" stickyFirstColumn>
       <TableHeader><TableRow className="bg-muted hover:bg-muted">
-        <TableHead rowSpan={2} scope="col" className="sticky top-0 left-0 z-30! min-w-48 bg-muted align-bottom shadow-[inset_0_-1px_0_var(--color-border)] md:min-w-64">Skill / Rule</TableHead>
+        <TableHead rowSpan={2} scope="col" className="sticky top-0 left-0 z-30! min-w-48 bg-muted pb-2.5 align-bottom shadow-[inset_0_-1px_0_var(--color-border)] md:min-w-64">Skill / Rule</TableHead>
         {groups.map(g => <TableHead key={g.machine.id} scope="colgroup" colSpan={g.collapsed || !g.loaded ? 1 : g.harnesses.length}
-          aria-label={[g.machine.id, g.machine.id === status.machine_id && 'This Machine', g.offline && 'Offline'].filter(Boolean).join(', ')} className={cn(headEdge, 'top-0 pl-1')}><div className="flex items-center gap-1.5">
+          aria-label={[g.machine.id, g.machine.id === status.machine_id && 'This Machine', g.offline && 'Offline'].filter(Boolean).join(', ')} className={cn(headEdge, 'top-0 pl-1 text-sm text-foreground')}><div className="flex items-center gap-1.5">
           {g.loaded ? <Button size="icon-xs" variant="ghost" className="text-muted-foreground aria-expanded:bg-transparent aria-expanded:text-muted-foreground aria-expanded:hover:bg-muted" aria-expanded={!g.collapsed} aria-label={`${g.machine.id} Harnesses`}
             onClick={() => setCollapsed(old => g.collapsed ? old.filter(id => id !== g.machine.id) : [...old, g.machine.id])}>
             <ChevronRight className={cn('transition-transform', !g.collapsed && 'rotate-90')} /></Button> : <span aria-hidden className="size-6" />}
@@ -326,7 +326,7 @@ function AuthorityMatrix({ revision, status, target, openLog }: MatrixProps) {
           {g.offline && <span className="inline-flex items-center gap-1.5 text-xs font-normal text-muted-foreground"><span aria-hidden className="size-2 rounded-full border-[1.5px] border-muted-foreground" />Offline</span>}
         </div></TableHead>)}
       </TableRow><TableRow className="bg-muted hover:bg-muted">
-        {segments(c => <TableHead key={`${c.machine}/${c.harness}`} scope="col" className={cn(headEdge, 'top-10 h-8 min-w-28 font-mono text-xs font-normal text-muted-foreground')}><div className="flex items-center justify-between gap-1">{c.harness}{menu(`Actions for ${c.machine} / ${c.harness}`, [
+        {segments(c => <TableHead key={`${c.machine}/${c.harness}`} scope="col" className={cn(headEdge, 'top-10 h-8 min-w-28 first:pl-2 font-mono text-xs font-normal text-muted-foreground')}><div className="flex items-center justify-between gap-1">{c.harness}{menu(`Actions for ${c.machine} / ${c.harness}`, [
           { label: 'Enable all visible items', run: () => columnBulk(c, true) },
           { label: 'Disable all visible items', run: () => columnBulk(c, false) },
         ], !!pending.get(c.machine) || !items.some(item => available(item, c.machine)))}</div></TableHead>,

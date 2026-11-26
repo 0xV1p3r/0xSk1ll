@@ -11,7 +11,7 @@ export const statusTone: Record<MachineStatus, 'secondary' | 'destructive' | 'wa
 export const plural = (count: number, one: string, many = `${one}s`) => `${count} ${count === 1 ? one : many}`;
 export function pullToast(result: PullResult) {
   if (result.state !== 'blocked') return { title: result.state === 'up_to_date' ? 'Baseline is up to date' : 'Pull complete' };
-  const description = result.items.length ? `The new Baseline also changes ${result.items.join(', ')} in this Machine's Draft.`
+  const description = result.items.length ? `The new Baseline also changes ${itemNames(result.items)} in this Machine's Draft.`
     : result.pending ? 'An interrupted pull still needs to finish.' : "The new Baseline clashes with this Machine's Draft.";
   return { title: 'Pull blocked', description };
 }
@@ -35,6 +35,8 @@ export function splitItem(item: ItemRef): { kind: string; name: string } {
   const at = item.indexOf(':');
   return at < 0 ? { kind: item, name: item } : { kind: item.slice(0, at), name: item.slice(at + 1) };
 }
+// Item IDs as people read them: `skill:pdf` → `pdf`. Commands keep the full ID.
+export const itemNames = (items: ItemRef[]) => items.map(item => splitItem(item).name).join(', ');
 // Mirrors the Daemon's warning: plain HTTP sends the Machine token in clear text, except to this computer.
 export function insecureHttp(server: string): boolean {
   let url: URL;

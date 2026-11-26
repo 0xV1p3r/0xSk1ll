@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useState, type CSSProperties, type ReactNode } from 'react';
 import { Check, CircleAlert, Info, Inbox, LoaderCircle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -30,10 +30,44 @@ export function KindBadge({ kind }: { kind: string }) {
 export function CheckboxSwatch({ explicit, enabled }: { explicit: boolean; enabled: boolean }) {
   return <span inert aria-hidden className="inline-flex"><Checkbox tabIndex={-1} className={matrixCheckbox(explicit, enabled)} checked={enabled} /></span>;
 }
-// Unified diff lines whose colours span the full scroll width.
+type DiffRow = { kind: 'file' | 'hunk' | 'add' | 'delete' | 'context' | 'note'; text: string; old?: number; new?: number };
+// Parses a unified diff into rows with line numbers. A `---`/`+++` pair becomes one file row naming the new side.
+function diffRows(diff: string): DiffRow[] {
+  const lines = diff.replace(/\n$/, '').split('\n');
+  const rows: DiffRow[] = [];
+  let oldLine = 0, newLine = 0, inHunk = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.startsWith('diff --git ') || line.startsWith('index ')) continue;
+    if (!inHunk && line.startsWith('--- ') && lines[i + 1]?.startsWith('+++ ')) {
+      const from = line.slice(4).replace(/^a\//, ''), to = lines[i + 1].slice(4).replace(/^b\//, '');
+      rows.push({ kind: 'file', text: from === to || from === '/dev/null' ? to : to === '/dev/null' ? from : `${from} → ${to}` });
+      i++; continue;
+    }
+    const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+    if (hunk) { oldLine = +hunk[1]; newLine = +hunk[2]; inHunk = true; rows.push({ kind: 'hunk', text: line }); continue; }
+    if (line.startsWith('\\')) rows.push({ kind: 'note', text: line });
+    else if (line.startsWith('+')) rows.push({ kind: 'add', text: line, new: inHunk ? newLine++ : undefined });
+    else if (line.startsWith('-')) rows.push({ kind: 'delete', text: line, old: inHunk ? oldLine++ : undefined });
+    else rows.push({ kind: inHunk ? 'context' : 'note', text: line, old: inHunk ? oldLine++ : undefined, new: inHunk ? newLine++ : undefined });
+    // A blank line between files ends the hunk.
+    if (!line && inHunk && lines[i + 1]?.startsWith('--- ')) inHunk = false;
+  }
+  // One file needs no label: its path is already shown beside the diff.
+  return rows.filter(row => row.kind === 'file').length > 1 ? rows : rows.filter(row => row.kind !== 'file');
+}
+// Unified diff lines with an old/new line-number gutter. Numbers are CSS-drawn so copying keeps the `+`/`-` text intact.
 export function DiffLines({ diff }: { diff: string }) {
-  return <div className="w-max min-w-full">{diff.split('\n').map((line, i) => <div key={i} className="-mx-3 px-3"
-    data-kind={line.startsWith('@@') ? 'hunk' : line.startsWith('+') ? 'add' : line.startsWith('-') ? 'delete' : undefined}>{line || ' '}</div>)}</div>;
+  const rows = diffRows(diff);
+  const digits = Math.max(2, ...rows.map(row => String(Math.max(row.old ?? 0, row.new ?? 0)).length));
+  return <div className="w-max min-w-full" style={{ '--diff-gutter': `${digits}ch` } as CSSProperties}>{rows.map((row, i) => row.kind === 'file' || row.kind === 'hunk'
+    ? <div key={i} data-kind={row.kind}>{row.text}</div>
+    : <div key={i} data-kind={row.kind}><span aria-hidden data-n={row.old ?? ''} /><span aria-hidden data-n={row.new ?? ''} />{row.text || ' '}</div>)}</div>;
+}
+// The one frame every diff uses: bordered, scrollable, monospace.
+export function DiffView({ diff, label, empty = 'No differences.', className }: { diff: string; label: string; empty?: string; className?: string }) {
+  return <pre tabIndex={0} aria-label={label} className={cn('diff min-w-0 max-w-full max-h-[32rem] overflow-auto rounded-md border bg-card font-mono text-xs leading-5 outline-none [tab-size:4] focus-visible:ring-3 focus-visible:ring-ring', className)}>
+    {diff.trim() ? <DiffLines diff={diff} /> : <span className="block px-3 py-2 font-sans text-muted-foreground">{empty}</span>}</pre>;
 }
 export function StatusBadge({ status }: { status: MachineStatus }) {
   return <Badge variant={statusTone[status]}><span aria-hidden className="size-1.5 shrink-0 rounded-full bg-current" />{statusLabels[status]}</Badge>;
@@ -42,9 +76,10 @@ export function ErrorNotice({ error, title = 'Could not complete the request' }:
   return error ? <Alert variant="destructive" role="alert"><CircleAlert /><AlertTitle>{title}</AlertTitle>
     <AlertDescription className="break-words">{error}</AlertDescription></Alert> : null;
 }
-export function Notice({ title, children, tone = 'default' }: { title: string; children: ReactNode; tone?: 'default' | 'destructive' }) {
-  return <Alert variant={tone} role={tone === 'destructive' ? 'alert' : 'status'}>{tone === 'destructive' ? <CircleAlert /> : <Info />}
-    <AlertTitle>{title}</AlertTitle><AlertDescription className={tone === 'destructive' ? 'text-foreground/85!' : undefined}>{children}</AlertDescription></Alert>;
+export function Notice({ title, children, tone = 'default', action }: { title: string; children: ReactNode; tone?: 'default' | 'destructive'; action?: ReactNode }) {
+  return <Alert variant={tone} role={tone === 'destructive' ? 'alert' : 'status'} className={action ? 'has-[>svg]:grid-cols-[auto_1fr_auto]' : undefined}>{tone === 'destructive' ? <CircleAlert /> : <Info />}
+    <AlertTitle>{title}</AlertTitle><AlertDescription className={cn('col-start-2', tone === 'destructive' && 'text-foreground/85!')}>{children}</AlertDescription>
+    {action && <div className="col-start-3 row-span-2 row-start-1 self-center pl-2">{action}</div>}</Alert>;
 }
 export function Nothing({ title = 'Nothing here', children, className, action }: { title?: string; children: ReactNode; className?: string; action?: ReactNode }) {
   return <Empty className={cn('border border-dashed', className)}><EmptyHeader><EmptyMedia variant="icon"><Inbox /></EmptyMedia>
@@ -59,7 +94,7 @@ export function Pending({ pending, children }: { pending: boolean; children: Rea
 }
 // A small titled block of key/value rows.
 export function Details({ rows, className }: { rows: [string, ReactNode][]; className?: string }) {
-  return <dl className={cn('grid grid-cols-[max-content_minmax(0,1fr)] gap-x-6 gap-y-2 text-sm', className)}>
+  return <dl className={cn('grid grid-cols-[minmax(9rem,max-content)_minmax(0,1fr)] gap-x-6 gap-y-2 text-sm', className)}>
     {rows.map(([term, value]) => <div key={term} className="contents"><dt className="text-muted-foreground">{term}</dt>
       <dd className="break-words">{value}</dd></div>)}</dl>;
 }
