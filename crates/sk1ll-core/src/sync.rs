@@ -819,7 +819,9 @@ fn apply_instructions(repo: &Repo, action: &Action, content: Option<&str>, expec
     let spliced = instructions::splice(&text, block.as_ref(), content);
     // A file sync created stays sync's only while it holds exactly what
     // sync last wrote: anything else (an edit anywhere, a file replaced)
-    // makes it the user's for good, and it is never removed.
+    // makes it the user's for good, and it is never removed. The one
+    // exception is an Overwrite of an edit made only inside the block
+    // (`reclaimed` below).
     let created = displaced::created_block(dest)?;
     let owned = match &created {
         Some(created) => existing.is_some() && !is_symlink(dest) && created.is(dest)?,
@@ -839,10 +841,15 @@ fn apply_instructions(repo: &Repo, action: &Action, content: Option<&str>, expec
         false => OldCopy::DropIfIntact,
         true => OldCopy::KeepMarked,
     };
+    // A forced rewrite of a hand-edited block in a file sync created, with
+    // nothing at all outside the block, leaves nothing of anyone else's in
+    // it (the edit is kept in recovery), so the file is sync's again.
+    let reclaimed =
+        created.is_some() && content.is_some() && block.as_ref().is_some_and(|b| b.edited() && b.is_whole(&text));
     let (displaced, published) = replace_file_published(dest, &spliced, unchanged, displace, old)?;
     // Recorded after the write: a crash in between leaves no record, and
     // the file stays, as one that sync didn't create would.
-    if (existing.is_none() || owned) && !is_symlink(dest) {
+    if (existing.is_none() || owned || reclaimed) && !is_symlink(dest) {
         let created =
             published.map(|(file, payload)| displaced::CreatedBlock { written: hash_str(&spliced), file, payload });
         displaced::record_created_block(dest, created.as_ref())?;

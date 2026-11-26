@@ -481,6 +481,7 @@ fn stale_skill_plans_preserve_harness_edits() {
 fn an_emptied_block_file_goes_only_if_sync_created_it_and_nobody_touched_it() {
     for case in [
         "created",
+        "overwritten",
         "preexisting",
         "whitespace",
         "outside text",
@@ -492,13 +493,16 @@ fn an_emptied_block_file_goes_only_if_sync_created_it_and_nobody_touched_it() {
         let (home, repo, harnesses, dest) = instructions_setup(InstructionsFormat::Block);
         let _home = home.enter();
         let id = rule_id(&repo, "git");
-        let toggle = |on| {
+        let sync = |on, force| {
             let mut assignment = Assignment::default();
             assignment.set_rule("h", &id, on);
-            for action in plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap() {
-                apply(&repo, &action).unwrap();
-            }
+            plan(&repo, &harnesses, &assignment, PlanOptions { force })
+                .unwrap()
+                .iter()
+                .map(|a| apply(&repo, a))
+                .collect::<Vec<_>>()
         };
+        let toggle = |on| sync(on, false).into_iter().collect::<Result<Vec<_>, _>>().unwrap();
         if case == "preexisting" {
             write(&dest, "");
         }
@@ -508,6 +512,14 @@ fn an_emptied_block_file_goes_only_if_sync_created_it_and_nobody_touched_it() {
         match case {
             "whitespace" => write(&dest, &format!("\n{original}")),
             "outside text" => write(&dest, &format!("# Mine\n\n{original}")),
+            // An Overwrite of an edit inside the block: the edit goes to
+            // recovery, and the file is sync's again.
+            "overwritten" => {
+                write(&dest, &original.replace("Use CC.", "Use whatever."));
+                let results = sync(true, true);
+                assert!(matches!(results[..], [Ok(())]), "{results:?}");
+                assert_eq!(sk1ll_testkit::read(&dest), original);
+            }
             #[cfg(unix)]
             "replaced" => {
                 let save = home.path().join("editor");
@@ -527,6 +539,9 @@ fn an_emptied_block_file_goes_only_if_sync_created_it_and_nobody_touched_it() {
         if case == "created" {
             assert!(!dest.exists());
             assert!(entries.len() == 1 && entries[0].dest == dest && !entries[0].changed, "{entries:?}");
+        } else if case == "overwritten" {
+            assert!(!dest.exists(), "taken out, not left empty");
+            assert_eq!(entries.iter().filter(|e| e.changed).count(), 1, "the edit is kept: {entries:?}");
         } else {
             assert_eq!(sk1ll_testkit::read(&dest).trim(), if case == "outside text" { "# Mine" } else { "" }, "{case}");
             assert!(entries.is_empty(), "{case}: {entries:?}");
