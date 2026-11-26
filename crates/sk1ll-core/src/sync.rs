@@ -820,18 +820,37 @@ fn apply_instructions(repo: &Repo, action: &Action, content: Option<&str>, expec
     // A file sync created stays sync's only while it holds exactly what
     // sync last wrote: anything else (an edit anywhere, a file replaced)
     // makes it the user's for good, and it is never removed. The one
-    // exception is an Overwrite of an edit made only inside the block
-    // (`reclaimed` below).
+    // exception is a forced write over an edit made only inside the block
+    // (`block_edited` below).
     let created = displaced::created_block(dest)?;
     let owned = match &created {
         Some(created) => existing.is_some() && !is_symlink(dest) && created.is(dest)?,
         None => false,
     };
+    // Still the very file sync created, with nothing at all outside its
+    // block, whose block was edited by hand: forcing the block over that
+    // edit (kept in recovery) leaves nothing of anyone else's in the file,
+    // so it stays sync's, and a forced take-out removes the file.
+    let block_edited = match &created {
+        Some(created) => {
+            !owned
+                && existing.is_some()
+                && !is_symlink(dest)
+                && block.as_ref().is_some_and(|b| b.edited() && b.is_whole(&text))
+                && created.same_file(dest)?
+        }
+        None => false,
+    };
+    if let (None, Some(created)) = (content, &created) {
+        if owned && spliced.trim().is_empty() {
+            return remove_created_block(repo, &action.harness, dest, created, None, unchanged);
+        }
+        if block_edited {
+            return remove_created_block(repo, &action.harness, dest, created, Some(&whole), unchanged);
+        }
+    }
     if created.is_some() && !owned {
         displaced::record_created_block(dest, None)?;
-    }
-    if let (None, true, Some(created)) = (content, owned && spliced.trim().is_empty(), &created) {
-        return remove_created_block(repo, &action.harness, dest, created, unchanged);
     }
     // Splicing keeps every byte outside the block. A block that is still
     // what sk1ll wrote (or none) is sk1ll's own, so the rewrite displaces
@@ -841,15 +860,10 @@ fn apply_instructions(repo: &Repo, action: &Action, content: Option<&str>, expec
         false => OldCopy::DropIfIntact,
         true => OldCopy::KeepMarked,
     };
-    // A forced rewrite of a hand-edited block in a file sync created, with
-    // nothing at all outside the block, leaves nothing of anyone else's in
-    // it (the edit is kept in recovery), so the file is sync's again.
-    let reclaimed =
-        created.is_some() && content.is_some() && block.as_ref().is_some_and(|b| b.edited() && b.is_whole(&text));
     let (displaced, published) = replace_file_published(dest, &spliced, unchanged, displace, old)?;
     // Recorded after the write: a crash in between leaves no record, and
     // the file stays, as one that sync didn't create would.
-    if (existing.is_none() || owned || reclaimed) && !is_symlink(dest) {
+    if (existing.is_none() || owned || block_edited) && !is_symlink(dest) {
         let created =
             published.map(|(file, payload)| displaced::CreatedBlock { written: hash_str(&spliced), file, payload });
         displaced::record_created_block(dest, created.as_ref())?;
@@ -868,35 +882,49 @@ fn is_symlink(path: &Path) -> bool {
 /// is kept. The file is checked once more where it was moved to: if it
 /// isn't sync's after all, it goes back (or, if something took its place,
 /// stays in recovery for good), and nothing is removed.
+///
+/// `edited`: the hash of the whole text, for a forced take-out of the file
+/// sync created whose block was edited by hand: it must still be that very
+/// file with that text, and its recovery entry keeps the edit for good.
 fn remove_created_block(
     repo: &Repo,
     harness: &str,
     dest: &Path,
     created: &displaced::CreatedBlock,
+    edited: Option<&str>,
     unchanged: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     let holder = dest.parent().ok_or_else(|| Error::Invalid(format!("{} has no parent", dest.display())))?;
     let _lock = DirLock::acquire(holder)?;
     unchanged()?;
-    if !created.is(dest)? {
+    let kind = displaced::Kind::Instructions;
+    let ours = |path: &Path| match edited {
+        None => created.is(path),
+        Some(whole) => Ok(created.same_file(path)? && displaced::fingerprint(kind, path)?.as_deref() == Some(whole)),
+    };
+    if !ours(dest)? {
         return Err(changed_since_plan(dest));
     }
-    let kind = displaced::Kind::Instructions;
-    // Its backup holds only what sync wrote: pruned once unchanged and old enough.
-    let payload = Some(created.payload.as_str());
-    let mut held =
-        displaced::Displacing::begin(Some(repo), kind, harness, dest, Some(&created.written), payload, holder)?;
+    // An unedited backup holds only what sync wrote: pruned once unchanged and old enough.
+    let (expected, payload) = match edited {
+        None => (created.written.as_str(), Some(created.payload.as_str())),
+        Some(whole) => (whole, None),
+    };
+    let mut held = displaced::Displacing::begin(Some(repo), kind, harness, dest, Some(expected), payload, holder)?;
     crate::failpoint!(BeforeSwap, dest);
     if let Err(e) = held.take(dest) {
         held.abandon();
         return Err(e);
     }
     crate::failpoint!(AfterAside, dest);
-    if !created.is(&held.content())? {
+    if !ours(&held.content())? {
         held.put_back()?;
         return Err(changed_since_plan(dest));
     }
-    let displaced = held.finish(false)?;
+    let displaced = match edited {
+        None => held.finish(false)?,
+        Some(_) => held.finish_kept().map(|()| None)?,
+    };
     displaced::record_created_block(dest, None)?;
     displaced.map_or(Ok(()), Err)
 }
@@ -2545,6 +2573,12 @@ pub mod displaced {
     }
 
     impl CreatedBlock {
+        /// Whether `path` is still the very file sync published (its
+        /// identity), whatever it holds now.
+        pub(super) fn same_file(&self, path: &Path) -> Result<bool> {
+            Ok(rule_identity(path)? == Some(self.file))
+        }
+
         /// Whether `path` is still the very file sync published, unchanged.
         pub(super) fn is(&self, path: &Path) -> Result<bool> {
             Ok(rule_identity(path)? == Some(self.file)
