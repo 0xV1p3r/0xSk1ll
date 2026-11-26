@@ -584,6 +584,43 @@ fn an_emptied_block_file_goes_only_if_sync_created_it_and_nobody_touched_it() {
     }
 }
 
+/// A file put in place of sync's while an Overwrite is about to swap,
+/// with the very same text, is the user's: what the swap replaced decides,
+/// not what was checked before it, so a later take-out leaves it.
+#[cfg(unix)]
+#[test]
+fn a_file_swapped_in_during_an_overwrite_stays_the_users() {
+    let (tmp, repo, harnesses, dest) = instructions_setup(InstructionsFormat::Block);
+    let _home = tmp.enter();
+    let id = rule_id(&repo, "git");
+    let sync = |on, force| {
+        let mut assignment = Assignment::default();
+        assignment.set_rule("h", &id, on);
+        plan(&repo, &harnesses, &assignment, PlanOptions { force })
+            .unwrap()
+            .iter()
+            .map(|a| apply(&repo, a))
+            .collect::<Vec<_>>()
+    };
+    let _: Vec<()> = sync(true, false).into_iter().collect::<Result<_, _>>().unwrap();
+    let original = sk1ll_testkit::read(&dest);
+    let edited = original.replace("Use CC.", "Use whatever.");
+    write(&dest, &edited);
+    let swap = {
+        let (dest, mine) = (dest.clone(), tmp.path().join("mine.md"));
+        move |_: &Path| {
+            write(&mine, &edited);
+            fs::rename(&mine, &dest).unwrap();
+        }
+    };
+    let results: Vec<_> = with_hook(Point::BeforeSwap, swap, || sync(true, true));
+    assert!(matches!(results[..], [Ok(())]), "{results:?}");
+    assert_eq!(sk1ll_testkit::read(&dest), original, "overwritten");
+    let _: Vec<()> = sync(false, false).into_iter().collect::<Result<_, _>>().unwrap();
+    assert!(dest.exists(), "the user's file stays");
+    assert_eq!(sk1ll_testkit::read(&dest).trim(), "");
+}
+
 #[cfg(unix)]
 #[test]
 fn a_created_block_file_swapped_during_its_removal_goes_back() {
