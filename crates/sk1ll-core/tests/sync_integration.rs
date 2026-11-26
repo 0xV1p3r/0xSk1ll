@@ -482,6 +482,9 @@ fn an_emptied_block_file_goes_only_if_sync_created_it_and_nobody_touched_it() {
     for case in [
         "created",
         "overwritten",
+        "taken out, then overwritten",
+        #[cfg(unix)]
+        "replaced, then overwritten",
         "preexisting",
         "whitespace",
         "outside text",
@@ -520,6 +523,27 @@ fn an_emptied_block_file_goes_only_if_sync_created_it_and_nobody_touched_it() {
                 assert!(matches!(results[..], [Ok(())]), "{results:?}");
                 assert_eq!(sk1ll_testkit::read(&dest), original);
             }
+            // Taking the rule out leaves the edit as a conflict; overwriting
+            // that conflict takes the file out, the edit into recovery.
+            "taken out, then overwritten" => {
+                let edited = original.replace("Use CC.", "Use whatever.");
+                write(&dest, &edited);
+                toggle(false);
+                assert_eq!(sk1ll_testkit::read(&dest), edited, "a conflict is left alone");
+                let results = sync(false, true);
+                assert!(matches!(results[..], [Ok(())]), "{results:?}");
+            }
+            // An edited file saved in place of sync's (a new inode) is the
+            // user's: an Overwrite rewrites its block, and it stays theirs.
+            #[cfg(unix)]
+            "replaced, then overwritten" => {
+                let save = home.path().join("editor");
+                write(&save, &original.replace("Use CC.", "Use whatever."));
+                fs::rename(save, &dest).unwrap();
+                let results = sync(true, true);
+                assert!(matches!(results[..], [Ok(())]), "{results:?}");
+                assert_eq!(sk1ll_testkit::read(&dest), original);
+            }
             #[cfg(unix)]
             "replaced" => {
                 let save = home.path().join("editor");
@@ -539,9 +563,17 @@ fn an_emptied_block_file_goes_only_if_sync_created_it_and_nobody_touched_it() {
         if case == "created" {
             assert!(!dest.exists());
             assert!(entries.len() == 1 && entries[0].dest == dest && !entries[0].changed, "{entries:?}");
-        } else if case == "overwritten" {
-            assert!(!dest.exists(), "taken out, not left empty");
-            assert_eq!(entries.iter().filter(|e| e.changed).count(), 1, "the edit is kept: {entries:?}");
+        } else if case.contains("overwritten") {
+            let kept = entries.iter().filter(|e| e.changed).count();
+            assert_eq!(kept, 1, "{case}: the edit is kept: {entries:?}");
+            if case.starts_with("replaced") {
+                assert_eq!(sk1ll_testkit::read(&dest).trim(), "", "{case}: the user's file stays");
+                toggle(true);
+                toggle(false);
+                assert!(dest.exists(), "{case}: once the user's, always the user's");
+            } else {
+                assert!(!dest.exists(), "{case}: taken out, not left empty");
+            }
         } else {
             assert_eq!(sk1ll_testkit::read(&dest).trim(), if case == "outside text" { "# Mine" } else { "" }, "{case}");
             assert!(entries.is_empty(), "{case}: {entries:?}");
