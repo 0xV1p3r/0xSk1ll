@@ -87,6 +87,8 @@ fn adopts_only_chosen_variant_preserves_originals_in_recovery_and_respects_defau
         write(&tmp.path().join(h).join("pdf/SKILL.md"), "same");
     }
     write(&tmp.path().join("a/pdf/.sk1ll-id"), "from-elsewhere\n");
+    // A local checkout's history, which the copy into the repo leaves out.
+    write(&tmp.path().join("b/pdf/.git/refs/heads/local"), "0123\n");
     write(&tmp.path().join("c/pdf/SKILL.md"), "different");
     let adoption = prepare(&repo, &hs, "a", "pdf").unwrap();
     assert_eq!(adoption.locations.len(), 2);
@@ -118,8 +120,10 @@ fn adopts_only_chosen_variant_preserves_originals_in_recovery_and_respects_defau
     assert_eq!(recovery.len(), 2);
     for entry in &recovery {
         assert_eq!(fs::read_to_string(entry.path.join("SKILL.md")).unwrap(), "same");
+        // Only the original with a `.git` is the one full copy of what it holds.
+        assert_eq!(entry.changed, entry.path.join(".git").exists(), "{entry:?}");
         // An original goes back into the skill it was adopted as.
-        assert!(entry.adoptable());
+        assert!(displaced::adoptable(&repo, entry));
         assert_eq!(entry.item_id.as_ref(), Some(&id));
         assert_eq!(displaced::target(&repo, entry).unwrap().path, repo.personal_dir().join("pdf"));
     }
@@ -224,7 +228,8 @@ fn unmanaged_directory_links_are_hashed_by_content_and_adopted_without_touching_
     let entries = displaced::list().unwrap();
     assert_eq!(entries.len(), 2);
     let (links, copies): (Vec<_>, Vec<_>) = entries.iter().partition(|e| e.path.is_symlink());
-    assert!(links.iter().all(|e| !e.adoptable()) && copies.iter().all(|e| e.adoptable()));
+    assert!(links.iter().all(|e| !displaced::adoptable(&repo, e)));
+    assert!(copies.iter().all(|e| displaced::adoptable(&repo, e)));
     assert_eq!((links.len(), copies.len()), (1, 1));
 }
 
@@ -286,6 +291,12 @@ fn rollback_removes_only_the_uncommitted_copy_whose_source_still_matches() {
             let backup = displaced::list().unwrap().remove(0);
             assert!(displaced::prune_with(std::time::Duration::ZERO, 0).unwrap().is_empty());
             assert_eq!(sk1ll_testkit::read(&backup.path.join("SKILL.md")), "Original.\n");
+            // It goes back where it was while that is free; once a retried
+            // Adopt is there, nothing says where it would go.
+            assert!(displaced::adoptable(&repo, &backup));
+            prepare(&repo, &harnesses, "a", "pdf").unwrap();
+            assert!(!displaced::adoptable(&repo, &backup));
+            assert!(displaced::target(&repo, &backup).is_err());
         }
         assert_eq!(
             sk1ll_testkit::read(&source),

@@ -286,6 +286,38 @@ fn hash_xattrs(_: &mut Sha256, _: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Whether `path` (not following a symlink) has extended attributes Git
+/// can't restore: any but its SELinux label, which policy gives every new
+/// file. ACLs are among them on Linux.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn has_local_xattrs(path: &Path) -> std::io::Result<bool> {
+    use rustix::io::Errno;
+    let names = loop {
+        let mut buf = vec![
+            0;
+            match rustix::fs::llistxattr_query(path) {
+                Ok(size) => size,
+                Err(e) if e == Errno::NOTSUP || e == Errno::OPNOTSUPP => return Ok(false),
+                Err(e) => return Err(e.into()),
+            }
+        ];
+        match rustix::fs::llistxattr(path, &mut buf) {
+            Ok(n) => {
+                buf.truncate(n);
+                break buf;
+            }
+            Err(Errno::RANGE) => {}
+            Err(e) => return Err(e.into()),
+        }
+    };
+    Ok(names.split(|b| *b == 0).any(|name| !name.is_empty() && name != b"security.selinux"))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub(crate) fn has_local_xattrs(_: &Path) -> std::io::Result<bool> {
+    Ok(false)
+}
+
 #[derive(PartialEq, Eq)]
 struct PayloadMetadata {
     size: u64,

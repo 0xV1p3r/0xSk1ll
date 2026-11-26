@@ -423,7 +423,10 @@ impl Daemon {
             draft: Ok(draft),
             items: Daemon::items(&root),
             conflicts: conflict_views,
-            recovered: Ok(displaced.into_iter().map(|entry| displaced_view(entry, &root)).collect()),
+            recovered: Ok({
+                let repo = Repo::open_git_only(&root).ok();
+                displaced.into_iter().map(|entry| displaced_view(entry, &root, repo.as_ref())).collect()
+            }),
         }));
         // A refused push stands until `HEAD` moves on (a fix committed, or
         // the commit turned back into Draft).

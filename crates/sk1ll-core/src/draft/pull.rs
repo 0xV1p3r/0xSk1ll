@@ -586,7 +586,6 @@ impl Pull<'_> {
                 }
                 journal.remove(self)?;
                 tree.clear();
-                drop_replaced(journal);
                 let to = rev(self.git(), "HEAD")?.ok_or_else(|| Error::Invalid("HEAD is missing".into()))?;
                 return Ok(Finished::Updated { from: journal.old.clone(), to, displaced });
             }
@@ -657,7 +656,6 @@ impl Pull<'_> {
         crate::failpoint!(PullDone, self.repo);
         journal.remove(self)?;
         tree.clear();
-        drop_replaced(journal);
         let to = rev(self.git(), "HEAD")?.ok_or_else(|| Error::Invalid("HEAD is missing".into()))?;
         Ok(Finished::Updated { from: journal.old.clone(), to, displaced })
     }
@@ -1334,17 +1332,4 @@ fn unsupported_submodules() -> Error {
 
 fn git_error(args: &str, stderr: &[u8]) -> Error {
     Error::Git { args: args.into(), stderr: String::from_utf8_lossy(stderr).trim().to_string() }
-}
-
-/// Drops the recovery entries of a finished pull that hold just what it
-/// moved there. Pull only replaces or removes a path while it holds the
-/// committed version at the journal's `old`, so such an entry holds nothing
-/// the history lacks; one a save went into during the swap is changed, and
-/// stays. Best effort: an entry left behind only shows as unchanged.
-fn drop_replaced(journal: &Journal) {
-    for operation in journal.operations.values() {
-        if let journal::Operation::Remove { recovery } | journal::Operation::Replace { recovery, .. } = operation {
-            let _ = crate::sync::displaced::drop_committed(recovery);
-        }
-    }
 }

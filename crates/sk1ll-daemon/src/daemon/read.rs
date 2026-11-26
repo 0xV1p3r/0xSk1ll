@@ -206,7 +206,10 @@ impl Daemon {
             draft: self.draft(),
             items: Daemon::items(root),
             conflicts,
-            recovered: displaced.map(|entries| entries.into_iter().map(|entry| displaced_view(entry, root)).collect()),
+            recovered: displaced.map(|entries| {
+                let repo = Repo::open_git_only(root).ok();
+                entries.into_iter().map(|entry| displaced_view(entry, root, repo.as_ref())).collect()
+            }),
         })
     }
 
@@ -298,15 +301,16 @@ impl Daemon {
         let repo = Repo::open(self.repo_root())?;
         let (view, recovery) = if let Some(id) = &req.id {
             let entry = sync::displaced::get(id)?;
-            // Adopt can't place it: what it holds, against nothing.
-            if !entry.adoptable() {
-                return Self::recovery_diff(&repo, entry, None);
-            }
-            let target = sync::displaced::target(&repo, &entry)?;
+            // Where Adopt can't place it: what it holds, against nothing.
+            let target = match sync::displaced::adoptable(&repo, &entry) {
+                true => sync::displaced::target(&repo, &entry).ok(),
+                false => None,
+            };
+            let Some(target) = target else { return Self::recovery_diff(&repo, entry, None) };
             if entry.kind == sync::displaced::Kind::Draft {
                 return Self::recovery_diff(&repo, entry, Some(target.path));
             }
-            let view = displaced_view(entry, repo.root());
+            let view = displaced_view(entry, repo.root(), Some(&repo));
             (view, Some(target))
         } else {
             let view = snapshot.conflict(req)?.ok_or_else(|| Error::NotFound("Conflict no longer exists".into()))?;

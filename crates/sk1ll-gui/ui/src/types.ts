@@ -86,7 +86,7 @@ export interface ConflictView {
   // Harness conflicts: false for `block` instructions. Recovered content: false where Adopt can't tell where it goes.
   adoptable: boolean;
   // Recovered content only: it holds a change (a hand edit kept in recovery, a save during a swap), so it needs the user.
-  // Absent: as sk1ll set it aside, safe to discard.
+  // Absent: unchanged since sk1ll set it aside.
   changed?: boolean;
 }
 export interface ConflictTarget { harness: string; name: string }

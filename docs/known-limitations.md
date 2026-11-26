@@ -143,7 +143,10 @@ that the file still holds what the old Baseline has. It then exchanges the
 names with the new file, so a save renamed in at the last moment goes into
 recovery. A writer with the displaced file still open keeps writing to that
 same file. Adopt moves the recovered file into the Draft, including any
-subsequent writes through that open file. These operations need atomic
+subsequent writes through that open file. A replaced file that still holds
+just its committed version is pruned like sync's routine copies, ten
+minutes after it was replaced and once the Pull is finished; a write
+through a descriptor still open after that is lost. These operations need atomic
 exchange and no-replace rename on the filesystems where they are used.
 
 Pull checks for clashes item by item before it changes anything. After that,
