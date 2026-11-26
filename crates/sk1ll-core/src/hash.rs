@@ -318,6 +318,31 @@ pub(crate) fn has_local_xattrs(_: &Path) -> std::io::Result<bool> {
     Ok(false)
 }
 
+/// The permission bits Git gives what it checks out under this process's
+/// umask: a directory or `executable` file `0777`, another file `0666`,
+/// less the umask. Git records only the executable bit, so any other mode
+/// (a private `0600`, say) is one it can't give back.
+#[cfg(unix)]
+pub(crate) fn checkout_mode(executable: bool) -> u32 {
+    (if executable { 0o777 } else { 0o666 }) & !umask()
+}
+
+/// The process's umask, read without changing it (`/proc/self/status`);
+/// `022` where that can't be read.
+#[cfg(unix)]
+fn umask() -> u32 {
+    static UMASK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *UMASK.get_or_init(|| {
+        fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                let line = status.lines().find_map(|line| line.strip_prefix("Umask:"))?;
+                u32::from_str_radix(line.trim(), 8).ok()
+            })
+            .unwrap_or(0o022)
+    })
+}
+
 #[derive(PartialEq, Eq)]
 struct PayloadMetadata {
     size: u64,

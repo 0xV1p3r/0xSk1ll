@@ -1349,6 +1349,29 @@ fn pull_keeps_local_bytes_the_old_commit_cant_give_back() {
     assert_eq!(read(&left[0].path), local);
 }
 
+/// Git records only a file's executable bit: a private mode on a file a
+/// pull removes is kept, changed.
+#[cfg(unix)]
+#[test]
+fn pull_keeps_a_mode_git_cant_give_back() {
+    use sk1ll_core::sync::displaced;
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fleet::new();
+    let (a, b) = (f.a(), f.b());
+    let rel = "instructions/git.md";
+    fs::set_permissions(f.b.join(rel), fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(b.draft().unwrap().is_empty());
+    fs::remove_file(f.a.join(rel)).unwrap();
+    commit_all(&f.a, "remove the rule");
+    a.push().unwrap();
+    assert!(matches!(pull(&b).unwrap(), PullOutcome::Updated { .. }));
+    displaced::prune_with(std::time::Duration::ZERO).unwrap();
+    let kept = displaced::list().unwrap();
+    let entry = kept.iter().find(|e| e.dest == f.b.join(rel)).expect("the private mode is kept");
+    assert!(entry.changed, "{entry:?}");
+    assert_eq!(fs::metadata(&entry.path).unwrap().permissions().mode() & 0o777, 0o600);
+}
+
 /// The grace period runs from when the swap completed: a pull that waited
 /// between reserving an entry and filling it doesn't shorten it.
 #[cfg(unix)]

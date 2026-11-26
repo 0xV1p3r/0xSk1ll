@@ -1105,6 +1105,12 @@ async fn displaced_conflicts_report_to_server_and_resolve() {
     assert_eq!(target, m.repo().join("personal/x"));
     assert_eq!(std::fs::read_to_string(target.join("SKILL.md")).unwrap(), "x\nlate harness edit\n");
     assert!(m.client.conflicts().await.unwrap().is_empty());
+    // The Draft edit it replaced is in no other copy: kept, and it counts.
+    let draft = m.client.recovered().await.unwrap().into_iter().find(|e| e.harness == "repo").unwrap();
+    assert!(draft.changed, "{draft:?}");
+    assert_eq!(std::fs::read_to_string(draft.path.unwrap().join("SKILL.md")).unwrap(), "draft v2\n");
+    assert_eq!(m.status().await.report.conflicts.len(), 1);
+    m.client.discard_displaced(draft.id.as_deref().unwrap()).await.unwrap();
     assert!(m.status().await.report.conflicts.is_empty());
 }
 

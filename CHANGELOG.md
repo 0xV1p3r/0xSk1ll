@@ -164,8 +164,14 @@ break compatibility.
   replaced: an entry for a file that held exactly what checking out the old
   commit writes is a routine copy, pruned after the grace period once the
   pull is finished. A write since, other bytes (an edit inside an expanded
-  `$Id$`), or an extended attribute Git can't restore keeps it, changed.
+  `$Id$`), a mode or an extended attribute Git can't restore keeps it,
+  changed.
   The app marks recovered content **Changed** or **Unchanged**.
+- Adopt keeps the repo version it replaces as changed recovery content
+  unless that was exactly the committed version, so a Draft edit it
+  replaces is never pruned. It no longer prunes its own input on the way,
+  and refuses a recovered rule or instructions file that isn't UTF-8
+  instead of rewriting it with replacement characters.
 - The recovery grace period runs from when a displacement completed, and no
   recovery entry is pruned before it is over: `SK1LL_DISPLACED_MAX` and the
   size cap that pruned young entries are gone.
