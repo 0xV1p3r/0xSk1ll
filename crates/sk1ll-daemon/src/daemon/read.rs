@@ -208,7 +208,8 @@ impl Daemon {
             conflicts,
             recovered: displaced.map(|entries| {
                 let repo = Repo::open_git_only(root).ok();
-                entries.into_iter().map(|entry| displaced_view(entry, root, repo.as_ref())).collect()
+                let resolver = repo.as_ref().map(sync::displaced::Resolver::new);
+                entries.into_iter().map(|entry| displaced_view(entry, root, resolver.as_ref())).collect()
             }),
         })
     }
@@ -310,7 +311,7 @@ impl Daemon {
             if entry.kind == sync::displaced::Kind::Draft {
                 return Self::recovery_diff(&repo, entry, Some(target.path));
             }
-            let view = displaced_view(entry, repo.root(), Some(&repo));
+            let view = displaced_view(entry, repo.root(), Some(&sync::displaced::Resolver::new(&repo)));
             (view, Some(target))
         } else {
             let view = snapshot.conflict(req)?.ok_or_else(|| Error::NotFound("Conflict no longer exists".into()))?;

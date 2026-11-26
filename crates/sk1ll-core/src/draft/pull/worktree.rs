@@ -182,12 +182,19 @@ mod unix {
             old: &Node,
             content: Option<&Content>,
             keep_mode: bool,
+            committed: bool,
         ) -> Result<Operation> {
             let dest = self.root.join(path);
             let existing = matches!(old, Node::File { .. } | Node::Link(_));
+            // `committed`: `old` is the old commit's blob byte for byte.
             let recovery = || {
-                Displacing::begin(None, Kind::Draft, PULL, &dest, Some(&fingerprint(old)), None, &self.holder)
-                    .map(|held| held.id().to_string())
+                let held =
+                    Displacing::begin(None, Kind::Draft, PULL, &dest, Some(&fingerprint(old)), None, &self.holder)?;
+                if committed && let Err(e) = held.expect_committed() {
+                    held.abandon();
+                    return Err(e);
+                }
+                Ok::<_, Error>(held.id().to_string())
             };
             let Some(content) = content else {
                 return Ok(Operation::Remove { recovery: recovery()? });
@@ -612,6 +619,7 @@ mod other {
             _: &Path,
             _: &Node,
             _: Option<&Content>,
+            _: bool,
             _: bool,
         ) -> Result<Operation> {
             unreachable!()

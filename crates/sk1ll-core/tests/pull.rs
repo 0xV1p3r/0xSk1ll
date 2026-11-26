@@ -1256,7 +1256,7 @@ fn pull_keeps_the_working_tree_free_of_its_own_files() {
     assert!(entries.iter().all(|e| !e.changed), "{entries:?}");
     use sk1ll_core::sync::displaced;
     assert!(displaced::prune().unwrap().is_empty());
-    assert_eq!(displaced::prune_with(std::time::Duration::ZERO, displaced::max_size()).unwrap().len(), entries.len());
+    assert_eq!(displaced::prune_with(std::time::Duration::ZERO).unwrap().len(), entries.len());
     assert_eq!(displaced::list().unwrap(), []);
 }
 
@@ -1284,7 +1284,7 @@ fn pull_entries_keep_late_writes_and_local_metadata() {
     assert!(matches!(pull(&b).unwrap(), PullOutcome::Updated { .. }));
     open.write_all(b"saved after the pull\n").unwrap();
     drop(open);
-    displaced::prune_with(std::time::Duration::ZERO, displaced::max_size()).unwrap();
+    displaced::prune_with(std::time::Duration::ZERO).unwrap();
     let kept = displaced::list().unwrap();
     let at = |rel: &str| kept.iter().find(|e| e.dest == f.b.join(rel));
     let written = at(git_md).expect("the late write is kept");
@@ -1313,21 +1313,78 @@ fn pull_probes_exchange_before_starting() {
     assert_eq!(snapshot(&f.b), before);
 }
 
+/// `ident` (like an end-of-line conversion) hides local bytes from the
+/// clean view Git and Pull compare by. What Pull replaces is pruned only if
+/// it is exactly what checking the old commit out writes there.
+#[cfg(unix)]
+#[test]
+fn pull_keeps_local_bytes_the_old_commit_cant_give_back() {
+    use sk1ll_core::sync::displaced;
+    let f = Fleet::new();
+    let (a, b) = (f.a(), f.b());
+    let (clean, edited) = ("instructions/clean.md", "instructions/edited.md");
+    write(&f.a.join(".gitattributes"), "instructions/*.md ident\n");
+    for rel in [clean, edited] {
+        write(&f.a.join(rel), "$Id$\nrule\n");
+    }
+    commit_all(&f.a, "ident rules");
+    a.push().unwrap();
+    assert!(matches!(pull(&b).unwrap(), PullOutcome::Updated { .. }));
+    assert!(read(&f.b.join(clean)).starts_with("$Id: "));
+    let local = "$Id: a local note $\nrule\n";
+    write(&f.b.join(edited), local);
+    // Staged, it is the same blob: the tree reads as clean.
+    git(&f.b, &["add", edited]);
+    assert!(b.draft().unwrap().is_empty(), "the edit reads as clean");
+    for rel in [clean, edited] {
+        write(&f.a.join(rel), "$Id$\nnew rule\n");
+    }
+    commit_all(&f.a, "new rules");
+    a.push().unwrap();
+    assert!(matches!(pull(&b).unwrap(), PullOutcome::Updated { .. }));
+    displaced::prune_with(std::time::Duration::ZERO).unwrap();
+    let left = displaced::list().unwrap();
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert!(left[0].changed && left[0].dest == f.b.join(edited), "{left:?}");
+    assert_eq!(read(&left[0].path), local);
+}
+
+/// The grace period runs from when the swap completed: a pull that waited
+/// between reserving an entry and filling it doesn't shorten it.
+#[cfg(unix)]
+#[test]
+fn pull_entries_get_their_grace_period_from_when_the_swap_completed() {
+    use sk1ll_core::sync::displaced;
+    let f = Fleet::new();
+    let a = f.a();
+    write(&f.a.join("instructions/git.md"), "new rule\n");
+    commit_all(&f.a, "replace a rule");
+    a.push().unwrap();
+    interrupt_pull(&f.b(), Point::PullSwap, 0);
+    let mut aged = 0;
+    for dir in fs::read_dir(f.b.join(".git/.sk1ll-tmp/displaced")).unwrap() {
+        let meta = dir.unwrap().path().join("entry.json");
+        if let Ok(text) = fs::read_to_string(&meta) {
+            let mut json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            json["displaced_at"] = 0.into();
+            fs::write(&meta, json.to_string()).unwrap();
+            aged += 1;
+        }
+    }
+    assert_eq!(aged, 1);
+    assert!(matches!(finish(&f.b()).unwrap(), Some(PullOutcome::Updated { .. })));
+    assert!(displaced::prune().unwrap().is_empty());
+    let entries = displaced::list().unwrap();
+    assert!(entries.len() == 1 && !entries[0].changed, "{entries:?}");
+    assert_eq!(displaced::prune_with(std::time::Duration::ZERO).unwrap(), [entries[0].id.clone()]);
+}
+
 #[cfg(unix)]
 #[test]
 fn recovery_keeps_open_writers_through_prune_and_adoption() {
     use sk1ll_core::sync::displaced::{self, Kind};
-    use sk1ll_testkit::child;
     use std::io::Write;
 
-    if child::dir().is_none() {
-        let home = Home::new();
-        let name = "recovery_keeps_open_writers_through_prune_and_adoption";
-        let out = home.apply(&mut child::command(name, home.path())).env("SK1LL_DISPLACED_MAX", "0").output().unwrap();
-        let log = sk1ll_testkit::text(&out);
-        assert!(out.status.success() && log.contains("1 passed"), "{log}");
-        return;
-    }
     let f = Fleet::new();
     let (a, b) = (f.a(), f.b());
     let rel = "instructions/git.md";
@@ -1339,7 +1396,8 @@ fn recovery_keeps_open_writers_through_prune_and_adoption() {
     let mut open = fs::OpenOptions::new().append(true).open(&path).unwrap();
     assert!(matches!(
         during_pull(&b, (Point::PullFile, 1), || {
-            displaced::prune().unwrap();
+            // The first file's entry waits for the pull, however old.
+            assert!(displaced::prune_with(std::time::Duration::ZERO).unwrap().is_empty());
             open.write_all(b"saved while pull was running\n").unwrap();
         })
         .unwrap(),
@@ -1645,7 +1703,7 @@ fn restart_sweep(rebase: bool) {
             // which pruning takes once they are old enough.
             use sk1ll_core::sync::displaced;
             assert!(displaced::list().unwrap().iter().all(|e| !e.changed), "{case}");
-            displaced::prune_with(std::time::Duration::ZERO, displaced::max_size()).unwrap();
+            displaced::prune_with(std::time::Duration::ZERO).unwrap();
             assert_eq!(displaced::list().unwrap(), [], "{case}");
         }
     }

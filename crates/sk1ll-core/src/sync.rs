@@ -1350,17 +1350,22 @@ struct Displace<'a> {
 }
 
 /// Whether the skill directory at `path` holds anything a copy of it into
-/// the repo leaves out (a `.git`, with branches and stashes that may be
-/// nowhere else), so the original is the only full copy. An Item ID sidecar
-/// only names an item. A link holds nothing: what it points to stays.
+/// the repo leaves out, so the original is the only full copy: a `.git`
+/// (with branches and stashes that may be nowhere else), or extended
+/// attributes, which the copy doesn't take (see
+/// [`crate::hash::has_local_xattrs`]). An Item ID sidecar only names an
+/// item. A link holds nothing: what it points to stays.
 fn holds_uncopied(path: &Path) -> bool {
     if fs::symlink_metadata(path).map_or(true, |m| m.file_type().is_symlink()) {
         return false;
     }
-    WalkDir::new(path)
-        .min_depth(1)
-        .into_iter()
-        .any(|entry| entry.map_or(true, |e| excluded_from_skill(e.depth(), e.file_name())))
+    WalkDir::new(path).into_iter().any(|entry| {
+        entry.map_or(true, |e| {
+            // Not the placement marker: that one is sk1ll's own.
+            SKILL_CONTENT_EXCLUSIONS.iter().any(|excluded| e.file_name() == *excluded)
+                || crate::hash::has_local_xattrs(e.path()).unwrap_or(true)
+        })
+    })
 }
 
 impl Displace<'_> {
@@ -1815,20 +1820,40 @@ pub struct AdoptTarget {
     rule: Option<Rule>,
 }
 
-fn adopt_target(repo: &Repo, kind: displaced::Kind, dest: &Path, item_id: Option<&ItemId>) -> Result<AdoptTarget> {
-    let leaf = dest.file_name().unwrap_or_default().to_string_lossy();
-    let mut target = AdoptTarget {
-        path: dest.to_path_buf(),
-        origin: None,
-        placed_origin: None,
-        existing: false,
-        skill_id: None,
-        rule: None,
-    };
-    if matches!(kind, displaced::Kind::Instructions | displaced::Kind::Draft) {
-        return Ok(target);
+impl AdoptTarget {
+    /// Back where it was: a block instructions file, or a working-tree file pull displaced.
+    fn at(dest: &Path) -> Self {
+        Self {
+            path: dest.to_path_buf(),
+            origin: None,
+            placed_origin: None,
+            existing: false,
+            skill_id: None,
+            rule: None,
+        }
     }
-    let (skills, rules) = repo.content()?;
+}
+
+/// The repo's skills and rules ([`Repo::content`]).
+type Inventory = (Vec<crate::Skill>, Vec<Rule>);
+
+fn adopt_target(repo: &Repo, kind: displaced::Kind, dest: &Path, item_id: Option<&ItemId>) -> Result<AdoptTarget> {
+    match kind {
+        displaced::Kind::Instructions | displaced::Kind::Draft => Ok(AdoptTarget::at(dest)),
+        _ => adopt_target_in(repo, &repo.content()?, kind, dest, item_id),
+    }
+}
+
+/// [`adopt_target`] of a skill or rule file, against the repo's `inventory`.
+fn adopt_target_in(
+    repo: &Repo,
+    (skills, rules): &Inventory,
+    kind: displaced::Kind,
+    dest: &Path,
+    item_id: Option<&ItemId>,
+) -> Result<AdoptTarget> {
+    let leaf = dest.file_name().unwrap_or_default().to_string_lossy();
+    let mut target = AdoptTarget::at(dest);
     let name = if kind == displaced::Kind::Rule { leaf.strip_suffix(".md").unwrap_or(&leaf) } else { &leaf };
     let named = |candidate: &str, id: Option<&ItemId>| match item_id {
         Some(item_id) => id == Some(item_id),
@@ -1852,10 +1877,10 @@ fn adopt_target(repo: &Repo, kind: displaced::Kind, dest: &Path, item_id: Option
                 return Err(recovery_target_changed(item_id));
             }
         }
-    } else if let Some(rule) = rules.into_iter().find(|r| named(&r.name, r.id.as_ref())) {
+    } else if let Some(rule) = rules.iter().find(|r| named(&r.name, r.id.as_ref())) {
         target.path = rule.path.clone();
         target.existing = true;
-        target.rule = Some(rule);
+        target.rule = Some(rule.clone());
     } else {
         if skills.iter().any(|skill| item_id.is_some() && skill.id.as_ref() == item_id) {
             return Err(recovery_target_changed(item_id));
@@ -2286,11 +2311,10 @@ pub mod displaced {
     //! - If a swap is called off but the content can't go back (something
     //!   new is at the destination), it stays in its entry, marked changed.
     //!
-    //! Unchanged entries also go before their grace period is over when all
-    //! entries together take more than [`max_size`], oldest first. Pruning
+    //! The grace period runs from when the displacement was completed, and
+    //! no entry goes before it is over, whatever all entries take. Pruning
     //! never deletes recursively: see [`crate::hash::remove_payload`].
 
-    use std::collections::HashSet;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use serde::Deserialize;
@@ -2299,10 +2323,6 @@ pub mod displaced {
 
     /// How long an unchanged entry is kept before [`prune`] removes it.
     pub const GRACE: Duration = Duration::from_secs(10 * 60);
-
-    /// What all entries may take (see [`max_size`]) unless
-    /// `SK1LL_DISPLACED_MAX` says otherwise: 1 GiB.
-    pub const DEFAULT_MAX: u64 = 1 << 30;
 
     const META: &str = "entry.json";
     const CONTENT: &str = "content";
@@ -2421,9 +2441,10 @@ pub mod displaced {
         active: bool,
         #[serde(default)]
         payload: Option<String>,
-        /// A [`Kind::Draft`] entry holding just the committed version of a
-        /// path a pull replaced or removed (`payload` is what it held), so
-        /// it is pruned as a routine copy is, once the pull is finished.
+        /// A [`Kind::Draft`] entry for a path a pull replaced or removed
+        /// while it held exactly what checking out the old commit writes. Once the
+        /// displacement completed intact, `payload` is what it held, and it
+        /// is pruned as a routine copy is, once the pull is finished.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         committed: bool,
     }
@@ -2817,62 +2838,112 @@ pub mod displaced {
     }
 
     fn check_repo(repo: &Repo, entry: &Entry) -> Result<()> {
-        let other = match &entry.provenance {
-            Some(provenance) => (RepoIdentity::of(repo)? != provenance.repo).then(|| provenance.repo.root.clone()),
-            // Pull's entries are in the git directory of the repo they came from.
-            None if entry.kind == Kind::Draft => {
-                let holder = entry.path.ancestors().nth(4).unwrap_or(&entry.path);
-                let out = crate::git::Git::repo(repo.root())?.args(["rev-parse", "--absolute-git-dir"]).run()?;
-                let git_dir = crate::git::path_from_bytes(out.strip_suffix(b"\n").unwrap_or(&out));
-                let same = matches!((git_dir.canonicalize(), holder.canonicalize()), (Ok(a), Ok(b)) if a == b);
-                (!same).then(|| holder.to_path_buf())
-            }
-            None => None,
-        };
-        match other {
-            Some(root) => Err(Error::Invalid(format!(
-                "recovery entry `{}` belongs to another repo ({})",
-                entry.id,
-                root.display()
-            ))),
-            None => Ok(()),
-        }
+        Resolver::new(repo).check_repo(entry)
     }
 
     /// Where [`adopt`] puts an entry's content. Refused for an entry of
     /// another repo, and when the Item ID it was placed with no longer leads
     /// to the item it came from.
     pub fn target(repo: &Repo, entry: &Entry) -> Result<AdoptTarget> {
-        resolve(repo, entry, true)
+        Resolver::new(repo).resolve(entry, true)
     }
 
-    /// Whether [`adopt`] can tell where `entry`'s content goes: [`target`]
-    /// finds a destination for it, and it is not a skill link (which holds
-    /// no content of its own). Only the walk through the history since its
-    /// placement is left to Adopt, which refuses an Item ID the history
-    /// lost in between.
+    /// [`Resolver::adoptable`], for one entry.
     pub fn adoptable(repo: &Repo, entry: &Entry) -> bool {
-        let link = || fs::symlink_metadata(&entry.path).is_ok_and(|m| m.file_type().is_symlink());
-        !(entry.kind == Kind::Skill && link()) && resolve(repo, entry, false).is_ok()
+        Resolver::new(repo).adoptable(entry)
     }
 
-    /// [`target`]; `history`: also check that the Item ID it was placed
-    /// with leads to the same item through every commit since.
-    fn resolve(repo: &Repo, entry: &Entry, history: bool) -> Result<AdoptTarget> {
-        check_repo(repo, entry)?;
-        if entry.kind == Kind::Draft {
-            return adopt_target(repo, entry.kind, &entry.dest, None);
+    /// Resolves where [`adopt`] would put entries of `repo`, reading the
+    /// repo's git directory and its skills and rules at most once, however
+    /// many entries it is asked about.
+    pub struct Resolver<'a> {
+        repo: &'a Repo,
+        git_dir: std::cell::OnceCell<Option<PathBuf>>,
+        inventory: std::cell::OnceCell<Inventory>,
+    }
+
+    impl<'a> Resolver<'a> {
+        pub fn new(repo: &'a Repo) -> Self {
+            Self { repo, git_dir: Default::default(), inventory: Default::default() }
         }
-        let provenance = entry.provenance.as_ref().ok_or_else(|| recovery_target_changed(entry.item_id.as_ref()))?;
-        let mut target = adopt_target(repo, entry.kind, &entry.dest, entry.item_id.as_ref())?;
-        if target.existing {
-            let Some(id) = entry.item_id.as_ref() else { return Err(recovery_target_changed(None)) };
-            if history && !history_connects(repo, provenance, id)? {
-                return Err(recovery_target_changed(Some(id)));
+
+        /// Whether [`adopt`] can tell where `entry`'s content goes: [`target`]
+        /// finds a destination for it, and it is not a skill link (which
+        /// holds no content of its own). Only the walk through the history
+        /// since its placement is left to Adopt, which refuses an Item ID
+        /// the history lost in between.
+        pub fn adoptable(&self, entry: &Entry) -> bool {
+            let link = || fs::symlink_metadata(&entry.path).is_ok_and(|m| m.file_type().is_symlink());
+            !(entry.kind == Kind::Skill && link()) && self.resolve(entry, false).is_ok()
+        }
+
+        /// The repo's canonical git directory; `None` if it can't be read.
+        fn git_dir(&self) -> Option<&Path> {
+            self.git_dir
+                .get_or_init(|| {
+                    let out = crate::git::Git::repo(self.repo.root())
+                        .ok()?
+                        .args(["rev-parse", "--absolute-git-dir"])
+                        .run()
+                        .ok()?;
+                    crate::git::path_from_bytes(out.strip_suffix(b"\n").unwrap_or(&out)).canonicalize().ok()
+                })
+                .as_deref()
+        }
+
+        fn inventory(&self) -> Result<&Inventory> {
+            if let Some(inventory) = self.inventory.get() {
+                return Ok(inventory);
+            }
+            let loaded = self.repo.content()?;
+            Ok(self.inventory.get_or_init(|| loaded))
+        }
+
+        fn check_repo(&self, entry: &Entry) -> Result<()> {
+            let other = match &entry.provenance {
+                Some(provenance) => {
+                    (RepoIdentity::of(self.repo)? != provenance.repo).then(|| provenance.repo.root.clone())
+                }
+                // Pull's entries are in the git directory of the repo they came from.
+                None if entry.kind == Kind::Draft => {
+                    let holder = entry.path.ancestors().nth(4).unwrap_or(&entry.path);
+                    let same = matches!((self.git_dir(), holder.canonicalize()), (Some(a), Ok(b)) if a == b);
+                    (!same).then(|| holder.to_path_buf())
+                }
+                None => None,
+            };
+            match other {
+                Some(root) => Err(Error::Invalid(format!(
+                    "recovery entry `{}` belongs to another repo ({})",
+                    entry.id,
+                    root.display()
+                ))),
+                None => Ok(()),
             }
         }
-        target.placed_origin = provenance.origin();
-        Ok(target)
+
+        /// [`target`]; `history`: also check that the Item ID it was placed
+        /// with leads to the same item through every commit since.
+        fn resolve(&self, entry: &Entry, history: bool) -> Result<AdoptTarget> {
+            self.check_repo(entry)?;
+            if entry.kind == Kind::Draft {
+                return Ok(AdoptTarget::at(&entry.dest));
+            }
+            let provenance =
+                entry.provenance.as_ref().ok_or_else(|| recovery_target_changed(entry.item_id.as_ref()))?;
+            let mut target = match entry.kind {
+                Kind::Instructions => AdoptTarget::at(&entry.dest),
+                _ => adopt_target_in(self.repo, self.inventory()?, entry.kind, &entry.dest, entry.item_id.as_ref())?,
+            };
+            if target.existing {
+                let Some(id) = entry.item_id.as_ref() else { return Err(recovery_target_changed(None)) };
+                if history && !history_connects(self.repo, provenance, id)? {
+                    return Err(recovery_target_changed(Some(id)));
+                }
+            }
+            target.placed_origin = provenance.origin();
+            Ok(target)
+        }
     }
 
     fn history_connects(repo: &Repo, placed: &Provenance, id: &ItemId) -> Result<bool> {
@@ -2916,8 +2987,9 @@ pub mod displaced {
     ///   path as a Draft change (see [`crate::draft::adopt_displaced`]).
     ///
     /// The entry goes only if it holds nothing but what was taken back: a
-    /// skill's `.git` (which copies leave out), or a write since, keeps it,
-    /// as changed. Returns where the content went.
+    /// skill's `.git` (which copies leave out), extended attributes (which no
+    /// copy takes), or a write since, keeps it, as changed. Returns where the
+    /// content went.
     pub fn adopt(repo: &Repo, id: &str, lock: &crate::EngineLock) -> Result<PathBuf> {
         let entry = get(id)?;
         let target = target(repo, &entry)?;
@@ -2948,7 +3020,15 @@ pub mod displaced {
         };
         let root = root()?;
         let dir = locate(&root, id).ok_or_else(|| Error::Invalid(format!("no displaced entry `{id}`")))?;
-        if crate::hash::remove_payload(&entry.path, &payload)? {
+        // What the copy couldn't take (a `.git`, extended attributes) is
+        // nowhere else: the entry stays, changed.
+        let uncopied = match entry.kind {
+            Kind::Skill => super::holds_uncopied(&entry.path),
+            _ => crate::hash::has_local_xattrs(&entry.path).unwrap_or(true),
+        };
+        if uncopied {
+            keep_entry(&dir)?;
+        } else if crate::hash::remove_payload(&entry.path, &payload)? {
             release(&root, id, &dir)?;
         } else {
             keep_entry(&dir)?;
@@ -2991,75 +3071,47 @@ pub mod displaced {
         replace_file(dest, &text, unchanged, displace, OldCopy::Keep)
     }
 
-    /// Removes the entries that still match what sync expected and are older
-    /// than [`GRACE`], and the remains of entries that were never completed.
-    /// Then, while all entries take more than [`max_size`], the oldest of the
-    /// unchanged ones left, however young. Changed entries are never pruned.
-    /// Returns the ids removed. Sync runs this whenever it displaces something new.
+    /// Removes the entries that still match what sync expected and were
+    /// displaced more than [`GRACE`] ago, and the remains of entries that
+    /// were never completed. Changed entries are never pruned, nor is any
+    /// entry before its grace period is over, however much they all take:
+    /// a writer with a file still open may be writing to it. Returns the
+    /// ids removed. Sync runs this whenever it displaces something new.
     pub fn prune() -> Result<Vec<String>> {
-        prune_retaining(GRACE, max_size())
+        prune_retaining(GRACE)
     }
 
-    /// [`prune`] with its retention overridden: entries are old enough at
-    /// `age`, and unchanged ones go while all take more than `max` bytes.
-    /// Only for tests (the `failpoints` feature), which can't wait out [`GRACE`].
+    /// [`prune`] with its grace period overridden: entries are old enough
+    /// at `age`. Only for tests (the `failpoints` feature), which can't
+    /// wait out [`GRACE`].
     #[cfg(any(test, feature = "failpoints"))]
-    pub fn prune_with(age: Duration, max: u64) -> Result<Vec<String>> {
-        prune_retaining(age, max)
+    pub fn prune_with(age: Duration) -> Result<Vec<String>> {
+        prune_retaining(age)
     }
 
-    /// `SK1LL_DISPLACED_MAX`: bytes, or a number with `K`, `M`, `G` or `T`
-    /// (KiB and so on); else [`DEFAULT_MAX`].
-    pub fn max_size() -> u64 {
-        std::env::var("SK1LL_DISPLACED_MAX").ok().and_then(|v| parse_size(&v)).unwrap_or(DEFAULT_MAX)
-    }
-
-    fn parse_size(s: &str) -> Option<u64> {
-        let s = s.trim();
-        let (number, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
-        let unit = unit.trim().to_ascii_uppercase();
-        let shift = match unit.trim_end_matches("IB").trim_end_matches('B') {
-            "" => 0,
-            "K" => 10,
-            "M" => 20,
-            "G" => 30,
-            "T" => 40,
-            _ => return None,
-        };
-        number.parse::<u64>().ok()?.checked_mul(1 << shift)
-    }
-
-    /// Prunes recovery entries with an explicit retention age and byte cap.
-    /// Entries with user changes and entries still in use are always kept.
-    fn prune_retaining(age: Duration, max: u64) -> Result<Vec<String>> {
+    /// Prunes recovery entries with an explicit retention age. Entries with
+    /// user changes and entries still in use are always kept.
+    fn prune_retaining(age: Duration) -> Result<Vec<String>> {
         let root = root()?;
         let now = now();
         let old = |since: u64| now.saturating_sub(since) >= age.as_secs();
         let modified = |path: &Path| fs::symlink_metadata(path).and_then(|m| m.modified()).ok().map(secs);
         let mut pruned = Vec::new();
-        let mut inodes = HashSet::new();
-        let (mut total, mut unchanged) = (0u64, Vec::new());
         for id in ids(&root)? {
             let pointer = root.join(INDEX).join(&id);
             let dir = locate(&root, &id);
             let loaded = dir.as_deref().map(load).transpose()?.flatten();
             match (dir, loaded) {
                 (Some(dir), Some((meta, path))) => {
-                    let size = disk_size(&path, &mut inodes);
-                    if protected(&id, &meta, &dir) || differs(&meta, &path)? {
-                        total += size;
-                    } else if old(meta.displaced_at) {
-                        crate::failpoint!(BeforePrune, &path);
-                        let Some((meta, path)) = load(&dir)? else { continue };
-                        if protected(&id, &meta, &dir) || differs(&meta, &path)? || !retire(&root, &id, &dir, &meta)? {
-                            total += size;
-                            continue;
-                        }
-                        pruned.push(id);
-                    } else {
-                        total += size;
-                        unchanged.push((id, dir, size));
+                    if protected(&id, &meta, &dir) || differs(&meta, &path)? || !old(meta.displaced_at) {
+                        continue;
                     }
+                    crate::failpoint!(BeforePrune, &path);
+                    let Some((meta, path)) = load(&dir)? else { continue };
+                    if protected(&id, &meta, &dir) || differs(&meta, &path)? || !retire(&root, &id, &dir, &meta)? {
+                        continue;
+                    }
+                    pruned.push(id);
                 }
                 // Begun but never filled (killed meanwhile), or not ours.
                 (dir, None) => {
@@ -3087,38 +3139,7 @@ pub mod displaced {
                 (None, Some(_)) => unreachable!(),
             }
         }
-        for (id, dir, size) in unchanged {
-            if total <= max {
-                break;
-            }
-            crate::failpoint!(BeforePrune, &dir.join(CONTENT));
-            let Some((meta, path)) = load(&dir)? else { continue };
-            if protected(&id, &meta, &dir) || differs(&meta, &path)? || !retire(&root, &id, &dir, &meta)? {
-                continue;
-            }
-            total -= size;
-            pruned.push(id);
-        }
         Ok(pruned)
-    }
-
-    /// Bytes `path` takes, not counting files already in `inodes` again.
-    fn disk_size(path: &Path, inodes: &mut HashSet<(u64, u64)>) -> u64 {
-        let mut size = 0;
-        for entry in WalkDir::new(path).into_iter().filter_map(std::result::Result::ok) {
-            let Ok(meta) = entry.metadata() else { continue };
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                if meta.is_file() && meta.nlink() > 1 && !inodes.insert((meta.dev(), meta.ino())) {
-                    continue;
-                }
-            }
-            size += meta.len();
-        }
-        #[cfg(not(unix))]
-        let _ = inodes;
-        size
     }
 
     /// Lists in the index every entry in `holder`'s area it lacks (the state
@@ -3357,6 +3378,11 @@ pub mod displaced {
         let Some((mut meta, path)) = load(&dir)? else { return Ok(()) };
         if meta.dest != dest {
             return Err(changed_since_plan(dest));
+        }
+        // The grace period runs from here, when the displacement completed,
+        // not from when the entry was reserved (a pull may wait in between).
+        if meta.active {
+            meta.displaced_at = now();
         }
         meta.active = false;
         meta.kept |= keep;
@@ -3745,32 +3771,43 @@ pub mod displaced {
             Ok(None)
         }
 
-        /// [`finish`](Self::finish) for what a pull replaced or removed
-        /// once it checked that the path held the committed version: the
-        /// entry records what it holds, and is pruned like any routine copy
-        /// once it is old enough, while it still holds just that (a write
-        /// through a descriptor opened before the pull keeps it, changed).
-        /// Extended attributes Git can't restore keep it for good (see
-        /// [`crate::hash::has_local_xattrs`]). Run again by a resumed pull.
+        /// [`finish`](Self::finish) for what a pull replaced or removed. An
+        /// entry [`expect_committed`](Self::expect_committed) marked records
+        /// what it holds, and is pruned like any routine copy once its pull
+        /// is finished and it is old enough, while it still holds just that
+        /// (a write through a descriptor opened before the pull keeps it,
+        /// changed). Any other one, or one with extended attributes Git
+        /// can't restore (see [`crate::hash::has_local_xattrs`]), holds what
+        /// the old commit can't give back: it is kept, changed. Run again by
+        /// a resumed pull.
         #[cfg(unix)]
         pub(crate) fn finish_committed(self) -> Result<Option<Error>> {
             let content = self.content();
-            // Fingerprinted before the check, so a write in between fails the
-            // check. What can't be fingerprinted stays, as any Draft entry.
-            if let Ok(payload) = hash_payload(&content)
-                && self.intact().unwrap_or(false)
+            // Fingerprinted before the check, so a write in between fails the check.
+            let payload = hash_payload(&content);
+            // Written to during the swap: `finish` reports it changed.
+            if self.intact().unwrap_or(false)
                 && let Some(mut meta) = read_meta(&self.dir)
             {
-                match crate::hash::has_local_xattrs(&content) {
-                    Ok(false) => {
-                        meta.payload = Some(payload);
-                        meta.committed = true;
-                    }
-                    Ok(true) | Err(_) => meta.kept = true,
+                match (meta.committed, payload, crate::hash::has_local_xattrs(&content)) {
+                    (true, Ok(payload), Ok(false)) => meta.payload = Some(payload),
+                    _ => meta.kept = true,
                 }
                 self.write_meta(&meta)?;
             }
             self.finish(false)
+        }
+
+        /// Marks this [`Kind::Draft`] entry, before anything is displaced,
+        /// as one for a path that holds exactly what checking out the old
+        /// commit writes there: [`finish_committed`](Self::finish_committed)
+        /// then lets it be pruned.
+        #[cfg(unix)]
+        pub(crate) fn expect_committed(&self) -> Result<()> {
+            let mut meta = read_meta(&self.dir)
+                .ok_or_else(|| Error::Invalid(format!("cannot read recovery entry at {}", self.dir.display())))?;
+            meta.committed = true;
+            self.write_meta(&meta)
         }
 
         /// [`finish`](Self::finish) for a hand edit sk1ll was told to

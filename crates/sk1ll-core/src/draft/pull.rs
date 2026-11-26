@@ -714,7 +714,8 @@ impl Pull<'_> {
             let content = change.new.as_ref().map(|entry| convert.content(entry, &change.path)).transpose()?;
             let keep_mode = !convert.file_mode
                 && matches!((&change.old, &change.new), (Some(old), Some(new)) if old.mode == new.mode);
-            let operation = tree.prepare(i, &change.path, &node, content.as_ref(), keep_mode)?;
+            let committed = convert.verbatim(&node, change.old.as_ref(), &change.path)?;
+            let operation = tree.prepare(i, &change.path, &node, content.as_ref(), keep_mode, committed)?;
             journal.record(self, i, operation)?;
         }
         tree.apply(i, &journal.changes[i].path, &node, &journal.operations[&i])
@@ -1251,6 +1252,21 @@ impl<'a> Convert<'a> {
         let git = self.git(Side::Old).args(["hash-object", "--stdin"]);
         let git = if filtered { git.arg(path_option(path)) } else { git.arg("--no-filters") };
         Ok(git.stdin(bytes.clone()).text()? == entry.oid)
+    }
+
+    /// Whether `node`, which [`holds`](Self::holds) `entry`, is byte for
+    /// byte what checking `entry` out at `path` writes, so the old commit
+    /// gives it back exactly. [`holds`](Self::holds) compares through the
+    /// clean side (`ident`, end-of-line conversion), which can hide local
+    /// bytes: an edit inside an expanded `$Id: … $`, say.
+    fn verbatim(&self, node: &Node, entry: Option<&Entry>, path: &Path) -> Result<bool> {
+        let (Some(entry), Node::File { bytes, .. } | Node::Link(bytes)) = (entry, node) else { return Ok(false) };
+        if entry.mode == SYMLINK {
+            // `holds` compared it with no filters already.
+            return Ok(true);
+        }
+        let git = self.git(Side::Old).args(["cat-file", "--filters"]).arg(path_option(path)).arg(&entry.oid);
+        Ok(git.run()? == *bytes)
     }
 
     /// What checking out `entry` at `path` writes.

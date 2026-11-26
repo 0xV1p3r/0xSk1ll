@@ -165,7 +165,7 @@ fn a_file_resized_during_a_sync_hash_leaves_the_copy_consistent_with_the_source(
 #[cfg(unix)]
 #[test]
 fn recovery_keeps_payloads_changed_after_their_last_check() {
-    use rustix::fs::{XattrFlags, lsetxattr};
+    use rustix::fs::{XattrFlags, lremovexattr, lsetxattr};
     use rustix::io::Errno;
     use std::os::unix::fs::PermissionsExt;
 
@@ -190,11 +190,14 @@ fn recovery_keeps_payloads_changed_after_their_last_check() {
         sync();
         let entry = displaced::list().unwrap().into_iter().find(|e| e.dest == placement.path().join("pdf")).unwrap();
         let old = entry.path.join("SKILL.md");
+        // An attribute there beforehand keeps the entry anyway; this one
+        // only comes after the last check.
         if case == "xattr" {
             match lsetxattr(&old, "user.sk1ll-test", b"1", XattrFlags::empty()) {
                 Err(Errno::OPNOTSUPP | Errno::PERM) => continue,
                 result => result.unwrap(),
             }
+            lremovexattr(&old, "user.sk1ll-test").unwrap();
         }
         let expected = entry.path.clone();
         let mut hit = false;

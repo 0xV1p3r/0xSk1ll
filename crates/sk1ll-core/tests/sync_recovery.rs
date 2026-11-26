@@ -44,7 +44,7 @@ fn pruning_rechecks_queued_entries_and_includes_git_and_modes() {
                 let removed = with_hook(
                     Point::BeforePrune,
                     move |_| open.write_all(b"Late edit.\n").unwrap(),
-                    || displaced::prune_with(displaced::GRACE, 0),
+                    || displaced::prune_with(Duration::ZERO),
                 )
                 .unwrap();
                 assert!(removed.is_empty());
@@ -67,7 +67,7 @@ fn pruning_rechecks_queued_entries_and_includes_git_and_modes() {
             _ => unreachable!(),
         }
         assert!(displaced::get(&entry.id).unwrap().changed, "{case}");
-        assert!(displaced::prune_with(Duration::ZERO, u64::MAX).unwrap().is_empty(), "{case}");
+        assert!(displaced::prune_with(Duration::ZERO).unwrap().is_empty(), "{case}");
     }
 }
 
@@ -101,7 +101,7 @@ fn edits_since_placement_conflict_and_forced_swaps_keep_the_backup() {
             "empty directory" => assert!(entry.path.join("empty").is_dir()),
             _ => unreachable!(),
         }
-        assert!(displaced::prune_with(Duration::ZERO, u64::MAX).unwrap().is_empty(), "{case}");
+        assert!(displaced::prune_with(Duration::ZERO).unwrap().is_empty(), "{case}");
     }
 }
 
@@ -139,7 +139,7 @@ fn a_write_to_an_early_file_during_the_final_prune_scan_keeps_the_entry() {
             with_hook(
                 Point::BeforePrune,
                 move |_| at_deletion_check.set(true),
-                || displaced::prune_with(displaced::GRACE, 0),
+                || displaced::prune_with(Duration::ZERO),
             )
         },
     )
@@ -191,10 +191,10 @@ fn a_forced_swap_interrupted_after_detach_preserves_the_edited_backup() {
     .expect_err("interrupted before put_back");
     assert_eq!(stopped.downcast_ref::<&str>(), Some(&"interrupted sync"));
     let entry = d.entry();
-    assert!(displaced::prune_with(Duration::ZERO, u64::MAX).unwrap().is_empty());
+    assert!(displaced::prune_with(Duration::ZERO).unwrap().is_empty());
     recover(None, &d.harnesses).unwrap();
     assert!(displaced::get(&entry.id).unwrap().changed);
-    assert!(displaced::prune_with(Duration::ZERO, u64::MAX).unwrap().is_empty());
+    assert!(displaced::prune_with(Duration::ZERO).unwrap().is_empty());
     assert_eq!(fs::read_to_string(entry.path.join("SKILL.md")).unwrap(), "Hand-edited original.\n");
     assert_eq!(fs::read_to_string(&d.file).unwrap(), "Newcomer.\n");
 }
@@ -266,7 +266,7 @@ fn rewriting_an_owned_block_leaves_no_recovery_entry() {
     assert!(!dest.exists(), "sync created it, and its block was all of it");
     let entries = displaced::list().unwrap();
     assert!(entries.len() == 1 && !entries[0].changed, "taken out into recovery: {entries:?}");
-    assert_eq!(displaced::prune_with(Duration::ZERO, u64::MAX).unwrap().len(), 1);
+    assert_eq!(displaced::prune_with(Duration::ZERO).unwrap().len(), 1);
     assignment.set_rule("h", &rule_id(&repo, "git"), true);
     sync(&assignment, false);
     write(&dest, &format!("# Mine\n\n{}", fs::read_to_string(&dest).unwrap()));
@@ -283,7 +283,7 @@ fn rewriting_an_owned_block_leaves_no_recovery_entry() {
     let entries = displaced::list().unwrap();
     assert!(entries.len() == 1 && entries[0].changed, "{entries:?}");
     assert_eq!(fs::read_to_string(&entries[0].path).unwrap(), edited);
-    assert!(displaced::prune_with(Duration::ZERO, u64::MAX).unwrap().is_empty());
+    assert!(displaced::prune_with(Duration::ZERO).unwrap().is_empty());
 }
 
 #[test]
@@ -373,7 +373,7 @@ fn displaced_content_is_pruned_after_the_grace_period_unless_it_changed() {
 
     // A late write to the older entry keeps it, however old.
     write(&entries[0].path.join("SKILL.md"), "Late.\n");
-    assert_eq!(displaced::prune_with(Duration::ZERO, u64::MAX).unwrap(), [entries[1].id.clone()]);
+    assert_eq!(displaced::prune_with(Duration::ZERO).unwrap(), [entries[1].id.clone()]);
     let left = displaced::list().unwrap();
     assert_eq!(left.len(), 1);
     assert!(left[0].changed && left[0].id == entries[0].id);
@@ -452,7 +452,7 @@ fn crash_leftovers_are_ignored_by_planning_and_recovered() {
                 .any(|entry| entry.dest == rules.join("git.md")
                     && fs::read_to_string(&entry.path).unwrap() == "staged\n")
         );
-        assert!(displaced::prune_with(Duration::ZERO, u64::MAX).unwrap().is_empty());
+        assert!(displaced::prune_with(Duration::ZERO).unwrap().is_empty());
     }
 }
 
@@ -503,7 +503,7 @@ fn displaced_content_never_goes_back_over_what_appeared_meanwhile() {
             _ => assert_eq!(fs::read_to_string(d.kept_file(&entry)).unwrap(), "PDFs.\n", "intact, yet kept"),
         }
         // Kept for good, however old.
-        assert!(!displaced::prune_with(Duration::ZERO, u64::MAX).unwrap().contains(&entry.id), "{case}");
+        assert!(!displaced::prune_with(Duration::ZERO).unwrap().contains(&entry.id), "{case}");
         assert!(displaced::get(&entry.id).unwrap().changed, "{case}");
         assert!(!d.holder.join(TMP_DIR).join("stage-pdf").exists(), "{case}");
     }
@@ -537,12 +537,11 @@ fn adopting_a_block_entry_is_refused_while_the_managed_block_is_edited_by_hand()
 }
 
 #[test]
-fn displaced_content_over_the_size_cap_goes_oldest_unchanged_first() {
+fn displaced_content_stays_for_the_grace_period_however_much_there_is() {
     let (tmp, repo, harnesses) = skill_setup(LinkMode::Copy);
     let _home = tmp.enter();
     let assignment = Assignment::default();
-    let asset = "x".repeat(64 << 10);
-    write(&repo.personal_dir().join("pdf/asset.bin"), &asset);
+    write(&repo.personal_dir().join("pdf/asset.bin"), &"x".repeat(64 << 10));
     let sync = || {
         for a in plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap() {
             apply(&repo, &a).unwrap();
@@ -556,13 +555,13 @@ fn displaced_content_over_the_size_cap_goes_oldest_unchanged_first() {
     let entries = displaced::list().unwrap();
     assert_eq!(entries.len(), 3, "{entries:?}");
     write(&entries[0].path.join("SKILL.md"), "Late.\n");
-    // All young: nothing goes while under the cap.
-    assert!(displaced::prune_with(displaced::GRACE, 1 << 30).unwrap().is_empty());
-    // Room for two of three: the oldest unchanged one goes, not the changed one.
-    let cap = 3 * (64 << 10) - (32 << 10);
-    assert_eq!(displaced::prune_with(displaced::GRACE, cap).unwrap(), [entries[1].id.clone()]);
-    // No room at all: every unchanged one goes; the changed one stays.
-    assert_eq!(displaced::prune_with(displaced::GRACE, 0).unwrap(), [entries[2].id.clone()]);
+    // Young: nothing goes, whatever they take, as a writer may hold one open.
+    assert!(displaced::prune().unwrap().is_empty());
+    assert_eq!(displaced::list().unwrap().len(), 3);
+    // Old enough: the unchanged ones go; the changed one stays.
+    let mut pruned = displaced::prune_with(Duration::ZERO).unwrap();
+    pruned.sort();
+    assert_eq!(pruned, [entries[1].id.clone(), entries[2].id.clone()]);
     let left = displaced::list().unwrap();
     assert_eq!(left.len(), 1);
     assert!(left[0].changed && left[0].id == entries[0].id);
@@ -661,7 +660,7 @@ fn recover_adopt_keeps_an_entry_whose_copy_left_something_out() {
     assert!(kept.changed);
     assert_eq!(fs::read_to_string(kept.path.join(".git/HEAD")).unwrap(), "git\n");
     assert_eq!(fs::read_to_string(kept.path.join("SKILL.md")).unwrap(), "PDFs.\n");
-    assert!(!displaced::prune_with(Duration::ZERO, u64::MAX).unwrap().contains(&entry.id));
+    assert!(!displaced::prune_with(Duration::ZERO).unwrap().contains(&entry.id));
     assert!(kept.path.join(".git/HEAD").exists());
 }
 
@@ -685,7 +684,7 @@ fn pruning_never_deletes_recursively() {
                 "renamed away" => fs::rename(path.join("SKILL.md"), &target).unwrap(),
                 _ => unreachable!(),
             },
-            || displaced::prune_with(Duration::ZERO, u64::MAX),
+            || displaced::prune_with(Duration::ZERO),
         )
         .unwrap();
         match case {
@@ -765,7 +764,7 @@ fn a_late_instruction_edit_can_be_adopted_from_recovery() {
         let kept = sk1ll_testkit::read(&entry.path);
         assert!(kept.contains("Use CC.") && kept.ends_with("Late note.\n"));
         assert!(sk1ll_testkit::read(&file).contains("Updated rule."));
-        assert!(displaced::prune_with(Duration::ZERO, 0).unwrap().is_empty());
+        assert!(displaced::prune_with(Duration::ZERO).unwrap().is_empty());
 
         adopt_test_entry(&repo, &entry.id).unwrap();
         assert!(displaced::find(&entry.id).unwrap().is_none());
@@ -811,31 +810,5 @@ fn adopting_recovered_skill_bytes_keeps_harness_only_sidecars() {
         let kept = displaced::get(&entry.id).unwrap();
         assert!(kept.changed);
         assert_eq!(sk1ll_testkit::read(&kept.path.join(ID_FILE)), "harness-sidecar\n");
-    }
-}
-
-#[test]
-fn recovery_size_limits_accept_binary_units_and_fall_back_for_invalid_values() {
-    use sk1ll_testkit::{Home, child};
-
-    if child::dir().is_some() {
-        let expected = std::env::var("SK1LL_TEST_EXPECTED_SIZE").unwrap().parse::<u64>().unwrap();
-        assert_eq!(displaced::max_size(), expected);
-        return;
-    }
-    let home = Home::new();
-    for (input, expected) in [
-        ("1048576", 1 << 20),
-        ("512M", 512 << 20),
-        (" 2 GiB ", 2 << 30),
-        ("3kb", 3 << 10),
-        ("lots", displaced::DEFAULT_MAX),
-        ("1X", displaced::DEFAULT_MAX),
-    ] {
-        let mut cmd =
-            child::command("recovery_size_limits_accept_binary_units_and_fall_back_for_invalid_values", home.path());
-        home.apply(&mut cmd).env("SK1LL_DISPLACED_MAX", input).env("SK1LL_TEST_EXPECTED_SIZE", expected.to_string());
-        let output = cmd.output().unwrap();
-        assert!(output.status.success(), "{input}: {}", sk1ll_testkit::text(&output));
     }
 }

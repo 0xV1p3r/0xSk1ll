@@ -278,21 +278,21 @@ On filesystems without hard links, such as FAT, an existing object without
 an anchor is unmanaged and a new placement fails before changing the
 destination. Block instructions also use hard links for recovery.
 
-## The recovery size cap
+## Recovery pruning
 
-Recovery prunes backups after a 10-minute grace period if they still match
-their placement fingerprints. A backup with changes or without a placement
-fingerprint stays until explicit discard, and so does every Draft recovery
-entry from Pull. Above `SK1LL_DISPLACED_MAX`
-(default 1 GiB), the oldest unchanged backups can be pruned before the grace
-period ends. Pruning rechecks the payload and then every entry's metadata.
-A write through a still-open file descriptor after that last check can be
-lost, whether pruning happens after the grace period or to meet the size
-cap.
+Recovery prunes backups 10 minutes after the displacement completed, if they
+still match their placement fingerprints, whatever all backups take: there
+is no size cap that prunes earlier. A backup with changes or without a
+placement fingerprint stays until explicit discard. So does a Draft recovery
+entry from Pull, except one for a file that held exactly what checking out
+the old commit writes, with no extended attributes beyond its SELinux label:
+that one is pruned like a backup, once the Pull is finished. Pruning
+rechecks the payload and then every entry's metadata. A write through a
+still-open file descriptor after that last check can be lost.
 
 Superseded ownership indexes are saved under `.sk1ll-state/index-history/`.
 Directory recovery checks them after the same grace period and keeps any
-that changed. This history sits outside the size cap.
+that changed.
 
 Pruning never deletes a directory recursively. It unlinks only the files and
 symlinks the fingerprint covered, each after checking that its metadata is

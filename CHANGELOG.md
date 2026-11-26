@@ -155,15 +155,20 @@ break compatibility.
   adopted (back into that skill) and its diff shows, where both failed for
   want of a target. Content Adopt can't place is reported as not adoptable,
   and the app offers only Discard and a diff against nothing. An original
-  holding what the copy left out (a `.git`) stays as changed content.
+  holding what the copy left out (a `.git`, extended attributes) stays as
+  changed content, and Recover Adopt keeps it.
 - After **Overwrite** of a hand-edited block, the kept copy is listed only
   as recovered content: `GET /conflicts` lists Harness conflicts alone, and
   `POST /sync` returns changed recovery entries as `kept`.
 - A clean pull no longer leaves a permanent recovery entry for each file it
-  replaced: an entry that holds only the committed version is a routine
-  copy, pruned after the grace period once the pull is finished. A write
-  since, or an extended attribute Git can't restore, keeps it, changed. The
-  app marks recovered content **Changed** or **Unchanged**.
+  replaced: an entry for a file that held exactly what checking out the old
+  commit writes is a routine copy, pruned after the grace period once the
+  pull is finished. A write since, other bytes (an edit inside an expanded
+  `$Id$`), or an extended attribute Git can't restore keeps it, changed.
+  The app marks recovered content **Changed** or **Unchanged**.
+- The recovery grace period runs from when a displacement completed, and no
+  recovery entry is pruned before it is over: `SK1LL_DISPLACED_MAX` and the
+  size cap that pruned young entries are gone.
 - The app's Conflicts badge counts what the Fleet table's Conflicts column
   counts: Harness conflicts and recovered content holding a change, not
   routine copies.
