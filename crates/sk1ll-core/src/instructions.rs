@@ -424,6 +424,11 @@ impl Block {
     pub(crate) fn edited(&self) -> bool {
         hash_str(&self.inner) != self.recorded_hash
     }
+
+    /// Whether the block is all of `text`, the file it was found in.
+    pub(crate) fn is_whole(&self, text: &str) -> bool {
+        self.start == 0 && self.end == text.len()
+    }
 }
 
 /// Extracts managed content for conflict previews, excluding surrounding user notes.
