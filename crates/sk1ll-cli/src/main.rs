@@ -511,13 +511,13 @@ fn command(s: &Session, cmd: Cmd) -> Result<()> {
         Cmd::Conflicts => {
             // Their ids and names are what the next command acts on.
             for e in s.block(c.conflicts_fresh())? {
-                if e.kind.as_deref() == Some("displaced") {
-                    print_recovered(&e, false);
-                } else {
-                    let kind = if e.adoptable { "item" } else { "instructions" };
-                    let reason = conflict_reason(&e.harness, kind, &e.name, e.reason.as_deref());
-                    println!("! {:<10} {} {}{reason}", e.harness, e.name, e.dest.display());
-                }
+                let kind = if e.adoptable { "item" } else { "instructions" };
+                let reason = conflict_reason(&e.harness, kind, &e.name, e.reason.as_deref());
+                println!("! {:<10} {} {}{reason}", e.harness, e.name, e.dest.display());
+            }
+            // The recovery entries that hold a change need a decision too.
+            for e in s.block(c.recovered())?.into_iter().filter(|e| e.changed) {
+                print_recovered(&e, false);
             }
         }
         Cmd::Recover { command: RecoverCmd::List { paths } } => {
@@ -750,13 +750,12 @@ fn command(s: &Session, cmd: Cmd) -> Result<()> {
         }
         Cmd::Sync { dry_run: false, force } => {
             let result = s.block(c.sync(&SyncRequest { force, ..Default::default() }))?;
-            let (kept, conflicts): (Vec<_>, Vec<_>) =
-                result.conflicts.iter().partition(|x| x.kind.as_deref() == Some("displaced"));
+            let (kept, conflicts) = (&result.kept, &result.conflicts);
             if conflicts.is_empty() && result.errors.is_empty() {
                 println!("harnesses in sync");
             }
             let mut adopts = Vec::new();
-            for x in &conflicts {
+            for x in conflicts {
                 let kind = match (x.items.first(), x.adoptable) {
                     (_, false) if x.name == "instructions" => "instructions",
                     (Some(sk1ll_core::ItemRef::Rule(_)), _) => "rule",
@@ -767,7 +766,7 @@ fn command(s: &Session, cmd: Cmd) -> Result<()> {
                 let name = if kind == "instructions" { names_only(&x.items) } else { x.name.clone() };
                 println!("! {:<10} {}{reason}", x.harness, placement_what(kind, &name, &x.dest));
             }
-            for x in &kept {
+            for x in kept {
                 println!(
                     "kept in recovery as {}: the edit to {} (`sk1ll recover adopt` or `sk1ll recover discard` it)",
                     x.id.as_deref().unwrap_or_default(),

@@ -255,7 +255,24 @@ might predate dry-run support.
 A regular `POST /sync` replans and applies. Supply the preview’s `fingerprint` to apply a reviewed plan. The Daemon checks it under the engine lock after recovering interrupted writes. If the plan changed, it returns 409 with the fresh preview. Copy-mode placements
 are hashed after staging. A mismatched copy stays unpublished and also returns
 409 with a fresh preview. Earlier placements may already have applied.
-A completed sync returns remaining `conflicts` and any placement `errors`.
+A completed sync returns remaining `conflicts`, the recovery entries that
+hold a change (`kept`, such as each hand edit a forced sync overwrote) and
+any placement `errors`.
+
+## Conflicts and recovered content
+
+`GET /conflicts` lists Harness conflicts: Harness content that differs from
+the Draft, to adopt or overwrite. `GET /conflicts/displaced` lists every
+recovery entry, each with an `id` to adopt or discard. An entry with
+`changed` holds a change (a hand edit that was overwritten, a save during a
+swap) and needs the user; one without it is as sk1ll set it aside and is
+safe to discard. `adoptable` is false where Adopt can't tell which item the
+content belongs to (a skill link, or content with no record of where it came
+from); `POST /conflicts/diff` with its `id` then compares it with nothing.
+The original of an adopted unmanaged skill goes back into that skill. The
+Machine's report counts Harness conflicts and changed entries, by item and
+Harness: that is the Conflict status, the Fleet's Conflicts column and the
+app's badge.
 
 ## Harness change and import update preconditions
 

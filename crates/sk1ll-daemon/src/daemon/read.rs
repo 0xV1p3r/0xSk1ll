@@ -199,9 +199,6 @@ impl Daemon {
                 let actions = sync::plan(&repo, &harnesses, &assignment, PlanOptions::default())?;
                 views.extend(actions.iter().filter(|a| a.kind == ActionKind::Conflict).map(conflict_view));
             }
-            for entry in displaced.as_ref().map_err(Error::duplicate)?.iter().filter(|entry| entry.changed) {
-                views.push(displaced_view(entry.clone(), root));
-            }
             Ok(views)
         })();
         Ok(Snapshot {
@@ -301,9 +298,13 @@ impl Daemon {
         let repo = Repo::open(self.repo_root())?;
         let (view, recovery) = if let Some(id) = &req.id {
             let entry = sync::displaced::get(id)?;
+            // Adopt can't place it: what it holds, against nothing.
+            if !entry.adoptable() {
+                return Self::recovery_diff(&repo, entry, None);
+            }
             let target = sync::displaced::target(&repo, &entry)?;
             if entry.kind == sync::displaced::Kind::Draft {
-                return Self::pull_recovery_diff(&repo, entry, target.path);
+                return Self::recovery_diff(&repo, entry, Some(target.path));
             }
             let view = displaced_view(entry, repo.root());
             (view, Some(target))
@@ -386,23 +387,43 @@ impl Daemon {
         Ok(DiffView { item, target, diff: String::from_utf8_lossy(&output.stdout).into_owned() })
     }
 
-    /// What a pull displaced from the working tree, against what is at its
-    /// path now: adopting puts it back there.
-    pub(super) fn pull_recovery_diff(repo: &Repo, entry: sync::displaced::Entry, target: PathBuf) -> Result<DiffView> {
+    /// A recovery entry's content against what is at `target` now (a
+    /// pull's: its path in the working tree, which adopting puts it back
+    /// at), or against nothing: no `target`, or nothing there.
+    pub(super) fn recovery_diff(
+        repo: &Repo,
+        entry: sync::displaced::Entry,
+        target: Option<PathBuf>,
+    ) -> Result<DiffView> {
         let item = displaced_item(&entry, repo.root());
         let temp = tempfile::tempdir().map_err(anyhow::Error::from)?;
-        let right = if target.symlink_metadata().is_ok() {
-            target.clone()
-        } else {
-            let empty = temp.path().join("Draft");
-            std::fs::write(&empty, "").map_err(anyhow::Error::from)?;
-            empty
+        let dir = entry.path.symlink_metadata().is_ok_and(|meta| meta.is_dir());
+        let left = match dir {
+            // A skill directory, without what a copy leaves out (`.git`).
+            true => {
+                let copy = temp.path().join("Harness");
+                sync::copy_skill_for_diff(&entry.path, &copy, sk1ll_core::Origin::Personal)?;
+                copy
+            }
+            false => entry.path.clone(),
         };
-        let output = plumbing::diff_no_index(&entry.path, &right).map_err(anyhow::Error::from)?;
+        let right = match &target {
+            Some(target) if target.symlink_metadata().is_ok() => target.clone(),
+            _ => {
+                let empty = temp.path().join("Draft");
+                match dir {
+                    true => std::fs::create_dir(&empty),
+                    false => std::fs::write(&empty, ""),
+                }
+                .map_err(anyhow::Error::from)?;
+                empty
+            }
+        };
+        let output = plumbing::diff_no_index(&left, &right).map_err(anyhow::Error::from)?;
         if !matches!(output.status.code(), Some(0 | 1)) {
             return Err(Error::BadRequest(String::from_utf8_lossy(&output.stderr).into_owned()));
         }
-        Ok(DiffView { item, target: Some(target), diff: String::from_utf8_lossy(&output.stdout).into_owned() })
+        Ok(DiffView { item, target, diff: String::from_utf8_lossy(&output.stdout).into_owned() })
     }
 }
 

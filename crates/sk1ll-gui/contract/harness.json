@@ -27,6 +27,19 @@
       ],
       "name": "code-review",
       "reason": "SKILL.md was edited in the Harness after the last sync."
+    },
+    "kept": {
+      "adoptable": false,
+      "changed": true,
+      "dest": "/home/dev/.claude/skills/notes",
+      "displaced_at": 1760000000,
+      "harness": "claude",
+      "id": "d-2",
+      "items": [],
+      "kind": "displaced",
+      "name": "notes",
+      "path": "/home/dev/.local/share/sk1ll/recovered/d-1",
+      "reason": "Unmanaged directory replaced by an assigned Skill."
     }
   },
   "harness_applied": {
@@ -357,7 +370,22 @@
       "errors": [
         "Could not place notes"
       ],
-      "fingerprint": "s-1"
+      "fingerprint": "s-1",
+      "kept": [
+        {
+          "adoptable": false,
+          "changed": true,
+          "dest": "/home/dev/.claude/skills/notes",
+          "displaced_at": 1760000000,
+          "harness": "claude",
+          "id": "d-2",
+          "items": [],
+          "kind": "displaced",
+          "name": "notes",
+          "path": "/home/dev/.local/share/sk1ll/recovered/d-1",
+          "reason": "Unmanaged directory replaced by an assigned Skill."
+        }
+      ]
     },
     {
       "conflicts": []

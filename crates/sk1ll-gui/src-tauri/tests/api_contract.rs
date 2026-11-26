@@ -460,8 +460,10 @@ fn harness_golden() -> Value {
         adoptable: true,
         changed: false,
     };
+    // An overwritten hand edit: it needs the user, and Adopt can't place a skill link.
+    let kept = ConflictView { id: Some("d-2".into()), adoptable: false, changed: true, ..displaced.clone() };
     json!({
-        "conflict_view": { "harness": sample(conflict()), "displaced": sample(displaced) },
+        "conflict_view": { "harness": sample(conflict()), "displaced": sample(displaced), "kept": sample(kept.clone()) },
         "conflict_target": sample(ConflictTarget { harness: "codex".into(), name: "code-review".into() }),
         "harness_view": sample(HarnessView { name: "claude".into(), harness: claude(), origin: "detected".into() }),
         "instructions_format": by_tag("instructions_format", [InstructionsFormat::Block, InstructionsFormat::Rules].map(|instructions_format| Harness { instructions_format, ..claude() })),
@@ -497,12 +499,21 @@ fn harness_golden() -> Value {
             sample(SyncResult {
                 fingerprint: Some("s-1".into()),
                 conflicts: vec![conflict()],
+                kept: vec![kept],
                 actions: Some(vec![placement("update", None)]),
                 completed: vec![placement("create", None)],
                 changed: Some(placement("update", None)),
                 errors: vec!["Could not place notes".into()],
             }),
-            sample(SyncResult { fingerprint: None, conflicts: vec![], actions: None, completed: vec![], changed: None, errors: vec![] }),
+            sample(SyncResult {
+                fingerprint: None,
+                conflicts: vec![],
+                kept: vec![],
+                actions: None,
+                completed: vec![],
+                changed: None,
+                errors: vec![],
+            }),
         ],
         "instruction_preview": by_tag("format", [InstructionsFormat::Block, InstructionsFormat::Rules].map(preview)),
     })

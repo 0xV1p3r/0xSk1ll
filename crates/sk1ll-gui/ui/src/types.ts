@@ -80,7 +80,12 @@ export interface ConflictView {
   kind?: string; id?: string; item?: ItemRef; path?: string; displaced_at?: number;
   // Harness conflicts only: newest mtime of the Harness content (when it was last edited), not a first-seen time.
   detected_at?: number | null;
-  harness: string; name: string; items: ItemRef[]; dest: string; reason: string | null; adoptable: boolean;
+  harness: string; name: string; items: ItemRef[]; dest: string; reason: string | null;
+  // Harness conflicts: false for `block` instructions. Recovered content: false where Adopt can't tell where it goes.
+  adoptable: boolean;
+  // Recovered content only: it holds a change (a hand edit kept in recovery, a save during a swap), so it needs the user.
+  // Absent: as sk1ll set it aside, safe to discard.
+  changed?: boolean;
 }
 export interface ConflictTarget { harness: string; name: string }
 export interface HarnessView {
@@ -98,7 +103,7 @@ export interface HarnessChangeRequest { change: HarnessChange; fingerprint?: str
 export interface InstructionPreview {
   path: string; format: 'block' | 'rules'; content: string; next_content: string; differs: boolean; diff: string;
 }
-export interface SyncResult { fingerprint?: string; conflicts: ConflictView[]; actions?: PlacementView[]; completed?: PlacementView[]; changed?: PlacementView; errors?: string[] }
+export interface SyncResult { fingerprint?: string; conflicts: ConflictView[]; kept?: ConflictView[]; actions?: PlacementView[]; completed?: PlacementView[]; changed?: PlacementView; errors?: string[] }
 export interface PlacementView {
   harness: string; kind: 'create' | 'update' | 'remove' | 'conflict'; item: 'skill' | 'rule' | 'instructions';
   name: string; dest: string; reason: string | null;

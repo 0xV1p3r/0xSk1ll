@@ -757,6 +757,7 @@ fn apply_rule(repo: &Repo, action: &Action) -> Result<()> {
         expected,
         ownership: Some(&ownership),
         baseline: None,
+        adopting: None,
     };
     let outcome = match content {
         Some(content) => {
@@ -813,6 +814,7 @@ fn apply_instructions(repo: &Repo, action: &Action, content: Option<&str>, expec
         expected: Some(&whole),
         ownership: None,
         baseline: None,
+        adopting: None,
     };
     let spliced = instructions::splice(&text, block.as_ref(), content);
     // A file sync created stays sync's only while it holds exactly what
@@ -955,6 +957,10 @@ fn apply_skill(repo: &Repo, action: &Action, adopted: bool, reviewed_digest: Opt
         expected,
         ownership: Some(&ownership),
         baseline: None,
+        adopting: match &existing {
+            Existing::Unmanaged(_) => source.map(|source| (source, item_id.as_ref())),
+            _ => None,
+        },
     };
     let outcome = match action.kind {
         ActionKind::Conflict => unreachable!(),
@@ -1209,6 +1215,16 @@ fn swap_in(stage: Option<&Path>, dest: &Path, displace: Displace, intent: Option
     } else {
         None
     };
+    let recorded = match (&held, displace.adopting) {
+        (Some(entry), Some((source, id))) => entry.record_source(displace.repo, source, id),
+        _ => Ok(()),
+    };
+    if let Err(e) = recorded {
+        if let Some(held) = held {
+            held.abandon();
+        }
+        return Err(e);
+    }
     let setup = || -> Result<()> {
         if let (Some(ownership), Some(intent)) = (displace.ownership, intent) {
             ownership.begin(intent.with_recovery(held.as_ref().map(|entry| entry.id().to_owned())))?;
@@ -1285,6 +1301,10 @@ struct Displace<'a> {
     /// had, so its backup is pruned once it is unchanged and old enough
     /// (`None`: it is kept until discarded).
     baseline: Option<&'a str>,
+    /// Adopt replaces an unmanaged skill with the repo item it copied it
+    /// into (its source and Item ID): sync placed nothing there, so the
+    /// recovery entry records that item, which its Adopt goes back into.
+    adopting: Option<(&'a Path, Option<&'a ItemId>)>,
 }
 
 impl Displace<'_> {
@@ -1977,6 +1997,7 @@ fn copy_into_repo(
             expected: expected.as_deref(),
             ownership: None,
             baseline: baseline.as_deref(),
+            adopting: None,
         };
         let displaced = swap_in(Some(&stage), dest, displace, None)?;
         Ok((hash, payload, displaced))
@@ -2138,6 +2159,7 @@ fn rule_into_repo(
             expected: expected.as_deref(),
             ownership: None,
             baseline: baseline.as_deref(),
+            adopting: None,
         };
         swap_in(Some(&stage), dest, displace, None)
     });
@@ -2409,6 +2431,20 @@ pub mod displaced {
         /// It differs from what sync expected to displace: someone wrote to
         /// it during (or after) the swap. Never pruned.
         pub changed: bool,
+    }
+
+    impl Entry {
+        /// Whether [`adopt`] can tell where its content goes, as far as the
+        /// entry itself says: not for a skill link (no content of its own),
+        /// nor for a skill or rule file with no record of the repo it came
+        /// from. [`target`] decides the rest, against the repo.
+        pub fn adoptable(&self) -> bool {
+            match self.kind {
+                Kind::Draft | Kind::Instructions => true,
+                Kind::Skill if fs::symlink_metadata(&self.path).is_ok_and(|m| m.file_type().is_symlink()) => false,
+                Kind::Skill | Kind::Rule => self.provenance.is_some(),
+            }
+        }
     }
 
     /// `displaced` in sk1ll's state directory ([`crate::paths::state_dir`],
@@ -2708,6 +2744,27 @@ pub mod displaced {
         release(&root, id, &dir).map(drop)
     }
 
+    /// Drops the [`Kind::Draft`] entry `id` of a finished pull while it
+    /// still holds exactly what the pull moved there: the committed version
+    /// of a path it replaced or removed, which the repo's history has, so
+    /// keeping it would only look like lost work. One written to since (a
+    /// save during the swap) stays, changed, as does anything that can't
+    /// be read. Never recursive (see [`crate::hash::remove_payload`]).
+    pub(crate) fn drop_committed(id: &str) -> Result<bool> {
+        let root = root()?;
+        let Some(dir) = locate(&root, id) else { return Ok(false) };
+        let Some((meta, path)) = load(&dir)? else { return Ok(false) };
+        if meta.kind != Kind::Draft || meta.active {
+            return Ok(false);
+        }
+        // Fingerprinted before the check, so a write in between fails one of them.
+        let payload = hash_payload(&path)?;
+        if differs(&meta, &path)? || !crate::hash::remove_payload(&path, &payload)? {
+            return Ok(false);
+        }
+        release(&root, id, &dir)
+    }
+
     pub fn discard_from(repo: &Repo, id: &str) -> Result<()> {
         let entry = get(id)?;
         check_repo(repo, &entry)?;
@@ -2868,6 +2925,7 @@ pub mod displaced {
             expected: Some(&expected),
             ownership: None,
             baseline: None,
+            adopting: None,
         };
         replace_file(dest, &text, unchanged, displace, OldCopy::Keep)
     }
@@ -3439,6 +3497,18 @@ pub mod displaced {
 
         fn write_meta(&self, meta: &Meta) -> Result<()> {
             save_meta(&self.dir, meta)
+        }
+
+        /// Records that what this entry is about to hold is the content of
+        /// the repo item at `source` (Item ID `id`), placed or not: what an
+        /// Adopt of an unmanaged skill copied into the repo. Before
+        /// anything is displaced.
+        pub(super) fn record_source(&self, repo: &Repo, source: &Path, id: Option<&ItemId>) -> Result<()> {
+            let mut meta = read_meta(&self.dir)
+                .ok_or_else(|| Error::Invalid(format!("cannot read recovery entry at {}", self.dir.display())))?;
+            meta.item_id = id.cloned();
+            meta.provenance = Some(Provenance::current(repo, Some(source))?);
+            self.write_meta(&meta)
         }
 
         /// Takes up again the [`Kind::Draft`] entry `id` an earlier pull

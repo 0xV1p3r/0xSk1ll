@@ -20,6 +20,7 @@ pub(super) fn conflict_items(a: &Action) -> Vec<ItemRef> {
 
 pub(super) fn displaced_view(entry: sync::displaced::Entry, root: &Path) -> ConflictView {
     let item = displaced_item(&entry, root);
+    let adoptable = entry.adoptable();
     ConflictView {
         kind: Some("displaced".into()),
         id: Some(entry.id),
@@ -32,7 +33,7 @@ pub(super) fn displaced_view(entry: sync::displaced::Entry, root: &Path) -> Conf
         displaced_at: Some(entry.displaced_at),
         detected_at: None,
         reason: None,
-        adoptable: true,
+        adoptable,
         changed: entry.changed,
     }
 }

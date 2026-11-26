@@ -1412,7 +1412,7 @@ async fn skills_api_browses_content_and_adopts_only_while_connected() {
     assert_eq!(std::fs::read_to_string(m.home.path().join("different/pdf/SKILL.md")).unwrap(), "different");
     assert!(m.skills().join(".sk1ll-tmp/displaced").is_dir());
     let recovered = m.client.recovered().await.unwrap();
-    let originals = recovered
+    let originals: Vec<_> = recovered
         .iter()
         .filter(|entry| {
             entry.name == "pdf"
@@ -1420,8 +1420,21 @@ async fn skills_api_browses_content_and_adopts_only_while_connected() {
                     std::fs::read_to_string(path.join("SKILL.md")).is_ok_and(|text| text.ends_with("same"))
                 })
         })
-        .count();
-    assert_eq!(originals, 2);
+        .collect();
+    assert_eq!(originals.len(), 2);
+    // Each original maps to the skill it was adopted as: its diff and its
+    // Adopt both go there.
+    let personal = m.repo().canonicalize().unwrap().join("personal/pdf");
+    for entry in &originals {
+        assert!(entry.adoptable && !entry.changed, "{entry:?}");
+        let request = sk1ll_daemon::client::ConflictDiffRequest { id: entry.id.clone(), harness: None, name: None };
+        let diff = m.client.conflict_diff(&request).await.unwrap();
+        assert_eq!(diff.target.as_ref().and_then(|t| t.canonicalize().ok()), Some(personal.clone()));
+    }
+    // Routine copies need no one: the report (Fleet's count) has no conflict.
+    assert!(m.status().await.report.conflicts.is_empty());
+    let adopted_to = m.client.adopt_displaced(originals[0].id.as_deref().unwrap()).await.unwrap();
+    assert_eq!(adopted_to.canonicalize().unwrap(), personal);
 
     let skills = m.client.skills().await.unwrap();
     let adopted = skills.iter().find(|s| s.name == "pdf" && s.kind == ContentType::Personal).unwrap();
@@ -1645,6 +1658,17 @@ async fn block_conflict_diff_preserves_surrounding_notes() {
     assert!(diff.diff.contains("+Expected rule"), "{}", diff.diff);
     assert!(!diff.diff.contains("private notes"), "{}", diff.diff);
     assert!(!diff.diff.contains("More notes"), "{}", diff.diff);
+
+    // Overwrite resolves the conflict: the edit is only recovered content
+    // now, which still counts as needing the user.
+    let target = sk1ll_daemon::client::ConflictTarget { harness: HARNESS.into(), name: "instructions".into() };
+    m.client.overwrite(&target).await.unwrap();
+    assert_eq!(m.client.conflicts_fresh().await.unwrap(), []);
+    let kept: Vec<_> = m.client.recovered().await.unwrap().into_iter().filter(|e| e.changed).collect();
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert!(std::fs::read_to_string(kept[0].path.as_ref().unwrap()).unwrap().contains("Edited rule"));
+    assert_eq!(m.status().await.report.conflicts.len(), 1);
+    assert!(m.client.overwrite(&target).await.unwrap_err().message.contains("no conflict"));
 }
 
 // Standalone tests use the local API and git only; no fleet server is needed.

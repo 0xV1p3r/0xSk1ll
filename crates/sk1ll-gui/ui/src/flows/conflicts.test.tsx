@@ -8,7 +8,8 @@ it('resolves a Harness conflict from the Library banner and discards recovered c
   await heading('Library');
   expect(await screen.findByText('This Machine has a Conflict')).toBeTruthy();
   expect(screen.getByText('code-review', { selector: 'code' }).parentElement?.textContent).toContain('was edited in codex after the last sync.');
-  expect(await nav().findByLabelText('1 Conflict to resolve, 1 recovered item to review')).toBeTruthy();
+  // The unchanged recovered copy needs no one, so the badge counts only the Harness conflict.
+  expect(await nav().findByLabelText('1 Conflict to resolve')).toBeTruthy();
   await user.click(screen.getByRole('button', { name: 'Resolve' }));
   const title = await heading('Conflicts');
   await waitFor(() => expect(document.activeElement).toBe(title));
@@ -64,4 +65,26 @@ it('keeps diffs closed when four or more entries need review, loading each on de
   expect(await screen.findByLabelText('Conflict diff')).toBeTruthy();
   expect(daemon.sent('conflict_diff')).toEqual([{ request: { id: 'd-2' } }]);
   expect(screen.getAllByText(/^Edited/)).toHaveLength(1);
+});
+
+it('marks recovered content changed or unchanged and offers Adopt only where it can go', async () => {
+  const { daemon, user } = launch('fleet', { hash: '#/conflicts', setup: daemon => {
+    daemon.recovered.push({ ...daemon.recovered[0], id: 'd-2', name: 'linked', reason: null, changed: true, adoptable: false });
+  } });
+  await heading('Conflicts');
+  const [unchanged, kept] = await screen.findAllByRole('button', { name: /^Discard / });
+  expect(unchanged.getAttribute('aria-label')).toBe('Discard notes in claude');
+  expect(kept.getAttribute('aria-label')).toBe('Discard linked in claude');
+  expect(screen.getByText('Unchanged')).toBeTruthy();
+  expect(screen.getByText('It is as sk1ll set it aside. Discarding it is safe.')).toBeTruthy();
+  expect(screen.getByText('Changed')).toBeTruthy();
+  expect(screen.getByText(/can't tell which item this came from/)).toBeTruthy();
+  expect(screen.getByRole('button', { name: 'Adopt notes from claude' })).toBeTruthy();
+  expect(screen.queryByRole('button', { name: 'Adopt linked from claude' })).toBeNull();
+  // Its diff still loads: what it holds, with no Draft destination.
+  expect((await screen.findAllByLabelText('Conflict diff')).length).toBeGreaterThan(0);
+  expect(daemon.sent('conflict_diff')).toEqual(expect.arrayContaining([{ request: { id: 'd-2' } }]));
+  await user.click(kept);
+  await user.click((await dialog('Discard linked in claude?')).getByRole('button', { name: 'Discard' }));
+  await waitFor(() => expect(daemon.sent('discard_displaced')).toEqual([{ id: 'd-2' }]));
 });

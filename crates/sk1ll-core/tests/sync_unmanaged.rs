@@ -116,9 +116,19 @@ fn adopts_only_chosen_variant_preserves_originals_in_recovery_and_respects_defau
     assert!(!tmp.path().join("d/pdf").exists());
     let recovery = displaced::list().unwrap();
     assert_eq!(recovery.len(), 2);
-    for entry in recovery {
+    for entry in &recovery {
         assert_eq!(fs::read_to_string(entry.path.join("SKILL.md")).unwrap(), "same");
+        // An original goes back into the skill it was adopted as.
+        assert!(entry.adoptable());
+        assert_eq!(entry.item_id.as_ref(), Some(&id));
+        assert_eq!(displaced::target(&repo, entry).unwrap().path, repo.personal_dir().join("pdf"));
     }
+    write(&repo.personal_dir().join("pdf/SKILL.md"), "edited since");
+    let lock = sk1ll_core::EngineLock::acquire(repo.root()).unwrap();
+    assert_eq!(displaced::adopt(&repo, &recovery[0].id, &lock).unwrap(), repo.personal_dir().join("pdf"));
+    drop(lock);
+    assert_eq!(fs::read_to_string(repo.personal_dir().join("pdf/SKILL.md")).unwrap(), "same");
+    assert_eq!(skill_id(&repo, "pdf"), id);
     let remaining = discover(&repo, &hs).unwrap();
     assert_eq!(remaining[0].variants[0].locations[0].harness, "c");
     assignment.set_skill("c", &id, true);
@@ -210,7 +220,12 @@ fn unmanaged_directory_links_are_hashed_by_content_and_adopted_without_touching_
     let dest = tmp.path().join("a/pdf");
     assert_copy_recorded(&dest);
     assert_eq!(hash_dir(&dest).unwrap(), adoption.hash);
-    assert_eq!(displaced::list().unwrap().len(), 2);
+    // The link's own entry holds no content to adopt; the copy's goes back into the skill.
+    let entries = displaced::list().unwrap();
+    assert_eq!(entries.len(), 2);
+    let (links, copies): (Vec<_>, Vec<_>) = entries.iter().partition(|e| e.path.is_symlink());
+    assert!(links.iter().all(|e| !e.adoptable()) && copies.iter().all(|e| e.adoptable()));
+    assert_eq!((links.len(), copies.len()), (1, 1));
 }
 
 #[test]

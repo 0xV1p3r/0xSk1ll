@@ -91,6 +91,7 @@ impl Daemon {
         Ok(SyncResult {
             fingerprint: Some(sk1ll_core::hash::hash_str(&serialized)),
             conflicts: actions.iter().filter(|a| a.kind == ActionKind::Conflict).map(conflict_view).collect(),
+            kept: Vec::new(),
             actions: Some(actions.iter().map(placement_view).collect()),
             completed: Vec::new(),
             changed: None,
@@ -169,9 +170,11 @@ impl Daemon {
             preview.changed = changed;
             return Ok(preview);
         }
+        let snapshot = self.snapshot();
         Ok(SyncResult {
             fingerprint: None,
-            conflicts: self.snapshot().conflicts()?,
+            conflicts: snapshot.conflicts()?,
+            kept: snapshot.recovered()?.into_iter().filter(|entry| entry.changed).collect(),
             actions: None,
             errors,
             completed: Vec::new(),
