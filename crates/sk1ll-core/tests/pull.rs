@@ -1372,6 +1372,34 @@ fn pull_keeps_a_mode_git_cant_give_back() {
     assert_eq!(fs::metadata(&entry.path).unwrap().permissions().mode() & 0o777, 0o600);
 }
 
+/// With `core.symlinks=false` a symlink is checked out as a file holding its
+/// target: a private mode on one is kept as well.
+#[cfg(unix)]
+#[test]
+fn pull_keeps_a_mode_git_cant_give_back_on_a_symlink_placeholder() {
+    use sk1ll_core::sync::displaced;
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fleet::new();
+    let (a, b) = (f.a(), f.b());
+    let rel = "instructions/link";
+    std::os::unix::fs::symlink("git.md", f.a.join(rel)).unwrap();
+    commit_all(&f.a, "add a link");
+    a.push().unwrap();
+    git(&f.b, &["config", "core.symlinks", "false"]);
+    assert!(matches!(pull(&b).unwrap(), PullOutcome::Updated { .. }));
+    let placeholder = f.b.join(rel);
+    assert!(fs::symlink_metadata(&placeholder).unwrap().is_file());
+    fs::set_permissions(&placeholder, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::remove_file(f.a.join(rel)).unwrap();
+    commit_all(&f.a, "remove the link");
+    a.push().unwrap();
+    assert!(matches!(pull(&b).unwrap(), PullOutcome::Updated { .. }));
+    displaced::prune_with(std::time::Duration::ZERO).unwrap();
+    let kept = displaced::list().unwrap();
+    let entry = kept.iter().find(|e| e.dest == placeholder).expect("the private mode is kept");
+    assert!(entry.changed, "{entry:?}");
+}
+
 /// The grace period runs from when the swap completed: a pull that waited
 /// between reserving an entry and filling it doesn't shorten it.
 #[cfg(unix)]

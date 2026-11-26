@@ -289,8 +289,10 @@ the old commit writes, with the mode checkout gives (Git records only the
 executable bit) and no extended attributes beyond its SELinux label: that
 one is pruned like a backup, once the Pull is finished. The repo version an
 Adopt replaces is kept the same way unless it is exactly its committed
-version, so a Draft edit there is never pruned. An entry is never pruned
-while Adopt is using it. Pruning rechecks the payload and then every entry's
+version, every committed file there, so a Draft edit or deletion there is
+never pruned; it records its item, so `sk1ll recover adopt` puts it back.
+An entry is never pruned while an Adopt of it runs; a hold a crashed Adopt
+left lapses with its process. Pruning rechecks the payload and then every entry's
 metadata. A write through a still-open file descriptor after that last
 check can be lost.
 

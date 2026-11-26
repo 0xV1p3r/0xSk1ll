@@ -1260,7 +1260,9 @@ fn swap_in(stage: Option<&Path>, dest: &Path, displace: Displace, intent: Option
         None
     };
     let recorded = match (&held, displace.adopting) {
-        (Some(entry), Some((source, id, uncopied))) => entry.record_source(displace.repo, source, id, uncopied),
+        (Some(entry), Some((source, id, uncopied))) => {
+            entry.record_source(displace.repo, source, id, uncopied || displace.keep)
+        }
         (Some(entry), None) if displace.keep => entry.mark_kept(),
         _ => Ok(()),
     };
@@ -1346,10 +1348,12 @@ struct Displace<'a> {
     /// had, so its backup is pruned once it is unchanged and old enough
     /// (`None`: it is kept until discarded).
     baseline: Option<&'a str>,
-    /// Adopt replaces an unmanaged skill with the repo item it copied it
-    /// into (its source and Item ID): sync placed nothing there, so the
-    /// recovery entry records that item, which its Adopt goes back into.
-    /// `true`: the skill holds what the copy left out (see [`holds_uncopied`]).
+    /// The repo item (its source and Item ID) the replaced content is, or
+    /// was copied into, when no placement record says so: an unmanaged
+    /// skill Adopt copied into the repo, or the repo's own version Adopt
+    /// replaces. The recovery entry records it, so its Adopt goes back
+    /// there. `true`: the skill holds what the copy left out (see
+    /// [`holds_uncopied`]).
     adopting: Option<(&'a Path, Option<&'a ItemId>, bool)>,
     /// The replaced content may be the only copy of what it holds: its
     /// recovery entry is kept, changed, until adopted or discarded.
@@ -1358,7 +1362,8 @@ struct Displace<'a> {
 
 /// Whether the repo item at `path` (a skill directory or a rule file) is
 /// exactly its committed version: each file what `HEAD` has there byte for
-/// byte, with the mode checkout gives, no directory without one and no
+/// byte, with the mode checkout gives, every file `HEAD` has there present
+/// (a Draft deletion is a change too), no directory without one and no
 /// extended attribute. A backup of it then holds nothing the history lacks;
 /// of anything else (a Draft edit, a private mode), it may be the only copy.
 fn committed_exactly(repo: &Repo, path: &Path) -> bool {
@@ -1367,11 +1372,9 @@ fn committed_exactly(repo: &Repo, path: &Path) -> bool {
         use std::os::unix::fs::PermissionsExt;
         let root = repo.root();
         let Ok(rel) = path.strip_prefix(root) else { return Ok(false) };
-        let tree = crate::git::Git::repo(root)?
-            .literal()
-            .args(["ls-tree", "-r", "-z", "--full-tree", "HEAD", "--"])
-            .arg(rel)
-            .run()?;
+        // From the skills repo, which may be a subdirectory of its Git
+        // worktree: paths, given and listed, are relative to it.
+        let tree = crate::git::Git::repo(root)?.literal().args(["ls-tree", "-r", "-z", "HEAD", "--"]).arg(rel).run()?;
         let mut committed = BTreeMap::new();
         for row in tree.split(|b| *b == 0).filter(|row| !row.is_empty()) {
             let Some(tab) = row.iter().position(|b| *b == b'\t') else { return Ok(false) };
@@ -1382,6 +1385,9 @@ fn committed_exactly(repo: &Repo, path: &Path) -> bool {
                 .insert(root.join(crate::git::path_from_bytes(&row[tab + 1..])), (mode.to_string(), oid.to_string()));
         }
         let (mut paths, mut oids) = (Vec::new(), Vec::new());
+        if committed.is_empty() {
+            return Ok(false);
+        }
         for entry in WalkDir::new(path) {
             let entry = entry.map_err(std::io::Error::from).at(path)?;
             let at = entry.path();
@@ -1396,7 +1402,7 @@ fn committed_exactly(repo: &Repo, path: &Path) -> bool {
                 }
                 continue;
             }
-            let Some((committed_mode, oid)) = committed.get(at) else { return Ok(false) };
+            let Some((committed_mode, oid)) = committed.remove(at) else { return Ok(false) };
             let executable = committed_mode == "100755";
             if !meta.is_file()
                 || !executable && committed_mode != "100644"
@@ -1404,17 +1410,16 @@ fn committed_exactly(repo: &Repo, path: &Path) -> bool {
             {
                 return Ok(false);
             }
-            let bytes = crate::git::path_bytes(at);
-            if bytes.contains(&b'\n') {
-                return Ok(false);
-            }
-            paths.extend_from_slice(&bytes);
-            paths.push(b'\n');
-            oids.push(oid.as_str());
+            paths.push(at.to_path_buf());
+            oids.push(oid);
         }
-        let hashed =
-            crate::git::Git::repo(root)?.args(["hash-object", "--no-filters", "--stdin-paths"]).stdin(paths).text()?;
-        Ok(hashed.lines().eq(oids))
+        // Each one `HEAD` has must be there.
+        if !committed.is_empty() {
+            return Ok(false);
+        }
+        // As arguments: `--stdin-paths` would take a trailing CR off a name.
+        let hashed = crate::git::Git::repo(root)?.args(["hash-object", "--no-filters", "--"]).args(&paths).text()?;
+        Ok(hashed.lines().eq(oids.iter().map(String::as_str)))
     };
     #[cfg(not(unix))]
     let check = || -> Result<bool> { Ok(false) };
@@ -2162,7 +2167,8 @@ fn copy_into_repo(
             expected: expected.as_deref(),
             ownership: None,
             baseline: baseline.as_deref(),
-            adopting: None,
+            // The version replaced is that item: Recover Adopt puts it back.
+            adopting: existing.then_some((dest.as_path(), target.skill_id.as_ref(), false)),
             keep,
         };
         let displaced = swap_in(Some(&stage), dest, displace, None)?;
@@ -2327,7 +2333,10 @@ fn rule_into_repo(
             expected: expected.as_deref(),
             ownership: None,
             baseline: baseline.as_deref(),
-            adopting: None,
+            // The version replaced is that rule: Recover Adopt puts it back.
+            adopting: expected
+                .is_some()
+                .then(|| (dest.as_path(), target.rule.as_ref().and_then(|rule| rule.id.as_ref()), false)),
             keep,
         };
         swap_in(Some(&stage), dest, displace, None)
@@ -2526,6 +2535,11 @@ pub mod displaced {
         /// is pruned as a routine copy is, once the pull is finished.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         committed: bool,
+        /// The process an Adopt of this entry runs in: never pruned while
+        /// it runs. A mark a crashed Adopt left counts for nothing once that
+        /// process is gone.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        held_by: Option<u32>,
     }
 
     mod stored_path {
@@ -3076,10 +3090,10 @@ pub mod displaced {
         let dir = locate(&root, id).ok_or_else(|| Error::Invalid(format!("no displaced entry `{id}`")))?;
         // In use until Adopt is done, so no prune on the way (the one each
         // displacement runs) takes it: Adopt's input, past its grace period.
-        set_active(&dir, true)?;
+        hold(&dir, Some(std::process::id()))?;
         let adopted = adopt_entry(repo, &entry, target, lock, &root, &dir);
         if dir.join(META).exists() {
-            let _ = set_active(&dir, false);
+            let _ = hold(&dir, None);
         }
         adopted
     }
@@ -3372,12 +3386,29 @@ pub mod displaced {
         Ok(true)
     }
 
-    /// Marks the entry at `dir` in use (`active`): never pruned meanwhile.
-    fn set_active(dir: &Path, active: bool) -> Result<()> {
+    /// Marks the entry at `dir` in use by the process `pid` (`None`: by
+    /// none): never pruned while that process runs (see [`Meta::held_by`]).
+    fn hold(dir: &Path, pid: Option<u32>) -> Result<()> {
         let mut meta =
             read_meta(dir).ok_or_else(|| Error::Invalid(format!("cannot read recovery entry at {}", dir.display())))?;
-        meta.active = active;
+        meta.held_by = pid;
         save_meta(dir, &meta)
+    }
+
+    /// Whether the process `pid` runs; `true` where that can't be told.
+    fn running(pid: u32) -> bool {
+        #[cfg(unix)]
+        {
+            let Ok(pid) = libc::pid_t::try_from(pid) else { return true };
+            // SAFETY: signal 0 only checks that the process exists.
+            let sent = unsafe { libc::kill(pid, 0) } == 0;
+            sent || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            true
+        }
     }
 
     /// Marks the entry at `dir` kept: changed, never pruned.
@@ -3461,7 +3492,7 @@ pub mod displaced {
 
     /// `dir`: the entry's directory.
     fn protected(id: &str, meta: &Meta, dir: &Path) -> bool {
-        if meta.active || meta.payload.is_none() || meta.dest.parent().is_none() {
+        if meta.held_by.is_some_and(running) || meta.active || meta.payload.is_none() || meta.dest.parent().is_none() {
             return true;
         }
         // A Draft entry holds someone's version, except a committed one a
@@ -3700,6 +3731,7 @@ pub mod displaced {
                 active: true,
                 payload: payload.map(str::to_owned),
                 committed: false,
+                held_by: None,
             };
             let expected = meta.expected.clone();
             let held = Self { id, root, dir, kind, dest: dest.to_path_buf(), expected, held: None };

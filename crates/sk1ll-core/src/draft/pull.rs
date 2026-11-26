@@ -1263,15 +1263,16 @@ impl<'a> Convert<'a> {
     /// [`crate::hash::checkout_mode`]): Git records only the executable bit.
     fn verbatim(&self, node: &Node, entry: Option<&Entry>, path: &Path) -> Result<bool> {
         let (Some(entry), Node::File { bytes, .. } | Node::Link(bytes)) = (entry, node) else { return Ok(false) };
-        if entry.mode == SYMLINK {
-            // `holds` compared it with no filters already.
-            return Ok(true);
-        }
+        // A symlink checked out as a file (`core.symlinks=false`) included.
         #[cfg(unix)]
         if let Node::File { mode, .. } = node
             && *mode != crate::hash::checkout_mode(entry.mode == "100755")
         {
             return Ok(false);
+        }
+        if entry.mode == SYMLINK {
+            // `holds` compared it with no filters already.
+            return Ok(true);
         }
         let git = self.git(Side::Old).args(["cat-file", "--filters"]).arg(path_option(path)).arg(&entry.oid);
         Ok(git.run()? == *bytes)

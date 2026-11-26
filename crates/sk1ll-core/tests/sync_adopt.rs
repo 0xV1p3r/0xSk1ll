@@ -254,10 +254,11 @@ fn adopt_owns_only_what_it_copied_and_keeps_what_it_left_out() {
 }
 
 /// Adopt keeps the repo version it replaces as changed unless that is
-/// exactly the committed version: a Draft edit there may be in no other copy.
+/// exactly the committed version: a Draft edit or deletion there may be in
+/// no other copy. A name ending in a CR is compared as it is.
 #[test]
 fn adopt_keeps_a_replaced_draft_edit_and_lets_a_committed_version_go() {
-    for draft in [false, true] {
+    for draft in ["none", "edit", "deletion"] {
         let (tmp, repo, mut harnesses) = skill_setup(LinkMode::Copy);
         let _home = tmp.enter();
         let config = harnesses.get_mut("h").unwrap();
@@ -265,17 +266,23 @@ fn adopt_keeps_a_replaced_draft_edit_and_lets_a_committed_version_go() {
         config.instructions_format = InstructionsFormat::Rules;
         let rule = repo.root().join("instructions/git.md");
         write(&rule, "---\nid: git-id\nharnesses: [h]\n---\nCommitted.\n");
+        write(&repo.personal_dir().join("pdf/ref.md"), "Reference.\n");
+        write(&repo.personal_dir().join("pdf/notes\r"), "Notes.\n");
         sk1ll_testkit::git::git(repo.root(), &["add", "."]);
-        sk1ll_testkit::git::git(repo.root(), &["commit", "-qm", "rule"]);
+        sk1ll_testkit::git::git(repo.root(), &["commit", "-qm", "rule and references"]);
         let plan_now = || plan(&repo, &harnesses, &Assignment::default(), PlanOptions::default()).unwrap();
         for action in plan_now() {
             apply(&repo, &action).unwrap();
         }
         write(&tmp.path().join("skills/pdf/SKILL.md"), "Harness edit.\n");
         edit_rule_body(&tmp.path().join("rules/git.md"), "Harness edit.\n");
-        if draft {
-            write(&repo.personal_dir().join("pdf/SKILL.md"), "Draft edit.\n");
-            edit_rule_body(&rule, "Draft edit.\n");
+        match draft {
+            "edit" => {
+                write(&repo.personal_dir().join("pdf/SKILL.md"), "Draft edit.\n");
+                edit_rule_body(&rule, "Draft edit.\n");
+            }
+            "deletion" => fs::remove_file(repo.personal_dir().join("pdf/ref.md")).unwrap(),
+            _ => {}
         }
         let conflicts: Vec<_> = plan_now().into_iter().filter(|a| a.kind == ActionKind::Conflict).collect();
         assert_eq!(conflicts.len(), 2, "{conflicts:?}");
@@ -284,9 +291,61 @@ fn adopt_keeps_a_replaced_draft_edit_and_lets_a_committed_version_go() {
         }
         let replaced: Vec<_> = displaced::list().unwrap().into_iter().filter(|e| e.harness == "repo").collect();
         assert_eq!(replaced.len(), 2, "{replaced:?}");
-        assert!(replaced.iter().all(|e| e.changed == draft), "draft {draft}: {replaced:?}");
+        for entry in &replaced {
+            let changed = match draft {
+                "none" => false,
+                "edit" => true,
+                _ => entry.kind == displaced::Kind::Skill,
+            };
+            assert_eq!(entry.changed, changed, "{draft}: {entry:?}");
+        }
         displaced::prune_with(Duration::ZERO).unwrap();
         let left = displaced::list().unwrap().into_iter().filter(|e| e.harness == "repo").count();
-        assert_eq!(left, if draft { 2 } else { 0 }, "draft {draft}");
+        assert_eq!(left, replaced.iter().filter(|e| e.changed).count(), "{draft}");
+    }
+}
+
+/// A skills repo in a subdirectory of its Git worktree: what Adopt replaces
+/// is compared with that subdirectory's committed version, not with a path
+/// of the same name at the worktree's top.
+#[test]
+fn adopt_compares_a_nested_skills_repo_with_its_own_committed_version() {
+    for draft in [false, true] {
+        let tmp = Home::new();
+        let _home = tmp.enter();
+        let outer = tmp.path().join("project");
+        let git = |args: &[&str]| sk1ll_testkit::git::git(&outer, args);
+        fs::create_dir_all(&outer).unwrap();
+        git(&["init", "-q", "-b", "main"]);
+        let root = outer.join("skills");
+        write(&root.join("sk1ll.toml"), "");
+        write(&root.join("personal/pdf/SKILL.md"), "Committed.\n");
+        write(&root.join("personal/pdf").join(ID_FILE), "pdf-id\n");
+        // A path of the same name at the top, holding what the Draft will.
+        write(&outer.join("personal/pdf/SKILL.md"), "Draft edit.\n");
+        write(&outer.join("personal/pdf").join(ID_FILE), "pdf-id\n");
+        git(&["add", "."]);
+        git(&["commit", "-qm", "seed"]);
+        let repo = sk1ll_core::Repo::open(&root).unwrap();
+        let harness = Harness {
+            skills: Some(tmp.path().join("skills").display().to_string()),
+            mode: LinkMode::Copy,
+            ..Harness::default()
+        };
+        let harnesses = BTreeMap::from([("h".to_string(), harness)]);
+        let plan_now = || plan(&repo, &harnesses, &Assignment::default(), PlanOptions::default()).unwrap();
+        for action in plan_now() {
+            apply(&repo, &action).unwrap();
+        }
+        write(&tmp.path().join("skills/pdf/SKILL.md"), "Harness edit.\n");
+        if draft {
+            write(&root.join("personal/pdf/SKILL.md"), "Draft edit.\n");
+        }
+        let conflict = plan_now().into_iter().find(|a| a.kind == ActionKind::Conflict).unwrap();
+        adopt(&repo, &conflict).unwrap();
+        let replaced = displaced::list().unwrap().into_iter().find(|e| e.harness == "repo").unwrap();
+        assert_eq!(replaced.changed, draft, "{replaced:?}");
+        displaced::prune_with(Duration::ZERO).unwrap();
+        assert_eq!(displaced::get(&replaced.id).is_ok(), draft);
     }
 }
