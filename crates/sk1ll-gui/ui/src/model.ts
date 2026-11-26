@@ -24,8 +24,12 @@ export function headline(offline: boolean, report: MachineReport | null, baselin
   if (report?.behind || (baseline !== null && report?.baseline !== baseline)) return 'behind';
   return report?.drafts.length ? 'drafting' : 'in_sync';
 }
-export function emptyHarness(): HarnessAssignment {
-  return { new_skills_default: true, new_rules_default: true, skills: {}, rules: {} };
+// A Harness's entry, or what it has without one (as the Daemon's `Assignment::harness`).
+export function harnessOf(assignment: Assignment, harness: string): HarnessAssignment {
+  return own(assignment.harnesses, harness) ?? uniformHarness(assignment.new_harnesses_default);
+}
+export function uniformHarness(enabled: boolean): HarnessAssignment {
+  return { new_skills_default: enabled, new_rules_default: enabled, skills: {}, rules: {} };
 }
 export function splitItem(item: ItemRef): { kind: string; name: string } {
   const at = item.indexOf(':');
@@ -39,7 +43,7 @@ export function insecureHttp(server: string): boolean {
   return url.protocol === 'http:' && !(host.toLowerCase() === 'localhost' || host === '::1' || /^127\.\d+\.\d+\.\d+$/.test(host));
 }
 export function cellState(assignment: Assignment, harness: string, item: ItemRef, id: ItemId | null | undefined) {
-  const h = assignment.harnesses[harness] ?? emptyHarness();
+  const h = harnessOf(assignment, harness);
   const { kind } = splitItem(item);
   const items = kind === 'skill' ? h.skills : h.rules;
   const explicit = id != null && Object.hasOwn(items, id);
@@ -47,7 +51,7 @@ export function cellState(assignment: Assignment, harness: string, item: ItemRef
 }
 export function applyToggle(assignment: Assignment, change: ToggleChange): Assignment {
   const next = structuredClone(assignment);
-  const h = next.harnesses[change.harness] ??= emptyHarness();
+  const h = next.harnesses[change.harness] ??= uniformHarness(next.new_harnesses_default);
   // Default changes are rendered only after the Server materializes existing items.
   if ((change.kind === 'skill' || change.kind === 'rule') && change.item_id !== undefined) {
     const map = change.kind === 'skill' ? h.skills : h.rules;

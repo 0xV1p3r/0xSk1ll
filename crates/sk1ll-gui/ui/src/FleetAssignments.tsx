@@ -5,7 +5,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { api } from './api';
 import { useResource } from './hooks';
 import { matrixCheckbox, useAssignmentWrites } from './assignments';
-import { cellState, emptyHarness, mergeAssignments, splitItem, stamped, terms } from './model';
+import { cellState, harnessOf, mergeAssignments, splitItem, stamped, terms } from './model';
 import type { StampedSnapshot } from './model';
 import { CheckboxSwatch, ErrorNotice, KindBadge, Loading, Nothing, Panel, PanelToolbar, Pending, SectionTitle } from './shared';
 import type { ItemView } from './types';
@@ -24,7 +24,7 @@ export function FleetAssignments({ revision, machineId, harnesses, navigate, reg
   const expected = registration && shown ? { revision: shown.revision, registration: shown.registration ?? registration } : undefined;
   const columns = [...harnesses].sort();
   const score = (item: ItemView) => Math.max(0, ...columns.map(harness => {
-    const state = cellState(current!, harness, item.item, item.id), defaults = current!.harnesses[harness] ?? emptyHarness();
+    const state = cellState(current!, harness, item.item, item.id), defaults = harnessOf(current!, harness);
     return state.explicit ? state.enabled !== defaults[splitItem(item.item).kind === 'skill' ? 'new_skills_default' : 'new_rules_default'] ? 2 : 1 : 0;
   }));
   const all = resource.data?.items.filter(item => item.id != null && item.draft !== 'deleted') ?? [];

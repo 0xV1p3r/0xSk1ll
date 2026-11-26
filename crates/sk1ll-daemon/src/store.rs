@@ -461,7 +461,7 @@ fn apply_changes(assignment: &mut Assignment, changes: &AssignmentChanges, d: &D
                 assignment.set_new_rules_default(&change.harness, change.enabled.unwrap());
             }
             ToggleKind::Skill | ToggleKind::Rule => {
-                let h = assignment.harnesses.entry(change.harness.clone()).or_default();
+                let h = assignment.entry(&change.harness);
                 let toggles = if change.kind == ToggleKind::Skill { &mut h.skills } else { &mut h.rules };
                 let id = change.item_id.as_ref().unwrap();
                 match change.enabled {

@@ -51,12 +51,12 @@ fn entry_json(cause: Value) -> Value {
 }
 
 fn assignment() -> (Assignment, Value) {
-    let mut a = Assignment::default();
+    let mut a = Assignment::fleet();
     a.set_skill("claude", &id("01J0"), true);
-    a.harnesses.get_mut("claude").unwrap().new_skills_default = false;
+    a.harnesses.get_mut("claude").unwrap().new_rules_default = true;
     let v = json!({"harnesses": {"claude": {
         "new_skills_default": false, "new_rules_default": true, "skills": {"01J0": true}, "rules": {},
-    }}});
+    }}, "new_harnesses_default": false});
     (a, v)
 }
 
@@ -397,11 +397,15 @@ fn absent_defaulted_fields_and_unknown_fields_are_accepted() {
     assert!(view.skipped.is_empty());
     let preview = json!({"count": 0, "target": {"revision": 1}, "source": {"revision": 1}});
     assert!(serde_json::from_value::<AssignmentCopyPreview>(preview).unwrap().changes.is_empty());
-    // An assignment harness without defaults has them on.
+    // An assignment harness without defaults has them on, and so does a
+    // harness without an entry unless `new_harnesses_default` says otherwise.
     let snapshot = json!({"type": "assignment", "revision": 1, "harnesses": {"claude": {}}});
     let ServerMessage::Assignment(s) = serde_json::from_value(snapshot).unwrap() else { panic!() };
     let h = s.assignment.harness("claude");
     assert!(h.new_skills_default && h.new_rules_default && h.skills.is_empty());
+    assert!(s.assignment.harness("codex").new_skills_default && s.assignment.harness("codex").new_rules_default);
+    let fleet = serde_json::from_value::<Assignment>(json!({"new_harnesses_default": false})).unwrap();
+    assert!(!fleet.harness("codex").new_skills_default && !fleet.harness("codex").new_rules_default);
 }
 
 #[test]

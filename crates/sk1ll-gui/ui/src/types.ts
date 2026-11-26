@@ -40,7 +40,8 @@ export interface HarnessAssignment {
   new_skills_default: boolean; new_rules_default: boolean;
   skills: Record<string, boolean>; rules: Record<string, boolean>;
 }
-export interface Assignment { harnesses: Record<string, HarnessAssignment> }
+// `new_harnesses_default`: what a Harness without an entry has, everything on (standalone) or off (a Fleet).
+export interface Assignment { harnesses: Record<string, HarnessAssignment>; new_harnesses_default: boolean }
 export type ToggleKind = 'skill' | 'rule' | 'new_skills_default' | 'new_rules_default';
 export interface ToggleChange { harness: string; kind: ToggleKind; item_id?: ItemId; name?: string; enabled: boolean | null }
 // `expected`: apply only to this revision (and registration, when given), else HTTP 409 and nothing changes.

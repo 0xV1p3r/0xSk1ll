@@ -111,7 +111,7 @@ fn assignment() -> Assignment {
         skills: BTreeMap::from([(id("01J0DEPLOY"), false)]),
         rules: BTreeMap::from([(id("01J0STYLE"), true)]),
     };
-    Assignment { harnesses: BTreeMap::from([("claude".into(), claude)]) }
+    Assignment { harnesses: BTreeMap::from([("claude".into(), claude)]), ..Assignment::fleet() }
 }
 
 fn log_entry(id_: i64, kind: ToggleKind, cause: LogCause) -> LogEntry {

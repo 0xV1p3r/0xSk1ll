@@ -11,7 +11,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { CopyAssignment } from './CopyAssignment';
 import { api, errorMessage } from './api';
-import { cellState, emptyHarness, itemStateLabel, mergeAssignments, own, registrationOf, splitItem, stamped, terms } from './model';
+import { cellState, harnessOf, itemStateLabel, mergeAssignments, own, registrationOf, splitItem, stamped, terms } from './model';
 import type { StampedSnapshot } from './model';
 import { matrixCheckbox, useAssignmentWrites } from './assignments';
 import { useResource } from './hooks';
@@ -172,7 +172,7 @@ function AuthorityMatrix({ revision, status, target, openLog }: MatrixProps) {
     item.id != null && (item.in_baseline || !!reportedName(item, machine) || machine === status.machine_id);
   const cell = (item: ItemView, machine: string, harness: string) => {
     const state = cellState(assignment(machine), harness, item.item, item.id);
-    const defaults = assignment(machine).harnesses[harness] ?? emptyHarness();
+    const defaults = harnessOf(assignment(machine), harness);
     const differs = state.explicit && state.enabled !== defaults[splitItem(item.item).kind === 'skill' ? 'new_skills_default' : 'new_rules_default'];
     const localOnly = !available(item, machine);
     const { kind, name } = splitItem(reportedName(item, machine) ?? item.item);
@@ -344,7 +344,7 @@ function AuthorityMatrix({ revision, status, target, openLog }: MatrixProps) {
               <TooltipContent className="max-w-64">{defaultHint}</TooltipContent></Tooltip></div></TableHead>
           {segments(c => <TableCell key={`${c.machine}/${c.harness}`} className="border-l"><label className="flex min-h-8 cursor-pointer items-center justify-center pr-7">
             <Switch.Root className="inline-flex h-[18px] w-8 shrink-0 cursor-pointer items-center rounded-full bg-control-border/45 p-0.5 transition-colors outline-none focus-visible:ring-3 focus-visible:ring-ring data-checked:bg-foreground/75 data-disabled:cursor-not-allowed data-disabled:opacity-50"
-              checked={(assignment(c.machine).harnesses[c.harness] ?? emptyHarness())[kind === 'skill' ? 'new_skills_default' : 'new_rules_default']}
+              checked={harnessOf(assignment(c.machine), c.harness)[kind === 'skill' ? 'new_skills_default' : 'new_rules_default']}
               disabled={!!pending.get(c.machine)} aria-label={`Default for new ${kind}s in ${c.machine} / ${c.harness}`} aria-describedby="default-hint"
               onCheckedChange={enabled => void write(c.machine, [{ harness: c.harness,
                 kind: kind === 'skill' ? 'new_skills_default' : 'new_rules_default', enabled }], { expected: expectedFor(c.machine) })}>

@@ -164,8 +164,8 @@ async fn next_message(ws: &mut FakeWs) -> DaemonMessage {
 /// Assignment of `agent` with exactly `on` enabled among x, y and z.
 fn snapshot(revision: u64, on: &[&str]) -> AssignmentSnapshot {
     let skills = ["x", "y", "z"].iter().map(|s| (skill_id(s), on.contains(s))).collect();
-    let h = HarnessAssignment { new_skills_default: false, new_rules_default: false, skills, ..Default::default() };
-    let assignment = Assignment { harnesses: [(HARNESS.to_string(), h)].into() };
+    let h = HarnessAssignment { skills, ..HarnessAssignment::all_off() };
+    let assignment = Assignment { harnesses: [(HARNESS.to_string(), h)].into(), ..Assignment::fleet() };
     AssignmentSnapshot { revision, assignment, registration: None }
 }
 
@@ -2042,6 +2042,37 @@ async fn setup_chooses_harnesses_only_before_the_repo_exists() {
     assert_eq!(error.status, Some(409));
     assert!(error.message.contains("first-run setup"), "{}", error.message);
     assert_eq!(enabled(&m.client.setup_harnesses().await.unwrap(), "claude"), Some((true, false)));
+}
+
+/// A harness enabled on a joined Machine starts as the Server will assign
+/// it, all off: neither its preview nor the sync before the Server's
+/// column arrives places anything that column would take out again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_harness_enabled_in_a_fleet_starts_all_off() {
+    use sk1ll_daemon::client::{HarnessChange, HarnessChangeRequest};
+    let server = Server::start().await;
+    let (a, _b, _) = fleet_of_two(&server).await;
+    let extra = a.home.path().join("extra/skills");
+    let harness = sk1ll_core::Harness {
+        skills: Some(extra.to_string_lossy().into_owned()),
+        mode: sk1ll_core::LinkMode::Copy,
+        ..Default::default()
+    };
+    let mut add =
+        HarnessChangeRequest { fingerprint: None, change: HarnessChange::Set { name: "extra".into(), harness } };
+    let preview = a.client.preview_harness(&add).await.unwrap();
+    assert!(preview.sync.is_empty(), "{:?}", preview.sync);
+    add.fingerprint = Some(preview.fingerprint);
+    let applied = a.client.apply_harness(&add).await.unwrap();
+    assert!(applied.errors.is_empty(), "{:?}", applied.errors);
+    eventually(|| async { a.client.assignment("alpha").await.ok()?.assignment.harnesses.get("extra").cloned() }).await;
+    a.client.sync(&Default::default()).await.unwrap();
+    assert!(!extra.join("x").exists(), "nothing placed");
+    assert!(!extra.join(".sk1ll-tmp/displaced").exists(), "nothing taken out into recovery");
+
+    // Turning everything on (the setup wizard's choice) still places it all.
+    a.client.set_harness_assignment("extra", true).await.unwrap();
+    eventually(|| async { extra.join("x/SKILL.md").is_file().then_some(()) }).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

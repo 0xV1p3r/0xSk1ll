@@ -181,7 +181,7 @@ A `block` mixes several rules, so it can't be adopted. Move that edit into `inst
 
 ## Assignment
 
-Assignment decides which skills and rules each harness gets. Standalone items start enabled. A joined Machine without a copied Assignment starts with both defaults off.
+Assignment decides which skills and rules each harness gets. Standalone items start enabled. A joined Machine without a copied Assignment starts with both defaults off. A harness you enable later starts the same way: everything enabled on a standalone Machine, everything off on a joined one, where the server gives it an all-off column. A joined Machine places nothing in it until you turn its items on.
 
 ```sh
 sk1ll assign claude skill pdf off           # one toggle
@@ -193,7 +193,7 @@ Changing a default first records every existing item's current value as an expli
 
 Item toggles use Item IDs. `sk1ll assign` resolves the name in the local repo and warns if the item you want to turn on is missing. A rename preserves the Item ID and keeps the Assignment across the Fleet. Deleting an item and creating it again gives it a new ID, so it follows the defaults. That holds for an item re-created by hand too: Item IDs are never derived from names, so the Daemon or the next mutating command writes it a fresh one. Until an item has an Item ID it has no toggle and follows the defaults. Changing a default records every item's value by Item ID, so it is refused while a pending Pull leaves an item without one.
 
-An `assignment.json` file has this shape. The keys under `skills` and `rules` are Item IDs. Imports use the `skills` map.
+An `assignment.json` file has this shape. The keys under `skills` and `rules` are Item IDs. Imports use the `skills` map. `new_harnesses_default` is what a harness without an entry gets: everything enabled (`true`, the default when it's missing) or everything off (`false`, as on every joined Machine).
 
 ```json
 {
@@ -204,7 +204,8 @@ An `assignment.json` file has this shape. The keys under `skills` and `rules` ar
       "skills": { "01KAC9SRJZ9Z5SSWRBQE76YS69": false },
       "rules": {}
     }
-  }
+  },
+  "new_harnesses_default": true
 }
 ```
 

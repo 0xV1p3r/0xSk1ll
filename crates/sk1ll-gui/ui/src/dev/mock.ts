@@ -85,10 +85,10 @@ export function installMock(scenario: string, options: MockOptions = {}): MockDa
   ];
   let preferredEditor = 'code';
   const assignments: Record<string, T.AssignmentSnapshot> = {
-    workstation: { revision: 42, harnesses: { claude: harness({ 'id-deploy': false, 'id-old-skill': true }, { 'id-style': true }), codex: harness({}, { 'id-security': true }) } },
-    laptop: { revision: 17, harnesses: { claude: harness({ 'id-code-review': true, ...scenario === 'self' && { 'id-laptop-orphan': true } }) } },
-    'ci-runner': { revision: 9, harnesses: { codex: harness({}, {}) } },
-    'build-box': { revision: 5, harnesses: { claude: harness(), codex: harness() } },
+    workstation: { revision: 42, new_harnesses_default: !standalone, harnesses: { claude: harness({ 'id-deploy': false, 'id-old-skill': true }, { 'id-style': true }), codex: harness({}, { 'id-security': true }) } },
+    laptop: { revision: 17, new_harnesses_default: !standalone, harnesses: { claude: harness({ 'id-code-review': true, ...scenario === 'self' && { 'id-laptop-orphan': true } }) } },
+    'ci-runner': { revision: 9, new_harnesses_default: !standalone, harnesses: { codex: harness({}, {}) } },
+    'build-box': { revision: 5, new_harnesses_default: !standalone, harnesses: { claude: harness(), codex: harness() } },
   };
   const draft: T.DraftEntry[] = empty ? [] : [
     { item: 'skill:release-notes', change: 'added', paths: ['skills/release-notes/SKILL.md'], fingerprint: 'a1' },
@@ -338,7 +338,7 @@ export function installMock(scenario: string, options: MockOptions = {}): MockDa
       }
       case 'assignment': {
         const registration = machines.find(m => m.id === a.machine)?.registration;
-        return delay({ ...assignments[a.machine as string] ?? { revision: 0, harnesses: {} }, ...registration && { registration } });
+        return delay({ ...assignments[a.machine as string] ?? { revision: 0, new_harnesses_default: false, harnesses: {} }, ...registration && { registration } });
       }
       case 'set_harness_assignment': {
         const snapshot = assignments[status.machine_id];
