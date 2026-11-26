@@ -41,6 +41,7 @@ pub(super) fn displaced_view(
         reason: None,
         adoptable,
         changed: entry.changed,
+        overwritten: entry.overwritten,
     }
 }
 
@@ -103,6 +104,7 @@ pub(super) fn conflict_view(a: &Action) -> ConflictView {
         reason: a.reason.clone(),
         adoptable,
         changed: false,
+        overwritten: false,
     }
 }
 

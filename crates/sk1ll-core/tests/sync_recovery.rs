@@ -886,3 +886,33 @@ fn recover_adopt_refuses_a_rule_that_isnt_utf8() {
     assert!(displaced::get(&entry.id).unwrap().changed);
     assert_eq!(fs::read(&source).unwrap(), before);
 }
+
+/// A forced sync over a hand edit keeps the edit, changed and marked
+/// overwritten: the user chose that, so it needs no one. A write to the
+/// kept copy since makes it a change like any other.
+#[test]
+fn a_forced_overwrite_keeps_the_edit_marked_overwritten() {
+    for case in ["skill update", "rule update", "block update"] {
+        let d = Displacement::new(case);
+        let _home = d.home.enter();
+        let text = fs::read_to_string(&d.file).unwrap();
+        let edited = if text.contains("Use CC.") {
+            text.replace("Use CC.", "Use CC by hand.")
+        } else {
+            format!("{text}Hand edit.\n")
+        };
+        fs::write(&d.file, &edited).unwrap();
+        let normal = plan(&d.repo, &d.harnesses, &d.assignment, PlanOptions::default()).unwrap();
+        assert!(normal.iter().any(|a| a.kind == ActionKind::Conflict), "{case}: {normal:?}");
+        for action in plan(&d.repo, &d.harnesses, &d.assignment, PlanOptions { force: true }).unwrap() {
+            apply(&d.repo, &action).unwrap();
+        }
+        let entry = d.entry();
+        assert!(entry.changed && entry.overwritten, "{case}: {entry:?}");
+        assert!(displaced::prune_with(Duration::ZERO).unwrap().is_empty(), "{case}");
+        let kept = d.kept_file(&entry);
+        fs::write(&kept, format!("{edited}Written later.\n")).unwrap();
+        let entry = d.entry();
+        assert!(entry.changed && !entry.overwritten, "{case}: {entry:?}");
+    }
+}

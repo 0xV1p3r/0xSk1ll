@@ -516,7 +516,7 @@ fn command(s: &Session, cmd: Cmd) -> Result<()> {
                 println!("! {:<10} {} {}{reason}", e.harness, e.name, e.dest.display());
             }
             // The recovery entries that hold a change need a decision too.
-            for e in s.block(c.recovered())?.into_iter().filter(|e| e.changed) {
+            for e in s.block(c.recovered())?.into_iter().filter(|e| e.changed && !e.overwritten) {
                 print_recovered(&e, false);
             }
         }
@@ -731,12 +731,21 @@ fn command(s: &Session, cmd: Cmd) -> Result<()> {
                 };
                 println!("import {:<24} {}", import.name, state);
             }
-            // Changed entries are what the user still has to adopt or discard.
-            let kept = s.block(c.recovered_fresh())?.into_iter().filter(|e| e.changed).count();
+            // Changed entries are what the user still has to adopt or discard,
+            // but for the edits they chose to overwrite, which only wait there.
+            let recovered = s.block(c.recovered_fresh())?;
+            let kept = recovered.iter().filter(|e| e.changed && !e.overwritten).count();
             if kept > 0 {
                 println!(
                     "recovery: {} to adopt or discard; review with `sk1ll recover list`",
                     plural(kept, "changed entry", "changed entries")
+                );
+            }
+            let overwritten = recovered.iter().filter(|e| e.overwritten).count();
+            if overwritten > 0 {
+                println!(
+                    "recovery: {} you overwrote kept; adopt or discard with `sk1ll recover`",
+                    plural(overwritten, "edit", "edits")
                 );
             }
             // Blocked, Behind or a Conflict: placing nothing doesn't make the Machine in sync.
@@ -1307,6 +1316,7 @@ fn print_recovered(e: &ConflictView, paths: bool) {
     // keep each file they replace too: a committed version while unchanged.
     let pull = e.harness == sk1ll_core::sync::displaced::PULL;
     let what = match (e.changed, pull) {
+        _ if e.overwritten => "changed: your edit, kept when you overwrote it; adopt or discard it",
         (true, true) => "changed: your version; `sk1ll recover adopt` it",
         (true, false) => "changed: written to while or after it was set aside; adopt or discard it",
         (false, true) => "unchanged: a committed version a pull or adopt replaced; safe to discard",

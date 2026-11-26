@@ -380,9 +380,15 @@ pub struct ConflictView {
     pub reason: Option<String>,
     /// Only copied skills and rule files can be adopted, not `block` instructions.
     pub adoptable: bool,
-    /// A recovered entry written to while sk1ll replaced it: a conflict.
+    /// A recovered entry that holds a change (written to while sk1ll
+    /// replaced it, a Draft edit Adopt replaced, ...): a conflict, unless
+    /// `overwritten`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub changed: bool,
+    /// A recovered entry that is the hand edit the user chose to overwrite,
+    /// as it was: kept until adopted or discarded, but no conflict.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub overwritten: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

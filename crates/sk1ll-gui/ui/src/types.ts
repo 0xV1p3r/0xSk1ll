@@ -85,9 +85,11 @@ export interface ConflictView {
   harness: string; name: string; items: ItemRef[]; dest: string; reason: string | null;
   // Harness conflicts: false for `block` instructions. Recovered content: false where Adopt can't tell where it goes.
   adoptable: boolean;
-  // Recovered content only: it holds a change (a hand edit kept in recovery, a save during a swap), so it needs the user.
+  // Recovered content only: it holds a change (a save during a swap, a Draft edit Adopt replaced), so it needs the user.
   // Absent: unchanged since sk1ll set it aside.
   changed?: boolean;
+  // Recovered content only: the hand edit the user chose to overwrite, as it was. Kept (`changed`), but no Conflict.
+  overwritten?: boolean;
 }
 export interface ConflictTarget { harness: string; name: string }
 export interface HarnessView {

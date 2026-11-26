@@ -290,6 +290,7 @@ pub fn rollback(repo: &Repo, adoption: &Adoption, id: &crate::ItemId) -> Result<
             baseline: None,
             adopting: None,
             keep: false,
+            overwritten: false,
         };
         if let Some(error) = remove_displacing(&dest, displace)? {
             return Err(error);

@@ -264,18 +264,21 @@ any placement `errors`.
 `GET /conflicts` lists Harness conflicts: Harness content that differs from
 the Draft, to adopt or overwrite. `GET /conflicts/displaced` lists every
 recovery entry, each with an `id` to adopt or discard. An entry with
-`changed` holds a change (a hand edit that was overwritten, a save during a
-swap, the original of an adopted unmanaged skill that holds a `.git` the
-copy left out) and needs the user; one without it is as sk1ll set it aside.
+`changed` holds a change (a save during a swap, a Draft edit Adopt
+replaced, the original of an adopted unmanaged skill that holds a `.git`
+the copy left out) and needs the user; one without it is as sk1ll set it
+aside. One with `overwritten` too is a hand edit the user chose to
+overwrite (Overwrite, `sync --force`), as it was: it stays until adopted or
+discarded, but needs no one. A write to it since clears `overwritten`.
 `adoptable` is false where Adopt can't tell where the content goes (a skill
 link, content with no record of where it came from, or a destination since
 taken by another item), by the same resolution Adopt uses short of its walk
 through the history; `POST /conflicts/diff` with its `id` then compares it
 with nothing. The original of an adopted unmanaged skill goes back into that
 skill. The
-Machine's report counts Harness conflicts and changed entries, by item and
-Harness: that is the Conflict status, the Fleet's Conflicts column and the
-app's badge.
+Machine's report counts Harness conflicts and changed entries that aren't
+`overwritten`, by item and Harness: that is the Conflict status, the
+Fleet's Conflicts column and the app's badge.
 
 ## Harness change and import update preconditions
 

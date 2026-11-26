@@ -38,6 +38,7 @@
       "items": [],
       "kind": "displaced",
       "name": "notes",
+      "overwritten": true,
       "path": "/home/dev/.local/share/sk1ll/recovered/d-1",
       "reason": "Unmanaged directory replaced by an assigned Skill."
     }
@@ -382,6 +383,7 @@
           "items": [],
           "kind": "displaced",
           "name": "notes",
+          "overwritten": true,
           "path": "/home/dev/.local/share/sk1ll/recovered/d-1",
           "reason": "Unmanaged directory replaced by an assigned Skill."
         }

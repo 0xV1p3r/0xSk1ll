@@ -1666,15 +1666,19 @@ async fn block_conflict_diff_preserves_surrounding_notes() {
     assert!(!diff.diff.contains("private notes"), "{}", diff.diff);
     assert!(!diff.diff.contains("More notes"), "{}", diff.diff);
 
-    // Overwrite resolves the conflict: the edit is only recovered content
-    // now, which still counts as needing the user.
+    // Overwrite resolves the conflict, Conflict status included: the edit
+    // stays as recovered content, changed and adoptable, but the user chose
+    // to overwrite it, so it needs no one.
     let target = sk1ll_daemon::client::ConflictTarget { harness: HARNESS.into(), name: "instructions".into() };
     m.client.overwrite(&target).await.unwrap();
     assert_eq!(m.client.conflicts_fresh().await.unwrap(), []);
     let kept: Vec<_> = m.client.recovered().await.unwrap().into_iter().filter(|e| e.changed).collect();
     assert_eq!(kept.len(), 1, "{kept:?}");
+    assert!(kept[0].overwritten && kept[0].adoptable, "{kept:?}");
     assert!(std::fs::read_to_string(kept[0].path.as_ref().unwrap()).unwrap().contains("Edited rule"));
-    assert_eq!(m.status().await.report.conflicts.len(), 1);
+    let status = m.status().await;
+    assert!(status.report.conflicts.is_empty(), "{:?}", status.report.conflicts);
+    assert_ne!(status.headline, MachineStatus::Conflict);
     assert!(m.client.overwrite(&target).await.unwrap_err().message.contains("no conflict"));
 }
 

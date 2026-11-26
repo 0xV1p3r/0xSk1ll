@@ -396,7 +396,8 @@ impl Daemon {
         // Machine's Conflict status, the Fleet's count) counts it, while
         // the Snapshot lists it with the rest of the recovery area only.
         let displaced = sync::displaced::list()?;
-        for entry in displaced.iter().filter(|entry| entry.changed) {
+        // An edit the user chose to overwrite is kept, but needs no one.
+        for entry in displaced.iter().filter(|entry| entry.changed && !entry.overwritten) {
             let c = ConflictRef { item: displaced_item(entry, &root), harness: entry.harness.clone() };
             if !conflicts.contains(&c) {
                 conflicts.push(c);

@@ -19,7 +19,8 @@ changed) keeps every byte outside the block and leaves no recovery entry:
 the old file is held in recovery only during the swap and dropped once it
 checks unchanged. A write through a descriptor still open on the old file
 after that is lost. A forced rewrite of a block edited by hand keeps the
-old file in recovery until you adopt or discard it.
+old file in recovery until you adopt or discard it; since you chose to
+overwrite it, it doesn't make the Machine a Conflict.
 
 ## Placement anchors and directory locks
 
