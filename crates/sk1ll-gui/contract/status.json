@@ -77,6 +77,7 @@
       "auth_rejected_since": 1760000000,
       "awaiting_assignment": true,
       "connection": "auth_rejected",
+      "draft_commit_complete": true,
       "has_origin": true,
       "headline": "conflict",
       "keep_report": [
@@ -146,6 +147,7 @@
       "auth_rejected_since": null,
       "awaiting_assignment": false,
       "connection": "standalone",
+      "draft_commit_complete": false,
       "has_origin": false,
       "headline": "in_sync",
       "last_error": null,

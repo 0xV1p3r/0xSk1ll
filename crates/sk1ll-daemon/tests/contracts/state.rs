@@ -57,7 +57,7 @@ fn an_unreadable_pull_record_is_dropped_not_fatal() {
     json["server_baseline"] = serde_json::json!("abc");
     fs::write(&record, json.to_string()).unwrap();
     let loaded = load_record(&record, &repo).unwrap();
-    assert_eq!(loaded, PullRecord { server_baseline: Some("abc".into()), pull: PullState::Clear, push_refused: None });
+    assert_eq!(loaded, PullRecord { server_baseline: Some("abc".into()), ..PullRecord::default() });
 }
 
 fn state() -> DaemonState {
@@ -114,6 +114,7 @@ fn the_baseline_record_survives_a_save() {
         server_baseline: Some("abc".into()),
         pull: PullState::Blocked { baseline: "abc".into(), items: vec!["skill:pdf".parse().unwrap()] },
         push_refused: None,
+        draft_commit_complete: true,
     };
     let s = DaemonState { record: record.clone(), ..state() };
     s.save(&path).unwrap();
@@ -140,6 +141,7 @@ fn a_standalone_record_is_not_restored_for_another_repo() {
         server_baseline: Some("abc".into()),
         pull: PullState::Blocked { baseline: "abc".into(), items: vec!["skill:pdf".parse().unwrap()] },
         push_refused: None,
+        draft_commit_complete: true,
     };
     let (one, other) = (dir.path().join("one"), dir.path().join("other"));
     SkillsRepo::init(&one);

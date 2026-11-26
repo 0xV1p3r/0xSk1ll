@@ -128,7 +128,7 @@ fn status(repo: &Path) -> Value {
     json!({
         "machine_id":"alpha", "server_url":"http://server", "mode":"joined", "has_origin":true,
         "repo_ready":true, "repo":repo, "headline":"drafting", "connection":"connected", "last_error":null,
-        "revoked":false, "server_baseline":null, "assignment_revision":1, "report":{},
+        "revoked":false, "server_baseline":null, "assignment_revision":1, "report":{}, "draft_commit_complete":false,
     })
 }
 

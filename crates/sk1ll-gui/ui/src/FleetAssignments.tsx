@@ -22,7 +22,7 @@ export function FleetAssignments({ revision, machineId, harnesses, navigate, reg
   const current = resource.data && assignment(machineId);
   const shown = resource.data?.assignments[machineId];
   const expected = registration && shown ? { revision: shown.revision, registration: shown.registration ?? registration } : undefined;
-  const columns = [...new Set([...harnesses, ...Object.keys(current?.harnesses ?? {})])].sort();
+  const columns = [...harnesses].sort();
   const score = (item: ItemView) => Math.max(0, ...columns.map(harness => {
     const state = cellState(current!, harness, item.item, item.id), defaults = current!.harnesses[harness] ?? emptyHarness();
     return state.explicit ? state.enabled !== defaults[splitItem(item.item).kind === 'skill' ? 'new_skills_default' : 'new_rules_default'] ? 2 : 1 : 0;

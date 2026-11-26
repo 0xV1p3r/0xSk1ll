@@ -4,6 +4,21 @@ import { expect, it, vi } from 'vitest';
 import { act, screen, waitFor } from '@testing-library/react';
 import { dialog, heading, launch, nav, notify } from './harness';
 
+it('closes the theme menu on selection and keeps the selected theme', async () => {
+  const { user } = launch('fleet');
+  await heading('Fleet');
+  const trigger = screen.getByRole('button', { name: 'Toggle theme' });
+  await user.click(trigger);
+  await user.click(await screen.findByRole('menuitemradio', { name: 'Dark' }));
+  await waitFor(() => expect(trigger.getAttribute('aria-expanded')).toBe('false'));
+  expect(document.documentElement.classList.contains('dark')).toBe(true);
+  await user.click(trigger);
+  expect((await screen.findByRole('menuitemradio', { name: 'Dark' })).getAttribute('aria-checked')).toBe('true');
+  await user.click(screen.getByRole('menuitemradio', { name: 'System' }));
+  await waitFor(() => expect(trigger.getAttribute('aria-expanded')).toBe('false'));
+  expect(document.documentElement.classList.contains('dark')).toBe(false);
+});
+
 it('keeps a standalone Machine to its own screens and never asks for Fleet data, even in the background', async () => {
   for (const hash of ['', '#/fleet', '#/assignment-log']) {
     const { view } = launch('standalone', { hash });

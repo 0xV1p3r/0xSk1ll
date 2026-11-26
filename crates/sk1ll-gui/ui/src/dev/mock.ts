@@ -47,6 +47,7 @@ export function installMock(scenario: string, options: MockOptions = {}): MockDa
     last_error: scenario === 'auth' ? 'Server returned 401 Unauthorized' : null, revoked: scenario === 'revoked',
     server_baseline: '9f3c2a17d4e1', assignment_revision: 42, awaiting_assignment: scenario === 'awaiting',
     auth_rejected_since: scenario === 'auth' ? now - 600 : null, report: local,
+    draft_commit_complete: false,
   };
   const machines: T.MachineRow[] = [
     { id: 'workstation', scope: scenario === 'self' ? 'self' : 'fleet', registration: 'reg-workstation', status: status.headline, connected: true, joined_at: now - 86400 * 30, last_seen: now - 4, report: local },
@@ -213,6 +214,7 @@ export function installMock(scenario: string, options: MockOptions = {}): MockDa
       case 'init': status.repo_ready = true; return delay(undefined);
       case 'push': {
         const pushed = local.unpushed.length > 0; local.unpushed = [];
+        if (pushed && !standalone) status.draft_commit_complete = true;
         items.forEach(item => { item.unpushed = false; });
         return delay({ pushed });
       }
@@ -446,6 +448,7 @@ export function installMock(scenario: string, options: MockOptions = {}): MockDa
       case 'commit': {
         const request = a.request as T.CommitRequest;
         settle(request.items, true);
+        status.draft_commit_complete = true;
         if (standalone) {
           local.unpushed = [...new Set([...local.unpushed, ...request.items])];
           items.filter(entry => request.items.includes(entry.item)).forEach(entry => { entry.unpushed = true; });
@@ -484,6 +487,7 @@ export function installMock(scenario: string, options: MockOptions = {}): MockDa
       case 'set_setup_harness': {
         const choice = setupHarnesses.find(h => h.name === a.name);
         if (choice) choice.enabled = a.enabled as boolean;
+        local.harnesses = setupHarnesses.filter(h => h.enabled).map(h => h.name);
         return delay(setupHarnesses);
       }
       case 'notifications_enabled': return delay(notificationsEnabled);
@@ -502,6 +506,7 @@ export function installMock(scenario: string, options: MockOptions = {}): MockDa
           else Object.assign(setupHarnesses[index], { harness: change.harness, configured: true });
         } else if (change.op === 'remove' && index >= 0 && !setupHarnesses[index].preset) setupHarnesses.splice(index, 1);
         else if (index >= 0) Object.assign(setupHarnesses[index], change.op === 'remove' ? { configured: false, enabled: setupHarnesses[index].installed } : { enabled: change.op === 'enable', configured: true, available: change.op === 'enable' ? false : setupHarnesses[index].available });
+        local.harnesses = setupHarnesses.filter(h => h.enabled).map(h => h.name);
         if (cmd === 'take_out_harness')
           return delay({ applied: true, taken_out: preview.placed.filter(p => p.kind === 'remove'), harnesses: setupHarnesses, errors: [] } satisfies T.HarnessTakenOut, 600);
         return delay({ harnesses: setupHarnesses, errors: [] }, 600);

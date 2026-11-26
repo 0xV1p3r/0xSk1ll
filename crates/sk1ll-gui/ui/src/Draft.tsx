@@ -11,6 +11,7 @@ import { Badge } from '@/components/ui/badge';
 import { toast } from './toast';
 import { api } from './api';
 import { useMutation, useResource } from './hooks';
+import { plural, pullToast } from './model';
 import { Action, ChangeBadge, DiffLines, ErrorNotice, KindBadge, Loading, Nothing, Notice, Panel, PanelToolbar, Pending } from './shared';
 import { captureReview, confirmReview, loadDraft, reconcileReview, type DraftReview } from './draftReview';
 import type { DraftEntry, CommitResponse, PullKeepResult, PullResult, StatusView } from './types';
@@ -79,6 +80,7 @@ export function Draft({ revision, status, changed }: { revision: number; status:
   }, [data]);
   const commitReview = commit && data && reconcileReview(commit.review, data);
   const restoreReview = restore && data && reconcileReview(restore.review, data);
+  const restoreCount = restoreReview?.items.length ?? 0;
   const reviewDisabled = loading || !!error || mutation.pending;
   const items = (selectionTouched.current ? selected : data?.map(entry => entry.item) ?? []).filter(item => data?.some(d => d.item === item));
   const all = !!data?.length && items.length === data.length;
@@ -86,7 +88,7 @@ export function Draft({ revision, status, changed }: { revision: number; status:
   const clashes = pull?.state === 'blocked' ? pull.items : status.report.clashes;
   const keepNames = keep?.all ? clashes.join(', ') : keep?.items.join(', ');
   const allExpanded = !!data?.length && data.every(entry => expanded.includes(entry.item));
-  const pullAction = noOrigin ? <Button variant="outline" disabled>Pull</Button> : <Action label="Pull Baseline" action={async () => { const value = await api.pull(); setPull(value); setKept(undefined); toast({ title: value.state === 'blocked' ? 'Pull blocked' : 'Pull complete' }); }} onDone={changed} />;
+  const pullAction = noOrigin ? <Button variant="outline" disabled>Pull</Button> : <Action label="Pull Baseline" action={async () => { const value = await api.pull(); setPull(value); setKept(undefined); toast(pullToast(value)); }} onDone={changed} />;
   const unpushed = [...new Set([...status.report.unpushed, ...(!result?.pushed ? result?.items ?? [] : [])])];
   return <>
     {!!status.keep_report?.length && <Notice title="Interrupted Keep mine" tone="destructive">
@@ -133,7 +135,7 @@ export function Draft({ revision, status, changed }: { revision: number; status:
           <Checkbox aria-label={all ? 'Clear checkboxes' : 'Check all items'} checked={all}
             indeterminate={items.length > 0 && !all} disabled={mutation.pending}
             onCheckedChange={() => { selectionTouched.current = true; setSelected(all ? [] : data.map(d => d.item)); }} />
-          <span className="text-muted-foreground">{items.length ? `${items.length} of ${data.length} selected` : `${data.length} Draft items`}</span>
+          <span className="text-muted-foreground">{items.length ? `${items.length} of ${data.length} selected` : plural(data.length, 'Draft item')}</span>
         </div>
         {data.map(entry => <DraftItem key={entry.item} {...entry} checked={items.includes(entry.item)}
           open={expanded.includes(entry.item)} onOpenChange={open => setExpanded(previous => open ? [...previous, entry.item] : previous.filter(item => item !== entry.item))} unpushed={unpushed.includes(entry.item)}
@@ -170,15 +172,15 @@ export function Draft({ revision, status, changed }: { revision: number; status:
             if (keep) void mutation.run(() => api.pullKeep(keep), value => {
               setPull(value.pull); setKept(value); setKeep(undefined);
               if (value.kept?.length) { setExpanded(previous => [...new Set([...previous, ...value.kept ?? []])]); toast({ title: 'Kept your version' }); }
-              else toast({ title: value.pull.state === 'blocked' ? 'Still blocked' : 'Pull complete' });
+              else toast(pullToast(value.pull));
             });
           }}><Pending pending={mutation.pending}>Keep mine</Pending></Button>
         </DialogFooter></DialogContent>
     </Dialog>
     <Dialog open={!!restore} onOpenChange={open => { if (!open && !mutation.pending) setRestore(undefined); }}>
       <DialogContent finalFocus={restoreTrigger} showCloseButton={!mutation.pending}><DialogHeader>
-        <DialogTitle>Restore {restore?.all ? 'all Draft items' : `${restoreReview?.items.length ?? 0} selected items`}?</DialogTitle>
-        <DialogDescription>Return {restoreReview?.items.join(', ') || 'no items'} to Baseline. Their Draft changes will be lost.</DialogDescription>
+        <DialogTitle>Restore {restore?.all ? 'all Draft items' : plural(restoreCount, 'selected item')}?</DialogTitle>
+        <DialogDescription>Return {restoreReview?.items.join(', ') || 'no items'} to Baseline. Draft changes to {restoreCount === 1 ? 'this item' : 'these items'} will be lost.</DialogDescription>
       </DialogHeader>
         {restoreReview && <ReviewNotice review={restoreReview} disabled={reviewDisabled}
           accept={() => setRestore(value => value && { ...value, review: confirmReview(restoreReview) })} />}

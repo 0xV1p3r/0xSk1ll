@@ -149,6 +149,10 @@ impl Lifecycle {
         self.record.server_baseline = baseline;
     }
 
+    pub(crate) fn mark_draft_commit_complete(&mut self) {
+        self.record.draft_commit_complete = true;
+    }
+
     // -------------------------------------------------------------------
     // Queries
 
@@ -225,6 +229,7 @@ impl Lifecycle {
             _ => None,
         };
         v.server_baseline.clone_from(&self.record.server_baseline);
+        v.draft_commit_complete = self.record.draft_commit_complete;
         let r = &mut v.report;
         let (blocked, pending): (Option<&Vec<ItemRef>>, Option<&Vec<ItemRef>>) = match &self.record.pull {
             PullState::Clear => (None, None),

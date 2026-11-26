@@ -240,6 +240,9 @@ impl Daemon {
                         d.note(|lc| {
                             lc.set_server_baseline(remote);
                             lc.set_push_refused(None);
+                            if d.remote.pushes_commits() {
+                                lc.mark_draft_commit_complete();
+                            }
                         });
                     }
                     Ok(pushed)
@@ -355,6 +358,9 @@ impl Daemon {
             None => None,
         };
         let sha = repo.commit(&items, &message, author.as_deref())?;
+        if self.is_standalone() {
+            self.note(|lc| lc.mark_draft_commit_complete());
+        }
         tracing::info!("committed {} as {sha}", items.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "));
         Ok(CommitResponse {
             sha,

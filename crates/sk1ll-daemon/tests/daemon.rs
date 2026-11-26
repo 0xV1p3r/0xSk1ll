@@ -365,33 +365,34 @@ async fn assignment_change_reaches_another_harness_without_git() {
 #[tokio::test]
 async fn offline_commits_are_queued_and_pushed_on_reconnect() {
     let mut server = Server::start().await;
-    let mut a = machine("alpha");
-    a.join(&server).await;
-    a.start_connected().await;
-    a.write_repo("personal/v/SKILL.md", "v\n");
-    let first = a.commit_all().await;
-    assert!(first.pushed);
+    let (a, mut b, baseline) = fleet_of_two(&server).await;
+    assert!(a.status().await.draft_commit_complete);
+    assert!(!b.status().await.draft_commit_complete, "cloning another Machine's commit doesn't complete the step");
 
     server.stop();
-    eventually(|| async { (a.status().await.connection == Connection::Offline).then_some(()) }).await;
-    let err = a.client.fleet().await.unwrap_err();
+    eventually(|| async { (b.status().await.connection == Connection::Offline).then_some(()) }).await;
+    let err = b.client.fleet().await.unwrap_err();
     assert_eq!(err.status, Some(503), "{err}");
 
-    a.write_repo("personal/z/SKILL.md", "z\n");
-    let p = a.commit(&["z"]).await;
+    b.write_repo("personal/z/SKILL.md", "z\n");
+    let p = b.commit(&["z"]).await;
     assert!(!p.pushed, "nothing to push to while offline");
-    let s = a.status().await;
+    let s = b.status().await;
+    assert!(!s.draft_commit_complete);
     assert_eq!(s.report.unpushed, [ItemRef::Skill("z".into())]);
     assert_eq!(s.headline, MachineStatus::Offline);
-    assert_eq!(server.head().as_deref(), Some(first.sha.as_str()));
+    assert_eq!(server.head().as_deref(), Some(baseline.as_str()));
 
     server.restart().await;
     eventually(|| async { (server.head().as_deref() == Some(p.sha.as_str())).then_some(()) }).await;
     eventually(|| async {
-        let s = a.status().await;
-        (s.connection == Connection::Connected && s.report.unpushed.is_empty()).then_some(())
+        let s = b.status().await;
+        (s.connection == Connection::Connected && s.report.unpushed.is_empty() && s.draft_commit_complete).then_some(())
     })
     .await;
+    b.stop();
+    b.start_connected().await;
+    assert!(b.status().await.draft_commit_complete);
 }
 
 #[tokio::test]
@@ -1801,8 +1802,10 @@ async fn standalone_commits_locally_and_pushes_and_pulls_its_own_origin() {
     m.write_repo("personal/pdf/SKILL.md", "initial");
     m.start().await;
     assert!(m.status().await.has_origin);
+    assert!(!m.status().await.draft_commit_complete);
     let commit = m.commit_all().await;
     assert!(!commit.pushed);
+    assert!(m.status().await.draft_commit_complete);
     assert_eq!(commit.push_error, None);
     assert!(git(&bare, &["for-each-ref"]).is_empty());
     assert!(m.client.push().await.unwrap().pushed);

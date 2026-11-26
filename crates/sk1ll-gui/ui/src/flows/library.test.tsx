@@ -1,8 +1,8 @@
 // The Library: browsing this Machine's Skills and Rules, making them editable, creating, renaming and deleting them.
 // Editing a file in place is its own flow (editing.test.tsx).
-import { expect, it } from 'vitest';
-import { screen, waitFor, within } from '@testing-library/react';
-import { dialog, heading, isDisabled, launch } from './harness';
+import { expect, it, vi } from 'vitest';
+import { act, screen, waitFor, within } from '@testing-library/react';
+import { dialog, heading, isDisabled, launch, nav } from './harness';
 
 const rows = () => within(screen.getByRole('table', { name: 'Skills' })).getAllByRole('row').slice(1);
 
@@ -153,4 +153,19 @@ it('creates, renames and deletes personal items in the Draft, refusing names alr
   await waitFor(() => expect(screen.queryByRole('dialog', { name: 'ship' })).toBeNull());
   expect(daemon.sent('delete_item')).toEqual([{ request: { kind: 'skill', name: 'ship' } }]);
   expect(await screen.findByText('ship deleted in Draft')).toBeTruthy();
+});
+
+it('discovers unmanaged skills on entry and while Library is open, without daemon events', async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  const { daemon, user } = launch('fleet');
+  await heading('Fleet');
+  await screen.findByText('1 unmanaged skill · notes');
+  const skill = daemon.content.find(entry => entry.type === 'unmanaged')!;
+  daemon.content.push({ ...skill, name: 'added-before-entry' });
+  await user.click(nav().getByRole('button', { name: 'Library' }));
+  expect(await screen.findByRole('row', { name: 'View Unmanaged added-before-entry' })).toBeTruthy();
+
+  daemon.content.push({ ...skill, name: 'added-while-open' });
+  await act(() => vi.advanceTimersByTimeAsync(15100));
+  expect(await screen.findByRole('row', { name: 'View Unmanaged added-while-open' })).toBeTruthy();
 });

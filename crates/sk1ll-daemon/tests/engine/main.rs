@@ -205,7 +205,7 @@ fn a_restart_clears_a_finished_pull_and_keeps_a_newer_baseline_pending() {
                 record: PullRecord {
                     server_baseline: Some(future.clone()),
                     pull: PullState::Pending { baseline: baseline.clone(), items: vec!["skill:pdf".parse().unwrap()] },
-                    push_refused: None,
+                    ..PullRecord::default()
                 },
                 ..state.clone()
             };

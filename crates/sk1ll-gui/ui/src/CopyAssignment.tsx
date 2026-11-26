@@ -19,8 +19,7 @@ interface Props {
 
 export function CopyAssignment({ target, expected, targetHarnesses, sources, close, copied, refreshed }: Props) {
   const id = useId();
-  const [latest, setLatest] = useState<{ expected: Expected; harnesses: string[] }>();
-  const currentHarnesses = latest?.harnesses ?? targetHarnesses;
+  const [latest, setLatest] = useState<Expected>();
   const [source, setSource] = useState('');
   const [mode, setMode] = useState<MachineAssignmentCopy['mode']>('replace');
   const [mapping, setMapping] = useState<Record<string, string>>({});
@@ -29,21 +28,22 @@ export function CopyAssignment({ target, expected, targetHarnesses, sources, clo
   const [error, setError] = useState<string>();
   const sourceHarnesses = sources.find(machine => machine.id === source)?.harnesses ?? [];
   const fromFor = (to: string) => mapping[to] !== undefined ? (sourceHarnesses.includes(mapping[to]) ? mapping[to] : '') : (sourceHarnesses.includes(to) ? to : '');
+  const harnesses = targetHarnesses.flatMap(to => {
+    const from = fromFor(to);
+    return from ? [{ from, to }] : [];
+  });
+  const previewHarnesses = preview?.body.harnesses;
+  const currentPreview = previewHarnesses?.length === harnesses.length
+    && previewHarnesses.every(({ from, to }, i) => from === harnesses[i].from && to === harnesses[i].to) ? preview : undefined;
   const reset = () => { setPreview(undefined); setError(undefined); };
 
   const submit = async () => {
     setBusy(true);
     setError(undefined);
-    const body: MachineAssignmentCopy = {
-      source, mode, expected: latest?.expected ?? expected,
-      harnesses: currentHarnesses.flatMap(to => {
-        const from = fromFor(to);
-        return from ? [{ from, to }] : [];
-      }),
-    };
+    const body: MachineAssignmentCopy = { source, mode, expected: latest ?? expected, harnesses };
     try {
-      if (preview) copied(await api.copyMachineAssignment(target, {
-        ...preview.body, expected: preview.result.target, source_expected: preview.result.source,
+      if (currentPreview) copied(await api.copyMachineAssignment(target, {
+        ...currentPreview.body, expected: currentPreview.result.target, source_expected: currentPreview.result.source,
       }));
       else setPreview({ result: await api.previewAssignmentCopy(target, body), body });
     } catch (error) {
@@ -53,8 +53,7 @@ export function CopyAssignment({ target, expected, targetHarnesses, sources, clo
         try {
           const snapshot = await api.assignment(target);
           await refreshed?.();
-          setLatest({ expected: { revision: snapshot.revision, registration: snapshot.registration },
-            harnesses: Object.keys(snapshot.assignment.harnesses).sort() });
+          setLatest({ revision: snapshot.revision, registration: snapshot.registration });
           setMapping({});
         } catch (reloadError) {
           setError(errorMessage(reloadError));
@@ -81,7 +80,7 @@ export function CopyAssignment({ target, expected, targetHarnesses, sources, clo
           <option value="replace">Replace</option><option value="merge">Merge</option>
         </NativeSelect>
       </Field>
-      {source && currentHarnesses.map(to => <Field key={to}><FieldLabel htmlFor={`${id}-harness-${to}`}>Source Harness for {to}</FieldLabel>
+      {source && targetHarnesses.map(to => <Field key={to}><FieldLabel htmlFor={`${id}-harness-${to}`}>Source Harness for {to}</FieldLabel>
         <NativeSelect id={`${id}-harness-${to}`} value={fromFor(to)} disabled={busy} onChange={event => {
           setMapping(old => ({ ...old, [to]: event.target.value }));
           reset();
@@ -91,12 +90,12 @@ export function CopyAssignment({ target, expected, targetHarnesses, sources, clo
         </NativeSelect>
       </Field>)}
       </FieldGroup>
-      {preview && <p role="status">{preview.result.count} {preview.result.count === 1 ? 'change' : 'changes'} to item toggles and defaults</p>}
+      {currentPreview && <p role="status">{currentPreview.result.count} {currentPreview.result.count === 1 ? 'change' : 'changes'} to item toggles and defaults</p>}
       <ErrorNotice error={error} />
       <DialogFooter>
         <Button variant="outline" disabled={busy} onClick={close}>Cancel</Button>
-        <Button disabled={busy || !source || !currentHarnesses.some(fromFor) || preview?.result.count === 0}
-          onClick={() => void submit()}>{preview ? 'Copy Assignment' : 'Preview changes'}</Button>
+        <Button disabled={busy || !source || !harnesses.length || currentPreview?.result.count === 0}
+          onClick={() => void submit()}>{currentPreview ? 'Copy Assignment' : 'Preview changes'}</Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>;
