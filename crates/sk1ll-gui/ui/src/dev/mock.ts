@@ -2,6 +2,7 @@
 // the UI flow tests (`src/flows`), which drive the real App against it.
 import { mockIPC } from '@tauri-apps/api/mocks';
 import type * as T from '../types';
+import { uniformHarness } from '../model';
 
 export interface MockOptions {
   // Multiplies every simulated Daemon latency; tests pass 0.
@@ -85,10 +86,10 @@ export function installMock(scenario: string, options: MockOptions = {}): MockDa
   ];
   let preferredEditor = 'code';
   const assignments: Record<string, T.AssignmentSnapshot> = {
-    workstation: { revision: 42, new_harnesses_default: !standalone, harnesses: { claude: harness({ 'id-deploy': false, 'id-old-skill': true }, { 'id-style': true }), codex: harness({}, { 'id-security': true }) } },
-    laptop: { revision: 17, new_harnesses_default: !standalone, harnesses: { claude: harness({ 'id-code-review': true, ...scenario === 'self' && { 'id-laptop-orphan': true } }) } },
-    'ci-runner': { revision: 9, new_harnesses_default: !standalone, harnesses: { codex: harness({}, {}) } },
-    'build-box': { revision: 5, new_harnesses_default: !standalone, harnesses: { claude: harness(), codex: harness() } },
+    workstation: { revision: 42, new_harnesses_default: standalone, harnesses: { claude: harness({ 'id-deploy': false, 'id-old-skill': true }, { 'id-style': true }), codex: harness({}, { 'id-security': true }) } },
+    laptop: { revision: 17, new_harnesses_default: standalone, harnesses: { claude: harness({ 'id-code-review': true, ...scenario === 'self' && { 'id-laptop-orphan': true } }) } },
+    'ci-runner': { revision: 9, new_harnesses_default: standalone, harnesses: { codex: harness({}, {}) } },
+    'build-box': { revision: 5, new_harnesses_default: standalone, harnesses: { claude: harness(), codex: harness() } },
   };
   const draft: T.DraftEntry[] = empty ? [] : [
     { item: 'skill:release-notes', change: 'added', paths: ['skills/release-notes/SKILL.md'], fingerprint: 'a1' },
@@ -338,12 +339,12 @@ export function installMock(scenario: string, options: MockOptions = {}): MockDa
       }
       case 'assignment': {
         const registration = machines.find(m => m.id === a.machine)?.registration;
-        return delay({ ...assignments[a.machine as string] ?? { revision: 0, new_harnesses_default: false, harnesses: {} }, ...registration && { registration } });
+        return delay({ ...assignments[a.machine as string] ?? { revision: 0, new_harnesses_default: standalone, harnesses: {} }, ...registration && { registration } });
       }
       case 'set_harness_assignment': {
         const snapshot = assignments[status.machine_id];
         const enabled = Boolean(a.enabled);
-        const h = snapshot.harnesses[a.harness as string] ??= harness();
+        const h = snapshot.harnesses[a.harness as string] ??= uniformHarness(snapshot.new_harnesses_default);
         h.new_skills_default = enabled;
         h.new_rules_default = enabled;
         for (const toggles of [h.skills, h.rules]) {
@@ -393,7 +394,7 @@ export function installMock(scenario: string, options: MockOptions = {}): MockDa
             harness, kind, item_id, name: items.find(item => item.id === item_id)?.item.split(':')[1] ?? null, before, after, cause: { type: 'change' } });
         };
         for (const mapping of copy.harnesses ?? []) {
-          const src = source.harnesses[mapping.from], dest = next[mapping.to] ??= harness();
+          const src = source.harnesses[mapping.from], dest = next[mapping.to] ??= uniformHarness(target.new_harnesses_default);
           if (!src) continue;
           for (const kind of ['skills', 'rules'] as const) {
             const toggle = kind === 'skills' ? 'skill' : 'rule';
@@ -432,7 +433,7 @@ export function installMock(scenario: string, options: MockOptions = {}): MockDa
           return Promise.reject({ status: 409, message: `the assignment of \`${a.machine}\` changed since revision ${expected.revision} (now ${snapshot.revision}); reload it` });
         }
         for (const change of changes) {
-          const h = snapshot.harnesses[change.harness] ??= harness();
+          const h = snapshot.harnesses[change.harness] ??= uniformHarness(snapshot.new_harnesses_default);
           if (change.kind === 'skill' || change.kind === 'rule') {
             const map = change.kind === 'skill' ? h.skills : h.rules;
             if (change.enabled === null) delete map[change.item_id!]; else map[change.item_id!] = change.enabled;
@@ -570,7 +571,7 @@ export function installMock(scenario: string, options: MockOptions = {}): MockDa
         const entry = log.find(e => e.id === a.entry);
         if (!entry) return Promise.reject({ status: 404, message: 'No such log entry' });
         const snapshot = assignments[entry.machine];
-        const h = snapshot.harnesses[entry.harness] ??= harness();
+        const h = snapshot.harnesses[entry.harness] ??= uniformHarness(snapshot.new_harnesses_default);
         if (entry.kind === 'skill' || entry.kind === 'rule') {
           const map = entry.kind === 'skill' ? h.skills : h.rules;
           if (entry.before === null) delete map[entry.item_id!]; else map[entry.item_id!] = entry.before;

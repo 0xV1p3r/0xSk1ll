@@ -46,6 +46,20 @@ it('writes single toggles against the revision shown, and reloads instead when s
   expect(daemon.assignments.laptop.harnesses.claude.skills['id-code-review']).toBe(true);
 });
 
+it('shows a reported Harness the Server has no entry for yet as all off, as the Server will assign it', async () => {
+  const { user } = launch('fleet', { hash: '#/assignment-matrix', setup: daemon => { delete daemon.assignments['build-box'].harnesses.codex; } });
+  await heading('Assignment matrix');
+  const review = await screen.findByRole('checkbox', { name: 'skill:code-review in build-box / codex, inherited' });
+  expect(checked(review)).toBe(false);
+  expect(checked(cell('rule:security', 'build-box / codex', 'inherited'))).toBe(false);
+  expect(checked(screen.getByRole('switch', { name: 'Default for new skills in build-box / codex' }))).toBe(false);
+  expect(checked(screen.getByRole('switch', { name: 'Default for new rules in build-box / codex' }))).toBe(false);
+  // Turning one item on there leaves the others off.
+  await user.click(review);
+  await waitFor(() => expect(checked(cell('skill:code-review', 'build-box / codex', 'explicit'))).toBe(true));
+  expect(checked(cell('rule:security', 'build-box / codex', 'inherited'))).toBe(false);
+});
+
 it('bulk-changes rows and filtered columns once per Machine, and Undo restores what was accepted', async () => {
   const { daemon, user } = launch('fleet', { hash: '#/assignment-matrix', setup: daemon => {
     daemon.override('set_assignment', args => args.machine === 'build-box' ? Promise.reject({ message: 'build-box rejected', status: 500 }) : undefined);
