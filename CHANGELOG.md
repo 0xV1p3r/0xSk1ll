@@ -25,6 +25,17 @@ break compatibility.
   `home`; anywhere else it is only listed (`sk1ll harnesses`, `--all`,
   Settings → Harnesses) until `sk1ll harnesses enable <name>` or **Enable**
   adds it after the usual preview. No directory is ever globbed.
+- A new Harness can start from another Harness's Assignment on the same
+  Machine, both defaults and every toggle: `sk1ll harnesses add claude_2
+  --preset claude --home ~/.claude_2 --copy-assignment-from claude` copies it
+  before the first sync, so that sync places what `claude` has on, also on a
+  joined Machine. `sk1ll assign <harness> --copy-from <harness>` copies again
+  later (`--machine` for another fleet Machine's).
+- Settings → Harnesses offers **Add another config folder** on each built-in
+  preset: a folder, a name suggested from it and **Copy assignment from
+  <preset>**, on by default. Instances show their tool and folder (Claude
+  Code · ~/.claude_2) instead of Custom, and the Assignment matrix and Fleet
+  mark each instance's tool.
 
 ### Changed
 
@@ -37,6 +48,9 @@ break compatibility.
 - Machines report each Harness to the Server with its kind
   (`{"name", "kind"}`), and join requests carry the same. A Server and its
   Machines must be upgraded together.
+- The Server's `copy-from` accepts a target Harness the Machine hasn't
+  reported yet when the Machine copies within its own Assignment; it starts
+  from the all-off column a reported Harness gets.
 
 ## [0.2.0] - 2026-11-26
 

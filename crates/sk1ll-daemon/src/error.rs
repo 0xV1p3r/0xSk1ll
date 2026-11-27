@@ -26,6 +26,18 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 impl Error {
+    /// The same failure, its message rewritten by `f`.
+    pub(crate) fn reworded(self, f: impl FnOnce(&str) -> String) -> Self {
+        match self {
+            Self::BadRequest(m) => Self::BadRequest(f(&m)),
+            Self::NotFound(m) => Self::NotFound(f(&m)),
+            Self::Conflict(m) => Self::Conflict(f(&m)),
+            Self::Unavailable(m) => Self::Unavailable(f(&m)),
+            Self::Upstream(status, m) => Self::Upstream(status, f(&m)),
+            Self::Internal(e) => Self::Internal(anyhow::anyhow!(f(&format!("{e:#}")))),
+        }
+    }
+
     /// The same failure, to report it again (a published read keeps one).
     pub(crate) fn duplicate(&self) -> Self {
         match self {

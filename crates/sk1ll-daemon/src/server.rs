@@ -415,6 +415,30 @@ async fn request(
     req.send().await.map_err(|e| Error::Unavailable(redact(&format!("offline: the server is unreachable ({e})"))))
 }
 
+/// `POST /machines/{id}/assignment/copy-from` for this Machine itself, as
+/// the server confirms it; its error as the server words it.
+pub(crate) async fn copy_own_assignment(
+    d: &Daemon,
+    copy: &sk1ll_proto::MachineAssignmentCopy,
+) -> Result<AssignmentUpdate> {
+    if d.is_revoked() {
+        return Err(Error::Unavailable("this machine was removed from the fleet; it can't reach the server".into()));
+    }
+    let state = d.ident.joined()?;
+    let path = format!("/machines/{}/assignment/copy-from", crate::client::encode(&state.machine_id));
+    let body = Bytes::from(serde_json::to_vec(copy).map_err(|e| Error::Internal(e.into()))?);
+    let response = request(&d.http, state, Method::POST, &path, body).await?;
+    let status = StatusCode::from_u16(response.status().as_u16()).map_err(|e| Error::Internal(e.into()))?;
+    if !status.is_success() {
+        let error = match response.json::<sk1ll_proto::ErrorBody>().await {
+            Ok(body) => body.error,
+            Err(_) => status.to_string(),
+        };
+        return Err(Error::Upstream(status, redact(&error)));
+    }
+    response.json().await.map_err(|e| Error::Unavailable(redact(&format!("reading the server's response: {e}"))))
+}
+
 /// This Machine's Assignment as the server has it now.
 pub(crate) async fn fetch_machine_assignment(
     state: &DaemonState,

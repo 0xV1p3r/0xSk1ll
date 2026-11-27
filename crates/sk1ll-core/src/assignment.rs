@@ -213,6 +213,14 @@ impl Assignment {
         }
     }
 
+    /// Gives `to` exactly what `from` has, both defaults and every explicit
+    /// toggle, replacing what `to` had (`from` without an entry: the values
+    /// it has without one).
+    pub fn copy_harness(&mut self, from: &str, to: &str) {
+        let copied = self.harness(from).clone();
+        self.harnesses.insert(to.to_string(), copied);
+    }
+
     /// `harness`'s entry, added with the values it has without one.
     pub fn entry(&mut self, harness: &str) -> &mut HarnessAssignment {
         let unset = HarnessAssignment::uniform(self.new_harnesses_default);

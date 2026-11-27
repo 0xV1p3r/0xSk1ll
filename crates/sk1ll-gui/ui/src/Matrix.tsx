@@ -18,6 +18,7 @@ import { useResource } from './hooks';
 import { toast } from './toast';
 import { cn } from '@/lib/utils';
 import { CheckboxSwatch, Confirm, ErrorNotice, KindBadge, Loading, Nothing, Panel, PanelToolbar, Pending } from './shared';
+import { HarnessKindBadge } from './harnessKinds';
 import type { ItemView, MachineRow, StatusView, ToggleChange } from './types';
 
 const loadMatrix = async (status: StatusView) => {
@@ -149,7 +150,10 @@ function AuthorityMatrix({ revision, status, target, openLog }: MatrixProps) {
     && `${splitItem(i.item).name} ${i.description ?? ''}`.toLowerCase().includes(search.toLowerCase()));
   const selected = data.fleet.machines.filter(machine => standalone || machines === null || machines.includes(machine.id));
   // Assignment keys keep settings for disabled or removed Harnesses. The report lists which ones are active.
-  const activeHarnesses = (machine: MachineRow) => (machine.id === status.machine_id ? status.report.harnesses : machine.report?.harnesses ?? []).map(h => h.name).sort();
+  const reportedHarnesses = (machine: MachineRow) => machine.id === status.machine_id ? status.report.harnesses : machine.report?.harnesses ?? [];
+  const activeHarnesses = (machine: MachineRow) => reportedHarnesses(machine).map(h => h.name).sort();
+  // A column's kind, as its Machine reports it: an instance's shows as a badge.
+  const kindOf = (machine: string, harness: string) => reportedHarnesses(data.fleet.machines.find(m => m.id === machine)!).find(h => h.name === harness)?.kind ?? null;
   // A Machine whose Assignment failed to load has no columns, only its error; nothing reads or writes its Assignment.
   const groups = selected.map(machine => ({ machine, loaded: !!own(data.assignments, machine.id), harnesses: activeHarnesses(machine),
     collapsed: collapsed.includes(machine.id), offline: !machine.connected || machine.status === 'offline' })).filter(g => g.harnesses.length || !g.loaded);
@@ -326,7 +330,7 @@ function AuthorityMatrix({ revision, status, target, openLog }: MatrixProps) {
           {g.offline && <span className="inline-flex items-center gap-1.5 text-xs font-normal text-muted-foreground"><span aria-hidden className="size-2 rounded-full border-[1.5px] border-muted-foreground" />Offline</span>}
         </div></TableHead>)}
       </TableRow><TableRow className="bg-muted hover:bg-muted">
-        {segments(c => <TableHead key={`${c.machine}/${c.harness}`} scope="col" className={cn(headEdge, 'top-10 h-8 min-w-28 first:pl-2 font-mono text-xs font-normal text-muted-foreground')}><div className="flex items-center justify-between gap-1">{c.harness}{menu(`Actions for ${c.machine} / ${c.harness}`, [
+        {segments(c => <TableHead key={`${c.machine}/${c.harness}`} scope="col" className={cn(headEdge, 'top-10 h-8 min-w-28 first:pl-2 font-mono text-xs font-normal text-muted-foreground')}><div className="flex items-center justify-between gap-1"><span className="inline-flex items-center gap-1">{c.harness}<HarnessKindBadge harness={{ name: c.harness, kind: kindOf(c.machine, c.harness) }} /></span>{menu(`Actions for ${c.machine} / ${c.harness}`, [
           { label: 'Enable all visible items', run: () => columnBulk(c, true) },
           { label: 'Disable all visible items', run: () => columnBulk(c, false) },
         ], !!pending.get(c.machine) || !items.some(item => available(item, c.machine)))}</div></TableHead>,

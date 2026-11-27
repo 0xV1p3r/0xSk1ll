@@ -332,6 +332,38 @@ impl LocalAssignment {
     /// made again from the new revision, so it is never lost and never
     /// overwrites the edit.
     pub(crate) fn write(&self, d: &Daemon, eng: &mut Engine, write: &AssignmentWrite) -> Result<AssignmentUpdate> {
+        self.write_with(d, eng, |base, assignment| match write {
+            AssignmentWrite::Changes(changes) => {
+                check_expected(changes, base, d.ident.machine_id())?;
+                apply_changes(assignment, changes, d)
+            }
+            AssignmentWrite::Harness { harness, enabled } => {
+                known_harness(d, harness)?;
+                assignment.set_harness(harness, *enabled);
+                Ok(())
+            }
+            AssignmentWrite::RenameHarness(_) => {
+                Err(Error::Internal(anyhow::anyhow!("a machine-local Harness rename is made in one step")))
+            }
+        })
+    }
+
+    /// Gives `to` what `from` has (see [`Assignment::copy_harness`]), as
+    /// [`Self::write`] makes a write. `to` need not be in `machine.toml`
+    /// yet: a Harness being added is seeded before it is.
+    pub(crate) fn copy_harness(&self, d: &Daemon, eng: &mut Engine, from: &str, to: &str) -> Result<AssignmentUpdate> {
+        self.write_with(d, eng, |_, assignment| {
+            assignment.copy_harness(from, to);
+            Ok(())
+        })
+    }
+
+    fn write_with(
+        &self,
+        d: &Daemon,
+        eng: &mut Engine,
+        edit: impl Fn(&AssignmentSnapshot, &mut Assignment) -> Result<()>,
+    ) -> Result<AssignmentUpdate> {
         d.ensure_managed()?;
         d.lock_repo(eng)?;
         for _ in 0..WRITE_ATTEMPTS {
@@ -341,19 +373,7 @@ impl LocalAssignment {
             let applied = d.applied();
             let base = observed.snapshot(applied.as_deref());
             let mut assignment = base.assignment.clone();
-            match write {
-                AssignmentWrite::Changes(changes) => {
-                    check_expected(changes, &base, d.ident.machine_id())?;
-                    apply_changes(&mut assignment, changes, d)?;
-                }
-                AssignmentWrite::Harness { harness, enabled } => {
-                    known_harness(d, harness)?;
-                    assignment.set_harness(harness, *enabled);
-                }
-                AssignmentWrite::RenameHarness(_) => {
-                    return Err(Error::Internal(anyhow::anyhow!("a machine-local Harness rename is made in one step")));
-                }
-            }
+            edit(&base, &mut assignment)?;
             if assignment == base.assignment {
                 // Nothing to write but a hand edit's revision, if there was one.
                 if !observed.records(&base) && !self.swap(&observed, &base)? {

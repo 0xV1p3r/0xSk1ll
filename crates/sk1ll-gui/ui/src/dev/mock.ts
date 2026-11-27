@@ -509,10 +509,16 @@ export function installMock(scenario: string, options: MockOptions = {}): MockDa
       case 'preview_harness': return delay(harnessPreview((a.request as T.HarnessChangeRequest).change), 400);
       // Take out first turns the Harness's items off, so sync removes what it placed, then applies the change.
       case 'apply_harness': case 'take_out_harness': {
-        const { change, fingerprint } = a.request as T.HarnessChangeRequest;
+        const { change, fingerprint, copy_assignment_from: from } = a.request as T.HarnessChangeRequest;
         const preview = harnessPreview(change);
         if (fingerprint !== preview.fingerprint)
           return Promise.reject({ status: 409, message: 'machine.toml changed since the preview — preview again' });
+        // The Harness first gets the other one's Assignment, defaults and toggles, replacing its own.
+        if (from) {
+          const snapshot = assignments[status.machine_id];
+          snapshot.harnesses[change.name] = structuredClone(snapshot.harnesses[from] ?? uniformHarness(snapshot.new_harnesses_default));
+          snapshot.revision++;
+        }
         const index = setupHarnesses.findIndex(h => h.name === change.name);
         if (change.op === 'set') {
           if (index < 0) setupHarnesses.push({ name: change.name, installed: true, enabled: true, preset: false, configured: true, harness: change.harness });

@@ -14,6 +14,7 @@ import { api } from './api';
 import { ago, shortSha, splitItem, statusLabels, statusOrder, time } from './model';
 import { Action, Confirm, Details, ErrorNotice, Loading, Nothing, Notice, Panel, PanelToolbar, SectionTitle, StatusBadge, When } from './shared';
 import { FleetAssignments } from './FleetAssignments';
+import { HarnessKindBadge } from './harnessKinds';
 import { JoinCodeButton, ownScope, scopeSummary } from './Settings';
 import type { MachineReport, MachineRow, MachineStatus } from './types';
 
@@ -48,7 +49,7 @@ function MachineDetails({ machine }: { machine: MachineRow }) {
   return <Details className="py-1 md:grid-cols-[max-content_minmax(0,1fr)_max-content_minmax(0,1fr)]" rows={[
     ['Connection', machine.connected ? 'Connected' : 'Disconnected'],
     ['Joined', <When seconds={machine.joined_at} />],
-    ['Harnesses', list(report?.harnesses.map(h => h.name), 'None reported')],
+    ['Harnesses', report.harnesses.length ? <span className="inline-flex flex-wrap items-center gap-x-1 gap-y-0.5">{report.harnesses.map((h, i) => <span key={h.name} className="inline-flex items-center gap-1">{h.name}<HarnessKindBadge harness={h} />{i < report.harnesses.length - 1 && ','}</span>)}</span> : 'None reported'],
     ['Last seen', <When seconds={machine.last_seen} />],
     scopeRow,
     ...(report.drafts.length ? [['Draft', list(report.drafts)] as [string, ReactNode]] : []),
@@ -155,7 +156,7 @@ export function Fleet({ revision, machineId, initialMachine, serverUrl = null, l
       </Table> : <Nothing className="rounded-none border-0" title={filter ? "No matching Machines" : "No Machines"} action={filter ? <Button variant="outline" size="sm" aria-label="Clear Machine filter" onClick={() => setFilter(null)}>Show all Machines</Button> : undefined}>{filter ? "Clear the filter to see all Machines." : "Use Add Machine to create a join code for another Machine."}</Nothing>}
             </div>
           </Panel>
-          <FleetAssignments registration={local?.registration} key={machineId} revision={revision} machineId={machineId} harnesses={report?.harnesses.map(h => h.name) ?? []} navigate={navigate} />
+          <FleetAssignments registration={local?.registration} key={machineId} revision={revision} machineId={machineId} harnesses={report?.harnesses ?? []} navigate={navigate} />
         </div>
         <Panel label="Up next" className="min-w-0 gap-0 border py-0 ring-0">
           <PanelToolbar><SectionTitle id="fleet-next-title">Up next</SectionTitle>{queue > 0 && <Badge variant="secondary" className="ml-auto tabular-nums">{queue}</Badge>}</PanelToolbar>

@@ -208,7 +208,8 @@ enum Cmd {
     /// Turn a skill or rule on/off for a harness, or set its defaults
     #[command(
         after_help = "Examples:\n  sk1ll assign claude skill pdf off\n  sk1ll assign codex --default-skills off\n  \
-                      sk1ll assign kiro --all off   # then `sk1ll sync` takes out what sk1ll placed there"
+                      sk1ll assign kiro --all off   # then `sk1ll sync` takes out what sk1ll placed there\n  \
+                      sk1ll assign claude_2 --copy-from claude   # both defaults and every toggle"
     )]
     Assign {
         harness: String,
@@ -224,6 +225,10 @@ enum Cmd {
         /// Every skill and rule in the repo, and both defaults
         #[arg(long, value_name = "on|off", conflicts_with_all = ["kind", "default_skills", "default_rules"])]
         all: Option<Switch>,
+        /// Give the harness this other harness's Assignment on the same Machine: both defaults and every toggle,
+        /// replacing its own
+        #[arg(long, value_name = "HARNESS", conflicts_with_all = ["kind", "default_skills", "default_rules", "all"])]
+        copy_from: Option<String>,
         /// Another fleet Machine's Assignment (needs `fleet` scope; default: this Machine)
         #[arg(long, value_name = "ID")]
         machine: Option<String>,
@@ -980,7 +985,8 @@ fn command(s: &Session, cmd: Cmd) -> Result<()> {
             s.block(c.adopt(&ConflictTarget { harness: harness.clone(), name: name.clone() }))?;
             println!("adopted {name} from {harness} into the draft; review with `sk1ll diff {name}`");
         }
-        Cmd::Assign { harness, kind, name, state, default_skills, default_rules, all, machine } => {
+        Cmd::Assign { harness, copy_from: Some(from), machine, .. } => copy_assignment(s, machine, &from, &harness)?,
+        Cmd::Assign { harness, kind, name, state, default_skills, default_rules, all, machine, copy_from: None } => {
             assign(s, machine, &harness, kind, name, state, default_skills, default_rules, all)?;
         }
         Cmd::Init { .. }
@@ -1133,6 +1139,58 @@ fn assign(
         }
     }
     let whose = if standalone { "local" } else { "fleet" };
+    match unchanged {
+        true => println!("{whose} assignment of {machine} unchanged at revision {}", update.revision),
+        false => println!("{whose} assignment of {machine} is now revision {}", update.revision),
+    }
+    Ok(())
+}
+
+/// `sk1ll assign <to> --copy-from <from>`: `to` gets what `from` has on the
+/// same Machine. This Machine's is copied where its Assignment lives,
+/// another's at the server.
+fn copy_assignment(s: &Session, machine: Option<String>, from: &str, to: &str) -> Result<()> {
+    let own = s.status.machine_id.clone();
+    let update = match machine {
+        Some(_) if s.status.mode == DaemonMode::Standalone => bail!(
+            "this machine is standalone, so it has only its own Assignment; `--machine` needs a fleet (`sk1ll join`)"
+        ),
+        Some(machine) if machine != own => {
+            require_machine_harness(s, &machine, from)?;
+            require_machine_harness(s, &machine, to)?;
+            let copy = sk1ll_proto::MachineAssignmentCopy {
+                source: machine.clone(),
+                harnesses: Some(vec![sk1ll_proto::HarnessMapping { from: from.into(), to: to.into() }]),
+                mode: sk1ll_proto::CopyMode::Replace,
+                expected: None,
+                source_expected: None,
+            };
+            let update =
+                s.block(s.client.copy_machine_assignment(&machine, &copy)).map_err(|e| scope_hint(e, &machine))?;
+            (machine, update)
+        }
+        _ => {
+            let copy = sk1ll_daemon::client::HarnessCopyRequest { from: from.into(), to: to.into() };
+            (own.clone(), s.block(s.client.copy_harness_assignment(&copy))?)
+        }
+    };
+    let (machine, update) = update;
+    if !update.errors.is_empty() {
+        println!("Assignment of {machine} was saved at revision {}.", update.revision);
+        for error in &update.errors {
+            eprintln!("{error}");
+        }
+        bail!("Could not apply all placements");
+    }
+    for e in &update.entries {
+        println!("{}: {}", e.harness, toggle_text(e.kind, e.name.as_deref(), e.after));
+    }
+    println!("{to}: {from}'s Assignment, both defaults and every toggle");
+    let whose = if s.status.mode == DaemonMode::Standalone { "local" } else { "fleet" };
+    let unchanged = match machine == own {
+        true => update.revision == s.status.assignment_revision,
+        false => update.entries.is_empty(),
+    };
     match unchanged {
         true => println!("{whose} assignment of {machine} unchanged at revision {}", update.revision),
         false => println!("{whose} assignment of {machine} is now revision {}", update.revision),

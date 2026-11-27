@@ -97,6 +97,7 @@ pub(crate) fn router(d: Arc<Daemon>) -> Router {
         .route("/machines/{id}/assignment/harness/{harness}", post(machine_harness_assignment))
         .route("/assignment/harness/{harness}", post(set_harness_assignment))
         .route("/assignment/rename-harness", post(rename_harness))
+        .route("/assignment/copy-harness", post(copy_harness_assignment))
         .route("/assignment/orphans", get(pass))
         .route("/assignment/orphans/prune", post(pass))
         .route("/machines/{id}/assignment/copy-from", post(pass))
@@ -442,7 +443,7 @@ async fn harness_settings(State(d): St) -> Result<Json<HarnessSettings>> {
 }
 
 async fn preview_harness(State(d): St, Json(req): Json<HarnessChangeRequest>) -> Result<Json<HarnessPreview>> {
-    Ok(Json(d.reading(move |d| d.preview_harness(&req.change)).await?))
+    Ok(Json(d.reading(move |d| d.preview_harness(&req.change, req.copy_assignment_from.as_deref())).await?))
 }
 
 async fn apply_harness(State(d): St, Json(req): Json<HarnessChangeRequest>) -> Result<Json<HarnessApplied>> {
@@ -629,6 +630,22 @@ async fn set_harness_assignment(
 ) -> Result<Json<sk1ll_proto::AssignmentUpdate>> {
     let write = sk1ll_proto::AssignmentWrite::Harness { harness, enabled: body.enabled };
     Ok(Json(d.write_assignment(write).await?))
+}
+
+async fn copy_harness_assignment(
+    State(d): St,
+    Json(copy): Json<crate::client::HarnessCopyRequest>,
+) -> Result<Json<sk1ll_proto::AssignmentUpdate>> {
+    d.reading({
+        let copy = copy.clone();
+        move |d| {
+            d.ensure_managed()?;
+            d.known_harness(&copy.from)?;
+            d.known_harness(&copy.to)
+        }
+    })
+    .await?;
+    Ok(Json(d.copy_harness_assignment(&copy.from, &copy.to).await?))
 }
 
 async fn rename_harness(

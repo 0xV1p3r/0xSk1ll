@@ -190,7 +190,7 @@ fn choose_harnesses(input: &mut Input, machine_config: &Path, session: &Session,
 /// Makes `change` as `sk1ll harnesses` does, after its preview, and syncs.
 /// Whether sk1ll had placed anything where the change stops syncing.
 fn apply_change(session: &Session, change: HarnessChange) -> Result<bool> {
-    let mut request = HarnessChangeRequest { change, fingerprint: None };
+    let mut request = HarnessChangeRequest { copy_assignment_from: None, change, fingerprint: None };
     let preview = session.block(session.client.preview_harness(&request))?;
     for warning in &preview.warnings {
         println!("  warning: {warning}");

@@ -50,7 +50,8 @@ pub(crate) enum HarnessCmd {
     #[command(after_help = "Examples:\n  sk1ll harnesses add agents --skills ~/.agents/skills\n  \
                             sk1ll harnesses add mytool --skills /opt/mytool/skills --mode copy \\\n    \
                             --instructions ~/.mytool/AGENTS.md\n  \
-                            sk1ll harnesses add claude_2 --preset claude --home ~/.claude_2")]
+                            sk1ll harnesses add claude_2 --preset claude --home ~/.claude_2 \\\n    \
+                            --copy-assignment-from claude")]
     Add {
         name: String,
         /// Make it an instance of this preset (e.g. claude), whose paths follow from --home
@@ -71,6 +72,9 @@ pub(crate) enum HarnessCmd {
         /// How skills are placed: symlinks to the repo, or marked copies (default for a new harness: symlink)
         #[arg(long, value_enum)]
         mode: Option<Mode>,
+        /// First give it this harness's Assignment (both defaults and every toggle), so its first sync places that
+        #[arg(long, value_name = "HARNESS")]
+        copy_assignment_from: Option<String>,
         #[command(flatten)]
         opts: ChangeOpts,
     },
@@ -120,7 +124,7 @@ impl HarnessCmd {
             Self::Enable { name, opts } => (HarnessChange::Enable { name }, opts),
             Self::Disable { name, take, opts } => return Ok((HarnessChange::Disable { name }, opts, take.take_out)),
             Self::Remove { name, take, opts } => return Ok((HarnessChange::Remove { name }, opts, take.take_out)),
-            Self::Add { name, preset, home, skills, instructions, format, mode, opts } => {
+            Self::Add { name, preset, home, skills, instructions, format, mode, opts, .. } => {
                 let mut harness = config.rebased(&name, preset.as_deref(), home.as_deref())?;
                 let path = |v: String| Some(v).filter(|v| !v.is_empty());
                 if let Some(v) = skills {
@@ -209,6 +213,10 @@ pub(crate) fn run(s: &Session, all: bool, command: Option<HarnessCmd>) -> Result
         HarnessCmd::Add { .. } | HarnessCmd::Enable { .. } => Some(s.block(s.client.harness_settings())?),
         _ => None,
     };
+    let copy_assignment_from = match &command {
+        HarnessCmd::Add { copy_assignment_from, .. } => copy_assignment_from.clone(),
+        _ => None,
+    };
     let config = match (&command, &settings) {
         (HarnessCmd::Add { .. }, Some(settings)) => MachineConfig::load(&settings.path)?,
         _ => MachineConfig::default(),
@@ -231,12 +239,16 @@ pub(crate) fn run(s: &Session, all: bool, command: Option<HarnessCmd>) -> Result
         reason: p.reason.clone(),
         placed,
     };
-    let mut req = HarnessChangeRequest { change, fingerprint: None };
+    let mut req = HarnessChangeRequest { change, fingerprint: None, copy_assignment_from };
     let preview = s.block(s.client.preview_harness(&req))?;
     let rows: Vec<Row> =
         preview.placed.iter().map(|p| view(p, true)).chain(preview.sync.iter().map(|p| view(p, false))).collect();
     for warning in &preview.warnings {
         eprintln!("warning: {warning}");
+    }
+    if let Some(from) = &req.copy_assignment_from {
+        let name = req.change.name();
+        println!("first {name} gets {from}'s Assignment: both defaults and every toggle, replacing its own");
     }
     print_preview(&preview.path, &req.change, &rows, preview.awaiting_assignment, take_out);
     decide(&opts)?;
@@ -244,7 +256,17 @@ pub(crate) fn run(s: &Session, all: bool, command: Option<HarnessCmd>) -> Result
     if take_out {
         return take_out_and_apply(s, &req);
     }
-    let applied = s.block(s.client.apply_harness(&req))?;
+    let applied = s.block(s.client.apply_harness(&req)).inspect_err(|e| {
+        // Offline, a joined Machine can't copy: the change can still be made on its own.
+        let offline = e.downcast_ref::<sk1ll_daemon::client::ClientError>().is_some_and(|c| c.status == Some(503));
+        if let (Some(from), true) = (&req.copy_assignment_from, offline) {
+            let name = req.change.name();
+            eprintln!(
+                "to add {name} now, run this again without --copy-assignment-from; once online, `sk1ll assign {name} \
+                 --copy-from {from}` copies the Assignment"
+            );
+        }
+    })?;
     for e in &applied.errors {
         eprintln!("error: {e}");
     }

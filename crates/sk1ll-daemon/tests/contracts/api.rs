@@ -32,7 +32,11 @@ fn harness_changes_are_tagged_by_op() {
     assert!(req.fingerprint.is_none());
     assert!(matches!(&req.change, HarnessChange::Set { name, harness } if name == "agents"
         && harness.mode == LinkMode::Copy));
-    let disable = HarnessChangeRequest { fingerprint: None, change: HarnessChange::Disable { name: "codex".into() } };
+    let disable = HarnessChangeRequest {
+        copy_assignment_from: None,
+        fingerprint: None,
+        change: HarnessChange::Disable { name: "codex".into() },
+    };
     assert_eq!(serde_json::to_value(&disable).unwrap(), json!({"change": {"op": "disable", "name": "codex"}}));
     let reviewed: HarnessChangeRequest =
         serde_json::from_value(json!({"fingerprint": "f", "change": {"op": "remove", "name": "codex"}})).unwrap();
