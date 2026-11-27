@@ -33,8 +33,11 @@ The server listens on port 7878 and keeps `repo.git` and `server.db` in the `ser
 | `SK1LL_SERVER_SEND_TIMEOUT` | `10s` | A daemon that takes longer to receive one frame is disconnected |
 | `SK1LL_SERVER_PUSH_IDLE` | `30s` | Maximum idle time inside a git request |
 | `SK1LL_SERVER_PUSH_MAX` | `10m` | Deadline for one whole git exchange |
+| `SK1LL_SERVER_PUSH_MAX_SIZE` | `100m` | Largest pack one push may send. Takes `k`, `m` or `g` (powers of 1024); a bare number is bytes |
 
 Durations take `s`, `m`, `h` or `d`. A bare number is seconds. Other variables set to an empty value count as unset.
+
+Git refuses a push whose pack is over `SK1LL_SERVER_PUSH_MAX_SIZE` with `pack exceeds maximum allowed size`, and the server cuts off any git request body more than 1 MiB over it. `POST /api/join` allows 10 failed attempts (a wrong, used or expired code) in a burst, then one more every 30 seconds; past that it answers 429 to every join, valid codes included, until attempts are available again. Successful joins don't count.
 
 ### Import checks
 
@@ -52,6 +55,25 @@ While the list is set, the check restricts the host name in the source, not wher
 If your checks relied on that configuration, write sources with the real host name and port, list that host, and use a default key or the agent; for https, set a proxy or CA with the variables above. Without the list, the check uses the server's git and ssh configuration as before.
 
 The server skips imports these settings exclude and reports each with the reason. The GUI's Imports screen shows them as *Not checked by Server*, and **Check now** checks every import from that machine instead. `sk1ll status` shows only local import state, so it isn't affected. Neither setting restricts other outbound traffic: a firewall is still the way to keep the server out of its own network.
+
+### Expose the server publicly
+
+The server speaks plain HTTP, and every request carries a machine token. On the internet, run it behind TLS with `deploy/docker-compose.public.yml`, which puts [Caddy](https://caddyserver.com) in front and publishes no port of the server's own:
+
+```sh
+echo SK1LL_SERVER_DOMAIN=sk1ll.example.com >> deploy/.env
+echo SK1LL_SERVER_ADMIN_TOKEN=$(openssl rand -hex 32) >> deploy/.env
+docker compose -f deploy/docker-compose.public.yml up -d
+```
+
+Point the domain's DNS at the host and open ports 80 and 443. Caddy gets and renews the certificate, forwards only `/api`, `/git` and `/healthz` (`deploy/Caddyfile`), and drops clients that take over 10 seconds to send their headers or sit idle for 2 minutes. Machines join with `https://sk1ll.example.com`. With your own proxy instead, keep the server's port off the internet (`127.0.0.1:7878:7878` in the plain compose file) and pass WebSocket upgrades through for `/api/ws`.
+
+That compose file also changes two defaults:
+
+- **Import checks** contact only `github.com` (`SK1LL_SERVER_IMPORT_HOSTS`). Add the hosts your imports come from, or set `SK1LL_SERVER_IMPORT_CHECKS=off`. Any machine that can push chooses where the check connects, and the list matches host names, not addresses. To keep the server out of your own network, also block the container's traffic to private ranges with a firewall (the `DOCKER-USER` chain).
+- **The admin token** is optional. It can do everything and is only needed to create the first join code. Once a machine with `fleet` scope has joined, remove `SK1LL_SERVER_ADMIN_TOKEN` from `deploy/.env` and run `up -d` again. The server logs a warning at startup while the token is set and such a machine exists, and while import checks may contact any host.
+
+Caddy has no per-client rate limits or connection caps built in. The server's own limits (push size, push deadlines, failed joins) bound what one client can do, but not a flood of connections. For that, put the host behind a provider with DDoS protection, build Caddy with the `caddy-ratelimit` module, or use nginx's `limit_req` and `limit_conn`. A VPN such as WireGuard or Tailscale, with no public port, avoids all of this.
 
 ## Join a machine
 

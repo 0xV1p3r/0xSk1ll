@@ -1600,6 +1600,75 @@ async fn stalled_upload_does_not_block_the_next_push() {
 }
 
 #[tokio::test]
+async fn failed_join_attempts_are_limited_and_successful_joins_are_not() {
+    let server = start_with(|c| {
+        c.join_failures_burst = 2;
+        c.join_failure_every = Duration::from_secs(3600);
+    })
+    .await;
+    // Successful joins give their attempt back.
+    for id in ["a", "b", "c"] {
+        server.join(id, &[]).await;
+    }
+    let code = server.join_code().await;
+    for _ in 0..2 {
+        assert_eq!(server.try_join("NOPE0-NOPE0", "d", &[]).await.status(), StatusCode::FORBIDDEN);
+    }
+    let resp = server.try_join(&code, "d", &[]).await;
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body: Value = resp.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("too many failed join attempts"), "{body}");
+    // The refused attempt did not use the code.
+    let used = server.row("d").await;
+    assert!(used.is_none());
+}
+
+#[tokio::test]
+async fn pushes_over_the_size_limit_are_refused() {
+    const LIMIT: u64 = 64 << 10;
+    let server = start_with(|c| c.push_max_size = LIMIT).await;
+    let token = server.join("ws", &[]).await;
+    let (dir, head) = seed(&server, "ws", &token, &["personal/pdf/SKILL.md"]).await;
+    let repo = dir.path().join("repo");
+
+    // Incompressible, so the pack is about as big as the file.
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let noise: Vec<u8> = (0..4 * LIMIT)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect();
+    std::fs::write(repo.join("noise.bin"), noise).unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "--quiet", "-m", "big"]);
+    let out = push_main(&repo).output().await.unwrap();
+    assert!(!out.status.success(), "an oversized push landed");
+    let fleet: FleetView = server.get_json(&token, "/fleet").await;
+    assert_eq!(fleet.baseline.as_deref(), Some(head.as_str()));
+
+    // A declared body over the limit is refused before git runs.
+    let body = vec![0u8; (LIMIT + (1 << 20) + 1) as usize];
+    let resp = server
+        .http()
+        .post(format!("http://127.0.0.1:{}/git/repo.git/git-receive-pack", server.port()))
+        .basic_auth("ws", Some(&token))
+        .header("content-type", "application/x-git-receive-pack-request")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    // Smaller pushes still work.
+    git(&repo, &["reset", "--quiet", "--hard", "HEAD~1"]);
+    write(&repo.join("personal/pdf/SKILL.md"), "updated\n");
+    commit_push(&server, &repo, "small").await;
+}
+
+#[tokio::test]
 async fn idle_disconnect_does_not_refresh_last_seen() {
     let server = start_with(|c| {
         c.ping_every = Duration::from_millis(200);

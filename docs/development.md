@@ -71,7 +71,7 @@ Workflows name actions by version tag, and `.github/workflows/actions.lock` pins
 
 ## Release
 
-1. Set the version in `Cargo.toml`, `crates/sk1ll-gui/src-tauri/tauri.conf.json`, `crates/sk1ll-gui/ui/package.json` and the `SK1LL_SERVER_VERSION` default in `deploy/docker-compose.server.yml`. Then run `cargo build` so `Cargo.lock` follows.
+1. Set the version in `Cargo.toml`, `crates/sk1ll-gui/src-tauri/tauri.conf.json`, `crates/sk1ll-gui/ui/package.json` and the `SK1LL_SERVER_VERSION` default in `deploy/docker-compose.server.yml` and `deploy/docker-compose.public.yml`. Then run `cargo build` so `Cargo.lock` follows.
 2. Date the version's section in `CHANGELOG.md`. Bump `PROTOCOL_VERSION` in `sk1ll-proto` or `API_VERSION` in `sk1ll-daemon`'s client if the server protocol or the local API changed incompatibly.
 3. Run `scripts/check-version.sh vX.Y.Z` and the checks above, then tag and push: `git tag vX.Y.Z && git push origin vX.Y.Z`.
 4. `.github/workflows/release.yml` builds the Linux x86_64 and aarch64 archives and the Linux `.deb`. The `sign` job waits for your approval of the `release` environment, then signs the `.deb` for the app's updater. The workflow opens a draft release with `SHA256SUMS`, the changelog section, the `.deb.sig` and `latest.json`. A tag that isn't `vX.Y.Z` opens a pre-release. Review it and publish it.

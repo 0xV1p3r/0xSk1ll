@@ -19,6 +19,9 @@ pub enum ApiError {
     /// The server can't answer right now, e.g. it can't read the baseline.
     #[error("{0}")]
     Unavailable(String),
+    /// Too many attempts; try again later.
+    #[error("{0}")]
+    TooManyRequests(String),
     #[error(transparent)]
     Db(#[from] rusqlite::Error),
     #[error(transparent)]
@@ -36,6 +39,7 @@ impl ApiError {
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::Db(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

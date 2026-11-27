@@ -56,6 +56,15 @@ pub struct Server {
     push_degraded: AtomicBool,
     imports: Mutex<ImportsView>,
     imports_due: Notify,
+    /// Failed join attempts still allowed; see [`Server::take_join_attempt`].
+    join_budget: Mutex<JoinBudget>,
+}
+
+/// A token bucket of join attempts: each attempt takes one, a successful
+/// join gives it back, and one comes back every `join_failure_every`.
+struct JoinBudget {
+    left: f64,
+    at: tokio::time::Instant,
 }
 
 /// HEAD as last read, and the last commit whose items were listed. They
@@ -139,12 +148,14 @@ impl Server {
     pub async fn open(config: Config) -> anyhow::Result<Arc<Self>> {
         let (data_dir, repo, db_path) = (config.data_dir.clone(), config.repo_dir(), config.db_path());
         let push_check = config.push_check.clone();
-        let (conn, branch) = tokio::task::spawn_blocking(move || {
+        let (conn, branch, fleet_machine) = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
             git::init_bare(&repo)?;
             git::init_baseline(&repo)?;
             let branch = git::configure_pushes(&repo, push_check.as_deref())?;
-            anyhow::Ok((db::open(&db_path)?, branch))
+            let conn = db::open(&db_path)?;
+            let fleet_machine = db::machines(&conn)?.iter().any(|m| m.scope == Scope::Fleet);
+            anyhow::Ok((conn, branch, fleet_machine))
         })
         .await??;
         let baseline = match git::head(&config.repo_dir(), &branch).await? {
@@ -153,9 +164,19 @@ impl Server {
         };
         if config.admin_token.is_none() {
             tracing::warn!("SK1LL_SERVER_ADMIN_TOKEN is not set: only joined machines can create join codes");
+        } else if fleet_machine {
+            tracing::warn!(
+                "SK1LL_SERVER_ADMIN_TOKEN is set, but a machine with fleet scope has joined and can do what it does; \
+                 unset it and restart"
+            );
+        }
+        if config.import_checks && config.import_hosts.is_none() {
+            tracing::warn!(
+                "import checks may contact any host a pushed manifest names, including ones on the server's network; \
+                 set SK1LL_SERVER_IMPORT_HOSTS or SK1LL_SERVER_IMPORT_CHECKS=off"
+            );
         }
         Ok(Arc::new(Self {
-            config,
             branch,
             db: Arc::new(Mutex::new(conn)),
             conns: Mutex::default(),
@@ -165,6 +186,11 @@ impl Server {
             push_degraded: AtomicBool::new(false),
             imports: Mutex::default(),
             imports_due: Notify::new(),
+            join_budget: Mutex::new(JoinBudget {
+                left: f64::from(config.join_failures_burst),
+                at: tokio::time::Instant::now(),
+            }),
+            config,
         }))
     }
 
@@ -239,6 +265,31 @@ impl Server {
             baseline.inventory = Some(Inventory { commit: commit.to_string(), items: items.clone() });
         }
         Ok(items)
+    }
+
+    /// Takes one join attempt from the budget, or refuses while failed
+    /// attempts have used it up. Give it back with [`Server::refund_join_attempt`]
+    /// unless the attempt failed on its code.
+    fn take_join_attempt(&self) -> Result<()> {
+        let mut budget = lock(&self.join_budget);
+        let now = tokio::time::Instant::now();
+        let every = self.config.join_failure_every.as_secs_f64();
+        let refilled = now.saturating_duration_since(budget.at).as_secs_f64() / every;
+        budget.left = (budget.left + refilled).min(f64::from(self.config.join_failures_burst));
+        budget.at = now;
+        if budget.left < 1.0 {
+            let wait = ((1.0 - budget.left) * every).ceil();
+            return Err(ApiError::TooManyRequests(format!(
+                "too many failed join attempts; try again in {wait} seconds"
+            )));
+        }
+        budget.left -= 1.0;
+        Ok(())
+    }
+
+    fn refund_join_attempt(&self) {
+        let mut budget = lock(&self.join_budget);
+        budget.left = (budget.left + 1.0).min(f64::from(self.config.join_failures_burst));
     }
 
     pub async fn authenticate(&self, token: &str) -> Result<Caller> {

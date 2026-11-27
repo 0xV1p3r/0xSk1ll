@@ -1,0 +1,57 @@
+# The server on the internet, behind Caddy, which gets and renews a TLS
+# certificate for SK1LL_SERVER_DOMAIN. Point the domain's DNS at this host
+# and open ports 80 and 443. The server itself publishes no port.
+#
+#   echo SK1LL_SERVER_DOMAIN=sk1ll.example.com >> deploy/.env
+#   echo SK1LL_SERVER_ADMIN_TOKEN=$(openssl rand -hex 32) >> deploy/.env
+#   docker compose -f deploy/docker-compose.public.yml up -d
+#
+# Machines join with https://<domain>. Once a machine with fleet scope has
+# joined, remove SK1LL_SERVER_ADMIN_TOKEN from deploy/.env and run `up -d`
+# again: that machine can do everything the admin token can.
+# See docs/fleet.md#expose-the-server-publicly.
+services:
+  server:
+    image: ghcr.io/0xv1p3r/sk1ll-server:${SK1LL_SERVER_VERSION:-0.2.0}
+    build:
+      context: ..
+      dockerfile: Dockerfile.server
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "sk1ll-server", "--healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    environment:
+      SK1LL_SERVER_ADMIN_TOKEN: ${SK1LL_SERVER_ADMIN_TOKEN:-}
+      SK1LL_SERVER_OFFLINE_AFTER: 2m
+      SK1LL_SERVER_IMPORT_POLL: 1h
+      # Only contact these hosts when checking imports for updates. Add the
+      # hosts your imports come from, or set SK1LL_SERVER_IMPORT_CHECKS=off.
+      SK1LL_SERVER_IMPORT_HOSTS: ${SK1LL_SERVER_IMPORT_HOSTS:-github.com}
+      SK1LL_SERVER_IMPORT_CHECKS: ${SK1LL_SERVER_IMPORT_CHECKS:-on}
+      # Largest pack one push may send.
+      SK1LL_SERVER_PUSH_MAX_SIZE: ${SK1LL_SERVER_PUSH_MAX_SIZE:-100m}
+      RUST_LOG: info
+    volumes:
+      - server-data:/data
+
+  caddy:
+    image: caddy:2.10
+    restart: unless-stopped
+    depends_on:
+      - server
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      SK1LL_SERVER_DOMAIN: ${SK1LL_SERVER_DOMAIN:?set SK1LL_SERVER_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  server-data:
+  caddy-data:
+  caddy-config:

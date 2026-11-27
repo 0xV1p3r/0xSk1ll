@@ -392,3 +392,10 @@ working tree only: they can take up to one `SK1LL_RECONCILE_INTERVAL` to show.
 A reviewed Sync can apply several placements. When a staged copy's digest
 differs from the reviewed digest, the Daemon leaves that copy unpublished and
 returns a new preview. Placements completed before the mismatch remain applied.
+
+## Failed joins are limited for everyone at once
+
+The server counts failed join attempts for the whole server, not per client,
+since behind a proxy every client has the proxy's address. Someone sending
+wrong join codes can keep valid joins answered with 429 for as long as they
+keep it up. Successful joins never count, so joined machines are unaffected.
