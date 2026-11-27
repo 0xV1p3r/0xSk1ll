@@ -59,7 +59,7 @@ sk1ll harnesses add claude_2 --preset claude --home ~/.claude_2
 
 The harness's **kind** is the preset it is, or is an instance of. A Rule with `harnesses: [claude]` reaches every harness named or of kind `claude`, so both `claude` and `claude_2`; `harnesses: [claude_2]` reaches only the instance. Renaming a preset or an instance keeps its kind: the renamed entry is written as an instance (`preset = "claude"`, and `home` if it isn't the preset's).
 
-`home` follows the path rules below. `preset` must name a built-in preset, and on an entry named after a preset it can only be that preset; a custom harness can't have `home`. Two instances can't share a directory, nor share one with the preset: their locations overlap.
+`home` follows the path rules below. `preset` must name a built-in preset, and on an entry named after a preset it can only be that preset; a custom harness can't have `home`. Unlike the other paths, `home` is checked when `machine.toml` is read: an empty, relative or `..` home is an error, because every path of the harness comes from it. Two instances can't share a directory, nor share one with the preset: their locations overlap. That includes a preset that isn't installed yet but would be detected once its directory exists, since the instance's first sync creates it. If an entry written by hand roots an instance in a preset's home anyway, the preset (found only by its directory) yields to the instance and isn't synced into.
 
 sk1ll doesn't look for these directories itself. Add each one you use.
 

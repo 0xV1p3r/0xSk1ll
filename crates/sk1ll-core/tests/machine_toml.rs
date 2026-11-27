@@ -449,6 +449,12 @@ fn machine_toml_reports_malformed_fields_at_the_config_path() {
         ("[harnesses.h]\npreset = 'nope'", "no preset `nope`"),
         ("[harnesses.claude]\npreset = 'codex'", "its `preset` can only be `claude`"),
         ("[harnesses.h]\nhome = '~/.h'", "`home` needs `preset`"),
+        ("[harnesses.h]\npreset = 'claude'\nhome = ''", "`home` must be a directory path"),
+        ("[harnesses.h]\npreset = 'claude'\nhome = '.h'", "`home` must be a directory path"),
+        ("[harnesses.h]\npreset = 'claude'\nhome = '~/'", "`home` must be a directory path"),
+        ("[harnesses.h]\npreset = 'claude'\nhome = '//'", "`home` must be a directory path"),
+        ("[harnesses.h]\npreset = 'claude'\nhome = '~/a/../b'", "`home` must be a directory path"),
+        ("[harnesses.claude]\nhome = ' ~/.c'", "`home` must be a directory path"),
     ] {
         fs::write(&path, text).unwrap();
         let error = MachineConfig::load(&path).unwrap_err();
@@ -601,7 +607,7 @@ fn adding_a_preset_instance_writes_only_what_it_doesnt_derive() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(MACHINE_FILE);
     let added = |name: &str, kind: &str, home: &str| {
-        let harness = sk1ll_core::machine::rebase(name, &Harness::default(), Some(kind), Some(home)).unwrap();
+        let harness = MachineConfig::load(&path).unwrap().rebased(name, Some(kind), Some(home)).unwrap();
         edit(&path, HarnessChange::Set { name: name.into(), harness })
     };
     let (text, cfg) = added("claude_2", "claude", "~/.claude_2").unwrap();
@@ -628,9 +634,77 @@ fn adding_a_preset_instance_writes_only_what_it_doesnt_derive() {
         edit(&path, HarnessChange::Enable { name: "claude_2".into() }).unwrap_err().to_string().contains("overlaps")
     );
     // `home` alone re-roots the preset itself.
-    let claude = preset_harness("claude");
-    let moved = sk1ll_core::machine::rebase("claude", &claude, Some("claude"), Some("~/.config/claude")).unwrap();
+    let moved = MachineConfig::load(&path).unwrap().rebased("claude", None, Some("~/.config/claude")).unwrap();
     let (text, cfg) = edit(&path, HarnessChange::Set { name: "claude".into(), harness: moved }).unwrap();
     assert!(text.contains("[harnesses.claude]\nhome = \"~/.config/claude\"\n"), "{text}");
     assert_eq!(cfg.effective()["claude"].harness.instructions.as_deref(), Some("~/.config/claude/rules"));
+}
+
+/// An instance rooted at a preset's own home owns it: the preset, found only
+/// because that directory exists, yields instead of syncing the same files.
+#[test]
+fn a_detected_preset_yields_to_an_instance_in_its_home() {
+    let Some(_home) = isolated_home("a_detected_preset_yields_to_an_instance_in_its_home", &[".claude", ".codex"])
+    else {
+        return;
+    };
+    let effective = config("[harnesses.second]\npreset = 'claude'\nhome = '~/.claude'\n").effective();
+    assert!(!effective.contains_key("claude") && effective.contains_key("codex"), "{:?}", effective.keys());
+    assert_eq!(effective["second"].harness.skills.as_deref(), Some("~/.claude/skills"));
+    // An entry of the preset's own is explicit: both stay, for edits to refuse.
+    let effective =
+        config("[harnesses.claude]\nmode = 'copy'\n[harnesses.second]\npreset = 'claude'\nhome = '~/.claude'\n")
+            .effective();
+    assert!(effective.contains_key("claude") && effective.contains_key("second"));
+    // `~//x` stays under the home directory.
+    let effective = config("[harnesses.h]\npreset = 'claude'\nhome = '~//tmp/h'\n").effective();
+    let home = dirs::home_dir().unwrap();
+    assert_eq!(effective["h"].harness.skills_dir().unwrap(), home.join("tmp/h/skills"));
+}
+
+/// `rebased` works from what the entry sets, so moving a harness keeps its
+/// own settings, never takes a derived or advertised path for one, and a
+/// custom entry can become the preset it is named after; unchanged values
+/// keep their comments.
+#[test]
+fn moving_a_harness_keeps_only_what_its_entry_sets() {
+    let Some(_home) = isolated_home("moving_a_harness_keeps_only_what_its_entry_sets", &[]) else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(MACHINE_FILE);
+    let set = |name: &str, kind: Option<&str>, home: Option<&str>, change: &dyn Fn(&mut Harness)| {
+        let mut harness = MachineConfig::load(&path).unwrap().rebased(name, kind, home).unwrap();
+        change(&mut harness);
+        edit(&path, HarnessChange::Set { name: name.into(), harness })
+    };
+    // Nothing is installed, but `claude` would come on once `~/.claude` exists.
+    let error = set("second", Some("claude"), Some("~/.claude"), &|_| {}).unwrap_err().to_string();
+    assert!(error.contains("overlaps"), "{error}");
+    // gemini isn't installed: its advertised opt-in skills directory isn't an override.
+    let (text, cfg) = set("gemini", None, Some("~/.gemini_work"), &|_| {}).unwrap();
+    assert!(!text.contains("skills"), "{text}");
+    assert_eq!(cfg.effective()["gemini"].harness.skills, None);
+    // An explicit setting equal to the derived one stays explicit across a move.
+    fs::write(
+        &path,
+        "[harnesses.second]\npreset = 'claude'  # work\nhome = '~/.second'  # account\nskills = '~/.second/skills'\n",
+    )
+    .unwrap();
+    let (text, cfg) = set("second", None, Some("~/.other"), &|_| {}).unwrap();
+    assert_eq!(cfg.effective()["second"].harness.skills.as_deref(), Some("~/.second/skills"));
+    assert_eq!(cfg.effective()["second"].harness.instructions.as_deref(), Some("~/.other/rules"));
+    assert!(text.contains("preset = 'claude'  # work\n"), "{text}");
+    assert!(text.contains("home = \"~/.other\"  # account\n"), "{text}");
+    // Another setting leaves `preset` and `home` as written.
+    let (text, _) = set("second", None, None, &|h| h.mode = LinkMode::Copy).unwrap();
+    assert!(text.contains("preset = 'claude'  # work\nhome = \"~/.other\"  # account\n"), "{text}");
+    // A custom harness named like an opt-in preset becomes an instance of it.
+    fs::write(&path, "[harnesses.copilot]\nskills = '/opt/copilot'\n").unwrap();
+    assert_eq!(MachineConfig::load(&path).unwrap().effective()["copilot"].harness.kind, None);
+    let (text, cfg) = set("copilot", Some("copilot"), Some("~/.copilot_work"), &|_| {}).unwrap();
+    assert!(text.contains("home = \"~/.copilot_work\""), "{text}");
+    let copilot = &cfg.effective()["copilot"].harness;
+    assert_eq!(copilot.kind.as_deref(), Some("copilot"));
+    assert_eq!(copilot.instructions.as_deref(), Some("~/.copilot_work/copilot-instructions.md"));
 }
