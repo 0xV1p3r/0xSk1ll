@@ -45,6 +45,8 @@ export const api = {
   setupHarnesses: () => invoke<T.HarnessChoice[]>('setup_harnesses'),
   setSetupHarness: (name: string, enabled: boolean) => invoke<T.HarnessChoice[]>('set_setup_harness', { name, enabled }),
   addSetupInstance: (name: string, harness: T.HarnessView['harness']) => invoke<T.HarnessChoice[]>('add_setup_instance', { name, harness }),
+  // The system folder chooser, opened by the app (the webview has no dialog permission); null if closed.
+  pickFolder: (start?: string) => invoke<string | null>('pick_folder', { start: start || null }),
   harnessCandidates: (setup: boolean) => invoke<T.HarnessCandidate[]>('harness_candidates', { setup }),
   notificationsEnabled: () => invoke<boolean>('notifications_enabled'),
   setNotifications: (enabled: boolean) => invoke<boolean>('set_notifications', { enabled }),

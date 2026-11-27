@@ -270,6 +270,43 @@ pub async fn restart_daemon() -> Result<()> {
         .map_err(local_error)
 }
 
+/// Not a Daemon call: asks for a folder with the system's folder chooser,
+/// starting in `start` (absolute or `~/`) where it exists. The folder is
+/// spelled `~/…` when it is in the home directory, as `machine.toml` writes
+/// it; `None` if the chooser was closed. The webview gets no dialog or
+/// filesystem permission: only this command opens the chooser.
+#[tauri::command]
+pub async fn pick_folder<R: tauri::Runtime>(app: tauri::AppHandle<R>, start: Option<String>) -> Result<Option<String>> {
+    use tauri_plugin_dialog::DialogExt;
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let start = start.and_then(|s| match (s.strip_prefix("~/"), &home) {
+        (Some(rest), Some(home)) => Some(home.join(rest.trim_start_matches('/'))),
+        _ if s.starts_with('/') => Some(std::path::PathBuf::from(s)),
+        _ => home.clone(),
+    });
+    let fallback = home.clone();
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        let mut dialog = app.dialog().file().set_title("Choose a config folder");
+        if let Some(dir) = start.filter(|d| d.is_dir()).or(fallback) {
+            dialog = dialog.set_directory(dir);
+        }
+        dialog.blocking_pick_folder()
+    })
+    .await
+    .map_err(|e| local_error(e.to_string()))?;
+    let Some(path) = picked else { return Ok(None) };
+    let path = path.into_path().map_err(|e| local_error(e.to_string()))?;
+    Ok(Some(home_spelling(&path, home.as_deref())))
+}
+
+/// `path` as `~/…` when it is inside `home`, else as it is.
+fn home_spelling(path: &std::path::Path, home: Option<&std::path::Path>) -> String {
+    match home.and_then(|home| path.strip_prefix(home).ok()) {
+        Some(rest) if !rest.as_os_str().is_empty() => format!("~/{}", rest.display()),
+        _ => path.display().to_string(),
+    }
+}
+
 /// Opens the fleet deployment guide in the system browser.
 #[tauri::command]
 pub async fn open_fleet_deployment_docs() -> Result<()> {

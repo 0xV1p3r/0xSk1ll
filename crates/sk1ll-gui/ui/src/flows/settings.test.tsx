@@ -166,7 +166,14 @@ it('adds another config folder of a preset as an instance with its Assignment, s
   await user.clear(form.getByLabelText('Config folder')); await user.type(form.getByLabelText('Config folder'), '~/.claude');
   await user.click(form.getByRole('button', { name: 'Preview change' }));
   expect(form.getByText(/claude's own config folder/)).toBeTruthy();
-  await user.clear(form.getByLabelText('Config folder')); await user.type(form.getByLabelText('Config folder'), '~/.claude_2');
+  // Browse… opens the system folder chooser where the field points; closing it changes nothing.
+  daemon.pickedFolder = null;
+  await user.click(form.getByRole('button', { name: 'Browse…' }));
+  await waitFor(() => expect(daemon.sent('pick_folder')).toEqual([{ start: '~/.claude' }]));
+  expect((form.getByLabelText('Config folder') as HTMLInputElement).value).toBe('~/.claude');
+  daemon.pickedFolder = '~/.claude_2';
+  await user.click(form.getByRole('button', { name: 'Browse…' }));
+  await waitFor(() => expect((form.getByLabelText('Config folder') as HTMLInputElement).value).toBe('~/.claude_2'));
   expect((form.getByLabelText('Name') as HTMLInputElement).value).toBe('claude_2');
   expect(checked(form.getByRole('checkbox', { name: 'Copy assignment from claude' }))).toBe(true);
   await user.click(form.getByRole('button', { name: 'Preview change' }));

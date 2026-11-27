@@ -39,7 +39,9 @@ break compatibility.
   that Machine joined again since its report was read).
 - Settings → Harnesses offers **Add another config folder** on each built-in
   preset: a folder, a name suggested from it and **Copy assignment from
-  <preset>**, on by default when the preset is on. Instances show their tool and folder (Claude
+  <preset>**, on by default when the preset is on. **Browse…** picks the
+  folder with the system folder chooser, which the app opens; the page gets
+  no file or dialog access. Instances show their tool and folder (Claude
   Code · ~/.claude_2) instead of Custom, and the Assignment matrix and Fleet
   mark each instance's tool.
 
