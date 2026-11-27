@@ -7,6 +7,10 @@ use anyhow::{Context, bail};
 /// Transports the import check may use (git's `GIT_ALLOW_PROTOCOL` format).
 pub const IMPORT_PROTOCOLS: &str = "https:http:ssh:git";
 
+/// Room above [`Config::push_max_size`] for a git request's ref commands
+/// and protocol framing around the pack.
+pub const REQUEST_SLACK: u64 = 1 << 20;
+
 /// Server settings, from `SK1LL_SERVER_*` environment variables.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -51,6 +55,17 @@ pub struct Config {
     /// Deadline for the whole Git backend exchange, including upload and
     /// response forwarding (`SK1LL_SERVER_PUSH_MAX`, default `10m`).
     pub push_max: Duration,
+    /// Largest pack one push may send, in bytes (`SK1LL_SERVER_PUSH_MAX_SIZE`,
+    /// default `100m`). Git refuses a bigger pack itself, and any git request
+    /// body past this plus [`REQUEST_SLACK`] is cut off.
+    pub push_max_size: u64,
+    /// Failed join attempts (a wrong, used or expired code) allowed in a
+    /// burst before `POST /api/join` answers 429. Not configurable from the
+    /// environment.
+    pub join_failures_burst: u32,
+    /// One more failed join attempt is allowed after each of these. Not
+    /// configurable from the environment.
+    pub join_failure_every: Duration,
     /// The `sk1ll-server` binary the pre-receive hook runs as
     /// `--check-push <commit>` to refuse a baseline whose items lack Item
     /// IDs of their own. [`Config::from_env`] sets the running binary;
@@ -76,6 +91,9 @@ impl Config {
             send_timeout: Duration::from_secs(10),
             push_idle: Duration::from_secs(30),
             push_max: Duration::from_secs(600),
+            push_max_size: 100 << 20,
+            join_failures_burst: 10,
+            join_failure_every: Duration::from_secs(30),
             push_check: None,
         }
     }
@@ -113,6 +131,9 @@ impl Config {
         }
         if let Some(v) = var("SK1LL_SERVER_PUSH_MAX") {
             cfg.push_max = parse_duration(&v).with_context(|| format!("SK1LL_SERVER_PUSH_MAX: `{v}`"))?;
+        }
+        if let Some(v) = var("SK1LL_SERVER_PUSH_MAX_SIZE") {
+            cfg.push_max_size = parse_size(&v).with_context(|| format!("SK1LL_SERVER_PUSH_MAX_SIZE: `{v}`"))?;
         }
         cfg.push_check = Some(std::env::current_exe().context("locating the sk1ll-server binary for push checks")?);
         Ok(cfg)
@@ -167,6 +188,25 @@ pub fn parse_hosts(s: &str) -> anyhow::Result<Vec<String>> {
         );
     }
     Ok(hosts)
+}
+
+/// `500k`, `100m` or `1g` (powers of 1024, either case); a bare number is bytes.
+pub fn parse_size(s: &str) -> anyhow::Result<u64> {
+    let s = s.trim();
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let n: u64 = num.parse().context("expected a number with an optional k/m/g unit")?;
+    let shift = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 0,
+        "k" | "kb" | "kib" => 10,
+        "m" | "mb" | "mib" => 20,
+        "g" | "gb" | "gib" => 30,
+        u => bail!("unknown unit `{u}`; use k, m or g"),
+    };
+    if n == 0 {
+        bail!("must be greater than zero");
+    }
+    n.checked_mul(1 << shift).context("too large")
 }
 
 /// `90`, `90s`, `2m`, `1h` or `1d`; a bare number is seconds.

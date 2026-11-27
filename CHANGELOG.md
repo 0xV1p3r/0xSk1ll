@@ -9,6 +9,14 @@ break compatibility.
 
 ### Added
 
+- `deploy/docker-compose.public.yml` and `deploy/Caddyfile` run the server
+  behind Caddy with TLS for exposing it on the internet. Import checks there
+  default to `github.com` only, and the admin token is optional.
+- The server refuses a push whose pack is over `SK1LL_SERVER_PUSH_MAX_SIZE`
+  (default `100m`), and limits failed join attempts to 10 in a burst, then one
+  every 30 seconds, answering 429 past that.
+- The server warns at startup while the admin token is set after a machine
+  with fleet scope has joined, and while import checks may contact any host.
 - Several config directories of one tool, such as a second Claude Code account
   started with `CLAUDE_CONFIG_DIR=~/.claude_2`: a `machine.toml` entry with
   `preset = "claude"` and `home = "~/.claude_2"` is a preset instance, which

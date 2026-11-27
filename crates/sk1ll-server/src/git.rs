@@ -24,6 +24,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio_util::io::ReaderStream;
 
+use crate::config::REQUEST_SLACK;
 use crate::error::ApiError;
 use crate::{Caller, Server};
 
@@ -553,6 +554,12 @@ pub async fn http(State(server): State<Arc<Server>>, req: Request) -> Response {
     if !path_info.starts_with("/repo.git/") || path_info.split('/').any(|s| s == ".." || s == ".") {
         return (StatusCode::NOT_FOUND, "only /git/repo.git is served\n").into_response();
     }
+    let declared = req.headers().get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
+    if declared.is_some_and(|len| len > server.config.push_max_size.saturating_add(REQUEST_SLACK)) {
+        let limit = server.config.push_max_size;
+        return (StatusCode::PAYLOAD_TOO_LARGE, format!("the push is over the server's {limit}-byte limit\n"))
+            .into_response();
+    }
     match cgi(server, caller, path_info, req).await {
         Ok(resp) => resp,
         Err(e) => {
@@ -628,9 +635,12 @@ async fn cgi(server: Arc<Server>, caller: Caller, path_info: String, req: Reques
         .env("GIT_NO_REPLACE_OBJECTS", "1")
         // The repo's own hooks, whatever its config says: the pre-receive
         // hook there keeps pushes to the baseline branch.
-        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_COUNT", "2")
         .env("GIT_CONFIG_KEY_0", "core.hooksPath")
         .env("GIT_CONFIG_VALUE_0", server.config.repo_dir().join("hooks"))
+        // receive-pack refuses a bigger pack and tells the client why.
+        .env("GIT_CONFIG_KEY_1", "receive.maxInputSize")
+        .env("GIT_CONFIG_VALUE_1", server.config.push_max_size.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -646,6 +656,9 @@ async fn cgi(server: Arc<Server>, caller: Caller, path_info: String, req: Reques
 
     let idle = server.config.push_idle;
     let max = server.config.push_max;
+    // The backstop for a client that ignores receive-pack's refusal, and for
+    // requests other than pushes.
+    let body_cap = server.config.push_max_size.saturating_add(REQUEST_SLACK);
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
     // This task owns the child and push guard even if the HTTP caller leaves.
     // Every exit after spawning the backend must run the push follow-up.
@@ -664,12 +677,17 @@ async fn cgi(server: Arc<Server>, caller: Caller, path_info: String, req: Reques
         let exchange = async {
             let upload = async {
                 let mut deadline = tokio::time::Instant::now() + idle;
+                let mut received = 0u64;
                 loop {
                     let chunk = tokio::time::timeout_at(deadline, body.next())
                         .await
                         .context("git request body inactivity timeout")?;
                     let Some(chunk) = chunk else { break };
                     let chunk = chunk.context("reading git request body")?;
+                    received = received.saturating_add(chunk.len() as u64);
+                    if received > body_cap {
+                        bail!("git request body is over {body_cap} bytes (SK1LL_SERVER_PUSH_MAX_SIZE)");
+                    }
                     if !chunk.is_empty() {
                         deadline = tokio::time::Instant::now() + idle;
                         tokio::time::timeout_at(deadline, stdin.write_all(&chunk))

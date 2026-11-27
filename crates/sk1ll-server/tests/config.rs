@@ -2,7 +2,10 @@
 
 use std::time::Duration;
 
-use sk1ll_server::{Config, config::parse_duration};
+use sk1ll_server::{
+    Config,
+    config::{parse_duration, parse_size},
+};
 use sk1ll_testkit::{child, text};
 
 #[test]
@@ -12,6 +15,16 @@ fn durations_accept_seconds_minutes_hours_and_days() {
     }
     for input in ["0", "5w", "m"] {
         assert!(parse_duration(input).is_err(), "{input}");
+    }
+}
+
+#[test]
+fn sizes_accept_bytes_and_binary_units() {
+    for (input, bytes) in [("512", 512), ("4k", 4096), (" 100m ", 100 << 20), ("2G", 2 << 30), ("3MiB", 3 << 20)] {
+        assert_eq!(parse_size(input).unwrap(), bytes, "{input}");
+    }
+    for input in ["0", "5t", "m", "-1", "99999999999999999g"] {
+        assert!(parse_size(input).is_err(), "{input}");
     }
 }
 
@@ -28,6 +41,7 @@ fn the_server_reads_and_validates_its_environment() {
                 assert_eq!(config.import_hosts, None);
                 assert!(config.import_checks);
                 assert_eq!(config.idle_limit(), Duration::from_secs(120));
+                assert_eq!(config.push_max_size, 100 << 20);
             }
             "valid" => {
                 let config = Config::from_env().unwrap();
@@ -38,6 +52,7 @@ fn the_server_reads_and_validates_its_environment() {
                 assert_eq!(config.import_poll, Duration::from_secs(3600));
                 assert_eq!(config.push_idle, Duration::from_secs(90));
                 assert_eq!(config.push_max, Duration::from_secs(120));
+                assert_eq!(config.push_max_size, 20 << 20);
                 assert_eq!(config.send_timeout, Duration::from_secs(3));
                 assert_eq!(config.offline_after, Duration::from_secs(4));
                 assert_eq!(config.idle_limit(), Duration::from_secs(10));
@@ -77,6 +92,7 @@ fn the_server_reads_and_validates_its_environment() {
         .env("SK1LL_SERVER_IMPORT_HOSTS", "GitHub.com, bücher.example, [::1], 10.0.0.1,,github.com")
         .env("SK1LL_SERVER_PUSH_IDLE", "90")
         .env("SK1LL_SERVER_PUSH_MAX", "2m")
+        .env("SK1LL_SERVER_PUSH_MAX_SIZE", "20m")
         .env("SK1LL_SERVER_SEND_TIMEOUT", "3s")
         .env("SK1LL_SERVER_OFFLINE_AFTER", "4s")
         .env("SK1LL_SERVER_PING", "5s"));
@@ -100,6 +116,8 @@ fn the_server_reads_and_validates_its_environment() {
         ("SK1LL_SERVER_SEND_TIMEOUT", "0s"),
         ("SK1LL_SERVER_PUSH_IDLE", "forever"),
         ("SK1LL_SERVER_PUSH_MAX", "15ms"),
+        ("SK1LL_SERVER_PUSH_MAX_SIZE", "0"),
+        ("SK1LL_SERVER_PUSH_MAX_SIZE", "lots"),
     ] {
         run(command(var).env(var, value));
     }

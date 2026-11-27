@@ -1,0 +1,26 @@
+# TLS in front of sk1ll-server, for deploy/docker-compose.public.yml.
+{
+	servers {
+		timeouts {
+			# Clients that are slow to send their headers, or that keep
+			# an idle connection open, are dropped. There is no body or
+			# write timeout: the server bounds pushes itself
+			# (SK1LL_SERVER_PUSH_IDLE, SK1LL_SERVER_PUSH_MAX), and the
+			# daemons' WebSockets stay open.
+			read_header 10s
+			idle 2m
+		}
+	}
+}
+
+{$SK1LL_SERVER_DOMAIN} {
+	# Only what machines use: the API and its WebSocket, git and the health check.
+	@sk1ll path /api/* /git/* /healthz
+	handle @sk1ll {
+		reverse_proxy server:7878
+	}
+	handle {
+		respond 404
+	}
+	log
+}

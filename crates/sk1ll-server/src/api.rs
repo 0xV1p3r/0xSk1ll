@@ -118,6 +118,16 @@ async fn create_join_code(
 }
 
 async fn join(State(server): ServerState, Json(req): Json<JoinRequest>) -> Result<(StatusCode, Json<JoinResponse>)> {
+    server.take_join_attempt()?;
+    let joined = join_with_code(&server, req).await;
+    match &joined {
+        Err(ApiError::Forbidden(_)) => tracing::warn!("refused a join attempt with an invalid join code"),
+        _ => server.refund_join_attempt(),
+    }
+    joined
+}
+
+async fn join_with_code(server: &Arc<Server>, req: JoinRequest) -> Result<(StatusCode, Json<JoinResponse>)> {
     check_name("machine id", &req.machine_id)?;
     if req.machine_id == assign::SERVER_AUTHOR || req.machine_id == "admin" {
         return Err(ApiError::BadRequest(format!("`{}` is reserved", req.machine_id)));
@@ -127,7 +137,7 @@ async fn join(State(server): ServerState, Json(req): Json<JoinRequest>) -> Resul
     }
     let token = crate::hex(&random_bytes::<32>());
     let token_hash = hash(&token);
-    let ttl = join_code_ttl(&server);
+    let ttl = join_code_ttl(server);
     let req2 = req.clone();
     let (assignment, revision, scope) = server
         .db(move |conn| {
