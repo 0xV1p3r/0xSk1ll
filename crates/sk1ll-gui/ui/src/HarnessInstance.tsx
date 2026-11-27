@@ -1,5 +1,7 @@
 // Adding a preset instance: another config folder of a built-in preset's tool, a Harness of its own.
 import { useState } from 'react';
+import { FolderOpen } from 'lucide-react';
+import { api } from './api';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from '@/components/ui/field';
@@ -27,6 +29,14 @@ export function InstanceDialog({ preset, taken, onClose, onSubmit }: {
     setHome(value);
     if (!named) setName(suggestName(value.trim(), taken));
   };
+  const [browsing, setBrowsing] = useState(false);
+  const browse = () => {
+    setBrowsing(true);
+    api.pickFolder(home.trim() || preset.harness.home || undefined)
+      .then(folder => { if (folder) { changeHome(folder); setError(''); } })
+      .catch((e: unknown) => setError(`The folder chooser could not open: ${e instanceof Error ? e.message : (e as { message?: string })?.message ?? String(e)}`))
+      .finally(() => setBrowsing(false));
+  };
   const submit = () => {
     const folder = home.trim().replace(/(.)\/+$/, '$1');
     if (!folder.startsWith('~/') && !folder.startsWith('/')) return setError('The config folder must be absolute or start with ~/.');
@@ -39,8 +49,9 @@ export function InstanceDialog({ preset, taken, onClose, onSubmit }: {
     <DialogContent><DialogHeader><DialogTitle>Add another {tool} config folder</DialogTitle>
       <DialogDescription>Another config folder of {tool}, for a second account say, is a Harness of its own with {preset.name}'s settings under that folder. It is saved in machine.toml; the next step shows what sync will do.</DialogDescription></DialogHeader>
       <form onSubmit={e => { e.preventDefault(); submit(); }}><FieldGroup>
-        <Field><FieldLabel htmlFor="instance-home">Config folder</FieldLabel><Input id="instance-home" required value={home} onChange={e => changeHome(e.target.value)} placeholder={`${preset.harness.home ?? '~/.tool'}_2`} aria-describedby="instance-home-hint" />
-          <FieldDescription id="instance-home-hint">Absolute, or starting with ~/: the folder the tool runs with{preset.name === 'claude' ? ' (CLAUDE_CONFIG_DIR)' : preset.name === 'codex' ? ' (CODEX_HOME)' : preset.name === 'copilot' ? ' (COPILOT_HOME)' : ''}.</FieldDescription></Field>
+        <Field><FieldLabel htmlFor="instance-home">Config folder</FieldLabel><div className="flex gap-2"><Input id="instance-home" required value={home} onChange={e => changeHome(e.target.value)} placeholder={`${preset.harness.home ?? '~/.tool'}_2`} aria-describedby="instance-home-hint" />
+            <Button type="button" variant="outline" disabled={browsing} onClick={browse}><FolderOpen data-icon="inline-start" />Browse…</Button></div>
+          <FieldDescription id="instance-home-hint">Choose it with Browse… or type it, absolute or starting with ~/: the folder the tool runs with{preset.name === 'claude' ? ' (CLAUDE_CONFIG_DIR)' : preset.name === 'codex' ? ' (CODEX_HOME)' : preset.name === 'copilot' ? ' (COPILOT_HOME)' : ''}.</FieldDescription></Field>
         <Field><FieldLabel htmlFor="instance-name">Name</FieldLabel><Input id="instance-name" required value={name} onChange={e => { setName(e.target.value); setNamed(true); }} placeholder={`${preset.name}_2`} /></Field>
         <Field orientation="horizontal"><Checkbox id="instance-copy" checked={copy} onCheckedChange={on => setCopy(on)} />
           <FieldLabel htmlFor="instance-copy" className="font-normal">Copy assignment from {preset.name}</FieldLabel></Field>

@@ -13,6 +13,8 @@ pub fn run() {
     let client = Client::default_socket().expect("cannot determine the Daemon socket");
     eprintln!("sk1ll-gui: Daemon socket {}", client.socket().display());
     let builder = tauri::Builder::default()
+        // Used only by the `pick_folder` command; the webview has no dialog permission.
+        .plugin(tauri_plugin_dialog::init())
         .manage(editors::EditorCache::default())
         .manage(commands::Bridge::new(client.clone()))
         .manage(updates::Found::default())
@@ -68,6 +70,7 @@ pub fn register_commands<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri
         commands::set_setup_harness,
         commands::add_setup_instance,
         commands::harness_candidates,
+        commands::pick_folder,
         commands::notifications_enabled,
         commands::set_notifications,
         commands::harness_settings,

@@ -19,6 +19,8 @@ export interface MockDaemon {
   setupHarnesses: T.HarnessChoice[];
   // Config folders the app's environment points at (CLAUDE_CONFIG_DIR, ...); each is offered until a Harness has its name.
   harnessCandidates: T.HarnessCandidate[];
+  // What the system folder chooser returns next; null: it was closed.
+  pickedFolder: string | null;
   // Whether the Daemon answers, and whether the next sync would change anything.
   running: boolean; syncPending: boolean;
   // Every command the App sent, in order, without the event plugin's.
@@ -167,7 +169,7 @@ export function installMock(scenario: string, options: MockOptions = {}): MockDa
   const delay = <V,>(value: V, ms = 250) => new Promise<V>(resolve => setTimeout(() => resolve(structuredClone(value)), ms * latency));
   const overrides = new Map<string, (args: Args) => unknown>();
   const daemon: MockDaemon = {
-    status, machines, items, content, assignments, draft, diffs, conflicts, recovered, log, imports, setupHarnesses, harnessCandidates,
+    status, machines, items, content, assignments, draft, diffs, conflicts, recovered, log, imports, setupHarnesses, harnessCandidates, pickedFolder: '~/.claude_2',
     running: scenario !== 'unreachable', syncPending: !empty, calls: [],
     sent: cmd => daemon.calls.filter(call => call.cmd === cmd).map(call => call.args),
     override: (cmd, handler) => { overrides.set(cmd, handler); },
@@ -500,6 +502,7 @@ export function installMock(scenario: string, options: MockOptions = {}): MockDa
         local.harnesses = setupHarnesses.filter(h => h.enabled).map(h => ({ name: h.name, kind: h.harness.kind }));
         return delay(setupHarnesses);
       }
+      case 'pick_folder': return delay(daemon.pickedFolder, 0);
       case 'harness_candidates': return delay(harnessCandidates.filter(c => !setupHarnesses.some(h => h.name === c.name)));
       case 'add_setup_instance': {
         if (setupHarnesses.some(h => h.name === a.name)) return Promise.reject({ status: 409, message: `harness \`${a.name as string}\` exists already` });
