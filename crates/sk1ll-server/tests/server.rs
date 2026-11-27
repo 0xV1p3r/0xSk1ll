@@ -21,6 +21,11 @@ use sk1ll_testkit::{
 };
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 
+/// Reported harnesses of these names, each the preset of its name.
+fn harnesses(names: &[&str]) -> Vec<sk1ll_proto::ReportedHarness> {
+    names.iter().map(|n| sk1ll_proto::ReportedHarness { name: n.to_string(), kind: Some(n.to_string()) }).collect()
+}
+
 fn id(s: &str) -> ItemId {
     s.parse().unwrap()
 }
@@ -120,7 +125,7 @@ impl TestServer {
     }
 
     async fn try_join(&self, code: &str, id: &str, harnesses: &[&str]) -> reqwest::Response {
-        let body = json!({"code": code, "machine_id": id, "harnesses": harnesses});
+        let body = json!({"code": code, "machine_id": id, "harnesses": self::harnesses(harnesses)});
         self.http().post(self.api("/join")).json(&body).send().await.unwrap()
     }
 
@@ -286,7 +291,7 @@ async fn fatten(server: &TestServer, ws: &mut Ws, machine: &str) {
     let report = MachineReport {
         seq: 1,
         drafts: names.iter().map(|n| ItemRef::Skill(n.clone())).collect(),
-        harnesses: vec!["claude".into()],
+        harnesses: harnesses(&["claude"]),
         ..Default::default()
     };
     ws_send(ws, &DaemonMessage::Status(report.clone())).await;
@@ -701,7 +706,7 @@ async fn websocket_gets_assignment_nudge_and_status() {
     assert_eq!(ws_next(&mut ws).await, ServerMessage::Nudge { baseline: fleet.baseline.unwrap() });
 
     ws_send(&mut ws, &DaemonMessage::Hello { machine_id: "ws".into() }).await;
-    let report = MachineReport { seq: 1, harnesses: vec!["claude".into(), "codex".into()], ..Default::default() };
+    let report = MachineReport { seq: 1, harnesses: harnesses(&["claude", "codex"]), ..Default::default() };
     ws_send(&mut ws, &DaemonMessage::Status(report)).await;
     // `codex` was new, so the server adds it all off and pushes the assignment.
     let ServerMessage::Assignment(b) = ws_next(&mut ws).await else { panic!("expected assignment") };
@@ -741,7 +746,7 @@ async fn websocket_gets_assignment_nudge_and_status() {
         seq: 2,
         baseline: Some(head.clone()),
         drafts: vec![ItemRef::Skill("new".into())],
-        harnesses: vec!["claude".into(), "codex".into()],
+        harnesses: harnesses(&["claude", "codex"]),
         ..Default::default()
     };
     ws_send(&mut ws, &DaemonMessage::Status(report)).await;
@@ -1232,13 +1237,17 @@ async fn replaced_socket_cannot_report_after_revocation() {
 
     let token = server.join("ws", &["claude"]).await;
     let mut fresh = ws_connect(&server, &token).await;
-    let good =
-        MachineReport { seq: 1, baseline: Some("good".into()), harnesses: vec!["claude".into()], ..Default::default() };
+    let good = MachineReport {
+        seq: 1,
+        baseline: Some("good".into()),
+        harnesses: harnesses(&["claude"]),
+        ..Default::default()
+    };
     ws_send(&mut fresh, &DaemonMessage::Status(good.clone())).await;
     server.reported("ws", &good).await;
 
     let evil =
-        MachineReport { seq: 2, baseline: Some("evil".into()), harnesses: vec!["evil".into()], ..Default::default() };
+        MachineReport { seq: 2, baseline: Some("evil".into()), harnesses: harnesses(&["evil"]), ..Default::default() };
     let _ = old.send(Message::text(serde_json::to_string(&DaemonMessage::Status(evil)).unwrap())).await;
     // The server let go of the old socket: it ends once what's buffered is read.
     let drained = tokio::time::timeout(Duration::from_secs(20), async { while let Some(Ok(_)) = old.next().await {} });
@@ -1324,7 +1333,7 @@ async fn a_replaced_sessions_pending_write_is_not_applied() {
     ws_assignment(&mut first).await;
     assert!(matches!(ws_next(&mut first).await, ServerMessage::Nudge { .. }));
     let report =
-        MachineReport { seq: 1, harnesses: vec!["claude".into()], inventory_complete: true, ..Default::default() };
+        MachineReport { seq: 1, harnesses: harnesses(&["claude"]), inventory_complete: true, ..Default::default() };
     ws_send(&mut first, &DaemonMessage::Status(report.clone())).await;
     server.reported("writer", &report).await;
     // Changing a default reads the baseline under the push lock.
@@ -1373,7 +1382,7 @@ async fn valid_report_entries_survive_malformed_neighbors() {
         "drafts": ["skill:pdf", "manifest", "other:notes.txt", "bogus:x", 3],
         "unpushed": ["skill:wip", "rule:git", 3, "manifest", "other:notes.txt"],
         "conflicts": [{"item":"rule:git", "harness":"codex"}, {"item":"bad"}],
-        "harnesses": ["claude"],
+        "harnesses": [{"name": "claude", "kind": "claude"}],
     });
     ws.send(Message::text(text.to_string())).await.unwrap();
     let expected = MachineReport {
@@ -1387,7 +1396,7 @@ async fn valid_report_entries_survive_malformed_neighbors() {
             ItemRef::Other("notes.txt".into()),
         ],
         conflicts: vec![sk1ll_proto::ConflictRef { item: ItemRef::Rule("git".into()), harness: "codex".into() }],
-        harnesses: vec!["claude".into()],
+        harnesses: harnesses(&["claude"]),
         ..Default::default()
     };
     server.reported("ws", &expected).await;
@@ -1784,7 +1793,7 @@ async fn defaults_and_undo_materialize_destination_drafts_and_unpushed() {
     let mut report = MachineReport {
         seq: 1,
         inventory_complete: true,
-        harnesses: vec!["claude".into()],
+        harnesses: harnesses(&["claude"]),
         drafts: vec![ItemRef::Skill("draft".into()), ItemRef::Rule("draft".into())],
         unpushed: vec![
             ItemRef::Skill("unpushed".into()),
@@ -2671,7 +2680,7 @@ async fn renaming_a_harness_moves_toggles_and_replay_leaves_the_destination_inta
 
     let mut ws = ws_connect(&server, &token).await;
     let report =
-        MachineReport { seq: 7, harnesses: vec!["claude".into()], inventory_complete: true, ..Default::default() };
+        MachineReport { seq: 7, harnesses: harnesses(&["claude"]), inventory_complete: true, ..Default::default() };
     ws_send(&mut ws, &DaemonMessage::Status(report)).await;
     ws_send(&mut ws, &DaemonMessage::SetAssignment { req: 9, write: AssignmentWrite::RenameHarness(rename) }).await;
     let (seq, result) = ws_result(&mut ws, 9).await;

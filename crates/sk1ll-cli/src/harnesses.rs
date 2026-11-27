@@ -41,12 +41,19 @@ pub(crate) enum HarnessCmd {
         #[command(flatten)]
         opts: ChangeOpts,
     },
-    /// Add a custom harness, or change one (or a preset's paths) in machine.toml; options left out keep their value
+    /// Add a custom harness or preset instance, or change one (or a preset's paths) in machine.toml; options left out keep their value
     #[command(after_help = "Examples:\n  sk1ll harnesses add agents --skills ~/.agents/skills\n  \
                             sk1ll harnesses add mytool --skills /opt/mytool/skills --mode copy \\\n    \
-                            --instructions ~/.mytool/AGENTS.md")]
+                            --instructions ~/.mytool/AGENTS.md\n  \
+                            sk1ll harnesses add claude_2 --preset claude --home ~/.claude_2")]
     Add {
         name: String,
+        /// Make it an instance of this preset (e.g. claude), whose paths follow from --home
+        #[arg(long)]
+        preset: Option<String>,
+        /// The instance's config directory (e.g. ~/.claude_2), which the preset's paths are relative to
+        #[arg(long)]
+        home: Option<String>,
         /// Skills directory: absolute or ~/-relative; '' for none
         #[arg(long)]
         skills: Option<String>,
@@ -101,14 +108,19 @@ pub(crate) enum Mode {
 impl HarnessCmd {
     /// The change and its options, and whether to take out what sk1ll
     /// placed first; `add` starts from `current`, the harness as it is now.
-    fn split(self, current: Option<Harness>) -> (HarnessChange, ChangeOpts, bool) {
+    fn split(self, current: Option<Harness>) -> Result<(HarnessChange, ChangeOpts, bool)> {
         let (change, opts) = match self {
             Self::Rename { .. } => unreachable!("renames are applied separately"),
             Self::Enable { name, opts } => (HarnessChange::Enable { name }, opts),
-            Self::Disable { name, take, opts } => return (HarnessChange::Disable { name }, opts, take.take_out),
-            Self::Remove { name, take, opts } => return (HarnessChange::Remove { name }, opts, take.take_out),
-            Self::Add { name, skills, instructions, format, mode, opts } => {
+            Self::Disable { name, take, opts } => return Ok((HarnessChange::Disable { name }, opts, take.take_out)),
+            Self::Remove { name, take, opts } => return Ok((HarnessChange::Remove { name }, opts, take.take_out)),
+            Self::Add { name, preset, home, skills, instructions, format, mode, opts } => {
                 let mut harness = current.unwrap_or_default();
+                if preset.is_some() || home.is_some() {
+                    let kind = preset.or_else(|| harness.kind.clone());
+                    let home = home.or_else(|| harness.home.clone().filter(|_| kind == harness.kind));
+                    harness = sk1ll_core::machine::rebase(&name, &harness, kind.as_deref(), home.as_deref())?;
+                }
                 let path = |v: String| Some(v).filter(|v| !v.is_empty());
                 if let Some(v) = skills {
                     harness.skills = path(v);
@@ -129,7 +141,7 @@ impl HarnessCmd {
                 (HarnessChange::Set { name, harness }, opts)
             }
         };
-        (change, opts, false)
+        Ok((change, opts, false))
     }
 }
 
@@ -162,7 +174,7 @@ pub(crate) fn run(s: &Session, all: bool, command: Option<HarnessCmd>) -> Result
         }
         _ => None,
     };
-    let (change, opts, take_out) = command.split(current);
+    let (change, opts, take_out) = command.split(current)?;
     let view = |p: &PlacementView, placed: bool| Row {
         kind: p.kind.clone(),
         harness: p.harness.clone(),
@@ -283,7 +295,15 @@ fn line(name: &str, origin: &str, h: &Harness) -> String {
     };
     let skills = h.skills.as_deref().map(|s| format!("skills {s} ({mode})")).unwrap_or_default();
     let instr = h.instructions.as_deref().map(|i| format!("instructions {i} ({format})"));
-    format!("{name:<10} {origin:<9} {skills:<40} {}", instr.unwrap_or_default())
+    // A preset instance, or a preset moved to another config directory: of what, and where.
+    let default_home =
+        h.kind.as_deref().and_then(|k| sk1ll_core::machine::preset_instance(k, None)).and_then(|p| p.home);
+    let of = match (h.kind.as_deref(), h.home.as_deref()) {
+        (Some(kind), Some(home)) if kind != name => format!("  [{kind} in {home}]"),
+        (Some(_), Some(home)) if Some(home) != default_home.as_deref() => format!("  [in {home}]"),
+        _ => String::new(),
+    };
+    format!("{name:<10} {origin:<9} {skills:<40} {}{of}", instr.unwrap_or_default())
 }
 
 /// One line of a preview: `kind` is `create`, `update`, `remove` or `conflict`.

@@ -4,9 +4,9 @@
 
 A harness is an agent tool on this machine with a skills directory, a global instructions location, or both. Harnesses are machine-local and never stored in the repo. `sk1ll harnesses` lists the ones sync writes into. `sk1ll harnesses --all` also lists the ones turned off and the presets that are available but off.
 
-sk1ll includes a built-in preset when its directory exists (an opt-in preset only once enabled, see below):
+sk1ll includes a built-in preset when its directory exists (an opt-in preset only once enabled, see below). A preset's paths are relative to that directory, its home: an entry's `home` moves them all (see [Several config directories of one tool](#several-config-directories-of-one-tool)).
 
-| Preset | Detected by | Skills | Instructions |
+| Preset | Detected by (home) | Skills | Instructions |
 |---|---|---|---|
 | `claude` | `~/.claude` | `~/.claude/skills` | `~/.claude/rules` (`rules` format) |
 | `codex` | `~/.codex` | `~/.codex/skills` (copy mode) | `~/.codex/AGENTS.md` |
@@ -35,11 +35,33 @@ First-run setup (the GUI wizard, `sk1ll setup`, joining a fleet without a repo, 
 
 The presets of 0.1.0 (`claude`, `codex`, `opencode`, and `gemini`'s instructions) are still included whenever their directory exists.
 
-For an opt-in preset name, an entry with either path key (`skills` or `instructions`) defines a custom harness, even with `enabled = true`. Missing keys use the custom harness defaults. An entry with no path keys and `enabled = true` activates the preset. To switch a custom harness back to the preset, remove the entry and enable the preset. Changing the paths of an enabled opt-in preset pins all four settings in `machine.toml`: `skills`, `instructions`, `instructions_format`, and `mode`. Future changes to preset defaults won't apply to that entry.
+For an opt-in preset name, an entry with either path key (`skills` or `instructions`) and neither `preset` nor `home` defines a custom harness, even with `enabled = true`. Missing keys use the custom harness defaults. An entry with no path keys and `enabled = true` activates the preset. To switch a custom harness back to the preset, remove the entry and enable the preset. Changing the paths of an enabled opt-in preset writes `preset = "<name>"` next to them, so the entry stays the preset and its other settings keep following the preset's defaults.
 
-Presets use copy mode where the tool's documentation doesn't say it follows skill symlinks. If you set `COPILOT_HOME`, point the `copilot` paths there in `machine.toml`. A Kiro steering file without front matter is always included. The Kiro CLI may load only files marked `inclusion: always`.
+Presets use copy mode where the tool's documentation doesn't say it follows skill symlinks. If you set `COPILOT_HOME`, set the `copilot` entry's `home` to it. A Kiro steering file without front matter is always included. The Kiro CLI may load only files marked `inclusion: always`.
 
 Several tools also read other tools' directories. Cursor reads `~/.claude/skills` and `~/.codex/skills`, Amp and Copilot read `~/.claude/skills`, and most of them read the shared `~/.agents/skills`. With both harnesses on, such a tool sees a skill twice. Turn one harness off, or narrow its assignment.
+
+### Several config directories of one tool
+
+Some tools can run with another config directory, for a second account say: Claude Code with `CLAUDE_CONFIG_DIR=~/.claude_2`, Codex with `CODEX_HOME`, Copilot with `COPILOT_HOME`. Each directory is a harness of its own, a **preset instance**: an entry with `preset` names the preset and `home` the directory.
+
+```toml
+[harnesses.claude_2]   # the account started with CLAUDE_CONFIG_DIR=~/.claude_2
+preset = "claude"
+home = "~/.claude_2"
+```
+
+```sh
+sk1ll harnesses add claude_2 --preset claude --home ~/.claude_2
+```
+
+`claude_2` then gets what the `claude` preset gets, under `~/.claude_2`: skills in `~/.claude_2/skills`, rules in `~/.claude_2/rules` (`rules` format), symlinked. The paths aren't written into `machine.toml`, so a change to the preset's defaults reaches the instance too. Keys the entry sets override the preset's as for a preset itself (`mode = "copy"`, `instructions = ""`). An instance is synced into because its entry exists, also for an opt-in preset; `enabled = false` turns it off. An instance of `gemini` includes gemini's skills directory, since its entry is explicit; `skills = ""` keeps it to its instructions. `home` without `preset` on an entry named after a preset moves that preset itself, e.g. `[harnesses.claude] home = "~/.config/claude"`.
+
+The harness's **kind** is the preset it is, or is an instance of. A Rule with `harnesses: [claude]` reaches every harness named or of kind `claude`, so both `claude` and `claude_2`; `harnesses: [claude_2]` reaches only the instance. Renaming a preset or an instance keeps its kind: the renamed entry is written as an instance (`preset = "claude"`, and `home` if it isn't the preset's).
+
+`home` follows the path rules below. `preset` must name a built-in preset, and on an entry named after a preset it can only be that preset; a custom harness can't have `home`. Two instances can't share a directory, nor share one with the preset: their locations overlap.
+
+sk1ll doesn't look for these directories itself. Add each one you use.
 
 ## machine.toml
 
@@ -101,6 +123,7 @@ sk1ll harnesses disable gemini --take-out         # take out what sk1ll placed t
 sk1ll harnesses enable gemini                     # sync into it again
 sk1ll harnesses add agents --skills ~/.agents/skills --mode copy
 sk1ll harnesses add codex --instructions ''       # adjust a preset; options left out keep their value
+sk1ll harnesses add claude_2 --preset claude --home ~/.claude_2   # a second Claude Code config directory
 sk1ll harnesses remove agents                     # drop the entry; a preset goes back to its defaults
 sk1ll harnesses rename agents team-agents         # rename a custom harness and move its Assignment
 ```
@@ -120,9 +143,9 @@ Harness-wide changes set both defaults and every stored toggle. Items without a 
 
 In Settings, the preview of a disable or remove that would leave content behind offers **Take out and turn off** (or **Take out and remove**), which does the same, and **Leave in place**. A joined machine writes the Assignment to the Server first.
 
-The change is then applied and the harnesses synced. It goes through the daemon when one manages the repo, else through the engine the command runs. The CLI asks for confirmation on a terminal. Pass `--yes` in scripts. Turning a Harness back on restores its toggles. Renaming a Harness moves both defaults and its toggles to the new name. Renaming a preset disables the original preset and gives the new custom Harness the same paths and settings. A joined machine reports its new set of harnesses to the server with its next status.
+The change is then applied and the harnesses synced. It goes through the daemon when one manages the repo, else through the engine the command runs. The CLI asks for confirmation on a terminal. Pass `--yes` in scripts. Turning a Harness back on restores its toggles. Renaming a Harness moves both defaults and its toggles to the new name. Renaming a preset disables the original preset and makes the new Harness an instance of it with the same settings, so it keeps its kind. A joined machine reports its new set of harnesses to the server with its next status.
 
-A Harness rename records an intent before changing `machine.toml`. If the command loses its connection, the Daemon retries the move before reporting its Harnesses. You can also repeat the same rename. In standalone mode, the next sync finishes a pending rename using the local Assignment. Use `--replace` if the destination already has an Assignment you want to replace. The command lists Rules that still name the old Harness in `harnesses:`. Update those Rules separately to route them to the new Harness.
+A Harness rename records an intent before changing `machine.toml`. If the command loses its connection, the Daemon retries the move before reporting its Harnesses. You can also repeat the same rename. In standalone mode, the next sync finishes a pending rename using the local Assignment. Use `--replace` if the destination already has an Assignment you want to replace. The command lists Rules that still name the old Harness in `harnesses:`, unless they name its kind too. Update those Rules separately to route them to the new Harness.
 
 Apply checks that `machine.toml` still matches the file, bytes and permissions seen at preview. If the check fails, preview again before applying. **Open configuration** in Settings works even if the file contains invalid TOML. If the file is missing, it creates it with mode 0600. sk1ll writes the new text to a temporary file only it created, next to the file (a symlinked `machine.toml` stays a link, and its target gets the new text), with the file's permissions (0600 for a new file) and, where allowed, its owner and group, then renames it into place. ACLs and extended attributes are not kept. A save that lands in the instant between that last check and the rename is lost; see [Known limitations](known-limitations.md).
 
@@ -147,7 +170,7 @@ harnesses: [claude]   # render only into these harnesses; default: all
 For commits, use Conventional Commits.
 ```
 
-`harnesses:` narrows a rule further on top of assignment. The older `targets:` key still works as a deprecated alias.
+`harnesses:` narrows a rule further on top of assignment. Each entry names a harness or a kind: `claude` reaches the `claude` preset and every instance of it. The older `targets:` key still works as a deprecated alias.
 
 ## Instruction formats
 

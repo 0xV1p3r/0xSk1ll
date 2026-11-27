@@ -160,8 +160,7 @@ fn left_part(old: &Harness, after: &BTreeMap<String, Harness>) -> Harness {
     Harness {
         skills: old.skills.clone().filter(|_| !used.iter().any(|(s, _)| s.is_some() && *s == skills)),
         instructions: old.instructions.clone().filter(|_| !used.iter().any(|(_, i)| i.is_some() && *i == instructions)),
-        instructions_format: old.instructions_format,
-        mode: old.mode,
+        ..old.clone()
     }
 }
 

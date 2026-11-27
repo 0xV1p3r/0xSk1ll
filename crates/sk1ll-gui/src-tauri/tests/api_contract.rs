@@ -30,7 +30,8 @@ use sk1ll_gui::events::ConnectionEvent;
 use sk1ll_gui::service::ServiceInfo;
 use sk1ll_gui::updates::{AvailableUpdate, Progress};
 use sk1ll_proto::{
-    ConflictRef, CopyMode, Expected, HarnessMapping, ImportError, LogCause, ReportedItem, ToggleChange, ToggleKind,
+    ConflictRef, CopyMode, Expected, HarnessMapping, ImportError, LogCause, ReportedHarness, ReportedItem,
+    ToggleChange, ToggleKind,
 };
 
 /// `value` as JSON, after checking that the JSON reads back as the same value.
@@ -78,11 +79,13 @@ fn harness(
     instructions_format: InstructionsFormat,
     mode: LinkMode,
 ) -> Harness {
-    Harness { skills: Some(skills.into()), instructions: instructions.map(Into::into), instructions_format, mode }
+    let (skills, instructions) = (Some(skills.into()), instructions.map(Into::into));
+    Harness { kind: None, home: None, skills, instructions, instructions_format, mode }
 }
 
 fn claude() -> Harness {
-    harness("~/.claude/skills", Some("~/.claude/CLAUDE.md"), InstructionsFormat::Block, LinkMode::Symlink)
+    let paths = harness("~/.claude/skills", Some("~/.claude/CLAUDE.md"), InstructionsFormat::Block, LinkMode::Symlink);
+    Harness { kind: Some("claude".into()), home: Some("~/.claude".into()), ..paths }
 }
 
 fn report() -> MachineReport {
@@ -95,7 +98,11 @@ fn report() -> MachineReport {
         inventory_complete: false,
         inventory_error: Some("could not read ~/.codex/skills".into()),
         conflicts: vec![ConflictRef { item: item("skill:code-review"), harness: "codex".into() }],
-        harnesses: vec!["claude".into(), "codex".into()],
+        harnesses: vec![
+            ReportedHarness { name: "claude".into(), kind: Some("claude".into()) },
+            ReportedHarness { name: "claude_2".into(), kind: Some("claude".into()) },
+            ReportedHarness { name: "agents".into(), kind: None },
+        ],
         blocked: true,
         clashes: vec![item("skill:deploy")],
         pull_pending: None,
@@ -481,6 +488,7 @@ fn harness_golden() -> Value {
         "harness_settings": sample(HarnessSettings { path: "/home/dev/.config/sk1ll/machine.toml".into(), harnesses: vec![
             choice(),
             HarnessChoice { name: "claude".into(), installed: true, enabled: true, harness: Harness { skills: None, ..claude() }, preset: false, configured: false, available: false, setup_warning: None },
+            HarnessChoice { name: "claude_2".into(), installed: true, enabled: true, harness: Harness { home: Some("~/.claude_2".into()), skills: Some("~/.claude_2/skills".into()), instructions: Some("~/.claude_2/CLAUDE.md".into()), ..claude() }, preset: false, configured: true, available: false, setup_warning: None },
         ] }),
         "harness_change": by_tag("op", changes.clone()),
         "harness_change_request": sample(HarnessChangeRequest { fingerprint: Some("f-1".into()), change: changes[1].clone() }),

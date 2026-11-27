@@ -47,6 +47,10 @@ An explicit Assignment toggle whose Item ID is absent from the Baseline and ever
 The self-hosted fleet server: the fleet's git remote, which also holds its assignments and machine status and tells machines when to pull. Always means this one; the daemon's endpoint is its **local API**.
 _Avoid_: Hub, relay, coordinator
 
+**Preset instance**:
+A Harness built from a preset in another config directory of the same tool (its `home`), e.g. `claude_2` in `~/.claude_2`. Its **kind** is that preset; a preset's own kind is itself, and a custom Harness has none. A Rule's `harnesses:` matches a Harness's name or kind.
+_Avoid_: Profile, account (for the Harness)
+
 **Opt-in preset**:
 A built-in Harness configuration that needs explicit enablement in `machine.toml` before sync uses it. Gemini’s skills directory is also opt-in.
 

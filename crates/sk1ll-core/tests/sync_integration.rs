@@ -894,6 +894,7 @@ fn missing_ids_use_defaults_and_reconcile_without_replacing_bytes() {
         instructions: Some(tmp.path().join("rules").to_string_lossy().into_owned()),
         instructions_format: InstructionsFormat::Rules,
         mode: LinkMode::Copy,
+        ..Harness::default()
     };
     let harnesses = BTreeMap::from([("h".into(), harness)]);
     // Toggles are keyed by Item ID: an item without one has none, so the
@@ -1008,4 +1009,55 @@ fn every_name_of_a_file_has_one_key_and_nothing_is_created() {
     assert_ne!(key(&root.join("dangling")).unwrap(), key(&real).unwrap());
     std::os::unix::fs::symlink("loop", root.join("loop")).unwrap();
     assert!(real_path(&root.join("loop")).unwrap_err().to_string().contains("too many levels"));
+}
+
+/// Two config directories of one tool, as preset instances: each gets the
+/// skills and rules, and a rule for the kind (`harnesses: [claude]`) reaches
+/// both, while one naming an instance reaches only it.
+#[test]
+fn preset_instances_receive_rules_routed_to_their_kind() {
+    let tmp = Home::new();
+    let _home = tmp.enter();
+    let repo = Repo::init_committed(&tmp.path().join("repo")).unwrap();
+    write(&repo.personal_dir().join("pdf/SKILL.md"), "PDFs.\n");
+    write(&repo.root().join("instructions/all.md"), "---\nharnesses: [claude]\n---\nEvery Claude Code.\n");
+    write(&repo.root().join("instructions/work.md"), "---\nharnesses: [claude_work]\n---\nWork only.\n");
+    write(&repo.root().join("instructions/codex.md"), "---\nharnesses: [codex]\n---\nCodex only.\n");
+    let home = |dir: &str| tmp.path().join(dir).to_string_lossy().into_owned();
+    let config = tmp.path().join("machine.toml");
+    write(
+        &config,
+        &format!(
+            "[harnesses.claude_home]\npreset = \"claude\"\nhome = {:?}\n[harnesses.claude_work]\npreset = \
+             \"claude\"\nhome = {:?}\n",
+            home("claude"),
+            home("claude_2")
+        ),
+    );
+    // Only the instances: preset detection reads the process HOME.
+    let harnesses: BTreeMap<String, Harness> = sk1ll_core::MachineConfig::load(&config)
+        .unwrap()
+        .harnesses()
+        .into_iter()
+        .filter(|(name, _)| name.starts_with("claude_"))
+        .collect();
+    assert_eq!(harnesses.len(), 2);
+    let assignment = Assignment::default();
+    for action in plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap() {
+        apply(&repo, &action).unwrap();
+    }
+    assert!(plan(&repo, &harnesses, &assignment, PlanOptions::default()).unwrap().is_empty());
+    for (dir, rules) in [("claude", &["all.md"][..]), ("claude_2", &["all.md", "work.md"])] {
+        let root = tmp.path().join(dir);
+        assert!(root.join("skills/pdf/SKILL.md").exists(), "{dir}");
+        let mut placed: Vec<_> = fs::read_dir(root.join("rules"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.starts_with('.'))
+            .collect();
+        placed.sort();
+        assert_eq!(placed, rules, "{dir}");
+    }
+    let rendered = render_instructions(&repo, &harnesses, &assignment, "claude_home").unwrap();
+    assert_eq!(rendered.len(), 1);
 }

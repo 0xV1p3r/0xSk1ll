@@ -70,3 +70,62 @@ fn rollback_preserves_an_edit_made_after_the_rename_config_was_written() {
     assert_eq!(read(&config), initial);
     assert!(!RenameIntent::exists(&state, &config).unwrap());
 }
+
+/// A renamed preset becomes an instance of itself, and a renamed instance
+/// stays one: the kind is kept, so Rules that name it still reach the
+/// harness and aren't reported as routed to the old name.
+#[test]
+fn renaming_a_preset_or_an_instance_keeps_its_kind() {
+    let home = Home::new();
+    let _entered = home.enter();
+    let repo = SkillsRepo::new();
+    repo.write("instructions/claude.md", "---\nharnesses: [claude]\n---\nFor Claude Code.\n");
+    repo.write("instructions/second.md", "---\nharnesses: [claude_2]\n---\nOnly the second.\n");
+    let config = home.path().join("machine.toml");
+    let at = |dir: &str| home.path().join(dir).to_string_lossy().into_owned();
+    let (c1, c2, g) = (at("c1"), at("c2"), at("g"));
+    // Preset detection reads the process HOME: every other preset is off.
+    let others: String = sk1ll_core::machine::presets()
+        .filter(|p| !["claude", "gemini"].contains(p))
+        .map(|p| format!("[harnesses.{p}]\nenabled = false\n"))
+        .collect();
+    write(
+        &config,
+        &format!(
+            "{others}[harnesses.claude]\nhome = {c1:?}\nmode = \"copy\"\n[harnesses.claude_2]\npreset = \"claude\"\nhome = \
+             {c2:?}\n[harnesses.gemini]\nhome = {g:?}\n"
+        ),
+    );
+    let state = home.state_dir();
+    let rename = |from: &str, to: &str| {
+        let request = RenameRequest { from: from.into(), to: to.into(), replace: false };
+        let intent =
+            RenameIntent::prepare(&state, &config, repo.root(), request, &Assignment::default(), None).unwrap();
+        intent.apply_config(&config).unwrap();
+        intent.finish().unwrap();
+        intent.routed_rules
+    };
+    assert!(rename("claude", "work").is_empty(), "`claude` still reaches it by kind");
+    assert_eq!(rename("claude_2", "second"), ["second"], "named only by name");
+    rename("gemini", "gem");
+    let text = read(&config);
+    assert!(
+        text.contains(&format!("[harnesses.work]\npreset = \"claude\"\nhome = {c1:?}\nmode = \"copy\"\n")),
+        "{text}"
+    );
+    assert!(text.contains(&format!("[harnesses.second]\npreset = \"claude\"\nhome = {c2:?}\n")), "{text}");
+    let effective = MachineConfig::load(&config).unwrap().harnesses();
+    assert_eq!(effective.keys().map(String::as_str).collect::<Vec<_>>(), ["gem", "second", "work"]);
+    for (name, kind, home) in [("work", "claude", &c1), ("second", "claude", &c2), ("gem", "gemini", &g)] {
+        assert_eq!(
+            (effective[name].kind.as_deref(), effective[name].home.as_ref()),
+            (Some(kind), Some(home)),
+            "{name}"
+        );
+    }
+    assert_eq!(effective["work"].skills, Some(format!("{c1}/skills")));
+    assert_eq!(effective["work"].mode, sk1ll_core::LinkMode::Copy);
+    // gemini synced only its instructions, and its instance does the same.
+    assert_eq!(effective["gem"].skills, None);
+    assert_eq!(effective["gem"].instructions, Some(format!("{g}/GEMINI.md")));
+}

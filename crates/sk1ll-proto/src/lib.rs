@@ -161,7 +161,7 @@ pub struct MachineReport {
     pub conflicts: Vec<ConflictRef>,
     /// Harnesses present on the machine.
     #[serde(default)]
-    pub harnesses: Vec<String>,
+    pub harnesses: Vec<ReportedHarness>,
     /// A newer baseline clashes with the draft, so the machine stays on its old one.
     #[serde(default)]
     pub blocked: bool,
@@ -178,6 +178,16 @@ pub struct MachineReport {
     /// check of a new Baseline): why. Pushing again won't help.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub push_refused: Option<String>,
+}
+
+/// A harness on a machine: its name and its kind, the preset it is or is
+/// an instance of (`claude` for a second Claude Code config directory);
+/// `None` for a custom harness.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ReportedHarness {
+    pub name: String,
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 /// A skill or rule's name and Item ID.
@@ -547,7 +557,7 @@ pub struct JoinRequest {
     pub code: String,
     pub machine_id: String,
     #[serde(default)]
-    pub harnesses: Vec<String>,
+    pub harnesses: Vec<ReportedHarness>,
     /// Start from this machine's assignment; otherwise everything starts off.
     #[serde(default)]
     pub copy_from: Option<String>,

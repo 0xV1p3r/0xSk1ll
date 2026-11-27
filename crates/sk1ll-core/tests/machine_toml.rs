@@ -120,6 +120,7 @@ fn harness_changes_keep_the_file_and_write_only_what_differs() {
         instructions: Some("/opt/agents/rules".into()),
         instructions_format: InstructionsFormat::Rules,
         mode: LinkMode::Symlink,
+        ..Harness::default()
     };
     let (text, cfg) = edit(set("agents", custom.clone())).unwrap();
     assert!(text.starts_with("# mine\nid = \"box\" # stays\n"), "{text}");
@@ -409,6 +410,13 @@ fn paths_are_checked_where_they_lead() {
     assert!(edit(&path, HarnessChange::Remove { name: "claude".into() }).is_err());
 }
 
+/// Sets `name` as an instance of `kind` in `home`.
+fn instance(name: &str, kind: &str, home: &str) -> HarnessChange {
+    let skills = Some("/opt/skills".into());
+    let harness = Harness { kind: Some(kind.into()), home: Some(home.into()), skills, ..Harness::default() };
+    HarnessChange::Set { name: name.into(), harness }
+}
+
 fn preset_harness(name: &str) -> Harness {
     MachineConfig::default().choices().into_iter().find(|choice| choice.name == name).unwrap().harness
 }
@@ -438,6 +446,9 @@ fn machine_toml_reports_malformed_fields_at_the_config_path() {
         ("[harnesses.h]\nenabled = 1", "expected a boolean"),
         ("[harnesses.h]\nskill = '/tmp/skills'", "unknown field"),
         ("harnesses = []", "expected a map"),
+        ("[harnesses.h]\npreset = 'nope'", "no preset `nope`"),
+        ("[harnesses.claude]\npreset = 'codex'", "its `preset` can only be `claude`"),
+        ("[harnesses.h]\nhome = '~/.h'", "`home` needs `preset`"),
     ] {
         fs::write(&path, text).unwrap();
         let error = MachineConfig::load(&path).unwrap_err();
@@ -472,9 +483,154 @@ fn invalid_harness_edits_name_the_problem_and_preserve_machine_toml() {
         (HarnessChange::Disable { name: "absent".into() }, "no harness `absent`"),
         (HarnessChange::Remove { name: "absent".into() }, "doesn't exist; nothing to remove"),
         (HarnessChange::Remove { name: "codex".into() }, "uses the built-in preset already"),
+        (instance("work", "nope", "~/.work"), "no preset `nope`"),
+        (instance("codex", "claude", "~/.work"), "can't be an instance of `claude`"),
+        (instance("work", "claude", "~/"), "must not be the home directory"),
+        (instance("work", "claude", "~/a/../b"), "must not contain"),
+        (instance("work", "claude", "work"), "must be absolute or start with"),
+        (
+            HarnessChange::Set {
+                name: "work".into(),
+                harness: Harness { home: Some("~/.work".into()), skills: Some("/s".into()), ..Harness::default() },
+            },
+            "needs a preset",
+        ),
     ] {
         let error = MachineConfig::write_change(&path, &edit).unwrap_err();
         assert!(error.to_string().contains(detail), "{error}");
         assert_eq!(fs::read_to_string(&path).unwrap(), before);
     }
+}
+
+/// `preset` and `home`: an instance of a preset gets the preset's settings
+/// under its own config directory, the paths derived rather than written, so
+/// changes to the preset's defaults keep applying. `home` alone re-roots a
+/// preset itself.
+#[test]
+fn preset_instances_derive_their_settings_from_the_preset_under_their_home() {
+    let Some(_home) = isolated_home(
+        "preset_instances_derive_their_settings_from_the_preset_under_their_home",
+        &[".claude", ".codex"],
+    ) else {
+        return;
+    };
+    let cfg = config(
+        r#"
+        [harnesses.claude_2]
+        preset = "claude"
+        home = "~/.claude_2"
+        [harnesses.claude_3]
+        preset = "claude"
+        home = "/opt/claude_3/"
+        mode = "copy"
+        instructions = ""
+        [harnesses.gemini_2]
+        preset = "gemini"
+        home = "~/.gemini_2"
+        [harnesses.gemini_3]
+        preset = "gemini"
+        home = "~/.gemini_3"
+        skills = ""
+        [harnesses.kiro_2]
+        preset = "kiro"
+        home = "~/.kiro_2"
+        [harnesses.codex_2]
+        preset = "codex"
+        [harnesses.codex]
+        enabled = false
+        [harnesses.opencode]
+        home = "~/.opencode"
+        [harnesses.off]
+        preset = "amp"
+        home = "~/.amp_off"
+        enabled = false
+        "#,
+    );
+    let eff = cfg.effective();
+    use InstructionsFormat::{Block, Rules};
+    use LinkMode::{Copy, Symlink};
+    /// Name, kind, home, skills, instructions, format, mode, origin.
+    type Row<'a> =
+        (&'a str, &'a str, &'a str, Option<&'a str>, Option<&'a str>, InstructionsFormat, LinkMode, HarnessOrigin);
+    #[rustfmt::skip]
+    let rows: [Row; 8] = [
+        ("claude", "claude", "~/.claude", Some("~/.claude/skills"), Some("~/.claude/rules"), Rules, Symlink, HarnessOrigin::Detected),
+        ("claude_2", "claude", "~/.claude_2", Some("~/.claude_2/skills"), Some("~/.claude_2/rules"), Rules, Symlink, HarnessOrigin::Local),
+        ("claude_3", "claude", "/opt/claude_3/", Some("/opt/claude_3/skills"), None, Rules, Copy, HarnessOrigin::Local),
+        // An instance's entry is explicit, so gemini's opt-in skills directory comes with it.
+        ("gemini_2", "gemini", "~/.gemini_2", Some("~/.gemini_2/skills"), Some("~/.gemini_2/GEMINI.md"), Block, Symlink, HarnessOrigin::Local),
+        ("gemini_3", "gemini", "~/.gemini_3", None, Some("~/.gemini_3/GEMINI.md"), Block, Symlink, HarnessOrigin::Local),
+        // So is an opt-in preset's.
+        ("kiro_2", "kiro", "~/.kiro_2", Some("~/.kiro_2/skills"), Some("~/.kiro_2/steering"), Rules, Copy, HarnessOrigin::Local),
+        ("codex_2", "codex", "~/.codex", Some("~/.codex/skills"), Some("~/.codex/AGENTS.md"), Block, Copy, HarnessOrigin::Local),
+        ("opencode", "opencode", "~/.opencode", Some("~/.opencode/skill"), Some("~/.opencode/AGENTS.md"), Block, Symlink, HarnessOrigin::Override),
+    ];
+    let mut names = rows.map(|r| r.0);
+    names.sort();
+    assert_eq!(eff.keys().map(String::as_str).collect::<Vec<_>>(), names);
+    for (name, kind, home, skills, instructions, format, mode, origin) in rows {
+        let want = Harness {
+            kind: Some(kind.into()),
+            home: Some(home.into()),
+            skills: skills.map(Into::into),
+            instructions: instructions.map(Into::into),
+            instructions_format: format,
+            mode,
+        };
+        assert_eq!(eff[name].harness, want, "{name}");
+        assert_eq!(eff[name].origin, origin, "{name}");
+    }
+    let choices = cfg.choices();
+    let choice = |name: &str| choices.iter().find(|c| c.name == name).unwrap();
+    assert!(!choice("claude_2").preset && choice("claude_2").configured && choice("claude_2").enabled);
+    assert_eq!(choice("off").harness.kind.as_deref(), Some("amp"));
+    assert!(!choice("off").enabled);
+    assert!(choice("opencode").preset, "re-rooted, still the preset");
+    // A custom harness has no kind.
+    let custom = config("[harnesses.agents]\nskills = \"/opt/agents\"\n").effective();
+    assert_eq!((custom["agents"].harness.kind.as_deref(), custom["agents"].harness.home.as_deref()), (None, None));
+}
+
+/// Adding an instance writes `preset` and `home` and nothing it derives;
+/// its locations are checked against every other harness like any.
+#[test]
+fn adding_a_preset_instance_writes_only_what_it_doesnt_derive() {
+    let Some(_home) = isolated_home("adding_a_preset_instance_writes_only_what_it_doesnt_derive", &[".claude"]) else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(MACHINE_FILE);
+    let added = |name: &str, kind: &str, home: &str| {
+        let harness = sk1ll_core::machine::rebase(name, &Harness::default(), Some(kind), Some(home)).unwrap();
+        edit(&path, HarnessChange::Set { name: name.into(), harness })
+    };
+    let (text, cfg) = added("claude_2", "claude", "~/.claude_2").unwrap();
+    assert_eq!(text, "[harnesses.claude_2]\npreset = \"claude\"\nhome = \"~/.claude_2\"\n");
+    assert_eq!(cfg.effective()["claude_2"].harness.skills.as_deref(), Some("~/.claude_2/skills"));
+    // Overrides on top are written as for a preset, and setting them back drops them.
+    let mut copy = cfg.effective()["claude_2"].harness.clone();
+    copy.mode = LinkMode::Copy;
+    let (text, _) = edit(&path, HarnessChange::Set { name: "claude_2".into(), harness: copy.clone() }).unwrap();
+    assert!(text.ends_with("home = \"~/.claude_2\"\nmode = \"copy\"\n"), "{text}");
+    copy.mode = LinkMode::Symlink;
+    let (text, _) = edit(&path, HarnessChange::Set { name: "claude_2".into(), harness: copy }).unwrap();
+    assert!(!text.contains("mode"), "{text}");
+
+    // Two instances in one home, or one in the preset's own, overlap.
+    for home in ["~/.claude_2", "~/.claude"] {
+        let error = added("claude_3", "claude", home).unwrap_err().to_string();
+        assert!(error.contains("overlaps"), "{home}: {error}");
+    }
+    // Disabled, one may take its place; enabling it again is refused.
+    edit(&path, HarnessChange::Disable { name: "claude_2".into() }).unwrap();
+    added("claude_3", "claude", "~/.claude_2").unwrap();
+    assert!(
+        edit(&path, HarnessChange::Enable { name: "claude_2".into() }).unwrap_err().to_string().contains("overlaps")
+    );
+    // `home` alone re-roots the preset itself.
+    let claude = preset_harness("claude");
+    let moved = sk1ll_core::machine::rebase("claude", &claude, Some("claude"), Some("~/.config/claude")).unwrap();
+    let (text, cfg) = edit(&path, HarnessChange::Set { name: "claude".into(), harness: moved }).unwrap();
+    assert!(text.contains("[harnesses.claude]\nhome = \"~/.config/claude\"\n"), "{text}");
+    assert_eq!(cfg.effective()["claude"].harness.instructions.as_deref(), Some("~/.config/claude/rules"));
 }

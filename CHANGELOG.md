@@ -5,6 +5,32 @@ All notable changes to 0xSk1ll are listed here. The format follows
 [Semantic Versioning](https://semver.org/). Before 1.0, a minor version may
 break compatibility.
 
+## [Unreleased]
+
+### Added
+
+- Several config directories of one tool, such as a second Claude Code account
+  started with `CLAUDE_CONFIG_DIR=~/.claude_2`: a `machine.toml` entry with
+  `preset = "claude"` and `home = "~/.claude_2"` is a preset instance, which
+  gets the preset's skills, rules, format and mode under that directory, its
+  paths derived rather than written. `sk1ll harnesses add <name> --preset
+  <preset> --home <dir>` adds one, and `sk1ll harnesses` shows what each is an
+  instance of. `home` on a preset's own entry moves that preset.
+- A Harness has a kind: the preset it is or is an instance of. A Rule's
+  `harnesses: [claude]` reaches every Harness named or of kind `claude`.
+
+### Changed
+
+- Renaming a preset or a preset instance keeps its kind: the new entry is an
+  instance (`preset = "<kind>"`) instead of a custom Harness with copied
+  paths, and Rules naming the kind aren't reported as still routed to the old
+  name.
+- Changing the paths of an opt-in preset writes `preset = "<name>"` beside
+  them instead of pinning all four settings.
+- Machines report each Harness to the Server with its kind
+  (`{"name", "kind"}`), and join requests carry the same. A Server and its
+  Machines must be upgraded together.
+
 ## [0.2.0] - 2026-11-26
 
 ### Added

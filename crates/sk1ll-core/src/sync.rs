@@ -193,11 +193,14 @@ impl<'c> Selection<'c> {
     }
 
     /// Assignment picks rules by Item ID; a rule's own `harnesses:` restricts further.
-    fn rules_for(&self, assignment: &Assignment, harness: &str) -> Vec<&Rule> {
+    fn rules_for(&self, assignment: &Assignment, harness: &str, config: &Harness) -> Vec<&Rule> {
         let a = assignment.harness(harness);
+        let kind = config.kind.as_deref();
         self.rules
             .iter()
-            .filter(|f| f.applies_to(harness) && f.id.as_ref().map_or(a.new_rules_default, |id| a.rule_enabled(id)))
+            .filter(|f| {
+                f.applies_to(harness, kind) && f.id.as_ref().map_or(a.new_rules_default, |id| a.rule_enabled(id))
+            })
             .collect()
     }
 }
@@ -240,7 +243,7 @@ fn plan_with(
     for (hname, harness) in harnesses {
         plan_skills(repo, hname, harness, &sel, &sel.skills_for(assignment, hname), opts, &mut actions)?;
         if let Some(path) = harness.instructions_file() {
-            let rules = sel.rules_for(assignment, hname);
+            let rules = sel.rules_for(assignment, hname, harness);
             match harness.instructions_format {
                 InstructionsFormat::Block => plan_instructions(hname, &path, &rules, opts, &mut actions)?,
                 InstructionsFormat::Rules => plan_rules(repo, hname, &path, &rules, opts, &mut actions)?,
@@ -311,7 +314,7 @@ pub fn render_instructions(
         return Ok(Vec::new());
     };
     let sel = Selection::new(repo, None)?;
-    let rules = sel.rules_for(assignment, harness);
+    let rules = sel.rules_for(assignment, harness, h);
     Ok(match h.instructions_format {
         InstructionsFormat::Block => {
             instructions::render(&rules).map(|content| RenderedFile { path, content }).into_iter().collect()

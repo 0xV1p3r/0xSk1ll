@@ -53,8 +53,10 @@ pub struct Rule {
 }
 
 impl Rule {
-    pub fn applies_to(&self, harness: &str) -> bool {
-        self.harnesses.as_ref().is_none_or(|h| h.iter().any(|h| h == harness))
+    /// Whether the rule is for the harness `name` of `kind`: `harnesses:`
+    /// names either one (`claude` reaches every Claude Code config directory).
+    pub fn applies_to(&self, name: &str, kind: Option<&str>) -> bool {
+        self.harnesses.as_ref().is_none_or(|h| h.iter().any(|h| h == name || Some(h.as_str()) == kind))
     }
 }
 

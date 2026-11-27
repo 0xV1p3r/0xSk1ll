@@ -405,7 +405,7 @@ impl Daemon {
         }
         let draft = self.draft()?;
         let drafts = draft.iter().map(|entry| entry.item.clone()).collect();
-        let mut report = repo_report(&root, harnesses.keys().cloned().collect(), drafts)?;
+        let mut report = repo_report(&root, crate::join::reported_harnesses(&harnesses), drafts)?;
         if pending {
             // The partial checkout is not a Draft. Keep the last complete
             // inventory while the journal is active; `repo_report` already
@@ -572,7 +572,7 @@ pub(crate) async fn run(d: Arc<Daemon>) {
 /// Item ID yet (a reconcile writes one; none is ever derived), or two items
 /// share one (until `repair-ids`). A report with only those and `harnesses`
 /// filled in.
-fn repo_inventory(root: &Path, harnesses: Vec<String>) -> MachineReport {
+fn repo_inventory(root: &Path, harnesses: Vec<sk1ll_proto::ReportedHarness>) -> MachineReport {
     let inventory = sk1ll_core::item_id::working_inventory(root);
     let mut errors = inventory.errors;
     match Repo::open_git_only(root).and_then(|repo| repo.pull_pending()) {
@@ -607,7 +607,11 @@ fn repo_inventory(root: &Path, harnesses: Vec<String>) -> MachineReport {
     }
 }
 
-pub(super) fn repo_report(root: &Path, harnesses: Vec<String>, drafts: Vec<ItemRef>) -> Result<MachineReport> {
+pub(super) fn repo_report(
+    root: &Path,
+    harnesses: Vec<sk1ll_proto::ReportedHarness>,
+    drafts: Vec<ItemRef>,
+) -> Result<MachineReport> {
     Ok(MachineReport {
         baseline: plumbing::baseline(root)?,
         drafts,

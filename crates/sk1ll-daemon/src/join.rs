@@ -51,6 +51,16 @@ pub struct Joined {
     pub revision: u64,
 }
 
+/// The harnesses a Machine reports to the Server: names and kinds.
+pub(crate) fn reported_harnesses(
+    harnesses: &std::collections::BTreeMap<String, sk1ll_core::Harness>,
+) -> Vec<sk1ll_proto::ReportedHarness> {
+    harnesses
+        .iter()
+        .map(|(name, h)| sk1ll_proto::ReportedHarness { name: name.clone(), kind: h.kind.clone() })
+        .collect()
+}
+
 /// What the server granted, not yet stored.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Registered {
@@ -212,7 +222,8 @@ async fn register_inner(
     }
     let machine = MachineConfig::load(&cfg.machine_config)?;
     let machine_id = opts.machine_id.clone().unwrap_or_else(|| machine.id.clone());
-    let harnesses: Vec<String> = machine.harnesses().into_keys().collect();
+    let reported = reported_harnesses(&machine.harnesses());
+    let harnesses: Vec<String> = reported.iter().map(|h| h.name.clone()).collect();
     let http =
         crate::server::http_client().timeout(timeout).connect_timeout(std::time::Duration::from_secs(15)).build()?;
     // Created only now, after the local checks, so a refused join doesn't
@@ -223,7 +234,7 @@ async fn register_inner(
         ("", _) => bail!("a join code or the server's admin token is needed"),
         (code, _) => code.to_string(),
     };
-    let req = JoinRequest { code, machine_id, harnesses: harnesses.clone(), copy_from: opts.copy_from.clone() };
+    let req = JoinRequest { code, machine_id, harnesses: reported, copy_from: opts.copy_from.clone() };
     let resp = http.post(format!("{server_url}/api/join")).json(&req).send().await.map_err(|e| {
         anyhow::anyhow!(
             "join request failed (connection or total request timeout): {}",

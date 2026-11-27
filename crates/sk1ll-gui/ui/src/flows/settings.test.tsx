@@ -6,7 +6,7 @@ import type { HarnessChoice, HarnessPreview, PlacementView } from '../types';
 
 // A Harness added to machine.toml by hand.
 const custom = (): HarnessChoice => ({ name: 'agents', installed: true, enabled: true, preset: false, configured: true,
-  harness: { skills: '~/.agents/skills', instructions: null, instructions_format: 'block', mode: 'copy' } });
+  harness: { kind: null, home: null, skills: '~/.agents/skills', instructions: null, instructions_format: 'block', mode: 'copy' } });
 const row = (name: string) => within(screen.getByRole('cell', { name }).closest('tr')!);
 
 it('shows this Machine\'s details in order, copies diagnostics as text, and saves the preferred editor', async () => {
@@ -128,7 +128,7 @@ it('labels each Harness\'s origin, tucks away presets not on this Machine, and v
   const save = await dialog('Save tool?');
   expect(await save.findByText('/opt/tool/skills/code-review')).toBeTruthy();
   expect(daemon.sent('preview_harness').at(-1)).toEqual({ request: { change: { op: 'set', name: 'tool',
-    harness: { skills: '/opt/tool/skills', instructions: null, instructions_format: 'block', mode: 'copy' } } } });
+    harness: { kind: null, home: null, skills: '/opt/tool/skills', instructions: null, instructions_format: 'block', mode: 'copy' } } } });
   await user.click(save.getByRole('button', { name: 'Apply' }));
   expect(await screen.findByRole('cell', { name: 'tool' })).toBeTruthy();
 });

@@ -10,7 +10,8 @@ export interface MachineReport {
   seq: number; items: { item: ItemRef; id: ItemId }[];
   inventory_complete?: boolean; inventory_error?: string;
   baseline: string | null; drafts: ItemRef[]; unpushed: ItemRef[];
-  conflicts: { item: ItemRef; harness: string }[]; harnesses: string[];
+  // `kind`: the preset a Harness is, or is an instance of (`claude` for a second Claude Code config directory); null for a custom one.
+  conflicts: { item: ItemRef; harness: string }[]; harnesses: { name: string; kind: string | null }[];
   blocked: boolean; clashes: ItemRef[]; behind: boolean;
   push_refused?: string;
 }
@@ -94,7 +95,8 @@ export interface ConflictView {
 export interface ConflictTarget { harness: string; name: string }
 export interface HarnessView {
   name: string; origin: string;
-  harness: { skills: string | null; instructions: string | null; instructions_format: 'block' | 'rules'; mode: 'symlink' | 'copy' };
+  // `kind`: the preset it is, or is an instance of; `home`: that preset's config directory (both null for a custom Harness).
+  harness: { kind: string | null; home: string | null; skills: string | null; instructions: string | null; instructions_format: 'block' | 'rules'; mode: 'symlink' | 'copy' };
 }
 // `preset`: built in (machine.toml can only override or disable it); `configured`: machine.toml has an entry;
 // `available`: an opt-in preset (added after 0.1.0) that machine.toml doesn't enable, or gemini without its opt-in

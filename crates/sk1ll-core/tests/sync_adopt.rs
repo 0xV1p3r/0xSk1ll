@@ -32,6 +32,7 @@ fn adopt_turns_harness_edits_into_draft() {
         instructions: Some(out.join("rules").to_string_lossy().into_owned()),
         instructions_format: InstructionsFormat::Rules,
         mode: LinkMode::Copy,
+        ..Harness::default()
     };
     let b = Harness { instructions: Some(out.join("AGENTS.md").to_string_lossy().into_owned()), ..Harness::default() };
     let harnesses = BTreeMap::from([("h".to_string(), h), ("b".to_string(), b)]);

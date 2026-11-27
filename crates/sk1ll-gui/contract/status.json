@@ -116,8 +116,18 @@
           "rule:style"
         ],
         "harnesses": [
-          "claude",
-          "codex"
+          {
+            "kind": "claude",
+            "name": "claude"
+          },
+          {
+            "kind": "claude",
+            "name": "claude_2"
+          },
+          {
+            "kind": null,
+            "name": "agents"
+          }
         ],
         "inventory_complete": false,
         "inventory_error": "could not read ~/.codex/skills",
