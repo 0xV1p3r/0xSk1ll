@@ -24,16 +24,22 @@ break compatibility.
   instance. First-run setup offers it as on and writes its `preset` and
   `home`; anywhere else it is only listed (`sk1ll harnesses`, `--all`,
   Settings → Harnesses) until `sk1ll harnesses enable <name>` or **Enable**
-  adds it after the usual preview. No directory is ever globbed.
+  adds it after the usual preview. No directory is ever globbed. A candidate
+  overlapping what the change would be refused for (a harness that is on, a
+  preset that comes on once its directory exists, the skills repo, or a
+  candidate offered before it) is listed with why, and not offered.
 - A new Harness can start from another Harness's Assignment on the same
   Machine, both defaults and every toggle: `sk1ll harnesses add claude_2
   --preset claude --home ~/.claude_2 --copy-assignment-from claude` copies it
   before the first sync, so that sync places what `claude` has on, also on a
-  joined Machine. `sk1ll assign <harness> --copy-from <harness>` copies again
-  later (`--machine` for another fleet Machine's).
+  joined Machine. Only a Harness that isn't synced into yet is seeded with a
+  change, and `machine.toml` changes only once this Machine holds the copy.
+  `sk1ll assign <harness> --copy-from <harness>` copies again later, also onto
+  a Harness that is on (`--machine` for another fleet Machine's, refused if
+  that Machine joined again since its report was read).
 - Settings → Harnesses offers **Add another config folder** on each built-in
   preset: a folder, a name suggested from it and **Copy assignment from
-  <preset>**, on by default. Instances show their tool and folder (Claude
+  <preset>**, on by default when the preset is on. Instances show their tool and folder (Claude
   Code · ~/.claude_2) instead of Custom, and the Assignment matrix and Fleet
   mark each instance's tool.
 
@@ -48,9 +54,9 @@ break compatibility.
 - Machines report each Harness to the Server with its kind
   (`{"name", "kind"}`), and join requests carry the same. A Server and its
   Machines must be upgraded together.
-- The Server's `copy-from` accepts a target Harness the Machine hasn't
-  reported yet when the Machine copies within its own Assignment; it starts
-  from the all-off column a reported Harness gets.
+- The Server's `copy-from` accepts a source or target Harness the Machine
+  hasn't reported yet when the Machine copies within its own Assignment; it
+  reads as the all-off column a reported Harness gets.
 
 ## [0.2.0] - 2026-11-26
 

@@ -2157,6 +2157,15 @@ async fn copy_within_one_machine_seeds_a_harness_before_it_is_reported() {
     let claude = seeded.assignment.harness("claude").clone();
     assert_eq!(seeded.assignment.harness("claude_2"), &claude);
     assert!(seeded.entries.iter().all(|e| e.harness == "claude_2" && e.cause == LogCause::Change));
+    // From one it hasn't reported either (a preset that is off): its all-off column, as the Machine previews it.
+    let from_off = json!({"source":"solo","mode":"replace","harnesses":[{"from":"gemini","to":"gemini_2"}]});
+    assert_eq!(post(ADMIN, from_off.clone()).await.unwrap().status(), StatusCode::BAD_REQUEST);
+    let off: AssignmentUpdate = post(&token, from_off).await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(off.assignment.harness("gemini_2"), off.assignment.harness("gemini"));
+    // Only within its own Assignment: not into a new Harness from another Machine's.
+    let into_other = json!({"source":"solo","mode":"replace","harnesses":[{"from":"claude","to":"claude_2"}]});
+    let request = server.http().post(server.api("/machines/other/assignment/copy-from")).bearer_auth(&other);
+    assert_eq!(request.json(&into_other).send().await.unwrap().status(), StatusCode::BAD_REQUEST);
 
     // Its report then finds the column there: nothing is reset to all off.
     let mut ws = ws_connect(&server, &token).await;

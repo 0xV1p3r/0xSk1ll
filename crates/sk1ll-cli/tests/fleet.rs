@@ -137,6 +137,34 @@ fn another_repos_daemon_refuses_writes_and_allows_previews() {
     assert!(!target.exists());
 }
 
+/// `init` through a daemon waiting for its repo sets up as `init` without
+/// one does: the config directory an environment variable points at is
+/// added only on a Machine without the machine.toml the daemon manages.
+#[test]
+fn init_through_a_daemon_adds_a_config_directory_only_without_a_machine_toml() {
+    for configured in [true, false] {
+        let machine = Machine::new();
+        let dir = machine.home.path().join(".claude_2");
+        fs::create_dir_all(&dir).unwrap();
+        fs::remove_dir_all(machine.repo.root()).unwrap();
+        if !configured {
+            fs::remove_file(machine.machine_toml()).unwrap();
+        }
+        let before = fs::read_to_string(machine.machine_toml()).ok();
+        let daemon = runtime().block_on(RunningDaemon::start(&machine, machine.repo.root()));
+        let mut init = command_for(&machine, machine.repo.root(), &daemon.socket, &["init"]);
+        outcome(init.env("CLAUDE_CONFIG_DIR", &dir).output().unwrap()).unwrap();
+        assert!(machine.repo.root().join(".git").exists());
+        let text = fs::read_to_string(machine.machine_toml()).ok();
+        match configured {
+            true => assert_eq!(text, before),
+            false => {
+                assert_eq!(text.as_deref(), Some("[harnesses.claude_2]\npreset = \"claude\"\nhome = \"~/.claude_2\"\n"))
+            }
+        }
+    }
+}
+
 /// Joining without a repo is first-run setup: the config directory an
 /// environment variable points at is added, and the join registers it.
 #[test]
@@ -444,6 +472,52 @@ fn assignment_copy_confirms_with_both_reviewed_registrations_and_revisions() {
         } else {
             assert_eq!(requests.len(), 2);
             assert_eq!(out, "work already matches home's Assignment; nothing to copy\n");
+        }
+    }
+}
+
+/// `assign --copy-from --machine` checks both names in one report and
+/// copies only to that registration, at the revision its preview read: a
+/// rejoin in between leaves the new registration's column alone.
+#[test]
+fn copying_within_another_machine_is_guarded_by_its_registration_and_revision() {
+    let machine = Machine::new();
+    for rejoined in [false, true] {
+        let socket = machine.root().join(format!("copy-within-{rejoined}.sock"));
+        let reported = json!({"harnesses":[{"name":"claude","kind":"claude"},{"name":"claude_2","kind":"claude"}]});
+        let row = json!({"id":"home","status":"in_sync","connected":true,"joined_at":1,"last_seen":2,
+            "report":reported,"scope":"fleet","registration":"first"});
+        let expected = json!({"revision": 7, "registration": if rejoined { "second" } else { "first" }});
+        let daemon = DaemonStub::start(
+            &socket,
+            vec![
+                ("GET /status", StatusCode::OK, status(&machine, "joined")),
+                ("GET /fleet", StatusCode::OK, json!({"baseline":null,"machines":[row]})),
+                (
+                    "POST /machines/home/assignment/copy-from/preview",
+                    StatusCode::OK,
+                    json!({"count":1,"changes":[],"target":expected,"source":expected}),
+                ),
+                (
+                    "POST /machines/home/assignment/copy-from",
+                    StatusCode::OK,
+                    json!({"revision":8,"assignment":{"harnesses":{}},"entries":[]}),
+                ),
+            ],
+        );
+        let out = run_on(&machine, &socket, &["assign", "claude_2", "--copy-from", "claude", "--machine", "home"]);
+        let requests = daemon.requests.lock().unwrap();
+        assert_eq!(requests.iter().filter(|(_, path, _)| path == "/fleet").count(), 1, "one report for both names");
+        let copies: Vec<_> =
+            requests.iter().filter(|(_, path, _)| path == "/machines/home/assignment/copy-from").collect();
+        if rejoined {
+            assert!(out.unwrap_err().contains("home joined the fleet again just now"));
+            assert!(copies.is_empty());
+        } else {
+            out.unwrap();
+            let body = json!({"source":"home","mode":"replace","harnesses":[{"from":"claude","to":"claude_2"}],
+                "expected":expected,"source_expected":expected});
+            assert_eq!(copies, [&("POST".into(), "/machines/home/assignment/copy-from".into(), body)]);
         }
     }
 }

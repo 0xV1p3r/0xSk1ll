@@ -142,6 +142,9 @@ impl AssignmentStore for ServerAssignment {
     }
 
     fn save(&self, snap: &AssignmentSnapshot) -> Result<()> {
+        if let Some(e) = sk1ll_core::failpoint_error!(DaemonSnapshotSave, &self.snapshot) {
+            return Err(Error::Internal(anyhow::Error::new(e).context("saving the assignment snapshot")));
+        }
         state::save_snapshot(&self.snapshot, snap, Some(&self.owner))?;
         self.write_mirror(snap);
         Ok(())

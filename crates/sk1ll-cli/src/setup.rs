@@ -174,10 +174,14 @@ fn choose_harnesses(input: &mut Input, machine_config: &Path, session: &Session,
         if !input.yes(&format!("  Sync {} ({what}: {paths})?", c.name), !existing)? {
             continue;
         }
-        if existing {
-            apply_change(session, c.change())?;
-        } else {
-            session.block(session.client.add_setup_instance(&c.name, &c.harness))?;
+        let added = match existing {
+            true => apply_change(session, c.change()).map(drop),
+            false => session.block(session.client.add_setup_instance(&c.name, &c.harness)).map(drop),
+        };
+        // One the engine refuses (it overlaps one kept before it) is skipped, not the rest.
+        match added {
+            Err(e) if crate::harnesses::refused(&e) => println!("  {} ({what}): not added: {e:#}", c.name),
+            added => added?,
         }
     }
     if !missing.is_empty() {

@@ -2049,6 +2049,12 @@ async fn setup_chooses_harnesses_only_before_the_repo_exists() {
     assert_eq!(m.client.add_setup_instance("claude_2", &instance).await.unwrap_err().status, Some(409));
     let custom = sk1ll_core::Harness { kind: None, home: None, ..instance.clone() };
     assert_eq!(m.client.add_setup_instance("mine", &custom).await.unwrap_err().status, Some(400));
+    // Checked as any harness change: nothing syncs into the skills repo.
+    let in_repo = sk1ll_core::machine::preset_instance("claude", Some(m.repo().to_str().unwrap())).unwrap();
+    let error = m.client.add_setup_instance("in_repo", &in_repo).await.unwrap_err();
+    assert_eq!(error.status, Some(400), "{}", error.message);
+    assert!(error.message.contains("overlaps the skills repo"), "{}", error.message);
+    assert!(!std::fs::read_to_string(&path).unwrap().contains("in_repo"));
 
     m.client.init().await.unwrap();
     // Setup ended: the opt-in presets it kept on are enabled in machine.toml.
@@ -2123,20 +2129,27 @@ async fn harnesses_change_after_setup_with_a_preview_of_what_stays() {
         mode: sk1ll_core::LinkMode::Copy,
         ..Default::default()
     };
-    let mut stream = tokio::net::UnixStream::connect(m.client.socket()).await.unwrap();
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let body = r#"{"change":{"op":"disable","name":"agent"}}"#;
-    let request = format!(
-        "POST /harnesses/apply HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n{}: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-        sk1ll_daemon::client::API_HEADER,
-        sk1ll_daemon::client::API_VERSION,
-        body.len()
-    );
-    stream.write_all(request.as_bytes()).await.unwrap();
-    let mut response = String::new();
-    stream.read_to_string(&mut response).await.unwrap();
-    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
-    assert!(response.contains("this client is older than the daemon; update it"), "{response}");
+    // A request without the preview's fingerprint changes nothing, a copy it asks for included.
+    let revision = m.client.status().await.unwrap().assignment_revision;
+    for body in [
+        r#"{"change":{"op":"disable","name":"agent"}}"#,
+        r#"{"change":{"op":"enable","name":"codex"},"copy_assignment_from":"agent"}"#,
+    ] {
+        let mut stream = tokio::net::UnixStream::connect(m.client.socket()).await.unwrap();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let request = format!(
+            "POST /harnesses/apply HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n{}: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            sk1ll_daemon::client::API_HEADER,
+            sk1ll_daemon::client::API_VERSION,
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert!(response.contains("this client is older than the daemon; update it"), "{response}");
+    }
+    assert_eq!(m.client.status().await.unwrap().assignment_revision, revision, "nothing copied");
 
     let mut add = HarnessChangeRequest {
         copy_assignment_from: None,

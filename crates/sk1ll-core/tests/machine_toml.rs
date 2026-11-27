@@ -147,7 +147,7 @@ fn harness_changes_keep_the_file_and_write_only_what_differs() {
 /// Makes `change` to the `machine.toml` at `path` with `home` as home.
 fn edit(path: &Path, change: HarnessChange) -> Result<(String, MachineConfig)> {
     let snapshot = Snapshot::take(path)?;
-    let edit = MachineConfig::edit(&snapshot, &change)?;
+    let edit = MachineConfig::edit(&snapshot, &change, &path.with_file_name("sk1ll-repo"))?;
     edit.write(&snapshot)?;
     Ok((edit.text, edit.config))
 }
@@ -467,9 +467,10 @@ fn machine_toml_reports_malformed_fields_at_the_config_path() {
 
 #[test]
 fn invalid_harness_edits_name_the_problem_and_preserve_machine_toml() {
-    let Some(_home) = isolated_home("invalid_harness_edits_name_the_problem_and_preserve_machine_toml", &[]) else {
+    let Some(home) = isolated_home("invalid_harness_edits_name_the_problem_and_preserve_machine_toml", &[]) else {
         return;
     };
+    let repo = home.join("repo");
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join(MACHINE_FILE);
     let before = "# mine\nid = 'box'\n";
@@ -494,6 +495,8 @@ fn invalid_harness_edits_name_the_problem_and_preserve_machine_toml() {
         (instance("work", "claude", "~/"), "must not be the home directory"),
         (instance("work", "claude", "~/a/../b"), "must not contain"),
         (instance("work", "claude", "work"), "must be absolute or start with"),
+        // Nothing syncs into the skills repo.
+        (put("work", Some("~/repo/skills")), "overlaps the skills repo"),
         (
             HarnessChange::Set {
                 name: "work".into(),
@@ -502,7 +505,7 @@ fn invalid_harness_edits_name_the_problem_and_preserve_machine_toml() {
             "needs a preset",
         ),
     ] {
-        let error = MachineConfig::write_change(&path, &edit).unwrap_err();
+        let error = MachineConfig::write_change(&path, &edit, &repo).unwrap_err();
         assert!(error.to_string().contains(detail), "{error}");
         assert_eq!(fs::read_to_string(&path).unwrap(), before);
     }
@@ -714,8 +717,12 @@ fn moving_a_harness_keeps_only_what_its_entry_sets() {
 /// `<preset>-<n>`), with what it overlaps.
 #[test]
 fn environment_config_directories_become_candidates() {
-    let dirs = [".claude/skills", ".claude_2", ".Codex Work", "work/claude", ".copilot-x", "repo"];
+    let dirs =
+        [".claude/skills", ".claude_2/skills", ".Codex Work", "work/claude", ".copilot-x", "repo", ".config", "work2"];
     let Some(home) = isolated_home("environment_config_directories_become_candidates", &dirs) else { return };
+    // Its skills directory leads to ~/.config, around opencode's, which is detected once ~/.config/opencode exists.
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(home.join(".config"), home.join("work2/skills")).unwrap();
     let cfg = config("id = \"box\"\n[harnesses.copilot_x]\npreset = \"copilot\"\nhome = \"~/.copilot-x\"\n");
     let choices = cfg.choices();
     let at = |rel: &str| home.join(rel).into_os_string().into_string().unwrap();
@@ -735,6 +742,11 @@ fn environment_config_directories_become_candidates() {
         ),
         (vec![("CODEX_HOME", at(".claude/skills"))], vec![("skills", "~/.claude/skills", Some("overlaps claude"))]),
         (vec![("CODEX_HOME", at("repo"))], vec![("repo", "~/repo", Some("overlaps the skills repo"))]),
+        // One inside another offered before it: only the first is offered.
+        (
+            vec![("CLAUDE_CONFIG_DIR", at(".claude_2")), ("CODEX_HOME", at(".claude_2/skills"))],
+            vec![("claude_2", "~/.claude_2", None), ("skills", "~/.claude_2/skills", Some("overlaps claude_2"))],
+        ),
         // The preset's own home, a configured harness's, none, the home itself.
         (vec![("CLAUDE_CONFIG_DIR", at(".claude"))], vec![]),
         (vec![("COPILOT_HOME", at(".copilot-x"))], vec![]),
@@ -749,6 +761,20 @@ fn environment_config_directories_become_candidates() {
         let found: Vec<_> =
             found.iter().map(|c| (c.name.as_str(), c.harness.home.as_deref().unwrap(), c.warning.as_deref())).collect();
         assert_eq!(found, expected, "{env:?}");
+    }
+    // A preset that isn't installed yet comes on by itself once it is: the writer refuses to overlap it, so
+    // it is never offered.
+    #[cfg(unix)]
+    {
+        let found = sk1ll_core::machine::candidates(&choices, &home.join("repo"), |var| {
+            (var == "CLAUDE_CONFIG_DIR").then(|| at("work2").into())
+        });
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].warning.as_deref(), Some("overlaps opencode"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MACHINE_FILE);
+        let refused = edit(&path, found[0].change()).unwrap_err().to_string();
+        assert!(refused.contains("`opencode` uses"), "{refused}");
     }
     // Added as it is offered: an instance of its preset in that home.
     let found = sk1ll_core::machine::candidates(&choices, &home.join("repo"), |var| {

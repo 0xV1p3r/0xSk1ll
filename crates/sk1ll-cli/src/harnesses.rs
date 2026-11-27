@@ -171,13 +171,20 @@ pub(crate) fn adopt_candidates(s: &Session) -> Result<()> {
     for c in env_candidates(&choices, &s.status.repo) {
         match &c.warning {
             Some(warning) => eprintln!("{} ({}): not added: {warning}", c.name, describe(&c)),
-            None => {
-                s.block(s.client.add_setup_instance(&c.name, &c.harness))?;
-                eprintln!("added harness {} ({})", c.name, describe(&c));
-            }
+            None => match s.block(s.client.add_setup_instance(&c.name, &c.harness)) {
+                Ok(_) => eprintln!("added harness {} ({})", c.name, describe(&c)),
+                Err(e) if refused(&e) => eprintln!("{} ({}): not added: {e:#}", c.name, describe(&c)),
+                Err(e) => return Err(e),
+            },
         }
     }
     Ok(())
+}
+
+/// Whether the engine refused a change itself (it overlaps, or exists
+/// already), rather than failing to answer: setup skips that one candidate.
+pub(crate) fn refused(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<sk1ll_daemon::client::ClientError>().is_some_and(|c| matches!(c.status, Some(400 | 409)))
 }
 
 /// `sk1ll harnesses [--all] [<command>]`.

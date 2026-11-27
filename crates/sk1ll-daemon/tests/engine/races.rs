@@ -599,3 +599,52 @@ fn a_credentials_collision_restores_the_original_and_saves_edits_to_the_replacem
         assert_eq!(c.status().await.unwrap().mode, DaemonMode::Standalone);
     });
 }
+
+/// A joined Machine seeding a Harness it adds changes `machine.toml` only
+/// once it has installed the Server's copy itself: otherwise the sync after
+/// the change would plan with the Assignment from before it. The error says
+/// that the Server kept the copy.
+#[test]
+fn a_joined_add_waits_until_its_copy_is_installed() {
+    use sk1ll_daemon::{JoinOptions, join};
+    use sk1ll_testkit::server::{ADMIN, Server};
+
+    let (m, cfg) = fixture();
+    let _home = m.home.enter();
+    let repo = m.repo.root();
+    std::fs::remove_dir_all(repo).unwrap();
+    runtime(m.home.dirs()).block_on(async {
+        let server = Server::start().await;
+        let code = server.join_code().await;
+        let (server_url, machine_id) = (server.url(), Some("test".into()));
+        let opts = JoinOptions { server_url, code, admin_token: None, machine_id, copy_from: None, repo: repo.into() };
+        join(&cfg, opts).await.unwrap();
+        let engine = writer(&cfg);
+        let c = engine.client();
+        c.set_harness_assignment("agent", true).await.unwrap();
+        let before = std::fs::read_to_string(&cfg.machine_config).unwrap();
+        let instance = sk1ll_core::machine::preset_instance("claude", Some("~/.claude_2")).unwrap();
+        let mut req = HarnessChangeRequest {
+            change: HarnessChange::Set { name: "claude_2".into(), harness: instance },
+            fingerprint: None,
+            copy_assignment_from: Some("agent".into()),
+        };
+        req.fingerprint = Some(c.preview_harness(&req).await.unwrap().fingerprint);
+        let snapshot = cfg.snapshot_path();
+        let _unsaved = failpoints::install_shared(move |point, path| match point == Point::DaemonSnapshotSave {
+            true if path == snapshot => Action::Fail(std::io::ErrorKind::PermissionDenied),
+            _ => Action::Continue,
+        });
+        let error = c.apply_harness(&req).await.unwrap_err();
+        assert!(
+            error.message.contains("claude_2 now has agent's Assignment, but machine.toml was not changed"),
+            "{error}"
+        );
+        assert!(error.message.contains("this Machine couldn't install that revision"), "{error}");
+        assert_eq!(std::fs::read_to_string(&cfg.machine_config).unwrap(), before);
+        assert!(!m.home.path().join(".claude_2").exists(), "nothing synced into it");
+        let stored = server.http().get(format!("{}/api/machines/test/assignment", server.url())).bearer_auth(ADMIN);
+        let stored: sk1ll_proto::AssignmentSnapshot = stored.send().await.unwrap().json().await.unwrap();
+        assert_eq!(stored.assignment.harness("claude_2"), stored.assignment.harness("agent"), "the Server kept it");
+    });
+}

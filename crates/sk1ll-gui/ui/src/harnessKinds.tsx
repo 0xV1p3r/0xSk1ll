@@ -5,12 +5,14 @@ import type { HarnessView, MachineReport } from './types';
 
 export type ReportedHarness = MachineReport['harnesses'][number];
 
-// The tool each built-in preset is for, by kind.
-const toolNames: Record<string, string> = {
+// The tool each built-in preset is for, by kind. A Map, not an object: a kind comes from other Machines' reports, and
+// one such as `constructor` must not find an inherited property.
+const toolNames = new Map(Object.entries({
   claude: 'Claude Code', codex: 'Codex', opencode: 'OpenCode', gemini: 'Gemini CLI', copilot: 'Copilot CLI',
   cursor: 'Cursor', amp: 'Amp', kiro: 'Kiro', cline: 'Cline', roo: 'Roo Code',
-};
-export const toolName = (kind: string) => toolNames[kind] ?? kind;
+}));
+// An unknown kind (a newer sk1ll's preset, say) reads as itself.
+export const toolName = (kind: string) => toolNames.get(kind) ?? kind;
 
 // The kind of a Harness that isn't the preset of its own name: a preset instance, or a renamed preset.
 export const instanceKind = (h: { name: string; kind: string | null }) => h.kind && h.kind !== h.name ? h.kind : null;

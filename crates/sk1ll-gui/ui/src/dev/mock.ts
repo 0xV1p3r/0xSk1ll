@@ -160,6 +160,10 @@ export function installMock(scenario: string, options: MockOptions = {}): MockDa
   let fileRevision = 0;
   const latency = options.latency ?? 1;
   // Answers are copies, as if they crossed the wire: later changes to the mock's state don't reach what the App holds.
+  // As the Daemon: only a Harness that isn't synced into yet takes another's Assignment with its change.
+  const copyRefused = ({ change, copy_assignment_from: from }: T.HarnessChangeRequest) => from && setupHarnesses.some(h => h.name === change.name && h.enabled)
+    ? Promise.reject({ status: 400, message: `\`${change.name}\` is on already, so a change to it can't copy an Assignment; make the change, then copy with \`sk1ll assign ${change.name} --copy-from ${from}\`` })
+    : undefined;
   const delay = <V,>(value: V, ms = 250) => new Promise<V>(resolve => setTimeout(() => resolve(structuredClone(value)), ms * latency));
   const overrides = new Map<string, (args: Args) => unknown>();
   const daemon: MockDaemon = {
@@ -506,9 +510,11 @@ export function installMock(scenario: string, options: MockOptions = {}): MockDa
       case 'notifications_enabled': return delay(notificationsEnabled);
       case 'set_notifications': notificationsEnabled = Boolean(a.enabled); return delay(notificationsEnabled);
       case 'harness_settings': return delay({ path: machineConfig, harnesses: setupHarnesses });
-      case 'preview_harness': return delay(harnessPreview((a.request as T.HarnessChangeRequest).change), 400);
+      case 'preview_harness': return copyRefused(a.request as T.HarnessChangeRequest) ?? delay(harnessPreview((a.request as T.HarnessChangeRequest).change), 400);
       // Take out first turns the Harness's items off, so sync removes what it placed, then applies the change.
       case 'apply_harness': case 'take_out_harness': {
+        const refused = copyRefused(a.request as T.HarnessChangeRequest);
+        if (refused) return refused;
         const { change, fingerprint, copy_assignment_from: from } = a.request as T.HarnessChangeRequest;
         const preview = harnessPreview(change);
         if (fingerprint !== preview.fingerprint)

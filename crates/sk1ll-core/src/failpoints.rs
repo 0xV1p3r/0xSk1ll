@@ -224,6 +224,9 @@ points! {
     /// The machine-local assignment store: before a write is swapped in.
     /// Path: the store file.
     DaemonStoreBeforeSwap,
+    /// A joined Machine storing an Assignment snapshot the Server sent or
+    /// confirmed. Path: the snapshot file. Failing it fails the save.
+    DaemonSnapshotSave => fault,
     /// Joining: after the snapshot was taken, before the daemon state is
     /// saved. Path: the daemon state file. Failing it fails the join there.
     DaemonJoinAfterSnapshot => fault,

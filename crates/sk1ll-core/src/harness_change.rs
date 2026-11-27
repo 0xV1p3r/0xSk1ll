@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::config_file::Snapshot;
-use crate::machine::{Harness, HarnessChange, InstructionsFormat, MachineConfig, overlaps, real};
+use crate::machine::{Harness, HarnessChange, InstructionsFormat, MachineConfig, real};
 use crate::sync::{self, Action, PlanOptions};
 use crate::{Assignment, Error, Repo, Result};
 
@@ -60,11 +60,8 @@ fn plan_snapshot(
 ) -> Result<ChangePlan> {
     let name = change.name();
     let before = MachineConfig::from_snapshot(&snapshot)?.harnesses();
-    let edit = MachineConfig::edit(&snapshot, change)?;
+    let edit = MachineConfig::edit(&snapshot, change, repo.root())?;
     let after = edit.config.harnesses();
-    if let Some(h) = after.get(name) {
-        check_outside_repo(repo, name, h)?;
-    }
     let mut placed = Vec::new();
     let mut warnings = Vec::new();
     if let Some(old) = before.get(name) {
@@ -162,19 +159,4 @@ fn left_part(old: &Harness, after: &BTreeMap<String, Harness>) -> Harness {
         instructions: old.instructions.clone().filter(|_| !used.iter().any(|(_, i)| i.is_some() && *i == instructions)),
         ..old.clone()
     }
-}
-
-/// Syncing into the repo itself would mix harness copies with repo content.
-fn check_outside_repo(repo: &Repo, name: &str, h: &Harness) -> Result<()> {
-    for path in [h.skills_dir(), h.instructions_file()].into_iter().flatten() {
-        let path = real(&path);
-        if overlaps(&path, repo.root()) {
-            return Err(Error::Invalid(format!(
-                "`{name}` can't sync into {}: it overlaps the skills repo {}",
-                path.display(),
-                repo.root().display()
-            )));
-        }
-    }
-    Ok(())
 }

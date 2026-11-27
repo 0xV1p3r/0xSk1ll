@@ -115,8 +115,15 @@ export function SetupWizard({ status, onDone }: { status: StatusView; onDone: (r
   const [found, setFound] = useState<HarnessCandidate[]>([]);
   const [declined, setDeclined] = useState<string[]>([]);
   const kept = found.filter(c => !c.warning && !declined.includes(c.name));
+  // Bumped after a save that stopped part way: the step lists again what is a Harness now and what is still found.
+  const [harnessRevision, setHarnessRevision] = useState(0);
   const continueToDetails = () => void harnessSave.run(async () => {
-    for (const c of kept) await api.addSetupInstance(c.name, c.harness);
+    try {
+      for (const c of kept) await api.addSetupInstance(c.name, c.harness);
+    } catch (error) {
+      setHarnessRevision(n => n + 1);
+      throw error;
+    }
   }, () => setStep('details'));
   const [path, setPath] = useState<SetupPath>('local');
   if (step === 'path') return <Frame wide step="Step 1 of 3" title="Set up this Machine" description="0xSk1ll keeps your agent Skills and Rules in one git repo and syncs them into every Harness.">
@@ -132,7 +139,7 @@ export function SetupWizard({ status, onDone }: { status: StatusView; onDone: (r
     <div><Button onClick={() => setStep('harnesses')}>Continue</Button></div>
   </Frame>;
   if (step === 'harnesses') return <Frame wide step="Step 2 of 3" title="Choose Harnesses" description="Sync places Skills and Rules into each Harness you keep on. Harnesses are saved in this Machine's machine.toml.">
-    <HarnessStep toggle={harnessSave} onFound={setFound} declined={declined} setDeclined={setDeclined} />
+    <HarnessStep revision={harnessRevision} toggle={harnessSave} onFound={setFound} declined={declined} setDeclined={setDeclined} />
     <div className="flex gap-2"><Button variant="outline" disabled={harnessSave.pending} onClick={() => setStep('path')}><ArrowLeft data-icon="inline-start" />Back</Button><Button disabled={harnessSave.pending} onClick={continueToDetails}>Continue</Button></div>
   </Frame>;
   return <DetailsStep path={path} status={status} back={() => setStep('harnesses')} onDone={onDone} />;
@@ -140,11 +147,11 @@ export function SetupWizard({ status, onDone }: { status: StatusView; onDone: (r
 
 const loadSetupCandidates = () => api.harnessCandidates(true);
 
-function HarnessStep({ toggle, onFound, declined, setDeclined }: {
-  toggle: ReturnType<typeof useMutation>; onFound: (found: HarnessCandidate[]) => void; declined: string[]; setDeclined: (update: (declined: string[]) => string[]) => void;
+function HarnessStep({ revision, toggle, onFound, declined, setDeclined }: {
+  revision: number; toggle: ReturnType<typeof useMutation>; onFound: (found: HarnessCandidate[]) => void; declined: string[]; setDeclined: (update: (declined: string[]) => string[]) => void;
 }) {
-  const choices = useResource(api.setupHarnesses, 0);
-  const candidates = useResource(loadSetupCandidates, 0);
+  const choices = useResource(api.setupHarnesses, revision);
+  const candidates = useResource(loadSetupCandidates, revision);
   const [changing, setChanging] = useState<string>();
   useEffect(() => { onFound(candidates.data ?? []); }, [candidates.data, onFound]);
   if (choices.loading && !choices.data) return <Loading rows={2} />;
