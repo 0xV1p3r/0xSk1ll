@@ -1,5 +1,5 @@
 import { useCallback, useState, type ReactNode } from 'react';
-import { FileCog, Plus } from 'lucide-react';
+import { FileCog, FolderPlus, Plus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Checkbox } from '@/components/ui/checkbox';
@@ -12,12 +12,16 @@ import { toast } from './toast';
 import { api, errorStatus } from './api';
 import { useMutation, useResource } from './hooks';
 import { ErrorNotice, Loading, Pending } from './shared';
+import { InstanceDialog } from './HarnessInstance';
+import { toolName } from './harnessKinds';
 import type { HarnessChange, HarnessChoice, HarnessTakenOut, HarnessView, PlacementView } from './types';
 
 type HarnessPaths = HarnessView['harness'];
 
 // What the table says about where a Harness comes from.
 export function harnessOrigin(h: HarnessChoice): string {
+  // A preset instance: another config folder of a preset's tool.
+  if (!h.preset && h.harness.kind) return `${toolName(h.harness.kind)} · ${h.harness.home}`;
   if (!h.preset) return 'Custom';
   if (h.available && !h.enabled) return h.installed ? 'Opt-in preset' : 'Opt-in preset, not detected';
   if (h.configured) return 'Preset, adjusted';
@@ -39,6 +43,9 @@ export function HarnessPanel({ revision, editorId, changed, actions }: {
   const [showAll, setShowAll] = useState(false);
   const [editing, setEditing] = useState<{ name: string; harness: HarnessPaths; existing: boolean }>();
   const [change, setChange] = useState<HarnessChange>();
+  // A new preset instance: the preset it copies, and the Harness whose Assignment its change copies first.
+  const [instanceOf, setInstanceOf] = useState<HarnessChoice>();
+  const [copyFrom, setCopyFrom] = useState<string>();
   const open = useMutation();
   const all = settings.data?.harnesses ?? [];
   const visible = all.filter(h => showAll || h.enabled || h.installed || h.configured);
@@ -64,6 +71,7 @@ export function HarnessPanel({ revision, editorId, changed, actions }: {
         {h.available && <p className="text-xs text-muted-foreground">{h.enabled ? 'Its skills directory is available.' : 'Available: off until you enable it.'}</p>}</TableCell>
       <TableCell className="whitespace-normal"><div className="flex flex-wrap justify-end gap-1">{actions?.(h)}
         {h.available && <Button variant="ghost" size="sm" aria-label={h.enabled ? `Sync ${h.name}'s skills directory too` : `Enable ${h.name}`} onClick={() => setChange({ op: 'enable', name: h.name })}>{h.enabled ? 'Add skills' : 'Enable'}</Button>}
+        {h.preset && <Button variant="ghost" size="sm" aria-label={`Add another config folder for ${h.name}`} onClick={() => setInstanceOf(h)}><FolderPlus data-icon="inline-start" />Add another config folder</Button>}
         <Button variant="ghost" size="sm" aria-label={`Edit ${h.name}`} onClick={() => setEditing({ name: h.name, harness: h.harness, existing: true })}>Edit</Button>
         {h.configured && <Button variant="ghost" size="sm" aria-label={`${h.preset ? 'Reset' : 'Remove'} ${h.name}`} onClick={() => setChange({ op: 'remove', name: h.name })}>{h.preset ? 'Reset' : 'Remove'}</Button>}</div></TableCell>
     </TableRow>)}</TableBody></Table></div>}
@@ -77,7 +85,9 @@ export function HarnessPanel({ revision, editorId, changed, actions }: {
     {(hidden > 0 || showAll) && <div><Button variant="ghost" size="sm" onClick={() => setShowAll(value => !value)}>{showAll ? 'Hide presets not found on this Machine' : `Show ${hidden} more preset${hidden === 1 ? '' : 's'}`}</Button></div>}
     {editing && <HarnessDialog initial={editing} preset={all.find(h => h.name === editing.name)?.preset ?? false} taken={all.map(h => h.name)}
       onClose={() => setEditing(undefined)} onSubmit={next => { setEditing(undefined); setChange(next); }} />}
-    {change && <ChangeDialog change={change} onClose={() => setChange(undefined)} onApplied={() => { setChange(undefined); void settings.refresh(); void candidates.refresh(); changed(); }} />}
+    {instanceOf && <InstanceDialog preset={instanceOf} taken={all.map(h => h.name)} onClose={() => setInstanceOf(undefined)}
+      onSubmit={(next, from) => { setInstanceOf(undefined); setCopyFrom(from); setChange(next); }} />}
+    {change && <ChangeDialog change={change} copyFrom={copyFrom} onClose={() => { setChange(undefined); setCopyFrom(undefined); }} onApplied={() => { setChange(undefined); setCopyFrom(undefined); void settings.refresh(); void candidates.refresh(); changed(); }} />}
   </div>;
 }
 
@@ -102,7 +112,9 @@ function HarnessDialog({ initial, preset, taken, onClose, onSubmit }: {
   };
   return <Dialog open onOpenChange={next => { if (!next) onClose(); }}>
     <DialogContent><DialogHeader><DialogTitle>{initial.existing ? `Edit ${initial.name}` : 'Add a Harness'}</DialogTitle>
-      <DialogDescription>{preset ? 'Changes to a preset are saved as an override in machine.toml. Reset returns it to the built-in paths.' : 'A custom Harness is saved in machine.toml.'} The next step shows what sync will do.</DialogDescription></DialogHeader>
+      <DialogDescription>{preset ? 'Changes to a preset are saved as an override in machine.toml. Reset returns it to the built-in paths.'
+        : initial.harness.kind ? `Another ${toolName(initial.harness.kind)} config folder (${initial.harness.home}): it keeps its preset and folder, and changes here are saved as overrides in machine.toml.`
+        : 'A custom Harness is saved in machine.toml.'} The next step shows what sync will do.</DialogDescription></DialogHeader>
       <form onSubmit={e => { e.preventDefault(); submit(); }}><FieldGroup>
         <Field><FieldLabel htmlFor="harness-name">Name</FieldLabel><Input id="harness-name" required value={name} disabled={initial.existing} onChange={e => setName(e.target.value)} placeholder="agents" /></Field>
         <Field><FieldLabel htmlFor="harness-skills">Skills directory</FieldLabel><Input id="harness-skills" value={skills} onChange={e => setSkills(e.target.value)} placeholder="~/.agents/skills" aria-describedby="harness-skills-hint" />
@@ -122,9 +134,11 @@ const changeTitle = (change: HarnessChange) => ({
 })[change.op];
 
 // The confirmation step: what sk1ll placed where the change stops syncing, and what sync does next. A disable or
-// remove can take that content out first (Take out), or leave it in place, unmanaged.
-export function ChangeDialog({ change, onClose, onApplied }: { change: HarnessChange; onClose: () => void; onApplied: () => void }) {
-  const load = useCallback(() => api.previewHarness({ change }), [change]);
+// remove can take that content out first (Take out), or leave it in place, unmanaged. With `copyFrom`, the changed
+// Harness first gets that Harness's Assignment, and the preview plans with it.
+export function ChangeDialog({ change, copyFrom, onClose, onApplied }: { change: HarnessChange; copyFrom?: string; onClose: () => void; onApplied: () => void }) {
+  const copy = copyFrom ? { copy_assignment_from: copyFrom } : {};
+  const load = useCallback(() => api.previewHarness(copyFrom ? { change, copy_assignment_from: copyFrom } : { change }), [change, copyFrom]);
   const preview = useResource(load, 0);
   const [failed, setFailed] = useState<string[]>();
   const [notTakenOut, setNotTakenOut] = useState<HarnessTakenOut>();
@@ -148,7 +162,7 @@ export function ChangeDialog({ change, onClose, onApplied }: { change: HarnessCh
       throw error;
     }
   };
-  const applyChange = () => void apply.run(() => conflictAware(() => api.applyHarness({ change, fingerprint: preview.data?.fingerprint })), result => {
+  const applyChange = () => void apply.run(() => conflictAware(() => api.applyHarness({ change, fingerprint: preview.data?.fingerprint, ...copy })), result => {
     if (result.errors.length) return setFailed(result.errors);
     toast({ title: 'Harness changed', description: 'The Harnesses are synced.' });
     onApplied();
@@ -163,6 +177,7 @@ export function ChangeDialog({ change, onClose, onApplied }: { change: HarnessCh
   return <Dialog open onOpenChange={next => { if (!next && !busy) onClose(); }}>
     <DialogContent showCloseButton={!busy} className="sm:max-w-2xl"><DialogHeader><DialogTitle>{changeTitle(change)}</DialogTitle>
       <DialogDescription>{preview.data ? <>Changes <code className="font-mono text-xs break-all">{preview.data.path}</code>, then syncs.{offersTakeOut ? ' Take out removes what sk1ll placed here first; Leave in place keeps it, unmanaged.' : ' It never removes anything.'}</> : 'Checking what this change does…'}</DialogDescription></DialogHeader>
+      {copyFrom && <p className="text-sm">First {change.name} gets {copyFrom}'s Assignment: both defaults and every Skill and Rule toggle. Then sync places what it turns on.</p>}
       <ErrorNotice error={preview.error} title="This change can't be made" />
       {preview.loading && !preview.data && <Loading rows={2} />}
       {preview.data && <div className="flex max-h-[50vh] flex-col gap-4 overflow-y-auto">

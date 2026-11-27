@@ -73,10 +73,11 @@ If Pull stops partway through, the next `sk1ll pull` or Daemon reconcile resumes
 | `status` | Import drift and pending sync actions |
 | `sync [--dry-run] [--force]` | Write skills and instructions into harnesses |
 | `render <harness>` | Print the instruction files a harness would receive |
-| `harnesses [--all] [enable\|disable\|add\|remove]` | List the harnesses sync writes into and use `--all` to include disabled Harnesses and opt-in presets. The subcommands change `machine.toml` after previewing what stays in each Harness. `add <name> --preset <preset> --home <dir>` adds a [preset instance](configuration.md#several-config-directories-of-one-tool), and `enable <name>` adds one found in the environment (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `COPILOT_HOME`), which `--all` lists |
+| `harnesses [--all] [enable\|disable\|add\|remove]` | List the harnesses sync writes into and use `--all` to include disabled Harnesses and opt-in presets. The subcommands change `machine.toml` after previewing what stays in each Harness. `add <name> --preset <preset> --home <dir>` adds a [preset instance](configuration.md#several-config-directories-of-one-tool); `--copy-assignment-from <harness>` gives it that harness's Assignment before its first sync. `enable <name>` adds one found in the environment (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `COPILOT_HOME`), which `--all` lists |
 | `assign <harness> skill\|rule <name> on\|off` | Toggle a local repo item for one harness |
 | `assign <harness> --default-skills on\|off` | Set the default for skills added later (`--default-rules` for rules) |
 | `assign <harness> --all on\|off` | Set every Skill and Rule and both defaults. With a Fleet, this includes Baseline items the Machine has yet to pull |
+| `assign <harness> --copy-from <other>` | Give the harness another harness's Assignment on the same Machine: both defaults and every toggle, replacing its own |
 | `assign ... --machine <id>` | Change another fleet Machine's Assignment instead, as the desktop app's matrix does. Needs `fleet` scope |
 | `conflicts` | List harness and recovery conflicts |
 | `adopt <harness> <name>` | Copy a hand edit or an unmanaged skill into the draft. A hand edit goes into the item it was placed from, found by its Item ID even if it was renamed since |

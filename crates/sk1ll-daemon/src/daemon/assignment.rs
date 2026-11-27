@@ -60,16 +60,53 @@ impl Daemon {
                 .blocking(move |d, eng| d.store.local().expect("a machine-local store").write(d, eng, &write))
                 .await;
         }
-        let world = self
-            .blocking(|d, _| {
-                d.refresh_assignment()?;
-                if RenameIntent::exists(&d.cfg.state_dir, &d.cfg.machine_config)? {
-                    return Err(Error::Unavailable("waiting for the pending Harness rename to finish".into()));
-                }
-                d.world()
-            })
-            .await?;
+        let world = self.before_server_write().await?;
         let update = self.store.send(self, write).await?;
+        self.blocking(move |d, eng| Ok(d.apply_confirmed(eng, world, update))).await
+    }
+
+    /// What a write to the server's Assignment is made in, once a Harness
+    /// rename it would race is finished.
+    async fn before_server_write(self: &Arc<Self>) -> Result<World> {
+        self.blocking(|d, _| {
+            d.refresh_assignment()?;
+            if RenameIntent::exists(&d.cfg.state_dir, &d.cfg.machine_config)? {
+                return Err(Error::Unavailable("waiting for the pending Harness rename to finish".into()));
+            }
+            d.world()
+        })
+        .await
+    }
+
+    /// Gives this Machine's Harness `to` the Assignment of its Harness
+    /// `from`: both defaults and every explicit toggle, replacing what `to`
+    /// had. Where the Assignment lives: the machine-local file, or the
+    /// server's copy endpoint with this Machine as source and target. `to`
+    /// need not be in `machine.toml` (or reported to the server) yet, so a
+    /// Harness being added is seeded before its first sync.
+    pub(crate) async fn copy_harness_assignment(self: &Arc<Self>, from: &str, to: &str) -> Result<AssignmentUpdate> {
+        if from == to {
+            return Err(Error::BadRequest(format!("`{to}` can't copy its own Assignment")));
+        }
+        sk1ll_core::machine::check_name(to)?;
+        let _writes = self.assignment_writes.lock().await;
+        if self.store.local().is_some() {
+            let (from, to) = (from.to_string(), to.to_string());
+            return self
+                .blocking(move |d, eng| {
+                    d.store.local().expect("a machine-local store").copy_harness(d, eng, &from, &to)
+                })
+                .await;
+        }
+        let world = self.before_server_write().await?;
+        let copy = sk1ll_proto::MachineAssignmentCopy {
+            source: self.ident.machine_id().to_string(),
+            harnesses: Some(vec![sk1ll_proto::HarnessMapping { from: from.into(), to: to.into() }]),
+            mode: sk1ll_proto::CopyMode::Replace,
+            expected: None,
+            source_expected: None,
+        };
+        let update = crate::server::copy_own_assignment(self, &copy).await?;
         self.blocking(move |d, eng| Ok(d.apply_confirmed(eng, world, update))).await
     }
 

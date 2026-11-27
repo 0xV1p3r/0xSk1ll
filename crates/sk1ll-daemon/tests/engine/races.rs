@@ -159,12 +159,16 @@ async fn take_out_request(c: &sk1ll_daemon::client::Client) -> HarnessChangeRequ
     c.items_fresh().await.unwrap();
     let change = HarnessChange::Disable { name: "agent".into() };
     let fingerprint = Some(
-        c.preview_harness(&HarnessChangeRequest { change: change.clone(), fingerprint: None })
-            .await
-            .unwrap()
-            .fingerprint,
+        c.preview_harness(&HarnessChangeRequest {
+            copy_assignment_from: None,
+            change: change.clone(),
+            fingerprint: None,
+        })
+        .await
+        .unwrap()
+        .fingerprint,
     );
-    HarnessChangeRequest { change, fingerprint }
+    HarnessChangeRequest { copy_assignment_from: None, change, fingerprint }
 }
 
 #[test]

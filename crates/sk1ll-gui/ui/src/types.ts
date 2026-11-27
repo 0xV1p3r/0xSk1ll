@@ -108,7 +108,9 @@ export interface HarnessSettings { path: string; harnesses: HarnessChoice[] }
 export interface HarnessCandidate { name: string; var: string; harness: HarnessView['harness']; warning?: string }
 export type HarnessChange = { op: 'enable' | 'disable' | 'remove'; name: string } | { op: 'set'; name: string; harness: HarnessView['harness'] };
 // Apply answers 409 if machine.toml changed while it was written; it never removes what sk1ll placed.
-export interface HarnessChangeRequest { change: HarnessChange; fingerprint?: string }
+// `copy_assignment_from`: with a `set` or `enable`, the Harness first gets this other Harness's Assignment (both
+// defaults and every toggle, replacing its own); the preview plans with it.
+export interface HarnessChangeRequest { change: HarnessChange; fingerprint?: string; copy_assignment_from?: string }
 export interface InstructionPreview {
   path: string; format: 'block' | 'rules'; content: string; next_content: string; differs: boolean; diff: string;
 }

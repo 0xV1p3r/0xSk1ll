@@ -75,12 +75,28 @@ impl Daemon {
         Ok(HarnessSettings { path: self.cfg.machine_config.clone(), harnesses })
     }
 
-    /// A reader: plans the change without making it.
-    pub(crate) fn preview_harness(&self, change: &HarnessChange) -> Result<HarnessPreview> {
+    /// A reader: a Harness of this Machine by `name`, in any state.
+    pub(crate) fn known_harness(&self, name: &str) -> Result<()> {
+        if !MachineConfig::load(&self.cfg.machine_config)?.choices().iter().any(|c| c.name == name) {
+            return Err(Error::NotFound(format!("no harness `{name}` on this machine")));
+        }
+        Ok(())
+    }
+
+    /// A reader: plans the change without making it, with `copy_from`'s
+    /// Assignment copied to the changed Harness first (see
+    /// [`HarnessChangeRequest::copy_assignment_from`]).
+    pub(crate) fn preview_harness(&self, change: &HarnessChange, copy_from: Option<&str>) -> Result<HarnessPreview> {
         let repo = Repo::open(self.repo_root())?;
         let snapshot = self.applied();
-        let plan =
-            harness_change::plan(&repo, &self.cfg.machine_config, change, snapshot.as_ref().map(|s| &s.assignment))?;
+        let mut assignment = snapshot.as_ref().map(|s| s.assignment.clone());
+        if let Some(from) = copy_from {
+            self.check_copy(change, from)?;
+            if let Some(a) = &mut assignment {
+                a.copy_harness(from, change.name());
+            }
+        }
+        let plan = harness_change::plan(&repo, &self.cfg.machine_config, change, assignment.as_ref())?;
         Ok(HarnessPreview {
             fingerprint: plan.fingerprint,
             path: self.cfg.machine_config.clone(),
@@ -116,15 +132,62 @@ impl Daemon {
         Ok(HarnessApplied { harnesses: MachineConfig::load(&self.cfg.machine_config)?.choices(), errors })
     }
 
+    /// Whether `change` can take `from`'s Assignment: an add, edit or
+    /// enable, from another Harness of this Machine.
+    fn check_copy(&self, change: &HarnessChange, from: &str) -> Result<()> {
+        if !matches!(change, HarnessChange::Set { .. } | HarnessChange::Enable { .. }) {
+            return Err(Error::BadRequest("only adding, changing or enabling a harness copies an Assignment".into()));
+        }
+        if from == change.name() {
+            return Err(Error::BadRequest(format!("`{from}` can't copy its own Assignment")));
+        }
+        self.known_harness(from)
+    }
+
     /// `POST /harnesses/apply`, one harness change at a time (see
-    /// [`Daemon::harness_changes`]).
+    /// [`Daemon::harness_changes`]). With
+    /// [`HarnessChangeRequest::copy_assignment_from`], the Assignment is
+    /// copied first, so the sync after the change places what was copied:
+    /// a copy that fails leaves `machine.toml` as it is, and a change that
+    /// fails after the copy says the copy stands.
     pub(crate) async fn apply_harness_serialized(
         self: &Arc<Self>,
         req: HarnessChangeRequest,
     ) -> Result<HarnessApplied> {
         let _harnesses = self.harness_changes.lock().await;
         sk1ll_core::failpoint!(DaemonApplyEntered, &self.cfg.machine_config);
-        self.blocking(move |d, eng| d.apply_harness(eng, req)).await
+        let Some(from) = req.copy_assignment_from.clone() else {
+            return self.blocking(move |d, eng| d.apply_harness(eng, req)).await;
+        };
+        // Checked first, so a stale preview, or a change the plan refuses, copies nothing.
+        let (change, copy_from, expected) = (req.change.clone(), from.clone(), req.fingerprint.clone());
+        self.blocking(move |d, _| {
+            d.ensure_managed()?;
+            let preview = d.preview_harness(&change, Some(&copy_from))?;
+            if expected.as_deref().is_some_and(|e| e != preview.fingerprint) {
+                return Err(sk1ll_core::Error::Changed(
+                    "machine.toml changed since the preview — preview again".into(),
+                )
+                .into());
+            }
+            Ok(())
+        })
+        .await?;
+        let to = req.change.name().to_string();
+        let copied = self.copy_harness_assignment(&from, &to).await.map_err(|e| {
+            e.reworded(|why| {
+                format!("copying {from}'s Assignment to {to} failed, so machine.toml was not changed: {why}")
+            })
+        })?;
+        let applied = self.blocking(move |d, eng| d.apply_harness(eng, req)).await;
+        let mut applied = applied.map_err(|e| {
+            e.reworded(|why| {
+                format!("{to} now has {from}'s Assignment, but machine.toml was not changed: {why}. Preview again")
+            })
+        })?;
+        // What the copy's own sync failed to place in the other harnesses.
+        applied.errors.splice(0..0, copied.errors);
+        Ok(applied)
     }
 
     /// `POST /harnesses/take-out`: disables or removes a harness after
@@ -162,7 +225,7 @@ impl Daemon {
         let before = self
             .blocking(move |d, _| {
                 d.ensure_managed()?;
-                let preview = d.preview_harness(&change)?;
+                let preview = d.preview_harness(&change, None)?;
                 if preview.fingerprint != expected {
                     return Err(sk1ll_core::Error::Changed(
                         "machine.toml changed since the preview — preview again".into(),
@@ -211,7 +274,7 @@ impl Daemon {
                 let taken_out = taken_out.unwrap_or_default();
                 Ok(HarnessTakenOut { applied: false, taken_out, left, harnesses, errors })
             };
-            let preview = match d.preview_harness(&req.change) {
+            let preview = match d.preview_harness(&req.change, None) {
                 Ok(preview) => preview,
                 Err(e) => return not_applied(None, Vec::new(), errors, format!("machine.toml was not changed: {e}")),
             };

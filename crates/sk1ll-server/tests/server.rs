@@ -2117,6 +2117,61 @@ async fn copy_machine_assignment_previews_merges_replaces_and_logs() {
     assert_eq!(restored.assignment, update.assignment);
 }
 
+/// A Machine seeds one of its Harnesses from another of its own, also one it
+/// hasn't reported yet (`sk1ll harnesses add --copy-assignment-from` copies
+/// before the Harness exists); only the Machine itself may name such a
+/// Harness, and once it reports it the copied column stays.
+#[tokio::test]
+async fn copy_within_one_machine_seeds_a_harness_before_it_is_reported() {
+    let server = start().await;
+    let token = server.join_scoped("solo", &["claude", "codex"], Scope::SelfOnly).await;
+    let other = server.join("other", &["claude"]).await;
+    server
+        .put_assignment(
+            &token,
+            "solo",
+            json!([
+                {"harness":"claude","kind":"skill","item_id":"pdf","name":"pdf","enabled":true},
+                {"harness":"claude","kind":"rule","item_id":"git","enabled":false},
+                {"harness":"claude","kind":"new_skills_default","enabled":true},
+                {"harness":"codex","kind":"skill","item_id":"old","enabled":true}
+            ]),
+        )
+        .await;
+    let path = "/machines/solo/assignment/copy-from";
+    let post = |token: &str, body: Value| server.http().post(server.api(path)).bearer_auth(token).json(&body).send();
+    let copy = |to: &str| json!({"source":"solo","mode":"replace","harnesses":[{"from":"claude","to":to}]});
+
+    // A reported Harness: replaced, its own toggles cleared.
+    let update: AssignmentUpdate =
+        post(&token, copy("codex")).await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(update.assignment.harness("codex"), update.assignment.harness("claude"));
+
+    // One not reported yet: only the Machine itself may name it, and only by a harness name.
+    for caller in [ADMIN, other.as_str()] {
+        assert_eq!(post(caller, copy("claude_2")).await.unwrap().status(), StatusCode::BAD_REQUEST, "{caller}");
+    }
+    assert_eq!(post(&token, copy("../x")).await.unwrap().status(), StatusCode::BAD_REQUEST);
+    let seeded: AssignmentUpdate =
+        post(&token, copy("claude_2")).await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    let claude = seeded.assignment.harness("claude").clone();
+    assert_eq!(seeded.assignment.harness("claude_2"), &claude);
+    assert!(seeded.entries.iter().all(|e| e.harness == "claude_2" && e.cause == LogCause::Change));
+
+    // Its report then finds the column there: nothing is reset to all off.
+    let mut ws = ws_connect(&server, &token).await;
+    ws_assignment(&mut ws).await;
+    ws_send(&mut ws, &DaemonMessage::Hello { machine_id: "solo".into() }).await;
+    let report = MachineReport { seq: 1, harnesses: harnesses(&["claude", "claude_2", "codex"]), ..Default::default() };
+    ws_send(&mut ws, &DaemonMessage::Status(report.clone())).await;
+    server.reported("solo", &report).await;
+    let now: AssignmentSnapshot = server.get("/machines/solo/assignment").await;
+    assert_eq!(now.revision, seeded.revision);
+    assert_eq!(now.assignment.harness("claude_2"), &claude);
+    let log: Vec<LogEntry> = server.get("/log?machine=solo").await;
+    assert!(!log.iter().any(|e| e.cause == LogCause::HarnessAdded && e.harness == "claude_2"), "{log:?}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oversized_rules_keep_their_claim_and_incomplete_baselines_refuse_prune() {
     let server = start().await;

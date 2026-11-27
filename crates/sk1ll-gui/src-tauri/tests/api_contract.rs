@@ -495,7 +495,7 @@ fn harness_golden() -> Value {
             sample(HarnessCandidate { name: "codex-2".into(), var: "CODEX_HOME".into(), harness: Harness { kind: Some("codex".into()), home: Some("~/.agents".into()), skills: Some("~/.agents/skills".into()), instructions: Some("~/.agents/AGENTS.md".into()), ..claude() }, warning: Some("overlaps agents".into()) }),
         ],
         "harness_change": by_tag("op", changes.clone()),
-        "harness_change_request": sample(HarnessChangeRequest { fingerprint: Some("f-1".into()), change: changes[1].clone() }),
+        "harness_change_request": sample(HarnessChangeRequest { fingerprint: Some("f-1".into()), change: changes[0].clone(), copy_assignment_from: Some("claude".into()) }),
         "placement_kind": keyed(["create", "update", "remove", "conflict"].map(|kind| sample(placement(kind, (kind == "conflict").then_some("edited")))), Some("kind")),
         "placement_item": keyed(["skill", "rule", "instructions"].map(|item| sample(PlacementView { item: item.into(), ..placement("create", None) })), Some("item")),
         "harness_preview": sample(HarnessPreview {

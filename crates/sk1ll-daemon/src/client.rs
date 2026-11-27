@@ -40,6 +40,7 @@
 //! | POST | `/harnesses/preview` | [`HarnessChangeRequest`] → [`HarnessPreview`]; changes nothing |
 //! | POST | `/harnesses/take-out` | [`HarnessChangeRequest`] (disable or remove) → [`HarnessTakenOut`]; turns the harness's items off and syncs, then makes the change only if nothing it placed is left |
 //! | POST | `/harnesses/apply` | [`HarnessChangeRequest`] → [`HarnessApplied`]; then syncs; never removes placed content; 409 if `machine.toml` changed while it was written |
+//! | POST | `/assignment/copy-harness` | [`HarnessCopyRequest`] → `AssignmentUpdate`; one of this Machine's Harnesses gets another's Assignment |
 //! | POST | `/imports/{name}/update` | Optional `?force=true` → [`ImportUpdated`] |
 //! | POST | `/imports/{name}/update-reviewed` | `{expected, force}` → [`ImportUpdated`] |
 //! | GET | `/imports/{name}/changes` | Optional `?upstream=<commit>` → [`ImportChanges`] |
@@ -428,6 +429,21 @@ pub struct HarnessChangeRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
     pub change: HarnessChange,
+    /// With a `set` or `enable`: first give the Harness the Assignment of
+    /// this other Harness of the Machine (both defaults and every toggle,
+    /// replacing its own), so its first sync places that. The preview's
+    /// `sync` plans with the copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_assignment_from: Option<String>,
+}
+
+/// `POST /assignment/copy-harness`: `to` gets `from`'s Assignment, both
+/// defaults and every toggle, replacing its own. Both are Harnesses of this
+/// Machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessCopyRequest {
+    pub from: String,
+    pub to: String,
 }
 
 /// One thing sync placed, or would place, in a harness.
@@ -1293,6 +1309,10 @@ impl Client {
 
     pub async fn join_code(&self, scope: Scope) -> Result<JoinCode> {
         self.post("/join-codes", &JoinCodeRequest { scope }).await
+    }
+
+    pub async fn copy_harness_assignment(&self, copy: &HarnessCopyRequest) -> Result<AssignmentUpdate> {
+        self.post("/assignment/copy-harness", copy).await
     }
 
     pub async fn rename_harness(&self, rename: &HarnessRenameRequest) -> Result<HarnessRenameResult> {

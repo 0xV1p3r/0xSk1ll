@@ -75,6 +75,14 @@ CLAUDE_CONFIG_DIR=~/.claude_2 sk1ll harnesses enable claude_2
 
 The app sees the environment it was started with, which for a desktop launcher is the session's, not your shell's. sk1ll never globs for directories such as `~/.claude*`: add any other directory with `sk1ll harnesses add`.
 
+A new instance starts as any new Harness does: everything off on a joined Machine. To start it with what the preset's Harness has, copy that Assignment as you add it:
+
+```sh
+sk1ll harnesses add claude_2 --preset claude --home ~/.claude_2 --copy-assignment-from claude
+```
+
+The preview says so, and its sync plan already uses the copy. `claude_2` gets `claude`'s Assignment, both defaults and every toggle, before `machine.toml` changes, so the first sync places what `claude` has on and nothing else. On a joined Machine the copy is made at the Server, which needs a connection; offline the change is refused, so add the Harness without the flag and copy later. If the copy fails, `machine.toml` stays as it was. If `machine.toml` changed since the preview, the copy stands and the error says so: preview again. To copy again later, or onto a Harness that exists, run `sk1ll assign claude_2 --copy-from claude`. In Settings, **Add another config folder** on a preset's row does the same.
+
 ## machine.toml
 
 `~/.config/sk1ll/machine.toml` adjusts the presets and adds harnesses. Override its location with `--machine-config` or `SK1LL_MACHINE_CONFIG`.
@@ -225,6 +233,8 @@ sk1ll assign codex --default-rules on       # default for new rules
 ```
 
 Changing a default first records every existing item's current value as an explicit toggle, so existing items keep their state.
+
+`sk1ll assign <harness> --copy-from <other>` gives a Harness exactly what another Harness of the same Machine has: both defaults and every explicit toggle, replacing its own, without recording anything for items that follow a default. Add `--machine <id>` for another fleet Machine's Harnesses. `sk1ll harnesses add --copy-assignment-from` does it for a Harness as it is added (see [Several config directories of one tool](#several-config-directories-of-one-tool)). To copy between Machines, use `sk1ll fleet copy-assignment`.
 
 Item toggles use Item IDs. `sk1ll assign` resolves the name in the local repo and warns if the item you want to turn on is missing. A rename preserves the Item ID and keeps the Assignment across the Fleet. Deleting an item and creating it again gives it a new ID, so it follows the defaults. That holds for an item re-created by hand too: Item IDs are never derived from names, so the Daemon or the next mutating command writes it a fresh one. Until an item has an Item ID it has no toggle and follows the defaults. Changing a default records every item's value by Item ID, so it is refused while a pending Pull leaves an item without one.
 

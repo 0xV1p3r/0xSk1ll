@@ -169,6 +169,49 @@ fn harness_changes_preview_apply_and_sync() {
     assert!(run(&repo, &["harnesses", "add", "x", "--skills", "relative", "--yes"]).is_err());
 }
 
+/// `add --copy-assignment-from` seeds the new harness from another one on
+/// this Machine before its first sync, so that sync places only what the
+/// other has on; `assign --copy-from` copies again later. A copy that can't
+/// be made leaves machine.toml as it was.
+#[test]
+fn harnesses_add_copies_another_harness_assignment_first() {
+    let repo = with_pdf();
+    repo.repo.write("personal/web/SKILL.md", "Web.");
+    run(&repo, &["assign", "h", "skill", "pdf", "off"]).unwrap();
+    run(&repo, &["assign", "h", "--default-rules", "off"]).unwrap();
+    let config = repo.machine_toml();
+    let before = fs::read_to_string(&config).unwrap();
+    for (from, error) in [("nope", "no harness `nope` on this machine"), ("claude_2", "can't copy its own Assignment")]
+    {
+        let add = ["harnesses", "add", "claude_2", "--preset", "claude", "--home", "~/.claude_2"];
+        let refused = run(&repo, &[&add[..], &["--copy-assignment-from", from, "--yes"]].concat()).unwrap_err();
+        assert!(refused.contains(error), "{refused}");
+        assert_eq!(fs::read_to_string(&config).unwrap(), before);
+    }
+
+    let add = ["harnesses", "add", "claude_2", "--preset", "claude", "--home", "~/.claude_2"];
+    let added = run(&repo, &[&add[..], &["--copy-assignment-from", "h", "--yes"]].concat()).unwrap();
+    assert!(added.contains("first claude_2 gets h's Assignment"), "{added}");
+    // The preview already plans with the copy: web, not pdf.
+    let planned = added.split("then sync does:").nth(1).unwrap();
+    assert!(planned.contains("skill web") && !planned.contains("skill pdf"), "{added}");
+    let skills = repo.home.path().join(".claude_2/skills");
+    assert!(skills.join("web/SKILL.md").is_file());
+    assert!(!skills.join("pdf").exists(), "pdf is off in h, so never placed");
+    let a = Assignment::load(&repo.assignment()).unwrap();
+    assert_eq!(a.harness("claude_2"), a.harness("h"));
+
+    run(&repo, &["assign", "claude_2", "skill", "pdf", "on"]).unwrap();
+    assert!(skills.join("pdf/SKILL.md").is_file());
+    let copied = run(&repo, &["assign", "claude_2", "--copy-from", "h"]).unwrap();
+    assert!(copied.contains("claude_2: h's Assignment, both defaults and every toggle"), "{copied}");
+    assert!(!skills.join("pdf").exists());
+    let a = Assignment::load(&repo.assignment()).unwrap();
+    assert_eq!(a.harness("claude_2"), a.harness("h"));
+    let refused = run(&repo, &["assign", "claude_2", "--copy-from", "h", "--all", "on"]).unwrap_err();
+    assert!(refused.contains("cannot be used with"), "{refused}");
+}
+
 /// `add --preset --home` makes a second config directory of one tool an
 /// instance of its preset: machine.toml gets just those keys, and sync places
 /// skills and the tool's rules (`harnesses: [claude]`) under that directory.

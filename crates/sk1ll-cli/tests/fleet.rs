@@ -283,6 +283,61 @@ fn joined_machines_share_a_baseline_and_scope_limits_changes() {
     });
 }
 
+/// On a joined Machine, `harnesses add --copy-assignment-from` seeds the new
+/// Harness at the Server, which takes a column the Machine hasn't reported
+/// yet, so the first sync places what the other Harness has on rather than
+/// nothing; the report that follows keeps that column.
+#[test]
+fn a_joined_machine_seeds_a_new_harness_from_another_one() {
+    runtime().block_on(async {
+        let server = Server::start().await;
+        let mut home = Machine::new();
+        home.harness("desk");
+        join_fleet(&home, &server, "home", None);
+        run(&home, &["new", "skill", "pdf"]).unwrap();
+        run(&home, &["new", "skill", "web"]).unwrap();
+        run(&home, &["commit", "--all", "-m", "skills", "--push"]).unwrap();
+        run(&home, &["assign", "desk", "--all", "on"]).unwrap();
+        run(&home, &["assign", "desk", "skill", "pdf", "off"]).unwrap();
+
+        let add = ["harnesses", "add", "claude_2", "--preset", "claude", "--home", "~/.claude_2"];
+        let added = run(&home, &[&add[..], &["--copy-assignment-from", "desk", "--yes"]].concat()).unwrap();
+        assert!(added.contains("first claude_2 gets desk's Assignment"), "{added}");
+        let skills = home.home.path().join(".claude_2/skills");
+        assert!(skills.join("web/SKILL.md").is_file(), "{added}");
+        assert!(!skills.join("pdf").exists());
+        let assignment = |server: &Server| {
+            let request = server
+                .http()
+                .get(format!("{}/api/machines/home/assignment", server.url()))
+                .bearer_auth(sk1ll_testkit::server::ADMIN);
+            async move { request.send().await.unwrap().json::<sk1ll_proto::AssignmentSnapshot>().await.unwrap() }
+        };
+        let seeded = assignment(&server).await;
+        assert_eq!(seeded.assignment.harness("claude_2"), seeded.assignment.harness("desk"));
+
+        // Its report finds the column there and leaves it as copied.
+        let daemon = RunningDaemon::start(&home, home.repo.root()).await;
+        sk1ll_testkit::eventually(|| async {
+            let report = server.row("home").await?.report?;
+            report.harnesses.iter().any(|h| h.name == "claude_2" && h.kind.as_deref() == Some("claude")).then_some(())
+        })
+        .await;
+        let now = assignment(&server).await;
+        assert_eq!(now.assignment.harness("claude_2"), seeded.assignment.harness("desk"));
+        let log =
+            run_on(&home, &daemon.socket, &["fleet", "log", "--machine", "home", "--harness", "claude_2"]).unwrap();
+        assert!(!log.is_empty() && !log.contains("new harness"), "{log}");
+
+        // Later copies go to the Server as well.
+        run_on(&home, &daemon.socket, &["assign", "claude_2", "skill", "pdf", "on"]).unwrap();
+        sk1ll_testkit::eventually(|| async { skills.join("pdf/SKILL.md").is_file().then_some(()) }).await;
+        let copied = run_on(&home, &daemon.socket, &["assign", "claude_2", "--copy-from", "desk"]).unwrap();
+        assert!(copied.contains("claude_2: skill pdf off") && copied.contains("fleet assignment of home"), "{copied}");
+        sk1ll_testkit::eventually(|| async { (!skills.join("pdf").exists()).then_some(()) }).await;
+    });
+}
+
 #[test]
 fn a_standalone_machine_explains_which_commands_need_a_fleet() {
     let machine = with_pdf();

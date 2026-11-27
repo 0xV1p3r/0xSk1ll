@@ -122,9 +122,10 @@
   },
   "harness_change_request": {
     "change": {
-      "name": "claude",
-      "op": "disable"
+      "name": "kiro",
+      "op": "enable"
     },
+    "copy_assignment_from": "claude",
     "fingerprint": "f-1"
   },
   "harness_preview": {

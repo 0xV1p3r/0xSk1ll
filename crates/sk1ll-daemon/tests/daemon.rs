@@ -2077,8 +2077,11 @@ async fn a_harness_enabled_in_a_fleet_starts_all_off() {
         mode: sk1ll_core::LinkMode::Copy,
         ..Default::default()
     };
-    let mut add =
-        HarnessChangeRequest { fingerprint: None, change: HarnessChange::Set { name: "extra".into(), harness } };
+    let mut add = HarnessChangeRequest {
+        copy_assignment_from: None,
+        fingerprint: None,
+        change: HarnessChange::Set { name: "extra".into(), harness },
+    };
     let preview = a.client.preview_harness(&add).await.unwrap();
     assert!(preview.sync.is_empty(), "{:?}", preview.sync);
     add.fingerprint = Some(preview.fingerprint);
@@ -2135,8 +2138,11 @@ async fn harnesses_change_after_setup_with_a_preview_of_what_stays() {
     assert!(response.starts_with("HTTP/1.1 400"), "{response}");
     assert!(response.contains("this client is older than the daemon; update it"), "{response}");
 
-    let mut add =
-        HarnessChangeRequest { fingerprint: None, change: HarnessChange::Set { name: "extra".into(), harness } };
+    let mut add = HarnessChangeRequest {
+        copy_assignment_from: None,
+        fingerprint: None,
+        change: HarnessChange::Set { name: "extra".into(), harness },
+    };
     let preview = m.client.preview_harness(&add).await.unwrap();
     assert!(preview.before.is_none() && preview.placed.is_empty());
     assert_eq!(
@@ -2162,8 +2168,11 @@ async fn harnesses_change_after_setup_with_a_preview_of_what_stays() {
     assert!(extra.join("pdf/SKILL.md").is_file());
 
     // Disabling shows what sk1ll placed, and leaves it.
-    let mut disable =
-        HarnessChangeRequest { fingerprint: None, change: HarnessChange::Disable { name: "extra".into() } };
+    let mut disable = HarnessChangeRequest {
+        copy_assignment_from: None,
+        fingerprint: None,
+        change: HarnessChange::Disable { name: "extra".into() },
+    };
     let preview = m.client.preview_harness(&disable).await.unwrap();
     assert!(preview.after.is_none());
     assert_eq!(
@@ -2180,8 +2189,11 @@ async fn harnesses_change_after_setup_with_a_preview_of_what_stays() {
     let result = m.client.set_harness_assignment(HARNESS, false).await.unwrap();
     assert!(!result.assignment.skill_enabled(HARNESS, &skill_id("pdf")));
     eventually(|| async { m.harness_skill("pdf").is_none().then_some(()) }).await;
-    let mut disable =
-        HarnessChangeRequest { fingerprint: None, change: HarnessChange::Disable { name: HARNESS.into() } };
+    let mut disable = HarnessChangeRequest {
+        copy_assignment_from: None,
+        fingerprint: None,
+        change: HarnessChange::Disable { name: HARNESS.into() },
+    };
     assert!(m.client.preview_harness(&disable).await.unwrap().placed.is_empty());
     disable.fingerprint = Some(m.client.preview_harness(&disable).await.unwrap().fingerprint);
     m.client.apply_harness(&disable).await.unwrap();
@@ -2199,6 +2211,7 @@ async fn harnesses_change_after_setup_with_a_preview_of_what_stays() {
         ..Default::default()
     };
     let mut add_blocked = HarnessChangeRequest {
+        copy_assignment_from: None,
         fingerprint: None,
         change: HarnessChange::Set { name: "blocked".into(), harness: blocked },
     };
@@ -2206,14 +2219,18 @@ async fn harnesses_change_after_setup_with_a_preview_of_what_stays() {
     let applied = m.client.apply_harness(&add_blocked).await.unwrap();
     assert!(applied.errors.iter().any(|e| e.contains("blocked/skills")), "{:?}", applied.errors);
     assert!(applied.harnesses.iter().any(|c| c.name == "blocked" && c.enabled), "machine.toml changed anyway");
-    let mut drop_blocked =
-        HarnessChangeRequest { fingerprint: None, change: HarnessChange::Remove { name: "blocked".into() } };
+    let mut drop_blocked = HarnessChangeRequest {
+        copy_assignment_from: None,
+        fingerprint: None,
+        change: HarnessChange::Remove { name: "blocked".into() },
+    };
     drop_blocked.fingerprint = Some(m.client.preview_harness(&drop_blocked).await.unwrap().fingerprint);
     m.client.apply_harness(&drop_blocked).await.unwrap();
     std::fs::set_permissions(m.home.path().join("blocked/skills"), std::os::unix::fs::PermissionsExt::from_mode(0o755))
         .unwrap();
 
     let mut bad = HarnessChangeRequest {
+        copy_assignment_from: None,
         fingerprint: None,
         change: HarnessChange::Set { name: "Bad Name".into(), harness: Default::default() },
     };

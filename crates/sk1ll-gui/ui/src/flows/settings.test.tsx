@@ -1,7 +1,7 @@
 // Settings: this Machine's details and diagnostics, its editor, rejoining a Fleet, and its Harnesses in machine.toml.
 import { expect, it } from 'vitest';
 import { screen, waitFor, within } from '@testing-library/react';
-import { checked, dialog, heading, isDisabled, launch } from './harness';
+import { checked, dialog, heading, isDisabled, launch, nav } from './harness';
 import type { HarnessChoice, HarnessPreview, PlacementView } from '../types';
 
 // A Harness added to machine.toml by hand.
@@ -153,6 +153,48 @@ it('lists config folders found in the environment and enables one as a preset in
   expect(await screen.findByRole('cell', { name: 'claude_2' })).toBeTruthy();
   await waitFor(() => expect(within(screen.getByRole('region', { name: 'Found in the environment' })).queryByText('claude_2')).toBeNull());
   expect(daemon.setupHarnesses.find(h => h.name === 'claude_2')?.harness.home).toBe('~/.claude_2');
+});
+
+it('adds another config folder of a preset as an instance with its Assignment, shown with its kind in Settings, the matrix and Fleet', async () => {
+  const { daemon, user } = launch('fleet', { hash: '#/settings' });
+  await heading('Settings');
+  await user.click(await screen.findByRole('button', { name: 'Add another config folder for claude' }));
+  const form = await dialog('Add another Claude Code config folder');
+  // The name follows the folder, made a Harness name that isn't taken; copying claude's Assignment is the default.
+  await user.type(form.getByLabelText('Config folder'), '~/.Claude Work/');
+  expect((form.getByLabelText('Name') as HTMLInputElement).value).toBe('claude_work');
+  await user.clear(form.getByLabelText('Config folder')); await user.type(form.getByLabelText('Config folder'), '~/.claude');
+  await user.click(form.getByRole('button', { name: 'Preview change' }));
+  expect(form.getByText(/claude's own config folder/)).toBeTruthy();
+  await user.clear(form.getByLabelText('Config folder')); await user.type(form.getByLabelText('Config folder'), '~/.claude_2');
+  expect((form.getByLabelText('Name') as HTMLInputElement).value).toBe('claude_2');
+  expect(checked(form.getByRole('checkbox', { name: 'Copy assignment from claude' }))).toBe(true);
+  await user.click(form.getByRole('button', { name: 'Preview change' }));
+
+  const save = await dialog('Save claude_2?');
+  expect(save.getByText(/First claude_2 gets claude's Assignment/)).toBeTruthy();
+  expect(await save.findByText('~/.claude_2/skills/code-review')).toBeTruthy();
+  const request = { change: { op: 'set', name: 'claude_2', harness: { kind: 'claude', home: '~/.claude_2', skills: '~/.claude_2/skills',
+    instructions: '~/.claude_2/CLAUDE.md', instructions_format: 'block', mode: 'symlink' } }, copy_assignment_from: 'claude' };
+  expect(daemon.sent('preview_harness').at(-1)).toEqual({ request });
+  await user.click(save.getByRole('button', { name: 'Apply' }));
+  await waitFor(() => expect(daemon.sent('apply_harness')).toEqual([{ request: { ...request, fingerprint: expect.any(String) } }]));
+  // An instance shows its tool and folder rather than Custom.
+  expect(await row('claude_2').findByText('Claude Code · ~/.claude_2')).toBeTruthy();
+  expect(daemon.assignments.workstation.harnesses.claude_2).toEqual(daemon.assignments.workstation.harnesses.claude);
+
+  // Its column names its kind, and has claude's values.
+  await user.click(nav().getByRole('button', { name: 'Assignment matrix' }));
+  await heading('Assignment matrix');
+  const column = await screen.findByRole('columnheader', { name: /^claude_2/ });
+  expect(within(column).getByText('Claude Code')).toBeTruthy();
+  const state = (column: string) => checked(screen.getByRole('checkbox', { name: new RegExp(`^skill:deploy in workstation / ${column},`) }));
+  expect(state('claude_2')).toBe(state('claude'));
+
+  await user.click(nav().getByRole('button', { name: 'Fleet' }));
+  await heading('Fleet');
+  const panel = within(await screen.findByRole('region', { name: "This Machine's Assignments" }));
+  expect(within(await panel.findByRole('columnheader', { name: /^claude_2/ })).getByText('Claude Code')).toBeTruthy();
 });
 
 it('turns a Harness off after a preview, taking out what sk1ll placed or leaving it, and retries when Take out fails', async () => {
