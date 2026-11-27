@@ -5,7 +5,7 @@ All notable changes to 0xSk1ll are listed here. The format follows
 [Semantic Versioning](https://semver.org/). Before 1.0, a minor version may
 break compatibility.
 
-## [Unreleased]
+## [0.3.0] - 2026-11-27
 
 ### Added
 
@@ -417,5 +417,6 @@ daemon and fleets; the CLI also builds elsewhere in standalone mode.
 - `--version` on every binary, `/healthz` and the app's Diagnostics name the
   release and the commit it was built from.
 
+[0.3.0]: https://github.com/0xV1p3r/0xSk1ll/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/0xV1p3r/0xSk1ll/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/0xV1p3r/0xSk1ll/releases/tag/v0.1.0
