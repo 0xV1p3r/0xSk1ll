@@ -73,7 +73,7 @@ If Pull stops partway through, the next `sk1ll pull` or Daemon reconcile resumes
 | `status` | Import drift and pending sync actions |
 | `sync [--dry-run] [--force]` | Write skills and instructions into harnesses |
 | `render <harness>` | Print the instruction files a harness would receive |
-| `harnesses [--all] [enable\|disable\|add\|remove]` | List the harnesses sync writes into and use `--all` to include disabled Harnesses and opt-in presets. The subcommands change `machine.toml` after previewing what stays in each Harness. `add <name> --preset <preset> --home <dir>` adds a [preset instance](configuration.md#several-config-directories-of-one-tool) |
+| `harnesses [--all] [enable\|disable\|add\|remove]` | List the harnesses sync writes into and use `--all` to include disabled Harnesses and opt-in presets. The subcommands change `machine.toml` after previewing what stays in each Harness. `add <name> --preset <preset> --home <dir>` adds a [preset instance](configuration.md#several-config-directories-of-one-tool), and `enable <name>` adds one found in the environment (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `COPILOT_HOME`), which `--all` lists |
 | `assign <harness> skill\|rule <name> on\|off` | Toggle a local repo item for one harness |
 | `assign <harness> --default-skills on\|off` | Set the default for skills added later (`--default-rules` for rules) |
 | `assign <harness> --all on\|off` | Set every Skill and Rule and both defaults. With a Fleet, this includes Baseline items the Machine has yet to pull |

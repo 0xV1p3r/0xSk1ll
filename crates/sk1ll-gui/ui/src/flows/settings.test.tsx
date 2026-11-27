@@ -133,6 +133,28 @@ it('labels each Harness\'s origin, tucks away presets not on this Machine, and v
   expect(await screen.findByRole('cell', { name: 'tool' })).toBeTruthy();
 });
 
+it('lists config folders found in the environment and enables one as a preset instance after a preview', async () => {
+  const instance = (home: string) => ({ kind: 'claude', home, skills: `${home}/skills`, instructions: `${home}/rules`, instructions_format: 'rules' as const, mode: 'symlink' as const });
+  const { daemon, user } = launch('fleet', { hash: '#/settings', setup: daemon => daemon.harnessCandidates.push(
+    { name: 'claude_2', var: 'CLAUDE_CONFIG_DIR', harness: instance('~/.claude_2') },
+    { name: 'repo', var: 'CODEX_HOME', harness: { ...instance('~/repo'), kind: 'codex' }, warning: 'overlaps the skills repo' }) });
+  const found = within(await screen.findByRole('region', { name: 'Found in the environment' }));
+  expect(found.getByText('~/.claude_2').tagName).toBe('CODE');
+  expect(found.getByText(/from CLAUDE_CONFIG_DIR/)).toBeTruthy();
+  expect(found.getByText("Can't be enabled: it overlaps the skills repo.")).toBeTruthy();
+  expect(isDisabled(found.getByRole('button', { name: 'Enable repo' }))).toBe(true);
+  expect(daemon.sent('harness_candidates')).toEqual([{ setup: false }]);
+
+  await user.click(found.getByRole('button', { name: 'Enable claude_2' }));
+  const confirm = await dialog('Save claude_2?');
+  expect(daemon.sent('preview_harness').at(-1)).toEqual({ request: { change: { op: 'set', name: 'claude_2', harness: instance('~/.claude_2') } } });
+  await user.click(await confirm.findByRole('button', { name: 'Apply' }));
+  // A Harness of its own now, no longer offered.
+  expect(await screen.findByRole('cell', { name: 'claude_2' })).toBeTruthy();
+  await waitFor(() => expect(within(screen.getByRole('region', { name: 'Found in the environment' })).queryByText('claude_2')).toBeNull());
+  expect(daemon.setupHarnesses.find(h => h.name === 'claude_2')?.harness.home).toBe('~/.claude_2');
+});
+
 it('turns a Harness off after a preview, taking out what sk1ll placed or leaving it, and retries when Take out fails', async () => {
   const { daemon, user } = launch('fleet', { hash: '#/settings' });
   await heading('Settings');

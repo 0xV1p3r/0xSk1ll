@@ -2,6 +2,10 @@
 //! `machine.toml` after showing what sk1ll placed where the change stops
 //! syncing (it stays there) and what sync does next. The engine makes the
 //! change and syncs.
+//!
+//! The preset instances this process's environment points at
+//! ([`sk1ll_core::machine::candidates`]) are found here, not by the engine:
+//! a daemon running as a user service rarely has the shell's variables.
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -9,7 +13,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
 use sk1ll_core::machine::MachineConfig;
-use sk1ll_core::{Harness, HarnessChange, HarnessChoice, InstructionsFormat, LinkMode};
+use sk1ll_core::{Harness, HarnessCandidate, HarnessChange, HarnessChoice, InstructionsFormat, LinkMode};
 use sk1ll_daemon::client::{HarnessChangeRequest, HarnessView, PlacementView};
 
 use crate::confirm;
@@ -142,13 +146,49 @@ impl HarnessCmd {
     }
 }
 
+/// The preset instances this process's environment points at, given the
+/// machine's harnesses and the skills repo at `repo`.
+pub(crate) fn env_candidates(choices: &[HarnessChoice], repo: &Path) -> Vec<HarnessCandidate> {
+    sk1ll_core::machine::candidates(choices, repo, |var| std::env::var_os(var).filter(|v| !v.is_empty()))
+}
+
+/// What a candidate is, for a prompt or a message: `claude in ~/.claude_2,
+/// from CLAUDE_CONFIG_DIR`.
+pub(crate) fn describe(c: &HarnessCandidate) -> String {
+    let kind = c.harness.kind.as_deref().unwrap_or_default();
+    format!("{kind} in {}, from {}", c.harness.home.as_deref().unwrap_or_default(), c.var)
+}
+
+/// First-run setup outside `sk1ll setup` (`init` through the daemon, `join`
+/// without a repo): adds the candidates that overlap nothing, as setup
+/// takes up the opt-in presets it finds.
+pub(crate) fn adopt_candidates(s: &Session) -> Result<()> {
+    let choices = s.block(s.client.setup_harnesses())?;
+    for c in env_candidates(&choices, &s.status.repo) {
+        match &c.warning {
+            Some(warning) => eprintln!("{} ({}): not added: {warning}", c.name, describe(&c)),
+            None => {
+                s.block(s.client.add_setup_instance(&c.name, &c.harness))?;
+                eprintln!("added harness {} ({})", c.name, describe(&c));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `sk1ll harnesses [--all] [<command>]`.
 pub(crate) fn run(s: &Session, all: bool, command: Option<HarnessCmd>) -> Result<()> {
     let Some(command) = command else {
         let settings = s.block(s.client.harness_settings())?;
         let effective = s.block(s.client.harnesses())?;
-        let listing =
-            Listing { machine: &s.status.machine_id, config: &settings.path, effective, choices: settings.harnesses };
+        let candidates = env_candidates(&settings.harnesses, &s.status.repo);
+        let listing = Listing {
+            machine: &s.status.machine_id,
+            config: &settings.path,
+            effective,
+            choices: settings.harnesses,
+            candidates,
+        };
         return list(&listing, all, &mut std::io::stdout());
     };
     if let HarnessCmd::Rename { old, new, replace, .. } = command {
@@ -165,11 +205,24 @@ pub(crate) fn run(s: &Session, all: bool, command: Option<HarnessCmd>) -> Result
         }
         return Ok(());
     }
-    let config = match &command {
-        HarnessCmd::Add { .. } => MachineConfig::load(&s.block(s.client.harness_settings())?.path)?,
+    let settings = match &command {
+        HarnessCmd::Add { .. } | HarnessCmd::Enable { .. } => Some(s.block(s.client.harness_settings())?),
+        _ => None,
+    };
+    let config = match (&command, &settings) {
+        (HarnessCmd::Add { .. }, Some(settings)) => MachineConfig::load(&settings.path)?,
         _ => MachineConfig::default(),
     };
-    let (change, opts, take_out) = command.split(&config)?;
+    let choices = settings.map(|s| s.harnesses).unwrap_or_default();
+    let (mut change, opts, take_out) = command.split(&config)?;
+    // A candidate found in the environment is added as the instance it is.
+    if let HarnessChange::Enable { name } = &change
+        && !choices.iter().any(|c| c.name == *name)
+        && let Some(c) = env_candidates(&choices, &s.status.repo).into_iter().find(|c| c.name == *name)
+    {
+        println!("adds {} ({})", c.name, describe(&c));
+        change = c.change();
+    }
     let view = |p: &PlacementView, placed: bool| Row {
         kind: p.kind.clone(),
         harness: p.harness.clone(),
@@ -247,6 +300,8 @@ struct Listing<'a> {
     /// The harnesses sync writes into.
     effective: Vec<HarnessView>,
     choices: Vec<HarnessChoice>,
+    /// Preset instances the environment points at, not yet added.
+    candidates: Vec<HarnessCandidate>,
 }
 
 /// The harnesses sync writes into; with `all`, also those it doesn't.
@@ -257,10 +312,17 @@ fn list(listing: &Listing, all: bool, out: &mut dyn Write) -> Result<()> {
     }
     let choices = &listing.choices;
     let available: Vec<_> = choices.iter().filter(|c| c.available && (c.installed || c.enabled)).collect();
+    let candidates = &listing.candidates;
     if !all {
         if !available.is_empty() {
             let names = available.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ");
             eprintln!("presets available, off until enabled: {names} (see `sk1ll harnesses --all`)");
+        }
+        if !candidates.is_empty() {
+            let names = candidates.iter().map(|c| format!("{} ({})", c.name, c.var)).collect::<Vec<_>>().join(", ");
+            eprintln!(
+                "config directories found in the environment, off until enabled: {names} (see `sk1ll harnesses --all`)"
+            );
         }
         return Ok(());
     }
@@ -272,9 +334,24 @@ fn list(listing: &Listing, all: bool, out: &mut dyn Write) -> Result<()> {
         };
         writeln!(out, "{}", line(&c.name, state, &c.harness))?;
     }
+    for c in candidates {
+        writeln!(out, "{}", line(&c.name, "found", &c.harness))?;
+    }
     for c in &available {
         let what = if c.enabled { "can also sync its skills directory" } else { "is an opt-in preset" };
         writeln!(out, "note: {} {what}, off until `sk1ll harnesses enable {}` (which previews it)", c.name, c.name)?;
+    }
+    for c in candidates {
+        match &c.warning {
+            Some(warning) => writeln!(out, "note: {} is {}; it {warning}, so it isn't offered", c.name, describe(c))?,
+            None => writeln!(
+                out,
+                "note: {} is {}, off until `sk1ll harnesses enable {}` (which previews it)",
+                c.name,
+                describe(c),
+                c.name
+            )?,
+        }
     }
     Ok(())
 }

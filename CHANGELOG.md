@@ -18,6 +18,13 @@ break compatibility.
   instance of. `home` on a preset's own entry moves that preset.
 - A Harness has a kind: the preset it is or is an instance of. A Rule's
   `harnesses: [claude]` reaches every Harness named or of kind `claude`.
+- Config directories found in the environment: `CLAUDE_CONFIG_DIR`,
+  `CODEX_HOME` or `COPILOT_HOME`, read by the `sk1ll` command and the app
+  (the daemon rarely has your shell's variables), name a candidate preset
+  instance. First-run setup offers it as on and writes its `preset` and
+  `home`; anywhere else it is only listed (`sk1ll harnesses`, `--all`,
+  Settings → Harnesses) until `sk1ll harnesses enable <name>` or **Enable**
+  adds it after the usual preview. No directory is ever globbed.
 
 ### Changed
 

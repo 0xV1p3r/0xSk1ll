@@ -33,10 +33,16 @@ impl Setup {
     }
 
     fn setup_at(&self, repo: &Path, answers: &str) -> Output {
+        self.setup_env(repo, answers, &[])
+    }
+
+    /// With these environment variables set, as a user's shell may have them.
+    fn setup_env(&self, repo: &Path, answers: &str, env: &[(&str, &Path)]) -> Output {
         let root = self.home.path();
         let mut child = self
             .home
             .command(BIN)
+            .envs(env.iter().copied())
             .arg("--repo")
             .arg(repo)
             .arg("--machine-config")
@@ -107,17 +113,46 @@ fn setup_offers_and_enables_opt_in_presets() {
     assert!(!fixture.home.path().join("presets.toml").exists());
 }
 
+/// First-run setup offers the config directory an environment variable
+/// points at as on, and adds it as a preset instance when kept; one that
+/// overlaps a harness is shown with why, and not offered.
+#[test]
+fn setup_offers_config_directories_from_the_environment() {
+    let fixture = Setup::new();
+    let root = fixture.home.path();
+    for dir in [".claude_2", "a"] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    // `a` is the custom harness's skills directory: CODEX_HOME would sync around it.
+    let env = [("CLAUDE_CONFIG_DIR", root.join(".claude_2")), ("CODEX_HOME", root.join("a"))];
+    let env: Vec<_> = env.iter().map(|(var, dir)| (*var, dir.as_path())).collect();
+    let out = fixture.setup_env(&root.join("repo"), "1\n\n\n\n", &env);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    let offered =
+        "Sync claude_2 (claude in ~/.claude_2, from CLAUDE_CONFIG_DIR: ~/.claude_2/skills, ~/.claude_2/rules)? [Y/n]";
+    assert!(stdout.contains(offered), "{stdout}");
+    // `a` is taken, so it is offered under the preset's name.
+    assert!(stdout.contains("codex-2 (codex in ~/a, from CODEX_HOME): not offered: overlaps a\n"), "{stdout}");
+    let config = std::fs::read_to_string(root.join("machine.toml")).unwrap();
+    assert!(config.contains("[harnesses.claude_2]\npreset = \"claude\"\nhome = \"~/.claude_2\"\n"), "{config}");
+    assert!(!config.contains("codex"), "{config}");
+}
+
 /// `sk1ll init` on a machine that already has a machine.toml (set up with
-/// an older sk1ll, say) takes up no opt-in preset; on a new one it does.
+/// an older sk1ll, say) takes up no opt-in preset and adds no config
+/// directory from the environment; on a new one it does both.
 #[test]
 fn init_adopts_opt_in_presets_only_without_a_machine_toml() {
     let fixture = Setup::new();
     let root = fixture.home.path();
     std::fs::create_dir_all(root.join(".kiro")).unwrap();
+    std::fs::create_dir_all(root.join(".claude_2")).unwrap();
     let init = |config: &str, repo: &str| {
         let out = fixture
             .home
             .command(BIN)
+            .env("CLAUDE_CONFIG_DIR", root.join(".claude_2"))
             .arg("--machine-config")
             .arg(root.join(config))
             .arg("init")
@@ -132,6 +167,7 @@ fn init_adopts_opt_in_presets_only_without_a_machine_toml() {
     init("new/machine.toml", "repo2");
     let config = std::fs::read_to_string(root.join("new/machine.toml")).unwrap();
     assert!(config.contains("[harnesses.kiro]\nenabled = true\n"), "{config}");
+    assert!(config.contains("[harnesses.claude_2]\npreset = \"claude\"\nhome = \"~/.claude_2\"\n"), "{config}");
 }
 
 #[test]

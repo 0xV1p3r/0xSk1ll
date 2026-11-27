@@ -67,6 +67,33 @@
       }
     ]
   },
+  "harness_candidate": [
+    {
+      "harness": {
+        "home": "~/.claude_2",
+        "instructions": "~/.claude_2/rules",
+        "instructions_format": "block",
+        "kind": "claude",
+        "mode": "symlink",
+        "skills": "~/.claude_2/skills"
+      },
+      "name": "claude_2",
+      "var": "CLAUDE_CONFIG_DIR"
+    },
+    {
+      "harness": {
+        "home": "~/.agents",
+        "instructions": "~/.agents/AGENTS.md",
+        "instructions_format": "block",
+        "kind": "codex",
+        "mode": "symlink",
+        "skills": "~/.agents/skills"
+      },
+      "name": "codex-2",
+      "var": "CODEX_HOME",
+      "warning": "overlaps agents"
+    }
+  ],
   "harness_change": {
     "disable": {
       "name": "claude",

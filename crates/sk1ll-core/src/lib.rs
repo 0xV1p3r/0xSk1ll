@@ -93,8 +93,8 @@ pub use instructions::Rule;
 pub use item_id::ItemId;
 pub use lock::{LockEntry, Lockfile};
 pub use machine::{
-    EffectiveHarness, Harness, HarnessChange, HarnessChoice, HarnessEntry, HarnessOrigin, InstructionsFormat, LinkMode,
-    MachineConfig,
+    EffectiveHarness, Harness, HarnessCandidate, HarnessChange, HarnessChoice, HarnessEntry, HarnessOrigin,
+    InstructionsFormat, LinkMode, MachineConfig,
 };
 pub use manifest::{Import, Manifest};
 pub use repo::Repo;

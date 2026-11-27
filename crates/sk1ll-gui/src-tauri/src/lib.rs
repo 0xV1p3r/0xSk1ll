@@ -66,6 +66,8 @@ pub fn register_commands<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri
         commands::harnesses,
         commands::setup_harnesses,
         commands::set_setup_harness,
+        commands::add_setup_instance,
+        commands::harness_candidates,
         commands::notifications_enabled,
         commands::set_notifications,
         commands::harness_settings,

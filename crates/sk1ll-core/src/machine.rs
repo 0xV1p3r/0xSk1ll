@@ -12,9 +12,12 @@
 //! synced into only while `machine.toml` enables them explicitly, so an
 //! upgrade never starts writing somewhere new. First-run setup enables the
 //! ones it finds ([`MachineConfig::adopt_detected_presets`]); anywhere else
-//! they are listed as available until enabled.
+//! they are listed as available until enabled. The instances environment
+//! variables point at ([`candidates`]) are found by the process that has the
+//! environment and offered the same way.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -144,6 +147,132 @@ pub struct HarnessChoice {
     pub available: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_warning: Option<String>,
+}
+
+/// The environment variables that point a tool at another config directory,
+/// with the preset each is for. Only these: no directory is ever globbed.
+pub const HOME_VARS: &[(&str, &str)] =
+    &[("CLAUDE_CONFIG_DIR", "claude"), ("CODEX_HOME", "codex"), ("COPILOT_HOME", "copilot")];
+
+/// A preset instance an environment variable of [`HOME_VARS`] points at,
+/// offered but not yet in `machine.toml` (see [`candidates`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessCandidate {
+    /// The name it is offered under, free on this machine.
+    pub name: String,
+    /// The variable it was found in, e.g. `CLAUDE_CONFIG_DIR`.
+    pub var: String,
+    /// What it syncs into once added: its preset in `harness.home`.
+    pub harness: Harness,
+    /// Why it isn't offered as on: what it overlaps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+impl HarnessCandidate {
+    /// The change that adds it to `machine.toml` as `preset` and `home`.
+    pub fn change(&self) -> HarnessChange {
+        HarnessChange::Set { name: self.name.clone(), harness: self.harness.clone() }
+    }
+}
+
+/// The preset instances that the environment variables of [`HOME_VARS`]
+/// point at, as `var` reads them, given the harnesses this machine has
+/// (`choices`, e.g. [`MachineConfig::choices`]) and its skills repo. The
+/// daemon usually runs without the user's shell environment, so the process
+/// that has it (the CLI, the GUI) calls this, and adds a candidate as any
+/// harness change through the engine.
+///
+/// A variable is skipped when it isn't an absolute or `~/` path to a
+/// directory, or names the preset's own home or the home of a harness that
+/// is on or in `machine.toml`. A candidate that overlaps a harness that is
+/// on, or the repo, carries a warning. Its name is the directory's, without
+/// leading dots, in the harness name charset, else `<preset>-<n>`.
+pub fn candidates(
+    choices: &[HarnessChoice],
+    repo: &Path,
+    var: impl Fn(&str) -> Option<OsString>,
+) -> Vec<HarnessCandidate> {
+    home_or_none(|home| candidates_in(choices, repo, &var, home))
+}
+
+fn candidates_in(
+    choices: &[HarnessChoice],
+    repo: &Path,
+    var: &dyn Fn(&str) -> Option<OsString>,
+    home: &Path,
+) -> Vec<HarnessCandidate> {
+    let repo = real(&std::path::absolute(repo).unwrap_or_else(|_| repo.to_path_buf()));
+    let resolve = |path: &str| real(&expand_in(path, home));
+    let mut taken: Vec<String> = presets().map(String::from).chain(choices.iter().map(|c| c.name.clone())).collect();
+    let mut used: Vec<PathBuf> = choices
+        .iter()
+        .filter(|c| c.enabled || c.configured)
+        .filter_map(|c| c.harness.home.as_deref())
+        .map(resolve)
+        .collect();
+    let mut out = Vec::new();
+    for (env, kind) in HOME_VARS {
+        let Some(spelled) = var(env).as_deref().and_then(|v| v.to_str()).and_then(|v| home_spelling(v, home)) else {
+            continue;
+        };
+        let p = preset(kind).expect("HOME_VARS names presets");
+        let dir = resolve(&spelled);
+        if !dir.is_dir() || dir == resolve(p.home) || used.contains(&dir) {
+            continue;
+        }
+        let harness = p.instance(Some(&spelled));
+        if check_harness(kind, &harness, home).is_err() {
+            continue;
+        }
+        let mine = locations(&harness, home);
+        let warning = choices
+            .iter()
+            .filter(|c| c.enabled)
+            .find(|c| locations(&c.harness, home).iter().any(|theirs| mine.iter().any(|m| overlaps(m, theirs))))
+            .map(|c| format!("overlaps {}", c.name))
+            .or_else(|| mine.iter().any(|m| overlaps(m, &repo)).then(|| "overlaps the skills repo".to_string()));
+        let name = candidate_name(&spelled, kind, &taken);
+        taken.push(name.clone());
+        used.push(dir);
+        out.push(HarnessCandidate { name, var: env.to_string(), harness, warning });
+    }
+    out
+}
+
+/// `value` as a `home` is written: `~/` for a path in the user's home,
+/// without a trailing `/`; `None` unless it is absolute or starts with `~/`.
+fn home_spelling(value: &str, home: &Path) -> Option<String> {
+    let value = value.trim();
+    let value = if value.len() > 1 { value.trim_end_matches('/') } else { value };
+    if value.starts_with("~/") {
+        return Some(value.to_string());
+    }
+    let path = Path::new(value);
+    if !path.is_absolute() {
+        return None;
+    }
+    match path.strip_prefix(home) {
+        Ok(rest) if !rest.as_os_str().is_empty() => rest.to_str().map(|rest| format!("~/{rest}")),
+        _ => Some(value.to_string()),
+    }
+}
+
+/// The name a candidate in `home` is offered under: the directory's name
+/// without leading dots, lowercased, other characters as `-`; else (empty,
+/// a preset's name, or `taken`) `<kind>-2`, `<kind>-3`, ...
+fn candidate_name(home: &str, kind: &str, taken: &[String]) -> String {
+    let base = home.rsplit('/').next().unwrap_or_default().trim_start_matches('.').to_lowercase();
+    let mut name: String = base
+        .chars()
+        .map(|c| if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' { c } else { '-' })
+        .skip_while(|c| !c.is_ascii_alphanumeric())
+        .take(64)
+        .collect();
+    if name.is_empty() || taken.contains(&name) || check_name(&name).is_err() {
+        name = (2..).map(|n| format!("{kind}-{n}")).find(|n| !taken.contains(n)).expect("a free name");
+    }
+    name
 }
 
 /// A change to this machine's harnesses, made in `machine.toml`.

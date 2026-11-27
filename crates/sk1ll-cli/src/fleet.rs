@@ -70,8 +70,17 @@ pub(crate) fn command(cli: Cli) -> Result<()> {
 
 fn join(cli: Cli) -> Result<()> {
     let cfg = daemon_config(&cli)?;
-    let Cmd::Join { server_url, code, admin_token, id, copy_from } = cli.cmd else { unreachable!() };
     let repo = sk1ll_daemon::locate_repo(cli.repo.as_deref(), false)?;
+    // Joining without a repo is first-run setup: the engine can't see this
+    // shell's environment, so the config directories it points at are added
+    // first. The join itself takes up the opt-in presets.
+    if !repo.join(".git").exists() && DaemonState::load(&cfg.state)?.is_none() {
+        let session = Session::any(&cli)?;
+        if !session.status.repo_ready && same_path(&session.status.repo, &repo) {
+            crate::harnesses::adopt_candidates(&session)?;
+        }
+    }
+    let Cmd::Join { server_url, code, admin_token, id, copy_from } = cli.cmd else { unreachable!() };
     if sk1ll_daemon::join::insecure_http(&server_url) {
         eprintln!("warning: joining over plain HTTP; the machine token travels in clear text");
     }

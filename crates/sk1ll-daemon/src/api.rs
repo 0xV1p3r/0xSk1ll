@@ -71,6 +71,7 @@ pub(crate) fn router(d: Arc<Daemon>) -> Router {
         .route("/harnesses/take-out", post(take_out_harness))
         .route("/setup/harnesses", get(setup_harnesses))
         .route("/setup/harnesses/{name}", post(set_setup_harness))
+        .route("/setup/harnesses/{name}/add", post(add_setup_instance))
         .route("/imports", get(imports))
         .route("/imports/check", post(check_imports))
         .route("/items/create", post(create_item))
@@ -407,6 +408,15 @@ async fn set_setup_harness(
 ) -> Result<Json<Vec<HarnessChoice>>> {
     let _harnesses = d.harness_changes.lock().await;
     Ok(Json(d.blocking(move |d, eng| d.set_setup_harness(eng, &name, req.enabled)).await?))
+}
+
+async fn add_setup_instance(
+    State(d): St,
+    UrlPath(name): UrlPath<String>,
+    Json(harness): Json<sk1ll_core::Harness>,
+) -> Result<Json<Vec<HarnessChoice>>> {
+    let _harnesses = d.harness_changes.lock().await;
+    Ok(Json(d.blocking(move |d, eng| d.add_setup_instance(eng, &name, harness)).await?))
 }
 
 async fn notifications_enabled(State(d): St) -> Result<Json<bool>> {

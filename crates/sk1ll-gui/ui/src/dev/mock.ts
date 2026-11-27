@@ -17,6 +17,8 @@ export interface MockDaemon {
   assignments: Record<string, T.AssignmentSnapshot>; draft: T.DraftEntry[]; diffs: Record<string, string>;
   conflicts: T.ConflictView[]; recovered: T.ConflictView[]; log: T.LogEntry[]; imports: T.ImportsView & { imports: T.ImportEntry[] };
   setupHarnesses: T.HarnessChoice[];
+  // Config folders the app's environment points at (CLAUDE_CONFIG_DIR, ...); each is offered until a Harness has its name.
+  harnessCandidates: T.HarnessCandidate[];
   // Whether the Daemon answers, and whether the next sync would change anything.
   running: boolean; syncPending: boolean;
   // Every command the App sent, in order, without the event plugin's.
@@ -140,6 +142,7 @@ export function installMock(scenario: string, options: MockOptions = {}): MockDa
     { name: 'gemini', installed: false, enabled: false, preset: true, configured: false, harness: { kind: 'gemini', home: '~/.gemini', skills: '~/.gemini/skills', instructions: '~/.gemini/GEMINI.md', instructions_format: 'block', mode: 'symlink' } },
     { name: 'kiro', installed: true, enabled: false, preset: true, configured: false, available: true, harness: { kind: 'kiro', home: '~/.kiro', skills: '~/.kiro/skills', instructions: '~/.kiro/steering', instructions_format: 'rules', mode: 'copy' } },
   ];
+  const harnessCandidates: T.HarnessCandidate[] = [];
   const machineConfig = '/home/dev/.config/sk1ll/machine.toml';
   let notificationsEnabled = true;
   // Every enabled Harness got `code-review`; a change previews it as left in place or placed.
@@ -160,7 +163,7 @@ export function installMock(scenario: string, options: MockOptions = {}): MockDa
   const delay = <V,>(value: V, ms = 250) => new Promise<V>(resolve => setTimeout(() => resolve(structuredClone(value)), ms * latency));
   const overrides = new Map<string, (args: Args) => unknown>();
   const daemon: MockDaemon = {
-    status, machines, items, content, assignments, draft, diffs, conflicts, recovered, log, imports, setupHarnesses,
+    status, machines, items, content, assignments, draft, diffs, conflicts, recovered, log, imports, setupHarnesses, harnessCandidates,
     running: scenario !== 'unreachable', syncPending: !empty, calls: [],
     sent: cmd => daemon.calls.filter(call => call.cmd === cmd).map(call => call.args),
     override: (cmd, handler) => { overrides.set(cmd, handler); },
@@ -490,6 +493,13 @@ export function installMock(scenario: string, options: MockOptions = {}): MockDa
       case 'set_setup_harness': {
         const choice = setupHarnesses.find(h => h.name === a.name);
         if (choice) choice.enabled = a.enabled as boolean;
+        local.harnesses = setupHarnesses.filter(h => h.enabled).map(h => ({ name: h.name, kind: h.harness.kind }));
+        return delay(setupHarnesses);
+      }
+      case 'harness_candidates': return delay(harnessCandidates.filter(c => !setupHarnesses.some(h => h.name === c.name)));
+      case 'add_setup_instance': {
+        if (setupHarnesses.some(h => h.name === a.name)) return Promise.reject({ status: 409, message: `harness \`${a.name as string}\` exists already` });
+        setupHarnesses.push({ name: a.name as string, installed: true, enabled: true, preset: false, configured: true, harness: a.harness as T.HarnessView['harness'] });
         local.harnesses = setupHarnesses.filter(h => h.enabled).map(h => ({ name: h.name, kind: h.harness.kind }));
         return delay(setupHarnesses);
       }

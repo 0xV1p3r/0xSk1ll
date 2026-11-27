@@ -103,6 +103,9 @@ export interface HarnessView {
 // skills directory; enabling it takes that up (`harness` shows what it then syncs into).
 export interface HarnessChoice { name: string; installed: boolean; enabled: boolean; harness: HarnessView['harness']; preset?: boolean; configured?: boolean; available?: boolean; setup_warning?: string }
 export interface HarnessSettings { path: string; harnesses: HarnessChoice[] }
+// A config directory an environment variable of the app's points at (`var`, e.g. CLAUDE_CONFIG_DIR), not yet a Harness:
+// `harness` is the preset instance adding it makes. `warning`: what it overlaps, so it isn't offered as on.
+export interface HarnessCandidate { name: string; var: string; harness: HarnessView['harness']; warning?: string }
 export type HarnessChange = { op: 'enable' | 'disable' | 'remove'; name: string } | { op: 'set'; name: string; harness: HarnessView['harness'] };
 // Apply answers 409 if machine.toml changed while it was written; it never removes what sk1ll placed.
 export interface HarnessChangeRequest { change: HarnessChange; fingerprint?: string }

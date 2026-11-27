@@ -202,6 +202,53 @@ fn harnesses_add_a_preset_instance_in_another_config_directory() {
     assert!(refused.contains("no preset `nope`"), "{refused}");
 }
 
+/// A config directory an environment variable points at is offered, never
+/// synced into unasked: `harnesses` mentions it, `--all` lists it, and
+/// `enable <its name>` adds it as a preset instance after the preview.
+#[test]
+fn harnesses_offer_a_config_directory_from_the_environment() {
+    let repo = Machine::new();
+    repo.repo.write("personal/pdf/SKILL.md", "PDFs.");
+    let dir = repo.home.path().join(".claude-work");
+    fs::create_dir_all(&dir).unwrap();
+    let with = |value: &Path, args: &[&str]| command(&repo, args).env("CLAUDE_CONFIG_DIR", value).output().unwrap();
+
+    let listed = with(&dir, &["harnesses"]);
+    let stderr = String::from_utf8_lossy(&listed.stderr);
+    assert!(
+        stderr.contains("found in the environment, off until enabled: claude-work (CLAUDE_CONFIG_DIR)"),
+        "{stderr}"
+    );
+    let all = outcome(with(&dir, &["harnesses", "--all"])).unwrap();
+    let line = all.lines().find(|line| line.starts_with("claude-work ")).unwrap();
+    assert!(line.contains("found") && line.ends_with("[claude in ~/.claude-work]"), "{line}");
+    assert!(all.contains("note: claude-work is claude in ~/.claude-work, from CLAUDE_CONFIG_DIR, off until `sk1ll harnesses enable claude-work`"), "{all}");
+    assert!(!dir.join("skills").exists(), "offered, not synced into");
+    assert!(!run(&repo, &["harnesses", "--all"]).unwrap().contains("claude-work"), "only from the variable");
+    // The preset's own home is the preset, not a candidate.
+    let own = repo.home.path().join(".claude");
+    fs::create_dir_all(&own).unwrap();
+    assert!(!outcome(with(&own, &["harnesses", "--all"])).unwrap().contains("CLAUDE_CONFIG_DIR"));
+
+    let enabled = outcome(with(&dir, &["harnesses", "enable", "claude-work", "--yes"])).unwrap();
+    assert!(enabled.contains("adds claude-work (claude in ~/.claude-work, from CLAUDE_CONFIG_DIR)"), "{enabled}");
+    assert!(enabled.contains("then sync does:"), "{enabled}");
+    let text = fs::read_to_string(repo.machine_toml()).unwrap();
+    assert!(text.ends_with("[harnesses.claude-work]\npreset = \"claude\"\nhome = \"~/.claude-work\"\n"), "{text}");
+    assert!(dir.join("skills/pdf/SKILL.md").exists());
+    // A harness of its own now, so no longer offered.
+    let all = outcome(with(&dir, &["harnesses", "--all"])).unwrap();
+    assert!(!all.contains("CLAUDE_CONFIG_DIR") && !all.contains("note: claude-work"), "{all}");
+
+    // One that overlaps the skills repo is listed with why, and can't be enabled.
+    let all = outcome(with(repo.repo.root(), &["harnesses", "--all"])).unwrap();
+    let note = all.lines().find(|line| line.contains("from CLAUDE_CONFIG_DIR")).unwrap();
+    assert!(note.ends_with("overlaps the skills repo, so it isn't offered"), "{all}");
+    let name = note.trim_start_matches("note: ").split(' ').next().unwrap();
+    let refused = outcome(with(repo.repo.root(), &["harnesses", "enable", name, "--yes"])).unwrap_err();
+    assert!(refused.contains("overlaps the skills repo"), "{refused}");
+}
+
 /// `--take-out` turns the harness's items off and syncs, so what sk1ll
 /// placed there goes, and makes the change only once that worked.
 #[cfg(unix)]

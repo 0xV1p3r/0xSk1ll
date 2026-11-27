@@ -34,6 +34,7 @@
 //! | GET | `/harnesses` | → `Vec<`[`HarnessView`]`>` |
 //! | GET | `/setup/harnesses` | → `Vec<`[`HarnessChoice`]`>` |
 //! | POST | `/setup/harnesses/{name}` | [`SetHarnessEnabled`] → `Vec<`[`HarnessChoice`]`>`; standalone without a repo only |
+//! | POST | `/setup/harnesses/{name}/add` | a preset instance's [`Harness`](sk1ll_core::Harness) → `Vec<`[`HarnessChoice`]`>`: adds a [`HarnessCandidate`] kept on; standalone without a repo only |
 //! | GET / POST | `/notifications` | read or set the desktop notification preference as a JSON boolean |
 //! | GET | `/harnesses/config` | → [`HarnessSettings`] |
 //! | POST | `/harnesses/preview` | [`HarnessChangeRequest`] → [`HarnessPreview`]; changes nothing |
@@ -85,7 +86,7 @@ use serde::{Deserialize, Serialize};
 pub use sk1ll_core::content::{
     ContentEntry, ContentQuery, ContentType, FileContent, FileEntry, FileQuery, WriteFileRequest,
 };
-pub use sk1ll_core::{HarnessChange, HarnessChoice};
+pub use sk1ll_core::{HarnessCandidate, HarnessChange, HarnessChoice};
 pub use sk1ll_proto::{
     Assignment, AssignmentChanges, AssignmentCopyPreview, AssignmentSnapshot, AssignmentUpdate, ErrorBody, FleetView,
     ImportSkipped, ImportUpdate, ItemRef, JoinCode, JoinCodeRequest, LogEntry, LogFacets, LogQuery,
@@ -1063,6 +1064,11 @@ impl Client {
 
     pub async fn set_setup_harness(&self, name: &str, enabled: bool) -> Result<Vec<HarnessChoice>> {
         self.post(&format!("/setup/harnesses/{}", encode(name)), &SetHarnessEnabled { enabled }).await
+    }
+
+    /// Adds a [`HarnessCandidate`] kept on in first-run setup.
+    pub async fn add_setup_instance(&self, name: &str, harness: &sk1ll_core::Harness) -> Result<Vec<HarnessChoice>> {
+        self.post(&format!("/setup/harnesses/{}/add", encode(name)), harness).await
     }
 
     pub async fn notifications_enabled(&self) -> Result<bool> {

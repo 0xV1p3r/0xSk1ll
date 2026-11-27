@@ -127,8 +127,10 @@ fn shell_quote(path: &Path) -> String {
 fn choose_harnesses(input: &mut Input, machine_config: &Path, session: &Session, existing: bool) -> Result<()> {
     // The opt-in presets found here read as on: setup enables them as it ends.
     let choices: Vec<HarnessChoice> = session.block(session.client.setup_harnesses())?;
+    // So do the config directories this environment points at, the first time.
+    let candidates = crate::harnesses::env_candidates(&choices, &session.status.repo);
     let (shown, missing): (Vec<_>, Vec<_>) = choices.into_iter().partition(|c| c.installed || c.enabled);
-    if shown.is_empty() {
+    if shown.is_empty() && candidates.is_empty() {
         println!("No harnesses found. Install an agent tool or add one to {}.", machine_config.display());
     } else {
         println!("Choose the harnesses to sync into (saved in {}):", machine_config.display());
@@ -152,17 +154,8 @@ fn choose_harnesses(input: &mut Input, machine_config: &Path, session: &Session,
         }
         let name = choice.name.clone();
         let change = if enabled { HarnessChange::Enable { name } } else { HarnessChange::Disable { name } };
-        let mut request = HarnessChangeRequest { change, fingerprint: None };
-        let preview = session.block(session.client.preview_harness(&request))?;
-        for warning in &preview.warnings {
-            println!("  warning: {warning}");
-        }
-        request.fingerprint = Some(preview.fingerprint);
-        let applied = session.block(session.client.apply_harness(&request))?;
-        for error in &applied.errors {
-            println!("  error: {error}");
-        }
-        if !enabled && !preview.placed.is_empty() {
+        let placed = apply_change(session, change)?;
+        if !enabled && placed {
             println!(
                 "  what sk1ll placed in {0} stays there, no longer managed; to take it out, enable {0} again, then run \
                  `sk1ll harnesses disable {0} --take-out`",
@@ -170,11 +163,44 @@ fn choose_harnesses(input: &mut Input, machine_config: &Path, session: &Session,
             );
         }
     }
+    for c in candidates {
+        let what = crate::harnesses::describe(&c);
+        if let Some(warning) = &c.warning {
+            println!("  {} ({what}): not offered: {warning}", c.name);
+            continue;
+        }
+        let paths = [c.harness.skills.as_deref(), c.harness.instructions.as_deref()];
+        let paths = paths.into_iter().flatten().collect::<Vec<_>>().join(", ");
+        if !input.yes(&format!("  Sync {} ({what}: {paths})?", c.name), !existing)? {
+            continue;
+        }
+        if existing {
+            apply_change(session, c.change())?;
+        } else {
+            session.block(session.client.add_setup_instance(&c.name, &c.harness))?;
+        }
+    }
     if !missing.is_empty() {
         let names = missing.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ");
         println!("Not found on this machine: {names}");
     }
     Ok(())
+}
+
+/// Makes `change` as `sk1ll harnesses` does, after its preview, and syncs.
+/// Whether sk1ll had placed anything where the change stops syncing.
+fn apply_change(session: &Session, change: HarnessChange) -> Result<bool> {
+    let mut request = HarnessChangeRequest { change, fingerprint: None };
+    let preview = session.block(session.client.preview_harness(&request))?;
+    for warning in &preview.warnings {
+        println!("  warning: {warning}");
+    }
+    request.fingerprint = Some(preview.fingerprint);
+    let applied = session.block(session.client.apply_harness(&request))?;
+    for error in &applied.errors {
+        println!("  error: {error}");
+    }
+    Ok(!preview.placed.is_empty())
 }
 
 /// Returns the machine id, whether the assignment was copied, and whether the daemon joined.

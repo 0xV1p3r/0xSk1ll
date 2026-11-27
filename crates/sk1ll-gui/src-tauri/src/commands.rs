@@ -77,6 +77,10 @@ command!(dismiss_keep_notes() -> usize, dismiss_keep_notes());
 command!(harnesses() -> Vec<HarnessView>, harnesses());
 command!(setup_harnesses() -> Vec<HarnessChoice>, setup_harnesses());
 command!(set_setup_harness(name: String, enabled: bool) -> Vec<HarnessChoice>, set_setup_harness(&name, enabled));
+command!(
+    add_setup_instance(name: String, harness: sk1ll_core::Harness) -> Vec<HarnessChoice>,
+    add_setup_instance(&name, &harness)
+);
 command!(render_instructions(name: String) -> Vec<InstructionPreview>, render_instructions(&name));
 command!(preview_sync() -> SyncResult, preview_sync());
 command!(sync_now(fingerprint: String) -> SyncResult, apply_sync_preview(fingerprint));
@@ -186,6 +190,28 @@ impl Bridge {
             unreachable: false,
         })?
     }
+}
+
+impl Bridge {
+    /// The config directories this app's environment points at, as
+    /// [`sk1ll_core::machine::candidates`] finds them: the Daemon usually
+    /// runs without it. `setup`: against first-run setup's choices.
+    pub async fn harness_candidates(&self, setup: bool) -> Result<Vec<HarnessCandidate>> {
+        let choices =
+            if setup { self.client.setup_harnesses().await? } else { self.client.harness_settings().await?.harnesses };
+        let repo = self.client.status().await?.repo;
+        tauri::async_runtime::spawn_blocking(move || {
+            sk1ll_core::machine::candidates(&choices, &repo, |var| std::env::var_os(var).filter(|v| !v.is_empty()))
+        })
+        .await
+        .map_err(|e| local_error(e.to_string()))
+    }
+}
+
+/// Not only a Daemon call: the candidates come from this process's environment.
+#[tauri::command]
+pub async fn harness_candidates(bridge: State<'_, Bridge>, setup: bool) -> Result<Vec<HarnessCandidate>> {
+    bridge.harness_candidates(setup).await
 }
 
 #[tauri::command]

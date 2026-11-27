@@ -2042,6 +2042,13 @@ async fn setup_chooses_harnesses_only_before_the_repo_exists() {
     let config = std::fs::read_to_string(&path).unwrap();
     assert!(config.contains("instructions_format = \"rules\""), "{config}");
     assert_eq!(m.client.set_setup_harness("nope", false).await.unwrap_err().status, Some(404));
+    // A config directory the client found in its environment, kept on.
+    let instance = sk1ll_core::machine::preset_instance("claude", Some("~/.claude_2")).unwrap();
+    let choices = m.client.add_setup_instance("claude_2", &instance).await.unwrap();
+    assert_eq!(enabled(&choices, "claude_2"), Some((true, true)));
+    assert_eq!(m.client.add_setup_instance("claude_2", &instance).await.unwrap_err().status, Some(409));
+    let custom = sk1ll_core::Harness { kind: None, home: None, ..instance.clone() };
+    assert_eq!(m.client.add_setup_instance("mine", &custom).await.unwrap_err().status, Some(400));
 
     m.client.init().await.unwrap();
     // Setup ended: the opt-in presets it kept on are enabled in machine.toml.
@@ -2051,7 +2058,9 @@ async fn setup_chooses_harnesses_only_before_the_repo_exists() {
     let error = m.client.set_setup_harness("claude", true).await.unwrap_err();
     assert_eq!(error.status, Some(409));
     assert!(error.message.contains("first-run setup"), "{}", error.message);
+    assert_eq!(m.client.add_setup_instance("claude_3", &instance).await.unwrap_err().status, Some(409));
     assert_eq!(enabled(&m.client.setup_harnesses().await.unwrap(), "claude"), Some((true, false)));
+    assert!(config.contains("[harnesses.claude_2]\npreset = \"claude\"\nhome = \"~/.claude_2\"\n"), "{config}");
 }
 
 /// A harness enabled on a joined Machine starts as the Server will assign

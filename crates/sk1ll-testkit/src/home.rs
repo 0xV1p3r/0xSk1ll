@@ -46,11 +46,13 @@ impl Home {
     }
 
     /// Points `cmd` at this HOME: `HOME` and the XDG variables, no `SK1LL_*`
-    /// overrides from the test's own environment, isolated git
-    /// ([`crate::git::isolate`]).
+    /// overrides from the test's own environment, none of the variables
+    /// that point a tool at another config directory (which the CLI offers
+    /// as harnesses, [`sk1ll_core::machine::HOME_VARS`]), isolated git
+    /// ([`crate::git::isolate`]). A test sets those itself.
     pub fn apply<'a>(&self, cmd: &'a mut Command) -> &'a mut Command {
         let h = self.path();
-        for var in SK1LL_ENV {
+        for var in SK1LL_ENV.iter().chain(sk1ll_core::machine::HOME_VARS.iter().map(|(var, _)| var)) {
             cmd.env_remove(var);
         }
         cmd.env("HOME", h)

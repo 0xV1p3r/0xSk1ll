@@ -57,6 +57,34 @@ it('sets up a standalone Machine: chooses Harnesses before anything syncs, creat
   expect(daemon.sent('fleet')).toEqual([]);
 });
 
+it('offers config folders found in the environment as on, and adds the kept ones as Harnesses on Continue', async () => {
+  const instance = (kind: string, home: string) => ({ kind, home, skills: `${home}/skills`, instructions: `${home}/rules`, instructions_format: 'rules' as const, mode: 'symlink' as const });
+  const { daemon, user } = launch('standalone-first-run', { setup: daemon => daemon.harnessCandidates.push(
+    { name: 'claude_2', var: 'CLAUDE_CONFIG_DIR', harness: instance('claude', '~/.claude_2') },
+    { name: 'codex-2', var: 'CODEX_HOME', harness: instance('codex', '~/.codex-work') },
+    { name: 'copilot-2', var: 'COPILOT_HOME', harness: instance('copilot', '~/.claude/skills'), warning: 'overlaps claude' }) });
+  await toHarnesses(user);
+  const found = within(screen.getByRole('list', { name: 'Config folders found in the environment' }));
+  expect(daemon.sent('harness_candidates')).toEqual([{ setup: true }]);
+  expect(checked(found.getByRole('checkbox', { name: 'Sync claude_2' }))).toBe(true);
+  expect(found.getByText(/from CLAUDE_CONFIG_DIR/)).toBeTruthy();
+  const overlapping = found.getByRole('checkbox', { name: 'Sync copilot-2' });
+  expect(checked(overlapping)).toBe(false);
+  expect(isDisabled(overlapping)).toBe(true);
+  expect(found.getByText('Not offered: it overlaps claude.')).toBeTruthy();
+  await user.click(found.getByRole('checkbox', { name: 'Sync codex-2' }));
+  expect(daemon.sent('add_setup_instance')).toEqual([]);
+
+  await user.click(screen.getByRole('button', { name: 'Continue' }));
+  expect(await screen.findByRole('button', { name: 'Create skills repo' })).toBeTruthy();
+  expect(daemon.sent('add_setup_instance')).toEqual([{ name: 'claude_2', harness: instance('claude', '~/.claude_2') }]);
+  // Back again: claude_2 is a Harness now, the declined one is still off.
+  await user.click(screen.getByRole('button', { name: 'Back' }));
+  const harnesses = within(await screen.findByRole('list', { name: 'Harnesses' }));
+  expect(checked(await harnesses.findByRole('checkbox', { name: 'Sync claude_2' }))).toBe(true);
+  expect(checked(within(screen.getByRole('list', { name: 'Config folders found in the environment' })).getByRole('checkbox', { name: 'Sync codex-2' }))).toBe(false);
+});
+
 it('marks the checklist commit step done after pushing part of the Draft', async () => {
   localStorage.setItem('sk1ll-getting-started', 'show');
   const { daemon, user } = launch('fleet', { hash: '#/library', setup: daemon => daemon.machines.splice(1) });
