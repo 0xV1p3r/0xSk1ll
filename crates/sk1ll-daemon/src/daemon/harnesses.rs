@@ -38,7 +38,7 @@ impl Daemon {
         if !self.setup_harnesses()?.iter().any(|c| c.name == name) {
             return Err(Error::NotFound(format!("no harness `{name}`")));
         }
-        MachineConfig::set_enabled(&self.cfg.machine_config, name, enabled)?;
+        MachineConfig::set_enabled(&self.cfg.machine_config, name, enabled, self.repo_root())?;
         self.setup_harnesses()
     }
 

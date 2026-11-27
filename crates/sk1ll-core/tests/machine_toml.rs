@@ -79,7 +79,7 @@ fn choices_list_disabled_presets_and_set_enabled_keeps_comments() {
     };
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("sk1ll").join(MACHINE_FILE);
-    MachineConfig::set_enabled(&path, "codex", false).unwrap();
+    MachineConfig::set_enabled(&path, "codex", false, Path::new("/nonexistent-repo")).unwrap();
     fs::write(&path, format!("# mine\nid = \"box\"\n{}", fs::read_to_string(&path).unwrap())).unwrap();
     let choices = MachineConfig::load(&path).unwrap().choices();
     let get = |name: &str| choices.iter().find(|c| c.name == name).unwrap().clone();
@@ -88,7 +88,7 @@ fn choices_list_disabled_presets_and_set_enabled_keeps_comments() {
     assert!(!get("gemini").installed && !get("gemini").enabled);
     assert_eq!(get("codex").harness.skills.as_deref(), Some("~/.codex/skills"));
 
-    MachineConfig::set_enabled(&path, "codex", true).unwrap();
+    MachineConfig::set_enabled(&path, "codex", true, Path::new("/nonexistent-repo")).unwrap();
     let text = fs::read_to_string(&path).unwrap();
     assert!(text.starts_with("# mine\nid = \"box\"\n"), "{text}");
     assert!(!text.contains("codex"), "{text}");
@@ -96,10 +96,15 @@ fn choices_list_disabled_presets_and_set_enabled_keeps_comments() {
     assert!(!path.with_extension("toml.tmp").exists());
 
     fs::write(&path, "[harnesses.agents]\nskills = \"/opt/s\"\n").unwrap();
-    MachineConfig::set_enabled(&path, "agents", false).unwrap();
-    MachineConfig::set_enabled(&path, "agents", true).unwrap();
+    MachineConfig::set_enabled(&path, "agents", false, Path::new("/nonexistent-repo")).unwrap();
+    MachineConfig::set_enabled(&path, "agents", true, Path::new("/nonexistent-repo")).unwrap();
     let cfg = MachineConfig::load(&path).unwrap();
     assert_eq!(cfg.harnesses["agents"].skills.as_deref(), Some("/opt/s"));
+    // Turning one on checks where it syncs, the skills repo included.
+    fs::write(&path, "[harnesses.agents]\nskills = \"/opt/repo/skills\"\nenabled = false\n").unwrap();
+    let error = MachineConfig::set_enabled(&path, "agents", true, Path::new("/opt/repo")).unwrap_err().to_string();
+    assert!(error.contains("overlaps the skills repo"), "{error}");
+    assert!(fs::read_to_string(&path).unwrap().contains("enabled = false"));
     assert_eq!(cfg.harnesses["agents"].enabled, None);
 }
 
@@ -221,7 +226,7 @@ fn first_run_setup_enables_the_opt_in_presets_it_finds() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(MACHINE_FILE);
     // Setup turned cursor off; the listing shows the rest as setup leaves them, writing nothing.
-    MachineConfig::set_enabled(&path, "cursor", false).unwrap();
+    MachineConfig::set_enabled(&path, "cursor", false, Path::new("/nonexistent-repo")).unwrap();
     let before = fs::read_to_string(&path).unwrap();
     let repo = dir.path().join("repo");
     let listed = MachineConfig::setup_choices(&path, &repo).unwrap();
@@ -717,8 +722,17 @@ fn moving_a_harness_keeps_only_what_its_entry_sets() {
 /// `<preset>-<n>`), with what it overlaps.
 #[test]
 fn environment_config_directories_become_candidates() {
-    let dirs =
-        [".claude/skills", ".claude_2/skills", ".Codex Work", "work/claude", ".copilot-x", "repo", ".config", "work2"];
+    let dirs = [
+        ".claude/skills",
+        ".claude_2/skills",
+        ".Codex Work",
+        "work/claude",
+        ".copilot-x",
+        "repo",
+        ".config",
+        "work2",
+        "cw/skills",
+    ];
     let Some(home) = isolated_home("environment_config_directories_become_candidates", &dirs) else { return };
     // Its skills directory leads to ~/.config, around opencode's, which is detected once ~/.config/opencode exists.
     #[cfg(unix)]
@@ -775,6 +789,18 @@ fn environment_config_directories_become_candidates() {
         let path = dir.path().join(MACHINE_FILE);
         let refused = edit(&path, found[0].change()).unwrap_err().to_string();
         assert!(refused.contains("`opencode` uses"), "{refused}");
+    }
+    // One the writer refuses on its own (rules leads into skills) claims nothing: the next is still offered.
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(home.join("cw/skills"), home.join("cw/rules")).unwrap();
+        let found = sk1ll_core::machine::candidates(&choices, &home.join("repo"), |var| match var {
+            "CLAUDE_CONFIG_DIR" => Some(at("cw").into()),
+            "CODEX_HOME" => Some(at("cw/skills").into()),
+            _ => None,
+        });
+        let found: Vec<_> = found.iter().map(|c| (c.name.as_str(), c.warning.as_deref())).collect();
+        assert_eq!(found, [("cw", Some("its skills directory and instructions overlap")), ("skills", None)]);
     }
     // Added as it is offered: an instance of its preset in that home.
     let found = sk1ll_core::machine::candidates(&choices, &home.join("repo"), |var| {
