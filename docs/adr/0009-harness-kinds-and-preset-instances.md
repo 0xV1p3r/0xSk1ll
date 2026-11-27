@@ -1,7 +1,7 @@
 # Harnesses have kinds, and presets have instances
 
-Status: accepted. Preset instances, kinds and matching Rules by kind are
-implemented; finding instances from environment variables is not yet.
+Status: accepted and implemented: preset instances, kinds, matching Rules by
+kind, and offering the instances environment variables point at.
 
 Some tools run with another config directory, for a second account:
 Claude Code with `CLAUDE_CONFIG_DIR`, Codex with `CODEX_HOME`, Copilot with
@@ -44,6 +44,17 @@ the preset it is or is an instance of, none for a custom one. A Rule's
 - A Machine reports each Harness with its kind, and the local API's Harness
   carries `kind` and `home`. The wire format changed without a protocol
   bump, while sk1ll is pre-stable and has no other users.
-- Instances are found by hand (`sk1ll harnesses add --preset --home`) and,
-  later, from the environment variables above where the daemon sees them;
-  never by globbing directories.
+- Instances are found by hand (`sk1ll harnesses add --preset --home`) and
+  from the environment variables above; never by globbing directories. The
+  daemon runs as a user service without the shell's environment, so the
+  process that has it reads it: core's `machine::candidates` is a pure
+  function of the variables, the harness choices the local API returns and
+  the repo path, which the CLI and the GUI's Tauri side call themselves.
+  Adding a candidate is an ordinary `Set` change through the engine, so the
+  engine stays the only writer of `machine.toml` ([ADR 0008](0008-cli-is-a-client-of-the-engine.md)).
+  During first-run setup the client adds the kept ones through
+  `POST /setup/harnesses/{name}/add` before setup ends (in the CLI's own
+  engine, directly); anywhere else a candidate is only listed until enabled,
+  so an upgrade, or a variable set later, never starts syncing somewhere new.
+- A candidate is offered under its directory's name; the user can't pick
+  another in `enable`, but can `add` the same home under any name.

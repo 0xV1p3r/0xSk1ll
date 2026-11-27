@@ -15,6 +15,7 @@ tauri-build = { version = "2", features = [] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+sk1ll-core.workspace = true
 sk1ll-daemon = { path = "../../sk1ll-daemon" }
 serde.workspace = true
 serde_json.workspace = true
@@ -34,6 +35,5 @@ custom-protocol = ["tauri/custom-protocol"]
 default = ["custom-protocol"]
 
 [target.'cfg(unix)'.dev-dependencies]
-sk1ll-core.workspace = true
 sk1ll-proto = { path = "../../sk1ll-proto" }
 tauri = { version = "2", features = ["test"] }

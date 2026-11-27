@@ -708,3 +708,56 @@ fn moving_a_harness_keeps_only_what_its_entry_sets() {
     assert_eq!(copilot.kind.as_deref(), Some("copilot"));
     assert_eq!(copilot.instructions.as_deref(), Some("~/.copilot_work/copilot-instructions.md"));
 }
+
+/// The config directories environment variables point at, as candidates:
+/// only a directory that is no harness's home yet, named after it (else
+/// `<preset>-<n>`), with what it overlaps.
+#[test]
+fn environment_config_directories_become_candidates() {
+    let dirs = [".claude/skills", ".claude_2", ".Codex Work", "work/claude", ".copilot-x", "repo"];
+    let Some(home) = isolated_home("environment_config_directories_become_candidates", &dirs) else { return };
+    let cfg = config("id = \"box\"\n[harnesses.copilot_x]\npreset = \"copilot\"\nhome = \"~/.copilot-x\"\n");
+    let choices = cfg.choices();
+    let at = |rel: &str| home.join(rel).into_os_string().into_string().unwrap();
+    let home_itself = at("");
+    for (env, expected) in [
+        (vec![("CLAUDE_CONFIG_DIR", at(".claude_2"))], vec![("claude_2", "~/.claude_2", None)]),
+        (vec![("CLAUDE_CONFIG_DIR", "~/.claude_2/".into())], vec![("claude_2", "~/.claude_2", None)]),
+        (vec![("CODEX_HOME", at(".Codex Work"))], vec![("codex-work", "~/.Codex Work", None)]),
+        // A preset's name, or one taken, falls back to the preset's.
+        (
+            vec![("CLAUDE_CONFIG_DIR", at("work/claude")), ("COPILOT_HOME", at(".claude_2"))],
+            vec![("claude-2", "~/work/claude", None), ("claude_2", "~/.claude_2", None)],
+        ),
+        (
+            vec![("CLAUDE_CONFIG_DIR", at(".claude_2")), ("CODEX_HOME", "~/.claude_2".into())],
+            vec![("claude_2", "~/.claude_2", None)],
+        ),
+        (vec![("CODEX_HOME", at(".claude/skills"))], vec![("skills", "~/.claude/skills", Some("overlaps claude"))]),
+        (vec![("CODEX_HOME", at("repo"))], vec![("repo", "~/repo", Some("overlaps the skills repo"))]),
+        // The preset's own home, a configured harness's, none, the home itself.
+        (vec![("CLAUDE_CONFIG_DIR", at(".claude"))], vec![]),
+        (vec![("COPILOT_HOME", at(".copilot-x"))], vec![]),
+        (vec![("CLAUDE_CONFIG_DIR", at("missing"))], vec![]),
+        (vec![("CLAUDE_CONFIG_DIR", "relative".into())], vec![]),
+        (vec![("CLAUDE_CONFIG_DIR", home_itself.clone())], vec![]),
+        (vec![("GEMINI_HOME", at(".claude_2"))], vec![]),
+    ] {
+        let found = sk1ll_core::machine::candidates(&choices, &home.join("repo"), |var| {
+            env.iter().find(|(name, _)| *name == var).map(|(_, value)| value.into())
+        });
+        let found: Vec<_> =
+            found.iter().map(|c| (c.name.as_str(), c.harness.home.as_deref().unwrap(), c.warning.as_deref())).collect();
+        assert_eq!(found, expected, "{env:?}");
+    }
+    // Added as it is offered: an instance of its preset in that home.
+    let found = sk1ll_core::machine::candidates(&choices, &home.join("repo"), |var| {
+        (var == "CLAUDE_CONFIG_DIR").then(|| at(".claude_2").into())
+    });
+    assert_eq!(found[0].var, "CLAUDE_CONFIG_DIR");
+    assert_eq!(found[0].harness.skills.as_deref(), Some("~/.claude_2/skills"));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(MACHINE_FILE);
+    let (text, _) = edit(&path, found[0].change()).unwrap();
+    assert_eq!(text, "[harnesses.claude_2]\npreset = \"claude\"\nhome = \"~/.claude_2\"\n");
+}

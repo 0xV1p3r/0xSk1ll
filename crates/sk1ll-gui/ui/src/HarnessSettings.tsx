@@ -27,12 +27,15 @@ export function harnessOrigin(h: HarnessChoice): string {
 // Same rule as sk1ll-core's check_name, so the form can say so before the Daemon does.
 export const harnessNamePattern = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const placesPath = (value: string) => value === '' || value.startsWith('~/') || value.startsWith('/');
+const loadCandidates = () => api.harnessCandidates(false);
 
 // The Harnesses of this Machine, switched and edited in its machine.toml. `actions` adds per-Harness controls.
 export function HarnessPanel({ revision, editorId, changed, actions }: {
   revision: number; editorId?: string; changed: () => void; actions?: (harness: HarnessChoice) => ReactNode;
 }) {
   const settings = useResource(api.harnessSettings, revision);
+  // Other config folders of a tool that this app's environment points at (CLAUDE_CONFIG_DIR, ...), not Harnesses yet.
+  const candidates = useResource(loadCandidates, revision);
   const [showAll, setShowAll] = useState(false);
   const [editing, setEditing] = useState<{ name: string; harness: HarnessPaths; existing: boolean }>();
   const [change, setChange] = useState<HarnessChange>();
@@ -64,10 +67,17 @@ export function HarnessPanel({ revision, editorId, changed, actions }: {
         <Button variant="ghost" size="sm" aria-label={`Edit ${h.name}`} onClick={() => setEditing({ name: h.name, harness: h.harness, existing: true })}>Edit</Button>
         {h.configured && <Button variant="ghost" size="sm" aria-label={`${h.preset ? 'Reset' : 'Remove'} ${h.name}`} onClick={() => setChange({ op: 'remove', name: h.name })}>{h.preset ? 'Reset' : 'Remove'}</Button>}</div></TableCell>
     </TableRow>)}</TableBody></Table></div>}
+    {!!candidates.data?.length && <section aria-label="Found in the environment" className="flex flex-col gap-2"><div><h4 className="text-sm font-medium">Config folders found in the environment</h4>
+      <p className="text-sm text-muted-foreground">Another config folder of a tool, set by a variable in this app's environment. It is synced into only once you enable it.</p></div>
+      <ul className="flex flex-col divide-y rounded-lg border">{candidates.data.map(c => <li key={c.name} className="flex flex-wrap items-center justify-between gap-2 p-2.5">
+        <div className="flex min-w-0 flex-col gap-0.5"><span className="font-medium">{c.name}</span>
+          <span className="text-xs text-muted-foreground">{c.harness.kind} in <code className="font-mono break-all">{c.harness.home}</code>, from {c.var}</span>
+          {c.warning && <span className="text-xs text-muted-foreground">Can't be enabled: it {c.warning}.</span>}</div>
+        <Button variant="outline" size="sm" disabled={!!c.warning} aria-label={`Enable ${c.name}`} onClick={() => setChange({ op: 'set', name: c.name, harness: c.harness })}>Enable</Button></li>)}</ul></section>}
     {(hidden > 0 || showAll) && <div><Button variant="ghost" size="sm" onClick={() => setShowAll(value => !value)}>{showAll ? 'Hide presets not found on this Machine' : `Show ${hidden} more preset${hidden === 1 ? '' : 's'}`}</Button></div>}
     {editing && <HarnessDialog initial={editing} preset={all.find(h => h.name === editing.name)?.preset ?? false} taken={all.map(h => h.name)}
       onClose={() => setEditing(undefined)} onSubmit={next => { setEditing(undefined); setChange(next); }} />}
-    {change && <ChangeDialog change={change} onClose={() => setChange(undefined)} onApplied={() => { setChange(undefined); void settings.refresh(); changed(); }} />}
+    {change && <ChangeDialog change={change} onClose={() => setChange(undefined)} onApplied={() => { setChange(undefined); void settings.refresh(); void candidates.refresh(); changed(); }} />}
   </div>;
 }
 

@@ -479,6 +479,9 @@ fn init(cli: &Cli, root: &Path) -> Result<()> {
     if let Some(session) = Session::daemon_for(cli, root)?
         && !session.status.repo_ready
     {
+        // The daemon's Init ends first-run setup; it can't see this shell's
+        // environment, so the config directories it points at are added first.
+        harnesses::adopt_candidates(&session)?;
         session.block(session.client.init())?;
     } else if let Some(session) = Session::daemon_for(cli, root)? {
         // The daemon manages this repo, which exists already.
@@ -494,6 +497,18 @@ fn init(cli: &Cli, root: &Path) -> Result<()> {
         if !root.join(".git").exists() && std::fs::symlink_metadata(&machine_path).is_err() {
             for warning in MachineConfig::adopt_detected_presets(&machine_path, root)? {
                 eprintln!("{warning}");
+            }
+            // And the config directories this environment points at.
+            let choices = MachineConfig::load(&machine_path)?.choices();
+            for c in harnesses::env_candidates(&choices, root) {
+                let what = harnesses::describe(&c);
+                match &c.warning {
+                    Some(warning) => eprintln!("{} ({what}): not added: {warning}", c.name),
+                    None => match MachineConfig::write_change(&machine_path, &c.change()) {
+                        Ok(_) => eprintln!("added harness {} ({what})", c.name),
+                        Err(e) => eprintln!("{} ({what}): not added: {e}", c.name),
+                    },
+                }
             }
         }
         std::fs::create_dir_all(root)?;

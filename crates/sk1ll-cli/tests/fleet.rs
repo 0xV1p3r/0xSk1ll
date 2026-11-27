@@ -137,6 +137,28 @@ fn another_repos_daemon_refuses_writes_and_allows_previews() {
     assert!(!target.exists());
 }
 
+/// Joining without a repo is first-run setup: the config directory an
+/// environment variable points at is added, and the join registers it.
+#[test]
+fn join_adds_a_config_directory_from_the_environment() {
+    runtime().block_on(async {
+        let server = Server::start().await;
+        let machine = Machine::new();
+        let dir = machine.home.path().join(".claude_2");
+        fs::create_dir_all(&dir).unwrap();
+        fs::remove_dir_all(machine.repo.root()).unwrap();
+        let url = server.url();
+        let join = ["join", &url, "--id", "m", "--admin-token", sk1ll_testkit::server::ADMIN];
+        let out = command(&machine, &join).env("CLAUDE_CONFIG_DIR", &dir).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let stdout = outcome(out).unwrap();
+        assert!(stderr.contains("added harness claude_2 (claude in ~/.claude_2, from CLAUDE_CONFIG_DIR)"), "{stderr}");
+        assert!(stdout.contains("harnesses: claude_2\n"), "{stdout}");
+        let text = fs::read_to_string(machine.machine_toml()).unwrap();
+        assert!(text.ends_with("[harnesses.claude_2]\npreset = \"claude\"\nhome = \"~/.claude_2\"\n"), "{text}");
+    });
+}
+
 #[test]
 fn joined_machines_share_a_baseline_and_scope_limits_changes() {
     runtime().block_on(async {

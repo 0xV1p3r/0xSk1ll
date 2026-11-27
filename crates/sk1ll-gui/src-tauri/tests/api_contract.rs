@@ -490,6 +490,10 @@ fn harness_golden() -> Value {
             HarnessChoice { name: "claude".into(), installed: true, enabled: true, harness: Harness { skills: None, ..claude() }, preset: false, configured: false, available: false, setup_warning: None },
             HarnessChoice { name: "claude_2".into(), installed: true, enabled: true, harness: Harness { home: Some("~/.claude_2".into()), skills: Some("~/.claude_2/skills".into()), instructions: Some("~/.claude_2/CLAUDE.md".into()), ..claude() }, preset: false, configured: true, available: false, setup_warning: None },
         ] }),
+        "harness_candidate": [
+            sample(HarnessCandidate { name: "claude_2".into(), var: "CLAUDE_CONFIG_DIR".into(), harness: Harness { home: Some("~/.claude_2".into()), skills: Some("~/.claude_2/skills".into()), instructions: Some("~/.claude_2/rules".into()), ..claude() }, warning: None }),
+            sample(HarnessCandidate { name: "codex-2".into(), var: "CODEX_HOME".into(), harness: Harness { kind: Some("codex".into()), home: Some("~/.agents".into()), skills: Some("~/.agents/skills".into()), instructions: Some("~/.agents/AGENTS.md".into()), ..claude() }, warning: Some("overlaps agents".into()) }),
+        ],
         "harness_change": by_tag("op", changes.clone()),
         "harness_change_request": sample(HarnessChangeRequest { fingerprint: Some("f-1".into()), change: changes[1].clone() }),
         "placement_kind": keyed(["create", "update", "remove", "conflict"].map(|kind| sample(placement(kind, (kind == "conflict").then_some("edited")))), Some("kind")),

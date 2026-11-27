@@ -86,6 +86,7 @@ export const contract = [
   tagged<T.HarnessView['harness'], 'instructions_format'>()(harness.instructions_format),
   tagged<T.HarnessView['harness'], 'mode'>()(harness.link_mode),
   value<T.HarnessSettings>()(harness.harness_settings),
+  value<T.HarnessCandidate[]>()(harness.harness_candidate),
   tagged<T.HarnessChange, 'op'>()(harness.harness_change),
   value<T.HarnessChangeRequest>()(harness.harness_change_request),
   tagged<T.PlacementView, 'kind'>()(harness.placement_kind),

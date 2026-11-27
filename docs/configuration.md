@@ -31,13 +31,13 @@ enabled = true
 skills = "~/.gemini/skills"   # gemini's skills directory; without it gemini gets its instructions only
 ```
 
-First-run setup (the GUI wizard, `sk1ll setup`, joining a fleet without a repo, or `sk1ll init` on a machine without a `machine.toml`) offers the opt-in presets it finds as on and writes these lines for the ones you keep. Setup skips any candidate whose destinations overlap an enabled harness or the skills repo and reports the overlap. `sk1ll init` on a machine that already has a `machine.toml` adds nothing. Anywhere else, an opt-in preset found on the machine is listed as available: `sk1ll harnesses` mentions it on stderr, and `sk1ll harnesses --all` and Settings list it with **Enable**. `sk1ll harnesses enable <name>` writes the lines above after the usual preview; for gemini, it adds the skills directory unless the entry sets `skills` already (`skills = ""` keeps gemini to its instructions).
+First-run setup (the GUI wizard, `sk1ll setup`, joining a fleet without a repo, or `sk1ll init` on a machine without a `machine.toml`) offers the opt-in presets it finds, and the config directories [found in the environment](#found-in-the-environment), as on and writes these lines for the ones you keep. Setup skips any candidate whose destinations overlap an enabled harness or the skills repo and reports the overlap. `sk1ll init` on a machine that already has a `machine.toml` adds nothing. Anywhere else, an opt-in preset found on the machine is listed as available: `sk1ll harnesses` mentions it on stderr, and `sk1ll harnesses --all` and Settings list it with **Enable**. `sk1ll harnesses enable <name>` writes the lines above after the usual preview; for gemini, it adds the skills directory unless the entry sets `skills` already (`skills = ""` keeps gemini to its instructions).
 
 The presets of 0.1.0 (`claude`, `codex`, `opencode`, and `gemini`'s instructions) are still included whenever their directory exists.
 
 For an opt-in preset name, an entry with either path key (`skills` or `instructions`) and neither `preset` nor `home` defines a custom harness, even with `enabled = true`. Missing keys use the custom harness defaults. An entry with no path keys and `enabled = true` activates the preset. To switch a custom harness back to the preset, remove the entry and enable the preset. Changing the paths of an enabled opt-in preset writes `preset = "<name>"` next to them, so the entry stays the preset and its other settings keep following the preset's defaults.
 
-Presets use copy mode where the tool's documentation doesn't say it follows skill symlinks. If you set `COPILOT_HOME`, set the `copilot` entry's `home` to it. A Kiro steering file without front matter is always included. The Kiro CLI may load only files marked `inclusion: always`.
+Presets use copy mode where the tool's documentation doesn't say it follows skill symlinks. If you set `COPILOT_HOME`, sk1ll offers that directory as a Copilot instance ([found in the environment](#found-in-the-environment)); to move the `copilot` preset there instead, set its entry's `home`. A Kiro steering file without front matter is always included. The Kiro CLI may load only files marked `inclusion: always`.
 
 Several tools also read other tools' directories. Cursor reads `~/.claude/skills` and `~/.codex/skills`, Amp and Copilot read `~/.claude/skills`, and most of them read the shared `~/.agents/skills`. With both harnesses on, such a tool sees a skill twice. Turn one harness off, or narrow its assignment.
 
@@ -61,7 +61,19 @@ The harness's **kind** is the preset it is, or is an instance of. A Rule with `h
 
 `home` follows the path rules below. `preset` must name a built-in preset, and on an entry named after a preset it can only be that preset; a custom harness can't have `home`. Unlike the other paths, `home` is checked when `machine.toml` is read: an empty, relative or `..` home is an error, because every path of the harness comes from it. Two instances can't share a directory, nor share one with the preset: their locations overlap. That includes a preset that isn't installed yet but would be detected once its directory exists, since the instance's first sync creates it. If an entry written by hand roots an instance in a preset's home anyway, the preset (found only by its directory) yields to the instance and isn't synced into.
 
-sk1ll doesn't look for these directories itself. Add each one you use.
+#### Found in the environment
+
+The `sk1ll` command and the app read `CLAUDE_CONFIG_DIR` (for `claude`), `CODEX_HOME` (`codex`) and `COPILOT_HOME` (`copilot`) from their own environment. The daemon doesn't: as a user service it rarely has your shell's variables. A variable naming a directory that is not the preset's own home, nor the `home` of a harness that is on or in `machine.toml`, is a candidate instance. Its name is the directory's, without leading dots, lowercased, with other characters than letters, digits, `-` and `_` as `-` (`~/.claude_2` is `claude_2`). If that is empty, a preset's name or taken, it is `<preset>-2`, `<preset>-3` and so on.
+
+- First-run setup (as for [opt-in presets](#opt-in-presets)) offers each candidate as on and writes `preset` and `home` for the ones you keep. A candidate that overlaps a harness that is on, or the skills repo, is shown with what it overlaps and isn't offered. `sk1ll setup` on an existing repo asks too, with the answer off by default.
+- Anywhere else a candidate is only listed: `sk1ll harnesses` mentions it on stderr, and `sk1ll harnesses --all` and Settings → Harnesses list it, with **Enable** in Settings. `sk1ll harnesses enable <name>` (or **Enable**) adds it, as `sk1ll harnesses add <name> --preset <preset> --home <dir>` would, after the usual preview.
+
+```sh
+CLAUDE_CONFIG_DIR=~/.claude_2 sk1ll harnesses --all   # lists claude_2 as found
+CLAUDE_CONFIG_DIR=~/.claude_2 sk1ll harnesses enable claude_2
+```
+
+The app sees the environment it was started with, which for a desktop launcher is the session's, not your shell's. sk1ll never globs for directories such as `~/.claude*`: add any other directory with `sk1ll harnesses add`.
 
 ## machine.toml
 

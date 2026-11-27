@@ -11,7 +11,7 @@ sentinel=$(mktemp -d "${TMPDIR:-/tmp}/sk1ll-home.XXXXXX")
 trap 'rm -rf "$sentinel"' EXIT
 unset XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_RUNTIME_DIR \
   SK1LL_REPO SK1LL_STATE_DIR SK1LL_CACHE_DIR SK1LL_DAEMON_SOCKET SK1LL_DAEMON_STATE \
-  SK1LL_MACHINE_CONFIG SK1LL_ASSIGNMENT
+  SK1LL_MACHINE_CONFIG SK1LL_ASSIGNMENT CLAUDE_CONFIG_DIR CODEX_HOME COPILOT_HOME
 HOME="$sentinel" cargo test --workspace --all-features "$@"
 written=$(find "$sentinel" -mindepth 1 | head -n 20)
 if [ -n "$written" ]; then

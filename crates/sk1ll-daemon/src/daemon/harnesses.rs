@@ -42,6 +42,33 @@ impl Daemon {
         self.setup_harnesses()
     }
 
+    /// Adds the preset instance `name` (`harness.kind` in `harness.home`)
+    /// during first-run setup: a candidate the client found in its
+    /// environment (see [`sk1ll_core::machine::candidates`]) and kept on.
+    /// The usual checks apply, as for `sk1ll harnesses add`.
+    pub(crate) fn add_setup_instance(
+        &self,
+        _eng: &mut Engine,
+        name: &str,
+        harness: sk1ll_core::Harness,
+    ) -> Result<Vec<HarnessChoice>> {
+        if !self.is_standalone() || self.repo_root().join(".git").exists() {
+            return Err(Error::Conflict(format!(
+                "harnesses can be added here only during first-run setup; use POST /harnesses/apply \
+                 (Settings or `sk1ll harnesses add`), or edit {}",
+                self.cfg.machine_config.display()
+            )));
+        }
+        if harness.kind.is_none() || harness.home.is_none() {
+            return Err(Error::BadRequest("only a preset instance (a kind and a home) is added in setup".into()));
+        }
+        if self.setup_harnesses()?.iter().any(|c| c.name == name) {
+            return Err(Error::Conflict(format!("harness `{name}` exists already")));
+        }
+        MachineConfig::write_change(&self.cfg.machine_config, &HarnessChange::Set { name: name.into(), harness })?;
+        self.setup_harnesses()
+    }
+
     /// A reader: no engine mutex.
     pub(crate) fn harness_settings(&self) -> Result<HarnessSettings> {
         let harnesses = MachineConfig::load(&self.cfg.machine_config)?.choices();

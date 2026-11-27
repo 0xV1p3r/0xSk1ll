@@ -17,7 +17,7 @@ import { useMutation, useResource } from './hooks';
 import { insecureHttp, plural } from './model';
 import { JoinCodeButton } from './Settings';
 import { Details, ErrorNotice, Loading, Notice, Panel, PanelToolbar, Pending, SectionTitle } from './shared';
-import type { ContentEntry, DaemonStarted, HarnessChoice, Scope, ServiceManager, StatusView } from './types';
+import type { ContentEntry, DaemonStarted, HarnessCandidate, HarnessChoice, Scope, ServiceManager, StatusView } from './types';
 
 export function Wordmark() {
   return <div className="mb-3 w-44"><img src={wordmarkLight} alt="0xSk1ll" className="block h-auto w-full dark:hidden" /><img src={wordmarkDark} alt="0xSk1ll" className="hidden h-auto w-full dark:block" /></div>;
@@ -111,6 +111,13 @@ export function SetupWizard({ status, onDone }: { status: StatusView; onDone: (r
   const docs = useMutation();
   // Owned here so Back and Continue wait for a Harness choice to save. A failed save stays visible but never traps the wizard.
   const harnessSave = useMutation();
+  // Config folders this app's environment points at: kept ones are added as Harnesses on Continue.
+  const [found, setFound] = useState<HarnessCandidate[]>([]);
+  const [declined, setDeclined] = useState<string[]>([]);
+  const kept = found.filter(c => !c.warning && !declined.includes(c.name));
+  const continueToDetails = () => void harnessSave.run(async () => {
+    for (const c of kept) await api.addSetupInstance(c.name, c.harness);
+  }, () => setStep('details'));
   const [path, setPath] = useState<SetupPath>('local');
   if (step === 'path') return <Frame wide step="Step 1 of 3" title="Set up this Machine" description="0xSk1ll keeps your agent Skills and Rules in one git repo and syncs them into every Harness.">
     <fieldset className="flex flex-col gap-2"><legend className="sr-only">How this Machine is used</legend>
@@ -125,28 +132,45 @@ export function SetupWizard({ status, onDone }: { status: StatusView; onDone: (r
     <div><Button onClick={() => setStep('harnesses')}>Continue</Button></div>
   </Frame>;
   if (step === 'harnesses') return <Frame wide step="Step 2 of 3" title="Choose Harnesses" description="Sync places Skills and Rules into each Harness you keep on. Harnesses are saved in this Machine's machine.toml.">
-    <HarnessStep toggle={harnessSave} />
-    <div className="flex gap-2"><Button variant="outline" disabled={harnessSave.pending} onClick={() => setStep('path')}><ArrowLeft data-icon="inline-start" />Back</Button><Button disabled={harnessSave.pending} onClick={() => setStep('details')}>Continue</Button></div>
+    <HarnessStep toggle={harnessSave} onFound={setFound} declined={declined} setDeclined={setDeclined} />
+    <div className="flex gap-2"><Button variant="outline" disabled={harnessSave.pending} onClick={() => setStep('path')}><ArrowLeft data-icon="inline-start" />Back</Button><Button disabled={harnessSave.pending} onClick={continueToDetails}>Continue</Button></div>
   </Frame>;
   return <DetailsStep path={path} status={status} back={() => setStep('harnesses')} onDone={onDone} />;
 }
 
-function HarnessStep({ toggle }: { toggle: ReturnType<typeof useMutation> }) {
+const loadSetupCandidates = () => api.harnessCandidates(true);
+
+function HarnessStep({ toggle, onFound, declined, setDeclined }: {
+  toggle: ReturnType<typeof useMutation>; onFound: (found: HarnessCandidate[]) => void; declined: string[]; setDeclined: (update: (declined: string[]) => string[]) => void;
+}) {
   const choices = useResource(api.setupHarnesses, 0);
+  const candidates = useResource(loadSetupCandidates, 0);
   const [changing, setChanging] = useState<string>();
+  useEffect(() => { onFound(candidates.data ?? []); }, [candidates.data, onFound]);
   if (choices.loading && !choices.data) return <Loading rows={2} />;
+  const found = candidates.data ?? [];
   const shown = choices.data?.filter(choice => choice.installed || choice.enabled) ?? [];
   const missing = choices.data?.filter(choice => !choice.installed && !choice.enabled) ?? [];
   const set = (choice: HarnessChoice, enabled: boolean) => { setChanging(choice.name); void toggle.run(() => api.setSetupHarness(choice.name, enabled), next => choices.setData(next)).finally(() => setChanging(undefined)); };
   return <div className="flex flex-col gap-3">
-    <ErrorNotice error={choices.error || toggle.error} />
-    {choices.data && !shown.length && <Notice title="No Harnesses found">Install an agent tool such as Claude Code or Codex, or add a Harness to machine.toml. You can continue now and sync later.</Notice>}
+    <ErrorNotice error={choices.error || candidates.error || toggle.error} />
+    {choices.data && !shown.length && !found.length && <Notice title="No Harnesses found">Install an agent tool such as Claude Code or Codex, or add a Harness to machine.toml. You can continue now and sync later.</Notice>}
     {shown.length > 0 && <ul className="flex flex-col divide-y rounded-lg border" aria-label="Harnesses">{shown.map(choice => <li key={choice.name}>
       <label className="flex cursor-pointer items-start gap-3 p-3">
         <Checkbox className="mt-0.5" checked={choice.enabled} disabled={toggle.pending || (!!choice.setup_warning && !choice.enabled)} aria-label={`Sync ${choice.name}`} onCheckedChange={enabled => set(choice, enabled)} />
         <span className="flex min-w-0 flex-col gap-0.5"><span className="flex items-center gap-2 font-medium">{choice.name}{changing === choice.name && <LoaderCircle aria-hidden className="size-3.5 animate-spin" />}</span>
           <span className="font-mono text-xs break-all text-muted-foreground">{[choice.harness.skills, choice.harness.instructions].filter(Boolean).join(' · ') || 'Nothing to sync'}</span>{choice.setup_warning && <span className="text-sm text-muted-foreground">{choice.setup_warning}</span>}</span>
       </label></li>)}</ul>}
+    {found.length > 0 && <div className="flex flex-col gap-1.5"><p className="text-sm font-medium">Other config folders, set in this app's environment</p>
+      <ul className="flex flex-col divide-y rounded-lg border" aria-label="Config folders found in the environment">{found.map(c => <li key={c.name}>
+        <label className="flex cursor-pointer items-start gap-3 p-3">
+          <Checkbox className="mt-0.5" checked={!c.warning && !declined.includes(c.name)} disabled={!!c.warning || toggle.pending} aria-label={`Sync ${c.name}`}
+            onCheckedChange={on => setDeclined(names => on ? names.filter(name => name !== c.name) : [...names, c.name])} />
+          <span className="flex min-w-0 flex-col gap-0.5"><span className="font-medium">{c.name}</span>
+            <span className="text-xs text-muted-foreground">{c.harness.kind} in <code className="font-mono break-all">{c.harness.home}</code>, from {c.var}</span>
+            <span className="font-mono text-xs break-all text-muted-foreground">{[c.harness.skills, c.harness.instructions].filter(Boolean).join(' · ')}</span>
+            {c.warning && <span className="text-sm text-muted-foreground">Not offered: it {c.warning}.</span>}</span>
+        </label></li>)}</ul></div>}
     {shown.length > 0 && shown.every(choice => !choice.enabled) && <p className="text-muted-foreground" role="status">Nothing is synced until you keep at least one Harness on.</p>}
     {missing.length > 0 && <p className="text-xs text-muted-foreground">Not found on this Machine: {missing.map(choice => choice.name).join(', ')}</p>}
   </div>;
