@@ -2165,7 +2165,7 @@ async fn harnesses_change_after_setup_with_a_preview_of_what_stays() {
     let applied = m.client.apply_harness(&disable).await.unwrap();
     assert!(applied.errors.is_empty(), "{:?}", applied.errors);
     assert!(extra.join("pdf/SKILL.md").is_file(), "left in place");
-    assert!(m.status().await.report.harnesses.iter().all(|h| h != "extra"));
+    assert!(m.status().await.report.harnesses.iter().all(|h| h.name != "extra"));
 
     // Turning a harness's items off first lets sync take them out; then disabling leaves nothing.
     let result = m.client.set_harness_assignment(HARNESS, false).await.unwrap();
@@ -2892,7 +2892,7 @@ async fn reconnect_replays_harness_rename_before_first_status() {
     };
     socket.send(Message::text(serde_json::to_string(&reply).unwrap())).await.unwrap();
     let DaemonMessage::Status(report) = next_message(&mut socket).await else { panic!("expected status after replay") };
-    assert_eq!(report.harnesses, ["renamed"]);
+    assert_eq!(report.harnesses.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(), ["renamed"]);
     assert!(!RenameIntent::exists(&state, &cfg).unwrap());
     assert!(m.snapshot().unwrap().assignment.skill_enabled("renamed", &id));
 }

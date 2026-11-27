@@ -1150,9 +1150,12 @@ fn require_machine_harness(s: &Session, machine: &str, harness: &str) -> Result<
     };
     if let Some(report) = &row.report
         && !report.harnesses.is_empty()
-        && !report.harnesses.iter().any(|h| h == harness)
+        && !report.harnesses.iter().any(|h| h.name == harness)
     {
-        bail!("{machine} has no harness `{harness}`; it has {}", report.harnesses.join(", "));
+        bail!(
+            "{machine} has no harness `{harness}`; it has {}",
+            report.harnesses.iter().map(|h| h.name.as_str()).collect::<Vec<_>>().join(", ")
+        );
     }
     Ok(())
 }

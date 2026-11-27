@@ -45,7 +45,7 @@ export function HarnessPanel({ revision, editorId, changed, actions }: {
       <p className="text-sm text-muted-foreground">Saved in {settings.data ? <code className="font-mono text-xs break-all">{settings.data.path}</code> : <code className="font-mono">machine.toml</code>}. Every change is previewed before it is applied.</p></div>
       <div className="flex gap-2"><Button variant="outline" size="sm" disabled={!editorId || open.pending} title={editorId ? undefined : 'Choose a preferred editor below first'}
         onClick={() => void open.run(() => api.openMachineConfig(editorId!))}><FileCog data-icon="inline-start" /><Pending pending={open.pending}>Open configuration</Pending></Button>
-        <Button size="sm" onClick={() => setEditing({ name: '', existing: false, harness: { skills: null, instructions: null, instructions_format: 'block', mode: 'symlink' } })}><Plus data-icon="inline-start" />Add Harness</Button></div></div>
+        <Button size="sm" onClick={() => setEditing({ name: '', existing: false, harness: { kind: null, home: null, skills: null, instructions: null, instructions_format: 'block', mode: 'symlink' } })}><Plus data-icon="inline-start" />Add Harness</Button></div></div>
     <ErrorNotice error={settings.error || open.error} />
     {settings.loading && !settings.data && <Loading rows={2} />}
     {settings.data && <div className="overflow-hidden rounded-lg border"><Table aria-label="Harnesses on this Machine"><TableHeader><TableRow>
@@ -87,7 +87,8 @@ function HarnessDialog({ initial, preset, taken, onClose, onSubmit }: {
     if (!initial.existing && taken.includes(name)) return setError(`${name} already exists; edit it instead.`);
     if (!s && !i) return setError('Set a skills directory, an instructions path, or both.');
     if (!placesPath(s) || !placesPath(i)) return setError('Paths must be absolute or start with ~/.');
-    onSubmit({ op: 'set', name, harness: { skills: s || null, instructions: i || null, instructions_format: format, mode } });
+    // A preset or preset instance keeps its kind and config directory; the dialog edits the rest.
+    onSubmit({ op: 'set', name, harness: { kind: initial.harness.kind, home: initial.harness.home, skills: s || null, instructions: i || null, instructions_format: format, mode } });
   };
   return <Dialog open onOpenChange={next => { if (!next) onClose(); }}>
     <DialogContent><DialogHeader><DialogTitle>{initial.existing ? `Edit ${initial.name}` : 'Add a Harness'}</DialogTitle>

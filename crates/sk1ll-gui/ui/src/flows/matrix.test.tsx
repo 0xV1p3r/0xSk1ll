@@ -113,15 +113,15 @@ it('bulk-changes rows and filtered columns once per Machine, and Undo restores w
 
 it('drops inactive Harnesses from editable columns and copy options while keeping their saved Assignments', async () => {
   const { daemon, user } = launch('fleet', { hash: '#/assignment-matrix', setup: daemon => {
-    daemon.status.report.harnesses.push('myagent');
+    daemon.status.report.harnesses.push({ name: 'myagent', kind: null });
     daemon.assignments.workstation.harnesses.myagent = structuredClone(daemon.assignments.workstation.harnesses.codex);
   } });
   await screen.findByRole('button', { name: 'Actions for workstation / myagent' });
   await screen.findByRole('button', { name: 'Actions for build-box / codex' });
 
   daemon.machines[0].report = { ...daemon.status.report }; // The server still has the old local report.
-  daemon.status.report.harnesses = ['claude', 'codex'];
-  daemon.machines.find(machine => machine.id === 'build-box')!.report!.harnesses = ['claude'];
+  daemon.status.report.harnesses = [{ name: 'claude', kind: 'claude' }, { name: 'codex', kind: 'codex' }];
+  daemon.machines.find(machine => machine.id === 'build-box')!.report!.harnesses = [{ name: 'claude', kind: 'claude' }];
   await notify('assignment');
   await waitFor(() => {
     expect(screen.queryByRole('button', { name: 'Actions for workstation / myagent' })).toBeNull();

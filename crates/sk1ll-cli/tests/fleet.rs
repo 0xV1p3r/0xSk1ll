@@ -167,7 +167,7 @@ fn joined_machines_share_a_baseline_and_scope_limits_changes() {
         let daemon = RunningDaemon::start(&work, work.repo.root()).await;
         sk1ll_testkit::eventually(|| async {
             let report = server.row("work").await?.report?;
-            (report.harnesses == ["lab"]).then_some(())
+            (report.harnesses.iter().map(|h| h.name.as_str()).collect::<Vec<_>>() == ["lab"]).then_some(())
         })
         .await;
         let fleet = run_on(&work, &daemon.socket, &["fleet"]).unwrap();

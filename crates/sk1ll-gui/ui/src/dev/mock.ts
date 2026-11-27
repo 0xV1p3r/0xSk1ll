@@ -29,8 +29,10 @@ export interface MockDaemon {
 }
 
 const now = Math.floor(Date.now() / 1000);
+// Reported Harnesses, each the preset of its name.
+const reported = (...names: string[]) => names.map(name => ({ name, kind: name }));
 const report = (overrides: Partial<T.MachineReport> = {}): T.MachineReport => ({
-  seq: 1, items: [], inventory_complete: true, baseline: '9f3c2a17d4e1', drafts: [], unpushed: [], conflicts: [], harnesses: ['claude', 'codex'],
+  seq: 1, items: [], inventory_complete: true, baseline: '9f3c2a17d4e1', drafts: [], unpushed: [], conflicts: [], harnesses: reported('claude', 'codex'),
   blocked: false, clashes: [], behind: false, ...overrides,
 });
 const harness = (skills: Record<string, boolean> = {}, rules: Record<string, boolean> = {}): T.HarnessAssignment =>
@@ -53,9 +55,9 @@ export function installMock(scenario: string, options: MockOptions = {}): MockDa
   const machines: T.MachineRow[] = [
     { id: 'workstation', scope: scenario === 'self' ? 'self' : 'fleet', registration: 'reg-workstation', status: status.headline, connected: true, joined_at: now - 86400 * 30, last_seen: now - 4, report: local },
     { id: 'laptop', registration: 'reg-laptop', status: 'behind', connected: true, joined_at: now - 86400 * 12, last_seen: now - 40,
-      report: report({ baseline: '1b2c3d4e5f60', behind: true, harnesses: ['claude'] }) },
+      report: report({ baseline: '1b2c3d4e5f60', behind: true, harnesses: reported('claude') }) },
     { id: 'ci-runner', registration: 'reg-ci-runner', status: 'offline', connected: false, joined_at: now - 86400 * 3, last_seen: now - 7200,
-      report: report({ harnesses: ['codex'] }) },
+      report: report({ harnesses: reported('codex') }) },
     { id: 'build-box', registration: 'reg-build-box', status: 'blocked', connected: true, joined_at: now - 86400 * 8, last_seen: now - 12,
       report: report({ blocked: true, clashes: ['skill:deploy'], drafts: ['skill:deploy'] }) },
   ];
@@ -127,16 +129,16 @@ export function installMock(scenario: string, options: MockOptions = {}): MockDa
         .map(item_id => ({ machine, harness, kind, item_id, name: log.find(entry => entry.item_id === item_id && entry.name)?.name ?? null })))));
   };
   const harnesses: T.HarnessView[] = [
-    { name: 'claude', origin: 'detected', harness: { skills: '~/.claude/skills', instructions: '~/.claude/CLAUDE.md', instructions_format: 'block', mode: 'symlink' } },
-    { name: 'codex', origin: 'machine.toml', harness: { skills: '~/.codex/skills', instructions: '~/.codex/AGENTS.md', instructions_format: 'block', mode: 'copy' } },
+    { name: 'claude', origin: 'detected', harness: { kind: 'claude', home: '~/.claude', skills: '~/.claude/skills', instructions: '~/.claude/CLAUDE.md', instructions_format: 'block', mode: 'symlink' } },
+    { name: 'codex', origin: 'machine.toml', harness: { kind: 'codex', home: '~/.codex', skills: '~/.codex/skills', instructions: '~/.codex/AGENTS.md', instructions_format: 'block', mode: 'copy' } },
   ];
   const imports: T.ImportsView & { imports: T.ImportEntry[] } = { imports: empty ? [] : [{ name: 'pdf', source: 'github:example/skills', ref: 'main', path: 'skills/pdf', locked: '4e5f6a7b8c9d' }, { name: 'anthropic-skills', source: 'https://github.com/anthropics/skills', ref: 'main', path: '', locked: '4e5f6a7b8c9d' }, { name: 'internal-skills', source: 'github:example/internal-skills', ref: 'main', path: '', locked: '123456789abc' }], checked_at: now - 900, errors: empty ? [] : [{ name: 'internal-skills', message: 'git fetch failed: repository not found' }],
     updates: empty ? [] : [{ name: 'anthropic-skills', source: 'https://github.com/anthropics/skills', ref: 'main', locked: '4e5f6a7b8c9d', upstream: 'c0ffee123456' }] };
   const setupHarnesses: T.HarnessChoice[] = [
     { name: 'claude', installed: true, enabled: true, preset: true, configured: false, harness: harnesses[0].harness },
     { name: 'codex', installed: true, enabled: true, preset: true, configured: true, harness: harnesses[1].harness },
-    { name: 'gemini', installed: false, enabled: false, preset: true, configured: false, harness: { skills: '~/.gemini/skills', instructions: '~/.gemini/GEMINI.md', instructions_format: 'block', mode: 'symlink' } },
-    { name: 'kiro', installed: true, enabled: false, preset: true, configured: false, available: true, harness: { skills: '~/.kiro/skills', instructions: '~/.kiro/steering', instructions_format: 'rules', mode: 'copy' } },
+    { name: 'gemini', installed: false, enabled: false, preset: true, configured: false, harness: { kind: 'gemini', home: '~/.gemini', skills: '~/.gemini/skills', instructions: '~/.gemini/GEMINI.md', instructions_format: 'block', mode: 'symlink' } },
+    { name: 'kiro', installed: true, enabled: false, preset: true, configured: false, available: true, harness: { kind: 'kiro', home: '~/.kiro', skills: '~/.kiro/skills', instructions: '~/.kiro/steering', instructions_format: 'rules', mode: 'copy' } },
   ];
   const machineConfig = '/home/dev/.config/sk1ll/machine.toml';
   let notificationsEnabled = true;
@@ -488,7 +490,7 @@ export function installMock(scenario: string, options: MockOptions = {}): MockDa
       case 'set_setup_harness': {
         const choice = setupHarnesses.find(h => h.name === a.name);
         if (choice) choice.enabled = a.enabled as boolean;
-        local.harnesses = setupHarnesses.filter(h => h.enabled).map(h => h.name);
+        local.harnesses = setupHarnesses.filter(h => h.enabled).map(h => ({ name: h.name, kind: h.harness.kind }));
         return delay(setupHarnesses);
       }
       case 'notifications_enabled': return delay(notificationsEnabled);
@@ -507,7 +509,7 @@ export function installMock(scenario: string, options: MockOptions = {}): MockDa
           else Object.assign(setupHarnesses[index], { harness: change.harness, configured: true });
         } else if (change.op === 'remove' && index >= 0 && !setupHarnesses[index].preset) setupHarnesses.splice(index, 1);
         else if (index >= 0) Object.assign(setupHarnesses[index], change.op === 'remove' ? { configured: false, enabled: setupHarnesses[index].installed } : { enabled: change.op === 'enable', configured: true, available: change.op === 'enable' ? false : setupHarnesses[index].available });
-        local.harnesses = setupHarnesses.filter(h => h.enabled).map(h => h.name);
+        local.harnesses = setupHarnesses.filter(h => h.enabled).map(h => ({ name: h.name, kind: h.harness.kind }));
         if (cmd === 'take_out_harness')
           return delay({ applied: true, taken_out: preview.placed.filter(p => p.kind === 'remove'), harnesses: setupHarnesses, errors: [] } satisfies T.HarnessTakenOut, 600);
         return delay({ harnesses: setupHarnesses, errors: [] }, 600);

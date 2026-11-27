@@ -53,8 +53,10 @@
         "configured": true,
         "enabled": false,
         "harness": {
+          "home": null,
           "instructions": "~/.kiro/steering",
           "instructions_format": "rules",
+          "kind": null,
           "mode": "copy",
           "skills": "~/.kiro/skills"
         },
@@ -80,8 +82,10 @@
     },
     "set": {
       "harness": {
+        "home": null,
         "instructions": null,
         "instructions_format": "block",
+        "kind": null,
         "mode": "copy",
         "skills": "/opt/tool/skills"
       },
@@ -100,8 +104,10 @@
     "after": null,
     "awaiting_assignment": false,
     "before": {
+      "home": "~/.claude",
       "instructions": "~/.claude/CLAUDE.md",
       "instructions_format": "block",
+      "kind": "claude",
       "mode": "symlink",
       "skills": "~/.claude/skills"
     },
@@ -138,8 +144,10 @@
         "configured": true,
         "enabled": false,
         "harness": {
+          "home": null,
           "instructions": "~/.kiro/steering",
           "instructions_format": "rules",
+          "kind": null,
           "mode": "copy",
           "skills": "~/.kiro/skills"
         },
@@ -153,13 +161,31 @@
         "configured": false,
         "enabled": true,
         "harness": {
+          "home": "~/.claude",
           "instructions": "~/.claude/CLAUDE.md",
           "instructions_format": "block",
+          "kind": "claude",
           "mode": "symlink",
           "skills": null
         },
         "installed": true,
         "name": "claude",
+        "preset": false
+      },
+      {
+        "available": false,
+        "configured": true,
+        "enabled": true,
+        "harness": {
+          "home": "~/.claude_2",
+          "instructions": "~/.claude_2/CLAUDE.md",
+          "instructions_format": "block",
+          "kind": "claude",
+          "mode": "symlink",
+          "skills": "~/.claude_2/skills"
+        },
+        "installed": true,
+        "name": "claude_2",
         "preset": false
       }
     ],
@@ -176,8 +202,10 @@
         "configured": true,
         "enabled": false,
         "harness": {
+          "home": null,
           "instructions": "~/.kiro/steering",
           "instructions_format": "rules",
+          "kind": null,
           "mode": "copy",
           "skills": "~/.kiro/skills"
         },
@@ -210,8 +238,10 @@
   },
   "harness_view": {
     "harness": {
+      "home": "~/.claude",
       "instructions": "~/.claude/CLAUDE.md",
       "instructions_format": "block",
+      "kind": "claude",
       "mode": "symlink",
       "skills": "~/.claude/skills"
     },
@@ -238,28 +268,36 @@
   },
   "instructions_format": {
     "block": {
+      "home": "~/.claude",
       "instructions": "~/.claude/CLAUDE.md",
       "instructions_format": "block",
+      "kind": "claude",
       "mode": "symlink",
       "skills": "~/.claude/skills"
     },
     "rules": {
+      "home": "~/.claude",
       "instructions": "~/.claude/CLAUDE.md",
       "instructions_format": "rules",
+      "kind": "claude",
       "mode": "symlink",
       "skills": "~/.claude/skills"
     }
   },
   "link_mode": {
     "copy": {
+      "home": "~/.claude",
       "instructions": "~/.claude/CLAUDE.md",
       "instructions_format": "block",
+      "kind": "claude",
       "mode": "copy",
       "skills": "~/.claude/skills"
     },
     "symlink": {
+      "home": "~/.claude",
       "instructions": "~/.claude/CLAUDE.md",
       "instructions_format": "block",
+      "kind": "claude",
       "mode": "symlink",
       "skills": "~/.claude/skills"
     }

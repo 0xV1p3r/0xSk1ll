@@ -149,7 +149,7 @@ function AuthorityMatrix({ revision, status, target, openLog }: MatrixProps) {
     && `${splitItem(i.item).name} ${i.description ?? ''}`.toLowerCase().includes(search.toLowerCase()));
   const selected = data.fleet.machines.filter(machine => standalone || machines === null || machines.includes(machine.id));
   // Assignment keys keep settings for disabled or removed Harnesses. The report lists which ones are active.
-  const activeHarnesses = (machine: MachineRow) => [...(machine.id === status.machine_id ? status.report.harnesses : machine.report?.harnesses ?? [])].sort();
+  const activeHarnesses = (machine: MachineRow) => (machine.id === status.machine_id ? status.report.harnesses : machine.report?.harnesses ?? []).map(h => h.name).sort();
   // A Machine whose Assignment failed to load has no columns, only its error; nothing reads or writes its Assignment.
   const groups = selected.map(machine => ({ machine, loaded: !!own(data.assignments, machine.id), harnesses: activeHarnesses(machine),
     collapsed: collapsed.includes(machine.id), offline: !machine.connected || machine.status === 'offline' })).filter(g => g.harnesses.length || !g.loaded);

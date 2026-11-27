@@ -254,7 +254,7 @@ fn adopting_a_rule_preserves_routing_and_item_id_while_taking_the_harness_edit()
         assert_eq!(conflict.kind, ActionKind::Conflict);
         sync::adopt(&repo, &conflict).unwrap();
         let restored = repo.rules().unwrap().into_iter().find(|rule| rule.name == name).unwrap();
-        assert!(restored.applies_to("h") && !restored.applies_to("other"));
+        assert!(restored.applies_to("h", None) && !restored.applies_to("other", None));
         assert_eq!(restored.id.unwrap().to_string(), format!("{name}-id"));
         assert_eq!(restored.body, "After.");
         assert!(fixture.read(&rel).contains(metadata));

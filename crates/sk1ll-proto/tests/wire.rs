@@ -87,7 +87,11 @@ fn daemon_messages_have_golden_json() {
         inventory_complete: true,
         inventory_error: Some("bad Rule ID".into()),
         conflicts: vec![ConflictRef { item: ItemRef::Rule("git".into()), harness: "codex".into() }],
-        harnesses: vec!["claude".into()],
+        harnesses: vec![
+            ReportedHarness { name: "claude".into(), kind: Some("claude".into()) },
+            ReportedHarness { name: "claude_2".into(), kind: Some("claude".into()) },
+            ReportedHarness { name: "agents".into(), kind: None },
+        ],
         blocked: true,
         clashes: vec![ItemRef::Skill("pdf".into())],
         pull_pending: Some(vec![ItemRef::Rule("git".into())]),
@@ -101,7 +105,11 @@ fn daemon_messages_have_golden_json() {
             "drafts": ["skill:pdf", "rule:git", "manifest", "other:README.md"],
             "unpushed": ["skill:wip"], "items": [{"item": "skill:pdf", "id": "01J0"}],
             "inventory_complete": true, "inventory_error": "bad Rule ID",
-            "conflicts": [{"item": "rule:git", "harness": "codex"}], "harnesses": ["claude"],
+            "conflicts": [{"item": "rule:git", "harness": "codex"}],
+            "harnesses": [
+                {"name": "claude", "kind": "claude"}, {"name": "claude_2", "kind": "claude"},
+                {"name": "agents", "kind": null},
+            ],
             "blocked": true, "clashes": ["skill:pdf"], "pull_pending": ["rule:git"], "behind": true,
             "push_refused": "no Item ID",
         }),
@@ -349,8 +357,13 @@ fn rest_bodies_have_golden_json() {
     golden(PruneOrphans { machine: None }, json!({}));
     golden(PruneOrphans { machine: Some("ws".into()) }, json!({"machine": "ws"}));
     golden(
-        JoinRequest { code: "C".into(), machine_id: "ws".into(), harnesses: vec!["claude".into()], copy_from: None },
-        json!({"code": "C", "machine_id": "ws", "harnesses": ["claude"], "copy_from": null}),
+        JoinRequest {
+            code: "C".into(),
+            machine_id: "ws".into(),
+            harnesses: vec![ReportedHarness { name: "claude_2".into(), kind: Some("claude".into()) }],
+            copy_from: None,
+        },
+        json!({"code": "C", "machine_id": "ws", "harnesses": [{"name": "claude_2", "kind": "claude"}], "copy_from": null}),
     );
     golden(
         JoinResponse {

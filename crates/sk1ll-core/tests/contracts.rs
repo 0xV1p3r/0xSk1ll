@@ -79,8 +79,11 @@ fn routing_is_removed_from_a_rendered_rule_and_every_other_byte_of_its_front_mat
                     let rule = rule(&raw);
                     let (name, rendered) = render_rule(&rule);
                     assert_eq!(name, "r.md");
-                    assert!(rule.applies_to("claude") && rule.applies_to("codex"), "{raw:?}");
-                    assert_eq!(rule.applies_to("other"), routing.is_none(), "{raw:?}");
+                    assert!(rule.applies_to("claude", None) && rule.applies_to("codex", None), "{raw:?}");
+                    assert_eq!(rule.applies_to("other", None), routing.is_none(), "{raw:?}");
+                    // A harness of a named kind is named too: an instance of a preset.
+                    assert!(rule.applies_to("claude_2", Some("claude")), "{raw:?}");
+                    assert_eq!(rule.applies_to("other", Some("cursor")), routing.is_none(), "{raw:?}");
                     if metadata.is_empty() {
                         assert_eq!(rendered, "Body.\n", "{raw:?}");
                     } else {

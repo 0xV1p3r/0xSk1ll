@@ -48,7 +48,7 @@ function MachineDetails({ machine }: { machine: MachineRow }) {
   return <Details className="py-1 md:grid-cols-[max-content_minmax(0,1fr)_max-content_minmax(0,1fr)]" rows={[
     ['Connection', machine.connected ? 'Connected' : 'Disconnected'],
     ['Joined', <When seconds={machine.joined_at} />],
-    ['Harnesses', list(report?.harnesses, 'None reported')],
+    ['Harnesses', list(report?.harnesses.map(h => h.name), 'None reported')],
     ['Last seen', <When seconds={machine.last_seen} />],
     scopeRow,
     ...(report.drafts.length ? [['Draft', list(report.drafts)] as [string, ReactNode]] : []),
@@ -155,7 +155,7 @@ export function Fleet({ revision, machineId, initialMachine, serverUrl = null, l
       </Table> : <Nothing className="rounded-none border-0" title={filter ? "No matching Machines" : "No Machines"} action={filter ? <Button variant="outline" size="sm" aria-label="Clear Machine filter" onClick={() => setFilter(null)}>Show all Machines</Button> : undefined}>{filter ? "Clear the filter to see all Machines." : "Use Add Machine to create a join code for another Machine."}</Nothing>}
             </div>
           </Panel>
-          <FleetAssignments registration={local?.registration} key={machineId} revision={revision} machineId={machineId} harnesses={report?.harnesses ?? []} navigate={navigate} />
+          <FleetAssignments registration={local?.registration} key={machineId} revision={revision} machineId={machineId} harnesses={report?.harnesses.map(h => h.name) ?? []} navigate={navigate} />
         </div>
         <Panel label="Up next" className="min-w-0 gap-0 border py-0 ring-0">
           <PanelToolbar><SectionTitle id="fleet-next-title">Up next</SectionTitle>{queue > 0 && <Badge variant="secondary" className="ml-auto tabular-nums">{queue}</Badge>}</PanelToolbar>

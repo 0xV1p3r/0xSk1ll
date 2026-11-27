@@ -169,6 +169,39 @@ fn harness_changes_preview_apply_and_sync() {
     assert!(run(&repo, &["harnesses", "add", "x", "--skills", "relative", "--yes"]).is_err());
 }
 
+/// `add --preset --home` makes a second config directory of one tool an
+/// instance of its preset: machine.toml gets just those keys, and sync places
+/// skills and the tool's rules (`harnesses: [claude]`) under that directory.
+#[test]
+fn harnesses_add_a_preset_instance_in_another_config_directory() {
+    let repo = Machine::new();
+    repo.repo.write("personal/pdf/SKILL.md", "PDFs.");
+    repo.repo.write("instructions/all.md", "---\nharnesses: [claude]\n---\nFor Claude Code.\n");
+    let config = repo.machine_toml();
+    let add = ["harnesses", "add", "claude_2", "--preset", "claude", "--home", "~/.claude_2", "--yes"];
+    run(&repo, &add).unwrap();
+    let text = fs::read_to_string(&config).unwrap();
+    assert!(text.ends_with("[harnesses.claude_2]\npreset = \"claude\"\nhome = \"~/.claude_2\"\n"), "{text}");
+    let dir = repo.home.path().join(".claude_2");
+    assert!(dir.join("skills/pdf/SKILL.md").exists());
+    assert!(fs::read_to_string(dir.join("rules/all.md")).unwrap().contains("For Claude Code."));
+    let listing = run(&repo, &["harnesses"]).unwrap();
+    let line = listing.lines().find(|line| line.starts_with("claude_2 ")).unwrap();
+    assert!(line.contains("~/.claude_2/skills") && line.ends_with("[claude in ~/.claude_2]"), "{line}");
+
+    // Options left out keep their value: still the instance, the paths still derived.
+    run(&repo, &["harnesses", "add", "claude_2", "--mode", "copy", "--yes"]).unwrap();
+    let text = fs::read_to_string(&config).unwrap();
+    assert!(text.ends_with("home = \"~/.claude_2\"\nmode = \"copy\"\n"), "{text}");
+    // Another home moves the derived paths along.
+    run(&repo, &["harnesses", "add", "claude_2", "--home", "~/.claude-work", "--yes"]).unwrap();
+    let text = fs::read_to_string(&config).unwrap();
+    assert!(text.ends_with("home = \"~/.claude-work\"\nmode = \"copy\"\n"), "{text}");
+    assert!(repo.home.path().join(".claude-work/skills/pdf/SKILL.md").is_file());
+    let refused = run(&repo, &["harnesses", "add", "x", "--preset", "nope", "--home", "~/.x", "--yes"]).unwrap_err();
+    assert!(refused.contains("no preset `nope`"), "{refused}");
+}
+
 /// `--take-out` turns the harness's items off and syncs, so what sk1ll
 /// placed there goes, and makes the change only once that worked.
 #[cfg(unix)]

@@ -94,9 +94,18 @@ impl RenameIntent {
                 request.to, request.from
             )));
         }
+        // A renamed preset or instance keeps its kind, so a Rule naming the kind still reaches it.
+        let kind = MachineConfig::from_snapshot(&before)?
+            .choices()
+            .into_iter()
+            .find(|choice| choice.name == request.from)
+            .and_then(|choice| choice.harness.kind);
+        let kind = kind.as_deref();
         let routed_rules = crate::instructions::discover(repo)?
             .into_iter()
-            .filter(|rule| rule.harnesses.is_some() && rule.applies_to(&request.from) && !rule.applies_to(&request.to))
+            .filter(|rule| {
+                rule.harnesses.is_some() && rule.applies_to(&request.from, kind) && !rule.applies_to(&request.to, kind)
+            })
             .map(|rule| rule.name)
             .collect();
         let intent = Self {

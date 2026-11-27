@@ -123,7 +123,7 @@ async fn join(State(server): ServerState, Json(req): Json<JoinRequest>) -> Resul
         return Err(ApiError::BadRequest(format!("`{}` is reserved", req.machine_id)));
     }
     for h in &req.harnesses {
-        check_name("harness", h)?;
+        check_name("harness", &h.name)?;
     }
     let token = crate::hex(&random_bytes::<32>());
     let token_hash = hash(&token);
@@ -147,7 +147,7 @@ async fn join(State(server): ServerState, Json(req): Json<JoinRequest>) -> Resul
                 None => Assignment::fleet(),
             };
             for h in &req.harnesses {
-                assignment.harnesses.entry(h.clone()).or_insert_with(HarnessAssignment::all_off);
+                assignment.harnesses.entry(h.name.clone()).or_insert_with(HarnessAssignment::all_off);
             }
             if db::machine(&tx, &req.machine_id)?.is_some() {
                 return Err(ApiError::Conflict(format!("machine `{}` already joined", req.machine_id)));

@@ -348,9 +348,10 @@ pub fn undo_change(conn: &Connection, id: i64, allowed: impl FnOnce(&str) -> Res
 }
 
 /// Harnesses in `reported` that `a` has no entry for, added all off.
-pub fn new_harness_changes(a: &Assignment, reported: &[String]) -> Vec<Change> {
+pub fn new_harness_changes(a: &Assignment, reported: &[sk1ll_proto::ReportedHarness]) -> Vec<Change> {
     reported
         .iter()
+        .map(|h| &h.name)
         .filter(|h| !a.harnesses.contains_key(*h) && crate::check_name("harness", h).is_ok())
         .flat_map(|h| {
             [ToggleKind::NewSkillsDefault, ToggleKind::NewRulesDefault].map(|kind| Change {

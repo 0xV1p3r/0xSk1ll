@@ -3,7 +3,10 @@
 //! Harnesses are not repo content: which agent tools exist, and where they
 //! read from, differs per machine. The effective set is the built-in presets
 //! whose home directory exists (e.g. `~/.claude`), adjusted by
-//! `machine.toml` in the user's config dir.
+//! `machine.toml` in the user's config dir. A preset's paths are relative to
+//! its home, so an entry with `preset` and `home` is an instance of it in
+//! another config directory of the same tool (a second Claude Code account,
+//! say), with the preset as its kind.
 //!
 //! Presets added after 0.1.0 (and gemini's skills directory) are opt-in:
 //! synced into only while `machine.toml` enables them explicitly, so an
@@ -46,6 +49,16 @@ pub enum InstructionsFormat {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Harness {
+    /// The preset this harness is, or is an instance of (`claude` for
+    /// `~/.claude_2`); `None` for a custom harness. Rules name it in
+    /// `harnesses:` as they name a harness.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// The config directory of a preset or preset instance, e.g.
+    /// `~/.claude_2`, which the preset's paths are relative to; `None` for a
+    /// custom harness.
+    #[serde(default)]
+    pub home: Option<String>,
     /// Skills directory, e.g. `~/.claude/skills`.
     pub skills: Option<String>,
     /// Global instructions file (`block`), e.g. `~/.codex/AGENTS.md`, or a
@@ -70,10 +83,17 @@ impl Harness {
 
 /// One `[harnesses.<name>]` table in `machine.toml`. For a preset name, set
 /// fields replace the preset's; an empty string clears `skills` or
-/// `instructions`. Any other name defines a new harness.
+/// `instructions`. Any other name defines a new harness: an instance of the
+/// preset `preset` names, rooted at `home`, or else a custom harness.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessEntry {
+    /// The preset this entry is an instance of. On an entry named after a
+    /// preset it can only be that preset.
+    pub preset: Option<String>,
+    /// The instance's config directory, which the preset's paths are
+    /// relative to (default: the preset's own, e.g. `~/.claude`).
+    pub home: Option<String>,
     pub skills: Option<String>,
     pub instructions: Option<String>,
     pub instructions_format: Option<InstructionsFormat>,
@@ -111,6 +131,7 @@ pub struct HarnessChoice {
     pub enabled: bool,
     pub harness: Harness,
     /// A built-in preset (`machine.toml` can only override or disable it).
+    /// A preset instance is not one: its kind is in `harness`.
     #[serde(default)]
     pub preset: bool,
     /// `machine.toml` has an entry for it.
@@ -137,7 +158,9 @@ pub enum HarnessChange {
     /// Stop syncing into it; its entry and the paths it sets stay.
     Disable { name: String },
     /// Adds a harness, or replaces what an entry sets (its `enabled` stays).
-    /// For a preset, only what differs from the preset is written.
+    /// For a preset, only what differs from the preset is written; for a
+    /// name that isn't a preset, a `harness.kind` makes it an instance of
+    /// that preset (rooted at `harness.home`), written the same way.
     Set { name: String, harness: Harness },
     /// Deletes the entry: a custom harness goes away, and a preset goes back
     /// to its built-in settings.
@@ -181,7 +204,8 @@ impl Default for Notifications {
 
 struct Preset {
     name: &'static str,
-    /// Home-relative directory whose existence means the harness is installed.
+    /// The config directory whose existence means the harness is installed.
+    /// The other paths are relative to it, or to an instance's `home`.
     home: &'static str,
     skills: Option<&'static str>,
     instructions: Option<&'static str>,
@@ -191,16 +215,17 @@ struct Preset {
     /// `enabled = true`, so upgrading never starts writing somewhere new.
     opt_in: bool,
     /// A skills directory added after 0.1.0 (gemini's): synced into only
-    /// while `machine.toml` sets it as the entry's `skills`.
+    /// while `machine.toml` sets it as the entry's `skills`. An instance's
+    /// entry is explicit, so an instance gets it unless it sets `skills`.
     opt_in_skills: Option<&'static str>,
 }
 
 const PRESETS: &[Preset] = &[
     Preset {
         name: "claude",
-        home: ".claude",
-        skills: Some("~/.claude/skills"),
-        instructions: Some("~/.claude/rules"),
+        home: "~/.claude",
+        skills: Some("skills"),
+        instructions: Some("rules"),
         format: InstructionsFormat::Rules,
         mode: LinkMode::Symlink,
         opt_in: false,
@@ -208,9 +233,9 @@ const PRESETS: &[Preset] = &[
     },
     Preset {
         name: "codex",
-        home: ".codex",
-        skills: Some("~/.codex/skills"),
-        instructions: Some("~/.codex/AGENTS.md"),
+        home: "~/.codex",
+        skills: Some("skills"),
+        instructions: Some("AGENTS.md"),
         format: InstructionsFormat::Block,
         mode: LinkMode::Copy,
         opt_in: false,
@@ -218,9 +243,9 @@ const PRESETS: &[Preset] = &[
     },
     Preset {
         name: "opencode",
-        home: ".config/opencode",
-        skills: Some("~/.config/opencode/skill"),
-        instructions: Some("~/.config/opencode/AGENTS.md"),
+        home: "~/.config/opencode",
+        skills: Some("skill"),
+        instructions: Some("AGENTS.md"),
         format: InstructionsFormat::Block,
         mode: LinkMode::Symlink,
         opt_in: false,
@@ -228,21 +253,21 @@ const PRESETS: &[Preset] = &[
     },
     Preset {
         name: "gemini",
-        home: ".gemini",
+        home: "~/.gemini",
         skills: None,
-        instructions: Some("~/.gemini/GEMINI.md"),
+        instructions: Some("GEMINI.md"),
         format: InstructionsFormat::Block,
         mode: LinkMode::Symlink,
         opt_in: false,
-        opt_in_skills: Some("~/.gemini/skills"),
+        opt_in_skills: Some("skills"),
     },
     // Presets below place copies wherever their docs don't say skill
     // symlinks are followed.
     Preset {
         name: "copilot",
-        home: ".copilot",
-        skills: Some("~/.copilot/skills"),
-        instructions: Some("~/.copilot/copilot-instructions.md"),
+        home: "~/.copilot",
+        skills: Some("skills"),
+        instructions: Some("copilot-instructions.md"),
         format: InstructionsFormat::Block,
         mode: LinkMode::Copy,
         opt_in: true,
@@ -250,8 +275,8 @@ const PRESETS: &[Preset] = &[
     },
     Preset {
         name: "cursor",
-        home: ".cursor",
-        skills: Some("~/.cursor/skills"),
+        home: "~/.cursor",
+        skills: Some("skills"),
         // Cursor's user rules live in its settings, not in a file.
         instructions: None,
         format: InstructionsFormat::Block,
@@ -261,9 +286,9 @@ const PRESETS: &[Preset] = &[
     },
     Preset {
         name: "amp",
-        home: ".config/amp",
-        skills: Some("~/.config/amp/skills"),
-        instructions: Some("~/.config/amp/AGENTS.md"),
+        home: "~/.config/amp",
+        skills: Some("skills"),
+        instructions: Some("AGENTS.md"),
         format: InstructionsFormat::Block,
         mode: LinkMode::Copy,
         opt_in: true,
@@ -271,10 +296,10 @@ const PRESETS: &[Preset] = &[
     },
     Preset {
         name: "kiro",
-        home: ".kiro",
-        skills: Some("~/.kiro/skills"),
+        home: "~/.kiro",
+        skills: Some("skills"),
         // Global steering: one Markdown file per rule, always included by default.
-        instructions: Some("~/.kiro/steering"),
+        instructions: Some("steering"),
         format: InstructionsFormat::Rules,
         mode: LinkMode::Copy,
         opt_in: true,
@@ -282,8 +307,8 @@ const PRESETS: &[Preset] = &[
     },
     Preset {
         name: "cline",
-        home: ".cline",
-        skills: Some("~/.cline/skills"),
+        home: "~/.cline",
+        skills: Some("skills"),
         instructions: None,
         format: InstructionsFormat::Block,
         mode: LinkMode::Copy,
@@ -292,8 +317,8 @@ const PRESETS: &[Preset] = &[
     },
     Preset {
         name: "roo",
-        home: ".roo",
-        skills: Some("~/.roo/skills"),
+        home: "~/.roo",
+        skills: Some("skills"),
         instructions: None,
         format: InstructionsFormat::Block,
         mode: LinkMode::Symlink,
@@ -311,14 +336,94 @@ fn preset(name: &str) -> Option<&'static Preset> {
     PRESETS.iter().find(|p| p.name == name)
 }
 
+/// The preset's settings for an instance in `home` (`None`: its own), as
+/// [`Harness::kind`] of an effective harness names it, with an instance's
+/// opt-in skills directory taken up. `None` if there is no such preset.
+pub fn preset_instance(kind: &str, home: Option<&str>) -> Option<Harness> {
+    preset(kind).map(|p| p.instance(home))
+}
+
+/// `harness`, the settings of the harness `name`, moved onto the preset
+/// `kind` rooted at `home` (`None`: the preset's own directory): each setting
+/// it takes from its preset now (or the custom harness defaults) follows the
+/// new one, and each it sets itself stays. For `sk1ll harnesses add --preset
+/// --home`.
+pub fn rebase(name: &str, harness: &Harness, kind: Option<&str>, home: Option<&str>) -> Result<Harness> {
+    let base = |kind: Option<&str>, home: Option<&str>| -> Result<Harness> {
+        let Some(kind) = kind else {
+            return match home {
+                Some(_) => Err(Error::Invalid(format!("`home` for `{name}` needs a preset (--preset)"))),
+                None => Ok(Harness::default()),
+            };
+        };
+        let p = preset(kind).ok_or_else(|| {
+            Error::Invalid(format!("no preset `{kind}` (presets: {})", presets().collect::<Vec<_>>().join(", ")))
+        })?;
+        Ok(if kind == name { p.harness(home) } else { p.instance(home) })
+    };
+    let old = base(harness.kind.as_deref(), harness.home.as_deref())?;
+    let new = base(kind, home)?;
+    let pick = |own: &Option<String>, old: &Option<String>, new: &Option<String>| match own == old {
+        true => new.clone(),
+        false => own.clone(),
+    };
+    Ok(Harness {
+        kind: new.kind.clone(),
+        home: new.home.clone(),
+        skills: pick(&harness.skills, &old.skills, &new.skills),
+        instructions: pick(&harness.instructions, &old.instructions, &new.instructions),
+        instructions_format: match harness.instructions_format == old.instructions_format {
+            true => new.instructions_format,
+            false => harness.instructions_format,
+        },
+        mode: if harness.mode == old.mode { new.mode } else { harness.mode },
+    })
+}
+
 impl Preset {
-    fn harness(&self) -> Harness {
+    /// The default instance's settings, rooted at `home` (`None`: its own).
+    fn harness(&self, home: Option<&str>) -> Harness {
+        let home = home.unwrap_or(self.home);
         Harness {
-            skills: self.skills.map(String::from),
-            instructions: self.instructions.map(String::from),
+            kind: Some(self.name.into()),
+            home: Some(home.into()),
+            skills: self.skills.map(|p| under(home, p)),
+            instructions: self.instructions.map(|p| under(home, p)),
             instructions_format: self.format,
             mode: self.mode,
         }
+    }
+
+    /// An instance's settings: an explicit entry, so with its opt-in skills directory.
+    fn instance(&self, home: Option<&str>) -> Harness {
+        let mut harness = self.harness(home);
+        if harness.skills.is_none() {
+            harness.skills = self.opt_in_skills(home);
+        }
+        harness
+    }
+
+    fn opt_in_skills(&self, home: Option<&str>) -> Option<String> {
+        self.opt_in_skills.map(|p| under(home.unwrap_or(self.home), p))
+    }
+
+    /// Whether `home` (the default one if `None`) exists, with `user` as `~`.
+    fn installed(&self, home: Option<&str>, user: &Path) -> bool {
+        expand_in(home.unwrap_or(self.home), user).is_dir()
+    }
+}
+
+/// `rel` inside the directory `home`, spelled as `home` is.
+fn under(home: &str, rel: &str) -> String {
+    format!("{}/{rel}", home.trim_end_matches('/'))
+}
+
+/// `path` with `~` meaning `home`.
+fn expand_in(path: &str, home: &Path) -> PathBuf {
+    if path == "~" {
+        home.to_path_buf()
+    } else {
+        path.strip_prefix("~/").map_or_else(|| PathBuf::from(path), |rest| home.join(rest))
     }
 }
 
@@ -377,10 +482,34 @@ impl MachineConfig {
     pub(crate) fn parse(text: &str, path: &Path) -> Result<Self> {
         let mut config: Self =
             toml::from_str(text).map_err(|e| Error::Parse { path: path.to_path_buf(), message: e.to_string() })?;
+        config.validate(path)?;
         if config.id.trim().is_empty() {
             config.id = hostname();
         }
         Ok(config)
+    }
+
+    /// What deserializing can't check: `preset` names a preset (its own, on
+    /// a preset's entry), and `home` roots a preset or preset instance.
+    fn validate(&self, path: &Path) -> Result<()> {
+        for (name, entry) in &self.harnesses {
+            let message = match (&entry.preset, preset(name)) {
+                (Some(kind), _) if preset(kind).is_none() => {
+                    let known = presets().collect::<Vec<_>>().join(", ");
+                    format!("harness `{name}`: no preset `{kind}` (presets: {known})")
+                }
+                (Some(kind), Some(own)) if kind != own.name => format!(
+                    "harness `{name}` is the `{name}` preset, so its `preset` can only be `{name}`; give an instance \
+                     of `{kind}` a name of its own"
+                ),
+                (None, None) if entry.home.is_some() => format!(
+                    "harness `{name}`: `home` needs `preset`; a custom harness sets its own `skills` and `instructions`"
+                ),
+                _ => continue,
+            };
+            return Err(Error::Parse { path: path.to_path_buf(), message });
+        }
+        Ok(())
     }
 
     /// First-run setup: takes up the opt-in presets found on this machine
@@ -415,24 +544,27 @@ impl MachineConfig {
         let mut doc = ConfigDoc::parse(&snapshot.text()?, snapshot.path())?;
         let repo = real(&std::path::absolute(repo).at(repo)?);
         let mut skipped = BTreeMap::new();
-        for p in PRESETS.iter().filter(|p| home.join(p.home).is_dir()) {
-            if config.custom(p.name) {
+        for p in PRESETS {
+            if config.defined_by_entry(p.name) {
                 continue;
             }
             let mut entry = config.harnesses.get(p.name).cloned().unwrap_or_default();
+            if !p.installed(entry.home.as_deref(), home) {
+                continue;
+            }
             let (key, value) = if p.opt_in && entry.enabled.is_none() {
                 entry.enabled = Some(true);
                 ("enabled", toml_edit::value(true))
-            } else if let Some(skills) = p.opt_in_skills
+            } else if let Some(skills) = p.opt_in_skills(entry.home.as_deref())
                 && entry.enabled != Some(false)
                 && entry.skills.is_none()
             {
-                entry.skills = Some(skills.into());
+                entry.skills = Some(skills.clone());
                 ("skills", toml_edit::value(skills))
             } else {
                 continue;
             };
-            let mine = locations(&merge(p.harness(), &entry), home);
+            let mine = locations(&merge(p.harness(entry.home.as_deref()), &entry), home);
             let effective = config.effective_in(home);
             let conflict = overlapping_harness(&effective, p.name, &mine, home)
                 .map(|(other, _, _)| other)
@@ -473,22 +605,20 @@ impl MachineConfig {
         let effective = self.effective_in(home);
         let mut out: Vec<HarnessChoice> = PRESETS
             .iter()
-            .filter(|preset| !self.custom(preset.name))
+            .filter(|preset| !self.defined_by_entry(preset.name))
             .map(|preset| {
                 let entry = self.harnesses.get(preset.name);
+                let own_home = entry.and_then(|e| e.home.as_deref());
                 let enabled = effective.contains_key(preset.name);
-                let mut harness = match entry {
-                    Some(entry) => merge(preset.harness(), entry),
-                    None => preset.harness(),
-                };
+                let mut harness = preset_harness(preset, entry);
                 // Its skills directory isn't taken up yet: shown as what enabling it syncs into.
                 let skills_off = preset.opt_in_skills.is_some() && entry.is_none_or(|e| e.skills.is_none());
                 if skills_off && !enabled {
-                    harness.skills = preset.opt_in_skills.map(String::from);
+                    harness.skills = preset.opt_in_skills(own_home);
                 }
                 HarnessChoice {
                     name: preset.name.to_string(),
-                    installed: home.join(preset.home).is_dir(),
+                    installed: preset.installed(own_home, home),
                     enabled,
                     harness,
                     preset: true,
@@ -499,12 +629,12 @@ impl MachineConfig {
             })
             .collect();
         for (name, entry) in &self.harnesses {
-            if self.custom(name) {
+            if self.defined_by_entry(name) {
                 out.push(HarnessChoice {
                     name: name.clone(),
                     installed: true,
                     enabled: effective.contains_key(name),
-                    harness: merge(Harness::default(), entry),
+                    harness: self.entry_harness(name, entry),
                     preset: false,
                     configured: true,
                     setup_warning: None,
@@ -515,12 +645,38 @@ impl MachineConfig {
         out
     }
 
-    /// An opt-in name with its own path keys keeps the custom harness defaults.
-    fn custom(&self, name: &str) -> bool {
+    /// Whether `name` is a harness of its own entry (a custom harness or a
+    /// preset instance) rather than a preset. An opt-in preset's name with
+    /// its own path keys keeps the custom harness defaults, unless `preset`
+    /// or `home` says it is the preset.
+    fn defined_by_entry(&self, name: &str) -> bool {
         match (preset(name), self.harnesses.get(name)) {
             (None, _) => true,
-            (Some(p), Some(entry)) if p.opt_in => entry.skills.is_some() || entry.instructions.is_some(),
+            (Some(p), Some(e)) if p.opt_in => {
+                e.preset.is_none() && e.home.is_none() && (e.skills.is_some() || e.instructions.is_some())
+            }
             (Some(_), _) => false,
+        }
+    }
+
+    /// The preset `name` is, unless an entry of its own took the name.
+    fn preset_named(&self, name: &str) -> Option<&'static Preset> {
+        preset(name).filter(|_| !self.defined_by_entry(name))
+    }
+
+    /// The preset the entry `name` is an instance of.
+    fn instance_of(&self, name: &str) -> Option<&'static Preset> {
+        match preset(name) {
+            Some(_) => None,
+            None => self.harnesses.get(name)?.preset.as_deref().and_then(preset),
+        }
+    }
+
+    /// What the entry of a custom harness or preset instance syncs into.
+    fn entry_harness(&self, name: &str, entry: &HarnessEntry) -> Harness {
+        match self.instance_of(name) {
+            Some(p) => merge(p.instance(entry.home.as_deref()), entry),
+            None => merge(Harness::default(), entry),
         }
     }
 
@@ -549,8 +705,9 @@ impl MachineConfig {
         home_or_none(|home| Self::edit_in(snapshot, change, home))
     }
 
-    /// Renames a harness in machine.toml. A renamed preset becomes a custom
-    /// harness with the same settings, and the original preset is disabled.
+    /// Renames a harness in machine.toml. A renamed preset becomes an
+    /// instance of itself with the same settings (`preset = "<name>"`), and
+    /// the original preset is disabled.
     pub fn rename_harness(snapshot: &Snapshot, from: &str, to: &str) -> Result<ConfigEdit> {
         check_name(to)?;
         let before = Self::from_snapshot(snapshot)?;
@@ -561,22 +718,21 @@ impl MachineConfig {
             )));
         }
         let mut doc = ConfigDoc::parse(&snapshot.text()?, snapshot.path())?;
-        if let Some(preset) = preset(from).filter(|_| !before.custom(from)) {
+        if let Some(preset) = before.preset_named(from) {
             let entry = before.harnesses.get(from);
-            let choice = before.choices().into_iter().find(|choice| choice.name == from).unwrap();
-            if entry.is_none() && !choice.enabled {
+            let enabled = before.effective().contains_key(from);
+            if entry.is_none() && !enabled {
                 return Err(Error::Invalid(format!("no configured or enabled harness `{from}`")));
             }
-            let harness = entry.map_or_else(|| preset.harness(), |entry| merge(preset.harness(), entry));
+            // An instance of the preset, so it keeps its kind and follows the preset's defaults.
+            let harness = preset_harness(preset, entry);
             let table = doc.entry(to)?;
-            for (key, path) in [("skills", harness.skills), ("instructions", harness.instructions)] {
-                if let Some(path) = path {
-                    table[key] = toml_edit::value(path);
-                }
+            table["preset"] = toml_edit::value(preset.name);
+            if let Some(home) = harness.home.as_deref().filter(|h| *h != preset.home) {
+                table["home"] = toml_edit::value(home);
             }
-            table["instructions_format"] = toml_edit::value(format_name(harness.instructions_format));
-            table["mode"] = toml_edit::value(mode_name(harness.mode));
-            if !choice.enabled {
+            write_settings(table, &harness, Some(&preset.instance(harness.home.as_deref())));
+            if !enabled {
                 table["enabled"] = toml_edit::value(false);
             }
         } else {
@@ -605,7 +761,7 @@ impl MachineConfig {
         let before = Self::from_snapshot(snapshot)?;
         let name = change.name();
         // The preset `name` means here, unless an entry of its own took the name.
-        let preset_of = preset(name).filter(|_| !before.custom(name));
+        let preset_of = before.preset_named(name);
         let known = before.harnesses.contains_key(name) || preset_of.is_some();
         let entry = before.harnesses.get(name);
         let mut doc = ConfigDoc::parse(&snapshot.text()?, path)?;
@@ -618,7 +774,7 @@ impl MachineConfig {
                     Some(p) if p.opt_in => doc.entry(name)?["enabled"] = toml_edit::value(true),
                     _ => {
                         // A preset without its home directory is included only by an entry.
-                        let installed = preset_of.is_none_or(|p| home.join(p.home).is_dir());
+                        let installed = preset_of.is_none_or(|p| p.installed(None, home));
                         let other_keys = entry
                             .is_some_and(|e| HarnessEntry { enabled: None, ..e.clone() } != HarnessEntry::default());
                         if installed || other_keys {
@@ -629,7 +785,7 @@ impl MachineConfig {
                     }
                 }
                 // Enabling a preset takes up its opt-in skills directory, unless one is set.
-                if let Some(skills) = preset_of.and_then(|p| p.opt_in_skills)
+                if let Some(skills) = preset_of.and_then(|p| p.opt_in_skills(entry.and_then(|e| e.home.as_deref())))
                     && entry.is_none_or(|e| e.skills.is_none())
                 {
                     doc.entry(name)?["skills"] = toml_edit::value(skills);
@@ -641,38 +797,51 @@ impl MachineConfig {
                     check_name(name)?;
                 }
                 check_harness(name, harness, home)?;
-                let base = preset_of.map(Preset::harness);
-                let table = doc.entry(name)?;
-                let path_key = |want: &Option<String>, preset: Option<&Option<String>>| match preset {
-                    Some(p) if p == want => None,
-                    Some(_) => Some(want.clone().unwrap_or_default()),
-                    None => want.clone(),
+                // The preset this builds on: `name` itself, or the one it is an instance of.
+                let instance = match (&harness.kind, preset(name)) {
+                    (Some(kind), Some(_)) if kind != name => {
+                        return Err(Error::Invalid(format!(
+                            "`{name}` is a preset, so it can't be an instance of `{kind}`; give the instance a name \
+                             of its own"
+                        )));
+                    }
+                    (Some(kind), None) => Some(preset(kind).ok_or_else(|| {
+                        let known = presets().collect::<Vec<_>>().join(", ");
+                        Error::Invalid(format!("no preset `{kind}` for `{name}` (presets: {known})"))
+                    })?),
+                    _ => None,
                 };
-                let keys = [
-                    ("skills", path_key(&harness.skills, base.as_ref().map(|b| &b.skills))),
-                    ("instructions", path_key(&harness.instructions, base.as_ref().map(|b| &b.instructions))),
-                ];
-                // An opt-in preset whose paths differ is written out in full,
-                // so it reads the same should it ever count as custom (see `custom`).
-                let full = preset_of.is_some_and(|p| p.opt_in) && keys.iter().any(|(_, v)| v.is_some());
-                if full {
-                    for (key, value) in [("skills", &harness.skills), ("instructions", &harness.instructions)] {
-                        table[key] = toml_edit::value(value.clone().unwrap_or_default());
-                    }
-                } else {
-                    for (key, value) in keys {
-                        match value {
-                            Some(v) => table[key] = toml_edit::value(v),
-                            None => drop(table.remove(key)),
-                        }
-                    }
+                let own = preset_of.or(instance);
+                if own.is_none() && harness.home.is_some() {
+                    return Err(Error::Invalid(format!(
+                        "`home` for `{name}` needs a preset: a custom harness sets its own skills and instructions"
+                    )));
                 }
-                let base = base.unwrap_or_default();
-                let format = harness.instructions_format;
-                let (same_format, same_mode) =
-                    (format == base.instructions_format && !full, harness.mode == base.mode && !full);
-                set_or_default(table, "instructions_format", format_name(format), same_format);
-                set_or_default(table, "mode", mode_name(harness.mode), same_mode);
+                let base = match (preset_of, instance) {
+                    (Some(p), _) => Some(p.harness(harness.home.as_deref())),
+                    (None, Some(p)) => Some(p.instance(harness.home.as_deref())),
+                    (None, None) => None,
+                };
+                // An opt-in preset's name with paths of its own would be a
+                // custom harness (see `defined_by_entry`) unless it says it is the preset.
+                let rehomed = own.zip(harness.home.as_deref()).filter(|(p, h)| *h != p.home).map(|(_, h)| h);
+                let own_paths =
+                    base.as_ref().is_some_and(|b| b.skills != harness.skills || b.instructions != harness.instructions);
+                let says_preset = match (instance, preset_of) {
+                    (Some(p), _) => Some(p),
+                    (None, Some(p)) if p.opt_in && own_paths && rehomed.is_none() => Some(p),
+                    _ => None,
+                };
+                let table = doc.entry(name)?;
+                match says_preset {
+                    Some(p) => table["preset"] = toml_edit::value(p.name),
+                    None => drop(table.remove("preset")),
+                }
+                match rehomed {
+                    Some(h) => table["home"] = toml_edit::value(h),
+                    None => drop(table.remove("home")),
+                }
+                write_settings(table, harness, base.as_ref());
                 // Setting an opt-in preset that says nothing about `enabled` takes it up.
                 if preset_of.is_some_and(|p| p.opt_in) && entry.and_then(|e| e.enabled).is_none() {
                     table["enabled"] = toml_edit::value(true);
@@ -691,6 +860,7 @@ impl MachineConfig {
             // Parse what we are about to write so a bad edit never reaches the daemon.
             let mut after: Self = toml::from_str(&doc.doc.to_string())
                 .map_err(|e| Error::Parse { path: path.to_path_buf(), message: e.to_string() })?;
+            after.validate(path)?;
             if after.id.trim().is_empty() {
                 after.id = before.id.clone();
             }
@@ -721,24 +891,22 @@ impl MachineConfig {
 
     fn effective_in(&self, home: &Path) -> BTreeMap<String, EffectiveHarness> {
         let mut out = BTreeMap::new();
-        for preset in PRESETS.iter().filter(|p| !self.custom(p.name)) {
+        for preset in PRESETS.iter().filter(|p| !self.defined_by_entry(p.name)) {
             let entry = self.harnesses.get(preset.name);
             let on = match preset.opt_in {
                 true => entry.and_then(|e| e.enabled) == Some(true),
-                false => home.join(preset.home).is_dir() || entry.is_some(),
+                false => preset.installed(None, home) || entry.is_some(),
             };
             if !on {
                 continue;
             }
-            let (harness, origin) = match entry {
-                Some(entry) => (merge(preset.harness(), entry), HarnessOrigin::Override),
-                None => (preset.harness(), HarnessOrigin::Detected),
-            };
-            out.insert(preset.name.to_string(), EffectiveHarness { harness, origin });
+            let origin = if entry.is_some() { HarnessOrigin::Override } else { HarnessOrigin::Detected };
+            out.insert(preset.name.to_string(), EffectiveHarness { harness: preset_harness(preset, entry), origin });
         }
+        // Custom harnesses and preset instances, on because their entry says so.
         for (name, entry) in &self.harnesses {
-            if self.custom(name) {
-                let harness = merge(Harness::default(), entry);
+            if self.defined_by_entry(name) {
+                let harness = self.entry_harness(name, entry);
                 out.insert(name.clone(), EffectiveHarness { harness, origin: HarnessOrigin::Local });
             }
         }
@@ -753,6 +921,38 @@ fn home_or_none<T>(f: impl FnOnce(&Path) -> T) -> T {
         Some(home) => f(&home),
         None => f(Path::new("/nonexistent")),
     }
+}
+
+/// What preset `p`'s own entry makes of it.
+fn preset_harness(p: &Preset, entry: Option<&HarnessEntry>) -> Harness {
+    match entry {
+        Some(entry) => merge(p.harness(entry.home.as_deref()), entry),
+        None => p.harness(None),
+    }
+}
+
+/// Writes into `table` the settings of `harness` that differ from `base`,
+/// the preset (instance) it builds on, and drops the rest; with no `base` (a
+/// custom harness), its paths and any non-default format or mode.
+fn write_settings(table: &mut toml_edit::Table, harness: &Harness, base: Option<&Harness>) {
+    for (key, want, preset) in [
+        ("skills", &harness.skills, base.map(|b| &b.skills)),
+        ("instructions", &harness.instructions, base.map(|b| &b.instructions)),
+    ] {
+        let value = match preset {
+            Some(p) if p == want => None,
+            Some(_) => Some(want.clone().unwrap_or_default()),
+            None => want.clone(),
+        };
+        match value {
+            Some(v) => table[key] = toml_edit::value(v),
+            None => drop(table.remove(key)),
+        }
+    }
+    let base = base.cloned().unwrap_or_default();
+    let format = harness.instructions_format;
+    set_or_default(table, "instructions_format", format_name(format), format == base.instructions_format);
+    set_or_default(table, "mode", mode_name(harness.mode), harness.mode == base.mode);
 }
 
 fn merge(mut base: Harness, entry: &HarnessEntry) -> Harness {
@@ -890,7 +1090,11 @@ fn check_harness(name: &str, harness: &Harness, home: &Path) -> Result<()> {
     if harness.skills.is_none() && harness.instructions.is_none() {
         return Err(Error::Invalid(format!("harness `{name}` needs a skills directory, an instructions path or both")));
     }
-    for (what, value) in [("skills directory", &harness.skills), ("instructions path", &harness.instructions)] {
+    for (what, value) in [
+        ("skills directory", &harness.skills),
+        ("instructions path", &harness.instructions),
+        ("home directory", &harness.home),
+    ] {
         let Some(value) = value else { continue };
         let bad = |why: &str| Error::Invalid(format!("{what} `{value}` for `{name}` {why}"));
         if value.trim() != value || value.is_empty() || value.contains(['\0', '\n', '\r']) {
@@ -919,18 +1123,7 @@ fn check_harness(name: &str, harness: &Harness, home: &Path) -> Result<()> {
 /// other's content for its own to replace or remove. Compared where they
 /// resolve to, so a symlink alias is no way around it.
 fn locations(harness: &Harness, home: &Path) -> Vec<PathBuf> {
-    [&harness.skills, &harness.instructions]
-        .into_iter()
-        .flatten()
-        .map(|path| {
-            let path = if path == "~" {
-                home.to_path_buf()
-            } else {
-                path.strip_prefix("~/").map_or_else(|| PathBuf::from(path), |rest| home.join(rest))
-            };
-            real(&path)
-        })
-        .collect()
+    [&harness.skills, &harness.instructions].into_iter().flatten().map(|path| real(&expand_in(path, home))).collect()
 }
 
 pub(crate) fn overlaps(a: &Path, b: &Path) -> bool {

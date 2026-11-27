@@ -249,7 +249,7 @@ pub fn list(
                         && id
                             .as_ref()
                             .map_or(assignment.harness(h).new_rules_default, |id| assignment.rule_enabled(h, id))
-                        && rules.iter().find(|f| f.name == *n).is_none_or(|f| f.applies_to(h))
+                        && rules.iter().find(|f| f.name == *n).is_none_or(|f| f.applies_to(h, config.kind.as_deref()))
                 }
                 _ => false,
             })
