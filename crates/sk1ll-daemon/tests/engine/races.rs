@@ -222,7 +222,9 @@ fn take_out_only_disables_a_harness_after_a_complete_scan_and_preserves_concurre
                 "second scan" => write(&index, "corrupt"),
                 "config edit" => write(path, &format!("{}\n# edited by hand\n", read(path))),
                 "removed by hand" => MachineToml::new().id("test").write(path),
-                "disabled by hand" => MachineConfig::set_enabled(path, "agent", false).unwrap(),
+                "disabled by hand" => {
+                    MachineConfig::set_enabled(path, "agent", false, std::path::Path::new("/nonexistent-repo")).unwrap()
+                }
                 _ => {}
             });
             let result = c.take_out_harness(&req).await.unwrap();

@@ -230,11 +230,21 @@ fn candidates_in(
             continue;
         }
         let mine = locations(&harness, home);
-        let warning = claimed
-            .iter()
-            .find(|(_, theirs)| theirs.iter().any(|theirs| mine.iter().any(|m| overlaps(m, theirs))))
-            .map(|(other, _)| format!("overlaps {other}"))
-            .or_else(|| mine.iter().any(|m| overlaps(m, &repo)).then(|| "overlaps the skills repo".to_string()));
+        // One the writer refuses on its own (its skills and instructions
+        // overlap, through a symlink say) claims nothing from the next.
+        let own = match mine.as_slice() {
+            [skills, instructions] if overlaps(skills, instructions) => {
+                Some("its skills directory and instructions overlap".to_string())
+            }
+            _ => None,
+        };
+        let warning = own.or_else(|| {
+            claimed
+                .iter()
+                .find(|(_, theirs)| theirs.iter().any(|theirs| mine.iter().any(|m| overlaps(m, theirs))))
+                .map(|(other, _)| format!("overlaps {other}"))
+                .or_else(|| mine.iter().any(|m| overlaps(m, &repo)).then(|| "overlaps the skills repo".to_string()))
+        });
         let name = candidate_name(&spelled, kind, &taken);
         taken.push(name.clone());
         used.push(dir);
@@ -850,7 +860,9 @@ impl MachineConfig {
     /// so a preset is synced again only while its home directory exists
     /// (an opt-in one once setup takes it up). First-run setup uses this;
     /// later changes go through [`HarnessChange`].
-    pub fn set_enabled(path: &Path, name: &str, enabled: bool) -> Result<()> {
+    /// Turning one on checks where it then syncs, as any change that does
+    /// ([`Self::edit`]), against the skills repo at `repo`.
+    pub fn set_enabled(path: &Path, name: &str, enabled: bool, repo: &Path) -> Result<()> {
         let snapshot = Snapshot::take(path)?;
         let mut doc = ConfigDoc::parse(&snapshot.text()?, path)?;
         if enabled {
@@ -860,7 +872,10 @@ impl MachineConfig {
         }
         let text = doc.doc.to_string();
         // Parse what we are about to write so a bad edit never reaches the daemon.
-        Self::parse(&text, path)?;
+        let after = Self::parse(&text, path)?;
+        if enabled {
+            home_or_none(|home| after.check_on(name, repo, home))?;
+        }
         snapshot.replace(&text)
     }
 
@@ -1045,15 +1060,22 @@ impl MachineConfig {
         // Whatever leaves the harness synced into (enabling it, resetting a
         // preset, setting its paths) checks where it now syncs. Turning it
         // off or removing it never does, so a bad entry can always be fixed.
-        let checked = after.all_on_in(home);
-        if !matches!(change, HarnessChange::Disable { .. })
-            && let Some(h) = checked.get(name)
-        {
-            check_harness(name, &h.harness, home)?;
-            check_locations(&after.checked_in(home), name, home)?;
-            check_outside_repo(name, &h.harness, repo, home)?;
+        if !matches!(change, HarnessChange::Disable { .. }) {
+            after.check_on(name, repo, home)?;
         }
         Ok(ConfigEdit { text: doc.doc.to_string(), config: after })
+    }
+
+    /// If `name` is synced into, where it syncs: valid paths that overlap
+    /// no other harness (nor a preset that comes on by itself later) and
+    /// stay out of the skills repo at `repo`.
+    fn check_on(&self, name: &str, repo: &Path, home: &Path) -> Result<()> {
+        if let Some(h) = self.all_on_in(home).get(name) {
+            check_harness(name, &h.harness, home)?;
+            check_locations(&self.checked_in(home), name, home)?;
+            check_outside_repo(name, &h.harness, repo, home)?;
+        }
+        Ok(())
     }
 
     fn effective_in(&self, home: &Path) -> BTreeMap<String, EffectiveHarness> {

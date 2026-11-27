@@ -1,5 +1,5 @@
 import { isTauri } from '@tauri-apps/api/core';
-import { useEffect, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import { ArrowLeft, Check, LoaderCircle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -117,10 +117,14 @@ export function SetupWizard({ status, onDone }: { status: StatusView; onDone: (r
   const kept = found.filter(c => !c.warning && !declined.includes(c.name));
   // Bumped after a save that stopped part way: the step lists again what is a Harness now and what is still found.
   const [harnessRevision, setHarnessRevision] = useState(0);
+  // Until that list is back, Continue would add again what was just saved.
+  const [stale, setStale] = useState(false);
+  const onFound = useCallback((list: HarnessCandidate[]) => { setFound(list); setStale(false); }, []);
   const continueToDetails = () => void harnessSave.run(async () => {
     try {
       for (const c of kept) await api.addSetupInstance(c.name, c.harness);
     } catch (error) {
+      setStale(true);
       setHarnessRevision(n => n + 1);
       throw error;
     }
@@ -139,8 +143,8 @@ export function SetupWizard({ status, onDone }: { status: StatusView; onDone: (r
     <div><Button onClick={() => setStep('harnesses')}>Continue</Button></div>
   </Frame>;
   if (step === 'harnesses') return <Frame wide step="Step 2 of 3" title="Choose Harnesses" description="Sync places Skills and Rules into each Harness you keep on. Harnesses are saved in this Machine's machine.toml.">
-    <HarnessStep revision={harnessRevision} toggle={harnessSave} onFound={setFound} declined={declined} setDeclined={setDeclined} />
-    <div className="flex gap-2"><Button variant="outline" disabled={harnessSave.pending} onClick={() => setStep('path')}><ArrowLeft data-icon="inline-start" />Back</Button><Button disabled={harnessSave.pending} onClick={continueToDetails}>Continue</Button></div>
+    <HarnessStep revision={harnessRevision} toggle={harnessSave} onFound={onFound} declined={declined} setDeclined={setDeclined} />
+    <div className="flex gap-2"><Button variant="outline" disabled={harnessSave.pending} onClick={() => setStep('path')}><ArrowLeft data-icon="inline-start" />Back</Button><Button disabled={harnessSave.pending || stale} onClick={continueToDetails}>Continue</Button></div>
   </Frame>;
   return <DetailsStep path={path} status={status} back={() => setStep('harnesses')} onDone={onDone} />;
 }
@@ -153,7 +157,7 @@ function HarnessStep({ revision, toggle, onFound, declined, setDeclined }: {
   const choices = useResource(api.setupHarnesses, revision);
   const candidates = useResource(loadSetupCandidates, revision);
   const [changing, setChanging] = useState<string>();
-  useEffect(() => { onFound(candidates.data ?? []); }, [candidates.data, onFound]);
+  useEffect(() => { if (!candidates.loading) onFound(candidates.data ?? []); }, [candidates.data, candidates.loading, onFound]);
   if (choices.loading && !choices.data) return <Loading rows={2} />;
   const found = candidates.data ?? [];
   const shown = choices.data?.filter(choice => choice.installed || choice.enabled) ?? [];

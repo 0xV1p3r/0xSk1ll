@@ -81,7 +81,8 @@ fn a_child_crash_at_a_failpoint_ends_the_process_there() {
             Point::ConfigBeforePublish => Action::Exit(child::CRASHED),
             _ => Action::Continue,
         });
-        MachineConfig::set_enabled(&dir.join("machine.toml"), "a", false).unwrap();
+        MachineConfig::set_enabled(&dir.join("machine.toml"), "a", false, std::path::Path::new("/nonexistent-repo"))
+            .unwrap();
         unreachable!("the process exits at the failpoint");
     }
     let tmp = tempfile::tempdir().unwrap();
