@@ -3798,7 +3798,7 @@ checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
 
 [[package]]
 name = "sk1ll-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3817,7 +3817,7 @@ dependencies = [
 
 [[package]]
 name = "sk1ll-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "dirs",
  "getrandom 0.4.3",
@@ -3839,7 +3839,7 @@ dependencies = [
 
 [[package]]
 name = "sk1ll-daemon"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3871,7 +3871,7 @@ dependencies = [
 
 [[package]]
 name = "sk1ll-gui"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "libc",
@@ -3892,7 +3892,7 @@ dependencies = [
 
 [[package]]
 name = "sk1ll-proto"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3902,7 +3902,7 @@ dependencies = [
 
 [[package]]
 name = "sk1ll-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3931,7 +3931,7 @@ dependencies = [
 
 [[package]]
 name = "sk1ll-testkit"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "reqwest 0.12.28",
  "serde",

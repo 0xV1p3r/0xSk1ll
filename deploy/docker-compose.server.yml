@@ -8,7 +8,7 @@
 # docker-compose.public.yml, which puts TLS in front (docs/fleet.md#expose-the-server-publicly).
 services:
   server:
-    image: ghcr.io/0xv1p3r/sk1ll-server:${SK1LL_SERVER_VERSION:-0.2.0}
+    image: ghcr.io/0xv1p3r/sk1ll-server:${SK1LL_SERVER_VERSION:-0.3.0}
     build:
       context: ..
       dockerfile: Dockerfile.server
