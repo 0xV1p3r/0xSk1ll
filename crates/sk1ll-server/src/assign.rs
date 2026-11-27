@@ -136,10 +136,12 @@ pub fn check_expected(tx: &Connection, m: &db::MachineRecord, expected: &Expecte
 /// Join-time copying retains explicit toggles even for items the destination
 /// has yet to see. Use the same policy here.
 ///
-/// With `unreported`, a target Harness without a column yet is accepted and
-/// starts from the all-off column it gets once reported: the Machine itself
-/// seeds a Harness it is about to add (`sk1ll harnesses add
-/// --copy-assignment-from`) before its next status names it.
+/// With `unreported`, a Harness without a column yet is accepted on either
+/// side and reads as the all-off column it gets once reported: the Machine
+/// itself seeds a Harness it is about to add (`sk1ll harnesses add
+/// --copy-assignment-from`) before its next status names it, possibly from
+/// one that is off and so never reported, which its own preview reads the
+/// same way.
 pub fn machine_copy_changes(
     source: &Assignment,
     target: &Assignment,
@@ -157,10 +159,14 @@ pub fn machine_copy_changes(
     let mut destinations = BTreeSet::new();
     let mut changes = Vec::new();
     for HarnessMapping { from, to } in mappings {
-        let src = source
-            .harnesses
-            .get(&from)
-            .ok_or_else(|| ApiError::BadRequest(format!("source has no Harness `{from}`")))?;
+        let src = match source.harnesses.get(&from) {
+            Some(src) => src,
+            None if unreported => {
+                crate::check_name("harness", &from)?;
+                source.harness(&from)
+            }
+            None => return Err(ApiError::BadRequest(format!("source has no Harness `{from}`"))),
+        };
         let dst = match target.harnesses.get(&to) {
             Some(dst) => dst,
             None if unreported => {

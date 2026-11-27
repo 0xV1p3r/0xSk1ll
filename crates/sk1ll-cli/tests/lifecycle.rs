@@ -203,6 +203,16 @@ fn harnesses_add_copies_another_harness_assignment_first() {
 
     run(&repo, &["assign", "claude_2", "skill", "pdf", "on"]).unwrap();
     assert!(skills.join("pdf/SKILL.md").is_file());
+    // A harness that is on isn't seeded by a change to it: the copy would sync at its old paths first.
+    let before = fs::read_to_string(&config).unwrap();
+    let moved = ["harnesses", "add", "claude_2", "--skills", "~/moved", "--copy-assignment-from", "h", "--yes"];
+    let refused = run(&repo, &moved).unwrap_err();
+    assert!(
+        refused.contains("`claude_2` is on already") && refused.contains("assign claude_2 --copy-from h"),
+        "{refused}"
+    );
+    assert_eq!(fs::read_to_string(&config).unwrap(), before);
+    assert!(skills.join("pdf/SKILL.md").is_file(), "the placement the preview would keep stays");
     let copied = run(&repo, &["assign", "claude_2", "--copy-from", "h"]).unwrap();
     assert!(copied.contains("claude_2: h's Assignment, both defaults and every toggle"), "{copied}");
     assert!(!skills.join("pdf").exists());

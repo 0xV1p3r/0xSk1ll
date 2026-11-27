@@ -134,7 +134,16 @@ async fn require_repo(State(d): St, request: Request, next: Next) -> Result<Resp
     let path = request.uri().path();
     if !matches!(
         path,
-        "/status" | "/events" | "/init" | "/join" | "/harnesses" | "/fleet" | "/log" | "/log/facets" | "/join-codes"
+        "/status"
+            | "/events"
+            | "/init"
+            | "/join"
+            | "/harnesses"
+            | "/harnesses/config/path"
+            | "/fleet"
+            | "/log"
+            | "/log/facets"
+            | "/join-codes"
     ) && !path.starts_with("/machines/")
         && !path.starts_with("/setup/")
         && !path.starts_with("/log/")

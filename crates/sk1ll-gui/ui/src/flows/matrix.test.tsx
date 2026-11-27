@@ -239,3 +239,13 @@ it('assigns this Machine\'s Draft-only items in standalone, without asking for t
   expect(daemon.sent('set_assignment').at(-1)).toMatchObject({ machine: 'workstation' });
   expect(daemon.sent('fleet')).toEqual([]);
 });
+
+it('marks each reported Harness with its tool, and shows a kind it doesn\'t know as written', async () => {
+  // Kinds come from other Machines' reports: one named like an object's own property is still just a name.
+  launch('fleet', { hash: '#/assignment-matrix', setup: daemon => daemon.machines.find(m => m.id === 'laptop')!.report!.harnesses.push(
+    { name: 'claude_2', kind: 'claude' }, { name: 'odd', kind: 'constructor' }, { name: 'proto', kind: '__proto__' }) });
+  await heading('Assignment matrix');
+  expect(within(await screen.findByRole('columnheader', { name: /^claude_2/ })).getByText('Claude Code')).toBeTruthy();
+  expect(within(screen.getByRole('columnheader', { name: /^odd/ })).getByText('constructor')).toBeTruthy();
+  expect(within(screen.getByRole('columnheader', { name: /^proto/ })).getByText('__proto__')).toBeTruthy();
+});

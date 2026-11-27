@@ -211,6 +211,10 @@ fn candidates_in(
         .filter_map(|c| c.harness.home.as_deref())
         .map(resolve)
         .collect();
+    // What adding one must not overlap, as the writer checks it; each
+    // candidate offered claims its own locations for the ones after it.
+    let mut claimed: Vec<(String, Vec<PathBuf>)> =
+        choices.iter().filter_map(|c| Some((c.name.clone(), locations(&reserved(c)?, home)))).collect();
     let mut out = Vec::new();
     for (env, kind) in HOME_VARS {
         let Some(spelled) = var(env).as_deref().and_then(|v| v.to_str()).and_then(|v| home_spelling(v, home)) else {
@@ -226,15 +230,17 @@ fn candidates_in(
             continue;
         }
         let mine = locations(&harness, home);
-        let warning = choices
+        let warning = claimed
             .iter()
-            .filter(|c| c.enabled)
-            .find(|c| locations(&c.harness, home).iter().any(|theirs| mine.iter().any(|m| overlaps(m, theirs))))
-            .map(|c| format!("overlaps {}", c.name))
+            .find(|(_, theirs)| theirs.iter().any(|theirs| mine.iter().any(|m| overlaps(m, theirs))))
+            .map(|(other, _)| format!("overlaps {other}"))
             .or_else(|| mine.iter().any(|m| overlaps(m, &repo)).then(|| "overlaps the skills repo".to_string()));
         let name = candidate_name(&spelled, kind, &taken);
         taken.push(name.clone());
         used.push(dir);
+        if warning.is_none() {
+            claimed.push((name.clone(), mine));
+        }
         out.push(HarnessCandidate { name, var: env.to_string(), harness, warning });
     }
     out
@@ -273,6 +279,18 @@ fn candidate_name(home: &str, kind: &str, taken: &[String]) -> String {
         name = (2..).map(|n| format!("{kind}-{n}")).find(|n| !taken.contains(n)).expect("a free name");
     }
     name
+}
+
+/// What a new harness must not overlap in `c`, read from a choice as
+/// [`MachineConfig::checked_in`] reads it from the config: a harness that is
+/// on, or a preset that isn't opt-in, has no entry and so comes on by
+/// itself once its home directory appears.
+fn reserved(c: &HarnessChoice) -> Option<Harness> {
+    if c.enabled {
+        return Some(c.harness.clone());
+    }
+    let p = preset(&c.name).filter(|p| c.preset && !c.configured && !p.opt_in)?;
+    Some(p.harness(None))
 }
 
 /// A change to this machine's harnesses, made in `machine.toml`.
@@ -847,9 +865,11 @@ impl MachineConfig {
     }
 
     /// `change` made to the `machine.toml` `snapshot` read, keeping the rest
-    /// of it as written. Changes nothing on disk; see [`ConfigEdit::write`].
-    pub fn edit(snapshot: &Snapshot, change: &HarnessChange) -> Result<ConfigEdit> {
-        home_or_none(|home| Self::edit_in(snapshot, change, home))
+    /// of it as written. A change that leaves the harness synced into is
+    /// checked against the other harnesses and the skills repo at `repo`.
+    /// Changes nothing on disk; see [`ConfigEdit::write`].
+    pub fn edit(snapshot: &Snapshot, change: &HarnessChange, repo: &Path) -> Result<ConfigEdit> {
+        home_or_none(|home| Self::edit_in(snapshot, change, repo, home))
     }
 
     /// Renames a harness in machine.toml. A renamed preset becomes an
@@ -895,15 +915,16 @@ impl MachineConfig {
         Ok(ConfigEdit { text, config })
     }
 
-    /// Makes `change` to the `machine.toml` at `path`.
-    pub fn write_change(path: &Path, change: &HarnessChange) -> Result<Self> {
+    /// Makes `change` to the `machine.toml` at `path`, checked as
+    /// [`Self::edit`] checks it, against the skills repo at `repo`.
+    pub fn write_change(path: &Path, change: &HarnessChange, repo: &Path) -> Result<Self> {
         let snapshot = Snapshot::take(path)?;
-        let edit = Self::edit(&snapshot, change)?;
+        let edit = Self::edit(&snapshot, change, repo)?;
         edit.write(&snapshot)?;
         Ok(edit.config)
     }
 
-    fn edit_in(snapshot: &Snapshot, change: &HarnessChange, home: &Path) -> Result<ConfigEdit> {
+    fn edit_in(snapshot: &Snapshot, change: &HarnessChange, repo: &Path, home: &Path) -> Result<ConfigEdit> {
         let path = snapshot.path();
         let before = Self::from_snapshot(snapshot)?;
         let name = change.name();
@@ -1030,6 +1051,7 @@ impl MachineConfig {
         {
             check_harness(name, &h.harness, home)?;
             check_locations(&after.checked_in(home), name, home)?;
+            check_outside_repo(name, &h.harness, repo, home)?;
         }
         Ok(ConfigEdit { text: doc.doc.to_string(), config: after })
     }
@@ -1351,6 +1373,19 @@ fn check_locations(harnesses: &BTreeMap<String, EffectiveHarness>, name: &str, h
             "`{name}`'s skills directory {} and instructions {} overlap",
             skills.display(),
             instructions.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Syncing into the repo itself would mix harness copies with repo content.
+fn check_outside_repo(name: &str, harness: &Harness, repo: &Path, home: &Path) -> Result<()> {
+    let repo = real(&std::path::absolute(repo).at(repo)?);
+    if let Some(path) = locations(harness, home).into_iter().find(|path| overlaps(path, &repo)) {
+        return Err(Error::Invalid(format!(
+            "`{name}` can't sync into {}: it overlaps the skills repo {}",
+            path.display(),
+            repo.display()
         )));
     }
     Ok(())

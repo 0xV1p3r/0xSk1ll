@@ -65,7 +65,8 @@ impl Daemon {
         if self.setup_harnesses()?.iter().any(|c| c.name == name) {
             return Err(Error::Conflict(format!("harness `{name}` exists already")));
         }
-        MachineConfig::write_change(&self.cfg.machine_config, &HarnessChange::Set { name: name.into(), harness })?;
+        let change = HarnessChange::Set { name: name.into(), harness };
+        MachineConfig::write_change(&self.cfg.machine_config, &change, self.repo_root())?;
         self.setup_harnesses()
     }
 
@@ -132,16 +133,28 @@ impl Daemon {
         Ok(HarnessApplied { harnesses: MachineConfig::load(&self.cfg.machine_config)?.choices(), errors })
     }
 
-    /// Whether `change` can take `from`'s Assignment: an add, edit or
-    /// enable, from another Harness of this Machine.
+    /// Whether `change` can take `from`'s Assignment: adding or enabling a
+    /// harness that isn't synced into yet, from another Harness of this
+    /// Machine. The copy is made before `machine.toml` changes, and syncs:
+    /// into a harness that is off nothing, so the first sync into it is the
+    /// one after the change. One that is on would be synced with the copy
+    /// at its old paths first, so it copies with `assign --copy-from` instead.
     fn check_copy(&self, change: &HarnessChange, from: &str) -> Result<()> {
         if !matches!(change, HarnessChange::Set { .. } | HarnessChange::Enable { .. }) {
-            return Err(Error::BadRequest("only adding, changing or enabling a harness copies an Assignment".into()));
+            return Err(Error::BadRequest("only adding or enabling a harness copies an Assignment".into()));
         }
-        if from == change.name() {
+        let to = change.name();
+        if from == to {
             return Err(Error::BadRequest(format!("`{from}` can't copy its own Assignment")));
         }
-        self.known_harness(from)
+        self.known_harness(from)?;
+        if MachineConfig::load(&self.cfg.machine_config)?.harnesses().contains_key(to) {
+            return Err(Error::BadRequest(format!(
+                "`{to}` is on already, so a change to it can't copy an Assignment; make the change, then copy \
+                 with `sk1ll assign {to} --copy-from {from}`"
+            )));
+        }
+        Ok(())
     }
 
     /// `POST /harnesses/apply`, one harness change at a time (see
@@ -159,12 +172,16 @@ impl Daemon {
         let Some(from) = req.copy_assignment_from.clone() else {
             return self.blocking(move |d, eng| d.apply_harness(eng, req)).await;
         };
-        // Checked first, so a stale preview, or a change the plan refuses, copies nothing.
-        let (change, copy_from, expected) = (req.change.clone(), from.clone(), req.fingerprint.clone());
+        // Checked first, so an old client, a stale preview, or a change the plan refuses, copies nothing.
+        let expected = req
+            .fingerprint
+            .clone()
+            .ok_or_else(|| Error::BadRequest("this client is older than the daemon; update it".into()))?;
+        let (change, copy_from) = (req.change.clone(), from.clone());
         self.blocking(move |d, _| {
             d.ensure_managed()?;
             let preview = d.preview_harness(&change, Some(&copy_from))?;
-            if expected.as_deref().is_some_and(|e| e != preview.fingerprint) {
+            if preview.fingerprint != expected {
                 return Err(sk1ll_core::Error::Changed(
                     "machine.toml changed since the preview — preview again".into(),
                 )
@@ -179,7 +196,23 @@ impl Daemon {
                 format!("copying {from}'s Assignment to {to} failed, so machine.toml was not changed: {why}")
             })
         })?;
-        let applied = self.blocking(move |d, eng| d.apply_harness(eng, req)).await;
+        let (revision, install_errors) = (copied.revision, copied.errors.clone());
+        let applied = self
+            .blocking(move |d, eng| {
+                // The sync after the change must plan with the copy: a joined Machine that couldn't store
+                // the Server's confirmation would plan with the Assignment from before it.
+                if d.applied().is_none_or(|have| have.revision < revision) {
+                    let why = match install_errors.is_empty() {
+                        true => String::new(),
+                        false => format!(": {}", install_errors.join("; ")),
+                    };
+                    return Err(Error::Unavailable(format!(
+                        "it was saved as revision {revision}, but this Machine couldn't install that revision{why}"
+                    )));
+                }
+                d.apply_harness(eng, req)
+            })
+            .await;
         let mut applied = applied.map_err(|e| {
             e.reworded(|why| {
                 format!("{to} now has {from}'s Assignment, but machine.toml was not changed: {why}. Preview again")

@@ -19,7 +19,8 @@ export function InstanceDialog({ preset, taken, onClose, onSubmit }: {
   const [home, setHome] = useState('');
   const [name, setName] = useState('');
   const [named, setNamed] = useState(false);
-  const [copy, setCopy] = useState(true);
+  // Only a preset that is on has an Assignment to start from; one that is off would copy all off.
+  const [copy, setCopy] = useState(preset.enabled);
   const [error, setError] = useState('');
   const tool = toolName(preset.harness.kind ?? preset.name);
   const changeHome = (value: string) => {

@@ -327,8 +327,8 @@ fn plan_copy(
     };
     let (destination, target_state) = load(target, body.expected.as_ref())?;
     let (source, source_state) = load(&body.source, body.source_expected.as_ref())?;
-    // Only the Machine itself knows a Harness it hasn't reported yet.
-    let unreported = matches!(caller, Caller::Machine { id, .. } if id == target);
+    // Only the Machine itself knows a Harness it hasn't reported yet, within its own Assignment.
+    let unreported = matches!(caller, Caller::Machine { id, .. } if id == target) && body.source == target;
     let changes = assign::machine_copy_changes(&source, &destination, body, unreported)?;
     let name = |id: &ItemId| -> Result<Option<String>> {
         match baseline.iter().chain(&reported).find(|(_, known)| known == id) {

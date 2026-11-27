@@ -85,6 +85,27 @@ it('offers config folders found in the environment as on, and adds the kept ones
   expect(checked(within(screen.getByRole('list', { name: 'Config folders found in the environment' })).getByRole('checkbox', { name: 'Sync codex-2' }))).toBe(false);
 });
 
+it('lists the found config folders again after a save that stopped part way, so Continue adds only what is left', async () => {
+  const instance = (kind: string, home: string) => ({ kind, home, skills: `${home}/skills`, instructions: `${home}/rules`, instructions_format: 'rules' as const, mode: 'symlink' as const });
+  const { daemon, user } = launch('standalone-first-run', { setup: daemon => daemon.harnessCandidates.push(
+    { name: 'claude_2', var: 'CLAUDE_CONFIG_DIR', harness: instance('claude', '~/.claude_2') },
+    { name: 'codex-2', var: 'CODEX_HOME', harness: instance('codex', '~/.codex-work') }) });
+  let refuse = true;
+  daemon.override('add_setup_instance', args => args.name === 'codex-2' && refuse ? Promise.reject({ status: 400, message: 'codex-2 overlaps something' }) : undefined);
+  await toHarnesses(user);
+  await user.click(screen.getByRole('button', { name: 'Continue' }));
+  expect(await screen.findByText('codex-2 overlaps something')).toBeTruthy();
+  // claude_2 was added: a Harness now, no longer found; codex-2 is still offered.
+  const harnesses = within(screen.getByRole('list', { name: 'Harnesses' }));
+  expect(checked(await harnesses.findByRole('checkbox', { name: 'Sync claude_2' }))).toBe(true);
+  const found = within(screen.getByRole('list', { name: 'Config folders found in the environment' }));
+  await waitFor(() => expect(found.queryByRole('checkbox', { name: 'Sync claude_2' })).toBeNull());
+  refuse = false;
+  await user.click(screen.getByRole('button', { name: 'Continue' }));
+  expect(await screen.findByRole('button', { name: 'Create skills repo' })).toBeTruthy();
+  expect(daemon.sent('add_setup_instance').map(args => args.name)).toEqual(['claude_2', 'codex-2', 'codex-2']);
+});
+
 it('marks the checklist commit step done after pushing part of the Draft', async () => {
   localStorage.setItem('sk1ll-getting-started', 'show');
   const { daemon, user } = launch('fleet', { hash: '#/library', setup: daemon => daemon.machines.splice(1) });

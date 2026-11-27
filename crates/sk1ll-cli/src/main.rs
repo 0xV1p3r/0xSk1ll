@@ -485,8 +485,12 @@ fn init(cli: &Cli, root: &Path) -> Result<()> {
         && !session.status.repo_ready
     {
         // The daemon's Init ends first-run setup; it can't see this shell's
-        // environment, so the config directories it points at are added first.
-        harnesses::adopt_candidates(&session)?;
+        // environment, so the config directories it points at are added
+        // first: on a Machine without the machine.toml it manages, as below.
+        let config = session.block(session.client.machine_config_path())?;
+        if std::fs::symlink_metadata(&config).is_err() {
+            harnesses::adopt_candidates(&session)?;
+        }
         session.block(session.client.init())?;
     } else if let Some(session) = Session::daemon_for(cli, root)? {
         // The daemon manages this repo, which exists already.
@@ -509,7 +513,7 @@ fn init(cli: &Cli, root: &Path) -> Result<()> {
                 let what = harnesses::describe(&c);
                 match &c.warning {
                     Some(warning) => eprintln!("{} ({what}): not added: {warning}", c.name),
-                    None => match MachineConfig::write_change(&machine_path, &c.change()) {
+                    None => match MachineConfig::write_change(&machine_path, &c.change(), root) {
                         Ok(_) => eprintln!("added harness {} ({what})", c.name),
                         Err(e) => eprintln!("{} ({what}): not added: {e}", c.name),
                     },
@@ -1156,15 +1160,23 @@ fn copy_assignment(s: &Session, machine: Option<String>, from: &str, to: &str) -
             "this machine is standalone, so it has only its own Assignment; `--machine` needs a fleet (`sk1ll join`)"
         ),
         Some(machine) if machine != own => {
-            require_machine_harness(s, &machine, from)?;
-            require_machine_harness(s, &machine, to)?;
-            let copy = sk1ll_proto::MachineAssignmentCopy {
+            // Both names checked against one report, and the copy made only
+            // to the registration and revision that report belongs to.
+            let registration = require_machine_harnesses(s, &machine, &[from, to])?;
+            let mut copy = sk1ll_proto::MachineAssignmentCopy {
                 source: machine.clone(),
                 harnesses: Some(vec![sk1ll_proto::HarnessMapping { from: from.into(), to: to.into() }]),
                 mode: sk1ll_proto::CopyMode::Replace,
                 expected: None,
                 source_expected: None,
             };
+            let preview =
+                s.block(s.client.preview_assignment_copy(&machine, &copy)).map_err(|e| scope_hint(e, &machine))?;
+            if preview.target.registration.as_ref() != Some(&registration) {
+                bail!("{machine} joined the fleet again just now; run the command again");
+            }
+            copy.expected = Some(preview.target);
+            copy.source_expected = Some(preview.source);
             let update =
                 s.block(s.client.copy_machine_assignment(&machine, &copy)).map_err(|e| scope_hint(e, &machine))?;
             (machine, update)
@@ -1217,20 +1229,26 @@ fn toggle_text(kind: ToggleKind, name: Option<&str>, value: Option<bool>) -> Str
 /// Another Machine's harness, as its last report names them: the server
 /// refuses a harness the Machine doesn't have.
 fn require_machine_harness(s: &Session, machine: &str, harness: &str) -> Result<()> {
+    require_machine_harnesses(s, machine, &[harness]).map(drop)
+}
+
+/// Checks that `machine` reported each of `harnesses`, all in one report;
+/// returns the registration it belongs to.
+fn require_machine_harnesses(s: &Session, machine: &str, harnesses: &[&str]) -> Result<String> {
     let fleet = s.block(s.client.fleet())?;
     let Some(row) = fleet.machines.iter().find(|m| m.id == machine) else {
         bail!("no machine `{machine}` in the fleet (see `sk1ll fleet`)");
     };
     if let Some(report) = &row.report
         && !report.harnesses.is_empty()
-        && !report.harnesses.iter().any(|h| h.name == harness)
+        && let Some(harness) = harnesses.iter().find(|name| !report.harnesses.iter().any(|h| h.name == **name))
     {
         bail!(
             "{machine} has no harness `{harness}`; it has {}",
             report.harnesses.iter().map(|h| h.name.as_str()).collect::<Vec<_>>().join(", ")
         );
     }
-    Ok(())
+    Ok(row.registration.clone())
 }
 
 /// The server refuses a `self`-scope Machine another's Assignment: say what that means.

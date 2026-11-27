@@ -120,11 +120,16 @@ fn setup_offers_and_enables_opt_in_presets() {
 fn setup_offers_config_directories_from_the_environment() {
     let fixture = Setup::new();
     let root = fixture.home.path();
-    for dir in [".claude_2", "a"] {
+    for dir in [".claude_2/skills", "a"] {
         std::fs::create_dir_all(root.join(dir)).unwrap();
     }
-    // `a` is the custom harness's skills directory: CODEX_HOME would sync around it.
-    let env = [("CLAUDE_CONFIG_DIR", root.join(".claude_2")), ("CODEX_HOME", root.join("a"))];
+    // `a` is the custom harness's skills directory: CODEX_HOME would sync around it. COPILOT_HOME would
+    // sync inside claude_2's skills, so only claude_2 is offered and added.
+    let env = [
+        ("CLAUDE_CONFIG_DIR", root.join(".claude_2")),
+        ("CODEX_HOME", root.join("a")),
+        ("COPILOT_HOME", root.join(".claude_2/skills")),
+    ];
     let env: Vec<_> = env.iter().map(|(var, dir)| (*var, dir.as_path())).collect();
     let out = fixture.setup_env(&root.join("repo"), "1\n\n\n\n", &env);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -134,9 +139,11 @@ fn setup_offers_config_directories_from_the_environment() {
     assert!(stdout.contains(offered), "{stdout}");
     // `a` is taken, so it is offered under the preset's name.
     assert!(stdout.contains("codex-2 (codex in ~/a, from CODEX_HOME): not offered: overlaps a\n"), "{stdout}");
+    let nested = "skills (copilot in ~/.claude_2/skills, from COPILOT_HOME): not offered: overlaps claude_2\n";
+    assert!(stdout.contains(nested), "{stdout}");
     let config = std::fs::read_to_string(root.join("machine.toml")).unwrap();
     assert!(config.contains("[harnesses.claude_2]\npreset = \"claude\"\nhome = \"~/.claude_2\"\n"), "{config}");
-    assert!(!config.contains("codex"), "{config}");
+    assert!(!config.contains("codex") && !config.contains("copilot"), "{config}");
 }
 
 /// `sk1ll init` on a machine that already has a machine.toml (set up with

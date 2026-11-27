@@ -197,6 +197,20 @@ it('adds another config folder of a preset as an instance with its Assignment, s
   expect(within(await panel.findByRole('columnheader', { name: /^claude_2/ })).getByText('Claude Code')).toBeTruthy();
 });
 
+it('starts another config folder of a preset that is off without copying its Assignment', async () => {
+  const { daemon, user } = launch('fleet', { hash: '#/settings' });
+  await heading('Settings');
+  await user.click(await screen.findByRole('button', { name: 'Add another config folder for kiro' }));
+  const form = await dialog('Add another Kiro config folder');
+  // kiro is off, so it has no Assignment of its own to start from.
+  expect(checked(form.getByRole('checkbox', { name: 'Copy assignment from kiro' }))).toBe(false);
+  expect(form.getByText(/It starts as any new Harness does/)).toBeTruthy();
+  await user.type(form.getByLabelText('Config folder'), '~/.kiro_2');
+  await user.click(form.getByRole('button', { name: 'Preview change' }));
+  await dialog('Save kiro_2?');
+  expect(daemon.sent('preview_harness').at(-1)).not.toHaveProperty('request.copy_assignment_from');
+});
+
 it('turns a Harness off after a preview, taking out what sk1ll placed or leaving it, and retries when Take out fails', async () => {
   const { daemon, user } = launch('fleet', { hash: '#/settings' });
   await heading('Settings');

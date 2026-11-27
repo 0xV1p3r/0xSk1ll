@@ -95,7 +95,7 @@ fn unreadable_old_instructions_warn_without_blocking_disable_or_remove() {
             1,
             "{case}"
         );
-        MachineConfig::write_change(&config, &HarnessChange::Enable { name: "h".into() }).unwrap();
+        MachineConfig::write_change(&config, &HarnessChange::Enable { name: "h".into() }, repo.root()).unwrap();
         let preview = plan(&repo, &config, &remove, None).unwrap();
         let removed = apply(&lock, &repo, &config, &remove, &preview.fingerprint).unwrap();
         assert_eq!(removed.warnings.len(), 1, "{case}");
