@@ -343,43 +343,6 @@ pub fn preset_instance(kind: &str, home: Option<&str>) -> Option<Harness> {
     preset(kind).map(|p| p.instance(home))
 }
 
-/// `harness`, the settings of the harness `name`, moved onto the preset
-/// `kind` rooted at `home` (`None`: the preset's own directory): each setting
-/// it takes from its preset now (or the custom harness defaults) follows the
-/// new one, and each it sets itself stays. For `sk1ll harnesses add --preset
-/// --home`.
-pub fn rebase(name: &str, harness: &Harness, kind: Option<&str>, home: Option<&str>) -> Result<Harness> {
-    let base = |kind: Option<&str>, home: Option<&str>| -> Result<Harness> {
-        let Some(kind) = kind else {
-            return match home {
-                Some(_) => Err(Error::Invalid(format!("`home` for `{name}` needs a preset (--preset)"))),
-                None => Ok(Harness::default()),
-            };
-        };
-        let p = preset(kind).ok_or_else(|| {
-            Error::Invalid(format!("no preset `{kind}` (presets: {})", presets().collect::<Vec<_>>().join(", ")))
-        })?;
-        Ok(if kind == name { p.harness(home) } else { p.instance(home) })
-    };
-    let old = base(harness.kind.as_deref(), harness.home.as_deref())?;
-    let new = base(kind, home)?;
-    let pick = |own: &Option<String>, old: &Option<String>, new: &Option<String>| match own == old {
-        true => new.clone(),
-        false => own.clone(),
-    };
-    Ok(Harness {
-        kind: new.kind.clone(),
-        home: new.home.clone(),
-        skills: pick(&harness.skills, &old.skills, &new.skills),
-        instructions: pick(&harness.instructions, &old.instructions, &new.instructions),
-        instructions_format: match harness.instructions_format == old.instructions_format {
-            true => new.instructions_format,
-            false => harness.instructions_format,
-        },
-        mode: if harness.mode == old.mode { new.mode } else { harness.mode },
-    })
-}
-
 impl Preset {
     /// The default instance's settings, rooted at `home` (`None`: its own).
     fn harness(&self, home: Option<&str>) -> Harness {
@@ -413,6 +376,21 @@ impl Preset {
     }
 }
 
+/// Whether `home` is spelled as a config directory can be: absolute or
+/// `~/`-relative, with no `..`, and not `~` or `/` themselves. Symlinks are
+/// checked when a change turns the harness on ([`check_harness`]).
+fn plain_home(home: &str) -> bool {
+    let rest = match home.strip_prefix("~/") {
+        Some(rest) => rest,
+        None if home.starts_with('/') => home,
+        None => return false,
+    };
+    home.trim() == home
+        && !home.contains(['\0', '\n', '\r'])
+        && rest.split('/').any(|c| !c.is_empty())
+        && !rest.split('/').any(|c| c == "..")
+}
+
 /// `rel` inside the directory `home`, spelled as `home` is.
 fn under(home: &str, rel: &str) -> String {
     format!("{}/{rel}", home.trim_end_matches('/'))
@@ -423,7 +401,7 @@ fn expand_in(path: &str, home: &Path) -> PathBuf {
     if path == "~" {
         home.to_path_buf()
     } else {
-        path.strip_prefix("~/").map_or_else(|| PathBuf::from(path), |rest| home.join(rest))
+        path.strip_prefix("~/").map_or_else(|| PathBuf::from(path), |rest| home.join(rest.trim_start_matches('/')))
     }
 }
 
@@ -504,6 +482,13 @@ impl MachineConfig {
                 ),
                 (None, None) if entry.home.is_some() => format!(
                     "harness `{name}`: `home` needs `preset`; a custom harness sets its own `skills` and `instructions`"
+                ),
+                // Every path of a preset (instance) is derived from `home`,
+                // so a malformed one would send sync anywhere: refused
+                // while loading, not only when a change turns it on.
+                _ if entry.home.as_deref().is_some_and(|h| !plain_home(h)) => format!(
+                    "harness `{name}`: `home` must be a directory path, absolute or starting with `~/`, without \
+                     `..` or surrounding spaces, and not the home directory or `/`"
                 ),
                 _ => continue,
             };
@@ -672,6 +657,39 @@ impl MachineConfig {
         }
     }
 
+    /// What the harness `name` becomes as the preset `kind` (or an instance
+    /// of it) rooted at `home`: each setting its `machine.toml` entry sets
+    /// stays, and the rest follow the new preset (the custom harness
+    /// defaults with no `kind`). `kind`/`home` of `None` keep the entry's,
+    /// and `home` resets to the preset's own when `kind` changes. Built from
+    /// the entry, not from what sync uses now, so a derived path never turns
+    /// into an override. For `sk1ll harnesses add`, ahead of a
+    /// [`HarnessChange::Set`].
+    pub fn rebased(&self, name: &str, kind: Option<&str>, home: Option<&str>) -> Result<Harness> {
+        let entry = self.harnesses.get(name).cloned().unwrap_or_default();
+        let current = self.preset_named(name).map(|p| p.name).or(entry.preset.as_deref());
+        let kind = kind.or(current);
+        let home = home.or(entry.home.as_deref().filter(|_| kind == current));
+        let base = match kind {
+            None if home.is_some() => {
+                return Err(Error::Invalid(format!("`home` for `{name}` needs a preset (--preset)")));
+            }
+            None => Harness::default(),
+            Some(kind) => {
+                let p = preset(kind).ok_or_else(|| {
+                    Error::Invalid(format!(
+                        "no preset `{kind}` (presets: {})",
+                        presets().collect::<Vec<_>>().join(", ")
+                    ))
+                })?;
+                if kind == name { p.harness(home) } else { p.instance(home) }
+            }
+        };
+        // A custom entry's paths are its own; an override of a preset (or
+        // instance) keeps only the keys it sets.
+        Ok(merge(base, &entry))
+    }
+
     /// What the entry of a custom harness or preset instance syncs into.
     fn entry_harness(&self, name: &str, entry: &HarnessEntry) -> Harness {
         match self.instance_of(name) {
@@ -760,8 +778,12 @@ impl MachineConfig {
         let path = snapshot.path();
         let before = Self::from_snapshot(snapshot)?;
         let name = change.name();
-        // The preset `name` means here, unless an entry of its own took the name.
-        let preset_of = before.preset_named(name);
+        // The preset `name` means here, unless an entry of its own took the
+        // name and this change doesn't make it that preset again.
+        let preset_of = before.preset_named(name).or_else(|| match change {
+            HarnessChange::Set { harness, .. } if harness.kind.as_deref() == Some(name) => preset(name),
+            _ => None,
+        });
         let known = before.harnesses.contains_key(name) || preset_of.is_some();
         let entry = before.harnesses.get(name);
         let mut doc = ConfigDoc::parse(&snapshot.text()?, path)?;
@@ -833,14 +855,8 @@ impl MachineConfig {
                     _ => None,
                 };
                 let table = doc.entry(name)?;
-                match says_preset {
-                    Some(p) => table["preset"] = toml_edit::value(p.name),
-                    None => drop(table.remove("preset")),
-                }
-                match rehomed {
-                    Some(h) => table["home"] = toml_edit::value(h),
-                    None => drop(table.remove("home")),
-                }
+                set_str(table, "preset", says_preset.map(|p| p.name));
+                set_str(table, "home", rehomed);
                 write_settings(table, harness, base.as_ref());
                 // Setting an opt-in preset that says nothing about `enabled` takes it up.
                 if preset_of.is_some_and(|p| p.opt_in) && entry.and_then(|e| e.enabled).is_none() {
@@ -879,17 +895,49 @@ impl MachineConfig {
         // Whatever leaves the harness synced into (enabling it, resetting a
         // preset, setting its paths) checks where it now syncs. Turning it
         // off or removing it never does, so a bad entry can always be fixed.
-        let effective = after.effective_in(home);
+        let checked = after.all_on_in(home);
         if !matches!(change, HarnessChange::Disable { .. })
-            && let Some(h) = effective.get(name)
+            && let Some(h) = checked.get(name)
         {
             check_harness(name, &h.harness, home)?;
-            check_locations(&effective, name, home)?;
+            check_locations(&after.checked_in(home), name, home)?;
         }
         Ok(ConfigEdit { text: doc.doc.to_string(), config: after })
     }
 
     fn effective_in(&self, home: &Path) -> BTreeMap<String, EffectiveHarness> {
+        let mut out = self.all_on_in(home);
+        // A preset found only by its directory yields to an entry that syncs
+        // into the same places: an instance rooted at its home creates that
+        // directory with its first placement, which must not bring in a
+        // second harness over the same files.
+        let claimed: Vec<PathBuf> = out
+            .values()
+            .filter(|e| e.origin == HarnessOrigin::Local)
+            .flat_map(|e| locations(&e.harness, home))
+            .collect();
+        out.retain(|_, e| {
+            e.origin != HarnessOrigin::Detected
+                || !locations(&e.harness, home).iter().any(|p| claimed.iter().any(|c| overlaps(p, c)))
+        });
+        out
+    }
+
+    /// What a change must not overlap: every harness that is on, before any
+    /// yields, and each preset that would come on by itself once its home
+    /// directory appears.
+    fn checked_in(&self, home: &Path) -> BTreeMap<String, EffectiveHarness> {
+        let mut out = self.all_on_in(home);
+        for p in PRESETS.iter().filter(|p| !p.opt_in && !self.defined_by_entry(p.name)) {
+            if !self.harnesses.get(p.name).is_some_and(|e| e.enabled == Some(false)) {
+                out.entry(p.name.to_string())
+                    .or_insert(EffectiveHarness { harness: p.harness(None), origin: HarnessOrigin::Detected });
+            }
+        }
+        out
+    }
+
+    fn all_on_in(&self, home: &Path) -> BTreeMap<String, EffectiveHarness> {
         let mut out = BTreeMap::new();
         for preset in PRESETS.iter().filter(|p| !self.defined_by_entry(p.name)) {
             let entry = self.harnesses.get(preset.name);
@@ -944,15 +992,30 @@ fn write_settings(table: &mut toml_edit::Table, harness: &Harness, base: Option<
             Some(_) => Some(want.clone().unwrap_or_default()),
             None => want.clone(),
         };
-        match value {
-            Some(v) => table[key] = toml_edit::value(v),
-            None => drop(table.remove(key)),
-        }
+        set_str(table, key, value.as_deref());
     }
     let base = base.cloned().unwrap_or_default();
     let format = harness.instructions_format;
     set_or_default(table, "instructions_format", format_name(format), format == base.instructions_format);
     set_or_default(table, "mode", mode_name(harness.mode), harness.mode == base.mode);
+}
+
+/// Sets `key` to `value` (`None`: removes it). An unchanged value is left
+/// as written, and a changed one keeps the comments around it.
+fn set_str(table: &mut toml_edit::Table, key: &str, value: Option<&str>) {
+    let Some(value) = value else {
+        table.remove(key);
+        return;
+    };
+    match table.get_mut(key).and_then(|item| item.as_value_mut()) {
+        Some(old) if old.as_str() == Some(value) => {}
+        Some(old) => {
+            let decor = old.decor().clone();
+            *old = value.into();
+            *old.decor_mut() = decor;
+        }
+        None => table[key] = toml_edit::value(value),
+    }
 }
 
 fn merge(mut base: Harness, entry: &HarnessEntry) -> Harness {
@@ -1047,11 +1110,7 @@ impl ConfigDoc {
 /// Sets `key` to `value`, or drops it when `value` is the default (the
 /// preset's, for a preset): the entry then follows the default again.
 fn set_or_default(entry: &mut toml_edit::Table, key: &str, value: &str, default: bool) {
-    if default {
-        entry.remove(key);
-    } else {
-        entry[key] = toml_edit::value(value);
-    }
+    set_str(entry, key, (!default).then_some(value));
 }
 
 fn format_name(format: InstructionsFormat) -> &'static str {
@@ -1101,7 +1160,7 @@ fn check_harness(name: &str, harness: &Harness, home: &Path) -> Result<()> {
             return Err(bad("must be a plain path without surrounding spaces"));
         }
         let path = match value.strip_prefix("~/") {
-            Some(rest) => home.join(rest),
+            Some(rest) => home.join(rest.trim_start_matches('/')),
             None if Path::new(value).is_absolute() => PathBuf::from(value),
             None => return Err(bad("must be absolute or start with `~/`")),
         };

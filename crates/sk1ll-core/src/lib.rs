@@ -168,7 +168,8 @@ impl<T> IoExt<T> for std::io::Result<T> {
 
 pub(crate) fn expand_tilde(path: &str) -> PathBuf {
     match (path.strip_prefix("~/"), dirs::home_dir()) {
-        (Some(rest), Some(home)) => home.join(rest),
+        // `~//x` is `x` under the home directory, never the absolute `/x`.
+        (Some(rest), Some(home)) => home.join(rest.trim_start_matches('/')),
         _ if path == "~" => dirs::home_dir().unwrap_or_else(|| path.into()),
         _ => PathBuf::from(path),
     }

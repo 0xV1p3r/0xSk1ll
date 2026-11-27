@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
+use sk1ll_core::machine::MachineConfig;
 use sk1ll_core::{Harness, HarnessChange, HarnessChoice, InstructionsFormat, LinkMode};
 use sk1ll_daemon::client::{HarnessChangeRequest, HarnessView, PlacementView};
 
@@ -107,20 +108,16 @@ pub(crate) enum Mode {
 
 impl HarnessCmd {
     /// The change and its options, and whether to take out what sk1ll
-    /// placed first; `add` starts from `current`, the harness as it is now.
-    fn split(self, current: Option<Harness>) -> Result<(HarnessChange, ChangeOpts, bool)> {
+    /// placed first; `add` starts from what `config` (this machine's
+    /// `machine.toml`) sets for the harness.
+    fn split(self, config: &MachineConfig) -> Result<(HarnessChange, ChangeOpts, bool)> {
         let (change, opts) = match self {
             Self::Rename { .. } => unreachable!("renames are applied separately"),
             Self::Enable { name, opts } => (HarnessChange::Enable { name }, opts),
             Self::Disable { name, take, opts } => return Ok((HarnessChange::Disable { name }, opts, take.take_out)),
             Self::Remove { name, take, opts } => return Ok((HarnessChange::Remove { name }, opts, take.take_out)),
             Self::Add { name, preset, home, skills, instructions, format, mode, opts } => {
-                let mut harness = current.unwrap_or_default();
-                if preset.is_some() || home.is_some() {
-                    let kind = preset.or_else(|| harness.kind.clone());
-                    let home = home.or_else(|| harness.home.clone().filter(|_| kind == harness.kind));
-                    harness = sk1ll_core::machine::rebase(&name, &harness, kind.as_deref(), home.as_deref())?;
-                }
+                let mut harness = config.rebased(&name, preset.as_deref(), home.as_deref())?;
                 let path = |v: String| Some(v).filter(|v| !v.is_empty());
                 if let Some(v) = skills {
                     harness.skills = path(v);
@@ -168,13 +165,11 @@ pub(crate) fn run(s: &Session, all: bool, command: Option<HarnessCmd>) -> Result
         }
         return Ok(());
     }
-    let current = match &command {
-        HarnessCmd::Add { name, .. } => {
-            s.block(s.client.harness_settings())?.harnesses.into_iter().find(|c| c.name == *name).map(|c| c.harness)
-        }
-        _ => None,
+    let config = match &command {
+        HarnessCmd::Add { .. } => MachineConfig::load(&s.block(s.client.harness_settings())?.path)?,
+        _ => MachineConfig::default(),
     };
-    let (change, opts, take_out) = command.split(current)?;
+    let (change, opts, take_out) = command.split(&config)?;
     let view = |p: &PlacementView, placed: bool| Row {
         kind: p.kind.clone(),
         harness: p.harness.clone(),
